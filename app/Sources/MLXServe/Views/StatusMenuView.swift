@@ -171,6 +171,7 @@ struct StatusMenuView: View {
     let openTasks: () -> Void
     var openAgents: () -> Void = {}
     var openSandboxTerminal: () -> Void = {}
+    var openBenchmarks: () -> Void = {}
 
     /// Observes the shared sandbox so the tray badge appears/updates live when
     /// the Agent Sandbox is turned on and when its guest boots. Safe to observe
@@ -332,6 +333,18 @@ struct StatusMenuView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.regular)
                         .help("Open Server Log in a separate window (easier copy/paste)")
+
+                        // Needs a running server with a model loaded — the
+                        // benchmark measures whatever is currently served.
+                        Button {
+                            openBenchmarks()
+                        } label: {
+                            Image(systemName: "speedometer")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .disabled(server.status != .running)
+                        .help("Benchmark this Mac and compare with the community")
                     }
 
                     HStack {

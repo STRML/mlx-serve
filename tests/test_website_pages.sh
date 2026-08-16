@@ -32,6 +32,7 @@ SLUGS=(
   speculative-decoding
   local-ai-assistant
   llm-tier-list
+  benchmarks
 )
 
 PASS=0; FAIL=0; PEND=0
@@ -169,6 +170,36 @@ if [ -f "$TIER" ]; then
   fi
 else
   fail "llm-tier-list: interactive page missing ($TIER)"
+fi
+
+# ── 7b: benchmarks board contract ──────────────────────────────────────────
+# The community benchmark board reads Firebase Realtime Database over plain
+# HTTPS (no SDK — that's why RTDB was chosen over Firestore) and renders two
+# views: absolute tok/s per comparable cell, and each setting's decode ratio
+# against its own session's `defaults` arm. The ratio view is the only
+# comparison that's valid across different Macs, so it must always ship.
+BENCH="$DOCS/benchmarks/index.html"
+if [ -f "$BENCH" ]; then
+  pass
+  check "$BENCH" 'firebaseio.com'          "benchmarks: RTDB endpoint"
+  check "$BENCH" 'limitToLast'             "benchmarks: bounded fetch, never the whole database"
+  check "$BENCH" 'function isValidRow'     "benchmarks: per-row validation (open database)"
+  check "$BENCH" 'function cellKey'        "benchmarks: comparable-cell grouping"
+  check "$BENCH" 'function ratiosBySession' "benchmarks: cross-session ratio view"
+  check "$BENCH" 'gpuCores'                "benchmarks: GPU cores in the grouping key"
+  check "$BENCH" 'id="mode-ratio"'         "benchmarks: vs-defaults view toggle"
+  check "$BENCH" 'id="f-chip"'             "benchmarks: chip filter"
+  check "$BENCH" 'id="f-ram"'              "benchmarks: memory filter"
+  check "$BENCH" 'lossy'                   "benchmarks: lossy-setting badge"
+  # The grouping mirrors BenchmarkStore.cellKey in the Swift app; both sides
+  # are unit-tested so the two can't quote different numbers for one dataset.
+  if command -v node >/dev/null 2>&1; then
+    if node tests/website_benchmarks_logic.mjs; then pass; else fail "benchmarks: logic assertions (tests/website_benchmarks_logic.mjs)"; fi
+  else
+    pend "benchmarks logic assertions skipped (node not installed)"
+  fi
+else
+  fail "benchmarks: board page missing ($BENCH)"
 fi
 
 # ── 8: ONE shared header on every page ──────────────────────────────────────
