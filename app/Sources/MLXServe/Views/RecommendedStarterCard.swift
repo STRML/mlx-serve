@@ -32,7 +32,7 @@ struct RecommendedStarterCard: View {
                     .foregroundColor(.accentColor)
                     .frame(width: 24, alignment: .center)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(Self.lead(for: pick))
+                    Text(L10n.text(Self.lead(for: pick)))
                         .font(.subheadline.weight(.semibold))
                         .fixedSize(horizontal: false, vertical: true)
                     Text(pick.name)
@@ -51,7 +51,7 @@ struct RecommendedStarterCard: View {
     @ViewBuilder private var action: some View {
         if let state, state.status == .downloading {
             VStack(alignment: .leading, spacing: 4) {
-                ProgressView(value: state.fileProgress)
+                ProgressView(value: state.progress)
                 HStack(spacing: 6) {
                     Text("Downloading \(state.percentFormatted) \(state.speedFormatted)")
                         .font(.caption.monospacedDigit())
@@ -72,8 +72,10 @@ struct RecommendedStarterCard: View {
                 Button {
                     startDownload()
                 } label: {
-                    Text(Self.actionTitle(hasPartial: downloads.hasPartialDownload(pick.repoId),
-                                          failed: state?.status == .failed))
+                    Text(L10n.text(
+                                          Self.actionTitle(hasPartial: downloads.hasPartialDownload(pick.repoId),
+                                          failed: state?.status == .failed)
+))
                         .font(.subheadline.weight(.medium))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 3)
@@ -124,10 +126,10 @@ struct RecommendedStarterCard: View {
     static func lead(for pick: RecommendedModelPick) -> String {
         let what: String
         switch pick.id {
-        case "gemma-4-e2b":     what = "A small, quick assistant"
         case "gemma-4-e4b":     what = "A fast, capable assistant"
         case "gemma-4-12b":     what = "A capable all-round assistant"
-        case "qwen36-27b-mtp":  what = "A strong assistant, great at code"
+        case "qwen38-27b":      what = "A strong assistant, great at code"
+        case "qwen38-flash-next": what = "A frontier-class assistant, fast for its size"
         default:                what = "A local AI assistant"
         }
         return "\(what) · \(String(format: "%.1f GB", pick.sizeGB))"

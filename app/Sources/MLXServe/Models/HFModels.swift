@@ -21,12 +21,19 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "llama",
     "mistral",
     "nemotron",   // nemotron_h (Mamba2 SSM hybrid)
-    "lfm",        // lfm2, lfm2-vl (Liquid state-space hybrid)
+    "lfm",        // lfm2, lfm2_vl (Liquid state-space hybrid; VL serves images)
     "bert",       // encoder-only embedding models (/v1/embeddings)
     "hunyuan",    // Tencent Hunyuan 3 (model_type hy_v3) — repos tag "hunyuan"
     "hy_v3",      // …and/or the model_type verbatim (some tag only that)
     "laguna",     // poolside Laguna S 2.1 — repos tag "laguna" and/or "laguna-s-2.1"
     "inkling",    // Thinking Machines Inkling Small — repos tag "inkling" and/or "inkling_mm_model"
+    "muse",       // meta-models Muse-Glimmer-30B — repos tag "muse_glimmer" (and *_text)
+    "bailing",    // inclusionAI Ling 3.0 — repos tag "bailing_moe_v3" and/or "bailing_hybrid"
+    "ling",       // …and/or the family name
+    "gpt_oss",    // GPT-OSS family tags (e.g. mlx-community/gpt-oss-20b-MXFP4-Q8)
+    "spark",      // XHToken Spark-X2.5 — repos tag "spark2_5" and/or "sparkx2_5"
+    "k2-horizon", // IFM K2-Horizon — repos tag "k2-horizon" and/or "k2_horizon"
+    "k2_horizon",
 ]
 
 /// model_type values from config.json that the Zig server can load.
@@ -36,20 +43,26 @@ let supportedModelTypes: Set<String> = [
     "gemma3", "gemma3_text", "gemma4", "gemma4_text",
     "gemma4_unified", "gemma4_unified_text",
     "diffusion_gemma", // DiffusionGemma block diffusion (text-only; vision tower not wired)
-    "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
+    "qwen3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
     "qwen3_moe", "qwen3_moe_text",
+    "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "qwen2",
     "llama", "mistral",
-    "lfm2", "lfm2-vl",
+    "lfm2", "lfm2_vl", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
     "nemotron_h",
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
+    "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
+    "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
+    "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
+    "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)
     // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.
     "gguf", "deepseek_v4",
+    "gpt_oss",
 ]
 
 /// model_type prefixes/exact values for native media-generation checkpoints
@@ -60,12 +73,125 @@ let supportedModelTypes: Set<String> = [
 /// chat-model pickers (`LocalModel.isChatPickable` checks this separately).
 /// Mirrors `model_discovery.isMediaModelType` (Zig).
 private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "hunyuan3d"]
-private let mediaModelTypeExactValues: Set<String> = ["qwen3_tts", "AudioVideo", "acestep"]
+// Mirrors `gen.media_model_types` on the server. Drift here is not cosmetic:
+// a media model missing from this list fails the ARCHITECTURE gate outright,
+// so the browser draws it a red "Unsupported" — which is what happened to
+// `minimax_music3` on the same screen that offers to download it, and to bare
+// `mageflow` (MageFlow ships no root config.json, so it is classified from
+// model_index.json under that spelling). `kokoro` was excluded on purpose
+// because it is voice-mode-only and absent from every media picker — but
+// "hidden from pickers" and "shown to the user as an unsupported
+// architecture" are different decisions, and it was getting both. Exclusion
+// from pickers is `isChatPickable`'s job, which reads this same list. #228.
+//
+// `MediaModalityParityTests` reads `media_model_types` out of src/gen.zig and
+// asserts this agrees. Zig already pinned its own two copies against each
+// other; nothing pinned Swift, which is why this drifted unnoticed.
+private let mediaModelTypeExactValues: Set<String> = [
+    "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow",
+]
 
 func isMediaModelType(_ modelType: String) -> Bool {
     if mediaModelTypeExactValues.contains(modelType) { return true }
     return mediaModelTypePrefixes.contains { modelType.hasPrefix($0) }
 }
+
+/// Media architectures a **Discover search row** may offer as a download.
+///
+/// A narrower question than `isMediaModelType`, and the two were conflated.
+/// "Is this a media architecture?" decides the Unsupported badge and the
+/// chat-picker exclusion — Kokoro is one, and pretending otherwise is what put
+/// a red flag on it. "Should a search result offer this repo?" is a CATALOG
+/// decision, and Kokoro is answered by the built-in voice-mode entry rather
+/// than by arbitrary repos found on the hub. Kokoro still appears in the Media
+/// pane's Audio section via `AudioModelPreset.allIncludingVoiceOnly`, so this
+/// hides nothing the user needs; it only keeps the Discover door shut.
+func discoverableMediaModelType(_ modelType: String) -> Bool {
+    modelType != "kokoro" && isMediaModelType(modelType)
+}
+
+/// Which create pane a media checkpoint belongs to.
+///
+/// Mirrors Zig's `gen.modalityFromType` with ONE deliberate difference: Zig
+/// collapses speech and music into `.audio` because they share an engine slot,
+/// but the app has to tell them apart — they are two tabs of one pane, so a
+/// Use button that only knew "audio" would drop a music model on the Voice
+/// tab. `CustomMediaModels.musicFamily` is the existing discriminator; this is
+/// the same split, minus the running-server requirement (a browser row is a
+/// filesystem `LocalModel` with no capabilities).
+enum MediaModality: CaseIterable {
+    case image, voice, music, video, mesh
+
+    init?(modelType: String) {
+        if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
+            || modelType.hasPrefix("mage_flow") || modelType == "mageflow" { self = .image; return }
+        if modelType.hasPrefix("hunyuan3d") { self = .mesh; return }
+        switch modelType {
+        case "qwen3_tts", "kokoro": self = .voice
+        case "acestep", "minimax_music3": self = .music
+        case "AudioVideo", "minimax_h3": self = .video
+        default: return nil
+        }
+    }
+
+    /// The top-level create page. Music has no `GenExperiment` case of its own
+    /// — it is a tab inside Audio — so it shares `.audio` with voice.
+    var experiment: GenExperiment {
+        switch self {
+        case .image: return .image
+        case .voice, .music: return .audio
+        case .video: return .video
+        case .mesh: return .model3d
+        }
+    }
+
+    /// Which tab of the Audio pane, or nil where the question does not apply.
+    var audioTab: AudioGenView.Tab? {
+        switch self {
+        case .voice: return .voice
+        case .music: return .music
+        default: return nil
+        }
+    }
+
+    /// What the Use button says it will open.
+    var paneName: String {
+        switch self {
+        case .image: return "Image Generation"
+        case .voice: return "Voice"
+        case .music: return "Music"
+        case .video: return "Video Generation"
+        case .mesh: return "3D"
+        }
+    }
+}
+
+/// The `config` block the HF API returns when asked (`expand[]=config`).
+/// `model_type` is the field the server dispatches on, so it's the definitive
+/// arch signal a search row can carry. A diffusers repo has no `model_type`;
+/// HF surfaces the pipeline's own class instead
+/// (`{"diffusers":{"_class_name":"MageFlowPipeline"}}`).
+struct HFConfigMeta: Codable {
+    let modelType: String?
+    var diffusers: DiffusersMeta? = nil
+    var diffusersClassName: String? { diffusers?.className }
+
+    struct DiffusersMeta: Codable {
+        let className: String?
+        enum CodingKeys: String, CodingKey { case className = "_class_name" }
+    }
+    enum CodingKeys: String, CodingKey { case modelType = "model_type", diffusers }
+}
+
+/// Served media families recognizable from a diffusers repo's `_class_name`.
+/// Only pipelines our engines load in that repo's OWN layout belong here —
+/// the class is a family claim, and the tree check still has to prove the
+/// files. Krea and FLUX conversions ship a root config.json with `model_type`
+/// (they come through the main door); their raw upstream layouts are not
+/// served, so their classes deliberately map nowhere.
+private let servedDiffusersClasses: [String: String] = [
+    "MageFlowPipeline": "mage_flow", // mirrors model_discovery.peekMageFlowIndex
+]
 
 struct HFModel: Identifiable, Codable {
     let id: String
@@ -75,6 +201,14 @@ struct HFModel: Identifiable, Codable {
     let tags: [String]?
     let safetensors: HFSafetensors?
     let pipelineTag: String?
+    var config: HFConfigMeta? = nil
+
+    /// Whether the repo's file TREE proved the family bundle's ready markers
+    /// (set by `HFSearchService` from the tree fetch; nil = not checked yet
+    /// or unfetchable). Media repos are judged by this, never by tags alone —
+    /// a raw upstream checkpoint declares the same `model_type` as a
+    /// converted pack, and only the converted layout loads.
+    var mediaStructureVerified: Bool? = nil
 
     /// Fallback file size from tree API (not from JSON — set by HFSearchService).
     /// For safetensors repos this is the sum across all `.safetensors` shards.
@@ -92,14 +226,42 @@ struct HFModel: Identifiable, Codable {
     /// Largest non-mmproj GGUF in the repo (bytes). See `ggufMinSizeBytes`.
     var ggufMaxSizeBytes: Int64? = nil
 
+    /// The per-quant subfolders a multi-variant MLX repo publishes, smallest
+    /// first — empty for every ordinary repo. Populated by `HFSearchService`
+    /// from the tree fetch it already runs for the size column (such a repo
+    /// carries no `safetensors` metadata: HF computes that from a ROOT index,
+    /// which a subfoldered repo doesn't have, so the fetch always happens).
+    var mlxVariants: [MlxVariant] = []
+
     enum CodingKeys: String, CodingKey {
-        case id, downloads, likes, lastModified, tags, safetensors
+        case id, downloads, likes, lastModified, tags, safetensors, config
         case pipelineTag = "pipeline_tag"
     }
 
+    /// The served media family this repo declares — `config.model_type`
+    /// first (definitive), else a served diffusers `_class_name` (Mage-Flow —
+    /// diffusers repos carry no model_type), else a tag spelling a media
+    /// model_type verbatim (mlx-serve packs tag it, e.g. "minimax_h3").
+    /// nil = not a media repo we serve; Kokoro deliberately maps nowhere
+    /// (voice-mode-only catalog rule — see `discoverableMediaModelType`).
+    var mediaFamilyModelType: String? {
+        if let t = config?.modelType, discoverableMediaModelType(t) { return t }
+        if let c = config?.diffusersClassName, let t = servedDiffusersClasses[c] { return t }
+        return (tags ?? []).first(where: discoverableMediaModelType)
+    }
+
+    var isServedMediaRepo: Bool { mediaFamilyModelType != nil }
+
     /// Whether mlx-serve supports this model's pipeline type.
     /// Models with unknown pipeline (nil/empty) get benefit of the doubt.
+    ///
+    /// A served media repo is judged by its VERIFIED structure instead —
+    /// its pipeline tag ("text-to-video") would fail the chat allowlist, and
+    /// whitelisting media pipeline tags broadly would hand a Download button
+    /// to every diffusers repo on HF. nil (tree not checked / unfetchable)
+    /// stays conservatively incompatible.
     var isCompatible: Bool {
+        if isServedMediaRepo { return mediaStructureVerified == true }
         guard let tag = pipelineTag, !tag.isEmpty else { return true }
         return compatiblePipelineTags.contains(tag)
     }
@@ -116,7 +278,7 @@ struct HFModel: Identifiable, Codable {
     /// internally, so flagging these "Unsupported architecture" was a false
     /// negative that hid legit downloads.
     var isSupportedArchitecture: Bool {
-        if isGgufRepo { return true }
+        if isGgufRepo || isServedMediaRepo { return true }
         guard let tags, !tags.isEmpty else { return true }
         return tags.contains { tag in
             supportedArchitectureTagPrefixes.contains { tag.hasPrefix($0) }
@@ -131,6 +293,11 @@ struct HFModel: Identifiable, Codable {
     var isGgufRepo: Bool {
         (tags ?? []).contains { $0.lowercased() == "gguf" }
     }
+
+    /// True when this repo ships one complete MLX model PER SUBFOLDER — a shelf
+    /// of quants, like a GGUF repo. The row offers a quant menu instead of a
+    /// plain Download, and each pick lands in its own model dir.
+    var isMlxVariantRepo: Bool { !mlxVariants.isEmpty }
 
     /// The FP quantization this repo uses that the server CANNOT load, if any.
     /// Since v26.6.10 (issue #24) the server loads nvfp4/mxfp4/mxfp8
@@ -154,6 +321,10 @@ struct HFModel: Identifiable, Codable {
 
     /// Human-readable reason why this model isn't compatible.
     var incompatibleReason: String? {
+        if isServedMediaRepo {
+            return mediaStructureVerified == true ? nil
+                : "Not an mlx-serve pack (missing converted files)"
+        }
         if !isCompatible, let tag = pipelineTag {
             return "Not supported (\(tag))"
         }
@@ -225,9 +396,10 @@ struct HFModel: Identifiable, Codable {
     /// modes (mxfp6) deliberately don't match here — they surface via
     /// `incompatibleReason`, not as a misleading badge.
     var quantization: String? {
-        // GGUF repos host multiple quants in separate files; the repo ID alone
-        // doesn't identify one, so surface "Multi" rather than "—".
-        if isGgufRepo { return Self.quantizationLabel(forId: id) ?? "Multi" }
+        // GGUF repos host multiple quants in separate files, multi-variant MLX
+        // repos in separate subfolders; the repo ID alone doesn't identify one,
+        // so surface "Multi" rather than "—".
+        if isGgufRepo || isMlxVariantRepo { return Self.quantizationLabel(forId: id) ?? "Multi" }
         return Self.quantizationLabel(forId: id)
     }
 
@@ -260,23 +432,47 @@ struct HFModel: Identifiable, Codable {
     /// Estimated on-disk / in-memory size in bytes.
     /// Prefers safetensors parameter dtype math; falls back to tree API file sizes.
     var estimatedSizeBytes: Int64 {
-        if let params = safetensors?.parameters, !params.isEmpty {
-            var total: Int64 = 0
-            for (dtype, count) in params {
-                let bytesPerParam: Double
-                switch dtype.uppercased() {
-                case "F64": bytesPerParam = 8
-                case "F32", "U32", "I32": bytesPerParam = 4
-                case "F16", "BF16", "U16", "I16": bytesPerParam = 2
-                case "I8", "U8": bytesPerParam = 1
-                case let d where d.contains("4"): bytesPerParam = 0.5
-                default: bytesPerParam = 2
-                }
-                total += Int64(Double(count) * bytesPerParam)
+        Self.estimateWeightBytes(parameters: safetensors?.parameters, id: id) ?? fallbackSizeBytes ?? 0
+    }
+
+    /// Weight bytes from HF's `safetensors.parameters` dtype histogram. HF
+    /// counts packed U32/I32 as the LOGICAL element count (a 4-bit and an
+    /// 8-bit pack of one model report identical histograms), so those are
+    /// priced by the width in the repo id plus the group scale/bias overhead
+    /// (`(bits + 0.5) / 8` bytes each reproduces the real repo sizes). Nil
+    /// when packed elements are present but the id names no width: the
+    /// caller falls to the tree-API size instead of a 4x-wrong number.
+    static func estimateWeightBytes(parameters: [String: Int64]?, id: String) -> Int64? {
+        guard let params = parameters, !params.isEmpty else { return nil }
+        var total: Double = 0
+        for (dtype, count) in params {
+            let bytesPerParam: Double
+            switch dtype.uppercased() {
+            case "F64": bytesPerParam = 8
+            case "F32": bytesPerParam = 4
+            case "U32", "I32":
+                guard let bits = packedBitWidth(forId: id) else { return nil }
+                bytesPerParam = (bits + 0.5) / 8
+            case "F16", "BF16", "U16", "I16": bytesPerParam = 2
+            case "I8", "U8": bytesPerParam = 1
+            case let d where d.contains("4"): bytesPerParam = 0.5
+            default: bytesPerParam = 2
             }
-            return total
+            total += Double(count) * bytesPerParam
         }
-        return fallbackSizeBytes ?? 0
+        return Int64(total)
+    }
+
+    /// Bit width of a quantized repo's packed weights, read from its id
+    /// ("4bit", "8-bit", "3.5bit", NVFP4/MXFP4 = 4, MXFP8 = 8).
+    static func packedBitWidth(forId id: String) -> Double? {
+        guard let label = quantizationLabel(forId: id) else { return nil }
+        switch label {
+        case "NVFP4", "MXFP4": return 4
+        case "MXFP8": return 8
+        case "FP16", "BF16": return 16
+        default: return Double(label.replacingOccurrences(of: "-bit", with: ""))
+        }
     }
 
     /// Model size parsed from the name (e.g. "31B", "82M", "0.6B").
@@ -308,6 +504,12 @@ struct HFModel: Identifiable, Codable {
     /// more honest than a single number. Single-file repos (safetensors or
     /// single GGUF) get the existing single-value formatting.
     var ramEstimate: String {
+        // A multi-variant MLX repo hasn't been narrowed to one quant either —
+        // and its `estimatedSizeBytes` is 0 (no root safetensors metadata), so
+        // without this it reads "Unknown".
+        if let lo = mlxVariants.map(\.sizeBytes).min(), let hi = mlxVariants.map(\.sizeBytes).max(), lo < hi {
+            return MemoryInfo.formatRange(Int64(Double(lo) * 1.2), Int64(Double(hi) * 1.2))
+        }
         if let minB = ggufMinSizeBytes, let maxB = ggufMaxSizeBytes, minB < maxB {
             let lo = Int64(Double(minB) * 1.2)
             let hi = Int64(Double(maxB) * 1.2)
@@ -325,6 +527,9 @@ struct HFModel: Identifiable, Codable {
     /// colors as won't-fit rather than misleading-green on its smallest
     /// quant. Single-value paths are unchanged.
     var ramEstimateBytes: Int64 {
+        if let maxV = mlxVariants.map(\.sizeBytes).max() {
+            return Int64(Double(maxV) * 1.2)
+        }
         if let maxB = ggufMaxSizeBytes {
             return Int64(Double(maxB) * 1.2)
         }

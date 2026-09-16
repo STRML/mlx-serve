@@ -432,9 +432,18 @@ const func_builtins & global_builtins() {
             return mk_val<value_bool>(res);
         }},
         {"test_is_sameas", [](const func_args & args) -> value {
-            // Check if an object points to the same memory address as another object
-            (void)args;
-            throw not_implemented_exception("sameas test not implemented");
+            // Python identity: the singletons (true/false/none) by kind and
+            // value, everything else by object address.
+            args.ensure_count(2);
+            value a = args.get_pos(0);
+            value b = args.get_pos(1);
+            if (is_val<value_bool>(a) || is_val<value_bool>(b)) {
+                return mk_val<value_bool>(is_val<value_bool>(a) && is_val<value_bool>(b) && a->as_bool() == b->as_bool());
+            }
+            if (is_val<value_none>(a) || is_val<value_none>(b)) {
+                return mk_val<value_bool>(is_val<value_none>(a) && is_val<value_none>(b));
+            }
+            return mk_val<value_bool>(a.get() == b.get());
         }},
         {"test_is_escaped", [](const func_args & args) -> value {
             (void)args;
@@ -869,6 +878,41 @@ const func_builtins & value_array_t::get_builtins() const {
                 return mk_val<value_undefined>();
             }
             return arr[arr.size() - 1];
+        }},
+        // Jinja2 `min`/`max` over a non-empty sequence. These were previously
+        // registered ONLY in the empty-sequence table below, so `[a, b]|min`
+        // threw "Unknown (built-in) filter 'min' for type Array" and any
+        // template using it silently downgraded to the caller's fallback
+        // formatter (MiniCPM5's chat_template.jinja:59 does exactly this in
+        // its multi-turn tool-history branch). Comparison reuses the same
+        // `value_compare` the `sort` filter uses, so ordering semantics match.
+        {"min", [](const func_args & args) -> value {
+            args.ensure_vals<value_array>();
+            const auto & arr = args.get_pos(0)->as_array();
+            if (arr.empty()) {
+                return mk_val<value_undefined>();
+            }
+            value best = arr[0];
+            for (size_t i = 1; i < arr.size(); i++) {
+                if (value_compare(arr[i], best, value_compare_op::lt)) {
+                    best = arr[i];
+                }
+            }
+            return best;
+        }},
+        {"max", [](const func_args & args) -> value {
+            args.ensure_vals<value_array>();
+            const auto & arr = args.get_pos(0)->as_array();
+            if (arr.empty()) {
+                return mk_val<value_undefined>();
+            }
+            value best = arr[0];
+            for (size_t i = 1; i < arr.size(); i++) {
+                if (value_compare(arr[i], best, value_compare_op::gt)) {
+                    best = arr[i];
+                }
+            }
+            return best;
         }},
         {"length", [](const func_args & args) -> value {
             args.ensure_vals<value_array>();

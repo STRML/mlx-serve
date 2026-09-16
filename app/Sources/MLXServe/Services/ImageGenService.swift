@@ -187,8 +187,9 @@ final class ImageGenService: ObservableObject {
     /// the contract is unit-testable: plain text-to-image bodies carry ONLY the
     /// classic fields; img2img (`image`+`strength`), edit references
     /// (`mode`+`ref_images`), conditioning rebalance
-    /// (`cond_gain`+`cond_weights`), and LoRA (`lora_path`+`lora_scale`) are
-    /// added only when set, so the server sees no behavior change otherwise.
+    /// (`cond_gain`+`cond_weights`), CFG (`guidance_scale`+`negative_prompt`,
+    /// base klein only), and LoRA (`lora_paths`+`lora_scales`) are added only
+    /// when set, so the server sees no behavior change otherwise.
     static func requestJson(for request: ImageGenRequest, modelName: String, seed: Int) -> [String: Any] {
         var json: [String: Any] = [
             "model": modelName,
@@ -201,7 +202,6 @@ final class ImageGenService: ObservableObject {
         if request.width > 0 && request.height > 0 {
             json["size"] = "\(request.width)x\(request.height)"
         }
-        if !request.safeMode { json["safety"] = false }
         if let src = request.initImagePath,
            let data = FileManager.default.contents(atPath: src) {
             json["image"] = data.base64EncodedString()
@@ -223,9 +223,20 @@ final class ImageGenService: ObservableObject {
            weights.count == request.condWeightCount {
             json["cond_weights"] = weights
         }
-        if let lora = request.loraPath, !lora.isEmpty {
-            json["lora_path"] = lora
-            if request.loraScale != 1.0 { json["lora_scale"] = request.loraScale }
+        // Classifier-free guidance (base klein only — `model.supportsGuidance`
+        // gates the control, so a distilled preset's 1.0 default never reaches
+        // here as anything but the omitted-field no-op).
+        if request.guidanceScale != 1.0 { json["guidance_scale"] = request.guidanceScale }
+        let negativePrompt = request.negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !negativePrompt.isEmpty { json["negative_prompt"] = negativePrompt }
+        // Stacked style LoRAs: several `.safetensors` adapters attach at once
+        // and their effects sum (mirrors mflux's `lora_paths`/`lora_scales`).
+        // Half-filled rows (no path picked yet) are dropped here rather than
+        // sent as an empty string the server would reject.
+        let loras = request.loras.filter { !$0.path.isEmpty }
+        if !loras.isEmpty {
+            json["lora_paths"] = loras.map(\.path)
+            json["lora_scales"] = loras.map(\.scale)
         }
         return json
     }

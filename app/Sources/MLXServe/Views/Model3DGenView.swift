@@ -13,7 +13,11 @@ import UniformTypeIdentifiers
 struct Model3DGenView: View {
     @EnvironmentObject var service: Model3DGenService
     @EnvironmentObject var server: ServerManager
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
+    /// For the model row's Download button (`MediaModelChooser`) — a completed
+    /// transfer has to re-scan the models directory.
+    @EnvironmentObject var appState: AppState
 
     @State private var photoURL: URL? = nil
     @State private var model: Model3DModelPreset = .hunyuan3d21_8bit
@@ -33,10 +37,14 @@ struct Model3DGenView: View {
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
+    /// True while a drag carrying a file hovers the photo section — drives its
+    /// dashed-border highlight and the well's fill (see `MediaDropTarget`).
+    @State private var isDropTargeted: Bool = false
 
     var body: some View {
+        // No window-sized floor — see ImageGenView: pages shrink their
+        // preview side, they don't overflow the detail column.
         readyView
-        .frame(minWidth: 820, minHeight: 600)
         .onAppear {
             if !didHydrate {
                 hydrating = true
@@ -76,7 +84,8 @@ struct Model3DGenView: View {
                 outputFolderLink
             }
             .padding(16)
-            .frame(minWidth: 420)
+            // The preview gives way in a small window.
+            .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
@@ -85,7 +94,7 @@ struct Model3DGenView: View {
                 pendingRequest = nil
             }
         } message: {
-            Text(ramWarningMessage)
+            Text(L10n.text(ramWarningMessage))
         }
     }
 
@@ -114,34 +123,38 @@ struct Model3DGenView: View {
                 .padding(6)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
             } else {
-                Button { choosePhoto() } label: {
-                    Label("Choose photo…", systemImage: "photo.badge.plus").font(.caption)
-                }
+                MediaDropWell(title: "Choose photo…",
+                              systemImage: "photo.badge.plus",
+                              isTargeted: isDropTargeted) { choosePhoto() }
                 Text("A single, well-lit photo of one object works best. The subject is auto-cut from its background.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
         }
+        // One photo slot, so a drop replaces what's there — see
+        // `MediaDropTarget`. The target covers the whole section, which once a
+        // photo is set is the thumbnail row you'd aim a replacement at.
+        .mediaDrop(.image, isTargeted: $isDropTargeted) { urls in
+            if let url = urls.first { photoURL = url }
+        }
     }
 
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: LanPick.selection(
-                model: $model, lanModel: $lanModel,
-                resolve: { id in Model3DModelPreset.all.first { $0.id == id } },
-                persist: persist)
-            ) {
-                ForEach(Model3DModelPreset.all) { preset in
-                    Text(preset.name).tag(preset.id)
-                }
-                LanModelPickerRows(capability: "3d")
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            Text("~\(model.approxRAMGB) GB RAM • single image → 3D mesh")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        MediaModelChooser.pane(
+            all: Model3DModelPreset.all,
+            onThisMac: CustomMediaModels.meshPresets(from: server.allModels),
+            capability: "3d",
+            selected: $model, lanModel: $lanModel,
+            capabilityOf: { $0.capabilityLabel },
+            resolveCustom: { [models = server.allModels] in
+                CustomMediaModels.meshPreset(for: $0, from: models)
+            },
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
     }
 
     private var advancedToggle: some View {
@@ -195,7 +208,7 @@ struct Model3DGenView: View {
             if lanModel == nil && !downloads.bundleReady(model.bundle) {
                 // Local-only models have no HF download yet — steer the user to
                 // the on-device conversion instead of a Download button.
-                if model.isLocalOnly { convertHint } else { BundleDownloadBar(bundle: model.bundle) }
+                if model.isLocalOnly { convertHint } else { BundleDownloadBar(bundle: model.bundle, showsStartButton: false) }
             }
             HStack {
                 if service.isRunning {
@@ -317,7 +330,7 @@ struct Model3DGenView: View {
     // MARK: - Photo picker
 
     private func choosePhoto() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -331,7 +344,7 @@ struct Model3DGenView: View {
 
     private func hydrate() {
         let s = Model3DGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         steps = s.steps
         guidance = s.guidance
@@ -380,11 +393,7 @@ struct Model3DGenView: View {
     }
 
     private func showLogWindow() {
-        let logText = service.log.joined(separator: "\n")
-        let alert = NSAlert()
-        alert.messageText = "3D generation log"
-        alert.informativeText = logText.isEmpty ? "(no output)" : logText
-        alert.runModal()
+        AppActivation.openWindow(id: "serverLog", using: openWindow)
     }
 }
 
@@ -488,13 +497,6 @@ enum Model3DThumbnailer {
 
 /// Loads a `.glb` mesh into an `SCNScene`. Factored out (pure) so the load path
 /// is unit-testable against a fixture without standing up a view.
-///
-/// macOS has NO built-in glTF loader — ModelIO / SceneKit only parse obj / usd
-/// / stl / … — so we read the GLB container ourselves. Scoped to what the
-/// mlx-serve GLB writer emits: a single embedded BIN buffer, POSITION (+ optional
-/// NORMAL) VEC3-float attributes, and TRIANGLES indices (uint16/uint32/uint8).
-/// Anything outside that shape returns nil and the caller falls back to ModelIO
-/// (for the obj/usd formats it does handle).
 enum GLBMeshLoader {
     /// Load the file at `url` into a scene, or nil if it can't be parsed.
     static func loadScene(url: URL) -> SCNScene? {

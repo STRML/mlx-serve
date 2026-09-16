@@ -29,7 +29,9 @@ enum AgentBudget {
     /// "enough for a one-shot whole-file write (8–11k measured)" was NOT enough:
     /// a flat 16384 truncated every large `write` at 262K context and looped a
     /// pi session for hours (2026-07-20). The budget scales with context
-    /// (context/4); this cap only bounds a degenerate runaway generation.
+    /// (context/2: thinking shares it, and one xhigh design turn on Qwen3.8
+    /// spent all of a 24k window's quarter); this cap only bounds a
+    /// degenerate runaway generation.
     private static let maxOutput = 65536
 
     /// The advertised context is declared to the CLI VERBATIM — no second margin.
@@ -45,8 +47,33 @@ enum AgentBudget {
     /// the correct, loud answer.
     static func forServerContext(_ advertised: Int?) -> Budget {
         guard let advertised, advertised > 0 else { return fallback }
-        let output = min(maxOutput, max(1024, advertised / 4))
+        let output = min(maxOutput, max(1024, advertised / 2))
         return Budget(context: advertised, output: output)
+    }
+
+    /// Room an agent keeps free before compacting, and what it keeps after: a
+    /// quarter of the window, capped where pi's and opencode2's own 20000-token
+    /// defaults (sized for 200k windows) take over. Twin of Zig `compactionReserve`.
+    static func compactionReserve(_ context: Int) -> Int {
+        min(20000, max(1024, context / 4))
+    }
+
+    /// Below this the agent's own fixed prompt leaves every turn compacting or
+    /// truncated: Claude Code sends 40-70k before the first word (tool + MCP
+    /// schemas, skills catalogue), opencode ~8k, pi ~2k. Twin of Zig `contextFloor`.
+    static func contextFloor(agentId: String) -> Int {
+        switch agentId {
+        case "claude": return 65536
+        case "opencode", "opencode2": return 32768
+        default: return 16384
+        }
+    }
+
+    /// Alert text, or nil when the window is enough.
+    static func contextWarning(agentId: String, context: Int) -> String? {
+        let floor = contextFloor(agentId: agentId)
+        guard context > 0, context < floor else { return nil }
+        return "The model advertises a \(context)-token context; \(agentId) needs \(floor)+ to work well. Raise Context size in Settings > Server, or expect compaction and truncated turns."
     }
 }
 
@@ -94,6 +121,12 @@ enum AgentConfigs {
     /// `apiKey` defaults to the placeholder the loopback-trusted server
     /// ignores; the SANDBOXED session passes the real `--api-key` when one is
     /// set — guest→host traffic arrives non-loopback (via the NAT gateway).
+    /// `supportsReasoningEffort: true` is what lets pi's own reasoning-level
+    /// picker reach the server. With it false the level was a local label pi
+    /// never transmitted, so every request arrived effort-less and took the
+    /// server's default. It rides BOTH surfaces (here and the extension's
+    /// per-model COMPAT) because applyExtension does not inherit provider
+    /// compat — `AgentBudgetTests` pins the two together.
     static func piModelsJSON(baseURL: String, model: String, budget: AgentBudget.Budget,
                              apiKey: String = "mlx-serve") -> String {
         """
@@ -105,7 +138,7 @@ enum AgentConfigs {
               "apiKey": "\(apiKey)",
               "compat": {
                 "supportsDeveloperRole": false,
-                "supportsReasoningEffort": false,
+                "supportsReasoningEffort": true,
                 "maxTokensField": "max_tokens",
                 "thinkingFormat": "qwen"
               },
@@ -170,7 +203,7 @@ enum AgentConfigs {
         const FALLBACK_CONTEXT = 32768;
         const COMPAT = {
           supportsDeveloperRole: false,
-          supportsReasoningEffort: false,
+          supportsReasoningEffort: true,
           maxTokensField: "max_tokens",
           thinkingFormat: "qwen",
         };
@@ -196,7 +229,7 @@ enum AgentConfigs {
                 const meta = row.meta || {};
                 const ctx = meta.context_length > 0 ? meta.context_length : FALLBACK_CONTEXT;
                 // Mirrors AgentBudget.forServerContext — keep the two in sync.
-                const maxTokens = Math.min(65536, Math.max(1024, Math.floor(ctx / 4)));
+                const maxTokens = Math.min(65536, Math.max(1024, Math.floor(ctx / 2)));
                 const image = Array.isArray(row.input_modalities) && row.input_modalities.includes("image");
                 return {
                   id: row.id,
@@ -242,8 +275,16 @@ enum AgentConfigs {
     /// custom providers, so the FULL chat-capable list is baked here — its
     /// in-session /models picker shows exactly these entries, each with its
     /// own limits (never the loaded model's budget stamped on everything).
+    /// `pinModel` writes a top-level `"model"` — opencode 2's TUI has no
+    /// `--model` flag, so the config is the only place to select one.
+    /// `limit.output` is the room opencode keeps free before compacting (it
+    /// never sends max_tokens), so it carries the reserve, not the response
+    /// cap. `compaction` (opencode2) scales its global buffer/keep to the
+    /// pinned model's window: the defaults compact a 24k window before its
+    /// first reply.
     static func opencodeJSON(baseURL: String, defaultModel: String,
-                             entries: [AgentModelEntry]) -> String {
+                             entries: [AgentModelEntry], pinModel: Bool = false,
+                             compaction: Bool = false) -> String {
         var list = entries
         if !list.contains(where: { $0.id == defaultModel }) {
             list.insert(AgentModelEntry(id: defaultModel, budget: AgentBudget.fallback,
@@ -252,11 +293,18 @@ enum AgentConfigs {
         let models = list.map { e -> String in
             let attachment = e.vision ? " \"attachment\": true," : ""
             return "\"\(e.id)\": { \"name\": \"\(e.id) (mlx-serve)\",\(attachment) "
-                + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(e.budget.output) } }"
+                + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(AgentBudget.compactionReserve(e.budget.context)) } }"
         }.joined(separator: ",\n        ")
+        let pinned = pinModel ? "\n  \"model\": \"mlx/\(defaultModel)\"," : ""
+        var compactionBlock = ""
+        if compaction {
+            let ctx = list.first { $0.id == defaultModel }?.budget.context ?? AgentBudget.fallback.context
+            let reserve = AgentBudget.compactionReserve(ctx)
+            compactionBlock = "\n  \"compaction\": { \"buffer\": \(reserve), \"keep\": { \"tokens\": \(min(15000, reserve)) } },"
+        }
         return """
         {
-          "$schema": "https://opencode.ai/config.json",
+          "$schema": "https://opencode.ai/config.json",\(pinned)\(compactionBlock)
           "provider": {
             "mlx": {
               "npm": "@ai-sdk/openai-compatible",
@@ -276,6 +324,228 @@ enum AgentConfigs {
     static func opencodeJSON(baseURL: String, model: String, budget: AgentBudget.Budget) -> String {
         opencodeJSON(baseURL: baseURL, defaultModel: model,
                      entries: [AgentModelEntry(id: model, budget: budget, vision: false)])
+    }
+
+    static func isLoopbackBaseURL(_ url: String) -> Bool {
+        guard let parsed = URL(string: url), let host = parsed.host else { return false }
+        if host == "localhost" || host == "::1" { return true }
+        return host.hasPrefix("127.")
+    }
+
+    /// pi `settings.json`: compaction numbers scaled to the window, everything
+    /// else kept (theme, packages, the user's own `enabled`). pi compacts when
+    /// context exceeds window - reserveTokens and keeps keepRecentTokens; its
+    /// defaults (16384 / 20000) never compact a 24k window while max_tokens
+    /// shrinks to 1. Twin of Zig `mergePiSettingsJson`.
+    static func piSettingsJSON(existing: String, context: Int) -> String {
+        var obj = (try? JSONSerialization.jsonObject(with: Data(existing.utf8))) as? [String: Any] ?? [:]
+        var compaction = obj["compaction"] as? [String: Any] ?? [:]
+        let reserve = AgentBudget.compactionReserve(context)
+        compaction["reserveTokens"] = min(16384, reserve + 4096)
+        compaction["keepRecentTokens"] = reserve
+        obj["compaction"] = compaction
+        guard let out = try? JSONSerialization.data(withJSONObject: obj),
+              let s = String(data: out, encoding: .utf8) else { return "{}" }
+        return s.replacingOccurrences(of: "\\/", with: "/")
+    }
+
+    static func opencode2CliJSON(existing: String, baseURL: String, apiKey: String? = nil) -> String {
+        let data = Data(existing.utf8)
+        var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        var plugins: [[String: Any]] = []
+        if let raw = obj["plugins"] as? [Any] {
+            plugins = raw.compactMap { $0 as? [String: Any] }
+        }
+        plugins.removeAll { p in
+            let pkg = p["package"] as? String ?? ""
+            return pkg == "./plugins/mlx-serve" || pkg == "mlx-serve" || pkg.hasSuffix("/mlx-serve")
+        }
+        let trimmed = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
+        var options: [String: Any] = ["metricsUrl": trimmed + "/metrics.json"]
+        let token: String?
+        if let k = apiKey, !k.isEmpty { token = k }
+        else if !isLoopbackBaseURL(baseURL) { token = "mlx-serve" }
+        else { token = nil }
+        if let token { options["metricsToken"] = token }
+        plugins.append(["package": "./plugins/mlx-serve", "options": options])
+        obj["plugins"] = plugins
+        guard let out = try? JSONSerialization.data(withJSONObject: obj),
+              let s = String(data: out, encoding: .utf8) else { return "{}" }
+        return s.replacingOccurrences(of: "\\/", with: "/")
+    }
+
+    static func opencode2PluginSourceDir() -> URL? {
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("lib/opencode2-mlx-serve")
+        let candidates = [
+            Bundle.main.resourceURL?.appendingPathComponent("opencode2-mlx-serve"),
+            repo,
+        ]
+        return candidates.compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    static func copyOpencode2Plugin(to dest: String) {
+        guard let src = opencode2PluginSourceDir() else { return }
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: dest, withIntermediateDirectories: true)
+        guard let names = try? fm.contentsOfDirectory(atPath: src.path) else { return }
+        for name in names {
+            if name.hasSuffix(".test.ts") { continue }
+            let keep = name.hasSuffix(".ts") || name == "tui.tsx" || name == "package.json" || name == "LICENSE"
+            if !keep { continue }
+            let from = (src.path as NSString).appendingPathComponent(name)
+            let to = (dest as NSString).appendingPathComponent(name)
+            try? fm.removeItem(atPath: to)
+            try? fm.copyItem(atPath: from, toPath: to)
+        }
+    }
+
+    /// oh-my-pi (omp) `models.yml` — written to the dedicated
+    /// `~/.mlx-serve/omp/` config dir, never the user's real `~/.omp/agent`.
+    /// The dir is selected via `PI_CODING_AGENT_DIR` — measured against omp
+    /// v17: the changelog's `OMP_CODING_AGENT_DIR` rename reached only its
+    /// help text, the env read is still the pi spelling (launch scripts
+    /// export BOTH so a completed rename keeps working).
+    ///
+    /// The model list is STATIC, one entry per chat-capable model, like
+    /// opencode's — deliberately NOT omp's `discovery: openai-models-list`:
+    /// discovery lists every /v1/models row, so media/embedding models would
+    /// enter the coding agent's picker (each at omp's 128k default context,
+    /// since a media row has no context to advertise). Users who wire omp's
+    /// discovery themselves still get real per-model context from the rows'
+    /// top-level `max_model_len`/`context_length` twins (issue #188).
+    /// `compat` keys verified against the omp schema (same vocabulary as
+    /// pi's, `thinkingFormat: qwen` included).
+    static func ompModelsYML(baseURL: String, defaultModel: String,
+                             entries: [AgentModelEntry],
+                             apiKey: String = "mlx-serve") -> String {
+        var list = entries
+        if !list.contains(where: { $0.id == defaultModel }) {
+            list.insert(AgentModelEntry(id: defaultModel, budget: AgentBudget.fallback,
+                                        vision: false), at: 0)
+        }
+        let models = list.map { e -> String in
+            """
+                  - id: "\(e.id)"
+                    name: "\(e.id) (mlx-serve)"
+                    reasoning: true
+                    input: [\(e.vision ? "text, image" : "text")]
+                    cost:
+                      input: 0
+                      output: 0
+                      cacheRead: 0
+                      cacheWrite: 0
+                    contextWindow: \(e.budget.context)
+                    maxTokens: \(e.budget.output)
+            """
+        }.joined(separator: "\n")
+        return """
+        # written by mlx-serve — custom `mlx` provider for oh-my-pi (omp).
+        # Regenerated at each launch; edits here are overwritten.
+        providers:
+          mlx:
+            baseUrl: \(baseURL)/v1
+            api: openai-completions
+            apiKey: \(apiKey)
+            compat:
+              supportsDeveloperRole: false
+              supportsReasoningEffort: true
+              maxTokensField: max_tokens
+              thinkingFormat: qwen
+            models:
+        \(models)
+        """
+    }
+
+    /// Single-model convenience — the MAS instructions panel's shape.
+    static func ompModelsYML(baseURL: String, model: String,
+                             budget: AgentBudget.Budget) -> String {
+        ompModelsYML(baseURL: baseURL, defaultModel: model,
+                     entries: [AgentModelEntry(id: model, budget: budget, vision: false)])
+    }
+
+    /// codex `config.toml` — written into a dedicated `CODEX_HOME`
+    /// (`~/.mlx-serve/codex`; codex requires the dir to EXIST, so every
+    /// writer creates it first) so the user's real `~/.codex` is never
+    /// touched. Current codex speaks ONLY the Responses wire API (`WireApi`
+    /// has one variant in codex-rs), so this points at our `/v1/responses`.
+    /// No `env_key`: with `requires_openai_auth` false (the default) and no
+    /// key var, codex skips login entirely — the loopback server ignores
+    /// keys anyway.
+    static func codexConfigTOML(baseURL: String, model: String,
+                                budget: AgentBudget.Budget) -> String {
+        """
+        # written by mlx-serve — dedicated CODEX_HOME, regenerated at each launch.
+        model = "\(model)"
+        model_provider = "mlx"
+        model_context_window = \(budget.context)
+
+        [model_providers.mlx]
+        name = "MLX Serve (local)"
+        base_url = "\(baseURL)/v1"
+        wire_api = "responses"
+        """
+    }
+
+    /// Shell snippet that resolves the codex binary: PATH first, then the
+    /// CLI bundled inside the desktop app (codex's rebranded app installs as
+    /// ChatGPT.app or Codex.app — its own launcher checks both names in
+    /// /Applications and ~/Applications, bundle id com.openai.codex — and
+    /// ships the CLI at Contents/Resources/codex). Shared by the DMG launch
+    /// script, the MAS instructions tab, and mirrored by `mlx-serve launch`
+    /// (launch.zig), so a desktop-app-only user gets a working launch.
+    static let codexBinResolver = """
+        CODEX_BIN="$(command -v codex)"
+        if [ -z "$CODEX_BIN" ]; then
+          for app in "/Applications/ChatGPT.app" "/Applications/Codex.app" "$HOME/Applications/ChatGPT.app" "$HOME/Applications/Codex.app"; do
+            if [ -x "$app/Contents/Resources/codex" ]; then CODEX_BIN="$app/Contents/Resources/codex"; break; fi
+          done
+        fi
+        if [ -z "$CODEX_BIN" ]; then echo "codex is not installed: npm install -g @openai/codex, or install the ChatGPT app"; exit 127; fi
+        """
+
+    /// aider model metadata (litellm's registry format) — tells aider the
+    /// real context window of every `openai/<id>` model so its budgeting and
+    /// warnings work; without it unknown models get litellm defaults. One
+    /// entry per chat-capable model, the served model force-included.
+    static func aiderModelMetadataJSON(model: String, budget: AgentBudget.Budget,
+                                       entries: [AgentModelEntry]) -> String {
+        var list = entries
+        if !list.contains(where: { $0.id == model }) {
+            list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+        }
+        let rows = list.map { e -> String in
+            """
+              "openai/\(e.id)": {
+                "max_input_tokens": \(e.budget.context),
+                "max_output_tokens": \(e.budget.output),
+                "max_tokens": \(e.budget.output),
+                "input_cost_per_token": 0,
+                "output_cost_per_token": 0,
+                "litellm_provider": "openai",
+                "mode": "chat"
+              }
+            """
+        }.joined(separator: ",\n")
+        return "{\n\(rows)\n}"
+    }
+
+    /// hermes `.env` — the first-run wizard kill switch: hermes's
+    /// `_has_any_provider_configured()` is satisfied by `OPENAI_BASE_URL`
+    /// alone, and the file lives under HERMES_HOME (hermes_constants.py), so
+    /// it rides the same dedicated dir as config.yaml.
+    static func hermesEnvFile(baseURL: String, apiKey: String = "mlx-serve") -> String {
+        """
+        # written by mlx-serve — OPENAI_BASE_URL marks a provider as configured,
+        # which is what keeps the first-run setup wizard out of the session.
+        OPENAI_BASE_URL=\(baseURL)/v1
+        OPENAI_API_KEY=\(apiKey)
+        """
     }
 
     /// hermes `config.yaml` — mirrors EXACTLY what `hermes setup`'s
@@ -317,8 +587,15 @@ enum AgentConfigs {
     }
 
     /// Env exports for the Claude Code launch script (no trailing newline).
+    /// Twin of Zig `launch.scriptFor(.claude, …)` — change both together.
     static func claudeCodeExports(baseURL: String, model: String, budget: AgentBudget.Budget) -> String {
-        """
+        // A model outside Claude Code's own catalog is assumed to hold 200k and
+        // auto-compacted there; CLAUDE_CODE_MAX_CONTEXT_TOKENS is the documented
+        // override. Declared VERBATIM like every other agent's context field —
+        // and omitted entirely when the server advertised nothing.
+        let contextExport = budget.context > 0
+            ? "\nexport CLAUDE_CODE_MAX_CONTEXT_TOKENS=\(budget.context)" : ""
+        return """
         export ANTHROPIC_BASE_URL='\(baseURL)'
         export ANTHROPIC_API_KEY=
         export ANTHROPIC_AUTH_TOKEN=mlx-serve
@@ -327,7 +604,7 @@ enum AgentConfigs {
         export ANTHROPIC_DEFAULT_SONNET_MODEL=\(model)
         export ANTHROPIC_DEFAULT_HAIKU_MODEL=\(model)
         export CLAUDE_CODE_SUBAGENT_MODEL=\(model)
-        export CLAUDE_CODE_MAX_OUTPUT_TOKENS=\(budget.output)
+        export CLAUDE_CODE_MAX_OUTPUT_TOKENS=\(budget.output)\(contextExport)
         """
     }
 }

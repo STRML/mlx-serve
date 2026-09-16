@@ -36,18 +36,22 @@ const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
+const model_settings = @import("model_settings.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
@@ -55,6 +59,7 @@ const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zi
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
+const sleep_inhibit = @import("sleep_inhibit.zig");
 
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -65,6 +70,10 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
 const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
+const dflash_mod = @import("dflash.zig");
+const round_cost_mod = @import("round_cost.zig");
+const group_cost_mod = @import("mtp_group_cost.zig");
+const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
 const ChatConfig = chat_mod.ChatConfig;
@@ -107,11 +116,26 @@ pub const LoadParams = struct {
     /// Path to the assistant drafter checkpoint. Empty disables the drafter.
     /// Borrowed; outlive scheduler.
     drafter_dir: []const u8 = "",
+    /// `--no-drafter`: never load a drafter, including one MERGED into the
+    /// checkpoint. `drafter_dir == ""` stopped meaning "off" the moment a
+    /// checkpoint could carry its own, so the opt-out needs its own bit.
+    no_drafter: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
+    mtp_head_kv_quant: bool = false,
     /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
+    /// Build the ANE prefill-MLP offload at load (`--ane-prefill`,
+    /// perf-plan-aug-17 P5). Opt-in, lossy by design; every refusal is a
+    /// named `[ane]` line and the model serves GPU-only.
+    ane_prefill: bool = false,
+    /// The server's prefill-chunk pin (`server.pinPrefillChunk`), passed as a
+    /// pointer because the scheduler deliberately has no server.zig import.
+    /// The ANE build compiles fixed-shape tiles against THIS width — resolving
+    /// it any other way would let the tile and the forward's chunk drift.
+    ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32 = null,
+    ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64 = null,
     /// Whether to also load vision-tower weights. Combined with
     /// `config.has_vision` — false here disables vision regardless of config.
     load_vision: bool = false,
@@ -133,6 +157,10 @@ pub const LoadParams = struct {
     prefix_cache_capacity: u32 = 1,
     /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
     prefix_cache_mem_bytes: u64 = 0,
+    /// Clamp the hot-cache byte budget against live post-load headroom
+    /// (`server.prefixCacheMemForLoad`) — a pointer because the scheduler
+    /// deliberately has no server.zig import. Null = no clamp (tests).
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget for the hot prefix cache (`--prefix-cache-disk`).
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
@@ -145,7 +173,7 @@ pub const LoadParams = struct {
     /// `main.zig` overrides via `--ssm-checkpoint-stride` for the serve path.
     ssm_checkpoint_stride: u32 = 0,
     /// Phase 1: cap on snapshots retained per request.
-    ssm_checkpoint_max: u32 = 32,
+    ssm_checkpoint_max: u32 = 16,
     /// Iteration 2 (perf-plan Phase 4 #3): per-LoadedModel LRU cache
     /// of chat-template render+tokenize results. 0 disables the cache
     /// (useful for ablation benches / debugging). Default 4 matches
@@ -182,6 +210,12 @@ pub const LoadParams = struct {
     /// decode. Default on; forced off when `ds4_ssd_streaming` (ds4 refuses the
     /// combination). `--no-ds4-mtp` disables it.
     ds4_mtp: bool = true,
+    /// Select ds4's DSpark runtime when the auto-found support GGUF carries
+    /// DSpark stages (`--dspark`, the same flag that opts the NATIVE dsv4
+    /// engine into its draft stages). Off by default — the engine loads the
+    /// stages but keeps target-only decode. Requires `ds4_mtp` (the sidecar
+    /// is the support model).
+    ds4_dspark: bool = false,
     /// Like `ds4_path` but for the generic llama.cpp engine (any GGUF except
     /// DeepSeek-V4-Flash). The inference thread opens a `LlamaEngine` and
     /// installs it on the entry's `llama_engine` field. Mutually exclusive with
@@ -215,6 +249,9 @@ pub const SubmitParams = struct {
     full_prompt: ?[]const u32 = null,
     cached_tokens: u32 = 0,
     has_tools: bool = false,
+    /// The server's final resolved thinking mode after request overrides and
+    /// model defaults. DFlash economics key off this, not tool presence.
+    enable_thinking: bool = false,
     sampling: SamplingParams,
     eos_token_ids: []const u32,
     max_tokens: u32,
@@ -222,9 +259,14 @@ pub const SubmitParams = struct {
     enable_pld: bool = false,
     enable_drafter: bool = false,
     drafter: ?*DrafterModel = null,
+    /// DFlash assistant for this model. Rides the SAME `enable_drafter`
+    /// request switch (a model loads at most ONE of drafter/dflash);
+    /// `drafter_block_size` carries the dflash-resolved block size too.
+    dflash: ?*DflashModel = null,
     drafter_block_size: u32 = 4,
     enable_mtp: bool = false,
-    mtp: ?*mtp_mod.MtpModel = null,
+    allow_batch_mtp: bool = true,
+    mtp: ?generate_mod.MtpHeadRef = null,
     /// 0 = auto (see generate_mod.resolveMtpDepthCap).
     mtp_depth: u32 = 0,
     pld_draft_len: u32 = 5,
@@ -236,6 +278,10 @@ pub const SubmitParams = struct {
     /// Vision embeddings spliced at image-token positions during prefill.
     /// Ownership transferred to the slot; freed on slot.deinit.
     vision_embeddings: ?mlx.mlx_array = null,
+    /// Prefix-cache key for the media under the placeholder tokens (0 = none).
+    vision_key: u64 = 0,
+    /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
+    cache_key: u64 = 0,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.
@@ -259,6 +305,73 @@ pub const SubmitParams = struct {
     model: *model_registry_mod.LoadedModel,
 };
 
+/// Set by `server.installPrefillAdmission`: does a request of this shape fit in GPU memory
+/// right now? Null (unit tests, no HTTP server) disables evict-to-admit. The trailing warm
+/// arguments are the restored rows, their capacity, and whether the restore checked the
+/// entry out (the only restore whose rows the request will not allocate).
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) bool = null;
+
+/// The prefill width this request should run at, chosen against live post-eviction memory
+/// (`server.requestPrefillChunkNow`). Null keeps the model's load-time pin.
+pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) u32 = null;
+
+pub const PostEvictionWidth = struct {
+    /// The width the prefill runs at. Always the re-ask.
+    width: u32,
+    widened: bool,
+    /// The re-ask came back narrower than the admitted width: memory moved between the reads.
+    moved: bool,
+};
+
+/// The prefill width to run, given the width admission was billed at before the eviction
+/// pass and the width re-asked against live memory after it. The re-ask wins in both
+/// directions: `@max` would widen on memory that is gone. `admitted == 0` = no pass ran.
+pub fn postEvictionPrefillChunk(admitted: u32, reasked: u32) PostEvictionWidth {
+    return .{
+        .width = reasked,
+        .widened = admitted != 0 and reasked > admitted,
+        .moved = admitted != 0 and reasked < admitted,
+    };
+}
+
+/// Asked by the prefill loop: the width of the next chunk, re-priced at every chunk boundary
+/// (`server.adaptivePrefillWidthNow`). Null keeps the admitted width.
+pub var prefill_chunk_adapt: ?*const fn (
+    *const model_mod.ModelConfig,
+    u64,
+    usize,
+    u32,
+    u32,
+    *generate_mod.AdaptiveWidthState,
+    u64,
+) u32 = null;
+
+/// Whether the per-chunk adaptive width is enabled for this model. The hook above is
+/// installed process-wide, so its presence is not the arch gate.
+pub var prefill_chunk_adaptive_enabled: ?*const fn (*const model_mod.ModelConfig) bool = null;
+
+/// What `Generator.InitOptions.adaptive_chunk_width` gets for a slot.
+pub fn adaptiveChunkWidthFor(cfg: ?*const model_mod.ModelConfig) bool {
+    const c = cfg orelse return false;
+    const enabled = prefill_chunk_adaptive_enabled orelse return false;
+    return enabled(c);
+}
+
+/// Re-price a widen after the interleave tick (`server.adaptivePrefillWidenStillFits`). Null declines every widen.
+pub var prefill_chunk_widen_ok: ?*const fn (
+    *const model_mod.ModelConfig,
+    u64,
+    usize,
+    u32,
+    u64,
+) bool = null;
+
+/// Logs the numbers the estimator compared on a refusal.
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) void = null;
+
+/// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
+pub var hot_cache_budget_invalidate: ?*const fn () void = null;
+
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
 /// Result of `Slot.waitNext`. Driven by the inference thread; consumed by
@@ -273,6 +386,24 @@ pub const NextResult = union(enum) {
     /// should surface it to the client and call `complete(slot)`.
     err: void,
 };
+
+fn firstMediaPlaceholder(
+    has_media: bool,
+    tokens: []const u32,
+    image_token_id: u32,
+    audio_token_id: u32,
+    video_token_id: u32,
+) ?usize {
+    // The placeholder ids are ordinary vocabulary entries, so a text-only
+    // prompt can contain one; a boundary exists only where media rows do.
+    if (!has_media) return null;
+    for (tokens, 0..) |token, i| {
+        if ((image_token_id > 0 and token == image_token_id) or
+            (audio_token_id > 0 and token == audio_token_id) or
+            (video_token_id > 0 and token == video_token_id)) return i;
+    }
+    return null;
+}
 
 /// Per-request state. Owned by the Scheduler from `submit` until `complete`.
 pub const Slot = struct {
@@ -293,7 +424,20 @@ pub const Slot = struct {
     cache: KVCache,
     moe_seq_offset: usize,
     ssm_entries: ?[]SSMCacheEntry,
+    /// SSM stride checkpoints salvaged from a prefill the client cancelled:
+    /// `Generator.initWithOptions` moves its captured checkpoints into this
+    /// sink before returning `error.Cancelled` (they die with the failed
+    /// construction otherwise). Consumed by `commitCancelledPrefillSlot`
+    /// (ownership transfers into the hot-cache entry); freed by `deinit`
+    /// when never consumed.
+    cancelled_prefill: Generator.CancelledCheckpointSink = .{},
     vision_embeddings: ?mlx.mlx_array,
+    vision_key: u64,
+    cache_key: u64 = 0,
+    skip_prefix_cache: bool = false,
+    /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
+    /// state before this position is safe to share across media hashes.
+    media_start: ?usize,
     /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.
     /// Owned by the slot; `mrope_pos` freed on deinit.
     mrope_pos: ?[]const i32,
@@ -307,9 +451,9 @@ pub const Slot = struct {
     /// Generator (constructed on inference thread post-prefill).
     legacy_gen: ?Generator,
 
-    /// Ds4 session for this slot. Created in `runPrefillDs4` when the slot's
-    /// model is `.ds4_engine`-backed; freed in `Slot.deinit`. Mutually
-    /// exclusive with `legacy_gen` (the MLX `Generator` path).
+    /// ds4 session for this slot, BORROWED from `model.ds4_session` (one
+    /// persistent session per model, claimed via `session_busy`) — never
+    /// freed here. Mutually exclusive with `legacy_gen` (the MLX path).
     ds4_session: ?*arch_ds4.Ds4Session = null,
     /// Per-request RNG state for ds4 sampling. ds4's sampler takes the seed
     /// by pointer so we keep it on the slot.
@@ -325,10 +469,10 @@ pub const Slot = struct {
     /// dequantized embedding table; freed in `Slot.deinit`. Mutually
     /// exclusive with `legacy_gen` (the autoregressive MLX path).
     diffusion: ?*diffusion_mod.Runner = null,
-    /// True when this slot claimed `model.llama_session_busy` in `submit`. The
+    /// True when this slot claimed `model.session_busy` in `submit`. The
     /// single persistent context serves one request at a time; the claim is
     /// released in `complete()`. Tracked per-slot so only the holder releases.
-    llama_holds_session: bool = false,
+    holds_session: bool = false,
     /// Per-request RNG state for llama.cpp sampling (passed by pointer, like ds4).
     llama_rng: u64 = 0,
 
@@ -340,12 +484,15 @@ pub const Slot = struct {
     max_tokens: u32,
     timeout_ns: u64,
     has_tools: bool,
+    enable_thinking: bool,
     enable_pld: bool,
     enable_drafter: bool,
     drafter: ?*DrafterModel,
+    dflash: ?*DflashModel,
     drafter_block_size: u32,
     enable_mtp: bool,
-    mtp: ?*mtp_mod.MtpModel,
+    allow_batch_mtp: bool,
+    mtp: ?generate_mod.MtpHeadRef,
     mtp_depth: u32,
     pld_draft_len: u32,
     pld_key_len: u32,
@@ -353,6 +500,16 @@ pub const Slot = struct {
     kv_attn_fused: bool,
     cached_tokens: u32,
     logprobs_n: u32,
+    serial_reason_logged: bool = false,
+    /// This tick decodes plain (batched) although the slot's MTP head is armed: the
+    /// batched forward captures its hidden so the next solo tick can resume speculating.
+    mtp_plain_tick: bool = false,
+    planner_plain_transition: bool = false,
+    planner_price_transition: bool = false,
+    planner_last_width: u8 = 255,
+    planner_force_plain: bool = false,
+    mtp_publish_ns: u64 = 0,
+    mtp_publish_gap_ms: f32 = 0,
 
     // ── State + output channel. ──
     state: SlotState,
@@ -369,7 +526,21 @@ pub const Slot = struct {
     finished: bool,
     error_code: ?[]const u8,
     finish_reason: []const u8,
+    /// Set ONLY by the degenerate-tail guard. The wire reason is "stop" so a
+    /// client does not mistake the guard for output/context exhaustion; this
+    /// sibling signal preserves the specific cause. Static string, never freed.
+    finish_details: ?[]const u8,
+    /// Index into the emitted tokens where the degenerate span begins;
+    /// everything from here on is the loop. Non-streaming responses are cut
+    /// here so the client cannot round-trip the loop into the next prompt.
+    loop_trim_start: ?usize,
     cancelled: std.atomic.Value(bool),
+    /// Reasoning-protocol payload boundary, published by the inference thread
+    /// BEFORE the token that carries it is pushed (single-writer atomics, so
+    /// the conn thread reading token i already sees its span). `token_index`
+    /// is the index into the generated stream; `maxInt(u32)` = not started.
+    constraint_payload_at: std.atomic.Value(u32),
+    constraint_payload_offset: std.atomic.Value(u32),
 
     // ── Stats (filled by inference thread, safe to read after finish). ──
     prompt_tokens: u32,
@@ -389,6 +560,11 @@ pub const Slot = struct {
     /// hot-prefix-cache lookup/restore and the model forward over the
     /// uncached tail. Populated by the scheduler main loop.
     prefill_ns: u64,
+    /// Wall-clock nanoseconds of interleaved decode ticks hosted INSIDE this
+    /// slot's prefill (chunk-boundary yields). Charged to the decoding slots
+    /// that received the tokens; subtracted from this slot's `prefill_ns` so
+    /// prefill_tps stays a statement about the prefill forward.
+    prefill_interleaved_ns: u64,
     /// Wall-clock nanoseconds the slot spent in decode ticks. For batched
     /// decode the full tick wall-clock is added to every participating slot,
     /// so this matches the per-slot throughput a user actually observes
@@ -424,13 +600,11 @@ pub const Slot = struct {
         // sentinel-empty fields so `Slot.deinit` is well-defined on both paths.
         const is_embedded = params.model.ds4_engine != null or params.model.llama_engine != null;
 
-        // Per-slot KVCache, honoring the process-level kv-quant setting.
-        // TurboQuant schemes need `head_dim` at construction time for the
-        // per-layer rotation matrices; other schemes ignore it. For embedded
-        // slots the engine owns its own cache — we initialize a zero-layer
-        // shell so `Slot.deinit` is symmetric with the MLX path.
+        // Per-slot KVCache, honoring the process-level kv-quant setting. For
+        // embedded slots the engine owns its own cache — we initialize a
+        // zero-layer shell so `Slot.deinit` is symmetric with the MLX path.
         const slot_kv_layers: u32 = if (is_embedded) 0 else config.num_hidden_layers;
-        var cache = try KVCache.initWithConfigAndHeadDim(allocator, slot_kv_layers, kv_quant_config, config.head_dim);
+        var cache = try KVCache.initWithConfig(allocator, slot_kv_layers, kv_quant_config);
         errdefer cache.deinit();
 
         // Per-slot SSM cache. Mirror the same predicate `Transformer.init`
@@ -459,6 +633,7 @@ pub const Slot = struct {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
+                transformer_mod.ssmFreeQsaState(e);
             }
             allocator.free(entries);
         };
@@ -469,6 +644,13 @@ pub const Slot = struct {
         const full_prompt_src = params.full_prompt orelse params.prompt_ids;
         const full_prompt_owned = try allocator.dupe(u32, full_prompt_src);
         errdefer allocator.free(full_prompt_owned);
+        const media_start = firstMediaPlaceholder(
+            params.vision_embeddings != null,
+            full_prompt_owned,
+            config.image_token_id,
+            config.audio_token_id,
+            config.video_token_id,
+        );
         const eos_owned = try allocator.dupe(u32, params.eos_token_ids);
         errdefer allocator.free(eos_owned);
 
@@ -480,6 +662,9 @@ pub const Slot = struct {
             .moe_seq_offset = 0,
             .ssm_entries = ssm_entries,
             .vision_embeddings = params.vision_embeddings,
+            .vision_key = params.vision_key,
+            .cache_key = params.cache_key,
+            .media_start = media_start,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
             .mrope_delta = params.mrope_delta,
@@ -497,14 +682,24 @@ pub const Slot = struct {
             .max_tokens = params.max_tokens,
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
+            .enable_thinking = params.enable_thinking,
             .enable_pld = params.enable_pld,
-            // The external drafter does not yet carry Qwen3-VL M-RoPE
-            // positions. Native Qwen MTP does: its prompt-history KV uses the
-            // explicit image positions and generated text uses offset+delta.
-            .enable_drafter = params.enable_drafter and params.vision_embeddings == null,
+            // Qwen's external drafter does not yet carry M-RoPE positions.
+            // Muse DFlash is different: it consumes captures from the same
+            // vision-conditioned trunk forward and Muse has no M-RoPE table,
+            // so image requests may keep that sidecar armed.
+            .enable_drafter = assistantSidecarEnabledForRequest(
+                params.enable_drafter,
+                params.vision_embeddings != null,
+                params.mrope_pos != null,
+                params.dflash != null,
+                config.muse_vision,
+            ),
             .drafter = params.drafter,
+            .dflash = params.dflash,
             .drafter_block_size = params.drafter_block_size,
             .enable_mtp = params.enable_mtp,
+            .allow_batch_mtp = params.allow_batch_mtp,
             .mtp = params.mtp,
             .mtp_depth = params.mtp_depth,
             .pld_draft_len = params.pld_draft_len,
@@ -521,7 +716,11 @@ pub const Slot = struct {
             .finished = false,
             .error_code = null,
             .finish_reason = "length",
+            .finish_details = null,
+            .loop_trim_start = null,
             .cancelled = std.atomic.Value(bool).init(false),
+            .constraint_payload_at = std.atomic.Value(u32).init(std.math.maxInt(u32)),
+            .constraint_payload_offset = std.atomic.Value(u32).init(0),
             .prompt_tokens = 0,
             .completion_tokens = 0,
             .prefill_tps = 0.0,
@@ -529,6 +728,7 @@ pub const Slot = struct {
             .request_start_ts = std.Io.Timestamp.now(io, .boot),
             .first_token_ns = 0,
             .prefill_ns = 0,
+            .prefill_interleaved_ns = 0,
             .decode_ns = 0,
             .generated_ids = null,
             .was_pad_only = true,
@@ -542,6 +742,7 @@ pub const Slot = struct {
             .cache = &slot.cache,
             .moe_seq_offset = &slot.moe_seq_offset,
             .ssm_entries = slot.ssm_entries,
+            .ssm_member_gen = transformer_mod.nextSsmMemberGen(),
             .vision_embeddings = slot.vision_embeddings,
             .mrope_pos = slot.mrope_pos,
             .mrope_total = slot.mrope_total,
@@ -558,10 +759,10 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
-        if (self.ds4_session) |session| {
-            session.free();
-            self.ds4_session = null;
-        }
+        // ds4_session / llama_session are borrowed from the model (persistent
+        // across requests) — never freed here. The claim on them is released
+        // in Scheduler.complete; the sessions die with the model.
+        self.ds4_session = null;
         // llama_session is borrowed from model.llama_session (persistent across
         // requests) — do NOT free it here. The claim on it is released in
         // Scheduler.complete; the session itself is freed with the model.
@@ -571,14 +772,19 @@ pub const Slot = struct {
             self.allocator.destroy(runner);
             self.diffusion = null;
         }
+        if (self.model.transformer) |xfm| xfm.markQsaPooledRopeStale();
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
         }
+        // Salvaged-but-never-consumed cancelled-prefill checkpoints.
+        self.cancelled_prefill.deinit();
         self.cache.deinit();
         if (self.ssm_entries) |entries| {
+            if (self.model.transformer) |xfm| xfm.ssmGroupDrop(entries);
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
+                transformer_mod.ssmFreeQsaState(e);
             }
             self.allocator.free(entries);
         }
@@ -598,10 +804,51 @@ pub const Slot = struct {
         self.allocator.destroy(self);
     }
 
+    /// Inference thread: record the reasoning→payload boundary so it is
+    /// visible to the conn thread no later than the token that carries it.
+    fn publishConstraintSpan(self: *Slot, token_index: u32, byte_offset: u32) void {
+        self.constraint_payload_offset.store(byte_offset, .release);
+        self.constraint_payload_at.store(token_index, .release);
+    }
+
+    /// Connection thread: where the constrained payload begins relative to
+    /// the generated stream, or null while it has not begun. `token_index`
+    /// matches the reader's own token count (token i carries the payload
+    /// start when the returned index equals i).
+    pub fn constraintPayloadStart(self: *const Slot) ?rp_mod.ConstraintSpan {
+        const at = self.constraint_payload_at.load(.acquire);
+        if (at == std.math.maxInt(u32)) return null;
+        return .{ .token_index = at, .byte_offset = self.constraint_payload_offset.load(.acquire) };
+    }
+
     /// Inference thread: enqueue a generated token for the consumer.
     fn pushToken(self: *Slot, t: u32) void {
+        self.pushTokenWithLogprob(t, null);
+    }
+
+    /// Publish one token and, when the request asked for logprobs, the entry
+    /// describing it — in ONE critical section.
+    ///
+    /// Both must move under `out_mu` together. The streaming path reads entry
+    /// i as soon as it is handed token i, so an append outside the lock races
+    /// the reader two ways: the entry may not be visible yet (a silently
+    /// missing trailing logprob), and a concurrent grow reallocates the
+    /// backing array under a reader mid-copy. Non-streaming consumes the whole
+    /// buffer at completion and is blind to both, which is why the streaming
+    /// gap survived: it is invisible to output-equality tests AND to llmprobe,
+    /// which probes logprobs non-streaming only.
+    fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?generate_mod.LogprobResult) void {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
+        if (lp) |entry| {
+            // Degrade to error like the token append below — and do NOT return:
+            // the broadcast at the bottom is what wakes a reader blocked on the
+            // condvar, so an early exit here trades an OOM for a hang.
+            self.logprobs_buf.append(self.allocator, entry) catch |err| {
+                self.error_code = self.allocator.dupe(u8, @errorName(err)) catch null;
+                self.state = .errored;
+            };
+        }
         self.out_buf.append(self.allocator, t) catch |err| {
             // Allocation failure: degrade to error.
             self.error_code = self.allocator.dupe(u8, @errorName(err)) catch null;
@@ -609,6 +856,29 @@ pub const Slot = struct {
         };
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
+    }
+
+    /// Connection thread: copy logprob entries produced since `cursor` into
+    /// `out`, returning the new cursor. Under `out_mu`, so it cannot observe a
+    /// half-written entry or a reallocating buffer.
+    ///
+    /// The COPY is shallow and that is deliberate: each entry's `top_logprobs`
+    /// is its own allocation, stable for the life of the slot, and owned by
+    /// the slot (`Slot.deinit` frees it). The caller borrows and must not free
+    /// — only the ArrayList's backing array is at risk from a concurrent grow,
+    /// and that is exactly what the lock covers.
+    pub fn copyLogprobsFrom(
+        self: *Slot,
+        allocator: std.mem.Allocator,
+        cursor: usize,
+        out: *std.ArrayList(generate_mod.LogprobResult),
+    ) !usize {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        const items = self.logprobs_buf.items;
+        if (cursor >= items.len) return cursor;
+        try out.appendSlice(allocator, items[cursor..]);
+        return items.len;
     }
 
     /// Inference thread: signal normal completion. Safe to call multiple
@@ -626,6 +896,27 @@ pub const Slot = struct {
 
     /// Inference thread: signal error. `name` is borrowed; we dupe so the
     /// connection thread can read it after the inference loop drops the slot.
+    /// Whether a slot error name names a memory failure (`OutOfMemory` from the MLX latch or Zig's allocator).
+    pub fn errorNameIsMemory(name: []const u8) bool {
+        return std.mem.eql(u8, name, "OutOfMemory") or
+            std.mem.eql(u8, name, "InsufficientMemory");
+    }
+
+    /// Whether the slot's latched error name is exactly `name`.
+    pub fn errorNameIs(self: *Slot, name: []const u8) bool {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        const have = self.error_code orelse return false;
+        return std.mem.eql(u8, have, name);
+    }
+
+    pub fn errorIsMemory(self: *Slot) bool {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        const name = self.error_code orelse return false;
+        return errorNameIsMemory(name);
+    }
+
     fn markError(self: *Slot, name: []const u8) void {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
@@ -734,6 +1025,16 @@ pub const VisionImagePixels = struct {
     grid_w: u32 = 0,
 };
 
+/// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
+/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo`). Borrowed;
+/// must outlive the encodeVision call.
+pub const VisionVideoPixels = struct {
+    pixels: []const u8,
+    grid_t: u32,
+    grid_h: u32,
+    grid_w: u32,
+};
+
 /// Phase A4: vision-encode work item. Conn thread fills `images` (raw pixel
 /// data, CPU-only) and calls `Scheduler.encodeVision`, which posts the
 /// request and blocks until the inference thread fills `result` and signals
@@ -747,17 +1048,23 @@ pub const VisionEncodeRequest = struct {
     model: *model_registry_mod.LoadedModel,
     /// Per-image float32 CHW pixel buffers. Borrowed; must outlive the call.
     images: []const VisionImagePixels,
+    /// Per-video pre-patchified pixel buffers. Borrowed; must outlive the call.
+    /// Qwen-only (video_token_id != 0) — empty on every other arch.
+    videos: []const VisionVideoPixels = &.{},
     /// Gemma 4 12B unified audio: per-clip raw float32-LE 16 kHz mono sample
     /// buffers. Borrowed; must outlive the call. The inference thread frames
     /// each into 640-sample tokens and projects them through the audio embedder.
     audio: []const []const u8 = &.{},
-    /// Output: encoded embedding tensor on success — vision soft tokens followed
-    /// by audio soft tokens, concatenated along the token axis. Ownership
-    /// transfers to the caller.
+    /// Output: encoded embedding tensor on success — vision soft tokens, then
+    /// video soft tokens, then audio soft tokens, concatenated along the token
+    /// axis (matches the prompt's image/video/audio block insertion order).
+    /// Ownership transfers to the caller.
     result: ?mlx.mlx_array = null,
-    /// Output: number of vision / audio soft tokens in `result` (in that order).
-    /// The caller inserts exactly this many image / audio placeholders.
+    /// Output: number of vision / video / audio soft tokens in `result` (in
+    /// that order). The caller inserts exactly this many image / video / audio
+    /// placeholders.
     n_vision_tokens: usize = 0,
+    n_video_tokens: usize = 0,
     n_audio_tokens: usize = 0,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
@@ -820,6 +1127,10 @@ pub const LoadRequest = struct {
     /// Borrowed paths. Conn thread keeps the buffers alive until `done`.
     model_dir: []const u8,
     drafter_dir: []const u8 = "",
+    /// `--no-drafter`: never load a drafter, including one MERGED into the
+    /// checkpoint. `drafter_dir == ""` stopped meaning "off" the moment a
+    /// checkpoint could carry its own, so the opt-out needs its own bit.
+    no_drafter: bool = false,
     /// SSD weight-streaming for cold-loaded ds4 models (issue #39). The CLI
     /// startup path supplies this via LoadParams; cold-load defaults it off.
     ds4_ssd_streaming: bool = false,
@@ -827,11 +1138,21 @@ pub const LoadRequest = struct {
     /// on (a switched-to ds4 model gets speculative decode); forced off under
     /// `ds4_ssd_streaming`.
     ds4_mtp: bool = true,
+    /// DSpark runtime for a cold-loaded ds4 model whose sidecar carries
+    /// DSpark stages. Cold loads inherit the launch flag via the Scheduler's
+    /// `ds4_dspark` (the headless flag-eater class — a LoadRequest default
+    /// would silently drop `--dspark` on every on-demand GGUF load).
+    ds4_dspark: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
+    mtp_head_kv_quant: bool = false,
     /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
+    /// `--ane-prefill` survives cold loads (the flag-eater class).
+    ane_prefill: bool = false,
+    ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32 = null,
+    ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64 = null,
 
     load_vision: bool = false,
     warmup_eager: bool = true,
@@ -840,6 +1161,7 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -852,7 +1174,7 @@ pub const LoadRequest = struct {
     /// Phase 1: maximum checkpoints retained per request. Older ones are
     /// dropped front-first when the buffer would grow past this. 0 = no cap
     /// beyond the prefix-cache byte budget.
-    ssm_checkpoint_max: u32 = 32,
+    ssm_checkpoint_max: u32 = 16,
     /// Iteration 2: tokenize cache LRU capacity. Mirrored on
     /// `LoadParams.tokenize_cache_entries`; both paths feed
     /// `doLoadOnInferenceThread`.
@@ -949,6 +1271,7 @@ pub const Scheduler = struct {
     weights: ?*Weights,
     vision_encoder: ?*VisionEncoder,
     drafter: ?*DrafterModel,
+    dflash: ?*DflashModel = null,
     drafter_block_size: u32,
     kv_quant_config: transformer_mod.KVQuantConfig,
     /// `LoadParams.ctx_size` — the --ctx-size launch flag, kept for sizing
@@ -962,6 +1285,7 @@ pub const Scheduler = struct {
     /// every model switch.
     prefix_cache_capacity: u32,
     prefix_cache_mem_bytes: u64,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
@@ -973,15 +1297,35 @@ pub const Scheduler = struct {
     /// (mtp on, default depth, 4 llama sessions, F16 KV), silently ignoring
     /// these flags on every on-demand load and model switch.
     mtp_enabled: bool,
+    mtp_head_kv_quant: bool,
     mtp_depth: u32,
     llama_cache_entries: u32,
     llama_kv_type_k: i32,
     llama_kv_type_v: i32,
+    /// Launch-flag ds4 speculative settings, retained for cold loads (same
+    /// class as `mtp_enabled` above — `--no-ds4-mtp` / `--dspark` must
+    /// survive an on-demand GGUF load, not just the `--model` primary).
+    ds4_mtp: bool,
+    ds4_dspark: bool,
+    ds4_ssd_streaming: bool,
+    /// `--ane-prefill`, retained for cold loads (same class as `mtp_enabled`).
+    ane_prefill: bool,
+    ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32,
+    ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64,
+    /// Launch-flag drafter settings, retained for cold loads. `--no-drafter`
+    /// became load-bearing on this path the moment `dflash.resolveInDirDrafter`
+    /// started probing `<model_dir>/drafter` at load: without it here, a server
+    /// launched with speculation off re-enabled it on every model switched to.
+    /// `drafter_dir` is the launch `--drafter` path and `primary_model_dir` the
+    /// `--model` it belongs to — see `coldLoadDrafterDir` for why it is not
+    /// simply copied across.
+    no_drafter: bool,
+    drafter_dir: []const u8,
+    primary_model_dir: []const u8,
+    draft_block_size: u32,
+    draft_block_size_explicit: bool,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
-    config: *const ModelConfig,
-    tok: *const Tokenizer,
-    chat_config: *const ChatConfig,
     drafter_path: []const u8,
 
     /// Phase A6 → Plan 05: per-model hot prefix cache. Pre-Plan-05 this was
@@ -990,6 +1334,23 @@ pub const Scheduler = struct {
     /// current model's cache (or null when the cache isn't applicable for
     /// the model, e.g. hybrid SSM archs).
     hot_prefix_cache: ?*prefix_cache_mod.HotPrefixCache,
+    /// Resident hot-cache bytes, published for the connection thread: `hot_prefix_cache` is
+    /// inference-thread state, freed on every model switch, so the guard reads this number
+    /// and never the pointer.
+    resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// The part of the above an eviction can prove it will return (residency minus the largest entry).
+    reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats
+    /// before each prefill batch while this is armed and settles as the ceiling recovers.
+    budget_revise_sw: ?io_util.Stopwatch = null,
+
+    /// Per-entry digest snapshot the connection-thread guard reads instead of the cache.
+    /// Replaced under `digest_mu` by the inference thread; readers copy under the lock.
+    hot_cache_digests: []prefix_cache_mod.HotPrefixCache.EntryDigest = &.{},
+    /// The residency the digests describe, published in the same critical section.
+    digest_residency: u64 = 0,
+    digest_mu: std.Io.Mutex = .init,
 
     max_concurrent: u32,
     /// Phase A7 test hook: when true, `runDecodeTick` forces the batched
@@ -1052,6 +1413,9 @@ pub const Scheduler = struct {
     /// prompt-token counters and prefill-time histograms only advance when the
     /// request finishes. Written per prefill CHUNK, read by the gauge sampler.
     inflight_prefill_tokens: std.atomic.Value(u64),
+    /// Post-cache tail the in-flight prefill will forward, same scale as
+    /// `inflight_prefill_tokens`; 0 when none is running.
+    inflight_prefill_expected: std.atomic.Value(u64),
     /// Number of slots currently inside `runPrefill`. Set on entry, cleared on
     /// every exit — so the panel can say "prefilling" IMMEDIATELY, rather than
     /// waiting for the first 8192-token chunk to land (~40 s on a 27B). Also
@@ -1067,7 +1431,7 @@ pub const Scheduler = struct {
     submit_cond: std.Io.Condition,
     /// Signaled when a persistent engine session (llama) is released in
     /// `complete()`, waking a `submit()` blocked waiting to claim it. Guarded by
-    /// `queue_mu` together with `LoadedModel.llama_session_busy`.
+    /// `queue_mu` together with `LoadedModel.session_busy`.
     session_cond: std.Io.Condition,
 
     inference_thread: ?std.Thread,
@@ -1124,21 +1488,27 @@ pub const Scheduler = struct {
             .gguf_ctx_size = params.ctx_size,
             .prefix_cache_capacity = params.prefix_cache_capacity,
             .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
+            .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
             .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
             .ssm_checkpoint_max = params.ssm_checkpoint_max,
             .mtp_enabled = params.mtp_enabled,
+            .mtp_head_kv_quant = params.mtp_head_kv_quant,
             .mtp_depth = params.mtp_depth,
             .llama_cache_entries = params.llama_cache_entries,
             .llama_kv_type_k = params.llama_kv_type_k,
             .llama_kv_type_v = params.llama_kv_type_v,
-            // Initial borrowed-view refs point at the (heap-allocated) CPU
-            // state carried on LoadParams; once the inference thread
-            // installs them on `entry`, the views still resolve to the
-            // same addresses (we store pointers, so the moves are no-ops).
-            .config = params.config,
-            .tok = params.tok,
-            .chat_config = params.chat_config,
+            .ds4_mtp = params.ds4_mtp,
+            .ds4_dspark = params.ds4_dspark,
+            .ds4_ssd_streaming = params.ds4_ssd_streaming,
+            .ane_prefill = params.ane_prefill,
+            .ane_chunk_resolver = params.ane_chunk_resolver,
+            .ane_headroom_resolver = params.ane_headroom_resolver,
+            .no_drafter = params.no_drafter,
+            .drafter_dir = params.drafter_dir,
+            .primary_model_dir = params.model_dir,
+            .draft_block_size = params.draft_block_size,
+            .draft_block_size_explicit = params.draft_block_size_explicit,
             .drafter_path = params.drafter_dir,
             .hot_prefix_cache = null,
             .max_concurrent = cap,
@@ -1156,6 +1526,7 @@ pub const Scheduler = struct {
             .metrics = params.metrics,
             .inflight_generated_tokens = std.atomic.Value(u64).init(0),
             .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
+            .inflight_prefill_expected = std.atomic.Value(u64).init(0),
             .requests_prefilling = std.atomic.Value(u64).init(0),
             .in_flight = 0,
             .queue_cap = cap + 32,
@@ -1202,6 +1573,12 @@ pub const Scheduler = struct {
         self.queue_mu.unlock(self.io);
 
         if (self.inference_thread) |t| t.join();
+
+        // Freed below the join: the publisher is gone, so this is the last writer.
+        if (self.hot_cache_digests.len > 0) {
+            self.allocator.free(self.hot_cache_digests);
+            self.hot_cache_digests = &.{};
+        }
 
         // Drain any leftover slots — should be empty if all conn threads
         // called `complete` properly, but defensive. Inference thread has
@@ -1286,7 +1663,11 @@ pub const Scheduler = struct {
         self.weights = null;
         self.vision_encoder = null;
         self.drafter = null;
+        self.dflash = null;
         self.hot_prefix_cache = null;
+        self.resident_hot_cache_bytes.store(0, .monotonic);
+        if (hot_cache_budget_invalidate) |f| f();
+        self.reclaimable_hot_cache_bytes.store(0, .monotonic);
         if (self.load_error_name) |n| self.allocator.free(n);
 
         self.allocator.destroy(self);
@@ -1299,7 +1680,6 @@ pub const Scheduler = struct {
         // Construct the slot up front so we don't hold the queue mutex
         // through any allocation. Per-request `kv_quant_config` override (Wave
         // 1.A) wins over the process-level default carried on the scheduler.
-        const eff_kv_quant = params.kv_quant_config orelse self.kv_quant_config;
         // Phase D fix: use the slot's target-model config (not the
         // scheduler's startup-model config) so per-slot state allocation
         // (KVCache shape, SSM entries) matches the model that will
@@ -1307,6 +1687,7 @@ pub const Scheduler = struct {
         // different architectures (e.g. pure-attention + hybrid SSM)
         // share one scheduler.
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
+        const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;
         const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
         errdefer slot.deinit();
 
@@ -1318,27 +1699,27 @@ pub const Scheduler = struct {
         }
         if (self.shutdown.load(.acquire)) return error.Shutdown;
 
-        // Persistent-session engines (llama) reuse one KV context across
+        // Persistent-session engines (llama, ds4) reuse one KV context across
         // requests, so only one request may drive it at a time. Block here until
         // the model's session is free, then claim it (released in `complete`).
-        // ds4 keeps a per-slot session, so it isn't gated. This serializes
-        // concurrent llama requests (v1 scope) without spinning the inference
-        // thread, and lets the next request reuse the previous one's prompt KV.
-        if (params.model.llama_engine != null) {
-            while (params.model.llama_session_busy and !self.shutdown.load(.acquire)) {
+        // This serializes concurrent embedded-engine requests without spinning
+        // the inference thread, and lets the next request reuse the previous
+        // one's prompt KV.
+        if (params.model.llama_engine != null or params.model.ds4_engine != null) {
+            while (params.model.session_busy and !self.shutdown.load(.acquire)) {
                 self.session_cond.waitUncancelable(self.io, &self.queue_mu);
             }
             if (self.shutdown.load(.acquire)) return error.Shutdown;
-            params.model.llama_session_busy = true;
-            slot.llama_holds_session = true;
+            params.model.session_busy = true;
+            slot.holds_session = true;
         }
 
         self.pending.append(self.allocator, slot) catch |err| {
             // Release the session claim before bubbling the error — the caller
             // never gets the slot, so `complete` won't run for it.
-            if (slot.llama_holds_session) {
-                params.model.llama_session_busy = false;
-                slot.llama_holds_session = false;
+            if (slot.holds_session) {
+                params.model.session_busy = false;
+                slot.holds_session = false;
                 self.session_cond.broadcast(self.io);
             }
             return err;
@@ -1389,9 +1770,9 @@ pub const Scheduler = struct {
         // the next queued llama request can claim it AND reuse the KV prefix the
         // session now holds. Done before enqueueing cleanup so a waiting
         // submitter can proceed immediately.
-        if (slot.llama_holds_session) {
-            slot.model.llama_session_busy = false;
-            slot.llama_holds_session = false;
+        if (slot.holds_session) {
+            slot.model.session_busy = false;
+            slot.holds_session = false;
             self.session_cond.broadcast(self.io);
         }
 
@@ -1424,6 +1805,24 @@ pub const Scheduler = struct {
         for (self.decoding.items) |slot| slot.cancel();
     }
 
+    /// The media residency bill for an entry, or 0 when it is not a media
+    /// model. The backend type must come from the DIRECTORY, never from the
+    /// entry's stub config, whose `model_type` is the MODALITY static
+    /// ("AudioVideo" for every video backend) and would bill the sum.
+    /// `arch_hint` is discovery's own read of config.json — the same authority
+    /// `gen.peekModelType` is — so it is used when present and the peek is the
+    /// fallback for an entry registered without one.
+    fn mediaPeakFor(self: *Scheduler, entry: *LoadedModel) u64 {
+        if (entry.arch_hint.len > 0) {
+            if (gen_mod.modalityFromType(entry.arch_hint) == null) return 0;
+            return gen_mod.estimatePeakResidentBytes(self.io, entry.path, entry.arch_hint);
+        }
+        const peeked = gen_mod.peekModelType(self.io, self.allocator, entry.path) orelse return 0;
+        defer self.allocator.free(peeked);
+        if (gen_mod.modalityFromType(peeked) == null) return 0;
+        return gen_mod.estimatePeakResidentBytes(self.io, entry.path, peeked);
+    }
+
     /// Plan 05 Phase D: resolve `id_or_empty` ("" / "mlx-serve" → default)
     /// to a refcounted, ready `*LoadedModel`. Cold-loads on demand: if the
     /// entry is `.unloaded`, parses CPU state, picks an LRU victim if
@@ -1436,6 +1835,8 @@ pub const Scheduler = struct {
     ///   error.UnknownModelId    — id isn't in the registry.
     ///   error.NoDefaultModel    — id empty AND no default set.
     ///   error.NotEnoughMemory   — would exceed caps and no LRU victim.
+    ///   error.InsufficientMemory — memory preflight refused the load (free
+    ///                             RAM can't hold weights + headroom).
     ///   error.LoadFailed        — inference thread reported a load failure.
     ///   error.Shutdown          — scheduler is shutting down.
     pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
@@ -1458,7 +1859,8 @@ pub const Scheduler = struct {
         // entry `.error_state` so /v1/models surfaces the failure (and
         // future ensureLoaded calls fail fast instead of re-tripping the
         // same parse error). FileNotFound / parse errors land here.
-        const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, self.gguf_ctx_size) catch |err| {
+        const settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
+        const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, settings.ctx_size orelse self.gguf_ctx_size) catch |err| {
             self.registry.mutex.lockUncancelable(self.io);
             self.registry.markErrorLocked(entry, @errorName(err));
             self.registry.mutex.unlock(self.io);
@@ -1470,6 +1872,7 @@ pub const Scheduler = struct {
         var owned = cpu_state;
         var owned_active: bool = true;
         defer if (owned_active) freeCpuState(self.allocator, &owned);
+        applyModelSettings(owned.config, settings);
         // The resolved .gguf path (when this is a GGUF entry) is borrowed by
         // the LoadRequest until `done`; the engines dupe what they keep, so
         // it's released here on success AND failure.
@@ -1480,6 +1883,10 @@ pub const Scheduler = struct {
         // slice handed to the LoadRequest stays valid while we block on `done`.
         var victims_buf: [16]*LoadedModel = undefined;
         var n_victims: usize = 0;
+
+        // Peeked OUTSIDE the registry mutex — it stats the model dir, and no
+        // other load should block on our filesystem.
+        const media_peak = self.mediaPeakFor(entry);
 
         // ── Stage 1 (registry mutex): claim .loading, plan eviction.
         {
@@ -1499,8 +1906,9 @@ pub const Scheduler = struct {
                         continue :wait_loop;
                     },
                     .error_state => {
+                        const load_err = ModelRegistry.loadErrorFromName(entry.error_name);
                         self.registry.mutex.unlock(self.io);
-                        return error.LoadFailed;
+                        return load_err;
                     },
                     .unloaded => break :wait_loop,
                 }
@@ -1509,17 +1917,9 @@ pub const Scheduler = struct {
             // Claim the slot.
             std.debug.assert(self.registry.tryBeginLoadLocked(entry));
 
-            // Estimate post-load bytes. We use the same estimator
-            // `doLoadOnInferenceThread` does (entry.bytes_on_disk; else a
-            // layers × hidden fallback). Adds 10% headroom for KV / vision
-            // / drafter overhead — close enough for the eviction gate.
-            const estimated: u64 = blk: {
-                const base: u64 = if (entry.bytes_on_disk) |b|
-                    b
-                else
-                    @as(u64, owned.config.num_hidden_layers) * @as(u64, owned.config.hidden_size) * 4 * 4;
-                break :blk base + base / 10;
-            };
+            // Estimate post-load bytes (see `gateEstimateBytes` for why a media
+            // entry cannot be billed by its directory's size).
+            const estimated: u64 = gateEstimateBytes(media_peak, entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
 
             // Reserve this load's estimate BEFORE planning eviction, so a
             // concurrent loader sees the pending allocation in its own gate.
@@ -1533,6 +1933,18 @@ pub const Scheduler = struct {
             // by an in-flight request — roll back and surface a 503 instead of
             // loading anyway and crashing.
             const n = self.registry.planEvictionsLocked(entry.id, &victims_buf) orelse {
+                // Name the numbers. A refusal that logs NOTHING sends the user
+                // hunting for a concurrent request that does not exist: on an
+                // idle server the cause is always the static cap (#126), and
+                // the flag that moves it is not otherwise discoverable.
+                const gb = 1024.0 * 1024.0 * 1024.0;
+                log.err("Refusing to load {s}: needs ~{d:.2} GB but --max-resident-mem is {d:.2} GB ({d:.2} GB already resident across {d} model(s), none evictable). Raise or disable the cap with --max-resident-mem <size>|0.\n", .{
+                    entry.id,
+                    @as(f64, @floatFromInt(estimated)) / gb,
+                    @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
+                    @as(f64, @floatFromInt(self.registry.current_resident_bytes)) / gb,
+                    self.registry.countLoadedLocked(),
+                });
                 self.registry.markUnloadedLocked(entry); // releases the reservation
                 self.registry.mutex.unlock(self.io);
                 return error.NotEnoughMemory;
@@ -1550,17 +1962,21 @@ pub const Scheduler = struct {
             .tok = owned.tok,
             .chat_config = owned.chat_config,
             .model_dir = entry.path,
-            .drafter_dir = "", // Phase E will wire the load-model API to set this.
+            // `--no-drafter` / `--drafter` / `--draft-block-size` reach cold
+            // loads too; the path itself is scoped by `coldLoadDrafterDir`.
+            .drafter_dir = coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
+            .no_drafter = self.no_drafter,
             .load_vision = coldLoadVision(owned.config.has_vision),
             .warmup_eager = true,
-            .draft_block_size = drafter_mod.DEFAULT_BLOCK_SIZE,
-            .draft_block_size_explicit = false,
+            .draft_block_size = self.draft_block_size,
+            .draft_block_size_explicit = self.draft_block_size_explicit,
             .kv_quant_config = self.kv_quant_config,
             // Cold loads get the SAME prefix-cache configuration as the
             // startup model — pre-plumbing these were (1, 0, stride 0),
             // which silently degraded warm reuse after every model switch.
             .prefix_cache_capacity = self.prefix_cache_capacity,
             .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
+            .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
             .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
@@ -1570,10 +1986,17 @@ pub const Scheduler = struct {
             // --llama-cache-entries / --llama-kv-quant were silently dropped
             // on every on-demand load and model switch.
             .mtp_enabled = self.mtp_enabled,
+            .mtp_head_kv_quant = self.mtp_head_kv_quant,
             .mtp_depth = self.mtp_depth,
             .llama_cache_entries = self.llama_cache_entries,
             .llama_kv_type_k = self.llama_kv_type_k,
             .llama_kv_type_v = self.llama_kv_type_v,
+            .ds4_mtp = self.ds4_mtp,
+            .ds4_dspark = self.ds4_dspark,
+            .ds4_ssd_streaming = self.ds4_ssd_streaming,
+            .ane_prefill = self.ane_prefill,
+            .ane_chunk_resolver = self.ane_chunk_resolver,
+            .ane_headroom_resolver = self.ane_headroom_resolver,
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
@@ -1599,10 +2022,13 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
 
         if (req.error_name) |name| {
-            self.allocator.free(name);
+            // The failure crosses the thread boundary by NAME — map it back
+            // to a typed error so a memory-preflight refusal surfaces as a
+            // named 503, not the generic "Model load failed" 500 (#144).
+            defer self.allocator.free(name);
             // On success the inference thread took ownership of cpu_state;
             // on failure it didn't, so we still hold it.
-            return error.LoadFailed;
+            return ModelRegistry.loadErrorFromName(name);
         }
 
         // Success — inference thread installed cpu_state onto the entry.
@@ -1621,6 +2047,19 @@ pub const Scheduler = struct {
     /// under registry.mutex.
     pub fn release(self: *Scheduler, lm: *LoadedModel) void {
         self.registry.release(lm);
+    }
+
+    /// `release` for a status read — same refcount protocol, no recency
+    /// stamp. See `ModelRegistry.releaseStatus`.
+    pub fn releaseStatus(self: *Scheduler, lm: *LoadedModel) void {
+        self.registry.releaseStatus(lm);
+    }
+
+    /// Duped stored failure name for the id `ensureLoaded` just refused with
+    /// `error.LoadFailed` — feeds the "Model load failed: <name>" HTTP
+    /// message (#144). Caller frees.
+    pub fn loadErrorName(self: *Scheduler, alloc: std.mem.Allocator, id_or_empty: []const u8) ?[]u8 {
+        return self.registry.loadErrorNameDupe(alloc, id_or_empty);
     }
 
     /// Run a media-generation job on the inference thread. Posts `req` to the
@@ -1646,6 +2085,17 @@ pub const Scheduler = struct {
     /// requests (refcount → 0), then hands the mlx free to the inference
     /// thread (stream-bound). Blocks until the free completes.
     pub fn unloadModel(self: *Scheduler, id_or_empty: []const u8) !void {
+        return self.unloadModelIfIdle(id_or_empty, null);
+    }
+
+    /// `unloadModel` with an optional idle precondition, re-checked under the
+    /// registry mutex at the moment we commit.
+    ///
+    /// The sweep picks a victim, drops the mutex, then calls in, so a request
+    /// can arrive in that gap: refcount and age are re-checked under the mutex
+    /// before committing. (`planEvictionsLocked` picks and marks under one
+    /// hold instead; the sweep cannot, because the unload itself is slow.)
+    pub fn unloadModelIfIdle(self: *Scheduler, id_or_empty: []const u8, idle_window_ms: ?i64) !void {
         const entry = try self.registry.resolveEntry(id_or_empty);
         {
             self.registry.mutex.lockUncancelable(self.io);
@@ -1663,6 +2113,13 @@ pub const Scheduler = struct {
                         continue :wait;
                     },
                     .ready => break :wait,
+                }
+            }
+            if (idle_window_ms) |window_ms| {
+                const now_ms = io_util.nowMsMonotonic(self.io);
+                if (!model_registry_mod.ModelRegistry.idleEvictable(entry, now_ms, window_ms)) {
+                    self.registry.mutex.unlock(self.io);
+                    return;
                 }
             }
             self.registry.markEvictingLocked(entry);
@@ -1739,6 +2196,49 @@ pub const Scheduler = struct {
         return req.result orelse error.VisionEncodeFailed;
     }
 
+    /// Does this slot's next decode tick actually run the regular (non-speculative)
+    /// path? The slot's `enable_*` flags carry the REQUEST's wish; `specTickMode` is
+    /// the authoritative dispatch answer, and a generator can also have turned spec
+    /// off at runtime. Reading the armed flags here vetoed batched decode for any
+    /// slot whose prompt merely n-gram-scored high enough to ARM PLD, even after
+    /// PLD's own yield gate had disabled itself — neither speculation nor batching
+    /// (measured 2.4x on concurrent GDN decode). Same class as "a guard that shapes
+    /// INIT options does not bind DISPATCH".
+    fn slotTicksRegular(slot: *const Slot) bool {
+        if (Planner.enabled() and slot.planner_force_plain) return true;
+        const gen = if (slot.legacy_gen) |*g| g else return !(slot.enable_pld or slot.enable_drafter or slot.enable_mtp);
+        // A runtime-disabled generator is already ticking regular, so batching it
+        // dispatches what it was going to dispatch anyway.
+        //
+        // The POLICY this encodes, which is deliberate and not free: `nextPld`'s
+        // periodic re-enable check (`SPEC_REENABLE_INTERVAL`) lives on the serial
+        // path, and the batched tick never calls it. So a slot whose PLD yield
+        // gate disabled itself stays disabled for as long as it keeps company —
+        // even if its tail later turns into the file/tool echo PLD is best at.
+        // That is the right trade at N>1 (the batched kernel reads the weight set
+        // once for the whole group, which beats one slot's lookup wins) and it
+        // self-corrects: a SOLO slot never reaches the batched path, so the
+        // re-enable check resumes the moment concurrency drops back to one.
+        // Pinned by `a spec_disabled_runtime slot is batchable, and that is the
+        // documented trade` below — flip either half deliberately, not by accident.
+        return gen.spec_disabled_runtime or specTickMode(
+            slot.enable_mtp,
+            gen.mtp != null,
+            slot.enable_drafter,
+            gen.drafter != null,
+            gen.dflash != null,
+            slot.enable_pld,
+            gen.pld_enabled,
+            gen.dspark_enabled,
+        ) == .regular;
+    }
+
+    /// Does this slot owe a module-head release? One single-slot tick lands it.
+    fn slotReleasePending(slot: *const Slot) bool {
+        const gen = if (slot.legacy_gen) |*g| g else return false;
+        return gen.mtpReleasePending();
+    }
+
     /// Active-tick gate. Decides whether a slot is eligible for the batched
     /// decode kernel. Hybrid SSM / MoE / encoder / DSV4 models can't ride
     /// the batched kernel (it doesn't model their state), so any slot
@@ -1746,18 +2246,141 @@ pub const Scheduler = struct {
     /// D: the gate reads off the slot's own model config — multi-model
     /// means the scheduler's startup config is no longer authoritative.
     fn batchable(self: *const Scheduler, slot: *const Slot) bool {
+        return self.batchVerdict(slot) == .ok;
+    }
+
+    /// Why a slot does or does not ride the batched kernel. `.ok` batches; every
+    /// other arm decodes serial this tick and is what the `[batched] serial` line
+    /// and `decode_serial_total{reason}` name.
+    fn batchVerdict(self: *const Scheduler, slot: *const Slot) BatchVerdict {
         _ = self;
-        if (slot.enable_pld or slot.enable_drafter or slot.enable_mtp) return false;
-        if (slot.sampling.constraint != null) return false;
-        if (slot.logprobs_n > 0) return false;
+        if (!slotTicksRegular(slot)) return .spec_active;
+        // A slot whose module-head release is armed but not landed still holds the head.
+        if (slotReleasePending(slot)) return .head_release_pending;
+        if (slot.sampling.constraint != null) return .grammar;
+        if (slot.logprobs_n > 0) return .logprobs;
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
         // always fall through to the per-slot decode path (which dispatches
         // into the engine).
-        if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
-        const cfg = slot.model.config orelse return false;
-        return modelBatchable(cfg);
+        if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return .embedded_engine;
+        const cfg = slot.model.config orelse return .arch;
+        if (modelBatchable(cfg)) return .ok;
+        // A GatedDeltaNet trunk is rejected by the pure-config predicate (it is
+        // a hybrid), but has its own batched kernel. Ask the transformer, never
+        // name the arch here — same rule as `modelExclusiveDecode`.
+        const t = slot.model.transformer orelse return .arch;
+        return if (t.supportsBatchedGdnDecode()) .ok else .arch;
     }
 };
+
+/// Slots one batched forward can carry; the tail decodes serial this tick.
+pub const MAX_BATCH_GROUP = 32;
+
+pub const BatchVerdict = enum {
+    ok,
+    spec_active,
+    head_release_pending,
+    grammar,
+    logprobs,
+    embedded_engine,
+    arch,
+    pad_waste,
+};
+
+/// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
+/// shared with `/props`, `/v1/models` and the serve-mode startup line.
+pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
+    return modelBatchable(cfg) or cfg.supportsBatchedGdnDecode();
+}
+
+/// One line per slot the first time it decodes serial beside live company;
+/// the counter moves every tick so the rate is visible under `--metrics`.
+fn noteSerial(sch: *Scheduler, slot: *Slot, why: BatchVerdict) void {
+    if (sch.metrics) |m| m.decode_serial_total[@backingInt(why)].inc();
+    if (slot.serial_reason_logged) return;
+    slot.serial_reason_logged = true;
+    log.info("[batched] slot serial: {s} (model={s})\n", .{ @tagName(why), slot.model.id });
+}
+
+/// Batched decode pads every slot's KV to the group's LONGEST (`padAndStackBatchedKV`),
+/// so the tensor it builds is `N x kv_max`, not `sum(kv_len)`. A group mixing one
+/// 100k-token stream with three 1k ones therefore materializes ~100x the bytes the
+/// short slots need — on a qwen3_5 trunk (hd 256, `--ctx-size` up to 262144) that is
+/// ~410 MB per full-attention layer, ~6.5 GB across the 16 of them, and NOTHING bills
+/// it: it is a per-tick transient, invisible to `prefillTransientReserve` and to the
+/// load-time gate. An uncatchable Metal OOM is the failure mode.
+///
+/// So the group is capped by PADDING WASTE, which is the quantity that actually hurts,
+/// rather than by a length ratio: keep the largest prefix of the ascending-sorted
+/// lengths whose padded tensor stays within `MAX_PAD_WASTE` of its useful bytes. The
+/// slots that fall out are the LONGEST ones — the ones dominating kv_max — and they
+/// decode serially this tick, so every slot still advances.
+///
+/// Returns how many of `kv_lens_asc` may batch together (0 or 1 = nobody batches).
+/// The lengths are the arch's true attention KV length (`batchKvLenOf`), pre-tick counts,
+/// so this is a heuristic bar on the padding the forward will build, not an accounting identity.
+/// The padded tensor may be at most this multiple of the bytes the group
+/// actually needs. It must stay BELOW 2.0 or a two-slot group can never be
+/// vetoed: one 1-token slot beside one 200k slot pads to exactly 2x, which is
+/// the worst case for N=2 and the pathological pair this cap exists for.
+pub const MAX_PAD_WASTE: f64 = 1.5;
+
+var kv_skew_split_logged: bool = false; // one-shot log guard
+
+pub fn batchedKvKeepCount(kv_lens_asc: []const u32) usize {
+    if (kv_lens_asc.len < 2) return 0;
+    var k: usize = kv_lens_asc.len;
+    while (k >= 2) : (k -= 1) {
+        var sum: u64 = 0;
+        for (kv_lens_asc[0..k]) |l| sum += l;
+        if (sum == 0) return k; // nothing prefilled yet: no padding to waste
+        const padded: f64 = @floatFromInt(@as(u64, k) * kv_lens_asc[k - 1]);
+        if (padded <= MAX_PAD_WASTE * @as(f64, @floatFromInt(sum))) return k;
+    }
+    return 0;
+}
+
+/// The padding waste the whole group would pay; reported by the cap's log.
+pub fn batchedPadWaste(kv_lens_asc: []const u32) f64 {
+    var sum: u64 = 0;
+    for (kv_lens_asc) |l| sum += l;
+    if (sum == 0 or kv_lens_asc.len == 0) return 1.0;
+    const padded: f64 = @floatFromInt(@as(u64, kv_lens_asc.len) * kv_lens_asc[kv_lens_asc.len - 1]);
+    return padded / @as(f64, @floatFromInt(sum));
+}
+
+/// One source for the length the batched group is sorted and capped by. `cache.step`
+/// advances only on global layer 0, so on a linear-layer-0 trunk (GDN, gated-conv, Mamba2,
+/// KDA) it is 0 forever and the pad-waste cap never fired. `KVCache.kvLenForBatching` reads
+/// the first attention layer's own offset there.
+pub fn batchKvLenOf(cache: *const KVCache, cfg: ?*const model_mod.ModelConfig) u32 {
+    return batchKvLenOfWith(cache, cfg, 1, false);
+}
+
+pub fn batchKvLenOfWith(cache: *const KVCache, cfg: ?*const model_mod.ModelConfig, seq_len: c_int, any_mrope: bool) u32 {
+    // Arch gate: the multi-stream batched wins on the 27B were measured with the cap dead,
+    // so every other arch keeps `cache.step` (and the dead cap) pending a measurement.
+    const c = cfg orelse return @intCast(cache.step);
+    if (!c.longCtxGated()) return @intCast(cache.step);
+    const raw: u32 = @intCast(cache.kvLenForBatching());
+    const gather_on = transformer_mod.qsaBatchedGatherOn(seq_len, any_mrope);
+    const min_kv: u32 = @intCast(transformer_mod.qsaBatchedGatherFloor(seq_len, cache.config.scheme == .affine));
+    return c.batchedEffectiveKvLen(raw, gather_on, min_kv);
+}
+
+pub fn fillGroupPadWasteKvLens(
+    caches: []const *const KVCache,
+    cfg: ?*const model_mod.ModelConfig,
+    seq_len: c_int,
+    mrope: []const bool,
+    out: []u32,
+) void {
+    var any_mrope = false;
+    for (mrope) |m| if (m) {
+        any_mrope = true;
+    };
+    for (caches, 0..) |c, i| out[i] = batchKvLenOfWith(c, cfg, seq_len, any_mrope);
+}
 
 /// Pure-config predicate: is this model's architecture compatible with the
 /// batched-decode kernel? Used by `Scheduler.batchable` after slot-level
@@ -1771,6 +2394,79 @@ pub fn modelBatchable(cfg: *const model_mod.ModelConfig) bool {
     // Block diffusion denoises whole canvases — no per-token batched decode.
     if (cfg.isDiffusion()) return false;
     return true;
+}
+
+/// A model whose per-request decode state is MODULE-OWNED (one per model,
+/// not per slot) — at most ONE in-flight request may touch it. dsv4 today:
+/// `Dsv4Model.dec_state` is rebuilt at cache.step==0 and advanced by every
+/// decode tick, so a second interleaved slot deinit+rebuilds the active
+/// request's state and both then append tokens to the ONE state (live
+/// 2026-08-02: an app chat leaked into a pi stream, every word doubled).
+/// Serial-tick interleave stays safe for per-slot-state archs (laguna/hy3)
+/// — ask the transformer which archs own their decode state, NEVER key on
+/// !modelBatchable, and never name ONE arch here: when a second module-owned
+/// arch arrived, this function's hardcoded `dsv4` check silently never
+/// reached the gate for it.
+fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
+    const t = model.transformer orelse return false;
+    return t.ownsModuleDecodeState();
+}
+
+/// Pure core of `slotExclusiveDecode`. `model_owns_state` (dsv4) wins outright and is never
+/// released; the head clause is qwen4_exp's per-model head, released for good once the
+/// adaptive switch moved the slot to serial (`Generator.mtpModuleHeadReleased`).
+pub fn headExclusiveFor(
+    model_owns_state: bool,
+    head_module_owned: bool,
+    slot_enable_mtp: bool,
+    head_released: bool,
+) bool {
+    if (model_owns_state) return true;
+    if (!head_module_owned or !slot_enable_mtp) return false;
+    return !head_released;
+}
+
+/// Per-SLOT exclusivity: the model's own bit, OR a slot that will drive a
+/// module-owned MTP head (qwen4: `Qwen4Mtp.cache` is one per model). Plain
+/// slots on the same model keep interleaving/batching beside it; two MTP
+/// slots serialize, until one of them releases the head.
+fn slotExclusiveDecode(slot: *const Slot) bool {
+    const head = slot.model.mtp;
+    return headExclusiveFor(
+        modelExclusiveDecode(slot.model),
+        if (head) |h| h.moduleOwned() else false,
+        slot.enable_mtp,
+        if (slot.legacy_gen) |*g| g.mtpModuleHeadReleased() else false,
+    );
+}
+
+/// One pending-drain candidate (or live decoding slot), reduced to what
+/// admission needs: an opaque model identity + the exclusive-decode bit.
+pub const AdmitCand = struct { model: usize, exclusive: bool };
+
+/// FIFO admission for one drain tick. An EXCLUSIVE candidate admits only if
+/// no EXCLUSIVE `active` slot (live decoding) holds its model and no earlier
+/// admitted exclusive candidate claimed it this tick
+/// (a same-tick sibling is not in `decoding` yet — the claim covers the
+/// window). Non-exclusive candidates always admit — no head-of-line
+/// blocking behind a held exclusive request. Writes admitted candidate
+/// indices to `out` (queue order preserved), returns the count. Held
+/// candidates stay where they are and retry next tick; no release
+/// bookkeeping exists — the busy signal IS presence in `decoding`.
+pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out: []usize) usize {
+    var n: usize = 0;
+    outer: for (cands, 0..) |c, i| {
+        if (n >= out.len) break;
+        if (c.exclusive) {
+            for (active) |a| if (a.exclusive and a.model == c.model) continue :outer;
+            for (out[0..n]) |j| {
+                if (cands[j].exclusive and cands[j].model == c.model) continue :outer;
+            }
+        }
+        out[n] = i;
+        n += 1;
+    }
+    return n;
 }
 
 const ThreadCtx = struct {
@@ -1787,7 +2483,6 @@ fn signalStarted(sch: *Scheduler) void {
     sch.started.store(true, .release);
     sch.started_cond.broadcast(sch.io);
 }
-
 /// Set the load_error_name + flip load_failed. Best-effort dupe; on OOM the
 /// parent still sees `load_failed=true` and surfaces "unknown".
 fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
@@ -1819,6 +2514,15 @@ const GgufRoute = struct {
     engine: gguf_meta.Engine,
 };
 
+/// Both load construction sites (here and main.zig's startup load) stamp the
+/// per-model settings onto the config the bills and defaults read.
+pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void {
+    config.ctx_override = o.ctx_size orelse 0;
+    config.kv_quant_override = o.kv_quant;
+    config.mtp_override = o.mtp;
+    config.mtp_acceptance_override = o.mtp_acceptance;
+}
+
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
 /// (CPU only — file I/O + parse, no mlx) ahead of posting a LoadRequest.
 /// Ownership transfers to the entry on successful load; on failure the
@@ -1839,8 +2543,8 @@ const CpuState = struct {
 ///
 /// Errdefer pattern: for each `try ... else error`, the `deinit` errdefer
 /// is registered AFTER the successful init so a downstream failure doesn't
-/// call deinit on uninitialized memory. ModelConfig has no allocator-owned
-/// fields, so `allocator.destroy` is sufficient there.
+/// call deinit on uninitialized memory. `ModelConfig.deinit` frees the config's
+/// one owned field; `allocator.destroy` alone would leak it.
 fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, gguf_ctx_size: u32) !CpuState {
     // GGUF first — mirrors `--model` routing in main.zig, where isGgufPath
     // is checked before any config.json read ("GGUF files bypass the MLX
@@ -1858,6 +2562,12 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     if (gen_mod.detectModality(io, allocator, model_dir)) |modality| {
         const stub = try gen_mod.buildStubCpuState(allocator, modality);
         return .{ .config = stub.config, .tok = stub.tok, .chat_config = stub.chat_config };
+    }
+    // A media-typed dir that FAILED its marker check must not fall through to
+    // the text path below: it would glob whatever safetensors are present and
+    // die on the first missing weight. Refuse by name instead (#144 flow).
+    if (gen_mod.incompleteMediaDir(io, allocator, model_dir)) {
+        return error.IncompleteMediaPack;
     }
 
     const config = try allocator.create(ModelConfig);
@@ -1903,6 +2613,7 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
 /// (on success the three pointers transfer to the entry, so this function
 /// is skipped, but the path must still be released).
 fn freeCpuState(allocator: std.mem.Allocator, s: *CpuState) void {
+    s.config.deinit(allocator);
     allocator.destroy(s.config);
     s.tok.deinit();
     allocator.destroy(s.tok);
@@ -2019,12 +2730,18 @@ const DS4_MTP_DRAFT_TOKENS: c_int = 4;
 const DS4_MTP_MARGIN: f32 = 3.0;
 const DS4_MTP_MAX_TOKENS: usize = 17;
 
-/// Whether a ds4 decode step should use MTP speculative decode: the engine
-/// loaded a draft head (`has_mtp`), it's configured for >1 draft token, and
-/// sampling is greedy (ds4's spec path is argmax-based — temp>0 falls back to
-/// the normal sampler). Pure + unit-tested; mirrors ds4's own CLI gate.
-fn ds4MtpShouldEngage(has_mtp: bool, draft_tokens: c_int, temperature: f32) bool {
-    return has_mtp and draft_tokens > 1 and temperature <= 0.0;
+/// Whether a ds4 decode step should use speculative decode: the engine
+/// reports >1 ready draft tokens and sampling is greedy (ds4's spec path is
+/// argmax-based — temp>0 falls back to the normal sampler). The draft count
+/// is the readiness signal for BOTH support kinds — legacy MTP reports its
+/// configured draft count only when `mtp_ready`, DSpark reports its block
+/// size only when `--dspark` armed the runtime — so a `has_mtp` conjunct
+/// (false for DSpark by design) would leave DSpark unreachable, the
+/// dispatch-hole class. Pure + unit-tested; mirrors ds4's own CLI gate.
+/// A support-GGUF draft (legacy MTP head, DSpark) verifies by argmax, so it
+/// serves greedy requests only; the in-checkpoint head has a sampled arm.
+fn ds4MtpShouldEngage(draft_tokens: c_int, temperature: f32, embedded: bool) bool {
+    return draft_tokens > 1 and (temperature <= 0.0 or embedded);
 }
 
 fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
@@ -2046,9 +2763,14 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
         .mtp_path = mtp_path,
         .mtp_draft_tokens = if (mtp_path != null) DS4_MTP_DRAFT_TOKENS else 0,
         .mtp_margin = DS4_MTP_MARGIN,
+        .dspark = params.ds4_dspark,
+        .embedded_mtp = params.ds4_mtp and !params.ds4_ssd_streaming and
+            arch_ds4.ggufDeclaresEmbeddedMtp(sch.io, sch.allocator, params.ds4_path),
     });
     errdefer engine.close();
-    log.info("[ds4] engine ready (EOS={d}, has_mtp={})\n", .{ engine.eosToken(), engine.hasMtp() });
+    // draft_tokens is the spec-readiness signal for BOTH support kinds
+    // (legacy MTP count, or DSpark block size when the runtime is armed).
+    log.info("[ds4] engine ready (EOS={d}, has_mtp={}, draft_tokens={d})\n", .{ engine.eosToken(), engine.hasMtp(), engine.mtpDraftTokens() });
 
     // Make sure the stub config knows about the engine's EOS token so the
     // streaming/non-streaming paths' EOS check fires correctly. addEosToken
@@ -2060,6 +2782,7 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     //    the MLX path's invariant about the per-ptr errdefers above).
     const entry = params.entry;
     entry.ds4_engine = engine;
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
@@ -2067,6 +2790,7 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.transformer = null;
     entry.vision_encoder = null;
     entry.drafter = null;
+    entry.dflash = null;
     entry.drafter_block_size = 0;
     entry.drafter_path = "";
     entry.prefix_cache = null;
@@ -2097,7 +2821,10 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.weights = null;
     sch.vision_encoder = null;
     sch.drafter = null;
+    sch.dflash = null;
     sch.hot_prefix_cache = null;
+    publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
 }
 
 /// llama.cpp load on the inference thread. Mirrors `doLoadDs4OnInferenceThread`:
@@ -2129,6 +2856,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     const entry = params.entry;
     entry.llama_engine = engine;
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
@@ -2136,6 +2864,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.transformer = null;
     entry.vision_encoder = null;
     entry.drafter = null;
+    entry.dflash = null;
     entry.drafter_block_size = 0;
     entry.drafter_path = "";
     entry.prefix_cache = null;
@@ -2171,7 +2900,50 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.weights = null;
     sch.vision_encoder = null;
     sch.drafter = null;
+    sch.dflash = null;
     sch.hot_prefix_cache = null;
+    publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
+}
+
+/// The post-load residency bill the eviction gate reserves, in bytes.
+///
+/// A media entry is billed by its BACKEND: a staged-residency model
+/// (`minimax_h3` runs its text encoder and FREES it before the DiT loads) never
+/// holds the sum of every safetensors in its directory. The gate runs BEFORE
+/// the media preflight that already knows this, so a disagreement here is a
+/// refusal the preflight never gets to overturn — H3's 37.55 GiB sum against a
+/// 48 GB Mac's 30.0 GiB auto cap made the model permanently unloadable while
+/// its real 22.83 GiB peak fit with 7 GB to spare (#126).
+///
+/// `media_peak == 0` means "not a media model, or a directory we could not
+/// read" and keeps the original ladder byte-for-byte: a text bill is weights
+/// only, so it takes 10% headroom for KV / vision / drafter overhead.
+///
+/// A media peak takes NONE. Those are text-model concepts — a media engine has
+/// no KV cache and no drafter — and `gen.estimatePeakResidentBytes` already
+/// carries an explicit transient term for the stage that generates. Stacking a
+/// second blanket margin on it billed H3's 8-bit pack ~27% over its measured
+/// peak, which is the difference between loading and not on a 48 GB Mac. It
+/// also makes the gate agree with `genLoadResidentBytes`, which has always
+/// committed the bare peak.
+pub fn gateEstimateBytes(media_peak: u64, bytes_on_disk: ?u64, num_hidden_layers: u32, hidden_size: u32) u64 {
+    if (media_peak > 0) return media_peak;
+    const base: u64 = if (bytes_on_disk) |b|
+        b
+    else
+        @as(u64, num_hidden_layers) * @as(u64, hidden_size) * 4 * 4;
+    return base + base / 10;
+}
+
+/// What a media load COMMITS to the residency budget once ready. Same estimator
+/// the gate reserved against, so reserve and commit can only differ by the
+/// gate's headroom: committing the dir sum instead parked H3 in the budget at
+/// 14.7 GB more than it can ever hold, evicting live LLMs for bytes nobody was
+/// using (#126, secondary 1).
+pub fn genLoadResidentBytes(media_peak: u64, bytes_on_disk: u64) u64 {
+    if (media_peak > 0) return media_peak;
+    return bytes_on_disk;
 }
 
 /// Media-gen load on the inference thread. Mirrors `doLoadDs4OnInferenceThread`:
@@ -2182,6 +2954,37 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mod.Modality) !void {
     log.info("[gen] loading {s} engine: {s}\n", .{ @tagName(modality), params.model_dir });
     const entry = params.entry;
+
+    // Media preflight, mirroring the MLX path's — a Metal OOM during engine
+    // build or the first generation is uncatchable, so refuse up front. The
+    // bill is per-BACKEND: a staged-residency model (minimax_h3 frees its text
+    // encoder before the DiT loads) is billed its true peak, not the sum of
+    // every safetensors in the dir, which refused loads that would have worked.
+    if (!skip_mem_preflight) {
+        // The stub config's model_type is a MODALITY static ("AudioVideo" for
+        // every video backend — the per-modality-vs-per-backend class), so the
+        // per-BACKEND residency estimate must re-peek the dir's actual type,
+        // the same authority the engine dispatch itself uses. Caught live:
+        // the H3 boot billed the 64.5 GB sum while claiming "staged".
+        const peeked = gen_mod.peekModelType(sch.io, sch.allocator, params.model_dir);
+        defer if (peeked) |p| sch.allocator.free(p);
+        const backend_type = peeked orelse params.config.model_type;
+        const peak = gen_mod.estimatePeakResidentBytes(sch.io, params.model_dir, backend_type);
+        const avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes());
+        const gb = 1024.0 * 1024.0 * 1024.0;
+        log.info("[preflight] media peak ~{d:.2} GB (staged residency), available {d:.2} GB\n", .{
+            @as(f64, @floatFromInt(peak)) / gb,
+            @as(f64, @floatFromInt(avail)) / gb,
+        });
+        if (memInsufficientForLoad(peak, avail)) {
+            log.err("Insufficient memory for this media model: needs ~{d:.1} GB free ({d:.1} GB for the model plus headroom for warmup buffers) but only {d:.1} GB is available. Unload the chat model or close other apps and retry; pass --skip-mem-preflight to override.\n", .{
+                @as(f64, @floatFromInt(loadRequirementBytes(peak))) / gb,
+                @as(f64, @floatFromInt(peak)) / gb,
+                @as(f64, @floatFromInt(avail)) / gb,
+            });
+            return error.InsufficientMemory;
+        }
+    }
 
     // Build the engine FIRST. On failure the engine's own errdefer cleans up
     // its partial state, the slot stays null, and the stub config (still owned
@@ -2195,6 +2998,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     }
 
     // Install stub CPU state (infallible from here, mirroring the ds4 path).
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
@@ -2202,15 +3006,29 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     entry.transformer = null;
     entry.vision_encoder = null;
     entry.drafter = null;
+    entry.dflash = null;
     entry.drafter_block_size = 0;
     entry.drafter_path = "";
     entry.prefix_cache = null;
 
+    // The SAME per-backend estimator the eviction gate reserved against — see
+    // `genLoadResidentBytes`. Peeked here rather than reused from the preflight
+    // block above because `--skip-mem-preflight` skips that block entirely, and
+    // the residency budget is not a preflight.
     const bytes_resident: u64 = blk: {
-        if (entry.bytes_on_disk) |b| {
-            if (b > 0) break :blk b;
-        }
-        break :blk gen_mod.estimateResidentBytes(sch.io, params.model_dir);
+        const peeked = gen_mod.peekModelType(sch.io, sch.allocator, params.model_dir);
+        defer if (peeked) |p| sch.allocator.free(p);
+        const media_peak: u64 = if (peeked) |p|
+            gen_mod.estimatePeakResidentBytes(sch.io, params.model_dir, p)
+        else
+            0;
+        const on_disk: u64 = on_disk_blk: {
+            if (entry.bytes_on_disk) |b| {
+                if (b > 0) break :on_disk_blk b;
+            }
+            break :on_disk_blk gen_mod.estimateResidentBytes(sch.io, params.model_dir);
+        };
+        break :blk genLoadResidentBytes(media_peak, on_disk);
     };
 
     sch.registry.mutex.lockUncancelable(sch.io);
@@ -2222,24 +3040,82 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     sch.weights = null;
     sch.vision_encoder = null;
     sch.drafter = null;
+    sch.dflash = null;
     sch.hot_prefix_cache = null;
+    publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
 }
 
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
 /// by the load pre-flight. Returns 0 if the dir can't be read (treated as
-/// "unknown" by the caller, which then skips the check).
+/// "unknown" by the caller, which then skips the check). Symlinked weights
+/// count (statFile follows links) — an HF hub-cache snapshot is ALL symlinks.
 fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
+    // A pack's index names the shards the loader reads; a stray shard beside
+    // them (issue #274) is dead weight and must not be billed.
+    var referenced: ?std.StringHashMapUnmanaged(void) = model_discovery.indexShardSet(io, dir);
+    defer if (referenced) |*r| model_discovery.freeShardSet(r);
     var it = dir.iterate();
     var total: u64 = 0;
     while (it.next(io) catch null) |entry| {
-        if (entry.kind != .file) continue;
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (referenced) |r| if (!r.contains(entry.name)) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind != .file) continue;
         total += @intCast(st.size);
     }
     return total;
+}
+
+test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
+    // A model served straight out of the HuggingFace hub cache is a snapshot
+    // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
+    // 121 GB checkpoint at 0 bytes, and memInsufficientForLoad treats 0 as
+    // "unknown" → the preflight waved the load through into 34 GB of swap.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "blobs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/abc123", .data = "0123456789abcdef" });
+    try tmp.dir.createDirPath(io, "snapshots/rev");
+    try tmp.dir.symLink(io, "../../blobs/abc123", "snapshots/rev/model.safetensors", .{});
+    // A dangling link (blob pruned) is skipped, never an error…
+    try tmp.dir.symLink(io, "../../blobs/gone", "snapshots/rev/model-00002.safetensors", .{});
+    // …and a symlink to a DIRECTORY must not be summed (statFile follows it).
+    try tmp.dir.symLink(io, "../../blobs", "snapshots/rev/dir.safetensors", .{});
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const snap = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/snapshots/rev", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(snap);
+
+    try std.testing.expectEqual(@as(u64, 16), modelDiskBytes(io, snap));
+}
+
+test "modelDiskBytes bills only the shards the index names (issue #274)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model-00001-of-00002.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model-00002-of-00002.safetensors", .data = "01234" });
+    // Dead weight: present on disk, referenced by nothing.
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/stray.safetensors", .data = "0123456789abcdef0123456789abcdef" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model.safetensors.index.json", .data =
+        \\{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors","c":"model-00001-of-00002.safetensors"}}
+    });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/m", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(dir);
+    try std.testing.expectEqual(@as(u64, 15), modelDiskBytes(io, dir));
 }
 
 /// Pure: would loading `weights_bytes` of model with `avail_bytes` free RAM risk
@@ -2264,9 +3140,96 @@ pub var skip_mem_preflight: bool = false;
 /// hardcode `load_vision = config.has_vision` and silently ignore the flag.
 pub var no_vision_global: bool = false;
 
+/// Which drafter directory a COLD load should use.
+///
+/// `--no-drafter` is a policy — it silences every model, including one whose
+/// own dir ships a sidecar `dflash.resolveInDirDrafter` would otherwise find.
+/// `--drafter <path>`, by contrast, names a sidecar for the checkpoint it was
+/// passed beside: handing it to whatever model is swapped in next would load a
+/// mismatched assistant, so it applies only when the entry being loaded IS the
+/// launch model (which happens on a reload after eviction). Every other model
+/// is served by the in-dir probe.
+pub fn coldLoadDrafterDir(
+    no_drafter: bool,
+    primary_model_dir: []const u8,
+    drafter_dir: []const u8,
+    entry_path: []const u8,
+) []const u8 {
+    if (no_drafter) return "";
+    if (drafter_dir.len == 0) return "";
+    if (!std.mem.eql(u8, primary_model_dir, entry_path)) return "";
+    return drafter_dir;
+}
+
 /// Should a cold load bring up the checkpoint's vision tower?
 pub fn coldLoadVision(has_vision: bool) bool {
     return has_vision and !no_vision_global;
+}
+
+test "coldLoadDrafterDir: --no-drafter wins, an explicit --drafter belongs to its OWN model" {
+    // `--drafter <path>` names a sidecar for the checkpoint it was passed
+    // with; handing it to whatever model gets swapped in next would load a
+    // mismatched assistant. Other models are served by the in-dir probe.
+    // Reloading the launch model AFTER an eviction must still get it back.
+    try testing.expectEqualStrings("/d", coldLoadDrafterDir(false, "/m", "/d", "/m"));
+    try testing.expectEqualStrings("", coldLoadDrafterDir(false, "/m", "/d", "/other"));
+    // --no-drafter is a policy, not a path: it silences every model, including
+    // one whose own dir ships a sidecar the in-dir probe would find.
+    try testing.expectEqualStrings("", coldLoadDrafterDir(true, "/m", "/d", "/m"));
+    try testing.expectEqualStrings("", coldLoadDrafterDir(true, "/m", "/d", "/other"));
+    // No --drafter at launch: nothing to carry, the in-dir probe decides.
+    try testing.expectEqualStrings("", coldLoadDrafterDir(false, "/m", "", "/m"));
+}
+
+test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
+    // Three separate rounds of this bug shipped: prefix-cache, then MTP +
+    // llama, then the drafter/ssd group — each time a launch flag reached
+    // only `--model` and the cold path (hot switch, /v1/load-model, first
+    // request naming an unloaded model) quietly used a struct default. The
+    // scan is the class guard: a field retained on the Scheduler for this
+    // purpose that no cold-load assignment mentions is the next round.
+    // Needles are ++-split so this test's own source can't satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    inline for (.{
+        "kv_quant_config",           "prefix_cache_capacity", "prefix_cache_mem_bytes",
+        "prefix_cache_disk_bytes",   "ssm_checkpoint_stride", "ssm_checkpoint_max",
+        "mtp_enabled",               "mtp_head_kv_quant",     "mtp_depth",
+        "llama_cache_entries",       "llama_kv_type_k",       "llama_kv_type_v",
+        "ds4_mtp",                   "ds4_dspark",            "ds4_ssd_streaming",
+        "no_drafter",                "draft_block_size",      "draft_block_size_explicit",
+        "ane_prefill",               "ane_chunk_resolver",    "ane_headroom_resolver",
+        "prefix_cache_mem_resolver",
+    }) |field| {
+        const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
+        try testing.expect(std.mem.indexOf(u8, src, needle) != null);
+    }
+    // The drafter path is the one retained setting that must NOT be copied
+    // straight across — it goes through the ownership rule above.
+    const via_rule = "coldLoadDrafterDir(" ++ "self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path)";
+    try testing.expect(std.mem.indexOf(u8, src, via_rule) != null);
+    // The stale TODO that stood in for the wiring must be gone.
+    const old = "Phase E will wire the load-model API" ++ " to set this.";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
+}
+
+test "every HotPrefixCache.initWithMem load site reads the CLAMPED budget, never the raw launch flag" {
+    // 2026-08-30 Metal OOM: a 40 GB `--prefix-cache-mem` beside a ~70 GB pack
+    // was never validated against what the weights left under the GPU ceiling;
+    // the cache filled to its cap and a 143k prefill died uncatchably. The
+    // budget must pass through the resolver (server.prefixCacheMemForLoad)
+    // before it reaches initWithMem — and a SECOND construction site must not
+    // be able to skip the clamp (the cold-load launch flags class).
+    const src = @embedFile("scheduler.zig");
+    const needle = "HotPrefixCache.initWith" ++ "Mem(";
+    var found: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, src, pos, needle)) |at| : (pos = at + needle.len) {
+        found += 1;
+        const window = src[at..@min(at + 240, src.len)];
+        try testing.expect(std.mem.indexOf(u8, window, "clamped_prefix_mem") != null);
+        try testing.expect(std.mem.indexOf(u8, window, "params.prefix_cache_mem_bytes") == null);
+    }
+    try testing.expect(found >= 1);
 }
 
 test "coldLoadVision honors the process-wide vision opt-out" {
@@ -2314,9 +3277,136 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     // served 6.7K-token prefills with ~8.6 GB to spare. 6 GB keeps the original
     // margin for every model under 48 GB (where it was tuned) and stays inside
     // the measured envelope above it.
+    return avail_bytes < loadRequirementBytes(weights_bytes);
+}
+
+/// Total free memory a load demands: the model's own peak plus the headroom the
+/// guard wants for warmup buffers and a baseline KV cache.
+///
+/// It exists so a REFUSAL can quote the number it actually compared. The media
+/// preflight used to say "generation peaks at ~4.3 GB but only 5.4 GB is free"
+/// — two figures that, read together, say the load should have worked. It was
+/// refused for the headroom, which the sentence never mentioned, so the user
+/// went hunting for a problem that wasn't there (live 2026-08-08). Same class as
+/// the context-overflow 400: a rejection has to state the bar it set.
+pub fn loadRequirementBytes(weights_bytes: u64) u64 {
     const HEADROOM_CAP: u64 = 6 * 1024 * 1024 * 1024;
     const headroom: u64 = @min(weights_bytes / 8, HEADROOM_CAP) + 1024 * 1024 * 1024;
-    return avail_bytes < weights_bytes + headroom;
+    return weights_bytes + headroom;
+}
+
+test "a refusal quotes the number it actually compared" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+
+    // Live report 2026-08-08: FLUX.2-klein 4B refused with "generation peaks at
+    // ~4.3 GB but only 5.4 GB is free" — two numbers that say the load should
+    // have worked. The guard was right (it also wants ~1.5 GB of headroom for
+    // warmup buffers) but the message quoted the PEAK, so the user went looking
+    // for a problem that wasn't there and then tried the same prompt in the
+    // other pane. What a refusal must state is the TOTAL it demanded.
+    const peak: u64 = 4300 * MB;
+    const avail: u64 = 5400 * MB;
+    try std.testing.expect(memInsufficientForLoad(peak, avail));
+    try std.testing.expect(loadRequirementBytes(peak) > avail);
+
+    // The requirement IS the comparison — not a second formula that can drift
+    // from it. At exactly the requirement a load is allowed; a byte under is not.
+    try std.testing.expect(!memInsufficientForLoad(peak, loadRequirementBytes(peak)));
+    try std.testing.expect(memInsufficientForLoad(peak, loadRequirementBytes(peak) - 1));
+    try std.testing.expect(!memInsufficientForLoad(42 * GB, loadRequirementBytes(42 * GB)));
+}
+
+test "BOTH preflight refusals quote the number they compared, not the weights" {
+    // The media arm was fixed for #144's class (2026-08-08) and the TEXT arm was
+    // not: it printed "weights ~8.4 GB but only 10.1 GB free", which reads as
+    // "this should have worked" — the load was refused for the 2.05 GB of
+    // headroom the sentence never named (live 2026-08-17, a gemma-4-12B QAT pack
+    // on a 16 GB M4, where the bar is 10.45 GB). `insufficient_free_memory_message`
+    // sends the client to this very line for the figures, so a line that omits
+    // the bar makes the client message a dead end too. Needles are ++-split so
+    // this test's own source cannot satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    // Each refusal formats the REQUIREMENT as its first figure, from the one
+    // helper the comparison itself uses — never a second formula that can drift.
+    const media_arg = "loadRequirement" ++ "Bytes(peak))) / gb";
+    try testing.expect(std.mem.indexOf(u8, src, media_arg) != null);
+    const text_arg = "loadRequirement" ++ "Bytes(weights_bytes))) / gb";
+    try testing.expect(std.mem.indexOf(u8, src, text_arg) != null);
+    // The weights-first shape that could not state its own bar must be GONE.
+    const old = "Insufficient memory to load model: weights ~" ++ "{d:.1} GB but only";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
+}
+
+test "the eviction gate bills a media entry its BACKEND peak, never the dir's safetensors sum" {
+    // #126. MiniMax-H3's four safetensors sum to 37.55 GiB, but the text
+    // encoder RUNS AND IS FREED before the DiT loads, so the real staged peak
+    // is 22.83 GiB. `doLoadGenOnInferenceThread`'s preflight already bills it
+    // correctly — and never gets the chance, because this gate runs first and
+    // billed the sum. On a 48 GB Mac (auto cap = 80% of a 38338 MB wired limit
+    // = 30.0 GiB) that refused every load, permanently, on an idle server with
+    // nothing to evict and nothing to wait for.
+    const disk_sum: u64 = 40_316_668_515; // te + dit + video_vae + audio_vae
+    const staged_peak: u64 = 24_511_876_594; // max(te, dit) + both vaes
+    const cap: u64 = 30 * 1024 * 1024 * 1024;
+
+    try testing.expect(gateEstimateBytes(0, disk_sum, 0, 0) > cap); // the bug
+    try testing.expect(gateEstimateBytes(staged_peak, disk_sum, 0, 0) <= cap); // the fix
+
+    // A media peak OUTRANKS bytes_on_disk — the whole point is that the two
+    // disagree. It must not be averaged, summed or maxed with it, and it takes
+    // no headroom: the KV/vision/drafter margin is a TEXT concept, the media
+    // estimator carries its own transient term, and the commit
+    // (`genLoadResidentBytes`) has always parked the bare peak.
+    try testing.expectEqual(staged_peak, gateEstimateBytes(staged_peak, disk_sum, 0, 0));
+    try testing.expectEqual(gateEstimateBytes(staged_peak, disk_sum, 0, 0), genLoadResidentBytes(staged_peak, disk_sum));
+
+    // Non-media entries are BYTE-UNCHANGED: a zero peak means "not a media
+    // model" (or a dir we could not read), and the old ladder stands.
+    try testing.expectEqual(@as(u64, 1100), gateEstimateBytes(0, 1000, 0, 0));
+    try testing.expectEqual(@as(u64, 0), gateEstimateBytes(0, 0, 0, 0));
+    // No bytes_on_disk → the layers × hidden × 16 fallback, unchanged.
+    const fallback: u64 = 32 * 4096 * 16;
+    try testing.expectEqual(fallback + fallback / 10, gateEstimateBytes(0, null, 32, 4096));
+}
+
+test "the gate and the media preflight read ONE estimator" {
+    // The class bug in #126 is not the formula, it is that two sites computed
+    // the same bill differently and the stricter one ran first. Both call
+    // `gen.estimatePeakResidentBytes`; the gate reaches it through
+    // `mediaPeakFor`, which is the only place allowed to decide "is this a
+    // media entry, and what backend is it". Needles are ++-split so this
+    // test's own source cannot satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    const peek = "const media_peak = self.mediaPeak" ++ "For(entry);";
+    try testing.expect(std.mem.indexOf(u8, src, peek) != null);
+    const gate = "gateEstimateBytes(media_peak, entry.bytes_on" ++ "_disk,";
+    try testing.expect(std.mem.indexOf(u8, src, gate) != null);
+    // The raw-bytes_on_disk shape the gate used to have must be GONE.
+    const old = "const base: u64 = if (entry.bytes_on" ++ "_disk) |b|";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
+    // Both the preflight and the committed residency go through the estimator.
+    var n: usize = 0;
+    var i: usize = 0;
+    const needle = "gen_mod.estimatePeakResident" ++ "Bytes(";
+    while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
+    try testing.expect(n >= 2);
+}
+
+test "a media model commits the residency the gate reserved" {
+    // Secondary #1 of the issue: the gate reserved the staged peak and then
+    // `markReadyLocked` committed the DIR SUM, so H3 sat in the budget at
+    // 37.55 GB — 14.7 GB more than it can ever hold — and would evict a
+    // genuinely-resident LLM to make room for bytes nobody was using.
+    // Reserve-then-commit must read the same estimator, so the only difference
+    // between them is the gate's 10% headroom.
+    const staged_peak: u64 = 24_511_876_594;
+    const disk_sum: u64 = 40_316_668_515;
+    try testing.expectEqual(staged_peak, genLoadResidentBytes(staged_peak, disk_sum));
+    // A backend with no staged plan keeps the sum (peak == sum there anyway).
+    try testing.expectEqual(disk_sum, genLoadResidentBytes(0, disk_sum));
+    // Neither known → 0, as before.
+    try testing.expectEqual(@as(u64, 0), genLoadResidentBytes(0, 0));
 }
 
 test "memInsufficientForLoad: headroom + unknown-query guards" {
@@ -2417,7 +3507,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         });
         if (memInsufficientForLoad(weights_bytes, avail_bytes)) {
             const gb = 1024.0 * 1024.0 * 1024.0;
-            log.err("Insufficient memory to load model: weights ~{d:.1} GB but only {d:.1} GB free. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+            log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+                @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
                 @as(f64, @floatFromInt(weights_bytes)) / gb,
                 @as(f64, @floatFromInt(avail_bytes)) / gb,
             });
@@ -2443,6 +3534,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     else
         try model_mod.loadWeights(sch.io, sch.allocator, params.model_dir);
     errdefer weights_ptr.deinit();
+    model_mod.resolveWeightPrefix(params.config, weights_ptr);
 
     // Transformer — owns the bulk of the GPU memory.
     const xfm_ptr = try sch.allocator.create(Transformer);
@@ -2450,14 +3542,22 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     xfm_ptr.* = try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
     errdefer xfm_ptr.deinit();
 
+    // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
+    // specials): derived per model from tokenizer + template + eos.
+    generate_mod.installSuppressMask(xfm_ptr, params.tok, params.chat_config.chat_template, params.config.eosTokenSlice());
+
     // Propagate the kv-quant config to the Transformer's own cache. Slot
     // caches in serve mode honor this independently in `Slot.init`; this
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
-    if (params.kv_quant_config.scheme != .off) {
-        xfm_ptr.cache.deinit();
-        xfm_ptr.cache = try KVCache.initWithConfigAndHeadDim(sch.allocator, params.config.num_hidden_layers, params.kv_quant_config, params.config.head_dim);
+    // Per-model settings (stamped on the config at BOTH construction sites) outrank the flags.
+    const kv_quant_config = params.config.kv_quant_override orelse params.kv_quant_config;
+    const mtp_enabled = params.config.mtp_override orelse params.mtp_enabled;
+    if (kv_quant_config.scheme != .off) {
+        try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
+    Transformer.mtp_head_kv_quant_flag = params.mtp_head_kv_quant;
+    try xfm_ptr.qwen4MtpApplyKvQuant(kv_quant_config);
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
     // Policy in mlx.applyWiredPolicy; re-applied in runLoadRequest /
@@ -2483,6 +3583,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         if (params.config.linear_num_key_heads > 0) {
             xfm_ptr.compileGdnGate();
+        }
+        if (params.config.isQwen4()) {
+            xfm_ptr.compileQwen4Hc();
         }
     }
 
@@ -2517,11 +3620,45 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const io_u = @import("io_util.zig");
             const tio = std.Io.Threaded.global_single_threaded.io();
             var ctx = xfm_ptr.defaultCtx();
-            const tok: i32 = 1;
-            const tsh = [_]c_int{ 1, 1 };
+            // MLX_SERVE_DECODE_FWD_UBENCH_S=<rows>: verify-width forwards
+            // (per-position SSM capture on, as spec verify runs them).
+            // MLX_SERVE_DECODE_FWD_UBENCH_KV=<tokens>: prefill that many
+            // tokens first so the meter runs at a real context length.
+            const rows: usize = blk: {
+                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_S") orelse break :blk 1;
+                break :blk @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 1);
+            };
+            const kv_pre: usize = blk: {
+                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_KV") orelse break :blk 0;
+                break :blk std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0;
+            };
+            const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
+            defer sch.allocator.free(tok_slice);
+            for (tok_slice, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
+            const tok = tok_slice.ptr;
+            const tsh = [_]c_int{ 1, @intCast(tok_slice.len) };
+            if (kv_pre > 0) {
+                var done_pre: usize = 0;
+                const pre_buf = try sch.allocator.alloc(i32, 2048);
+                defer sch.allocator.free(pre_buf);
+                for (pre_buf, 0..) |*v, i| v.* = @intCast(1 + (i % 1000));
+                while (done_pre < kv_pre) {
+                    const n_chunk = @min(2048, kv_pre - done_pre);
+                    const psh = [_]c_int{ 1, @intCast(n_chunk) };
+                    const ti = mlx.mlx_array_new_data(pre_buf.ptr, &psh, 2, .int32);
+                    defer _ = mlx.mlx_array_free(ti);
+                    const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                    _ = mlx.mlx_array_eval(lg);
+                    _ = mlx.mlx_array_free(lg);
+                    done_pre += n_chunk;
+                }
+                log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
+            }
+            ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
+            log.info("[fwd-ubench] rows={d} capture={}\n", .{ tok_slice.len, ctx.capture_ssm_seq });
             // Warm: first forward pays kernel JIT + lazy weight materialization.
             for (0..3) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -2537,7 +3674,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var ops_total: u64 = 0;
             var done: usize = 0;
             for (0..n) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const ops_before = mlx.op_count.load(.monotonic);
                 var swb = io_u.Stopwatch.init(tio);
@@ -2566,7 +3703,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // this the one sound ablation in the probe.
             ctx.skip_lm_head = true;
             for (0..3) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -2575,7 +3712,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var sw_nolm = io_u.Stopwatch.init(tio);
             var done_nolm: usize = 0;
             for (0..n) |_| {
-                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 _ = mlx.mlx_array_eval(lg);
@@ -2614,13 +3751,109 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.destroy(v);
     };
 
-    // Drafter (optional). Loaded only when `drafter_dir` is non-empty.
+    // The measured round-cost table (`round_cost.zig`) is keyed per (chip,
+    // model, quant, OS build); restored here, written at request end.
+    {
+        var quant_buf: [32]u8 = undefined;
+        const quant = std.fmt.bufPrint(&quant_buf, "q{d}g{d}", .{
+            params.config.quant_bits,
+            params.config.quant_group_size,
+        }) catch "q?";
+        var os_buf: [64]u8 = undefined;
+        const os_build = transformer_mod.macosProductVersion(&os_buf) orelse "";
+        // The measured round-cost table rides the same identity: restored
+        // here, written at the end of any request that folded new samples.
+        // The bucket grid and store version are the arch's (only qwen4_exp gets the long
+        // grid); every other arch keeps the `rc1` table 26.9.1 wrote and boots warm.
+        const rc_layout: round_cost_mod.Layout = round_cost_mod.layoutFor(params.config);
+        xfm_ptr.round_cost.layout = rc_layout;
+        const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build, rc_layout, round_cost_mod.engineBuildId());
+        xfm_ptr.round_cost_key_len = @intCast(rc_key.len);
+        if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key, rc_layout)) |t| {
+            xfm_ptr.round_cost = t;
+            log.info("[spec-cost] round-cost table restored ({d} width cells, {d} serial cells)\n", .{ t.restored, t.restored_serial });
+            if (t.restored_dropped > 0) log.info("[spec-cost] dropped {d} implausible persisted cell(s)\n", .{t.restored_dropped});
+        }
+    }
+
+    // Assistant sidecar (optional). Loaded only when `drafter_dir` is
+    // non-empty. The sidecar KIND is decided by its config CONTRACT: a
+    // config declaring block_size + mask_token_id + target_layer_ids is a
+    // DFlash block-drafter (any `*_assistant` family); anything else goes
+    // to the Gemma cross-attention drafter loader.
     var drafter_ptr: ?*DrafterModel = null;
-    if (params.drafter_dir.len > 0) {
+    var dflash_ptr: ?*DflashModel = null;
+    // An explicit `--drafter` always wins; otherwise the checkpoint's own
+    // `drafter/` subdir is the sidecar (dflash.resolveInDirDrafter). That is
+    // what makes the drafter a LOAD-time dependency rather than a launch
+    // flag: a hot model switch brings its own, and no pairing table has to
+    // decide which sidecar goes with which checkpoint.
+    const in_dir_drafter: ?[]u8 = if (params.no_drafter or params.drafter_dir.len > 0)
+        null
+    else
+        dflash_mod.resolveInDirDrafter(sch.io, sch.allocator, params.model_dir);
+    defer if (in_dir_drafter) |p| sch.allocator.free(p);
+    const drafter_dir: []const u8 = if (params.no_drafter)
+        ""
+    else if (params.drafter_dir.len > 0)
+        params.drafter_dir
+    else
+        in_dir_drafter orelse "";
+    if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
+        const env_off = if (std.c.getenv("MLX_SERVE_DFLASH")) |v| v[0] == '0' else false;
+        if (env_off) {
+            log.info("[dflash] sidecar at {s} skipped (MLX_SERVE_DFLASH=0)\n", .{drafter_dir});
+        } else {
+            const d = try sch.allocator.create(DflashModel);
+            d.* = dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir) catch |err| {
+                sch.allocator.destroy(d);
+                log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
+                return err;
+            };
+            d.bind(xfm_ptr) catch |err| {
+                d.deinit();
+                sch.allocator.destroy(d);
+                log.err(
+                    "DFlash assistant at {s} is incompatible with target: {s}\n" ++
+                        "  (assistant+target must share hidden_size, the mask token and\n" ++
+                        "  target_layer_ids must exist in the target, and the target must\n" ++
+                        "  run the standard dense-attention forward path)\n",
+                    .{ drafter_dir, @errorName(err) },
+                );
+                return err;
+            };
+            dflash_ptr = d;
+            const wide_lane = dflash_mod.wideVerifyLaneAvailable();
+            const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand());
+            sch.drafter_block_size = dflash_mod.resolveBlockSize(
+                d.config.block_size,
+                params.draft_block_size,
+                params.draft_block_size_explicit,
+                wide_lane,
+                block_cap.cap,
+            );
+            var cap_note_buf: [96]u8 = undefined;
+            const cap_note: []const u8 = if (params.draft_block_size_explicit)
+                ", user-clamped"
+            else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
+                std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
+                    block_cap.label,
+                    block_cap.cap,
+                }) catch ", capped"
+            else
+                "";
+            log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
+                sch.drafter_block_size,
+                cap_note,
+                wide_lane,
+                d.config.target_layer_ids,
+            });
+        }
+    } else if (drafter_dir.len > 0) {
         const d = try sch.allocator.create(DrafterModel);
-        d.* = drafter_mod.loadDrafter(sch.io, sch.allocator, mlx.gpuStream(), params.drafter_dir) catch |err| {
+        d.* = drafter_mod.loadDrafter(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir) catch |err| {
             sch.allocator.destroy(d);
-            log.err("Failed to load drafter at {s}: {s}\n", .{ params.drafter_dir, @errorName(err) });
+            log.err("Failed to load drafter at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
             return err;
         };
         d.bind(xfm_ptr) catch |err| {
@@ -2667,6 +3900,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         d.deinit();
         sch.allocator.destroy(d);
     };
+    errdefer if (dflash_ptr) |d| {
+        d.deinit();
+        sch.allocator.destroy(d);
+    };
 
     // Qwen native MTP head (optional). Auto-loaded when the model dir ships
     // one — an `mtp/weights.safetensors`-class sidecar file OR in-checkpoint
@@ -2674,14 +3911,26 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // bind only disables the head — the model still serves.
     var mtp_ptr: ?*mtp_mod.MtpModel = null;
     var mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
-    if (params.mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
+    if (mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
                 h.* = loaded;
                 if (h.bind(xfm_ptr)) {
                     mtp_ptr = h;
                     mtp_cost_profile = h.m5NaxCostProfile(xfm_ptr);
-                    log.info("MTP head ready (depth={d}).\n", .{generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile)});
+                    // Price the DRAFT side. The verify ladder above measures
+                    // the trunk forward and nothing else, but an m-deep round
+                    // is that forward PLUS m sequential head steps — which on
+                    // a 27B dominate the per-position marginal. Fitting the
+                    // EV surface without this under-prices depth ~9x (live
+                    // 2026-08-21: forward marginal 0.8 ms/position against a
+                    // hand-measured composite of 7.6). A cached curve already
+                    // carries it, so this is paid once per (chip, model,
+                    // quant, OS build) like the ladder itself.
+                    log.info("MTP head ready (depth={d}, profile={s}).\n", .{
+                        generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
+                        @tagName(mtp_cost_profile),
+                    });
                 } else |bind_err| {
                     log.warn("MTP sidecar incompatible with target ({s}) — disabled.\n", .{@errorName(bind_err)});
                     h.deinit();
@@ -2692,11 +3941,73 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 sch.allocator.destroy(h);
             }
         } else |_| {}
+    } else if (mtp_enabled) {
+        // A quiet fallback to mode=pld cost a tester a day: nothing logged
+        // when the probe finds no head. Debug-level — most checkpoints have
+        // no MTP head and an info line per load would be noise.
+        log.debug(
+            "[mtp] no head found: no mtp/ sidecar and no [language_model.]mtp.* " ++
+                "keys resolvable from the index at {s} — MTP off\n",
+            .{params.model_dir},
+        );
     }
     errdefer if (mtp_ptr) |h| {
         h.deinit();
         sch.allocator.destroy(h);
     };
+
+    // The qwen4_exp in-checkpoint head's twin of the sidecar's own coarse
+    // rerank build (inside `bind`, above): a `requantizeRows` of the whole
+    // trunk lm_head plus a synchronous eval of ~240 MB. Lazily it ran inside
+    // the FIRST request's draft chain — on this thread, mid-round, with the
+    // stream drained — i.e. first-token latency for whoever loaded the model.
+    // Gated exactly like `entry.mtp`'s `.qwen4` arm below: `--no-mtp` never
+    // drafts, so it never pays. One-shot, so the draft path's ask stays a
+    // pure read; if this ever does not run, that ask still builds.
+    if (mtp_ptr == null and mtp_enabled) _ = xfm_ptr.qwen4BuildDraftRerank();
+
+    // ANE prefill-MLP offload (`--ane-prefill`, perf-plan-aug-17 P5): built
+    // HERE because the mlx dequant must run on the inference thread (sole
+    // MLX caller), with the chunk width resolved through the server's own
+    // pin (idempotent — the later pinAutoContext keeps this value), so the
+    // compiled fixed-shape tile matches the width the forward will run.
+    if (params.ane_prefill) {
+        const ane_force: ?[]const u8 = if (std.c.getenv("MLX_SERVE_ANE_FORCE")) |p| std.mem.span(p) else null;
+        if (!ane_mod.anePrefillAllowed(transformer_mod.verifyQmmNaxAvailable(), ane_force)) {
+            // ANE prefill is M4-and-below: on NAX machines it measured a
+            // loss (M5 Max, PR #223). `/props` ane stays absent, as off.
+            log.info(
+                "[ane] --ane-prefill disabled: NAX-class GPU prefill already outruns the ANE seam " ++
+                    "(measured a loss on M5 Max, PR #223); MLX_SERVE_ANE_FORCE=1 overrides\n",
+                .{},
+            );
+        } else if (params.ane_chunk_resolver) |resolve| {
+            const pinned = resolve(@constCast(params.config));
+            // The forward's chunk is the pinned width run through the SAME
+            // per-request policy every prefill applies (effectivePrefillChunk:
+            // the MoE 4096 / dense-hd-256 8192 caps + the --prefill-chunk and
+            // env overrides) — compiling the tile at the pinned width alone
+            // left every MoE program built at 8192 while the forward chunked
+            // at 4096: built, never dispatched (A7, 2026-08-18). total_ctx is
+            // representative-large: under the default fused-causal mode the
+            // policy arm is ctx-independent, and under the composed fallback
+            // the chunk is ctx-dependent anyway (fixed shapes cannot follow
+            // it, and the seam's width equality just never engages).
+            const cfg = params.config;
+            const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+                cfg.prefillScoreHeadDim(),
+                cfg.num_attention_heads,
+                1 << 20,
+                cfg.has_sliding_window,
+                cfg.isMoe(),
+                cfg.longCtxGated(),
+                pinned,
+            ));
+            xfm_ptr.buildAnePrefill(sch.io, chunk, ane_mod.splitShare(), params.ane_headroom_resolver);
+        } else {
+            log.warn("[ane] --ane-prefill: no prefill-chunk resolver on this load path — disabled\n", .{});
+        }
+    }
 
     // Eager warmup: faults weight pages + compiles the decode-path kernels
     // on this thread's stream. ~600-900 ms at boot but the first user request
@@ -2708,6 +4019,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         };
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
+        if (mtp_enabled and xfm_ptr.qwen4_mtp != null) {
+            const cap = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
+            xfm_ptr.warmupSpecVerify(cap, params.kv_quant_config) catch |err| {
+                log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
+            };
+        }
     }
 
     // ── Phase 05: install everything onto the LoadedModel entry, mark
@@ -2726,16 +4043,32 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.transformer = xfm_ptr;
     entry.vision_encoder = vision_ptr;
     entry.drafter = drafter_ptr;
+    entry.dflash = dflash_ptr;
     entry.drafter_block_size = sch.drafter_block_size;
-    entry.mtp = mtp_ptr;
+    entry.mtp = if (mtp_ptr) |h|
+        generate_mod.MtpHeadRef{ .qwen = h }
+    else if (mtp_enabled and xfm_ptr.qwen4_mtp != null)
+        generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
+    else
+        null;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
     entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
+    xfm_ptr.mtp_depth_free = generate_mod.Generator.mtpDepthCapFree(params.mtp_depth);
+    // A MERGED drafter has no `--drafter` to echo, so the reported path comes
+    // from what was actually resolved — `drafter_loaded` and `drafter_path`
+    // must not disagree about the same sidecar.
+    if (drafter_path_owned.len == 0 and drafter_dir.len > 0 and
+        (dflash_ptr != null or drafter_ptr != null))
+    {
+        drafter_path_owned = try sch.allocator.dupe(u8, drafter_dir);
+    }
     entry.drafter_path = drafter_path_owned;
     drafter_path_owned = &[_]u8{}; // disarm the errdefer
     // Transfer ownership of the heap-allocated CPU state from `params` to
     // the entry. The caller (main.zig) MUST NOT free these — `LoadedModel.deinit`
     // walks them in the same `*X` pointer form they came in.
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
@@ -2748,11 +4081,25 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.prefix_cache_capacity > 0 and
         prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps))
     {
+        // The weights are resident here, so the resolver's active-memory read
+        // is honest; the raw launch budget never reaches initWithMem (a 40 GB
+        // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
+        // RAM allowance for idle entries on the SSD-first arm; 0 elsewhere.
+        var ssd_idle_mem: u64 = 0;
+        const clamped_prefix_mem: u64 = if (params.prefix_cache_mem_resolver) |resolve|
+            resolve(params.config, params.prefix_cache_mem_bytes, .{}, &ssd_idle_mem)
+        else
+            params.prefix_cache_mem_bytes;
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
             sch.allocator,
             params.prefix_cache_capacity,
-            params.prefix_cache_mem_bytes,
+            clamped_prefix_mem,
         );
+        entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
+        // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
+        // see a ModelConfig. The ungated value names the previous behaviour at each site.
+        entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated()) .min_span_recency else .min_span;
+        entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
         // state too: the disk tier is allowed whenever the RAM tier accepted
         // the arch — i.e. pure-attention always, hybrid iff SSM checkpoints
@@ -2781,9 +4128,30 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
+            entry.prefix_cache.?.disk.?.cp_thin =
+                if (params.config.longCtxGated()) .min_span_recency else .oldest;
+            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.longCtxGated())
+                kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
+            else
+                kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
+        }
+        // SSD-first: arch + env switch + a live disk tier. Below the attach because the tier
+        // is part of the answer; without `--prefix-cache-disk` qwen4_exp takes the RAM arm.
+        entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
+            params.config,
+            entry.prefix_cache.?.disk != null,
+        );
+        if (entry.prefix_cache.?.ssd_first) {
+            entry.prefix_cache.?.disk.?.ssd_first = true;
+            entry.prefix_cache.?.disk.?.enableBackgroundWriter();
+            // Startup sweep of strays + root-wide LRU across sibling fingerprints.
+            entry.prefix_cache.?.disk.?.sweepSiblings();
         }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
+        // The cache re-applies the cap after a replace-path merge; without this
+        // it defaults to 0 (unlimited) and multi-turn entries grow unbounded.
+        entry.prefix_cache.?.ssm_checkpoint_max = params.ssm_checkpoint_max;
     }
     // Iteration 2 (perf-plan Phase 4 #3): tokenize cache for warm-path
     // chat-template renders. Applies to MLX, ds4, and llama engines —
@@ -2832,12 +4200,109 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.xfm = xfm_ptr;
     sch.vision_encoder = vision_ptr;
     sch.drafter = drafter_ptr;
+    sch.dflash = dflash_ptr;
     if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
+    publishHotCacheResidency(sch);
+}
+
+/// Republish the hot cache's residency for the connection thread's admission guard.
+/// Called from the inference thread after a commit, eviction, invalidation or model switch.
+const BUDGET_REVISE_WINDOW_NS: u64 = 10 * std.time.ns_per_s;
+
+/// How a budget resolve differs from the load-time one: the cache's own resident bytes
+/// are excluded from the machine read, and the resolver keeps quiet (`setBudget` logs).
+pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
+
+/// Re-clamp every resident model's hot-cache budget after residency changed (#364): the
+/// load-time clamp read the machine with the other models on it and was never revisited, so
+/// a model loaded beside a large one kept a ~0 budget for life. Each cache's own resident
+/// entries are excluded from the read so a full cache cannot ratchet itself down.
+fn reviseHotCacheBudgets(sch: *Scheduler) void {
+    const resolve = sch.prefix_cache_mem_resolver orelse return;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    // The resolver publishes the process-global budget the admission guard reads, so the
+    // current model goes last.
+    for ([_]bool{ false, true }) |current_pass| {
+        var it = sch.registry.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if ((entry == sch.current_model) != current_pass) continue;
+            if (entry.state != .ready) continue;
+            const hc = if (entry.prefix_cache) |*h| h else continue;
+            const config = entry.config orelse continue;
+            var idle: u64 = 0;
+            hc.setBudget(resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle));
+            hc.ssd_idle_mem = idle;
+            if (current_pass) publishHotCacheResidency(sch);
+        }
+    }
+}
+
+pub fn publishHotCacheResidency(sch: *Scheduler) void {
+    const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    sch.resident_hot_cache_bytes.store(bytes, .monotonic);
+    const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
+    sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
+    publishHotCacheDigests(sch);
+}
+
+/// Swap in a fresh digest snapshot and free the one it supersedes (inference thread only).
+/// An allocation failure keeps the previous snapshot: a stale digest is a hint, an empty one
+/// credits bytes that exist.
+fn publishHotCacheDigests(sch: *Scheduler) void {
+    const fresh: []prefix_cache_mod.HotPrefixCache.EntryDigest = if (sch.hot_prefix_cache) |hc|
+        (hc.digestsAlloc(sch.allocator) catch return)
+    else
+        &.{};
+    const residency: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    sch.digest_mu.lockUncancelable(sch.io);
+    const old = sch.hot_cache_digests;
+    sch.hot_cache_digests = fresh;
+    // Published under the same lock as the digests it describes.
+    sch.digest_residency = residency;
+    sch.digest_mu.unlock(sch.io);
+    if (old.len > 0) sch.allocator.free(old);
+}
+
+/// Connection-thread entry point: what an eviction pass can prove it will get back for this prompt.
+pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) u64 {
+    const fp = prefix_cache_mod.HotPrefixCache.prefixFingerprint(prompt_tokens);
+    sch.digest_mu.lockUncancelable(sch.io);
+    defer sch.digest_mu.unlock(sch.io);
+    return prefix_cache_mod.HotPrefixCache.reclaimableFromDigests(
+        sch.hot_cache_digests,
+        sch.digest_residency,
+        fp,
+    );
+}
+
+/// Caller holds `queue_mu`. Shared with the wait condition below.
+fn hasWorkPendingLocked(sch: *const Scheduler) bool {
+    return sch.pending.items.len > 0 or
+        sch.decoding.items.len > 0 or
+        sch.vision_queue.items.len > 0 or
+        sch.embed_queue.items.len > 0 or
+        sch.cleanup_queue.items.len > 0 or
+        sch.load_queue.items.len > 0 or
+        sch.gen_queue.items.len > 0 or
+        sch.unload_queue.items.len > 0;
+}
+
+/// Poll interval for the idle-eviction sweep, given the configured window.
+///
+/// A quarter of the window, so a model is evicted within ~1.25x the configured
+/// idle time rather than up to 2x it. Floored at a second so `--idle-evict-secs 1`
+/// does not spin, capped at 30s so a long window still costs ~nothing.
+pub fn idleEvictTickMs(window_ms: i64) i64 {
+    return @max(1000, @min(@divTrunc(window_ms, 4), 30_000));
 }
 
 fn inferenceLoop(ctx: ThreadCtx) void {
     const sch = ctx.scheduler;
     const params = ctx.params;
+    // Covers shutdown and startup-load failure.
+    defer sleep_inhibit.release();
 
     // ── Phase A1 → Plan 05: load runs on this thread (mlx GPU stream
     //    binding). On failure, mark the entry `.error_state` in the
@@ -2852,6 +4317,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         log.info("Headless: no primary model loaded; models load on demand.\n", .{});
         signalStarted(sch);
     } else {
+        // Startup load runs before the wait loop can acquire.
+        sleep_inhibit.setActive(true);
         if (doLoadOnInferenceThread(sch, params)) |_| {
             log.info("Model ready (loaded on inference thread).\n", .{});
             signalStarted(sch);
@@ -2916,13 +4383,38 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 gen_req = sch.gen_queue.orderedRemove(0);
             }
         }
-        for (cleanup_batch[0..cleanup_n]) |s| s.deinit();
+        for (cleanup_batch[0..cleanup_n]) |s| {
+            // Decode-phase cancel: `complete()` pulled this slot straight
+            // into the cleanup queue, so it never went through finishSlot
+            // and its committed KV (prompt + every emitted token) would die
+            // right here with the slot. Commit it first — the same guards
+            // as a normal finish apply inside (pad-only / error / vision /
+            // empty all decline) — then flush what was committed to the
+            // SSD tier, since no finishSlot will. Normally-finished slots
+            // arrive here with `finished` already set (finishSlot committed
+            // them) and skip; errored slots decline via the error guard.
+            // Runs on the inference thread — the sole mlx caller — which is
+            // what makes the refcount-sharing snapshot legal here.
+            if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
+                commitSlotIfApplicable(sch, s);
+                if (s.model.prefix_cache) |*hc| {
+                    if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
+                }
+            }
+            // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
+            // record must not outlive the bytes `s.deinit()` frees.
+            if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
+            if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
+            s.deinit();
+        }
         if (vision_n > 0 or embed_n > 0) {
             for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
             for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
         }
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
+        if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
+        if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
         if (gen_req) |req| runGenRequest(sch, req);
 
         // 1. Wait for work. Drain pending slots into a local list under lock,
@@ -2932,25 +4424,72 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and sch.gen_queue.items.len == 0 and sch.unload_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
+            while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
+                // No later tick runs while parked, so release here.
+                sleep_inhibit.setActive(false);
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
             }
             if (sch.shutdown.load(.acquire)) break;
+            // Hold until the loop parks again.
+            sleep_inhibit.setActive(true);
 
             // If only vision/embed/cleanup/load work is pending, loop back to drain it.
             if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) continue;
 
-            while (n_prefill < to_prefill.len and sch.pending.items.len > 0) {
-                to_prefill[n_prefill] = sch.pending.orderedRemove(0);
+            // Single-flight admission (the dsv4 class): a model with
+            // MODULE-OWNED decode state admits at most one live slot.
+            // Snapshot live exclusive-model slots (same liveness predicate
+            // as the step-3 active list), let `admitPendingTick` decide,
+            // and leave held slots in `pending` — their conn threads keep
+            // flowing SSE keepalives while they wait, and the wait
+            // condition above never blocks while `pending` is non-empty,
+            // so a held slot admits on the first tick after the active one
+            // is culled (step 5, same mutex).
+            var live_buf: [32]AdmitCand = undefined;
+            var n_live: usize = 0;
+            for (sch.decoding.items) |s| {
+                if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+                if (!slotExclusiveDecode(s)) continue;
+                if (n_live >= live_buf.len) break;
+                live_buf[n_live] = .{ .model = @intFromPtr(s.model), .exclusive = true };
+                n_live += 1;
+            }
+            var cand_buf: [32]AdmitCand = undefined;
+            const n_cands = @min(sch.pending.items.len, cand_buf.len);
+            for (sch.pending.items[0..n_cands], 0..) |s, i| {
+                cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s) };
+            }
+            var admit_idx: [to_prefill.len]usize = undefined;
+            const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx);
+            for (admit_idx[0..n_admit]) |idx| {
+                to_prefill[n_prefill] = sch.pending.items[idx];
                 n_prefill += 1;
             }
+            // Remove admitted entries in DESCENDING index order so the
+            // earlier (ascending) indices stay valid during removal.
+            var r = n_admit;
+            while (r > 0) {
+                r -= 1;
+                _ = sch.pending.orderedRemove(admit_idx[r]);
+            }
+        }
+
+        if (sch.budget_revise_sw) |sw| {
+            if (sw.read() > BUDGET_REVISE_WINDOW_NS) sch.budget_revise_sw = null;
+            if (n_prefill > 0) reviseHotCacheBudgets(sch);
         }
 
         // 2. Prefill each pending slot (heavy; mlx ops on this thread).
         //    The inference thread is the sole mlx caller post-cleanup, so
         //    no per-tick stream rebind / mutex coexistence is needed.
         if (n_prefill > 0) {
-            for (to_prefill[0..n_prefill]) |slot| {
+            for (to_prefill[0..n_prefill], 0..) |slot, pi| {
+                // Between the slots of one admitted batch, tick the streams
+                // that just started decoding — a single-chunk prefill exposes
+                // no chunk-boundary yield, so without this every slot's first
+                // token waits for the LAST slot's prefill (the TTFT
+                // staircase collapse).
+                if (pi > 0 and prefillInterleaveEnabled()) _ = interleaveDecodeTick(sch);
                 if (slot.cancelled.load(.acquire)) {
                     // finishSlot (not raw markFinished) so the metrics sink
                     // counts the cancellation; safe pre-prefill — commit
@@ -2959,20 +4498,41 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     continue;
                 }
                 var prefill_sw = io_util.Stopwatch.init(sch.io);
-                runPrefill(sch, slot) catch |err| {
-                    if (err == error.Cancelled) {
-                        // Client vanished mid-prefill (conn thread noticed on
-                        // an idle keepalive probe and set slot.cancelled);
-                        // the chunk loop aborted. A clean finish, not an error.
-                        log.info("[scheduler] prefill aborted: client disconnected\n", .{});
-                        finishSlot(sch, slot, "cancelled");
-                        continue;
-                    }
-                    log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
-                    slot.markError(@errorName(err));
-                    continue;
-                };
-                slot.prefill_ns = prefill_sw.read();
+                var qsa_gap_retried = false;
+                prefill: while (true) {
+                    runPrefill(sch, slot) catch |err| {
+                        if (err == error.Cancelled) {
+                            log.info("[scheduler] prefill aborted: client disconnected\n", .{});
+                            finishSlot(sch, slot, "cancelled");
+                            break :prefill;
+                        }
+                        if (err == error.QsaHistoryGap and !qsa_gap_retried) {
+                            if (slot.model.prefix_cache) |*hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
+                            if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
+                            if (slot.model.transformer) |xf| {
+                                slot.cache.truncate(0, xf.s) catch {};
+                                xf.resetQsaPooledRope();
+                                xf.qwen4MtpResetOwned(slot.enable_mtp);
+                            }
+                            if (slot.legacy_gen) |*g| {
+                                g.deinit(slot.allocator);
+                                slot.legacy_gen = null;
+                            }
+                            slot.moe_seq_offset = 0;
+                            slot.cached_tokens = 0;
+                            slot.skip_prefix_cache = true;
+                            log.warn("[hot-cache] restored entry failed the QSA history check — dropped, cold prefill\n", .{});
+                            qsa_gap_retried = true;
+                            continue :prefill;
+                        }
+                        log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
+                        slot.markError(@errorName(err));
+                        break :prefill;
+                    };
+                    break :prefill;
+                }
+                if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
+                slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
                 // Exact time-to-first-token: elapsed from request arrival
                 // (Slot.init, pre-queue-wait) to prefill completion. Captured
                 // here rather than derived by subtraction in finishSlot, so a
@@ -3044,14 +4604,15 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         finishVisionRequest(sch, req, "VisionEncoderNotLoaded");
         return;
     };
-    if (req.images.len == 0 and req.audio.len == 0) {
+    if (req.images.len == 0 and req.videos.len == 0 and req.audio.len == 0) {
         finishVisionRequest(sch, req, "EmptyImages");
         return;
     }
 
-    // Encode all soft tokens into `emb_parts`: vision first, then audio, so the
-    // single splice channel scatters them in the same order as the placeholder
-    // blocks the conn thread injected (image block before audio block).
+    // Encode all soft tokens into `emb_parts`: vision, then video, then audio,
+    // so the single splice channel scatters them in the same order as the
+    // placeholder blocks the conn thread injected (image block, then video
+    // block, then audio block).
     var emb_parts = std.ArrayList(mlx.mlx_array).empty;
     defer emb_parts.deinit(req.allocator);
     const failParts = struct {
@@ -3065,14 +4626,14 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     for (req.images) |img| {
         var emb: mlx.mlx_array = undefined;
         if (img.grid_h > 0) {
-            // Qwen3-VL: pixels hold merge-order pixel_values [N, feat]; the ViT
+            // Patch-grid ViT: pixels hold pixel_values [N, feat]; the tower
             // produces [1, N/merge², out_hidden].
             const n: usize = @as(usize, img.grid_h) * img.grid_w;
             const feat: usize = (img.pixels.len / 4) / n;
             const shape = [_]c_int{ @intCast(n), @intCast(feat) };
             const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
             defer _ = mlx.mlx_array_free(pixel_arr);
-            emb = vision_enc.forwardQwen(pixel_arr, img.grid_h, img.grid_w) catch |err| {
+            emb = vision_enc.forwardPatches(pixel_arr, img.grid_h, img.grid_w) catch |err| {
                 failParts(sch, req, emb_parts.items, @errorName(err));
                 return;
             };
@@ -3089,6 +4650,26 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         }
         const es = mlx.getShape(emb);
         n_vision += @intCast(es[1]);
+        emb_parts.append(req.allocator, emb) catch |err| {
+            _ = mlx.mlx_array_free(emb);
+            failParts(sch, req, emb_parts.items, @errorName(err));
+            return;
+        };
+    }
+
+    var n_video: usize = 0;
+    for (req.videos) |vid| {
+        const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
+        const feat: usize = (vid.pixels.len / 4) / n;
+        const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+        const pixel_arr = mlx.mlx_array_new_data(vid.pixels.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(pixel_arr);
+        const emb = vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w) catch |err| {
+            failParts(sch, req, emb_parts.items, @errorName(err));
+            return;
+        };
+        const es = mlx.getShape(emb);
+        n_video += @intCast(es[1]);
         emb_parts.append(req.allocator, emb) catch |err| {
             _ = mlx.mlx_array_free(emb);
             failParts(sch, req, emb_parts.items, @errorName(err));
@@ -3157,6 +4738,7 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     defer req.done_mu.unlock(sch.io);
     req.result = combined;
     req.n_vision_tokens = n_vision;
+    req.n_video_tokens = n_video;
     req.n_audio_tokens = n_audio;
     req.done = true;
     req.done_cond.broadcast(sch.io);
@@ -3172,15 +4754,10 @@ fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []c
 }
 
 /// Service one embedding request on the inference thread. Runs the batched
-/// encoder-only forward pass via `generate.computeEmbeddingsBatch(xfm, ...)`,
-/// resets the global xfm.cache between requests (encoder-only does not
-/// share KV state across embeddings), and wakes the conn thread.
+/// forward pass via `generate.computeEmbeddingsBatch(xfm, ...)`, which resets
+/// the global xfm.cache before every sub-batch, and wakes the conn thread.
 fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
     const xfm_ptr = req.model.transformer.?;
-    xfm_ptr.resetCache() catch |err| {
-        finishEmbedRequest(sch, req, @errorName(err));
-        return;
-    };
     const results = generate_mod.computeEmbeddingsBatch(req.allocator, xfm_ptr, req.token_seqs) catch |err| {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
@@ -3243,9 +4820,17 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     doLoadOnInferenceThread(sch, req) catch |err| {
         log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
         sch.registry.mutex.lockUncancelable(sch.io);
-        // markErrorLocked dupes the error name onto the entry; the
-        // conn thread reads it back from the entry, not from req.
-        sch.registry.markErrorLocked(req.entry, @errorName(err));
+        if (err == error.InsufficientMemory) {
+            // A memory-preflight refusal is transient, not a property of the
+            // checkpoint: the 503 tells the user to free memory and retry, so
+            // the entry must go back to .unloaded — stuck in .error_state the
+            // retry would fail fast until a server restart (#144).
+            sch.registry.markUnloadedLocked(req.entry);
+        } else {
+            // markErrorLocked dupes the error name onto the entry; the
+            // conn thread reads it back from the entry, not from req.
+            sch.registry.markErrorLocked(req.entry, @errorName(err));
+        }
         sch.registry.mutex.unlock(sch.io);
         finishLoadRequest(sch, req, @errorName(err));
         return;
@@ -3340,7 +4925,10 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         sch.weights = null;
         sch.vision_encoder = null;
         sch.drafter = null;
+        sch.dflash = null;
         sch.hot_prefix_cache = null;
+        publishHotCacheResidency(sch);
+        if (hot_cache_budget_invalidate) |f| f();
     }
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.accountEvictedLocked(bytes);
@@ -3358,6 +4946,15 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     req.done_mu.unlock(sch.io);
 }
 
+fn dflashContextCoversPrefix(context_len: usize, prefix_len: usize) bool {
+    return context_len == prefix_len;
+}
+
+/// Only an all-pad generation poisons the prefix; a zero-token one still holds a real prefill.
+fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
+    return n_gen > 0 and all_pad;
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -3366,11 +4963,25 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
 fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
-    if (slot.was_pad_only) return;
     if (slot.error_code != null) return;
-    if (slot.vision_embeddings != null) return;
-    const gen_ptr = if (slot.legacy_gen) |*g| g else return;
-    if (gen_ptr.generated_ids.items.len == 0) return;
+    // `finishSlot` can be reached on an EOS the failing forward itself produced, before the
+    // tick wrapper reads the latch: an unread latch means the KV under this commit may be garbage.
+    if (mlx.errorPending()) return;
+    const gen_ptr = if (slot.legacy_gen) |*g| g else {
+        // A Generator-less slot whose cache is non-empty is a prefill the
+        // client disconnected from mid-chunk-loop: initWithOptions threw
+        // error.Cancelled before `slot.legacy_gen = gen` ever ran, but every
+        // chunk that DID forward still lives in slot.cache. Commit that
+        // forwarded prefix instead of dropping it. This arm sits ABOVE the
+        // pad-only guard: `was_pad_only` starts true and only flips on the
+        // first pushed token, so a slot that never pushed one is not
+        // pad-POISONED, it is merely empty.
+        commitCancelledPrefillSlot(slot, hc);
+        publishHotCacheResidency(sch);
+        return;
+    };
+    const n_gen = gen_ptr.generated_ids.items.len;
+    if (commitDeclinesPadOnly(n_gen, slot.was_pad_only)) return;
 
     // Construct the full token sequence: the original prompt + everything
     // generated this turn. The cache reflects exactly this state — Generator
@@ -3393,16 +5004,146 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // allocator's bookkeeping stays clean.
         gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
     }
-    hc.commitWithSsm(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt) catch |err| {
-        log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
-        // Commit failed — we still own the checkpoints. Free them so they
-        // don't leak.
-        if (ssm_cps_opt) |cps| {
-            const a = gen_ptr.ssm_checkpoint_alloc orelse sch.allocator;
-            for (cps) |*cp| cp.deinit(a);
-            a.free(cps);
+    // qwen4_exp: the newest checkpoint takes the slot's live QSA indexer history as a view
+    // of the capacity buffer (the slot is torn down right after). A failure commits the
+    // entry history-less, which a QSA arch treats as a miss.
+    if (ssm_cps_opt) |cps| {
+        if (transformer_mod.qsaHistoryShareEnabled() and !transformer_mod.checkpointHasQsaPooled(&cps[cps.len - 1])) {
+            if (slot.ssm_entries) |ents| {
+                if (slot.model.transformer) |xf| {
+                    transformer_mod.handoffQsaHistoryToLatest(cps, ents, xf.s) catch |err| {
+                        log.warn("[hot-cache] QSA history handoff failed: {s} — committing without it\n", .{@errorName(err)});
+                    };
+                }
+            }
         }
+    }
+    // A runtime fallback leaves the dormant assistant context at its last
+    // speculative boundary while serial decode continues growing the trunk.
+    // Only pair the assistant payload with this prefix when both end at the
+    // exact same absolute position; otherwise the next turn must rebuild it.
+    const dflash_commit: ?prefix_cache_mod.DflashCommit = if (gen_ptr.dflash_ctx) |*dc|
+        if (dflashContextCoversPrefix(dc.absLen(), total_len))
+            .{ .cache = &dc.cache, .base_pos = dc.base_pos }
+        else
+            null
+    else
+        null;
+    // MTP committed history: unlike dflash there is no exact-coverage
+    // requirement — the restore clamps to the matched length and declines a
+    // history that ends short, so a partial history (the deferred-stash lag,
+    // a runtime disable) is still worth committing. What MUST hold is that
+    // only COMMITTED entries are snapshotted: truncate off the speculative
+    // draft tail first (offset-only, cheap).
+    const mtp_commit: ?prefix_cache_mod.DflashCommit = blk: {
+        const mc = if (gen_ptr.mtp_cache) |*m| m else break :blk null;
+        // A released module head is another slot's to read now; the history stopped
+        // growing at the switch anyway.
+        if (gen_ptr.mtpModuleHeadReleased()) break :blk null;
+        const committed = gen_ptr.mtpCommittedHistoryLen();
+        if (committed == 0) break :blk null;
+        mc.truncate(committed, slot.model.transformer.?.s) catch |err| {
+            log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
+            break :blk null;
+        };
+        // The qwen4_exp in-checkpoint head also commits its QSA half.
+        mc.activate();
+        const head = mc.head();
+        // Its row count IS its cache's step (`KVCache.update` never advances a non-zero
+        // layer index); a snapshot whose step disagrees is refused, and says why.
+        if (head) |t| {
+            const hm = &t.qwen4_mtp.?;
+            if (hm.cache.step != hm.seq_offset) {
+                log.warn("[hot-cache] mtp head step gap (cache.step={d}, history={d} rows) — head history not committed\n", .{ hm.cache.step, hm.seq_offset });
+                break :blk null;
+            }
+        }
+        break :blk .{
+            .cache = mc.kv() orelse break :blk null,
+            .base_pos = gen_ptr.mtp_position_base,
+            .head = if (head) |t| &t.qwen4_mtp.?.entry else null,
+            .head_pos_base = if (head) |t| t.qwen4_mtp.?.pos_base else 0,
+            .head_marks = if (head) |t| t.qwen4MtpMarks() else &.{},
+        };
     };
+    const finish_st = hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit, slot.full_prompt.len) catch |err| {
+        // Ownership of the checkpoints transferred to the cache regardless of
+        // the outcome — its error paths free them (#330 adjacent: freeing
+        // here too was a double free, with a different allocator).
+        log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    publishHotCacheResidency(sch);
+    // The decline paths already log their reason inside the cache; a silent
+    // `_ =` here is fine — this caller has no commit-shaped log to lie about.
+    _ = finish_st;
+}
+
+/// Logical committed length for a cancelled-prefill commit: the tokens
+/// actually forwarded into the KV when the chunk loop aborted, clamped to
+/// the prompt and gated on the floor below which an entry is LRU pollution
+/// rather than saved work. Pure so the policy is unit-testable without a slot.
+fn cancelledPrefillCommitLen(step: usize, prompt_len: usize) ?usize {
+    const len = @min(step, prompt_len);
+    if (len < prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS) return null;
+    return len;
+}
+
+/// Commit the forwarded prefix of a prefill the client disconnected from
+/// (error.Cancelled out of `Generator.initWithOptions`; `legacy_gen` was
+/// never assigned). The partial KV in `slot.cache` is valid — every chunk
+/// that ran was a real forward — so the next request sharing this prefix
+/// skips exactly those chunks. The entry key is the forwarded prefix ONLY:
+/// `full_prompt` beyond `cache.step` was never forwarded and must not ride
+/// the key (a key longer than its KV is the alignment-error class).
+///
+/// Hybrids commit iff checkpoints were salvaged (`slot.cancelled_prefill`):
+/// `initWithOptions` hands its captured stride checkpoints to the slot on
+/// the abort, and they restore exactly like a normal finish's. KV-only
+/// hybrid entries still restore as a cold miss ("hybrid miss") while
+/// occupying an LRU slot, so a salvage-less hybrid prefill is declined —
+/// the cancel landed before the first stride boundary. decode-phase cancels
+/// keep their checkpoints in the live Generator and commit through the
+/// normal arm above.
+fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache) void {
+    const salvage = &slot.cancelled_prefill;
+    // Hybrid restore requires SSM checkpoints; a checkpoint-less hybrid
+    // entry restores as a cold miss ("hybrid miss") while occupying an LRU
+    // slot. Non-hybrids commit KV-only.
+    if (slot.ssm_entries != null and salvage.checkpoints.len == 0) {
+        log.debug("[hot-cache] cancelled prefill carried no stride checkpoints — a hybrid entry would restore as a miss; not committed\n", .{});
+        return;
+    }
+    // The sink's `forwarded` is the authoritative length — `cache.step`
+    // only advances when Generator init completes, so it reads 0 on every
+    // aborted prefill.
+    const len = cancelledPrefillCommitLen(salvage.forwarded, slot.full_prompt.len) orelse {
+        log.debug("[hot-cache] cancelled prefill forwarded < {d} tokens — below the commit floor; not committed\n", .{prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS});
+        return;
+    };
+    const cps: ?[]transformer_mod.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
+    // Pass the media boundary RAW: when the cancelled prefill forwarded less
+    // than the media position, the cache re-keys the pure-text entry to the
+    // null vision key (a kept pixel key with no boundary is the
+    // conservative-rejection poison shape; live 2026-09-07).
+    const media_start = slot.media_start;
+    // Ownership of the checkpoints transfers to the cache unconditionally —
+    // its error paths free them (#330 adjacent) — so detach from the slot
+    // BEFORE the call or Slot.deinit frees them a second time.
+    slot.cancelled_prefill = .{};
+    const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
+        log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    // Truthful outcome only: a budget decline must never print as a commit
+    // (live 2026-09-07: "skipped oversized" + "committed N/M" were the SAME
+    // event and the cache looked healthy while a 122k session re-prefilled
+    // ~95k tokens per retry).
+    switch (st) {
+        .ok => |n| log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled prefill\n", .{ n, slot.full_prompt.len }),
+        .kept_resident => |n| log.info("[hot-cache] kept resident {d}-token entry; oversized candidate declined\n", .{n}),
+        .declined => {},
+    }
 }
 
 /// Phase A6: finalize a slot. Commits to hot prefix cache (if applicable)
@@ -3414,27 +5155,151 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
 /// has collapsed into a short repeating cycle, returns the finish reason to
 /// cut the request with; null while generation is healthy.
 ///
-/// The reason is "length", NOT "stop": the SERVER is truncating the generation
-/// (the model didn't finish — we cut a runaway loop), and "length" is the one
-/// reason server.toolCallFinishReason preserves through tool-call parsing, so
-/// a call salvaged from the cut buffer reaches the client as a TRUNCATION and
-/// its recovery fires. Live 2026-07-14 (plang/php.html): "stop" became
-/// "tool_calls", presenting a server-cut fragment as a model-completed write.
+/// The reason is "stop", not "length": this guard fired far below the requested
+/// output cap, and clients such as pi treat "length" as context-overflow recovery
+/// and compact unnecessarily. The server separately suppresses tool-call parsing
+/// for this cause, so a cut fragment cannot be promoted to a completed call.
 pub fn loopStopReason(generated_ids: []const u32) ?[]const u8 {
-    if (generate_mod.isDegenerateTailLoop(
-        generated_ids,
-        generate_mod.degenerate_loop_max_period,
-        generate_mod.degenerate_loop_reps,
-    )) return "length";
-    return null;
+    const d = loopStopDecision(generated_ids) orelse return null;
+    return d.finish_reason;
+}
+
+/// What a loop cut tells the rest of the server. `finish_reason` is the wire
+/// value (always "stop" — see above); `finish_details` is the sibling
+/// signal that names the CAUSE, and `trim_start` is where the client's copy
+/// of the answer should end.
+pub const LoopStop = struct {
+    finish_reason: []const u8 = "stop",
+    /// The `finish_details.type` value. One string for all three tiers: a
+    /// client's decision ("this turn is unusable, don't feed it back") is the
+    /// same whichever tier convicted, and the tier is in the log.
+    finish_details: []const u8 = "repetition_loop",
+    tier: generate_mod.DegenerateTail.Tier,
+    trim_start: usize,
+};
+
+/// Pure decision + trim point. The three tiers live in generate.zig
+/// (`degenerateTail`); this is where their verdict becomes server behaviour.
+pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
+    const d = generate_mod.degenerateTail(generated_ids) orelse return null;
+    return .{ .tier = d.tier, .trim_start = d.start };
+}
+
+var loop_trim_env: ?bool = null;
+/// `MLX_SERVE_LOOP_TRIM=0` keeps the whole degenerate tail in the response —
+/// the A/B arm, and the escape hatch for anyone who needs to see exactly what
+/// the model emitted. The cut itself is unaffected either way.
+pub fn loopTrimEnabled() bool {
+    if (loop_trim_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_LOOP_TRIM");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    loop_trim_env = enabled;
+    return enabled;
+}
+
+/// The terminator a finishing slot publishes, and the only caller of `Slot.markFinished`.
+/// `latched` is a peek (`mlx.peekErrorName`): a decode forward that failed can still hand
+/// back a plausible EOS, and the request must not finish 200 on it. The tick wrapper still
+/// owns the latch and fails the rest of a batched group with it.
+fn publishSlotTerminator(slot: anytype, reason: []const u8, latched: ?[]const u8) void {
+    if (latched) |name| {
+        slot.markError(name);
+        return;
+    }
+    slot.markFinished(reason);
+}
+
+/// Decoded bytes of the answer that ride the `[short-gen]` line.
+const SHORT_GEN_TEXT_CAP = 200;
+
+/// `emitted` (what the client got) and `realized` (what the generator appended) diverge only on a block path.
+fn formatShortGen(
+    out: []u8,
+    reason: []const u8,
+    emitted: u32,
+    ids: []const u32,
+    text: []const u8,
+    path: []const u8,
+) []const u8 {
+    var n: usize = 0;
+    n += (std.fmt.bufPrint(out[n..], "[short-gen] reason={s} emitted={d} realized={d} ids=[", .{ reason, emitted, ids.len }) catch return out[0..n]).len;
+    for (ids, 0..) |id, i| {
+        const sep: []const u8 = if (i == 0) "" else ",";
+        n += (std.fmt.bufPrint(out[n..], "{s}{d}", .{ sep, id }) catch break).len;
+    }
+    n += (std.fmt.bufPrint(out[n..], "] bytes=\"", .{}) catch return out[0..n]).len;
+    var cap = @min(text.len, SHORT_GEN_TEXT_CAP);
+    // A token is a BPE fragment: never cut inside a multi-byte sequence.
+    while (cap > 0 and cap < text.len and (text[cap] & 0xC0) == 0x80) cap -= 1;
+    for (text[0..cap]) |c| {
+        var one = [_]u8{if (c < 0x20) ' ' else c};
+        const esc: []const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => one[0..1],
+        };
+        if (n + esc.len > out.len) break;
+        @memcpy(out[n..][0..esc.len], esc);
+        n += esc.len;
+    }
+    n += (std.fmt.bufPrint(out[n..], "\" path={s}", .{path}) catch return out[0..n]).len;
+    return out[0..n];
+}
+
+/// A one-word answer and a block-path handling bug look identical until the ids are named.
+fn logShortGen(slot: *Slot, reason: []const u8) void {
+    const gen = if (slot.legacy_gen) |*g| g else return;
+    const mode = specTickMode(
+        slot.enable_mtp,
+        gen.mtp != null,
+        slot.enable_drafter,
+        gen.drafter != null,
+        gen.dflash != null,
+        slot.enable_pld,
+        gen.pld_enabled,
+        gen.dspark_enabled,
+    );
+    const ids = gen.generated_ids.items;
+    const decoded: ?[]u8 = if (slot.model.tokenizer) |tok|
+        (tok.decode(slot.allocator, ids, false) catch null)
+    else
+        null;
+    defer if (decoded) |d| slot.allocator.free(d);
+    var buf: [1024]u8 = undefined;
+    log.info("{s}\n", .{formatShortGen(
+        &buf,
+        reason,
+        slot.completion_tokens,
+        ids,
+        decoded orelse "",
+        if (mode == .regular) "serial" else @tagName(mode),
+    )});
 }
 
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
-    if (slot.legacy_gen) |*g| g.logSpecStats();
+    if (slot.legacy_gen) |*g| {
+        g.logSpecStats();
+        // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
+        // wiring it only beside generate.zig's own logSpecStats() calls (the
+        // legacy/CLI path) makes it dead on every served request.
+        g.logQsaArms();
+        g.persistRoundCost();
+    }
+    const latched: ?[]const u8 = mlx.peekErrorName();
+    if (latched) |name| {
+        log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
+    }
+    if (slot.completion_tokens <= 2) logShortGen(slot, reason);
     commitSlotIfApplicable(sch, slot);
+    // Restore by move: a slot that ended without committing still holds its checkout, and
+    // the record now describes bytes that die with `slot.cache`. Above every early return.
+    if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the
     // broadcast: the conn thread may complete()+free the slot immediately.
@@ -3452,7 +5317,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // e2e = first_token_ns + decode_ns.
     if (sch.metrics) |m| {
         m.recordRequest(
-            reason,
+            if (latched != null) "error" else reason,
             slot.first_token_ns,
             slot.prefill_ns,
             slot.decode_ns,
@@ -3461,9 +5326,15 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
             slot.cached_tokens,
         );
     }
-    slot.markFinished(reason);
+    publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
-        if (stream_opt) |s| hc.flushPendingDisk(s);
+        if (stream_opt) |s| {
+            hc.flushPendingDisk(s);
+            // After the flush, so this turn's entry is the MRU one and any entry spilled
+            // already has a complete copy to spill into.
+            hc.spillIdleEntries(s);
+            publishHotCacheResidency(sch);
+        }
     }
     // Return this turn's transients to the OS. The per-`CACHE_CLEAR_INTERVAL`
     // clear inside `Generator.advanceStep` can't cover the tail of a turn, and
@@ -3473,12 +5344,10 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     _ = mlx.mlx_clear_cache();
 }
 
-/// ds4 prefill: create a session sized to the configured ctx and sync it to
-/// the full prompt. ds4 internally reuses the common prefix between its live
-/// session cache and the new prompt, so the mlx-serve hot prefix cache stays
-/// out of the picture. `slot.prompt_tokens` reports the full prompt length;
-/// `cached_tokens` is left at 0 (ds4 doesn't expose its per-session reuse
-/// count back through the FFI).
+/// ds4 prefill: sync the model's ONE persistent session to the full prompt.
+/// ds4 keeps the common prefix against the session's live KV (the previous
+/// request's prompt + reply) and rebuilds only the tail, so the mlx-serve hot
+/// prefix cache stays out of the picture. `cached_tokens` is that prefix.
 fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !void {
     _ = sch;
     // Convert the slot's u32 prompt to ds4's i32 view. Sized once per
@@ -3494,14 +5363,22 @@ fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !voi
     // ds4's default. Larger ctx → larger KV scratch up front.
     const req_ctx: u32 = if (slot.model.config) |c| c.max_position_embeddings else 0;
     const ctx_size: i32 = @intCast(arch_ds4.clampSessionCtx(req_ctx));
-    var sess = try engine.createSession(ctx_size);
-    errdefer sess.free();
+    const sess = slot.model.ds4_session orelse blk: {
+        const created = try engine.createSession(ctx_size);
+        slot.model.ds4_session = created;
+        break :blk created;
+    };
 
-    try sess.sync(i32_prompt);
+    const cached = sess.commonPrefix(i32_prompt) catch 0;
+    sess.sync(i32_prompt) catch |err| {
+        // Leave nothing half-built behind for the next request.
+        sess.invalidate();
+        return err;
+    };
 
     slot.ds4_session = sess;
     slot.prompt_tokens = @intCast(slot.full_prompt.len);
-    slot.cached_tokens = 0;
+    slot.cached_tokens = @intCast(@max(cached, 0));
     slot.state = .decoding;
 }
 
@@ -3645,12 +5522,17 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
     // verifies several more, advancing ds4's KV internally (no separate eval).
     // It emits `[sampled, accepted…]`, so this tick may push several tokens.
     // Mirrors ds4's own CLI loop; engages only under greedy sampling.
-    if (ds4MtpShouldEngage(engine.hasMtp(), engine.mtpDraftTokens(), slot.sampling.temperature)) {
+    if (ds4MtpShouldEngage(engine.mtpDraftTokens(), slot.sampling.temperature, engine.embedded_mtp)) {
         var spec_buf: [DS4_MTP_MAX_TOKENS]i32 = undefined;
         const done: i64 = @intCast(slot.completion_tokens);
         const cap: i64 = @intCast(slot.max_tokens);
         const remaining: i32 = @intCast(@max(@as(i64, 1), cap - done));
-        const n = session.evalSpeculative(next_id, remaining, engine.eosToken(), spec_buf[0..]) catch {
+        const spec = if (slot.sampling.temperature <= 0.0)
+            session.evalSpeculative(next_id, remaining, engine.eosToken(), spec_buf[0..])
+        else
+            session.evalSpeculativeSampled(next_id, remaining, engine.eosToken(), slot.sampling.temperature, @intCast(slot.sampling.top_k), slot.sampling.top_p, 0.05, &slot.ds4_rng, spec_buf[0..]);
+        const n = spec catch {
+            session.invalidate();
             slot.markError("ds4_spec_failed");
             return;
         };
@@ -3679,7 +5561,10 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
 
     // Advance ds4's KV by feeding the freshly-sampled token. After this
     // the session is in the state expected by the NEXT decode tick.
-    try session.eval(next_id);
+    session.eval(next_id) catch |err| {
+        session.invalidate();
+        return err;
+    };
 
     if (slot.completion_tokens >= slot.max_tokens) {
         finishSlot(sch, slot, "length");
@@ -3687,14 +5572,25 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
     }
 }
 
-test "ds4MtpShouldEngage: draft head + >1 draft tokens + greedy" {
-    // Engages only greedily (ds4's spec path is argmax) with a loaded head.
-    try std.testing.expect(ds4MtpShouldEngage(true, 4, 0.0));
-    try std.testing.expect(ds4MtpShouldEngage(true, 2, -1.0));
-    // No head, or 1 draft token, or sampling (temp>0) → regular decode.
-    try std.testing.expect(!ds4MtpShouldEngage(false, 4, 0.0));
-    try std.testing.expect(!ds4MtpShouldEngage(true, 1, 0.0));
-    try std.testing.expect(!ds4MtpShouldEngage(true, 4, 0.7));
+test "ds4MtpShouldEngage: >1 draft tokens + greedy (legacy MTP and DSpark)" {
+    // Engages only greedily (ds4's spec path is argmax) with a ready draft.
+    // The draft-token count IS the readiness signal for BOTH support kinds:
+    // legacy MTP reports its configured draft count only when `mtp_ready`,
+    // DSpark reports its block size only when `--dspark` armed the runtime
+    // (ds4_engine_mtp_draft_tokens) — a has_mtp conjunct here would leave
+    // DSpark (has_mtp=false by design) permanently unreachable, the
+    // engagement-blind dispatch-hole class.
+    try std.testing.expect(ds4MtpShouldEngage(4, 0.0, false));
+    try std.testing.expect(ds4MtpShouldEngage(2, -1.0, false));
+    // DSpark block size (e.g. 16) engages the same way.
+    try std.testing.expect(ds4MtpShouldEngage(16, 0.0, false));
+    // No ready draft (0), or 1 draft token, or sampling → regular decode.
+    try std.testing.expect(!ds4MtpShouldEngage(0, 0.0, false));
+    try std.testing.expect(!ds4MtpShouldEngage(1, 0.0, false));
+    try std.testing.expect(!ds4MtpShouldEngage(4, 0.7, false));
+    // The in-checkpoint head (Qwen3.8 Flash Next, GLM 5.x) drafts under sampling too.
+    try std.testing.expect(ds4MtpShouldEngage(2, 0.7, true));
+    try std.testing.expect(!ds4MtpShouldEngage(0, 0.7, true));
 }
 
 /// llama.cpp decode tick: argmax (temp < 0.01, matching the MLX greedy
@@ -3806,10 +5702,226 @@ fn runDiffusionDecodeTick(sch: *Scheduler, slot: *Slot, runner: *diffusion_mod.R
     }
 }
 
+/// Scale the measured M5/block-16 break-even to the effective number of
+/// draft positions. `block_size` includes the always-emitted anchor. Thinking
+/// is the actual resolved request mode; tools are neither necessary nor
+/// sufficient for a reasoning preamble.
+fn dflashGateMinimum(block_size: u32, enable_thinking: bool, moe_target: bool) f32 {
+    const drafts = block_size -| 1;
+    if (drafts == 0) return 0;
+    const calibrated_min = if (enable_thinking)
+        generate_mod.Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND
+    else
+        generate_mod.Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND;
+    const scaled = calibrated_min * @as(f32, @floatFromInt(drafts)) / 15.0;
+    // The bar is really "round cost / serial step cost", and the whole
+    // calibration above was measured on DENSE trunks where one verify forward
+    // costs about one serial step. A sparse trunk breaks that: an A1B MoE
+    // decodes ~1B of weights per token but its verify reads every expert the
+    // block's positions route to, so a round costs far more than a step while
+    // the bar stayed at 0.53 and nothing ever disabled.
+    //
+    // Measured LFM2.5-8B-A1B + its DSpark sidecar, M4 Max, block 5, greedy:
+    // novel prose accepts 1.40/round and runs 171 tok/s against 199 serial
+    // (round cost = 1.40 x 199/171 = 1.63 steps), while an echo prompt accepts
+    // 4.00 and runs 273. A floor of 1.8 disables the losing class after its
+    // three warmup rounds and leaves the winning one untouched.
+    if (!moe_target) return scaled;
+    return @max(scaled, generate_mod.Generator.DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND);
+}
+
 /// Allocate the slot's KVCache state (already done in Slot.init), construct
 /// the per-slot Generator via `Generator.initWithOptions(.{ .ctx = slot.ctx,
 /// .skip_lazy_preforward = true_for_regular, ... })`, and store it on the
 /// slot. After return, the slot is ready for decode ticks.
+/// Kill switch for prefill-side interleaving (MLX_SERVE_PREFILL_INTERLEAVE=0
+/// restores whole-prefill-then-decode scheduling). Default ON: the hook
+/// no-ops when nothing is decoding, so an idle or single-stream server never
+/// pays for it.
+var prefill_interleave_cached: ?bool = null;
+pub fn prefillInterleaveEnabled() bool {
+    if (prefill_interleave_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PREFILL_INTERLEAVE");
+    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    prefill_interleave_cached = on;
+    return on;
+}
+
+const InterleaveCtx = struct {
+    sch: *Scheduler,
+    decode_ns: u64 = 0,
+    ticks: u32 = 0,
+};
+
+/// SSD-first write-through: persist each completed prefill chunk as the prefill produces it,
+/// so a cancelled or killed prefill leaves a restorable chunk-aligned prefix. Armed only with
+/// a live background writer, so the inference thread never pays the file write.
+fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const transformer_mod.SSMCheckpoint) void {
+    const wc: *WriteThroughCtx = @ptrCast(@alignCast(opaque_ctx));
+    const slot = wc.slot;
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
+    if (!hc.ssd_first) return;
+    const d = if (hc.disk) |*dd| dd else return;
+    if (d.writer == null) return;
+    if (slot.vision_key != 0) return;
+    if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
+    const s = if (slot.model.transformer) |x| x.s else return;
+    wc.chunks += 1;
+    // Bounded to one chunk per boundary: this runs inside the prefill.
+    _ = d.appendCommitBounded(
+        slot.cache.entries,
+        abs_kv_pos,
+        slot.cache.config,
+        slot.full_prompt[0..abs_kv_pos],
+        slot.has_tools,
+        if (cps.len > 0) cps else null,
+        s,
+        WRITE_THROUGH_FLUSH_BOUND_BYTES,
+    ) catch |err| {
+        log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
+    };
+}
+
+/// The write-through hook's per-call flush bound: one byte, so the chunk loop stops after the first chunk it writes.
+pub const WRITE_THROUGH_FLUSH_BOUND_BYTES: u64 = 1;
+
+const WriteThroughCtx = struct {
+    slot: *Slot,
+    chunks: u32 = 0,
+};
+
+/// The write-through only pays when this turn's prefill produces at least one whole disk
+/// chunk: below that it persisted a warm turn's whole restored prefix inside TTFT
+/// (+183/+369/+737 ms at 16k/32k/64k) for a prefix the end-of-request commit persists anyway.
+fn writeThroughSpanReached(new_span: usize, chunk_tokens: u32) bool {
+    return new_span >= chunk_tokens;
+}
+
+var write_through_span_declined_logged = std.atomic.Value(bool).init(false);
+var write_through_off_logged = std.atomic.Value(bool).init(false);
+var write_through_env_cached: ?bool = null;
+
+/// `MLX_SERVE_SSD_WRITE_THROUGH=0` takes the write-through out of the prefill loop; the
+/// end-of-request commit then persists the whole turn. A real two-arm tradeoff (crash-safe
+/// prefix vs TTFT) and the only way to A/B its cost.
+pub fn writeThroughEnabledFromEnv(raw: ?[]const u8) bool {
+    const v = raw orelse return true;
+    return !std.mem.eql(u8, v, "0");
+}
+
+/// Read on the inference thread only.
+fn writeThroughEnabled() bool {
+    if (write_through_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_SSD_WRITE_THROUGH") orelse break :blk writeThroughEnabledFromEnv(null);
+        break :blk writeThroughEnabledFromEnv(std.mem.sliceTo(raw, 0));
+    };
+    write_through_env_cached = v;
+    return v;
+}
+
+/// The one gate for the write-through: SSD-first + a live writer + a disk tier + a new span
+/// worth at least one chunk.
+fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
+    if (!writeThroughEnabled()) {
+        if (hc.ssd_first and !write_through_off_logged.swap(true, .monotonic)) {
+            log.info("  [disk-cache] prefill write-through disabled by MLX_SERVE_SSD_WRITE_THROUGH=0 — the end-of-request commit persists every turn\n", .{});
+        }
+        return false;
+    }
+    if (!hc.ssd_first) return false;
+    const d = if (hc.disk) |*dd| dd else return false;
+    const writer_up = d.writer != null;
+    if (!writer_up or slot.vision_key != 0) return false;
+    if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
+        if (!write_through_span_declined_logged.swap(true, .monotonic)) {
+            log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) — the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
+        }
+        return false;
+    }
+    return true;
+}
+
+/// Context for `Generator.InitOptions.chunk_width_hook`. `cfg` is optional (embedded engines).
+const ChunkWidthCtx = struct {
+    cfg: ?*const model_mod.ModelConfig,
+    kv_bits: u64,
+    /// This slot's own per-model cache, never `sch.hot_prefix_cache`; only `stagedHostBytes`
+    /// is read, on the inference thread.
+    hc: ?*prefix_cache_mod.HotPrefixCache,
+};
+
+/// Host bytes the SSD writer is holding for this slot right now.
+fn chunkWidthStagedBytes(wc: *ChunkWidthCtx) u64 {
+    const hc = wc.hc orelse return 0;
+    return hc.stagedHostBytes();
+}
+
+fn chunkWidenConfirmCb(opaque_ctx: *anyopaque, pos: usize, want: u32) bool {
+    const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
+    const cfg = wc.cfg orelse return false;
+    const ok = prefill_chunk_widen_ok orelse return false;
+    return ok(cfg, wc.kv_bits, pos, want, chunkWidthStagedBytes(wc));
+}
+
+fn chunkWidthCb(
+    opaque_ctx: *anyopaque,
+    pos: usize,
+    cur: u32,
+    cap: u32,
+    st: *generate_mod.AdaptiveWidthState,
+) u32 {
+    const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
+    const cfg = wc.cfg orelse return cur;
+    const pick = prefill_chunk_adapt orelse return cur;
+    return pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
+}
+
+fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
+    const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
+    if (ic.ticks == 0) {
+        log.debug("[interleave] engaged: decode ticks between prefill chunks\n", .{});
+    }
+    ic.ticks += 1;
+    ic.decode_ns +|= interleaveDecodeTick(ic.sch);
+}
+
+/// One decode tick for the streams currently decoding, run from INSIDE a
+/// prefill (between chunks, and between the slots of one admitted batch).
+/// Returns the tick's wall-clock ns (0 when no stream is active). The
+/// prefilling slot is not in `decoding` yet, so the tick only advances OTHER
+/// requests' Generators — same-thread MLX, no reentrancy into this prefill.
+fn interleaveDecodeTick(sch: *Scheduler) u64 {
+    var buf: [32]*Slot = undefined;
+    var n: usize = 0;
+    sch.queue_mu.lockUncancelable(sch.io);
+    for (sch.decoding.items) |s| {
+        if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+        if (n >= buf.len) break;
+        buf[n] = s;
+        n += 1;
+    }
+    sch.queue_mu.unlock(sch.io);
+    if (n == 0) return 0;
+    // The interval since these slots' previous tick contains a prefill chunk; the serial
+    // cell must not fold it as a token's wall time. Drop it; the next tick seeds afresh.
+    for (buf[0..n]) |s| {
+        if (s.legacy_gen) |*g| {
+            g.invalidateSerialClock();
+            g.invalidateRoundClock();
+        }
+    }
+    var sw = io_util.Stopwatch.init(sch.io);
+    runDecodeTick(sch, buf[0..n]) catch |err| {
+        log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});
+        for (buf[0..n]) |s| s.markError(@errorName(err));
+    };
+    const tick_ns = sw.read();
+    for (buf[0..n]) |s| s.decode_ns +|= tick_ns;
+    return tick_ns;
+}
+
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
@@ -3824,6 +5936,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     defer if (observe) {
         _ = sch.requests_prefilling.fetchSub(1, .monotonic);
         sch.inflight_prefill_tokens.store(0, .monotonic);
+        sch.inflight_prefill_expected.store(0, .monotonic);
     };
 
     // ds4-backed model: bypass the MLX prefill path entirely. The ds4
@@ -3854,6 +5967,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.ctx.mrope_delta = slot.mrope_delta;
     slot.ctx.capture_hidden = null;
     slot.ctx.kv_attn_fused = slot.kv_attn_fused;
+    if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
 
     // deepseek_v4: PLD/drafter/qwen-MTP verify passes through forwardWith
     // would APPEND draft tokens to module-owned state and corrupt every later
@@ -3863,14 +5977,40 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // mode (stage-bearing checkpoint + clean-greedy request) or zero
     // everything. skip_lazy_preforward deliberately ignores the intent bit:
     // a non-armed dsv4 request keeps today's synchronous-t1 serial init.
-    const is_dsv4 = slot.model.transformer != null and slot.model.transformer.?.dsv4 != null;
-    const use_mtp = !is_dsv4 and slot.enable_mtp and slot.mtp != null;
-    const use_drafter = !use_mtp and !is_dsv4 and slot.enable_drafter and slot.drafter != null;
-    const use_pld = !use_mtp and !use_drafter and !is_dsv4 and slot.enable_pld;
-    // DSpark rides the MTP flag alone (the "model's native head" semantics):
-    // the server defaults enable_mtp ON for a stage-bearing dsv4, the n-gram
-    // prompt gate never touches it, and enable_mtp:false opts out.
-    const dsv4_spec_intent = is_dsv4 and slot.enable_mtp;
+    // A module-owned arch that CAN rewind (`moduleStateSpecRollback`) may run
+    // its own MTP head; PLD/drafter stay off there for the reasons in
+    // `specInitWiring`. DSpark rides the MTP flag alone (the
+    // "model's native head" semantics): the server defaults enable_mtp ON for a
+    // stage-bearing dsv4, the n-gram prompt gate never touches it, and
+    // enable_mtp:false opts out.
+    // Module CLASS (owned or shared-readonly), not ownership alone: qwen4
+    // batches its plain slots but its spec wiring stays the module one.
+    const owns_module_state = slot.model.transformer != null and
+        slot.model.transformer.?.moduleSpecWiring();
+    const has_native_draft = slot.model.transformer != null and
+        slot.model.transformer.?.dsv4 != null;
+    const module_spec_rollback = slot.model.transformer != null and
+        slot.model.transformer.?.moduleStateSpecRollback();
+    const wiring = specInitWiring(
+        owns_module_state,
+        module_spec_rollback,
+        has_native_draft,
+        slot.enable_mtp,
+        slot.mtp != null,
+        slot.enable_drafter,
+        slot.drafter != null,
+        slot.dflash != null,
+        slot.enable_pld,
+    );
+    const use_mtp = wiring.use_mtp;
+    const use_drafter = wiring.use_drafter;
+    const use_dflash = wiring.use_dflash;
+    const use_pld = wiring.use_pld;
+    const dsv4_spec_intent = wiring.native_intent;
+    log.debug("[spec-wiring] mtp={} dflash={} drafter={} pld={} (slot: drafter_flag={} dflash_handle={} drafter_handle={})\n", .{
+        use_mtp,             use_dflash,          use_drafter,          use_pld,
+        slot.enable_drafter, slot.dflash != null, slot.drafter != null,
+    });
 
     // Phase A6: prefill source-of-truth is `slot.full_prompt` — the conn
     // thread's `reuseKVCache` may have trimmed `slot.prompt_ids` based on
@@ -3885,19 +6025,60 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // per-request, so prefix matching would reuse stale features.
     var prefill_tokens: []const u32 = slot.full_prompt;
     var hot_matched: u32 = 0;
+    // Did the restore check out its entry (restore by move)? Only then are its rows credited.
+    var hot_checked_out: bool = false;
+    // The DFlash assistant's context rides the prefix cache: a restore
+    // forwards no trunk layers, so without it the assistant starts every
+    // reused turn blind and drafts against nothing. Measured on Muse 4-bit,
+    // 160-token generations: a full-prefix hit cost 92.6% -> 66.5% per-draft
+    // acceptance and 80.2 -> 60.9 tok/s. Adopted by the Generator below.
+    var dflash_restored: ?dflash_mod.DflashCtx = null;
+    errdefer if (dflash_restored) |*dc| dc.deinit();
+    // The MTP head's committed history rides the prefix cache the same way:
+    // it is built from trunk hiddens, a restore forwards nothing, and a
+    // blind start collapses acceptance (measured ~70 -> ~38 tok/s on warm
+    // Qwen3.6-27B echo). Adopted by the Generator below.
+    var mtp_restored: ?generate_mod.MtpRestored = null;
+    errdefer if (mtp_restored) |*mr| mr.cache.deinit();
     // Phase D: per-slot model — pull transformer + prefix cache off the
     // slot's LoadedModel. Both stay resident for the slot's lifetime
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     if (slot.model.prefix_cache) |*hc| {
-        if (slot.vision_embeddings == null) {
-            const lookup = hc.lookupAndRestore(
+        {
+            // Only build a restore target when this request will actually
+            // draft — a non-dflash turn leaves the payload in the entry for
+            // the next one that does.
+            var dfl_target: ?dflash_mod.DflashCtx = if (use_dflash and slot.dflash != null)
+                dflash_mod.DflashCtx.init(slot.allocator, slot.dflash.?, 0) catch null
+            else
+                null;
+            errdefer if (dfl_target) |*dc| dc.deinit();
+            var dfl_base: usize = 0;
+            var mtp_target: ?generate_mod.MtpCacheRef = if (use_mtp and slot.mtp != null)
+                slot.mtp.?.makeCache(slot.allocator) catch null
+            else
+                null;
+            errdefer if (mtp_target) |*mc| mc.deinit();
+            var mtp_base: usize = 0;
+            const mtp_kv: ?*KVCache = if (mtp_target) |*mc| mc.kv() else null;
+            // qwen4_exp: the head's QSA half travels with its KV; adoption is all-or-nothing.
+            const mtp_head: ?*Transformer = if (mtp_target) |*mc| mc.head() else null;
+            // Restore by move: the slot names itself, opting into the checkout; `finishSlot`
+            // releases it on every path that ends the slot.
+            const lookup = hc.lookupAndRestoreWithMedia(
                 &slot.cache,
                 &slot.moe_seq_offset,
                 slot.ssm_entries,
                 xfm_ptr.s,
                 slot.full_prompt,
                 slot.has_tools,
+                slot.vision_key,
+                slot.media_start,
+                if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
+                if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null,
+                @intFromPtr(slot),
+                slot.skip_prefix_cache,
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
@@ -3905,6 +6086,29 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
                 hot_matched = @intCast(lookup.matched);
                 prefill_tokens = slot.full_prompt[hot_matched..];
+                hot_checked_out = lookup.checked_out;
+            }
+            if (dfl_target) |*dc| {
+                // Adopt only a context that lines up EXACTLY with the trunk
+                // cursor — `nextDflash` asserts `absLen() == cache.step`, and
+                // a blind start is always a valid fallback.
+                if (lookup.dflash_base != null and dfl_base + dc.cache.step == hot_matched) {
+                    dc.base_pos = dfl_base;
+                    dflash_restored = dc.*;
+                } else {
+                    dc.deinit();
+                }
+                dfl_target = null;
+            }
+            if (mtp_target) |*mc| {
+                // Same exact-alignment rule (the Generator asserts
+                // `base + step == ssm_cp_offset` on adoption).
+                if (lookup.mtp_base != null and mtp_base + mc.step() == hot_matched) {
+                    mtp_restored = .{ .cache = mc.*, .base = mtp_base };
+                } else {
+                    mc.deinit();
+                }
+                mtp_target = null;
             }
         }
     }
@@ -3918,6 +6122,129 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const cp_stride: u32 = if (slot.model.prefix_cache != null) slot.model.ssm_checkpoint_stride else 0;
     const cp_max: u32 = slot.model.ssm_checkpoint_max;
 
+    // Evict the hot cache to admit (#353). Here, not on the connection thread: the inference
+    // thread is the sole mlx caller and the restore has already happened, so the entry this
+    // request uses is the MRU one. The estimator is re-asked after every eviction.
+    // `admitted_prefill_chunk` is the pre-eviction width (0 = no pass ran); the width is
+    // re-asked after the pass against the live delta.
+    var admitted_prefill_chunk: u32 = 0;
+    var evicted_live_bytes: u64 = 0;
+    // Arch gate for the whole pass; the connection-thread half is gated in
+    // `server.prefillAdmissionBill`. `publishHotCacheResidency` is not gated.
+    const admission_pass_armed = if (slot.model.config) |c| c.longCtxGated() else false;
+    if (admission_pass_armed) if (prefill_admission_fits) |fits_fn| {
+        if (slot.model.config) |cfg| {
+            // Bills the request's own kv-quant scheme and vision chunking, not the process defaults.
+            const Probe = struct {
+                cfg: *const model_mod.ModelConfig,
+                seq: usize,
+                max_tokens: u32,
+                kv_cfg: transformer_mod.KVQuantConfig,
+                unchunked: bool,
+                /// The prefix the hot cache restored and the capacity its buffers hold: already
+                /// inside active memory, so billing them again invents a copy.
+                warm_matched: u64,
+                warm_capacity: u64,
+                /// Only a checked-out restore is credited: a refcount share is copied by the first append.
+                warm_will_donate: bool,
+                enable_mtp: bool,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) bool,
+                fn call(ctx: ?*anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp);
+                }
+            };
+            var probe = Probe{
+                .cfg = cfg,
+                .seq = slot.full_prompt.len,
+                .max_tokens = slot.max_tokens,
+                .kv_cfg = slot.cache.config,
+                .unchunked = generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
+                .warm_matched = hot_matched,
+                .warm_capacity = slot.cache.residentCapacityTokens(),
+                .warm_will_donate = hot_checked_out,
+                .enable_mtp = slot.enable_mtp,
+                .fits = fits_fn,
+            };
+            if (!Probe.call(&probe)) {
+                // The width admission was billed at, read before anything is evicted.
+                if (prefill_request_chunk) |pick_pre| {
+                    admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
+                }
+                // Per-model, off the slot: `sch.hot_prefix_cache` is whichever model loaded last.
+                // Captured by pointer: a `|hc|` capture would evict from a stack copy.
+                const report = if (slot.model.prefix_cache) |*hc|
+                    // Never evict the entry this request restored from: its buffers are shared.
+                    hc.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, true)
+                else
+                    prefix_cache_mod.EvictionReport{ .admitted = false };
+                publishHotCacheResidency(sch);
+                // What the allocator returned, not what the cache was billed for.
+                evicted_live_bytes = report.bytes;
+                if (!report.admitted) {
+                    log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
+                    if (prefill_admission_refused_log) |report_fn| {
+                        report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
+                    }
+                    // Not `error.OutOfMemory` (the MLX latch's name, a 503): this is a request the
+                    // machine cannot hold, a named 400.
+                    return error.PrefillDoesNotFit;
+                }
+            }
+        }
+    };
+
+    // The prefill width for this request, chosen after the admission pass evicted. Falls
+    // back to the load-time pin without the hook or the arch opt-in.
+    const req_prefill_chunk: u32 = if (slot.model.config) |cfg| blk: {
+        const pin = cfg.pinned_prefill_chunk;
+        const pick = prefill_request_chunk orelse break :blk pin;
+        const reasked = pick(
+            cfg,
+            slot.full_prompt.len,
+            slot.max_tokens,
+            slot.cache.config,
+            generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
+            hot_matched,
+            slot.cache.residentCapacityTokens(),
+            hot_checked_out,
+            slot.enable_mtp,
+        );
+        const decision = postEvictionPrefillChunk(admitted_prefill_chunk, reasked);
+        if (decision.widened) {
+            log.info("[prefill] re-ask: width {d} -> {d} after the eviction pass returned {d} MB\n", .{ admitted_prefill_chunk, decision.width, evicted_live_bytes >> 20 });
+        } else if (decision.moved) {
+            log.warn("[prefill] re-ask: width {d} is NARROWER than the admitted {d} after the eviction pass returned {d} MB — memory moved between the two reads; the re-ask is the live reading, so it runs\n", .{ decision.width, admitted_prefill_chunk, evicted_live_bytes >> 20 });
+        }
+        break :blk decision.width;
+    } else 0;
+
+    // Chunk-boundary decode yields: the hook advances already-decoding
+    // streams between this prefill's chunks. Ticks hosted here are billed
+    // out of prefill_ns below (the decoding slots got the time).
+    var interleave_ctx = InterleaveCtx{ .sch = sch };
+    var write_through_ctx = WriteThroughCtx{ .slot = slot };
+    // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
+    var width_ctx = ChunkWidthCtx{
+        .cfg = slot.model.config,
+        .kv_bits = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits,
+        .hc = if (slot.model.prefix_cache) |*p| p else null,
+    };
+
+    // Ownership of the restored spec caches transfers AT THE CALL:
+    // initWithOptions adopts them and frees them via its own errdefers on
+    // any failure past adoption (a mid-prefill disconnect throws
+    // error.Cancelled from its chunk loop). MtpCacheRef/DflashCtx hold the
+    // KVCache BY VALUE, so a second deinit from our errdefers walked freed
+    // mlx handles — SIGSEGV in freeKVEntry (issue #266). Clear FIRST.
+    const dflash_pass = dflash_restored;
+    dflash_restored = null;
+    const mtp_pass = mtp_restored;
+    mtp_restored = null;
+    // Restore by move, the transfer: the last point at which nothing has written to `slot.cache`.
+    // Everything above can still refuse and `releaseCheckout` then hands the entry back whole;
+    // nothing between here and `initWithOptions` may fail.
+    if (slot.model.prefix_cache) |*hc| hc.donateCheckout(@intFromPtr(slot));
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -3932,8 +6259,22 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .drafter_enabled = use_drafter,
             .drafter = if (use_drafter) slot.drafter else null,
             .drafter_block_size = slot.drafter_block_size,
+            .dflash_enabled = use_dflash,
+            .dflash = if (use_dflash) slot.dflash else null,
+            // The dflash-resolved block rides the shared drafter_block_size.
+            .dflash_block_size = slot.drafter_block_size,
+            // Use the resolved thinking mode and normalize the M5/block-16
+            // calibration to this machine's effective assistant width.
+            .dflash_min_accepted_per_round = dflashGateMinimum(
+                slot.drafter_block_size,
+                slot.enable_thinking,
+                slot.model.config.?.isMoe(),
+            ),
             .mtp_enabled = use_mtp,
+            .mtp_acceptance = slot.model.config.?.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default,
             .mtp = if (use_mtp) slot.mtp else null,
+            // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
+            .model_has_mtp = slot.mtp != null,
             .mtp_depth = slot.mtp_depth,
             .lookup_prompt = slot.full_prompt,
             .ctx = slot.ctx,
@@ -3941,25 +6282,60 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // exactly prompt_len with t1 NOT in cache. Generator.next's
             // transition shim sync-forwards [t1] on the first decode call.
             // PLD/drafter/MTP init paths already skip preforward unconditionally.
-            .skip_lazy_preforward = !use_pld and !use_drafter and !use_mtp,
+            .skip_lazy_preforward = !use_pld and !use_drafter and !use_mtp and !use_dflash,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
+            // A restored prefix already holds its image rows: the splice
+            // resumes at the placeholder count inside the matched prefix.
+            .vision_rows_before = if (slot.vision_embeddings != null and hot_matched > 0)
+                generate_mod.countSpliceRows(@ptrCast(slot.full_prompt[0..hot_matched]), xfm_ptr.config.image_token_id, xfm_ptr.config.audio_token_id, xfm_ptr.config.video_token_id)
+            else
+                0,
+            // The width the admission guard billed for this request; the forward can never run wider.
+            .pinned_prefill_chunk = req_prefill_chunk,
+            .dflash_ctx_restored = dflash_pass,
+            .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
             // when the client disconnects; the chunk loop checks it between
             // chunks so a ghost 40K prefill stops within one chunk.
             .cancel_flag = &slot.cancelled,
+            // Salvage sink: on abort the Generator moves its captured SSM
+            // stride checkpoints here (they die with the failed
+            // construction otherwise) so the cancelled-prefill commit can
+            // restore hybrids too.
+            .cancelled_checkpoint_sink = &slot.cancelled_prefill,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
+            .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
+            .interleave_hook = if (prefillInterleaveEnabled())
+                .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
+            else
+                null,
+            .write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))
+                .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
+            else
+                null,
+            .chunk_width_hook = if (prefill_chunk_adapt != null)
+                .{ .ctx = &width_ctx, .call = chunkWidthCb, .confirm = chunkWidenConfirmCb }
+            else
+                null,
+            // The install above is process-wide, so it is not the arch gate.
+            .adaptive_chunk_width = adaptiveChunkWidthFor(width_ctx.cfg),
             // Init's argmax-only gate must see logprobs BEFORE the split-
             // prefill final-token forward runs — a post-init field write is
             // too late for the certified lm_head prune.
             .logprobs_n = slot.logprobs_n,
         },
     );
+    slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
 
     slot.legacy_gen = gen;
+    // The last chunks' transient is freed AFTER the loop's own per-chunk clear, so it
+    // parks in MLX's pool up to the cap and the first decode tick allocates on top of
+    // it. Returned once here, at the handover — long-context gate only.
+    if (slot.legacy_gen) |*g| g.clearPoolBeforeDecode();
     // The conn thread's `cached_tokens` counted against `xfm.cache` (legacy
     // global cache) which the slot doesn't use. The slot's `cached_tokens`
     // is the hot-cache match (or 0 if the hot cache missed / isn't
@@ -3970,6 +6346,14 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.cached_tokens = hot_matched;
     slot.prompt_tokens = gen.prompt_tokens + slot.cached_tokens;
     slot.state = .decoding;
+    if (hot_matched == 0) {
+        const cold_pos = if (slot.moe_seq_offset > 0) slot.moe_seq_offset else slot.cache.step;
+        _ = restore_dump.dumpRestoreIfEnabled(&slot.cache, slot.ssm_entries, xfm_ptr.s, .{
+            .kind = "cold",
+            .pos = cold_pos,
+            .source = "cold",
+        });
+    }
 }
 
 /// Sum the in-flight generated tokens over the active slots for the live-tok/s
@@ -3998,6 +6382,31 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // slot's completion drives this to 0 (live == total at rest).
     defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
 
+    // Contention discipline for the spec cost model's kv term: it learns
+    // from realized round times, and contention only ever ADDS time. Rather
+    // than try to correct for it, a busy server simply stops sampling.
+    for (active) |s| {
+        if (s.legacy_gen) |*g| g.spec_cost_solo = active.len == 1;
+    }
+
+    if (Planner.enabled()) {
+        for (active) |slot| if (slot.legacy_gen) |*gen| {
+            gen.mtp_planner_width = null;
+            gen.mtp_planner_probe = false;
+            gen.mtp_planner_recovering = false;
+            slot.planner_plain_transition = false;
+            slot.planner_force_plain = false;
+        };
+        if (try tryPlannerTick(sch, active)) return;
+        for (active) |slot| if (slot.legacy_gen) |*gen| {
+            if (gen.mtp_planner_owned) slot.planner_force_plain = true;
+        };
+    }
+    defer if (Planner.enabled()) for (active) |slot| {
+        slot.planner_force_plain = false;
+        if (slot.legacy_gen) |*gen| gen.mtp_planner_pending = false;
+    };
+
     // Phase 3 gate: at len==1, route to legacy single-slot path. Bit-identical
     // to pre-Phase-2 behavior including PLD/drafter speculative decoding.
     // Phase A7 test hook: `MLX_SERVE_FORCE_BATCHED=1` bypasses the gate so the
@@ -4017,18 +6426,64 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // share a transformer. We partition `batchable` by `slot.model` and
     // emit one batched call per model. The non-batchable bucket doesn't
     // care — each slot runs against its own `slot.model.transformer.?`.
-    var batchable_buf: [32]*Slot = undefined;
+    var batchable_buf: [MAX_BATCH_GROUP]*Slot = undefined;
     var batchable_n: usize = 0;
+    var mtp_buf: [MAX_BATCH_GROUP]*Slot = undefined;
+    var mtp_n: usize = 0;
     for (active) |s| {
-        if (sch.batchable(s) and batchable_n < batchable_buf.len) {
+        const why = sch.batchVerdict(s);
+        if (why == .ok and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = s;
             batchable_n += 1;
+        } else if (why == .spec_active and slotMtpGroupable(s) and mtp_n < mtp_buf.len) {
+            mtp_buf[mtp_n] = s;
+            mtp_n += 1;
         } else {
             // legacy single-slot for spec / grammar / overflow
+            noteSerial(sch, s, why);
             try runSingleDecodeTick(sch, s);
         }
     }
-    if (batchable_n == 0) return;
+    // A crowded MTP group (measured past 3 slots on the 27B) beats its sub-grouped verify
+    // rounds with ONE plain batched tick; those slots keep their head resumable by
+    // capturing the hidden the tick forwards (`mtp_plain_tick`).
+    var mtp_group_n: usize = 0;
+    {
+        std.sort.pdq(*Slot, mtp_buf[0..mtp_n], {}, struct {
+            fn lt(_: void, a: *Slot, b: *Slot) bool {
+                return @intFromPtr(a.model) < @intFromPtr(b.model);
+            }
+        }.lt);
+        var i: usize = 0;
+        while (i < mtp_n) {
+            var j = i + 1;
+            while (j < mtp_n and mtp_buf[j].model == mtp_buf[i].model) j += 1;
+            if (j - i >= mtpCrowdThresholdFor(mtp_buf[i]) and batchable_n + (j - i) <= batchable_buf.len) {
+                for (mtp_buf[i..j]) |slot| {
+                    const gen = &slot.legacy_gen.?;
+                    gen.mtpDetachHead(slot.allocator, true) catch |e| {
+                        slot.markError(@errorName(e));
+                        continue;
+                    };
+                    gen.mtp_group_cap = 0;
+                    slot.mtp_plain_tick = true;
+                    batchable_buf[batchable_n] = slot;
+                    batchable_n += 1;
+                }
+            } else {
+                for (mtp_buf[i..j]) |slot| {
+                    mtp_buf[mtp_group_n] = slot;
+                    mtp_group_n += 1;
+                }
+            }
+            i = j;
+        }
+    }
+    try runMtpGroups(sch, mtp_buf[0..mtp_group_n]);
+    if (batchable_n == 0) {
+        if (sch.metrics) |m| m.batched_group_size.set(0);
+        return;
+    }
 
     // Group batchable slots by model pointer (in-place partition by sort).
     // The order of slots within a model doesn't matter for batched decode;
@@ -4043,10 +6498,70 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     while (start < batchable_n) {
         var end = start + 1;
         while (end < batchable_n and batchable_buf[end].model == batchable_buf[start].model) end += 1;
-        const group = batchable_buf[start..end];
+        var group = batchable_buf[start..end];
+        // One predicate for both halves of the pad-waste change: the kv-length rule and the sort.
+        const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtxGated() else false;
+        // Cap the group by padding waste: the batched kernel pads every slot's
+        // KV to the longest in the group, so one long-context stream would make
+        // its short neighbours build a tensor orders of magnitude bigger than
+        // they need. Sort ascending by kv_len and let `batchedKvKeepCount` say
+        // how many still fit; the tail decodes serially this tick.
+        if (group.len >= 2) {
+            var kv_lens: [32]u32 = undefined;
+            // The stable insertion sort is part of the change: `std.sort.pdq` is unstable and
+            // off qwen4_exp every key is `cache.step` == 0, so the sort decides the ordering.
+            if (gate_batch_kv_len) {
+                var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
+                var mrope_buf: [MAX_BATCH_GROUP]bool = undefined;
+                for (group, 0..) |g, i| {
+                    caches_buf[i] = &g.cache;
+                    mrope_buf[i] = g.mrope_pos != null;
+                }
+                fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 1, mrope_buf[0..group.len], kv_lens[0..group.len]);
+                // Stable insertion sort, ascending, slots and lengths moving together.
+                var i: usize = 1;
+                while (i < group.len) : (i += 1) {
+                    const slot_i = group[i];
+                    const len_i = kv_lens[i];
+                    var j = i;
+                    while (j > 0 and kv_lens[j - 1] > len_i) : (j -= 1) {
+                        group[j] = group[j - 1];
+                        kv_lens[j] = kv_lens[j - 1];
+                    }
+                    group[j] = slot_i;
+                    kv_lens[j] = len_i;
+                }
+            } else {
+                std.sort.pdq(*Slot, group, {}, struct {
+                    fn lt(_: void, a: *Slot, b: *Slot) bool {
+                        return a.cache.step < b.cache.step;
+                    }
+                }.lt);
+                for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
+            }
+            const keep = batchedKvKeepCount(kv_lens[0..group.len]);
+            if (keep < group.len) {
+                if (!kv_skew_split_logged) {
+                    kv_skew_split_logged = true;
+                    log.info("[batched] pad-waste cap: kept {d} of {d} slots (waste {d:.2}x, kv_len {d}..{d}), rest serial\n", .{
+                        keep,
+                        group.len,
+                        batchedPadWaste(kv_lens[0..group.len]),
+                        kv_lens[0],
+                        kv_lens[group.len - 1],
+                    });
+                }
+                for (group[keep..]) |s| {
+                    noteSerial(sch, s, .pad_waste);
+                    try runSingleDecodeTick(sch, s);
+                }
+                group = group[0..keep];
+            }
+        }
         // Honor force_batched even when only one slot is batchable so the
         // test hook actually exercises forwardBatchedDecode at N=1.
         if (group.len >= 2 or (sch.force_batched and group.len == 1)) {
+            if (sch.metrics) |m| m.batched_group_size.set(group.len);
             try runBatchedDecodeTick(sch, group);
         } else if (group.len == 1) {
             try runSingleDecodeTick(sch, group[0]);
@@ -4055,8 +6570,107 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     }
 }
 
+/// What `runPrefill` arms in a slot's Generator init options.
+pub const SpecInitWiring = struct {
+    use_mtp: bool,
+    use_drafter: bool,
+    use_dflash: bool,
+    use_pld: bool,
+    /// The request's spec INTENT, forwarded to the Generator chokepoint for a
+    /// module-owned arch that has its OWN draft mode (dsv4 → DSpark). Rides
+    /// `pld_enabled` alongside `use_pld`.
+    native_intent: bool,
+};
+
+/// Per-site spec gating for one slot, as a pure function.
+///
+/// Speculative decode must be able to ROLL BACK a rejected tail, and the shell
+/// rolls back what it owns: the slot's KVCache and ssm_entries. A MODULE-OWNED
+/// arch uses neither — by the time a verify forward returns, its own state has
+/// already absorbed every draft token, and the shell's snapshot/truncate run
+/// over an empty entries array. So every shell-driven spec mode is off there.
+///
+/// This used to be three hand-written `!is_dsv4` conjuncts. A second
+/// module-owned arch arrived with the same `Model.state` shape and a 0-layer
+/// shell cache, got no conjunct, and `--pld` drove verify forwards straight
+/// through it. One predicate, one place to extend.
+pub fn specInitWiring(
+    owns_module_state: bool,
+    module_spec_rollback: bool,
+    has_native_draft: bool,
+    enable_mtp: bool,
+    has_mtp: bool,
+    enable_drafter: bool,
+    has_drafter: bool,
+    has_dflash: bool,
+    enable_pld: bool,
+) SpecInitWiring {
+    if (owns_module_state) return .{
+        // A module-owned arch that CAN rewind its state across a verify runs
+        // its own MTP head like any other target. PLD and the drafters
+        // stay off regardless: the drafters need a bound sidecar (DflashModel
+        // .bind refuses these archs anyway), and PLD's win case is
+        // echo-shaped traffic the n-gram gate rarely opens on a
+        // head this cheap — neither has been measured on this family, and an
+        // unmeasured spec mode is worse than none. Image requests ride the
+        // head too: `qwen4MtpForward` takes the slot's M-RoPE table.
+        .use_mtp = module_spec_rollback and enable_mtp and has_mtp,
+        .use_drafter = false,
+        .use_dflash = false,
+        .use_pld = false,
+        .native_intent = has_native_draft and enable_mtp,
+    };
+    // enable_drafter is the request-level "assistant sidecar" switch for BOTH
+    // sidecar kinds; the loader guarantees at most one of drafter/dflash is
+    // loaded per model. Priority: dflash > MTP > gemma drafter > PLD — a
+    // loaded DFlash sidecar is an explicit choice (`--drafter` or the pack's
+    // own `drafter/`) while the MTP head ships with the checkpoint;
+    // `--no-drafter` (or `enable_drafter:false`) hands the round back to MTP.
+    const use_dflash = enable_drafter and has_dflash;
+    const use_mtp = !use_dflash and enable_mtp and has_mtp;
+    const use_drafter = !use_mtp and !use_dflash and enable_drafter and has_drafter;
+    return .{
+        .use_mtp = use_mtp,
+        .use_drafter = use_drafter,
+        .use_dflash = use_dflash,
+        .use_pld = !use_mtp and !use_dflash and !use_drafter and enable_pld,
+        .native_intent = false,
+    };
+}
+
+/// Resolve the request-level switch shared by the classic external drafter
+/// and DFlash. Vision stays guarded by default: placeholder ids alone do not
+/// tell an external sidecar how to position image tokens. Muse DFlash is the
+/// measured exception because it drafts from captures produced by Muse's own
+/// vision-conditioned trunk and Muse does not use Qwen's M-RoPE table.
+pub fn assistantSidecarEnabledForRequest(
+    requested: bool,
+    has_vision: bool,
+    has_mrope: bool,
+    has_dflash: bool,
+    is_muse_vision: bool,
+) bool {
+    if (!requested) return false;
+    if (!has_vision) return true;
+    return has_dflash and is_muse_vision and !has_mrope;
+}
+
+test "assistant sidecar vision gate admits Muse DFlash without weakening Qwen M-RoPE" {
+    // Text requests keep the existing shared sidecar behavior.
+    try testing.expect(assistantSidecarEnabledForRequest(true, false, false, false, false));
+    // A request opt-out always wins.
+    try testing.expect(!assistantSidecarEnabledForRequest(false, true, false, true, true));
+    // Image requests remain guarded for classic external drafters.
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, false, false, false));
+    // Muse DFlash consumes vision-conditioned trunk captures and may engage.
+    try testing.expect(assistantSidecarEnabledForRequest(true, true, false, true, true));
+    // Qwen's explicit M-RoPE table is never admitted through this exception.
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, true));
+    try testing.expect(!assistantSidecarEnabledForRequest(true, true, true, true, false));
+}
+
 /// Which spec mode a decode tick drives for a slot.
-pub const SpecTickMode = enum { dspark, mtp, drafter, pld, regular };
+pub const SpecTickMode = enum { dspark, mtp, dflash, drafter, pld, regular };
 
 /// Pure decode-tick dispatch decision. The slot flags carry the REQUEST's
 /// wish; the generator-side values carry what `Generator.initWithOptions`
@@ -4076,11 +6690,13 @@ pub fn specTickMode(
     gen_has_mtp: bool,
     slot_enable_drafter: bool,
     gen_has_drafter: bool,
+    gen_has_dflash: bool,
     slot_enable_pld: bool,
     gen_pld_enabled: bool,
     gen_dspark_enabled: bool,
 ) SpecTickMode {
     if (gen_dspark_enabled and slot_enable_mtp) return .dspark;
+    if (slot_enable_drafter and gen_has_dflash) return .dflash;
     if (slot_enable_mtp and gen_has_mtp) return .mtp;
     if (slot_enable_drafter and gen_has_drafter) return .drafter;
     if (slot_enable_pld and gen_pld_enabled) return .pld;
@@ -4091,7 +6707,142 @@ pub fn specTickMode(
 /// tokens into the slot's output ring. Mirrors the existing
 /// `StreamingTokenStream` adapter contract: 0..N tokens per call, with EOS
 /// stopping the slot but NOT being emitted.
+fn plannerOutputClock(slot: *Slot, gen: *Generator) void {
+    const now = gen.timer.read();
+    slot.mtp_publish_gap_ms = if (slot.mtp_publish_ns > 0 and now >= slot.mtp_publish_ns) @as(f32, @floatFromInt(now - slot.mtp_publish_ns)) / std.time.ns_per_ms else 0;
+    slot.mtp_publish_ns = now;
+    if (Planner.enabled() and gen.mtp_planner_owned) gen.mtp_planner_max_gap_ms = @max(gen.mtp_planner_max_gap_ms, slot.mtp_publish_gap_ms);
+}
+
+fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens: []const u32) void {
+    if (gen.mtp != null and tokens.len > 0) {
+        plannerOutputClock(slot, gen);
+    }
+    // The Generator has already committed the whole block internally. Publish
+    // it incrementally so streaming, cancellation, EOS and usage all observe
+    // the same per-token boundary. The generator-side cap guarantees max_tokens
+    // cannot land before the returned block ends.
+    for (tokens, 0..) |t, i| {
+        if (slot.cancelled.load(.acquire)) {
+            if (gen.mtp != null) log.debug("[mtp-publish] cancelled after round: discarded={d}\n", .{tokens.len - i});
+            return;
+        }
+        if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+            finishSlot(sch, slot, "stop");
+            return;
+        }
+        slot.pushToken(t);
+        slot.completion_tokens += 1;
+        if (t != 0) slot.was_pad_only = false;
+        if (slot.completion_tokens >= slot.max_tokens) {
+            finishSlot(sch, slot, "length");
+            return;
+        }
+    }
+    std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+}
+
+/// Every single-slot decode tick funnels through here, so a decode-time MLX failure is
+/// attributed to the slot whose forward raised it instead of the next request's prefill.
+/// The repetition-loop guard every decode tick runs first. True = the slot was finished here.
+fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
+    // Stop a runaway repetition loop before generating more. Some models (seen
+    // on Gemma 4 12B after a large/confusing tool result) collapse into spamming
+    // one short cycle — e.g. the thinking opener `<|channel>thought` — forever;
+    // with no repeat penalty by default and a generous max_tokens, nothing else
+    // halts it until the cap. Checked here, before this tick's step, so it
+    // covers the regular, PLD, and drafter paths uniformly.
+    const loop_guard_start = gen.loopGuardStart();
+    if (loopStopDecision(gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
+        if (gen.hasPrePayloadConstraint()) {
+            switch (try gen.forceConstraintTransition(slot.allocator)) {
+                .committed => |boundary| {
+                    slot.pushToken(boundary);
+                    slot.completion_tokens += 1;
+                    std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+                    if (boundary != 0) slot.was_pad_only = false;
+                    log.warn("[grammar] reasoning boundary forced after repetition loop at {d} generated tokens\n", .{gen.generated_ids.items.len - 1});
+                    return true;
+                },
+                .activated => return true,
+                // The completion cap won the race with recovery: fall through
+                // to the ordinary loop-stop cut.
+                .refused => {},
+            }
+        }
+        var stop = relative_stop;
+        stop.trim_start += loop_guard_start;
+        // Never cut silently: the 2026-07-14 php.html post-mortem took log
+        // archaeology because this guard left no trace of having fired. The
+        // tier and the trim point are logged too — five cuts in a row is a
+        // different diagnosis from one, and the trim is what breaks the chain.
+        log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s} details={s} tier={s} trim_start={d})\n", .{
+            gen.generated_ids.items.len, stop.finish_reason, stop.finish_details,
+            @tagName(stop.tier),         stop.trim_start,
+        });
+        slot.finish_details = stop.finish_details;
+        if (loopTrimEnabled()) slot.loop_trim_start = stop.trim_start;
+        finishSlot(sch, slot, stop.finish_reason);
+        return true;
+    }
+    return thinkBoundTick(sch, slot, gen);
+}
+
+/// A thinking budget at its limit: commit the early-stop line and the closer
+/// through the model this tick, and decode the answer regular from here on
+/// (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
+fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
+    const tb = gen.sampling.think_bound orelse return false;
+    tb.observe(gen.generated_ids.items);
+    if (!tb.due()) return false;
+    tb.fired = true;
+    if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, tb.forced.len + 1)) {
+        log.warn("[think-bound] budget {d} reached with no room to close the thought (max_tokens {d})\n", .{ tb.budget, gen.max_tokens });
+        return false;
+    }
+    const r = try gen.commitForcedTokens(slot.allocator, tb.forced);
+    defer slot.allocator.free(r.emitted);
+    for (r.emitted) |t| {
+        slot.pushToken(t);
+        slot.completion_tokens += 1;
+        if (t != 0) slot.was_pad_only = false;
+    }
+    std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+    if (r.stopped) {
+        finishSlot(sch, slot, gen.finish_reason);
+        return true;
+    }
+    gen.spec_disabled_runtime = true;
+    gen.spec_disable_reason = .think_bound;
+    log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
+    return true;
+}
+
+fn thinkBoundFired(gen: *const Generator) bool {
+    const tb = gen.sampling.think_bound orelse return false;
+    return tb.fired;
+}
+
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
+    var inner_err: ?anyerror = null;
+    runSingleDecodeTickInner(sch, slot) catch |e| switch (e) {
+        // A reasoning-protocol dead end is this request's failure; the tick
+        // error path would fail every active slot.
+        error.NoValidProtocolToken, error.InvalidProtocolTransition, error.InvalidProtocolPayload => {
+            log.err("[grammar] reasoning protocol failed ({s}); failing this request only\n", .{@errorName(e)});
+            slot.markError(@errorName(e));
+        },
+        else => inner_err = e,
+    };
+    mlx.checkErrorDecode() catch |mlx_err| {
+        log.err("[scheduler] decode aborted: MLX failure mid-generation ({s}) — failing this request, the server keeps serving\n", .{@errorName(mlx_err)});
+        slot.markError(@errorName(mlx_err));
+        return;
+    };
+    if (inner_err) |e| return e;
+}
+
+fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // ds4-backed slot: drive the engine's session forward by one token. No
     // PLD / drafter / batched paths apply — ds4 has its own internal MTP
     // (see TODO: wire `evalSpeculative` when temp=0 and engine.hasMtp()).
@@ -4109,32 +6860,23 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         return;
     };
 
-    // Stop a runaway repetition loop before generating more. Some models (seen
-    // on Gemma 4 12B after a large/confusing tool result) collapse into spamming
-    // one short cycle — e.g. the thinking opener `<|channel>thought` — forever;
-    // with no repeat penalty by default and a generous max_tokens, nothing else
-    // halts it until the cap. Checked here, before this tick's step, so it
-    // covers the regular, PLD, and drafter paths uniformly.
-    if (loopStopReason(gen.generated_ids.items)) |reason| {
-        // Never cut silently: the 2026-07-14 php.html post-mortem took log
-        // archaeology because this guard left no trace of having fired.
-        log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s})\n", .{
-            gen.generated_ids.items.len, reason,
-        });
-        finishSlot(sch, slot, reason);
-        return;
+    if (try loopGuardTick(sch, slot, gen)) return;
+    if (Planner.enabled() and slot.planner_force_plain) {
+        gen.mtp_hidden_stale = true;
     }
+    if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
     // generators handle the disabled fallback internally, and `nextPld`'s
     // disabled branch is also where the mid-request RE-ENABLE check lives
     // (bypassing it pinned PLD off for the rest of the request even when the
     // generated tail turned echo-heavy).
-    const tick_mode = specTickMode(
+    const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundFired(gen)) .regular else specTickMode(
         slot.enable_mtp,
         gen.mtp != null,
         slot.enable_drafter,
         gen.drafter != null,
+        gen.dflash != null,
         slot.enable_pld,
         gen.pld_enabled,
         gen.dspark_enabled,
@@ -4146,43 +6888,18 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
     if (tick_mode == .mtp) {
+        gen.mtp_group_cap = 0;
         const result = try gen.nextMtp(slot.allocator);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -4193,20 +6910,18 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
+        return;
+    }
+
+    if (tick_mode == .dflash) {
+        const result = try gen.nextDflash(slot.allocator);
+        if (result == null) {
+            finishSlot(sch, slot, gen.finish_reason);
+            return;
         }
+        defer slot.allocator.free(result.?.tokens);
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
@@ -4217,45 +6932,339 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
             return;
         }
         defer slot.allocator.free(result.?.tokens);
-        for (result.?.tokens) |t| {
-            if (slot.cancelled.load(.acquire)) return;
-            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
-                finishSlot(sch, slot, "stop");
-                return;
-            }
-            slot.pushToken(t);
-            slot.completion_tokens = gen.completion_tokens;
-            if (t != 0) slot.was_pad_only = false;
-            if (slot.completion_tokens >= slot.max_tokens) {
-                finishSlot(sch, slot, "length");
-                return;
-            }
-        }
+        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
         return;
     }
 
-    // Regular path.
+    // Regular path. A request that never armed MTP teaches the round-cost table what a plain
+    // serial token costs; `observeSerialTick` owns the drop rules and `serialCellWanted`.
     const tok_opt = try gen.next(slot.allocator);
     if (tok_opt == null) {
         finishSlot(sch, slot, gen.finish_reason);
         return;
     }
+    gen.observeSerialTick();
+    if (Planner.enabled()) {
+        if (slot.planner_force_plain) gen.mtp_planner_plain_ticks += 1;
+        plannerOutputClock(slot, gen);
+    }
     const t = tok_opt.?;
-    slot.pushToken(t);
-    if (t != 0) slot.was_pad_only = false;
-    slot.completion_tokens = gen.completion_tokens;
-    // Phase A5: capture per-token logprob for the conn thread to consume at
-    // completion. `gen.last_logprob` ownership transfers into slot.logprobs_buf
-    // (gen sets the field, we null it after taking it).
+    // Phase A5: capture per-token logprob. `gen.last_logprob` ownership
+    // transfers into slot.logprobs_buf (gen sets the field, we null it here).
+    // Published in the SAME critical section as the token so a streaming
+    // reader that has been handed token i can read entry i — see
+    // `pushTokenWithLogprob`.
+    var lp_take: ?generate_mod.LogprobResult = null;
     if (slot.logprobs_n > 0) {
         if (gen.last_logprob) |lp| {
-            slot.logprobs_buf.append(slot.allocator, lp) catch |err| {
-                slot.markError(@errorName(err));
-                return;
-            };
+            lp_take = lp;
             gen.last_logprob = null;
         }
     }
+    // Publish the reasoning→payload boundary (if this is the token that
+    // carries it) BEFORE the token itself, so a streaming reader handed token
+    // i already sees its span.
+    if (gen.takeConstraintSpan()) |span| {
+        slot.publishConstraintSpan(span.token_index, span.byte_offset);
+    }
+    slot.pushTokenWithLogprob(t, lp_take);
+    if (t != 0) slot.was_pad_only = false;
+    slot.completion_tokens = gen.completion_tokens;
+}
+
+test "all speculative blocks publish through one per-token accounting loop" {
+    // Class guard for block-returning decoders. The Generator has already
+    // advanced by the whole accepted block when the scheduler receives it;
+    // copying that final count while publishing token 1 truncates the stream
+    // and over-reports usage. Every mode must use the shared incremental loop.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn runSingleDecodeTick(") orelse return error.MissingDecodeTick;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\n}\n\ntest \"all speculative blocks") orelse return error.MissingDecodeTickEnd;
+    const body = source[start..end];
+    const shared_call = "publishSpeculativeBlock(sch, slot, gen, result.?.tokens);";
+    try testing.expectEqual(@as(usize, 5), std.mem.count(u8, body, shared_call));
+    // The one remaining final-count assignment belongs to the scalar regular
+    // path, after every speculative arm. It must never reappear in a block.
+    const final_assign = "slot.completion_tokens = gen.completion_tokens;";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, final_assign));
+    try testing.expect(std.mem.lastIndexOf(u8, body, shared_call).? < std.mem.indexOf(u8, body, final_assign).?);
+}
+
+test "DFlash cache payload is committed only when it spans the trunk prefix" {
+    try testing.expect(dflashContextCoversPrefix(128, 128));
+    try testing.expect(!dflashContextCoversPrefix(96, 128));
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
+    const body = source[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
+}
+
+test "a finish over a latched MLX failure ends the request as an ERROR, never a 200" {
+    const Stub = struct {
+        finished: ?[]const u8 = null,
+        errored: ?[]const u8 = null,
+        fn markFinished(self: *@This(), reason: []const u8) void {
+            self.finished = reason;
+        }
+        fn markError(self: *@This(), name: []const u8) void {
+            self.errored = name;
+        }
+    };
+
+    var clean = Stub{};
+    publishSlotTerminator(&clean, "stop", null);
+    try testing.expectEqualStrings("stop", clean.finished.?);
+    try testing.expect(clean.errored == null);
+
+    // Latched: no "stop" is published at all.
+    var poisoned = Stub{};
+    publishSlotTerminator(&poisoned, "stop", "OutOfMemory");
+    try testing.expect(poisoned.finished == null);
+    try testing.expectEqualStrings("OutOfMemory", poisoned.errored.?);
+    try testing.expect(Slot.errorNameIsMemory(poisoned.errored.?));
+
+    var shape = Stub{};
+    publishSlotTerminator(&shape, "length", "MlxFailure");
+    try testing.expect(shape.finished == null);
+    try testing.expectEqualStrings("MlxFailure", shape.errored.?);
+    try testing.expect(!Slot.errorNameIsMemory(shape.errored.?));
+}
+
+test "firstMediaPlaceholder finds every dynamic media kind and ignores disabled ids" {
+    const tokens = [_]u32{ 0, 11, 22, 33, 44 };
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &tokens, 22, 0, 0));
+    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(true, &tokens, 0, 33, 0));
+    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(true, &tokens, 0, 0, 44));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &tokens, 44, 33, 22));
+    try testing.expect(firstMediaPlaceholder(true, &tokens, 0, 0, 0) == null);
+}
+
+test "cancelled-prefill commit length: floor, clamp, and zero" {
+    // A cancelled prefill only pays its way into the LRU once the forwarded
+    // prefix is past the chat-template-prologue class (~dozens of tokens);
+    // below the floor the entry is pollution, not saved work.
+    try testing.expect(cancelledPrefillCommitLen(0, 1000) == null);
+    try testing.expect(cancelledPrefillCommitLen(1, 1000) == null);
+    try testing.expect(cancelledPrefillCommitLen(255, 1000) == null);
+    try testing.expectEqual(@as(?usize, 256), cancelledPrefillCommitLen(256, 1000));
+    try testing.expectEqual(@as(?usize, 300), cancelledPrefillCommitLen(300, 1000));
+    // cache.step can never exceed the prompt (restore clamps to matched and
+    // chunks stop at the tail); clamp defensively anyway so a bad step can
+    // never key tokens the KV does not hold.
+    try testing.expectEqual(@as(?usize, 1000), cancelledPrefillCommitLen(5000, 1000));
+    // A short prompt is not worth an entry at any step.
+    try testing.expect(cancelledPrefillCommitLen(50, 50) == null);
+}
+
+test "the cleanup drain commits a cancelled slot before deinit" {
+    // Class guard: a decode-phase cancel is pulled straight into the cleanup
+    // queue by `complete()` and NEVER passes through finishSlot — without a
+    // commit in the drain, its prompt+generated KV dies with the slot. The
+    // commit must run BEFORE deinit (the snapshot refcount-shares live
+    // buffers; after deinit they are freed).
+    const source = @embedFile("scheduler.zig");
+    const drain_start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse return error.MissingCleanupDrain;
+    const region = source[drain_start..@min(drain_start + 1600, source.len)];
+    const commit_pos = std.mem.indexOf(u8, region, "commitSlotIfApplicable") orelse return error.DrainDoesNotCommit;
+    const deinit_pos = std.mem.indexOf(u8, region, ".deinit()") orelse return error.MissingDeinit;
+    try testing.expect(commit_pos < deinit_pos);
+    // The SSD tier has no finishSlot flush on this path — the drain must
+    // flush what it just committed itself.
+    try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
+}
+
+test "idleEvictTickMs: sweeps well inside the window without spinning" {
+    // Bar: a quarter of the window, clamped to [1s, 30s] — eviction lands near
+    // the configured time without the sweep becoming a busy loop.
+    try testing.expectEqual(@as(i64, 5_000), idleEvictTickMs(20_000));
+    try testing.expectEqual(@as(i64, 15_000), idleEvictTickMs(60_000));
+    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(900_000));
+    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(1000));
+    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
+    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
+    try testing.expect(idleEvictTickMs(0) >= 1000);
+}
+
+test "the inference loop parks without holding the sleep-inhibition assertion" {
+    // Pin release < park < acquire and startup acquire < load.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
+    const body = source[start..end];
+    const drop = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(false);") orelse return error.MissingSleepRelease;
+    const park = std.mem.indexOf(u8, body, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
+    const hold = std.mem.indexOfPos(u8, body, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+    try testing.expect(drop < park);
+    try testing.expect(park < hold);
+    try testing.expect(std.mem.indexOf(u8, body, "while (!hasWorkPendingLocked(sch)") != null);
+    const boot_load = std.mem.indexOf(u8, body, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingStartupLoad;
+    const boot_arm = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+    try testing.expect(boot_arm < boot_load);
+    try testing.expect(std.mem.indexOf(u8, body, "defer sleep_inhibit.release();") != null);
+}
+
+test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefill commit" {
+    // Prefill abort: `Generator.initWithOptions` throws error.Cancelled from
+    // its chunk loop, so `slot.legacy_gen` is never assigned — the legacy
+    // `else return` silently dropped every chunk that DID forward. The
+    // cancelled-prefill arm must be reachable from commitSlotIfApplicable,
+    // and hybrids are excluded inside it (their stride checkpoints die with
+    // the failed Generator init; a checkpoint-less hybrid entry restores as
+    // a cold miss while still occupying an LRU slot).
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
+    const body = source[start..end];
+    const route_pos = std.mem.indexOf(u8, body, "commitCancelledPrefillSlot") orelse return error.MissingRoute;
+    // `was_pad_only` initializes TRUE and only flips on the first pushed
+    // token, so a guard on it ABOVE the Generator-less arm makes that arm
+    // unreachable (live 2026-08-22: "prefill aborted" logged, nothing
+    // committed, full re-prefill on retry).
+    const pad_pos = std.mem.indexOf(u8, body, "slot.was_pad_only") orelse return error.MissingPadGuard;
+    try testing.expect(route_pos < pad_pos);
+
+    const cp_start = std.mem.indexOf(u8, source, "fn commitCancelledPrefillSlot(") orelse return error.MissingCancelledPrefillFn;
+    const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\nfn ") orelse return error.MissingCancelledPrefillEnd;
+    const cp_body = source[cp_start..cp_end];
+    // Hybrid gate: KV-only hybrid entries restore as cold misses and are
+    // declined; with salvaged checkpoints (handed off by initWithOptions on
+    // error.Cancelled) a cancelled hybrid prefill commits like a normal one.
+    try testing.expect(std.mem.indexOf(u8, cp_body, "slot.ssm_entries != null and salvage.checkpoints.len == 0") != null);
+    try testing.expect(std.mem.indexOf(u8, cp_body, "cancelledPrefillCommitLen") != null);
+    // The authoritative commit length is the sink's `forwarded` counter —
+    // `cache.step` only advances when Generator init COMPLETES, so it reads
+    // 0 on every aborted prefill (found live: step=0 while pos=1536).
+    try testing.expect(std.mem.indexOf(u8, cp_body, "salvage.forwarded") != null);
+    try testing.expect(std.mem.indexOf(u8, cp_body, "commitWithMediaState") != null);
+}
+
+test "hot-cache commit owns the checkpoints on every outcome (#330 adjacent)" {
+    // Ownership of the SSM checkpoint slice transfers to the cache
+    // UNCONDITIONALLY — commitWithMediaState's error paths free it (and after
+    // a byte-budget trim the slice may be a cache-allocated replacement). A
+    // caller-side free after a failed commit is therefore a double free, with
+    // a different allocator at that (gen_ptr.ssm_checkpoint_alloc vs the
+    // cache's). Live shape: any commit error, e.g. OOM.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingEnd;
+    const body = source[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "commitWithMediaState") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "cp.deinit") == null);
+
+    // The cancelled-prefill commit detaches the salvage BEFORE the call so
+    // Slot.deinit cannot free what the cache now owns.
+    const cp_start = std.mem.indexOf(u8, source, "fn commitCancelledPrefillSlot(") orelse return error.MissingCancelledPrefillFn;
+    const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\nfn ") orelse return error.MissingCancelledPrefillEnd;
+    const cp_body = source[cp_start..cp_end];
+    const detach = std.mem.indexOf(u8, cp_body, "slot.cancelled_prefill = .{};") orelse return error.MissingDetach;
+    const commit_pos = std.mem.indexOf(u8, cp_body, "hc.commitWithMediaState") orelse return error.MissingCommit;
+    try testing.expect(detach < commit_pos);
+}
+
+test "Generator.initWithOptions hands off checkpoints on cancel" {
+    // The chunk-loop cancel path must MOVE the captured stride checkpoints
+    // into the sink before returning error.Cancelled — they die with the
+    // failed construction otherwise, and hybrid cancelled-prefill commits
+    // are impossible. Anchored on the prefill loop's abandoned-request
+    // abort comment so a decode-loop cancel check can't satisfy it.
+    const source = @embedFile("generate.zig");
+    const anchor = std.mem.indexOf(u8, source, "Abandoned-request abort") orelse return error.MissingAbortComment;
+    const region = source[anchor..@min(anchor + 2400, source.len)];
+    try testing.expect(std.mem.indexOf(u8, region, "cancelled_checkpoint_sink") != null);
+    try testing.expect(std.mem.indexOf(u8, region, "error.Cancelled") != null);
+}
+
+test "Slot.deinit frees unconsumed cancelled-prefill salvage" {
+    // Ownership discipline: the sink holds checkpoint arrays allocated on
+    // the inference thread; anything commitCancelledPrefillSlot did not
+    // consume must die with the slot, not leak.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn deinit(self: *Slot)") orelse return error.MissingSlotDeinit;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "pub fn deinit(self: *Scheduler)") orelse return error.MissingSchedulerDeinit;
+    const body = source[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "cancelled_prefill.deinit()") != null);
+}
+
+test "runPrefill clears restored spec-cache ownership BEFORE Generator.initWithOptions (issue #266)" {
+    // Generator.initWithOptions ADOPTS the hot-cache-restored DFlash/MTP
+    // caches and frees them via its own errdefers on any failure past the
+    // adoption point — a mid-prefill client disconnect throws
+    // error.Cancelled from its chunk loop. MtpCacheRef/DflashCtx hold their
+    // KVCache BY VALUE, so runPrefill's own errdefers then walked the same
+    // entries slice + mlx handles a second time: SIGSEGV in
+    // KVCache.deinit -> freeKVEntry (issue #266, disconnect storms on long
+    // agent prompts). Ownership transfers AT THE CALL, so the locals must
+    // be cleared before the try, never after it.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn runPrefill(") orelse return error.MissingRunPrefill;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingRunPrefillEnd;
+    const body = source[start..end];
+    const call = std.mem.indexOf(u8, body, "try Generator.initWithOptions(") orelse return error.MissingInitCall;
+    const dfl = std.mem.indexOf(u8, body, "dflash_restored = null") orelse return error.MissingDflashClear;
+    const mtp = std.mem.indexOf(u8, body, "mtp_restored = null") orelse return error.MissingMtpClear;
+    try testing.expect(dfl < call);
+    try testing.expect(mtp < call);
+}
+
+test "DFlash gate policy follows effective block width and resolved thinking" {
+    // block_size includes the always-emitted anchor, so block 16 has 15 draft
+    // positions and block 7 has 6. The M5 calibration is normalized to that
+    // actual draft width instead of being imposed as an absolute threshold on
+    // machines without the wide verification lane.
+    try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), dflashGateMinimum(16, true, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), dflashGateMinimum(7, false, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), dflashGateMinimum(7, true, false), 0.0001);
+    try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false, false));
+
+    // A SPARSE target's verify reads every expert its block routes to, so the
+    // dense width scaling under-bars it: at block 5 the scaled value is 0.53
+    // and LFM2.5-8B-A1B measured break-even at 1.63 accepted/round. The floor
+    // binds there and in the thinking arm, and never lowers a bar the width
+    // scaling already set higher.
+    try testing.expectApproxEqAbs(@as(f32, 1.8), dflashGateMinimum(5, false, true), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 1.8), dflashGateMinimum(5, true, true), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false, true), 0.0001);
+    try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false, true));
+}
+
+test "every server scheduler path forwards resolved thinking to the DFlash gate" {
+    const source = @embedFile("server.zig");
+
+    // All direct streaming submissions, plus the shared non-streaming submit,
+    // must populate the field. Text completions resolve it explicitly false.
+    var submit_pos: usize = 0;
+    var submits: usize = 0;
+    while (std.mem.indexOfPos(u8, source, submit_pos, "sch.submit(.{")) |start| {
+        const end = std.mem.indexOfPos(u8, source, start, "});") orelse return error.UnclosedSchedulerSubmit;
+        try testing.expect(std.mem.indexOf(u8, source[start..end], ".enable_thinking =") != null);
+        submits += 1;
+        submit_pos = end + 3;
+    }
+    try testing.expectEqual(@as(usize, 5), submits);
+
+    // Positional calls into the non-streaming wrapper must pass the resolved
+    // value; the raw text-completion path is the sole explicit false arm.
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var calls: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "nonStreamingViaScheduler(") == null) continue;
+        if (std.mem.indexOf(u8, line, "fn nonStreamingViaScheduler(") != null) continue;
+        calls += 1;
+        try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
+            std.mem.indexOf(u8, line, ", false, false, use_pld") != null);
+    }
+    try testing.expectEqual(@as(usize, 4), calls);
+}
+
+/// Per-slot follow-up to a batched forward: `record` moves the id ledger, `publish` samples and streams.
+const BatchedTickAction = struct { record: bool, publish: bool };
+
+fn batchedTickAction(cancelled: bool) BatchedTickAction {
+    // The KV row is already written, so the ledger records it even when cancelled.
+    return .{ .record = true, .publish = !cancelled };
 }
 
 /// Batched decode kernel for >=2 active slots. All slots must have already
@@ -4264,7 +7273,886 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
 /// in one kernel pass, sample per-slot, push the OLD next_token_id (= the
 /// token we just committed to cache via the forward), and load the new
 /// sampled id back into next_token_id.
+/// Batched sibling: a batched group shares one forward, so a failure belongs to every slot in it.
+/// Can this MTP slot's verify ride one batched trunk forward with its neighbours?
+/// Per-request head (never qwen4's module-owned one), a GDN trunk with per-slot state
+/// the batched path merges, and a round that is actually speculating this tick.
+fn slotMtpGroupable(slot: *const Slot) bool {
+    if (!mtpGroupEnabled()) return false;
+    const gen = if (slot.legacy_gen) |*g| g else return false;
+    if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
+    if (gen.mtp.?.moduleOwned()) return false;
+    if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
+    if (gen.ctx.ssm_entries == null) return false;
+    if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
+    if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
+    const t = slot.model.transformer orelse return false;
+    if (!t.supportsBatchedGdnDecode()) return false;
+    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.drafter != null, gen.dflash != null, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled) == .mtp;
+}
+
+const Planner = @import("mtp_group_planner.zig");
+
+fn plannerShape(slots: []const *Slot, widths: []const u8) group_cost_mod.GroupShape {
+    const xfm = slots[0].model.transformer.?;
+    var shape = group_cost_mod.GroupShape{ .n = @intCast(slots.len), .kv_format = cacheCostFormat(slots[0].cache.config) };
+    for (slots, widths, 0..) |slot, width, i| {
+        const gen = &slot.legacy_gen.?;
+        const kv: u8 = @intCast(xfm.round_cost.bucketOf(@intCast(slot.moe_seq_offset)));
+        if (width == 0) {
+            shape.rows[i] = group_cost_mod.GroupShape.row(0, 0, 0, kv, 0, 0, group_cost_mod.GroupShape.samplingMode(false, false, false, gen.sampling.temperature > 0.01));
+        } else {
+            const off = Generator.mtpRoundOff0(gen.mtp_hist_stash, gen.mtp_cache.?.step());
+            const history = 1 + if (gen.mtp_hist_stash) |stash| stash.n else @as(usize, 0);
+            shape.head_format = cacheCostFormat(xfm.qwen4_mtp.?.cache.config);
+            shape.rows[i] = group_cost_mod.GroupShape.row(width, width, width, kv, @intCast(xfm.round_cost.bucketOf(@intCast(off))), @intCast(@min(history, round_cost_mod.MAX_WIDTH + 2)), gen.mtpPlannerMode());
+        }
+    }
+    return shape;
+}
+
+fn plannerInputSame(a: group_cost_mod.GroupShape, b: group_cost_mod.GroupShape) bool {
+    var aa = a;
+    var bb = b;
+    aa.attention = 0;
+    aa.moe = 0;
+    aa.head_calls = 0;
+    bb.attention = 0;
+    bb.moe = 0;
+    bb.head_calls = 0;
+    return std.meta.eql(aa, bb);
+}
+
+fn plannerPriceTransition(previous: u8, width: u8, pending: bool) bool {
+    return width > 0 and (pending or previous != width);
+}
+
+fn plannerRecurringInputSame(a: group_cost_mod.GroupShape, b: group_cost_mod.GroupShape) bool {
+    if (a.n != b.n or a.width() == 0 or b.width() == 0) return false;
+    inline for (.{ @as(u6, 24), @as(u6, 32) }) |shift| {
+        var a_max: u8 = 0;
+        var b_max: u8 = 0;
+        for (a.rows[0..a.n], b.rows[0..b.n]) |arow, brow| {
+            a_max = @max(a_max, group_cost_mod.GroupShape.part(arow, shift));
+            b_max = @max(b_max, group_cost_mod.GroupShape.part(brow, shift));
+        }
+        if (a_max != b_max) return false;
+    }
+    var aa = a;
+    var bb = b;
+    const recurring_mask = ~((@as(u64, 0xff) << 24) | (@as(u64, 0xff) << 32) | (@as(u64, 0xff) << 40));
+    for (aa.rows[0..aa.n], bb.rows[0..bb.n]) |*arow, *brow| {
+        if (group_cost_mod.GroupShape.part(arow.*, 40) < 2 or group_cost_mod.GroupShape.part(brow.*, 40) < 2) return false;
+        arow.* &= recurring_mask;
+        brow.* &= recurring_mask;
+    }
+    return plannerInputSame(aa.canonical(), bb.canonical());
+}
+
+const PlannerPrices = struct {
+    slots: []const *Slot,
+    geometry: group_cost_mod.GroupShape,
+
+    fn init(slots: []const *Slot) PlannerPrices {
+        var widths: [Planner.MAX_ROWS]u8 = @splat(0);
+        for (slots, 0..) |slot, i| widths[i] = @intFromBool(slot.legacy_gen.?.mtp != null and slot.legacy_gen.?.mtp_cache != null);
+        return .{ .slots = slots, .geometry = plannerShape(slots, widths[0..slots.len]) };
+    }
+
+    fn keyFor(self: *const PlannerPrices, slots: []const *Slot, widths: []const u8) group_cost_mod.GroupShape {
+        var key = self.geometry;
+        key.n = @intCast(slots.len);
+        key.rows = @splat(0);
+        key.head_format = 0;
+        for (slots, widths, 0..) |slot, width, i| {
+            for (self.slots, 0..) |original, j| {
+                if (original != slot) continue;
+                const code = self.geometry.rows[j];
+                key.rows[i] = if (width == 0) group_cost_mod.GroupShape.row(0, 0, 0, group_cost_mod.GroupShape.part(code, 24), 0, 0, group_cost_mod.GroupShape.part(code, 48) & 8) else (code & ~@as(u64, 0xffffff)) | @as(u64, width) * 0x10101;
+                if (width > 0) key.head_format = self.geometry.head_format;
+                break;
+            }
+        }
+        return key.canonical();
+    }
+
+    fn sample(self: *const PlannerPrices, slots: []const *Slot, widths: []const u8, trusted: bool) ?Planner.Price {
+        if (slots.len == 0) return .{ .ms = 0, .samples = std.math.maxInt(u32) };
+        const key = self.keyFor(slots, widths);
+        const table = &slots[0].model.transformer.?.mtp_group_cost;
+        var selected: ?Planner.Price = null;
+        var score: f32 = 0;
+        var max_gap: f32 = 0;
+        var mean_upper: f32 = 0;
+        var mean_lower: f32 = std.math.inf(f32);
+        const plain = key.width() == 0;
+        for (table.shapes) |entry| {
+            if (entry.cell.n == 0 or !plannerInputSame(key, entry.shape)) continue;
+            if (trusted and entry.cell.n < Planner.MIN_SAMPLES) continue;
+            const deviation = 2 * @sqrt(entry.variance);
+            const mean_deviation = 2 * @sqrt(entry.variance * entry.mean_weight_sq);
+            mean_upper = @max(mean_upper, entry.cell.ms + mean_deviation);
+            mean_lower = @min(mean_lower, entry.cell.ms - mean_deviation);
+            const value = if (plain) entry.cell.ms - deviation else entry.cell.ms + deviation;
+            for (entry.gap_ms[0..key.n]) |gap| max_gap = @max(max_gap, gap);
+            if (selected == null or (if (plain) value < score else value > score)) {
+                score = value;
+                selected = .{ .ms = entry.cell.ms, .variance = entry.variance, .samples = entry.cell.n };
+            }
+        }
+        if (selected) |*value| {
+            value.max_gap_ms = max_gap;
+            if (!plain) value.mean_upper_ms = mean_upper;
+            if (plain) value.mean_lower_ms = mean_lower;
+            return selected;
+        }
+        if (plain) return null;
+
+        var pooled_n: u32 = 0;
+        var sum: f64 = 0;
+        var sum_sq: f64 = 0;
+        var mean_sum_sq: f64 = 0;
+        max_gap = 0;
+        for (table.shapes) |entry| {
+            if (entry.cell.n == 0 or !plannerRecurringInputSame(key, entry.shape)) continue;
+            const n: f64 = @floatFromInt(entry.cell.n);
+            const mean: f64 = entry.cell.ms;
+            pooled_n +|= entry.cell.n;
+            sum += n * mean;
+            sum_sq += n * (@as(f64, entry.variance) + mean * mean);
+            // History-to-history differences remain uncertainty in a pooled prediction.
+            mean_sum_sq += n * (@as(f64, entry.variance) * entry.mean_weight_sq + mean * mean);
+            for (entry.gap_ms[0..key.n]) |gap| max_gap = @max(max_gap, gap);
+        }
+        const required: u32 = if (trusted) Planner.MIN_SAMPLES else 1;
+        if (pooled_n < required) return null;
+        const n: f64 = @floatFromInt(pooled_n);
+        const mean = sum / n;
+        const variance = @max(0, sum_sq / n - mean * mean);
+        const mean_variance = @max(0, mean_sum_sq / n - mean * mean);
+        return .{ .ms = @floatCast(mean), .variance = @floatCast(variance), .samples = pooled_n, .max_gap_ms = max_gap, .mean_upper_ms = @floatCast(mean + 2 * @sqrt(mean_variance)) };
+    }
+
+    pub fn price(self: *PlannerPrices, widths: []const u8) ?Planner.Price {
+        var positive: [Planner.MAX_ROWS]*Slot = undefined;
+        var drafts: [Planner.MAX_ROWS]u8 = undefined;
+        var zeros: [Planner.MAX_ROWS]*Slot = undefined;
+        const zero_widths: [Planner.MAX_ROWS]u8 = @splat(0);
+        var pn: usize = 0;
+        var zn: usize = 0;
+        for (self.slots, widths) |slot, width| {
+            if (width == 0) {
+                zeros[zn] = slot;
+                zn += 1;
+            } else {
+                positive[pn] = slot;
+                drafts[pn] = width;
+                pn += 1;
+            }
+        }
+        const plain = self.sample(zeros[0..zn], zero_widths[0..zn], true) orelse return null;
+        const spec = self.sample(positive[0..pn], drafts[0..pn], true) orelse return null;
+        const deviation = @sqrt(plain.variance) + @sqrt(spec.variance);
+        return .{ .ms = plain.ms + spec.ms, .variance = deviation * deviation, .samples = @min(plain.samples, spec.samples), .max_gap_ms = @max(plain.max_gap_ms, spec.max_gap_ms), .mean_upper_ms = if (spec.mean_upper_ms) |bound| plain.ms + 2 * @sqrt(plain.variance) + bound else null, .mean_lower_ms = if (pn == 0) plain.mean_lower_ms else null };
+    }
+
+    fn probeEstimate(self: *PlannerPrices, widths: []const u8, plain: Planner.Price) f32 {
+        if (self.sample(self.slots, widths, false)) |value| return value.ms + 2 * @sqrt(value.variance);
+        var widest: u8 = 0;
+        for (widths) |width| widest = @max(widest, width);
+        var lower: [Planner.MAX_ROWS]u8 = undefined;
+        for ([_]u8{ 2, 1 }) |cap| {
+            if (cap >= widest) continue;
+            for (widths, 0..) |width, i| lower[i] = @min(width, cap);
+            if (self.sample(self.slots, lower[0..widths.len], false)) |value| return scaledProbeEstimate(value, widest, cap);
+        }
+        if (self.slots.len >= 4 and self.slots.len % 2 == 0) {
+            const half = self.slots.len / 2;
+            if (self.sample(self.slots[0..half], widths[0..half], false)) |a| {
+                if (self.sample(self.slots[half..], widths[half..], false)) |b| return a.ms + b.ms + 2 * (@sqrt(a.variance) + @sqrt(b.variance));
+            }
+        }
+        return self.probeFallbackEstimate(widths, plain);
+    }
+
+    fn probeFallbackEstimate(_: *PlannerPrices, widths: []const u8, plain: Planner.Price) f32 {
+        var widest: u8 = 0;
+        for (widths) |width| widest = @max(widest, width);
+        const upper = plain.ms + 2 * @sqrt(plain.variance);
+        if (widest <= 2) return 2 * upper;
+        return 1.5 * upper * @as(f32, @floatFromInt(widest + 1));
+    }
+
+    fn scaledProbeEstimate(value: Planner.Price, widest: u8, measured: u8) f32 {
+        const ratio = @as(f32, @floatFromInt(widest + 1)) / @as(f32, @floatFromInt(measured + 1));
+        return value.ms * ratio;
+    }
+};
+
+var planner_engaged_logged = false;
+var planner_calibration_block_logged = false;
+var planner_depth_two_reject_logged = false;
+
+const ProbeSource = enum { calibrate, recovery };
+
+/// Widths for a calibration or recovery probe round, priced against the plain
+/// tick. False leaves `decision` untouched: no candidate, no price, or over budget.
+fn planProbe(
+    prices: *PlannerPrices,
+    active: []*Slot,
+    rows: []const Planner.Row,
+    decision: *Planner.Decision,
+    comptime source: ProbeSource,
+) bool {
+    const zero_widths: [Planner.MAX_ROWS]u8 = @splat(0);
+    var candidate: [Planner.MAX_ROWS]u8 = @splat(0);
+    for (active, rows, 0..) |slot, row, i| {
+        const gen = &slot.legacy_gen.?;
+        candidate[i] = switch (source) {
+            .calibrate => Planner.probeWidth(gen.mtp_planner_probes, gen.max_tokens -| gen.completion_tokens, row.cap),
+            .recovery => gen.mtp_planner_recovery.width(gen.completion_tokens, gen.max_tokens -| gen.completion_tokens, row.cap, gen.mtp_planner_probes),
+        } orelse return false;
+    }
+    const plain = prices.price(zero_widths[0..active.len]) orelse return false;
+    const estimate = prices.probeEstimate(candidate[0..active.len], plain);
+    var latency_limit: f32 = std.math.floatMax(f32);
+    var available = true;
+    for (rows) |row| {
+        latency_limit = @min(latency_limit, row.latency_ms);
+        if (estimate > row.latency_ms) available = false;
+    }
+    if (!available) {
+        if (source == .calibrate and !planner_calibration_block_logged) {
+            planner_calibration_block_logged = true;
+            log.info("[mtp-planner] calibration blocked widths={any} predicted_ms={d:.2} latency_ms={d:.2}\n", .{ candidate[0..active.len], estimate, latency_limit });
+        }
+        return false;
+    }
+    decision.widths = candidate;
+    decision.upper_ms = estimate;
+    return true;
+}
+
+fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
+    if (!Planner.enabled() or active.len == 0 or active.len > Planner.MAX_ROWS) return false;
+    const xfm = active[0].model.transformer orelse return false;
+    if (xfm.qwen4 == null or xfm.qwen4_mtp == null) return false;
+    if (active.len == 1) {
+        const gen = if (active[0].legacy_gen) |*g| g else return false;
+        if (!gen.mtp_planner_owned) return false;
+    }
+    var rows: [Planner.MAX_ROWS]Planner.Row = undefined;
+    var lenses: [Planner.MAX_ROWS]u32 = undefined;
+    var has_mtp = false;
+    var pending_pipeline = false;
+    var pending_draft = false;
+    for (active, 0..) |slot, i| {
+        if (slot.model != active[0].model or !slot.allow_batch_mtp) return false;
+        const gen = if (slot.legacy_gen) |*g| g else return false;
+        if (gen.ctx.mrope_pos != null) return false;
+        pending_pipeline = pending_pipeline or gen.has_pending_logits or gen.has_pending_token;
+        pending_draft = pending_draft or gen.mtp_pre_draft != null;
+        const why = sch.batchVerdict(slot);
+        const mtp_row = why == .spec_active and slotMtpGroupable(slot);
+        if (why != .ok and !mtp_row) return false;
+        has_mtp = has_mtp or mtp_row;
+        const cap = if (mtp_row) @min(@min(if (gen.mtp_depth > 0) gen.mtp_depth else @max(1, gen.mtp_depth_current), Planner.MAX_DEPTH), gen.max_tokens -| gen.completion_tokens -| 1) else 0;
+        rows[i] = .{ .history = &gen.mtp_planner_history, .cap = @intCast(cap), .latency_ms = Planner.LATENCY_MS };
+        lenses[i] = @intCast(slot.moe_seq_offset);
+    }
+    if (!has_mtp) return false;
+    std.sort.insertion(u32, lenses[0..active.len], {}, std.sort.asc(u32));
+    if (active.len > 1 and batchedKvKeepCount(lenses[0..active.len]) != active.len) return false;
+    const entry = Planner.entry(pending_pipeline, pending_draft);
+    if (entry == .wait_predraft) {
+        // Consume the pending rounds without perpetually replacing their successors.
+        for (active) |slot| slot.legacy_gen.?.mtp_planner_pending = true;
+        return false;
+    }
+    if (entry == .drain) {
+        for (active, rows[0..active.len]) |slot, row| {
+            const gen = &slot.legacy_gen.?;
+            if (gen.mtp != null) try gen.mtpDetachHead(slot.allocator, true);
+            if (row.cap > 0) gen.mtp_planner_owned = true;
+            slot.planner_plain_transition = true;
+            slot.mtp_plain_tick = row.cap > 0;
+        }
+        log.info("[mtp-planner] rows={d} action=drain\n", .{active.len});
+        try runBatchedDecodeTick(sch, active);
+        return true;
+    }
+
+    var live: [Planner.MAX_ROWS]*Slot = undefined;
+    var count: usize = 0;
+    for (active) |slot| {
+        const gen = &slot.legacy_gen.?;
+        if (try loopGuardTick(sch, slot, gen)) continue;
+        if (try gen.checkStop()) {
+            finishSlot(sch, slot, gen.finish_reason);
+            continue;
+        }
+        live[count] = slot;
+        count += 1;
+    }
+    if (count != active.len) {
+        if (count > 0) try runDecodeTick(sch, live[0..count]);
+        return true;
+    }
+    for (active, rows[0..active.len]) |slot, row| if (row.cap > 0) {
+        slot.legacy_gen.?.mtp_planner_owned = true;
+    };
+    var prices = PlannerPrices.init(active);
+    var decision = Planner.choose(rows[0..active.len], &prices);
+    var probe = false;
+    var recovering = false;
+    var probe_rounds: u8 = std.math.maxInt(u8);
+    for (active, rows[0..active.len]) |slot, row| if (row.cap > 0) {
+        probe_rounds = @min(probe_rounds, slot.legacy_gen.?.mtp_planner_probes);
+    };
+    if (!planner_depth_two_reject_logged and probe_rounds >= 12 and Planner.shouldProbe(decision, probe_rounds)) {
+        var depth_two: [Planner.MAX_ROWS]u8 = @splat(0);
+        var expected: f32 = 0;
+        for (rows[0..active.len], 0..) |row, i| {
+            depth_two[i] = @min(2, row.cap);
+            expected += row.history.expected(depth_two[i]);
+        }
+        planner_depth_two_reject_logged = true;
+        log.info("[mtp-planner] depth-two rejected price={any} expected_tokens={d:.2} plain_rate={d:.1}\n", .{ prices.price(depth_two[0..active.len]), expected, decision.plain_rate });
+    }
+    if (Planner.shouldProbe(decision, probe_rounds)) {
+        probe = planProbe(&prices, active, rows[0..active.len], &decision, .calibrate);
+    }
+    if (!probe and Planner.shouldProbe(decision, probe_rounds) and planProbe(&prices, active, rows[0..active.len], &decision, .recovery)) {
+        probe = true;
+        recovering = true;
+    }
+    if (Generator.mtpForcedDepth()) |depth| {
+        for (rows[0..active.len], 0..) |row, i| decision.widths[i] = @intCast(@min(depth, row.cap));
+        probe = false;
+        recovering = false;
+    }
+    var stale: [Planner.MAX_ROWS]bool = undefined;
+    for (active, 0..) |slot, row| stale[row] = slot.legacy_gen.?.mtp_hidden_stale;
+    const execution = Planner.execution(decision.widths[0..active.len], stale[0..active.len]);
+    const prime = execution.prime;
+    var positives: [Planner.MAX_ROWS]*Slot = undefined;
+    var plains: [Planner.MAX_ROWS]*Slot = undefined;
+    const pn = execution.speculative_n;
+    const zn = execution.plain_n;
+    var changed = false;
+    for (active, decision.widths[0..active.len]) |slot, width| {
+        const row_changed = slot.planner_last_width != width;
+        changed = changed or row_changed;
+        slot.planner_price_transition = plannerPriceTransition(slot.planner_last_width, width, slot.planner_price_transition);
+        slot.planner_last_width = width;
+    }
+    for (execution.plain[0..zn], 0..) |row, i| {
+        const slot = active[row];
+        const gen = &slot.legacy_gen.?;
+        slot.planner_plain_transition = gen.mtp_hist_stash != null or gen.mtp_pre_draft != null or prime;
+        if (gen.mtp != null) try gen.mtpDetachHead(slot.allocator, true);
+        slot.mtp_plain_tick = execution.capture[row];
+        plains[i] = slot;
+    }
+    for (execution.speculative[0..pn], 0..) |row, i| {
+        const slot = active[row];
+        const gen = &slot.legacy_gen.?;
+        gen.mtp_planner_width = decision.widths[row];
+        gen.mtp_planner_probe = probe;
+        gen.mtp_planner_recovering = recovering;
+        positives[i] = slot;
+    }
+    if (!planner_engaged_logged) {
+        planner_engaged_logged = true;
+        log.info("[mtp-planner] engaged: margin=5% noise=2sigma latency_ms={d:.1} max_rows=8\n", .{Planner.LATENCY_MS});
+    }
+    if (changed or prime or probe) log.info("[mtp-planner] rows={d} widths={any} action={s} predicted_ms={d:.2} rate={d:.1} plain={d:.1}\n", .{ active.len, decision.widths[0..active.len], if (prime) "prime" else if (recovering) "recover" else if (probe) "calibrate" else "choose", decision.upper_ms, decision.rate, decision.plain_rate });
+    if (pn > 0) {
+        try runBatchedMtpHeadTick(sch, positives[0..pn]);
+    }
+    if (zn > 0) try runBatchedDecodeTick(sch, plains[0..zn]);
+    return true;
+}
+
+var mtp_group_env: ?bool = null;
+fn mtpGroupEnabled() bool {
+    if (mtp_group_env) |v| return v;
+    const on = if (std.c.getenv("MLX_SERVE_MTP_BATCHED")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else true;
+    mtp_group_env = on;
+    return on;
+}
+
+/// qwen4_exp verify rows are expert bytes, so a batched verify measured no better than
+/// solo rounds: its MTP rounds stay solo unless opted in; two interleave, three go plain.
+var mtp_batched_qwen4_env: ?bool = null;
+fn mtpBatchedQwen4Enabled() bool {
+    if (mtp_batched_qwen4_env) |v| return v;
+    const on = if (std.c.getenv("MLX_SERVE_MTP_BATCHED_QWEN4")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else false;
+    mtp_batched_qwen4_env = on;
+    return on;
+}
+
+fn mtpQwen4StaySolo(has_qwen4: bool, env_on: bool) bool {
+    return has_qwen4 and !env_on;
+}
+
+/// Why this group cannot take the merged `[N, S]` verify forward, or null for a shape that
+/// may: a qwen4 trunk's batched sub-paths are decode-shaped and uncertified past width 1.
+pub fn mergedVerifyDeclineReason(has_qwen4: bool, width: u32) ?[]const u8 {
+    if (has_qwen4 and width > 1) return "qwen4 trunk past verify width 1";
+    return null;
+}
+
+pub const VerifyShape = enum { solo, row_axis, merged };
+
+pub fn verifyShapeFor(rows: usize, has_qwen4: bool, width: u32) VerifyShape {
+    if (rows <= 1) return .solo;
+    if (mergedVerifyDeclineReason(has_qwen4, width) != null) return .row_axis;
+    return .merged;
+}
+
+var merged_verify_decline_logged: bool = false;
+
+fn mtpRoundsStaySolo(slot: *const Slot) bool {
+    const t = slot.model.transformer orelse return true;
+    return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
+}
+
+fn mtpCrowdThresholdFor(slot: *const Slot) usize {
+    return if (mtpRoundsStaySolo(slot)) 3 else mtpCrowdThreshold();
+}
+
+fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
+    const cost_xfm = group[0].model.transformer.?;
+    cost_xfm.cost_trace_active = cost_xfm.qwen4 != null;
+    cost_xfm.cost_attention = 0;
+    cost_xfm.cost_moe = 0;
+    const head_calls_before = transformer_mod.mtp_head_row_dispatches;
+    defer cost_xfm.cost_trace_active = false;
+    defer for (group) |slot| {
+        if (slot.legacy_gen) |*gen| gen.mtp_batch_head = false;
+    };
+    var tick_sw = io_util.Stopwatch.init(group[0].io);
+    var gens: [MAX_BATCH_GROUP]*generate_mod.Generator = undefined;
+    var chains: [MAX_BATCH_GROUP]generate_mod.Generator.MtpPreDraft = undefined;
+    var opens: [MAX_BATCH_GROUP]generate_mod.Generator.MtpRoundOpen = undefined;
+    var live: [MAX_BATCH_GROUP]*Slot = undefined;
+    var n: usize = 0;
+    var n_chain: usize = 0;
+    defer for (opens[0..n]) |*o| {
+        if (o.chain.drafts.len != 0) o.chain.deinit(live[0].allocator);
+    };
+    defer for (chains[0..n_chain]) |*c| c.deinit(live[0].allocator);
+
+    for (group) |slot| {
+        const gen = &slot.legacy_gen.?;
+        if (try loopGuardTick(sch, slot, gen)) continue;
+        gen.mtp_batch_head = true;
+        const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
+            gen.mtp_batch_head = false;
+            slot.markError(@errorName(e));
+            continue;
+        };
+        switch (begun) {
+            .done => |r| publishMtpResult(sch, slot, gen, r),
+            .verify => |st_in| {
+                var state = st_in;
+                defer state.deinit(slot.allocator);
+                gen.mtpRoundVerify(&state) catch |e| {
+                    slot.markError(@errorName(e));
+                    continue;
+                };
+                mtpFinishPublish(sch, slot, gen, &state);
+            },
+            .open => |o| {
+                opens[n] = o;
+                gens[n] = gen;
+                live[n] = slot;
+                n += 1;
+            },
+        }
+    }
+    if (n == 0) return;
+
+    var depth: u32 = 1;
+    for (opens[0..n], 0..) |*o, i| {
+        depth = @max(depth, o.chain.m);
+        chains[i] = o.chain;
+        o.chain = .{
+            .plan = chains[i].plan,
+            .off0 = 0,
+            .t1 = 0,
+            .t1_arr = .{ .ctx = null },
+            .drafts = &.{},
+            .draft_arrs = &.{},
+            .n_drafted = 0,
+            .conf_arrs = null,
+            .n_conf = 0,
+            .q_probs = null,
+            .n_qp = 0,
+            .h_chain = null,
+            .m = 0,
+        };
+        n_chain = i + 1;
+    }
+
+    const chain_lap = generate_mod.Generator.SubLap.start(generate_mod.Generator.mtpTraceOn(), live[0].io);
+    generate_mod.Generator.mtpChainBuildBatched(gens[0..n], chains[0..n], 0, depth) catch |e| {
+        for (live[0..n]) |slot| slot.markError(@errorName(e));
+        return;
+    };
+    // Dispatched before the verify build so the chain's GPU time covers the build.
+    generate_mod.Generator.mtpChainDispatchBatched(chains[0..n]) catch |e| {
+        for (live[0..n]) |slot| slot.markError(@errorName(e));
+        return;
+    };
+    if (chain_lap.read()) |chain_ns| {
+        for (gens[0..n]) |gen| gen.mtpTraceSub(.chain, chain_ns);
+    }
+
+    const taken = n;
+    n = 0;
+    n_chain = 0;
+    var states: [MAX_BATCH_GROUP]generate_mod.Generator.MtpRoundState = undefined;
+    var vgens: [MAX_BATCH_GROUP]*generate_mod.Generator = undefined;
+    var vlive: [MAX_BATCH_GROUP]*Slot = undefined;
+    var vn: usize = 0;
+    defer for (states[0..vn], vlive[0..vn]) |*st, slot| {
+        st.deinit(slot.allocator);
+    };
+    for (0..taken) |i| {
+        opens[i].chain = chains[i];
+        states[vn] = gens[i].mtpRoundContinue(live[i].allocator, opens[i]) catch |e| {
+            live[i].markError(@errorName(e));
+            continue;
+        };
+        vgens[vn] = gens[i];
+        vlive[vn] = live[i];
+        vn += 1;
+    }
+    if (vn == 0) return;
+
+    var sts: [MAX_BATCH_GROUP]*generate_mod.Generator.MtpRoundState = undefined;
+    for (states[0..vn], 0..) |*st, i| sts[i] = st;
+    if (generate_mod.Generator.mtpGroupVerify(vgens[0..vn], sts[0..vn])) |_| {
+        generate_mod.Generator.mtpGroupAccept(vgens[0..vn], sts[0..vn]) catch |e| {
+            for (vlive[0..vn]) |slot| slot.markError(@errorName(e));
+            return;
+        };
+    } else |e| {
+        for (vlive[0..vn]) |slot| slot.markError(@errorName(e));
+        return;
+    }
+    for (states[0..vn], vgens[0..vn], vlive[0..vn]) |*st, gen, slot| {
+        if (slot.state == .errored) continue;
+        mtpFinishPublish(sch, slot, gen, st);
+    }
+    observeGroupRound(vlive[0..vn], states[0..vn], group.len, &tick_sw, head_calls_before);
+}
+
+/// Group MTP slots by model (pad-waste capped like the plain group) and run one
+/// batched verify per group; a group of one takes the solo round.
+fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
+    if (slots.len == 0) return;
+    std.sort.pdq(*Slot, slots, {}, struct {
+        fn lt(_: void, a: *Slot, b: *Slot) bool {
+            return @intFromPtr(a.model) < @intFromPtr(b.model);
+        }
+    }.lt);
+    var start: usize = 0;
+    while (start < slots.len) {
+        var end = start + 1;
+        while (end < slots.len and slots[end].model == slots[start].model) end += 1;
+        var group = slots[start..end];
+        if (mtpRoundsStaySolo(group[0])) {
+            for (group) |slot| try runSingleDecodeTick(sch, slot);
+            start = end;
+            continue;
+        }
+        if (group.len >= 2) {
+            var kv_lens: [MAX_BATCH_GROUP]u32 = undefined;
+            var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
+            var mrope_buf: [MAX_BATCH_GROUP]bool = undefined;
+            for (group, 0..) |g, i| {
+                caches_buf[i] = &g.cache;
+                mrope_buf[i] = g.mrope_pos != null;
+            }
+            fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 2, mrope_buf[0..group.len], kv_lens[0..group.len]);
+            var i: usize = 1;
+            while (i < group.len) : (i += 1) {
+                const slot_i = group[i];
+                const len_i = kv_lens[i];
+                var j = i;
+                while (j > 0 and kv_lens[j - 1] > len_i) : (j -= 1) {
+                    group[j] = group[j - 1];
+                    kv_lens[j] = kv_lens[j - 1];
+                }
+                group[j] = slot_i;
+                kv_lens[j] = len_i;
+            }
+            const keep = batchedKvKeepCount(kv_lens[0..group.len]);
+            for (group[keep..]) |s| {
+                noteSerial(sch, s, .pad_waste);
+                try runSingleDecodeTick(sch, s);
+            }
+            group = group[0..keep];
+        }
+        // Sub-groups sized to the verify lane's row budget; the leftover slot rounds solo.
+        var g0: usize = 0;
+        while (g0 < group.len) {
+            const rem = group.len - g0;
+            const size = mtpSubGroupSize(rem, mtpGroupRowCap());
+            const sub = group[g0 .. g0 + size];
+            if (size >= 2) {
+                const cap = mtpGroupRowCap() / @as(u32, @intCast(size)) - 1;
+                for (sub) |slot| slot.legacy_gen.?.mtp_group_cap = cap;
+                try runBatchedMtpTick(sch, sub);
+            } else {
+                sub[0].legacy_gen.?.mtp_group_cap = 0;
+                try runSingleDecodeTick(sch, sub[0]);
+            }
+            g0 += size;
+        }
+        start = end;
+    }
+}
+
+/// Rows one batched verify may carry: past 7 the projections leave the split-K lane for
+/// stock kernels; the NAX m16 tile carries 16.
+fn mtpGroupRowCap() u32 {
+    return if (dflash_mod.wideVerifyLaneAvailable()) 16 else 7;
+}
+
+/// MTP slots on one model at or past this count decode on the plain batched tick instead:
+/// sub-grouped verify rounds lose to one plain tick there.
+fn mtpCrowdThreshold() usize {
+    return mtpSubGroupSize(std.math.maxInt(usize), mtpGroupRowCap()) + 1;
+}
+
+/// Slots in the next sub-group: two at depth 2 or three at depth 1 fill 7 rows; four is
+/// better as 2+2 than 3+1.
+pub fn mtpSubGroupSize(remaining: usize, row_cap: u32) usize {
+    if (remaining < 2) return remaining;
+    if (row_cap >= 16) return @min(remaining, 4);
+    if (remaining == 3 or remaining >= 5) return 3;
+    return 2;
+}
+
+fn runBatchedMtpTick(sch: *Scheduler, group: []*Slot) !void {
+    var inner_err: ?anyerror = null;
+    runBatchedMtpTickInner(sch, group) catch |e| {
+        inner_err = e;
+    };
+    mlx.checkErrorDecode() catch |mlx_err| {
+        log.err("[scheduler] batched verify aborted: MLX failure mid-generation ({s}) — failing these requests, the server keeps serving\n", .{@errorName(mlx_err)});
+        for (group) |slot| slot.markError(@errorName(mlx_err));
+        return;
+    };
+    if (inner_err) |e| return e;
+}
+
+/// One speculative round for a group: every slot drafts on its own head, the trunk
+/// verifies all of them in ONE `[N, S]` forward (rows padded to the widest draft),
+/// every slot accepts and rolls back on its own row.
+fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
+    const allocator = sch.allocator;
+    var states: [MAX_BATCH_GROUP]generate_mod.Generator.MtpRoundState = undefined;
+    var live: [MAX_BATCH_GROUP]*Slot = undefined;
+    var n: usize = 0;
+    defer for (states[0..n], live[0..n]) |*st, slot| {
+        st.deinit(slot.allocator);
+    };
+
+    for (group) |slot| {
+        const gen = &slot.legacy_gen.?;
+        if (try loopGuardTick(sch, slot, gen)) continue;
+        const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
+            slot.markError(@errorName(e));
+            continue;
+        };
+        switch (begun) {
+            .open => unreachable,
+            .done => |r| publishMtpResult(sch, slot, gen, r),
+            .verify => |st| {
+                states[n] = st;
+                live[n] = slot;
+                n += 1;
+            },
+        }
+    }
+    if (n == 0) return;
+    if (n == 1) {
+        const gen = &live[0].legacy_gen.?;
+        try gen.mtpRoundVerify(&states[0]);
+        const r = try gen.mtpRoundFinish(live[0].allocator, &states[0]);
+        publishMtpResult(sch, live[0], gen, r);
+        return;
+    }
+
+    const xfm = live[0].model.transformer.?;
+    const s_stream = xfm.s;
+    var width: u32 = 0;
+    for (states[0..n]) |*st| width = @max(width, st.verify_len);
+    const ctxs = try allocator.alloc(*ForwardCtx, n);
+    defer allocator.free(ctxs);
+    const rope_offsets = try allocator.alloc(u32, n);
+    defer allocator.free(rope_offsets);
+    for (live[0..n], 0..) |slot, i| {
+        ctxs[i] = &slot.legacy_gen.?.ctx;
+        rope_offsets[i] = @intCast(slot.moe_seq_offset);
+    }
+    if (!xfm.batchedGdnReady(ctxs)) {
+        // No recurrent state to merge yet: every round solo this tick.
+        for (states[0..n], live[0..n]) |*st, slot| {
+            const gen = &slot.legacy_gen.?;
+            try gen.mtpRoundVerify(st);
+            const r = try gen.mtpRoundFinish(slot.allocator, st);
+            publishMtpResult(sch, slot, gen, r);
+        }
+        return;
+    }
+
+    // [N, width] rows: each verify input right-padded with token 0 (never read past 1+m).
+    const rows_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(rows_vec);
+    var padded: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    var padded_n: usize = 0;
+    defer for (padded[0..padded_n]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (states[0..n]) |*st| {
+        const pad: c_int = @intCast(width - st.verify_len);
+        var row = mlx.mlx_array_new();
+        if (pad > 0) {
+            const axes = [_]c_int{1};
+            const low = [_]c_int{0};
+            const high = [_]c_int{pad};
+            const zero = mlx.mlx_array_new_int(0);
+            defer _ = mlx.mlx_array_free(zero);
+            try mlx.check(mlx.mlx_pad(&row, st.verify_input, &axes, 1, &low, 1, &high, 1, zero, "constant", s_stream));
+        } else {
+            try mlx.check(mlx.mlx_array_set(&row, st.verify_input));
+        }
+        padded[padded_n] = row;
+        padded_n += 1;
+        _ = mlx.mlx_vector_array_append_value(rows_vec, row);
+    }
+    var token_arr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(token_arr);
+    try mlx.check(mlx.mlx_concatenate_axis(&token_arr, rows_vec, 0, s_stream));
+
+    var hidden_last = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hidden_last);
+    var hidden_all = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hidden_all);
+    const logits = try xfm.forwardMoeBatchedVerify(token_arr, ctxs, rope_offsets, &hidden_last, &hidden_all);
+    defer _ = mlx.mlx_array_free(logits);
+    // The batched forward moved only its scratch offset; the solo forward would have
+    // advanced every slot by the rows it ran, and the finish rolls back from there.
+    for (live[0..n]) |slot| slot.moe_seq_offset += width;
+
+    const logit_rows = try Transformer.sliceBatchRows(allocator, s_stream, logits, n);
+    defer allocator.free(logit_rows);
+    const last_rows = try Transformer.sliceBatchRows(allocator, s_stream, hidden_last, n);
+    defer allocator.free(last_rows);
+    const all_rows = try Transformer.sliceBatchRows(allocator, s_stream, hidden_all, n);
+    defer allocator.free(all_rows);
+    for (states[0..n], 0..) |*st, i| {
+        st.verify_logits = logit_rows[i];
+        st.new_hidden = last_rows[i];
+        st.verify_hidden_all = all_rows[i];
+        st.verify_len = width;
+    }
+    if (sch.metrics) |m| m.batched_group_size.set(n);
+    for (states[0..n], live[0..n]) |*st, slot| {
+        const gen = &slot.legacy_gen.?;
+        mtpFinishPublish(sch, slot, gen, st);
+    }
+}
+
+fn groupCostSampleComplete(expected: usize, retained: []const u32, published: []const bool) bool {
+    if (expected < 1 or expected > group_cost_mod.MAX_GROUP_ROWS or retained.len != expected or published.len != expected) return false;
+    for (retained, published) |count, complete| if (count == 0 or !complete) return false;
+    return true;
+}
+
+fn cacheCostFormat(config: transformer_mod.KVQuantConfig) u64 {
+    return (@as(u64, config.group_size) << 16) | (@as(u64, config.bits) << 8) | @backingInt(config.scheme);
+}
+
+/// One wall for the group grid: from the tick's first round-begin to its last publish.
+/// Both group sites hand their tick stopwatch here rather than starting one of their own.
+fn observeGroupRound(live: []*Slot, states: []const Generator.MtpRoundState, expected: usize, tick_sw: *io_util.Stopwatch, head_calls_before: u64) void {
+    const xfm = live[0].model.transformer orelse return;
+    if (live.len > group_cost_mod.MAX_GROUP_ROWS) return;
+    var price_transition = false;
+    for (live) |slot| price_transition = price_transition or slot.planner_price_transition;
+    defer {
+        for (live) |slot| slot.planner_price_transition = false;
+    }
+    var emitted: [group_cost_mod.MAX_GROUP_ROWS]u32 = undefined;
+    var published: [group_cost_mod.MAX_GROUP_ROWS]bool = undefined;
+    var gaps: [group_cost_mod.MAX_GROUP_ROWS]f32 = undefined;
+    for (live, states, 0..) |slot, st, i| {
+        emitted[i] = st.retained;
+        published[i] = slot.state == .decoding and !slot.cancelled.load(.acquire);
+        gaps[i] = slot.mtp_publish_gap_ms;
+    }
+    if (!groupCostSampleComplete(expected, emitted[0..live.len], published[0..live.len])) return;
+    if (price_transition) return;
+    var key = group_cost_mod.GroupShape{
+        .n = @intCast(live.len),
+        .kv_format = cacheCostFormat(live[0].cache.config),
+        .head_format = if (xfm.qwen4_mtp) |head| cacheCostFormat(head.cache.config) else 0,
+        .attention = xfm.cost_attention,
+        .moe = xfm.cost_moe,
+        .head_calls = @intCast(@min(std.math.maxInt(u16), transformer_mod.mtp_head_row_dispatches -% head_calls_before)),
+    };
+    for (live, states, 0..) |slot, st, i| {
+        const chain = st.chain;
+        if (chain.m > round_cost_mod.MAX_WIDTH or chain.n_drafted > round_cost_mod.MAX_WIDTH or chain.head_input_rows > round_cost_mod.MAX_WIDTH + 2) return;
+        const mode = group_cost_mod.GroupShape.samplingMode(slot.legacy_gen.?.mtp.?.canRerankDrafts(), chain.conf_arrs != null, chain.q_probs != null, slot.legacy_gen.?.sampling.temperature > 0.01);
+        key.rows[i] = group_cost_mod.GroupShape.row(@intCast(chain.m), @intCast(chain.n_drafted), @intCast(@min(chain.plan.m_lo, chain.n_drafted)), @intCast(xfm.round_cost.bucketOf(@intCast(st.moe_seq_offset_snap))), @intCast(xfm.round_cost.bucketOf(@intCast(chain.off0))), @intCast(chain.head_input_rows), mode);
+        key.padding += @intCast(st.verify_len - (1 + chain.m));
+    }
+    const ms = @as(f32, @floatFromInt(tick_sw.read())) / @as(f32, std.time.ns_per_ms);
+    _ = xfm.mtp_group_cost.observeShape(key, ms, emitted[0..live.len], gaps[0..live.len], .round);
+}
+
+/// One verify forward for a whole group: ragged rows ride the row-axis form, equal-lane
+/// trunks the merged padded forward, one row a solo round.
+/// Finish one row's round and publish it; a failed finish errors the slot instead.
+fn mtpFinishPublish(sch: *Scheduler, slot: *Slot, gen: *Generator, st: *Generator.MtpRoundState) void {
+    const r = gen.mtpRoundFinish(slot.allocator, st) catch |e| {
+        slot.markError(@errorName(e));
+        return;
+    };
+    publishMtpResult(sch, slot, gen, r);
+}
+
+fn publishMtpResult(sch: *Scheduler, slot: *Slot, gen: *Generator, result: ?Generator.DrafterStepResult) void {
+    const r = result orelse {
+        finishSlot(sch, slot, gen.finish_reason);
+        return;
+    };
+    defer slot.allocator.free(r.tokens);
+    publishSpeculativeBlock(sch, slot, gen, r.tokens);
+}
+
 fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+    var inner_err: ?anyerror = null;
+    runBatchedDecodeTickInner(sch, active) catch |e| {
+        inner_err = e;
+    };
+    mlx.checkErrorDecode() catch |mlx_err| {
+        log.err("[scheduler] batched decode aborted: MLX failure ({s}) — failing all {d} slots in the group\n", .{ @errorName(mlx_err), active.len });
+        for (active) |s| s.markError(@errorName(mlx_err));
+        return;
+    };
+    if (inner_err) |e| return e;
+}
+
+fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     const N = active.len;
     if (N == 0) return;
     const allocator = sch.allocator;
@@ -4277,6 +8165,25 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (std.debug.runtime_safety) {
         for (active) |s| std.debug.assert(s.model.transformer.? == xfm_ptr);
     }
+
+    const observe_plain = Planner.enabled() and xfm_ptr.qwen4 != null and N <= Planner.MAX_ROWS;
+    var price_watch = io_util.Stopwatch.init(active[0].io);
+    var price_key: group_cost_mod.GroupShape = .{};
+    var price_clean = observe_plain;
+    if (observe_plain) {
+        const zeros: [Planner.MAX_ROWS]u8 = @splat(0);
+        price_key = plannerShape(active, zeros[0..N]);
+        xfm_ptr.cost_trace_active = true;
+        xfm_ptr.cost_attention = 0;
+        xfm_ptr.cost_moe = 0;
+        for (active) |slot| {
+            const gen = &slot.legacy_gen.?;
+            if (gen.has_pending_logits or gen.has_pending_token or slot.planner_plain_transition or slot.mtp_plain_tick) price_clean = false;
+        }
+    }
+    defer if (observe_plain) {
+        xfm_ptr.cost_trace_active = false;
+    };
 
     // Legacy→batched transition: a slot arriving from a legacy single-slot
     // tick (or fresh from prefill) carries lazy pipeline state — a lookahead
@@ -4303,6 +8210,10 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             };
             if (emitted) |tok| {
                 slot.pushToken(tok);
+                if (Planner.enabled() and gen.mtp_planner_owned) {
+                    gen.mtp_planner_plain_ticks += 1;
+                    plannerOutputClock(slot, gen);
+                }
                 if (tok != 0) slot.was_pad_only = false;
                 slot.completion_tokens = gen.completion_tokens;
                 if (generate_mod.isEosId(gen.next_token_id, slot.eos_token_ids)) {
@@ -4339,24 +8250,90 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         const gen = &slot.legacy_gen.?;
         next_tokens[i] = gen.next_token_id;
         ctxs[i] = &gen.ctx;
-        rope_offsets[i] = @intCast(slot.cache.step);
     }
 
-    const logits_arr = try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
+    // Two batched kernels: the standard one, and the GatedDeltaNet twin for
+    // hybrid trunks (qwen3_5 family). `batchedGdnReady` is the runtime half of
+    // the gate — a slot that has not prefilled yet carries no recurrent state
+    // to merge, so that tick stays serial rather than merging a wrong width.
+    const use_gdn = xfm_ptr.supportsBatchedGdnDecode() and xfm_ptr.batchedGdnReady(ctxs);
+    // Position source is per PATH: a GDN trunk positions from the slot's
+    // `moe_seq_offset` — `KVCache.step` only advances on layer 0, which is a
+    // linear layer there, so it reads 0 forever and every batched token was
+    // roped at position 0 (qwen3_5 batched diverged from serial at token 14).
+    for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (use_gdn) slot.moe_seq_offset else slot.cache.step);
+    if (xfm_ptr.supportsBatchedGdnDecode() and !use_gdn) {
+        // A slot with no recurrent state yet cannot join the merge. Decode the
+        // group serially this tick instead of skipping it — skipping advances
+        // nothing, so a group that never becomes ready would spin forever.
+        for (batch) |s| try runSingleDecodeTick(sch, s);
+        return;
+    }
+    var want_hidden = false;
+    for (batch) |slot| {
+        want_hidden = want_hidden or slot.mtp_plain_tick;
+        if (Planner.enabled() and slot.legacy_gen.?.mtp_planner_owned) {
+            const gen = &slot.legacy_gen.?;
+            if (slot.mtp_plain_tick) gen.mtp_planner_prime_ticks += 1 else {
+                gen.mtp_hidden_stale = true;
+                gen.mtp_planner_plain_ticks += 1;
+            }
+        }
+    }
+    var hidden_rows: ?[]mlx.mlx_array = null;
+    defer if (hidden_rows) |rows| {
+        for (rows) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(rows);
+    };
+    const logits_arr = if (use_gdn)
+        try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
+    else
+        try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
     defer {
         for (logits_arr) |a| _ = mlx.mlx_array_free(a);
         allocator.free(logits_arr);
     }
+    if (hidden_rows) |rows| {
+        for (batch, 0..) |slot, i| {
+            if (!slot.mtp_plain_tick) continue;
+            slot.mtp_plain_tick = false;
+            const gen = &slot.legacy_gen.?;
+            if (gen.has_last_hidden) _ = mlx.mlx_array_free(gen.last_hidden);
+            gen.last_hidden = rows[i];
+            rows[i] = mlx.mlx_array_new();
+            gen.has_last_hidden = true;
+            if (Planner.enabled()) gen.mtp_hidden_stale = false;
+        }
+    }
+    for (batch) |slot| slot.mtp_plain_tick = false;
+    // The batched forward advances only its scratch offset; each slot's own
+    // position moves here so a slot leaving the batch resumes serial from
+    // the right place (qwen4's QSA reads it for kv length + tail rule).
+    for (batch) |slot| slot.moe_seq_offset += 1;
+
+    // `gen.sampling`, not `slot.sampling`: the Generator's copy passed
+    // the initWithOptions chokepoint and carries the model's
+    // reserved-token suppression mask; the slot's copy is the raw
+    // request params.
+    var sample_params: [MAX_BATCH_GROUP]generate_mod.SamplingParams = undefined;
+    var sample_rows: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    var sample_ids: [MAX_BATCH_GROUP]i32 = undefined;
+    std.debug.assert(live_n == logits_arr.len);
+    std.debug.assert(live_n <= sample_params.len);
+    for (batch, 0..) |slot, i| {
+        sample_params[i] = slot.legacy_gen.?.sampling;
+        sample_rows[i] = logits_arr[i];
+    }
+    if (live_n > 0) {
+        try generate_mod.sampleRows(sample_ids[0..live_n], sample_rows[0..live_n], sample_params[0..live_n], xfm_ptr.s);
+        for (batch, 0..) |slot, i| slot.legacy_gen.?.sampling.draw = sample_params[i].draw;
+    }
 
     // Sample per slot, emit prev id, set new next_token_id.
     for (batch, 0..) |slot, i| {
-        if (slot.cancelled.load(.acquire)) continue;
         const gen = &slot.legacy_gen.?;
-        const lazy = generate_mod.sampleTokenLazy(logits_arr[i], slot.sampling, xfm_ptr.s);
-        try mlx.check(mlx.mlx_array_eval(lazy));
-        var val: i32 = 0;
-        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-        _ = mlx.mlx_array_free(lazy);
+        const act = batchedTickAction(slot.cancelled.load(.acquire));
+        const sampled: ?i32 = if (act.publish) sample_ids[i] else null;
 
         const emit = gen.next_token_id;
         gen.generated_ids.append(slot.allocator, emit) catch |err| {
@@ -4364,7 +8341,10 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             continue;
         };
         gen.advanceStep(1);
+        if (emit != 0) slot.was_pad_only = false;
+        const val = sampled orelse continue;
         gen.next_token_id = @intCast(val);
+        if (Planner.enabled()) plannerOutputClock(slot, gen);
 
         // Stop checks (mirrors Generator.checkStop).
         if (generate_mod.isEosId(emit, slot.eos_token_ids)) {
@@ -4375,12 +8355,10 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             // behavior we emit and then mark finished if `next_token_id` is
             // EOS (i.e. STOP is the next sampled token, ignored).
             slot.pushToken(emit);
-            if (emit != 0) slot.was_pad_only = false;
             slot.completion_tokens = gen.completion_tokens;
             // not finished yet; next tick's checkStop on next_token_id ends it
         } else {
             slot.pushToken(emit);
-            if (emit != 0) slot.was_pad_only = false;
             slot.completion_tokens = gen.completion_tokens;
         }
 
@@ -4402,9 +8380,33 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             continue;
         }
     }
+    if (price_clean and live_n == N) {
+        var gaps: [Planner.MAX_ROWS]f32 = undefined;
+        for (batch, 0..) |slot, i| {
+            if (slot.state != .decoding or slot.cancelled.load(.acquire)) return;
+            gaps[i] = slot.mtp_publish_gap_ms;
+        }
+        price_key.attention = xfm_ptr.cost_attention;
+        price_key.moe = xfm_ptr.cost_moe;
+        const emitted: [Planner.MAX_ROWS]u32 = @splat(1);
+        const ms = @as(f32, @floatFromInt(price_watch.read())) / std.time.ns_per_ms;
+        _ = xfm_ptr.mtp_group_cost.observeShape(price_key, ms, emitted[0..N], gaps[0..N], .round);
+    }
 }
 
 const testing = std.testing;
+
+test "runPrefill wires the interleave hook and bills its decode ticks out of prefill_ns" {
+    const src = @embedFile("scheduler.zig");
+    // The hook is wired at the ONE Generator construction site, env-gated.
+    const wire = ".interleave" ++ "_hook = if (prefillInterleaveEnabled())";
+    try testing.expect(std.mem.indexOf(u8, src, wire) != null);
+    // Interleaved decode time is charged to the DECODING slots (they got the
+    // tokens), so the prefilling slot's prefill_ns must exclude it or
+    // prefill_tps under-reports on every interleaved prefill.
+    const bill = "slot.prefill_ns = prefill_sw.read() -| slot.prefill_" ++ "interleaved_ns;";
+    try testing.expect(std.mem.indexOf(u8, src, bill) != null);
+}
 
 test "modelBatchable rejects MoE / hybrid / encoder / sliding-window" {
     {
@@ -4460,10 +8462,554 @@ test "modelBatchable: a PARSED deepseek_v4 config can never route to batched dec
     try testing.expect(!prefix_cache_mod.HotPrefixCache.shouldUse(&cfg, true));
 }
 
+test "batchedKvKeepCount: padding waste caps the group, and the long slots are the ones dropped" {
+    // Even lengths: no padding waste, everybody batches.
+    try testing.expectEqual(@as(usize, 4), batchedKvKeepCount(&[_]u32{ 1000, 1000, 1000, 1000 }));
+    try testing.expectEqual(@as(usize, 4), batchedKvKeepCount(&[_]u32{ 900, 1000, 1100, 1200 }));
+
+    // The case this exists for: three short streams and one long one. Batching
+    // all four pads to 4 x 100000 = 400k against 103k useful (3.9x); dropping
+    // the long one leaves 3 x 1000 vs 3000 (1.0x).
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 1000, 1000, 1000, 100_000 }));
+
+    // Two long ones: the pair still batches together, since 2 x 100000 against
+    // 200000 useful wastes nothing — the veto is about the padding, not length.
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&[_]u32{ 100_000, 100_000 }));
+    // One short slot among two long ones still batches: 3 x 100000 padded
+    // against 200010 useful is 1.5x, inside the bar. The veto is about the
+    // WASTE the padding creates, not about any slot being an outlier.
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 10, 100_000, 100_000 }));
+
+    // One slot never "batches", and neither does an empty group.
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{1000}));
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{}));
+
+    // Nothing prefilled yet: no padding to waste, so nothing is vetoed (the
+    // ready gate, not this one, is what keeps unprefilled slots out).
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 0, 0, 0 }));
+
+    // A pathological pair degrades to no batch at all rather than making the
+    // 1-token slot build a 200k-wide tensor nobody billed. This is why the bar
+    // has to sit below 2.0 — at 2.0 a pair is unvetoable by construction.
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{ 1, 200_000 }));
+}
+
+test "the batched group is capped by padding waste before it is dispatched" {
+    // Source-scan class guard: the grouping loop must consult the cap. Without
+    // it a single long-context stream makes every short neighbour materialize
+    // a padded KV tensor sized by ITS length — a per-tick transient no gate
+    // bills, whose failure mode is an uncatchable Metal OOM.
+    const src = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, src, "// Group batchable slots by model pointer") orelse return error.MissingGrouping;
+    const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
+    const body = src[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "batchedKvKeepCount(") != null);
+    // ...and the dropped slots must still be ticked, or they never advance.
+    try testing.expect(std.mem.indexOf(u8, body, "noteSerial(sch, s, .pad_waste)") != null);
+}
+
+test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.step" {
+    // `cache.step` is 0 forever on a linear-layer-0 trunk, so the cap never fired there.
+    const lens = [_]usize{ 1_000, 1_000, 60_000 };
+    const first_attn = [_]u32{ 3, 2, 7 }; // GDN / gated-conv / KDA spacings
+    var caches: [3]KVCache = undefined;
+    var built: usize = 0;
+    defer for (caches[0..built]) |*c| c.deinit();
+    for (lens, first_attn, 0..) |len, fa, i| {
+        caches[i] = try KVCache.init(testing.allocator, 32);
+        built += 1;
+        caches[i].entries[fa].initialized = true;
+        caches[i].entries[fa].offset = len;
+        try testing.expectEqual(@as(usize, 0), caches[i].step); // the trap
+    }
+
+    var q4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    var kv_lens: [3]u32 = undefined;
+    for (caches[0..], 0..) |*c, i| kv_lens[i] = batchKvLenOf(c, &q4);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 60_000 }, &kv_lens);
+
+    // Every other hybrid keeps `cache.step` (the cap stays dead there, pending a multi-stream measurement).
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "lfm2", "nemotron_h", "bailing_hybrid" }) |mt| {
+        var cfg = model_mod.ModelConfig{ .model_type = mt };
+        for (caches[0..]) |*c| try testing.expectEqual(@as(u32, 0), batchKvLenOf(c, &cfg));
+    }
+    for (caches[0..]) |*c| try testing.expectEqual(@as(u32, 0), batchKvLenOf(c, null));
+
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&kv_lens));
+    try testing.expect(batchedPadWaste(&kv_lens) > MAX_PAD_WASTE);
+
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 0, 0, 0 }));
+    try testing.expectEqual(@as(f64, 1.0), batchedPadWaste(&[_]u32{ 0, 0, 0 }));
+}
+
+test "an attention-first trunk's batching lengths are unchanged by the fix" {
+    // Dense / attention-first archs are byte-identical across this change.
+    const lens = [_]usize{ 1_000, 1_000, 1_000, 100_000 };
+    var llama = model_mod.ModelConfig{ .model_type = "llama" };
+    var caches: [4]KVCache = undefined;
+    var built: usize = 0;
+    defer for (caches[0..built]) |*c| c.deinit();
+    var kv_lens: [4]u32 = undefined;
+    for (lens, 0..) |len, i| {
+        caches[i] = try KVCache.init(testing.allocator, 8);
+        built += 1;
+        caches[i].step = len;
+        caches[i].entries[0].initialized = true;
+        caches[i].entries[0].offset = len;
+        kv_lens[i] = batchKvLenOf(&caches[i], &llama);
+    }
+    try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 1_000, 100_000 }, &kv_lens);
+    var q4b = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    for (caches[0..], 0..) |*c, i| try testing.expectEqual(kv_lens[i], batchKvLenOf(c, &q4b));
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&kv_lens));
+    try testing.expectEqual(
+        batchedKvKeepCount(&[_]u32{ 1_000, 1_000, 1_000, 100_000 }),
+        batchedKvKeepCount(&kv_lens),
+    );
+}
+
+test "batchKvLenOf bills qwen4 selected length when the gather arm is on" {
+    const prev = transformer_mod.qsa_batched_gather_override;
+    defer transformer_mod.qsa_batched_gather_override = prev;
+    transformer_mod.qsa_batched_gather_override = true;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var cache = try KVCache.init(testing.allocator, 32);
+    defer cache.deinit();
+    cache.entries[3].initialized = true;
+    cache.entries[3].offset = 162_000;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOf(&cache, &q4));
+    transformer_mod.qsa_batched_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOf(&cache, &q4));
+    var llama = model_mod.ModelConfig{ .model_type = "llama" };
+    cache.step = 162_000;
+    cache.entries[0].initialized = true;
+    cache.entries[0].offset = 162_000;
+    transformer_mod.qsa_batched_gather_override = true;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOf(&cache, &llama));
+}
+
+test "batchKvLenOf bills raw when any gather switch is off or the slot is vision" {
+    const prev_b = transformer_mod.qsa_batched_gather_override;
+    const prev_g = transformer_mod.qsa_gather_override;
+    const prev_d = transformer_mod.qsa_decode_gather_override;
+    const prev_v = transformer_mod.qsa_verify_gather_override;
+    defer {
+        transformer_mod.qsa_batched_gather_override = prev_b;
+        transformer_mod.qsa_gather_override = prev_g;
+        transformer_mod.qsa_decode_gather_override = prev_d;
+        transformer_mod.qsa_verify_gather_override = prev_v;
+    }
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_decode_gather_override = true;
+    transformer_mod.qsa_verify_gather_override = true;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var cache = try KVCache.init(testing.allocator, 32);
+    defer cache.deinit();
+    cache.entries[3].initialized = true;
+    cache.entries[3].offset = 162_000;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 1, false));
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, true));
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 4, true));
+    transformer_mod.qsa_batched_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, false));
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, false));
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_decode_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, false));
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+    transformer_mod.qsa_decode_gather_override = true;
+    transformer_mod.qsa_verify_gather_override = false;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 1, false));
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 4, false));
+}
+
+test "grouping a 300k text slot beside a 1k vision slot is not admitted on the sparse bill" {
+    const prev_b = transformer_mod.qsa_batched_gather_override;
+    const prev_g = transformer_mod.qsa_gather_override;
+    const prev_d = transformer_mod.qsa_decode_gather_override;
+    defer {
+        transformer_mod.qsa_batched_gather_override = prev_b;
+        transformer_mod.qsa_gather_override = prev_g;
+        transformer_mod.qsa_decode_gather_override = prev_d;
+    }
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_decode_gather_override = true;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var caches: [2]KVCache = undefined;
+    var built: usize = 0;
+    defer for (caches[0..built]) |*c| c.deinit();
+    caches[0] = try KVCache.init(testing.allocator, 32);
+    built = 1;
+    caches[0].entries[3].initialized = true;
+    caches[0].entries[3].offset = 300_000;
+    caches[1] = try KVCache.init(testing.allocator, 32);
+    built = 2;
+    caches[1].entries[3].initialized = true;
+    caches[1].entries[3].offset = 1_000;
+    const ptrs = [_]*const KVCache{ &caches[0], &caches[1] };
+    var billed: [2]u32 = undefined;
+    fillGroupPadWasteKvLens(&ptrs, &q4, 1, &.{ false, true }, &billed);
+    try testing.expectEqual(@as(u32, 300_000), billed[0]);
+    try testing.expectEqual(@as(u32, 1_000), billed[1]);
+    var billed_asc = billed;
+    std.mem.sort(u32, &billed_asc, {}, std.sort.asc(u32));
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&billed_asc));
+    const per_slot = [_]u32{
+        batchKvLenOfWith(&caches[1], &q4, 1, true),
+        batchKvLenOfWith(&caches[0], &q4, 1, false),
+    };
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&per_slot));
+}
+
+test "S>=2 pad-waste floor is max of gather and verify mins" {
+    const prev_b = transformer_mod.qsa_batched_gather_override;
+    const prev_g = transformer_mod.qsa_gather_override;
+    const prev_v = transformer_mod.qsa_verify_gather_override;
+    const prev_gm = transformer_mod.qsa_gather_min_kv_override;
+    const prev_vm = transformer_mod.qsa_verify_gather_min_kv_override;
+    defer {
+        transformer_mod.qsa_batched_gather_override = prev_b;
+        transformer_mod.qsa_gather_override = prev_g;
+        transformer_mod.qsa_verify_gather_override = prev_v;
+        transformer_mod.qsa_gather_min_kv_override = prev_gm;
+        transformer_mod.qsa_verify_gather_min_kv_override = prev_vm;
+    }
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_verify_gather_override = true;
+    transformer_mod.qsa_gather_min_kv_override = 20_000;
+    transformer_mod.qsa_verify_gather_min_kv_override = 16_384;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var cache = try KVCache.init(testing.allocator, 32);
+    defer cache.deinit();
+    cache.entries[3].initialized = true;
+    cache.entries[3].offset = 18_000;
+    try testing.expectEqual(@as(u32, 18_000), batchKvLenOfWith(&cache, &q4, 4, false));
+    cache.entries[3].offset = 162_000;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+}
+
+test "batchedEffectiveKvLen: qwen4 bills selected length, other archs keep raw kv" {
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    const min_kv: u32 = 8192;
+    try testing.expectEqual(@as(u32, 2052), q4.batchedEffectiveKvLen(162_000, true, min_kv));
+    try testing.expectEqual(@as(u32, 2052), q4.batchedEffectiveKvLen(64_000, true, min_kv));
+    try testing.expectEqual(@as(u32, 8000), q4.batchedEffectiveKvLen(8000, true, min_kv));
+    try testing.expectEqual(@as(u32, 162_000), q4.batchedEffectiveKvLen(162_000, false, min_kv));
+    var llama = model_mod.ModelConfig{ .model_type = "llama" };
+    try testing.expectEqual(@as(u32, 162_000), llama.batchedEffectiveKvLen(162_000, true, min_kv));
+    var q35 = model_mod.ModelConfig{ .model_type = "qwen3_5" };
+    try testing.expectEqual(@as(u32, 162_000), q35.batchedEffectiveKvLen(162_000, true, min_kv));
+
+    const billed = [_]u32{
+        q4.batchedEffectiveKvLen(16_384, true, min_kv),
+        q4.batchedEffectiveKvLen(162_000, true, min_kv),
+    };
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&billed));
+    const raw_pair = [_]u32{ 16_384, 162_000 };
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&raw_pair));
+    const other = [_]u32{ 1_000, 162_000 };
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&other));
+}
+
+test "mtpQwen4StaySolo is opt-in" {
+    try testing.expect(mtpQwen4StaySolo(true, false));
+    try testing.expect(!mtpQwen4StaySolo(true, true));
+    try testing.expect(!mtpQwen4StaySolo(false, false));
+    try testing.expect(!mtpQwen4StaySolo(false, true));
+}
+
 test "modelBatchable permits pure-attention" {
     // Defaults are all zero / null → vanilla pure-attention path.
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
     try testing.expect(modelBatchable(&cfg));
+}
+
+test "a GDN trunk is batchable AND is not clamped by the server's concurrency gate" {
+    // The two sites that decide "does this model batch?" must agree. They
+    // disagreed once: the scheduler batched qwen3_5 while server.zig still
+    // clamped --max-concurrent to 1 for anything with
+    // full_attention_interval > 0, so asking for concurrency turned the
+    // batched path OFF. Both now read ModelConfig.supportsBatchedGdnDecode.
+    var cfg = std.mem.zeroes(model_mod.ModelConfig);
+    cfg.model_type = "qwen3_5";
+    cfg.full_attention_interval = 4;
+    try testing.expect(cfg.supportsBatchedGdnDecode());
+
+    // The pure-config gate rejects it (it IS a hybrid), which is exactly why
+    // the GDN predicate has to be consulted beside it.
+    try testing.expect(!modelBatchable(&cfg));
+
+    // The server's startup line, /props and /v1/models read this one predicate.
+    try testing.expect(configBatchesDecode(&cfg));
+}
+
+test "a spec_disabled_runtime slot is batchable, and that is the documented trade" {
+    // `slotTicksRegular` admits a generator whose speculation turned itself off
+    // at runtime. That is what recovered the throughput (9.6 -> 12.4 tok/s per
+    // stream on 4 concurrent 5.5k prompts), and it costs something real: the
+    // batched tick does not call `nextPld`, so its periodic re-enable check
+    // cannot run while the slot is batched. Both halves are load-bearing, so
+    // both are stated here — if the re-enable check ever moves onto the batched
+    // path, or the clause is dropped, this is the note to revisit.
+    const src = @embedFile("scheduler.zig");
+    const hs = std.mem.indexOf(u8, src, "fn slotTicksRegular(") orelse return error.MissingHelper;
+    const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
+    const hbody = src[hs..he];
+    // The clause that admits it...
+    try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime or") != null);
+    // ...and the trade it makes, written down where it is made.
+    try testing.expect(std.mem.indexOf(u8, hbody, "re-enable check") != null);
+    try testing.expect(std.mem.indexOf(u8, hbody, "SOLO slot never reaches the batched path") != null);
+}
+
+test "the batched gate reads DISPATCH, not the armed spec flags" {
+    // A prompt that merely n-gram-scores high enough to ARM PLD used to veto
+    // batched decode forever, even after PLD's own yield gate disabled itself
+    // at runtime: neither speculation nor batching (9.7 vs 14.3 tok/s per
+    // stream, 4 concurrent 4232-token prompts on Qwen3.5-4B). The armed flags
+    // are the REQUEST's wish; specTickMode is what the tick actually
+    // dispatches, and spec_disabled_runtime is what recovered the throughput.
+    const src = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, src, "fn batchVerdict(self: *const Scheduler") orelse return error.MissingBatchable;
+    const end = std.mem.indexOfPos(u8, src, start + 1, "\n    }\n") orelse return error.MissingBatchableEnd;
+    const body = src[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "slotTicksRegular(slot)") != null);
+    // No armed-flag read may come back into the gate.
+    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_pld") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_drafter") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_mtp") == null);
+
+    // ...and the helper answers from BOTH: the generator's runtime kill and
+    // the authoritative dispatch decision.
+    const hs = std.mem.indexOf(u8, src, "fn slotTicksRegular(") orelse return error.MissingHelper;
+    const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
+    const hbody = src[hs..he];
+    try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime") != null);
+    try testing.expect(std.mem.indexOf(u8, hbody, "specTickMode(") != null);
+
+    // The dispatch answer itself: a live MTP slot never ticks regular, an
+    // unarmed one always does.
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, true, true, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, true, false, false, true, false, false));
+}
+
+test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not model" {
+    // A new arch on the shared moe forward must default to SERIAL, not ride
+    // a kernel that never modelled its state.
+    {
+        var moe = std.mem.zeroes(model_mod.ModelConfig);
+        moe.model_type = "hy_v3";
+        moe.full_attention_interval = 4;
+        moe.num_experts = 128;
+        moe.num_experts_per_tok = 8;
+        try testing.expect(!moe.supportsBatchedGdnDecode());
+    }
+    {
+        var lfm2 = std.mem.zeroes(model_mod.ModelConfig);
+        lfm2.model_type = "lfm2";
+        lfm2.has_hybrid_layers = true;
+        try testing.expect(!lfm2.supportsBatchedGdnDecode());
+    }
+    {
+        var kda = std.mem.zeroes(model_mod.ModelConfig);
+        kda.model_type = "bailing_hybrid";
+        kda.full_attention_interval = 4;
+        kda.kda_vector_gate = true;
+        try testing.expect(!kda.supportsBatchedGdnDecode());
+    }
+    {
+        var ink = std.mem.zeroes(model_mod.ModelConfig);
+        ink.model_type = "inkling_mm_model";
+        ink.full_attention_interval = 4;
+        try testing.expect(!ink.supportsBatchedGdnDecode());
+    }
+    {
+        // Pure attention: not a GDN trunk at all, rides the standard kernel.
+        var dense = std.mem.zeroes(model_mod.ModelConfig);
+        dense.model_type = "qwen3";
+        try testing.expect(!dense.supportsBatchedGdnDecode());
+    }
+    {
+        // qwen4_exp: MoE, but every per-slot piece is on the SSMCacheEntry.
+        var q4 = std.mem.zeroes(model_mod.ModelConfig);
+        q4.model_type = "qwen4_exp";
+        q4.full_attention_interval = 4;
+        q4.num_experts = 256;
+        q4.num_experts_per_tok = 8;
+        try testing.expect(q4.supportsBatchedGdnDecode());
+    }
+}
+
+test "admitPendingTick: per-slot exclusivity (qwen4 MTP slot) blocks only its own class" {
+    const A: usize = 0xA0;
+    var out: [16]usize = undefined;
+    // An MTP candidate beside a live PLAIN slot on the same model admits.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = false }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+    }
+    // An MTP candidate beside a live MTP slot holds.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out));
+    }
+    // A plain candidate beside a live MTP slot admits.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = false }};
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+    }
+}
+
+test "admitPendingTick: exclusive single-flight FIFO contract" {
+    const A: usize = 0xA0;
+    const B: usize = 0xB0;
+    var out: [16]usize = undefined;
+
+    // Held while a live slot on the same exclusive model is decoding — the
+    // dsv4 class: a second admitted slot deinit+rebuilds the module-owned
+    // dec_state at cache.step==0 and both requests then interleave on it.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out));
+    }
+    // Admits once no live slot holds the model.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 0), out[0]);
+    }
+    // Two exclusive candidates on the SAME model in one tick: only the
+    // first admits — the tick-claim covers slots not yet in `decoding`.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = A, .exclusive = true },
+            .{ .model = A, .exclusive = true },
+        };
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 0), out[0]);
+    }
+    // Distinct exclusive models admit independently.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = A, .exclusive = true },
+            .{ .model = B, .exclusive = true },
+        };
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 0), out[0]);
+        try testing.expectEqual(@as(usize, 1), out[1]);
+    }
+}
+
+test "admitPendingTick: non-exclusive concurrency and queue order preserved" {
+    const A: usize = 0xA0;
+    const L: usize = 0x10;
+    var out: [16]usize = undefined;
+
+    // Non-exclusive candidates (laguna/hy3: per-slot state) admit freely
+    // even beside live slots — their serial-tick interleave is safe.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = L, .exclusive = false },
+            .{ .model = L, .exclusive = false },
+        };
+        const active = [_]AdmitCand{.{ .model = L, .exclusive = false }};
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &active, &out));
+    }
+    // A held exclusive candidate must not head-of-line-block a later
+    // candidate on another model (requests for OTHER models keep flowing).
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = A, .exclusive = true },
+            .{ .model = L, .exclusive = false },
+        };
+        const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 1), out[0]);
+    }
+    // `out` caps the admitted count (mirrors to_prefill's 16), in order.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = L, .exclusive = false },
+            .{ .model = L, .exclusive = false },
+            .{ .model = L, .exclusive = false },
+        };
+        var small: [2]usize = undefined;
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &small));
+        try testing.expectEqual(@as(usize, 0), small[0]);
+        try testing.expectEqual(@as(usize, 1), small[1]);
+    }
+}
+
+test "inferenceLoop pending drain routes through admitPendingTick" {
+    // A pure admission fn nobody calls is a silent no-op (the specTickMode /
+    // hardcoded use_drafter=false class). Needles are ++-split so this
+    // test's own source can't satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    const call = "admitPendingTick(" ++ "cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)";
+    try testing.expect(std.mem.indexOf(u8, src, call) != null);
+    // The candidates' exclusive bit must come from the per-slot predicate
+    // (model bit OR a module-owned MTP head on this slot).
+    const pred = ".exclusive = slotExclusiveDecode(" ++ "s)";
+    try testing.expect(std.mem.indexOf(u8, src, pred) != null);
+    // The pre-gate unconditional drain shape must be GONE — its survival
+    // would mean a path still admits without the gate.
+    const old = "to_prefill[n_prefill] = sch.pending." ++ "orderedRemove(0)";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
+}
+
+test "S21: a released module head drops the slot's exclusivity, and the MODEL bit is untouched" {
+    try testing.expect(headExclusiveFor(false, true, true, false));
+    try testing.expect(!headExclusiveFor(false, true, true, true));
+    try testing.expect(!headExclusiveFor(false, true, false, false));
+    try testing.expect(!headExclusiveFor(false, true, false, true));
+    try testing.expect(!headExclusiveFor(false, false, true, false));
+    try testing.expect(!headExclusiveFor(false, false, true, true));
+    try testing.expect(headExclusiveFor(true, false, false, true));
+    try testing.expect(headExclusiveFor(true, true, true, true));
+}
+
+test "modelExclusiveDecode asks the transformer, never one hardcoded arch" {
+    // The 2026-08-02 dsv4 fix hardcoded `t.dsv4 != null` here. When a second
+    // module-owned arch arrived — same `Model.state` shape, same
+    // `reset = cache.step == 0` rebuild — the gate did not follow, and two
+    // concurrent requests shared one state. The predicate now lives beside the fields it reads
+    // (`Transformer.module_owned_state_fields`), and this pins the delegation.
+    // Needles are ++-split so this test's source can't satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    const delegated = "t.ownsModuleDecode" ++ "State()";
+    try testing.expect(std.mem.indexOf(u8, src, delegated) != null);
+    const hardcoded = "return t.dsv4 " ++ "!= null;";
+    try testing.expect(std.mem.indexOf(u8, src, hardcoded) == null);
 }
 
 test "buildGgufStubCpuState: llama stub carries gguf model_type + ctx sizing" {
@@ -4525,16 +9071,11 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
 }
 
-test "loopStopReason: a degenerate tail cut reports length, a healthy tail is not cut" {
-    // The reason MUST be "length": the SERVER is truncating the generation
-    // (the model didn't finish — we cut a runaway repetition loop), and
-    // "length" is the one reason server.toolCallFinishReason preserves through
-    // tool-call parsing, so a call salvaged from the cut buffer reaches the
-    // client as a TRUNCATION and its recovery fires. Live 2026-07-14
-    // (plang/php.html): the cut reported "stop" → "tool_calls", presenting a
-    // server-cut fragment as a model-completed write call — pi validated
-    // garbage while the actual cause stayed invisible (the cut also never
-    // logged). Reverting the reason to "stop" turns this red.
+test "loopStopReason: a degenerate tail cut reports stop, a healthy tail is not cut" {
+    // A loop guard is an intentional server stop, not exhaustion of the
+    // requested output budget. Reporting "length" makes clients such as pi
+    // run context-overflow recovery and compact a mostly-empty context. Tool
+    // calls from this truncated buffer are suppressed separately at emission.
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(testing.allocator);
 
@@ -4543,14 +9084,237 @@ test "loopStopReason: a degenerate tail cut reports length, a healthy tail is no
     try testing.expect(loopStopReason(ids.items) == null);
 
     // Collapse into a short cycle (the php.html shape: "server-side scripting
-    // language, " ≈ a 6-token cycle) past the guard's rep threshold.
-    for (0..generate_mod.degenerate_loop_reps + 1) |_| {
+    // language, " ≈ a 6-token cycle) past the guard's span threshold.
+    for (0..generate_mod.degenerate_loop_min_span / 6 + 1) |_| {
         for ([_]u32{ 101, 202, 303, 404, 505, 606 }) |t| {
             try ids.append(testing.allocator, t);
         }
     }
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
-    try testing.expectEqualStrings("length", reason);
+    try testing.expectEqualStrings("stop", reason);
+}
+
+test "loopStopReason: a LONG-period sentence loop is cut at the second tier" {
+    // The 2026-08-02 shooter wrap-up failure: a two-sentence cycle ("The game
+    // is complete. Let me do a final review... Let me verify main.js...") of
+    // ~58 tokens repeated 26 times sailed through the 8-token-period tier and
+    // was never cut. Tier 2 scans periods 9..64 and requires 10 exact
+    // repetitions — verbatim-identical long cycles at that count are
+    // degeneration, not content.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    for (0..30) |i| try ids.append(testing.allocator, @as(u32, @intCast(i * 3 + 11)));
+
+    // 58-token cycle, one rep short of the tier's span bar: NOT cut.
+    var cycle: [58]u32 = undefined;
+    for (&cycle, 0..) |*v, i| v.* = @as(u32, @intCast(1000 + i));
+    for (0..generate_mod.degenerate_loop_long_min_span / cycle.len) |_| try ids.appendSlice(testing.allocator, &cycle);
+    try testing.expect(loopStopReason(ids.items) == null);
+
+    // The next repetition crosses it — cut as an intentional stop.
+    try ids.appendSlice(testing.allocator, &cycle);
+    const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqualStrings("stop", reason);
+}
+
+test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    try ids.appendSlice(testing.allocator, &[_]u32{ 5, 6, 7 });
+    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
+        try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 });
+    }
+
+    const stop = loopStopDecision(ids.items) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqualStrings("stop", stop.finish_reason);
+    try testing.expectEqualStrings("repetition_loop", stop.finish_details);
+    try testing.expectEqual(generate_mod.DegenerateTail.Tier.exact_cycle, stop.tier);
+    // Trimmed to the honest prefix plus one copy of the cycle.
+    try testing.expectEqual(@as(usize, 6), stop.trim_start);
+
+    // Once a deferred boundary has been committed, the old reasoning loop is
+    // outside the guard window and cannot stop the very next answer tick.
+    try ids.append(testing.allocator, 99);
+    const answer_start = ids.items.len;
+    try testing.expect(loopStopDecision(ids.items[answer_start..]) == null);
+
+    // A new loop wholly inside the constrained answer retains the existing
+    // stop/repetition result, with an absolute trim point for response code.
+    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
+        try ids.appendSlice(testing.allocator, &[_]u32{ 7, 8, 9 });
+    }
+    const answer_loop = loopStopDecision(ids.items[answer_start..]) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqualStrings("stop", answer_loop.finish_reason);
+    try testing.expect(answer_loop.trim_start + answer_start >= answer_start);
+
+    // Healthy output decides nothing at all — no reason, and nothing to trim.
+    var healthy: [512]u32 = undefined;
+    for (&healthy, 0..) |*v, i| v.* = @intCast(i);
+    try testing.expect(loopStopDecision(&healthy) == null);
+    try testing.expect(loopStopReason(&healthy) == null);
+}
+
+test "loopStopReason: periods past the long tier stay uncut" {
+    // A 70-token exact cycle (> long-tier max 64) repeated many times is
+    // outside both tiers — the guard stays scoped rather than judging whole
+    // repeated paragraphs.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    var cycle: [70]u32 = undefined;
+    for (&cycle, 0..) |*v, i| v.* = @as(u32, @intCast(2000 + i));
+    for (0..12) |_| try ids.appendSlice(testing.allocator, &cycle);
+    try testing.expect(loopStopReason(ids.items) == null);
+}
+
+test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repeat tier" {
+    // The agent-traffic shape (2026-08-04): the same intent restated forever in
+    // slightly different words. No exact cycle exists, so tiers 1 and 2 are
+    // blind and this ran to max_tokens.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    const phrasings = [_][]const u32{
+        &[_]u32{ 40, 41, 42, 43, 44, 45, 46 },
+        &[_]u32{ 40, 41, 42, 43, 44, 46 },
+        &[_]u32{ 40, 41, 42, 43, 44, 45, 47, 48, 46 },
+        &[_]u32{ 49, 40, 41, 42, 43, 44, 45, 46 },
+        &[_]u32{ 40, 41, 42, 43, 44, 45, 50, 46 },
+    };
+    var i: usize = 0;
+    while (ids.items.len < generate_mod.near_repeat_min_span + 32) : (i += 1) {
+        try ids.appendSlice(testing.allocator, phrasings[i % phrasings.len]);
+    }
+    const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqualStrings("stop", reason);
+
+    // A long answer that keeps introducing new material is untouched, however
+    // repetitive its scaffolding.
+    var healthy = std.ArrayList(u32).empty;
+    defer healthy.deinit(testing.allocator);
+    var line: u32 = 0;
+    while (healthy.items.len < generate_mod.near_repeat_window + 32) : (line += 1) {
+        try healthy.appendSlice(testing.allocator, &[_]u32{ 10, 11, 12 });
+        try healthy.append(testing.allocator, 1000 + line);
+        try healthy.appendSlice(testing.allocator, &[_]u32{ 13, 14 });
+    }
+    try testing.expect(loopStopReason(healthy.items) == null);
+}
+
+test "specInitWiring: a module-owned arch only gets the spec modes it can roll back" {
+    // Spec decode must be able to ROLL BACK a rejected tail. The shell rolls
+    // back its KVCache/ssm_entries — which a module-owned arch does not use, so
+    // by the time the verify returns, the module has already absorbed every
+    // draft and the shell's snapshot/truncate run over an EMPTY entries array.
+    // dsv4 got a hand-written `is_dsv4` conjunct on each of the three lines;
+    // the next module-owned arch (0-layer shell cache, state on the module)
+    // got none, so `--pld` drove verify forwards straight through it. The
+    // predicate is now per-ARCH CAPABILITY (`moduleStateSpecRollback`), not ownership.
+    // Args: (owns_module_state, module_spec_rollback, has_native_draft,
+    //        enable_mtp, has_mtp, enable_drafter, has_drafter, has_dflash,
+    //        enable_pld)
+
+    // Plain arch: today's precedence, unchanged.
+    {
+        const w = specInitWiring(false, false, false, true, true, true, true, false, true);
+        try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
+    }
+    {
+        const w = specInitWiring(false, false, false, true, false, true, true, false, true);
+        try testing.expect(!w.use_mtp and w.use_drafter and !w.use_pld);
+    }
+    {
+        const w = specInitWiring(false, false, false, false, false, false, false, false, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and w.use_pld and !w.native_intent);
+    }
+    // A flag with no loaded handle never arms.
+    {
+        const w = specInitWiring(false, false, false, true, false, false, false, false, false);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
+    }
+
+    // DFlash rides the enable_drafter switch: dflash > MTP > drafter > PLD.
+    {
+        const w = specInitWiring(false, false, false, false, false, true, false, true, true);
+        try testing.expect(!w.use_mtp and w.use_dflash and !w.use_drafter and !w.use_pld);
+    }
+    // A loaded drafter outranks the checkpoint's own MTP head: the sidecar
+    // is an explicit choice (`--drafter` or the in-dir `drafter/`), the head
+    // ships with every pack; `--no-drafter` restores MTP by not loading it.
+    {
+        const w = specInitWiring(false, false, false, true, true, true, false, true, true);
+        try testing.expect(w.use_dflash and !w.use_mtp and !w.use_pld);
+    }
+    // enable_drafter:false on the request hands the round back to MTP.
+    {
+        const w = specInitWiring(false, false, false, true, true, false, false, true, true);
+        try testing.expect(w.use_mtp and !w.use_dflash);
+    }
+    // enable_drafter:false opts BOTH sidecar kinds out.
+    {
+        const w = specInitWiring(false, false, false, false, false, false, false, true, true);
+        try testing.expect(!w.use_dflash and !w.use_drafter and w.use_pld);
+    }
+
+    // Module-owned with NO rollback and no native draft mode: everything off,
+    // and no intent bit either — nothing downstream can arm a draft path.
+    {
+        const w = specInitWiring(true, false, false, true, true, true, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
+    }
+
+    // Module-owned WITH rollback: its own MTP head arms; the shell
+    // spec modes stay off because none has been measured on this family.
+    {
+        const w = specInitWiring(true, true, false, true, true, true, true, true, true);
+        try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld and !w.native_intent);
+    }
+    // Rollback capability alone never arms a head that is not loaded.
+    {
+        const w = specInitWiring(true, true, false, true, false, true, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
+    }
+    // ...nor one the request opted out of.
+    {
+        const w = specInitWiring(true, true, false, false, true, true, true, false, true);
+        try testing.expect(!w.use_mtp);
+    }
+    // An image request keeps the head (the qwen4 head takes the slot's
+    // M-RoPE table); the drafters stay off.
+    {
+        const w = specInitWiring(true, true, false, true, true, true, true, true, true);
+        try testing.expect(w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
+    }
+
+    // Module-owned WITH a native draft mode (dsv4/DSpark) and no rollback: the
+    // shell paths stay off, but the request's MTP intent still reaches the
+    // Generator chokepoint.
+    {
+        const w = specInitWiring(true, false, true, true, true, true, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
+        try testing.expect(w.native_intent);
+    }
+    // enable_mtp:false opts out of DSpark; PLD intent alone never arms it.
+    {
+        const w = specInitWiring(true, false, true, false, false, false, false, false, true);
+        try testing.expect(!w.native_intent);
+    }
+}
+
+test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
+    // A pure predicate nobody calls is a silent no-op. Needles are ++-split so
+    // this test's own source cannot satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    // Keyed on the call site's own bindings, not on a `specInitWiring(` prefix
+    // this test's own arms would satisfy.
+    inline for (.{ "const use_mtp = wiring" ++ ".use_mtp;", "const use_drafter = wiring" ++ ".use_drafter;", "const use_dflash = wiring" ++ ".use_dflash;", "const use_pld = wiring" ++ ".use_pld;", "const dsv4_spec_intent = wiring" ++ ".native_intent;" }) |needle| {
+        try testing.expect(std.mem.indexOf(u8, src, needle) != null);
+    }
+    // The exclusion must come from the shared predicate, not a new arch list.
+    const from_predicate = "transformer.?.moduleSpec" ++ "Wiring()";
+    try testing.expect(std.mem.indexOf(u8, src, from_predicate) != null);
+    // The hand-written per-arch conjuncts must be GONE — their survival is how
+    // a second module-owned arch gets missed.
+    const old_pld = "and !is_dsv4 and slot." ++ "enable_pld";
+    try testing.expect(std.mem.indexOf(u8, src, old_pld) == null);
 }
 
 test "specTickMode: every spec arm requires the GENERATOR's armed state, not the slot flag alone" {
@@ -4566,36 +9330,468 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
 
     // Slot wants PLD, generator was NOT armed (chokepoint or per-site guard
     // flipped it off) → the tick must run the regular path.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, true, false, false));
     // Slot wants PLD and init armed it → PLD runs.
-    try testing.expectEqual(SpecTickMode.pld, specTickMode(false, false, false, false, true, true, false));
+    try testing.expectEqual(SpecTickMode.pld, specTickMode(false, false, false, false, false, true, true, false));
     // Generator armed but the slot never asked (stale generator state must
     // not resurrect spec either) → regular.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, true, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, false, true, false));
 
     // mtp/drafter keep their existing both-sides contract.
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false));
-    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, false, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, false, false));
 
     // Priority: MTP > drafter > PLD (the spec-dispatch rule).
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, true, true, true, false));
-    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, true, true, false));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, true, false, true, true, false));
+    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, false, true, true, false));
 
     // DSpark: the generator's post-chokepoint bit AND the slot's MTP flag —
     // the "model's native head" semantics (server defaults it ON for a
     // stage-bearing dsv4; the n-gram gate never touches enable_mtp). It wins
     // over everything (a set mtp/pld generator conjunct alongside dspark is
     // unreachable by the chokepoint's construction, but priority must hold).
-    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, false, false, false, false, false, true));
-    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, true, true, true, true, true, true));
+    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, false, false, false, false, false, false, true));
+    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, true, true, true, false, true, true, true));
     // PLD/drafter intent alone never drives dspark (their flags are
     // prompt-gated — riding them made engagement depend on the n-gram gate).
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, true));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, true));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, true, false, true));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, false, true));
     // Generator armed but the request opted enable_mtp off → serial.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, false, true));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, false, false, true));
     // Slot asked, generator never armed dspark → falls through as before.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false, false));
+
+    // DFlash: slot's enable_drafter + generator's dflash handle; outranks the
+    // gemma drafter AND the MTP head (a loaded sidecar is the explicit
+    // choice), loses to DSpark. Generator handle alone never resurrects it,
+    // and a dflash generator with the slot flag off stays regular (the
+    // specTickMode both-sides contract) — or MTP when that is armed.
+    try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, false, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.dflash, specTickMode(true, true, true, false, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, true, true, false, true, false, false, true));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false, false));
+}
+
+test "the ANE build resolves its chunk through effectivePrefillChunk, never the pin alone" {
+    // The compiled ANE tile only serves chunks of EXACTLY its width, and the
+    // forward's chunk is the pin run through effectivePrefillChunk's
+    // per-arch policy (MoE caps at 4096 where the pin says 8192) — building
+    // at the bare pin left every MoE program built-but-never-dispatched
+    // (A7, 2026-08-18). The needle is split so this test's own text cannot
+    // satisfy it.
+    const src = @embedFile("scheduler.zig");
+    const needle = "effectivePrefillChunk" ++ "(";
+    var it = std.mem.splitSequence(u8, src, "xfm_ptr.buildAnePrefill");
+    _ = it.first();
+    const before_call = it.rest();
+    _ = before_call;
+    // The call site's chunk value must be produced by effectivePrefillChunk
+    // in the same block: find the buildAnePrefill call and scan the 1200
+    // bytes before it for the resolver.
+    const call_at = std.mem.indexOf(u8, src, "xfm_ptr.buildAnePrefill(sch.io, chunk").?;
+    const window_start = call_at -| 1200;
+    try std.testing.expect(std.mem.indexOf(u8, src[window_start..call_at], needle) != null);
+}
+
+test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
+    // Built lazily it landed inside the first request's draft chain: a
+    // 248320-row requantize of the trunk lm_head plus a synchronous eval of
+    // ~240 MB, on the inference thread, mid-round. That is first-token
+    // latency on the first request after a load — the sidecar arm has always
+    // paid it at bind time instead.
+    //
+    // `doLoadOnInferenceThread` is the ONE Transformer construction site, and
+    // the boot load and the `/v1/load` cold load both route through it (the
+    // "a launch flag that shapes a LOAD" class: a hook on only one of them
+    // ships a server where the first cold-loaded model still pays lazily).
+    // This pins all three.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn doLoadOnInferenceThread(") orelse return error.MissingLoadFn;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingLoadFnEnd;
+    const body = source[start..end];
+    const build = std.mem.indexOf(u8, body, "qwen4BuildDraftRerank()") orelse return error.MissingEagerRerankBuild;
+    // Gated exactly like the head it drafts for: `--no-mtp` never drafts, so
+    // it must never pay for the coarse head.
+    const gate = std.mem.lastIndexOf(u8, body[0..build], "mtp_enabled") orelse return error.EagerRerankBuildUngated;
+    try testing.expect(build - gate < 200);
+
+    // Boot load (inferenceLoop) and cold load (runLoadRequest) both land there.
+    const boot = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingBootLoad;
+    const cold = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, req)") orelse return error.MissingColdLoad;
+    try testing.expect(boot != cold);
+}
+
+test "MLX_SERVE_SSD_WRITE_THROUGH=0 takes mechanism 3 out of the prefill, and only that" {
+    try testing.expect(writeThroughEnabledFromEnv(null));
+    try testing.expect(writeThroughEnabledFromEnv(""));
+    try testing.expect(writeThroughEnabledFromEnv("1"));
+    try testing.expect(writeThroughEnabledFromEnv("true"));
+    try testing.expect(!writeThroughEnabledFromEnv("0"));
+}
+
+test "writeThroughSpanReached: a sub-chunk warm turn never persists inside the prefill" {
+    const chunk: u32 = 1024;
+    // Warm turn: a restored 32k prefix plus a 31-token instruction tail.
+    try testing.expect(!writeThroughSpanReached(31, chunk));
+    try testing.expect(!writeThroughSpanReached(0, chunk));
+    try testing.expect(!writeThroughSpanReached(1023, chunk));
+    try testing.expect(writeThroughSpanReached(1024, chunk));
+    try testing.expect(writeThroughSpanReached(4096, chunk));
+    try testing.expect(writeThroughSpanReached(65_665, chunk));
+    try testing.expect(writeThroughSpanReached(4096, 4096));
+    try testing.expect(!writeThroughSpanReached(4095, 4096));
+}
+
+test "postEvictionPrefillChunk: the re-asked width is the one that runs, in BOTH directions" {
+    // 1. Admitted at 1024, affords 4096 after the pass: runs at 4096, logs the widen.
+    {
+        const d = postEvictionPrefillChunk(1024, 4096);
+        try testing.expectEqual(@as(u32, 4096), d.width);
+        try testing.expect(d.widened);
+        try testing.expect(!d.moved);
+    }
+    try testing.expectEqual(@as(u32, 8192), postEvictionPrefillChunk(512, 8192).width);
+
+    // 2. No eviction pass ran: the re-ask is the only ask, nothing reportable.
+    {
+        const d = postEvictionPrefillChunk(0, 1024);
+        try testing.expectEqual(@as(u32, 1024), d.width);
+        try testing.expect(!d.widened);
+        try testing.expect(!d.moved);
+    }
+    try testing.expectEqual(@as(u32, 512), postEvictionPrefillChunk(0, 512).width);
+    try testing.expectEqual(@as(u32, 0), postEvictionPrefillChunk(0, 0).width);
+
+    // 3. A narrower re-ask still wins (`@max` would widen on memory that is gone).
+    {
+        const d = postEvictionPrefillChunk(4096, 1024);
+        try testing.expectEqual(@as(u32, 1024), d.width);
+        try testing.expect(d.moved);
+        try testing.expect(!d.widened);
+    }
+    try testing.expectEqual(@as(u32, 512), postEvictionPrefillChunk(2048, 512).width);
+
+    // 4. Unchanged memory is a no-op in both directions.
+    inline for (.{ 512, 1024, 2048, 4096, 8192 }) |w| {
+        const d = postEvictionPrefillChunk(w, w);
+        try testing.expectEqual(@as(u32, w), d.width);
+        try testing.expect(!d.widened and !d.moved);
+    }
+
+    // 5. Never below the ladder floor: this function computes no width of its own.
+    inline for (.{ 512, 1024, 2048, 4096, 8192 }) |floor| {
+        try testing.expectEqual(@as(u32, floor), postEvictionPrefillChunk(8192, floor).width);
+    }
+}
+
+test "prefix-cache commit declines a pad-only generation, never a zero-token one" {
+    // Bar: a zero-token answer still commits; only an all-pad generation is declined.
+    try testing.expect(!commitDeclinesPadOnly(0, true));
+    try testing.expect(!commitDeclinesPadOnly(0, false));
+    try testing.expect(commitDeclinesPadOnly(3, true));
+    try testing.expect(!commitDeclinesPadOnly(3, false));
+}
+
+test "[short-gen] carries both token counts, the ids and what they decode to" {
+    // Bar: the line carries emitted vs realized and survives quotes, newlines and a 300-byte answer.
+    var buf: [1024]u8 = undefined;
+    const ids = [_]u32{ 151645, 17 };
+    try testing.expectEqualStrings(
+        "[short-gen] reason=stop emitted=0 realized=2 ids=[151645,17] bytes=\"hi\" path=mtp",
+        formatShortGen(&buf, "stop", 0, &ids, "hi", "mtp"),
+    );
+
+    const esc = formatShortGen(&buf, "length", 2, &.{}, "a\"b\nc", "serial");
+    try testing.expectEqualStrings(
+        "[short-gen] reason=length emitted=2 realized=0 ids=[] bytes=\"a\\\"b\\nc\" path=serial",
+        esc,
+    );
+
+    var long: [300]u8 = undefined;
+    @memset(&long, 'x');
+    const capped = formatShortGen(&buf, "stop", 1, &.{}, &long, "pld");
+    try testing.expectEqual(@as(usize, SHORT_GEN_TEXT_CAP), std.mem.count(u8, capped, "x"));
+}
+
+test "a cancel mid batched tick keeps generated_ids level with the KV rows" {
+    // Bar: kv rows == full_prompt + generated_ids even when the slot cancels mid tick.
+    const prompt_len: usize = 7;
+    var kv_rows = prompt_len;
+    var ids: usize = 0;
+    for ([_]bool{ false, false, false, true }) |cancelled| {
+        kv_rows += 1;
+        const act = batchedTickAction(cancelled);
+        if (act.record) ids += 1;
+        if (cancelled) try testing.expect(!act.publish);
+    }
+    try testing.expectEqual(kv_rows, prompt_len + ids);
+}
+
+test "mtpSubGroupSize fills the verify lane's row budget" {
+    // 7 rows off-NAX: pairs at depth 2, triples at depth 1, four as 2+2, one rounds solo.
+    try testing.expectEqual(@as(usize, 1), mtpSubGroupSize(1, 7));
+    try testing.expectEqual(@as(usize, 2), mtpSubGroupSize(2, 7));
+    try testing.expectEqual(@as(usize, 3), mtpSubGroupSize(3, 7));
+    try testing.expectEqual(@as(usize, 2), mtpSubGroupSize(4, 7));
+    try testing.expectEqual(@as(usize, 3), mtpSubGroupSize(5, 7));
+    try testing.expectEqual(@as(usize, 4), mtpSubGroupSize(9, 16));
+    // The depth each sub-group gets: floor(rows / size) - 1.
+    try testing.expectEqual(@as(u32, 2), 7 / @as(u32, 2) - 1);
+    try testing.expectEqual(@as(u32, 1), 7 / @as(u32, 3) - 1);
+}
+
+test "retained position: a padded row can never take the full-accept arm" {
+    // Unpadded full accept commits 1+m and keeps the trunk state the forward left.
+    try testing.expect(generate_mod.Generator.mtpFullAccept(2, 2, 3));
+    try testing.expectEqual(@as(u32, 3), generate_mod.Generator.mtpRetained(2));
+    // Same accept count, row padded to a neighbour's width: rollback arm.
+    try testing.expect(!generate_mod.Generator.mtpFullAccept(2, 2, 5));
+    try testing.expectEqual(@as(u32, 3), generate_mod.Generator.mtpRetained(2));
+    // Partial and zero accepts are rollback at any width.
+    try testing.expect(!generate_mod.Generator.mtpFullAccept(1, 2, 3));
+    try testing.expect(!generate_mod.Generator.mtpFullAccept(0, 2, 3));
+    try testing.expectEqual(@as(u32, 1), generate_mod.Generator.mtpRetained(0));
+}
+
+test "single MTP slot reaches the round entry through runDecodeTick" {
+    var xfm: Transformer = undefined;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.transformer = null;
+    var gen: Generator = undefined;
+    gen.mtp_planner_owned = false;
+    gen.generated_ids = .empty;
+    gen.loop_guard_start = 0;
+    gen.mtp = .{ .qwen4 = &xfm };
+    gen.mtp_cache = .{ .qwen = undefined };
+    gen.has_last_hidden = true;
+    gen.drafter = null;
+    gen.dflash = null;
+    gen.pld_enabled = false;
+    gen.dspark_enabled = false;
+    gen.done = false;
+    gen.sampling = .{};
+    gen.logprobs_n = 1;
+    var slot: Slot = undefined;
+    slot.allocator = testing.allocator;
+    slot.model = &model;
+    slot.ds4_session = null;
+    slot.llama_session = null;
+    slot.diffusion = null;
+    slot.legacy_gen = gen;
+    slot.enable_mtp = true;
+    slot.enable_drafter = false;
+    slot.enable_pld = false;
+    slot.finished = false;
+    slot.error_code = null;
+    slot.cancelled = std.atomic.Value(bool).init(false);
+    slot.completion_tokens = 0;
+    var sch: Scheduler = undefined;
+    sch.force_batched = false;
+    sch.inflight_generated_tokens = std.atomic.Value(u64).init(0);
+    var active = [_]*Slot{&slot};
+    try testing.expectError(error.SpecDecodeUnsupported, runDecodeTick(&sch, &active));
+    try testing.expect(slot.legacy_gen.?.spec_cost_solo);
+    try testing.expectEqual(@as(u32, 0), slot.legacy_gen.?.mtp_group_cap);
+    try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
+}
+
+test "merged verify: an uncertified [N,S] shape is declined by name, never dispatched" {
+    try testing.expect(mergedVerifyDeclineReason(true, 5) != null);
+    try testing.expect(mergedVerifyDeclineReason(true, 2) != null);
+    // Width 1 is a plain batched decode row, not a verify.
+    try testing.expect(mergedVerifyDeclineReason(true, 1) == null);
+    // Other GDN trunks keep the padded merged forward they had.
+    try testing.expect(mergedVerifyDeclineReason(false, 5) == null);
+}
+
+test "group verify: ragged widths keep ONE forward, never a solo cohort per width" {
+    // The row-axis form runs each row at its own width, so a mixed group is never split.
+    try testing.expectEqual(VerifyShape.row_axis, verifyShapeFor(4, true, 9));
+    try testing.expectEqual(VerifyShape.row_axis, verifyShapeFor(2, true, 2));
+    try testing.expectEqual(VerifyShape.merged, verifyShapeFor(4, false, 9));
+    try testing.expectEqual(VerifyShape.merged, verifyShapeFor(2, false, 3));
+    // One row is a solo round on every trunk.
+    try testing.expectEqual(VerifyShape.solo, verifyShapeFor(1, true, 5));
+    try testing.expectEqual(VerifyShape.solo, verifyShapeFor(1, false, 5));
+}
+
+test "group cost geometry rejects partial rounds and keeps complete cache formats" {
+    try testing.expect(groupCostSampleComplete(2, &.{ 1, 3 }, &.{ true, true }));
+    try testing.expect(!groupCostSampleComplete(3, &.{ 1, 3 }, &.{ true, true }));
+    try testing.expect(!groupCostSampleComplete(2, &.{ 1, 0 }, &.{ true, true }));
+    try testing.expect(!groupCostSampleComplete(2, &.{ 1, 3 }, &.{ true, false }));
+    const a = transformer_mod.KVQuantConfig.affine(8);
+    var b = a;
+    b.group_size = 128;
+    try testing.expect(cacheCostFormat(a) != cacheCostFormat(b));
+    try testing.expect(cacheCostFormat(a) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(4)));
+}
+
+test "scheduler prices each shared execution once and preserves row sampling geometry" {
+    var xfm: Transformer = undefined;
+    xfm.round_cost = .{ .layout = .long };
+    xfm.mtp_group_cost = .{};
+    var model: LoadedModel = undefined;
+    model.transformer = &xfm;
+    var a: Slot = undefined;
+    var b: Slot = undefined;
+    a.model = &model;
+    b.model = &model;
+    const slots = [_]*Slot{ &a, &b };
+    var geometry = group_cost_mod.GroupShape{ .n = 2, .kv_format = 8, .head_format = 8 };
+    geometry.rows[0] = group_cost_mod.GroupShape.row(1, 1, 1, 2, 1, 3, 1);
+    geometry.rows[1] = group_cost_mod.GroupShape.row(1, 1, 1, 5, 2, 2, 9);
+    var prices = PlannerPrices{ .slots = &slots, .geometry = geometry };
+    const speculative = prices.keyFor(&slots, &.{ 2, 4 });
+    const swapped = prices.keyFor(&.{ &b, &a }, &.{ 4, 2 });
+    try testing.expectEqual(speculative, swapped);
+    for (0..3) |_| _ = xfm.mtp_group_cost.observeShape(speculative, 30, &.{ 2, 4 }, &.{ 30, 30 }, .round);
+    try testing.expectEqual(@as(f32, 30), prices.price(&.{ 2, 4 }).?.ms);
+    const plain_a = prices.keyFor(&.{&a}, &.{0});
+    const spec_b = prices.keyFor(&.{&b}, &.{4});
+    for (0..3) |_| {
+        _ = xfm.mtp_group_cost.observeShape(plain_a, 10, &.{1}, &.{10}, .round);
+        _ = xfm.mtp_group_cost.observeShape(spec_b, 25, &.{4}, &.{25}, .round);
+    }
+    try testing.expectEqual(@as(f32, 35), prices.price(&.{ 0, 4 }).?.ms);
+    try testing.expect(prices.price(&.{ 4, 0 }) == null);
+    const plain_b = prices.keyFor(&.{&b}, &.{0});
+    try testing.expectEqual(@as(u8, 8), group_cost_mod.GroupShape.part(plain_b.rows[0], 48));
+    try testing.expectEqual(@as(u8, 5), group_cost_mod.GroupShape.part(plain_b.rows[0], 24));
+    try testing.expectEqual(@as(u8, 0), group_cost_mod.GroupShape.part(plain_b.rows[0], 40));
+    try testing.expectEqual(@as(u64, 0), plain_b.head_format);
+}
+
+test "planner pools recurring head histories without mixing the cold first history" {
+    var xfm: Transformer = undefined;
+    xfm.round_cost = .{ .layout = .long };
+    xfm.mtp_group_cost = .{};
+    var model: LoadedModel = undefined;
+    model.transformer = &xfm;
+    var slots_storage: [4]Slot = undefined;
+    var slots: [4]*Slot = undefined;
+    for (&slots_storage, 0..) |*slot, i| {
+        slot.model = &model;
+        slots[i] = slot;
+    }
+    var geometry = group_cost_mod.GroupShape{ .n = 4, .kv_format = 8, .head_format = 8 };
+    @memset(geometry.rows[0..4], group_cost_mod.GroupShape.row(2, 2, 2, 2, 1, 4, 1));
+    var prices = PlannerPrices{ .slots = &slots, .geometry = geometry };
+
+    var cold = geometry;
+    cold.rows[0] = group_cost_mod.GroupShape.row(2, 2, 2, 2, 1, 1, 1);
+    _ = xfm.mtp_group_cost.observeShape(cold, 180, &.{ 2, 2, 2, 2 }, &.{ 180, 180, 180, 180 }, .round);
+    var h2 = geometry;
+    h2.rows[0] = group_cost_mod.GroupShape.row(2, 2, 2, 2, 1, 2, 1);
+    _ = xfm.mtp_group_cost.observeShape(h2, 74, &.{ 2, 3, 3, 2 }, &.{ 74, 74, 74, 74 }, .round);
+    const probe_seed = prices.sample(&slots, &.{ 2, 2, 2, 2 }, false).?;
+    try testing.expectEqual(@as(u32, 1), probe_seed.samples);
+    try testing.expectEqual(@as(f32, 74), probe_seed.ms);
+    var h3 = geometry;
+    h3.rows[1] = group_cost_mod.GroupShape.row(2, 2, 2, 1, 1, 3, 1);
+    _ = xfm.mtp_group_cost.observeShape(h3, 76, &.{ 3, 2, 3, 2 }, &.{ 76, 76, 76, 76 }, .round);
+    var other_head_kv = geometry;
+    other_head_kv.rows[1] = group_cost_mod.GroupShape.row(2, 2, 2, 2, 2, 3, 1);
+    _ = xfm.mtp_group_cost.observeShape(other_head_kv, 20, &.{ 3, 3, 3, 3 }, &.{ 20, 20, 20, 20 }, .round);
+    var other_mode = geometry;
+    other_mode.rows[1] = group_cost_mod.GroupShape.row(2, 2, 2, 2, 1, 3, 9);
+    _ = xfm.mtp_group_cost.observeShape(other_mode, 20, &.{ 3, 3, 3, 3 }, &.{ 20, 20, 20, 20 }, .round);
+    try testing.expect(prices.price(&.{ 2, 2, 2, 2 }) == null);
+
+    var h4 = geometry;
+    h4.rows[2] = group_cost_mod.GroupShape.row(2, 2, 2, 2, 0, 2, 1);
+    _ = xfm.mtp_group_cost.observeShape(h4, 78, &.{ 3, 3, 2, 2 }, &.{ 78, 78, 78, 78 }, .round);
+    const pooled = prices.price(&.{ 2, 2, 2, 2 }).?;
+    try testing.expectEqual(@as(u32, 3), pooled.samples);
+    try testing.expect(pooled.ms >= 74 and pooled.ms <= 78);
+    try testing.expect(pooled.variance > 0);
+    try testing.expect(pooled.max_gap_ms >= 78);
+
+    const plain = prices.keyFor(&slots, &.{ 0, 0, 0, 0 });
+    for (0..3) |_| _ = xfm.mtp_group_cost.observeShape(plain, 37, &.{ 1, 1, 1, 1 }, &.{ 37, 37, 37, 37 }, .round);
+    var histories: [4]Planner.History = @splat(.{});
+    var rows: [4]Planner.Row = undefined;
+    for (&histories, 0..) |*history, i| {
+        for (0..3) |_| history.observe(2, 2);
+        rows[i] = .{ .history = history };
+    }
+    const decision = Planner.choose(&rows, &prices);
+    try testing.expectEqualSlices(u8, &.{ 2, 2, 2, 2 }, decision.widths[0..4]);
+}
+
+test "mean cost pooling retains differences between histories and both worst-case bounds" {
+    var xfm: Transformer = undefined;
+    xfm.round_cost = .{ .layout = .long };
+    xfm.mtp_group_cost = .{};
+    var model: LoadedModel = undefined;
+    model.transformer = &xfm;
+    var storage: [2]Slot = undefined;
+    var slots: [2]*Slot = undefined;
+    for (&storage, 0..) |*slot, i| {
+        slot.model = &model;
+        slots[i] = slot;
+    }
+    var geometry = group_cost_mod.GroupShape{ .n = 2 };
+    @memset(geometry.rows[0..2], group_cost_mod.GroupShape.row(2, 2, 2, 4, 4, 4, 1));
+    var prices = PlannerPrices{ .slots = &slots, .geometry = geometry };
+    var a = geometry;
+    var b = geometry;
+    a.rows[0] = group_cost_mod.GroupShape.row(2, 2, 2, 4, 4, 2, 1);
+    b.rows[0] = group_cost_mod.GroupShape.row(2, 2, 2, 4, 4, 3, 1);
+    for (0..20) |_| {
+        _ = xfm.mtp_group_cost.observeShape(a, 64, &.{ 3, 3 }, &.{ 64, 64 }, .round);
+        _ = xfm.mtp_group_cost.observeShape(b, 80, &.{ 3, 3 }, &.{ 80, 80 }, .round);
+    }
+    const pooled = prices.price(&.{ 2, 2 }).?;
+    try testing.expectApproxEqAbs(@as(f32, 88), pooled.mean_upper_ms.?, 0.001);
+    xfm.round_cost = .{ .layout = .long };
+    xfm.mtp_group_cost = .{};
+    a = geometry;
+    b = geometry;
+    b.head_calls = 2;
+    xfm.mtp_group_cost.shapes[0] = .{ .shape = a, .cell = .{ .ms = 60, .n = 100 }, .variance = 225, .mean_weight_sq = 1.0 / 19.0 };
+    xfm.mtp_group_cost.shapes[1] = .{ .shape = b, .cell = .{ .ms = 75, .n = 3 }, .variance = 9, .mean_weight_sq = 1.0 / 3.0 };
+    const exact = prices.price(&.{ 2, 2 }).?;
+    try testing.expectApproxEqAbs(@as(f32, 90), exact.ms + 2 * @sqrt(exact.variance), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 75) + 2 * @sqrt(@as(f32, 3)), exact.mean_upper_ms.?, 0.001);
+    a = prices.keyFor(&slots, &.{ 0, 0 });
+    b = a;
+    b.head_calls = 2;
+    xfm.mtp_group_cost.shapes[0] = .{ .shape = a, .cell = .{ .ms = 40, .n = 100 }, .variance = 25, .mean_weight_sq = 1.0 / 19.0 };
+    xfm.mtp_group_cost.shapes[1] = .{ .shape = b, .cell = .{ .ms = 35, .n = 3 }, .variance = 1, .mean_weight_sq = 1.0 / 3.0 };
+    const plain = prices.price(&.{ 0, 0 }).?;
+    try testing.expectApproxEqAbs(@as(f32, 35) - 2 * @sqrt(@as(f32, 1.0 / 3.0)), plain.mean_lower_ms.?, 0.001);
+}
+
+test "cold grouped depths one and two use a bounded two-tick bootstrap" {
+    var prices: PlannerPrices = undefined;
+    prices.slots = &.{};
+    const plain = Planner.Price{ .ms = 40, .variance = 4, .samples = 10 };
+    try testing.expectEqual(@as(f32, 88), prices.probeFallbackEstimate(&.{ 1, 1, 1, 1 }, plain));
+    try testing.expectEqual(@as(f32, 88), prices.probeFallbackEstimate(&.{ 2, 2, 2, 2 }, plain));
+    try testing.expectEqual(@as(f32, 330), prices.probeFallbackEstimate(&.{ 4, 4, 4, 4 }, plain));
+    const lower = Planner.Price{ .ms = 60, .variance = 100, .samples = 2, .max_gap_ms = 170 };
+    try testing.expectEqual(@as(f32, 90), PlannerPrices.scaledProbeEstimate(lower, 2, 1));
+}
+
+test "transition pricing skips the first realized round after prime or width change" {
+    try testing.expect(plannerPriceTransition(255, 1, false));
+    try testing.expect(plannerPriceTransition(1, 1, true));
+    try testing.expect(!plannerPriceTransition(1, 1, false));
+    try testing.expect(plannerPriceTransition(1, 2, false));
+    try testing.expect(!plannerPriceTransition(2, 0, true));
+}
+
+test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media boundary" {
+    // The ids are ordinary vocabulary entries, so a text-only prompt can carry
+    // one (live: a pasted source file held 248056 at index 18338 of a 73k
+    // prompt). A media boundary exists only where media rows do.
+    const image_id: u32 = 248056;
+    const text_only = [_]u32{ 7, 8, image_id, 9 };
+    try testing.expectEqual(@as(?usize, null), firstMediaPlaceholder(false, &text_only, image_id, 0, 0));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &text_only, image_id, 0, 0));
 }

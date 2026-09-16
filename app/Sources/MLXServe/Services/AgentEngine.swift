@@ -42,9 +42,16 @@ enum AgentEngine {
     // MARK: - Context Helpers
 
     /// Determine effective context length from user config or model metadata.
-    static func effectiveContextLength(appContextSize: Int, modelContextLength: Int?) -> Int {
-        if appContextSize > 0 { return appContextSize }
+    /// The server's advertised context wins: it already reflects `--ctx-size`
+    /// and the model's own `model-settings.json` override. The slider answers
+    /// only before a server has reported one.
+    /// - Parameter apple: chat is answered by the on-device model, whose
+    ///   window is fixed and much smaller than anything served here.
+    static func effectiveContextLength(appContextSize: Int, modelContextLength: Int?,
+                                       apple: Bool = false) -> Int {
+        if apple { return AppleFoundationChat.contextTokens }
         if let modelCtx = modelContextLength, modelCtx > 0 { return modelCtx }
+        if appContextSize > 0 { return appContextSize }
         return 32768  // safe default
     }
 
@@ -173,7 +180,7 @@ enum AgentEngine {
         // Emit pinned first assistant response (the plan) if it fell outside.
         if needsPinAssistant, let idx = firstAssistantIdx {
             let msg = allMessages[idx]
-            var content = msg.content
+            var content = TruncationNotice.stripped(from: msg.content)
                 .replacingOccurrences(of: "<pad>", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if content.count > 500 {
@@ -223,7 +230,7 @@ enum AgentEngine {
             // Assistant messages with tool_calls
             if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
                 var dict: [String: Any] = ["role": "assistant"]
-                let content = msg.content
+                let content = TruncationNotice.stripped(from: msg.content)
                     .replacingOccurrences(of: "<pad>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 dict["content"] = content.isEmpty ? "" : content
@@ -250,7 +257,10 @@ enum AgentEngine {
 
             // Regular messages
             if msg.role == .assistant && msg.content.isEmpty { continue }
-            var content = msg.content
+            // Legacy in-content truncation banners (pre-notice-as-data saves)
+            // must not ride back as assistant prose.
+            var content = (msg.role == .assistant
+                ? TruncationNotice.stripped(from: msg.content) : msg.content)
                 .replacingOccurrences(of: "<pad>", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if msg.role == .assistant && content.count > 500 {

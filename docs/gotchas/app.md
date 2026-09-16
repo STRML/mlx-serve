@@ -154,7 +154,7 @@ Three fallbacks the live protocol forces, each a distinct failure: a `200` answe
 
 Also shipped here: the app finally sends an HF token (`hfToken` → `HF_TOKEN`, then `$HF_HOME/token`, then `~/.cache/huggingface/token`). A Finder-launched bundle has NO shell environment, so the env var the Zig CLI reads is almost never set in the app and the `huggingface-cli login` file is the one that actually works. Buys gated repos and API rate limit, not speed.
 
-**The entry-point question.** The app has six download entry points (`start`, both `startGguf` overloads, `startBundle`, `download`, `downloadGguf`) reached from ~14 call sites across the views, plus `ensureNsfwClassifier` and DocumentIndex's bge auto-pull. All of them funnel into `download` or `downloadGguf`, which are the only two callers of `transferFile` — so the change is app-wide by construction, not by inspection. A seventh entry point that hand-rolled its own `dataTask` would work PERFECTLY and silently opt out of chunking, the shared session and the token; nothing would fail, it would just be slow again, which is why it's source-audited rather than trusted. The same audit one level up ("no service fetches huggingface.co on `URLSession.shared`") had to be written at FILE scope: at LINE scope it passed vacuously, because the URL is built a line or two above the fetch — and that false negative was hiding `HFSearchService`, i.e. the Model Browser's search and per-repo size lookups, which had never sent the token and were the surface most likely to be rate-limited. Non-model downloads stay on their own paths and are unchanged: `OCIClient` (sandbox guest image, a different registry and protocol) and `UpdateChecker` (the app DMG).
+**The entry-point question.** The app has six download entry points (`start`, both `startGguf` overloads, `startBundle`, `download`, `downloadGguf`) reached from ~14 call sites across the views, plus DocumentIndex's bge auto-pull. All of them funnel into `download` or `downloadGguf`, which are the only two callers of `transferFile` — so the change is app-wide by construction, not by inspection. A seventh entry point that hand-rolled its own `dataTask` would work PERFECTLY and silently opt out of chunking, the shared session and the token; nothing would fail, it would just be slow again, which is why it's source-audited rather than trusted. The same audit one level up ("no service fetches huggingface.co on `URLSession.shared`") had to be written at FILE scope: at LINE scope it passed vacuously, because the URL is built a line or two above the fetch — and that false negative was hiding `HFSearchService`, i.e. the Model Browser's search and per-repo size lookups, which had never sent the token and were the surface most likely to be rate-limited. Non-model downloads stay on their own paths and are unchanged: `OCIClient` (sandbox guest image, a different registry and protocol) and `UpdateChecker` (the app DMG).
 
 Guards: `ChunkedDownloadTests` — planning invariants, sidecar validation, and an end-to-end suite against a `URLProtocol` stub that speaks real Range semantics, asserting the ASSEMBLED BYTES (a chunk writing at the wrong offset is precisely what arithmetic-only tests miss). `DownloadManagerTransferTests` drives the REAL `download(repoId:)` loop against a stub HF origin — a working transport and a commit path that strands a `.partial` both look like "it downloaded fine" — covering retry-then-land, skip-what's-present, cancel-leaves-zero-footprint, and both source audits. Two opt-in live measurements (`MLX_SERVE_LIVE_DOWNLOAD=1`) keep both halves re-measurable, one of them verifying the shipped 16-way reassembly byte-for-byte against the CDN. Known untested: HF's response to sustained 16-way range requests (a 429 degrades to the retry loop, i.e. slower, not broken).
 
@@ -212,9 +212,9 @@ The app assumed a technical user. Someone installing it for the first time got a
 
 **A blocking sheet still needs exactly one door.** The chat gate was first presented on `.constant(true)`: correctly un-dismissable by Esc/click-away, and Cancel did NOTHING. AppKit refuses to close a window with an attached sheet, so `dismissWindow(id: "chat")` was a silent no-op — measured through the accessibility API, window count 1 before the click and 1 after, sheet still up. The binding's SETTER is what blocks SwiftUI's own dismissals; Cancel flips a `@State` that ends the sheet and only then closes the window, and that order is the whole fix (1 → 0 windows once corrected). The gate also counts LAN peer chat models (`ChatGateState.resolve`, matching `trayHasNoUsableModels`): locking someone out of a conversation their peer can already serve is worse than the composer it replaces. It fires on chat-CAPABLE models, so a Mac whose only download is an image backend is still gated, and it clears itself — `localModels` is `@Published` and the card refreshes it.
 
-**`UserDefaults.bool` on an unset key is not "the user said no".** `autoStartServer` defaults to true now (`object(forKey:) as? Bool ?? true`). It's safe because the launch gate is `autoStartServer && !selectedModelPath.isEmpty` — a no-op until a model exists, so nothing boots eagerly on a fresh install — and the first download's completion hook is what actually starts the server. No migration, deliberately: existing users who never touched the toggle get it on.
+**`UserDefaults.bool` on an unset key is not "the user said no".** `autoStartServer` defaults to true now (`object(forKey:) as? Bool ?? true`). At the time this shipped the launch gate was `autoStartServer && !selectedModelPath.isEmpty` — a no-op until a model existed, with the first download's completion hook starting the server — which is what made the default safe; that gate has since been split (see "One checkbox started a server and loaded 26 GB" below), and what auto-start starts is now a headless server. No migration, deliberately: existing users who never touched the toggle get it on.
 
-**The bars: intelligence is someone else's number, speed is ours.** The chips became three slim tracks (Intelligence / Speed / Context) with no numeric readout. Intelligence is the Artificial Analysis Intelligence Index rescaled `round(index/60 × 100)`, read 2026-07-30, reasoning variant, describing the ORIGINAL weights rather than our 4-bit build. Speed is never theirs: their figure is measured on cloud GPUs and that ordering does not survive the move to Apple Silicon, where decode is bandwidth-bound and ACTIVE parameters dominate — same M4 Max in `docs/perf-csvs/all-26.7.12.csv`, `gemma4-26b-a4b` 118 tok/s against `gemma4-31b` 25 tok/s, a 4.7× gap a cloud comparison shows as nearly level. So the speed scores are hand-tuned against that CSV, and `activeParamsB` (a fact per checkpoint, read from each repo's config or model card) exists to CHECK them: a model that wakes more parameters per token can never be scored faster than one that wakes fewer. Ties are unconstrained, which is where 4-bit vs 8-bit and different expert-bank sizes legitimately differ, and is also where the real crossings land (Hunyuan 3 at 21B active measured 26 tok/s against Qwen 3.6 27B's 28 — scored equal rather than fudged). Speculative decode is excluded from the score on purpose: it is a property of how we run a model, it moves some picks 2-3× on their own, and every pick that has one already says so in its blurb. Models with no site entry (both Lagunas, Hunyuan 3) carry our estimate and render "estimated" beside the bar — there is no unrated state, because a missing bar reads as "bad" rather than "unknown". Context is the checkpoint's own `max_position_embeddings`, on a log scale between 32K and 1M, and deliberately NOT the RAM-clamped effective window: the bars compare models to each other, and the clamp is a property of the user's Mac.
+**The bars: intelligence is someone else's number, speed is ours.** The chips became three slim tracks (Intelligence / Speed / Context) with no numeric readout. Intelligence is the Artificial Analysis Intelligence Index rescaled `round(index/60 × 100)`, read 2026-07-30, reasoning variant, describing the ORIGINAL weights rather than our 4-bit build. Speed is never theirs: their figure is measured on cloud GPUs and that ordering does not survive the move to Apple Silicon, where decode is bandwidth-bound and ACTIVE parameters dominate — same M4 Max in the 26.7.12 bench (`docs/perf-csvs/all-26.7.12.csv`, in git history), `gemma4-26b-a4b` 118 tok/s against `gemma4-31b` 25 tok/s, a 4.7× gap a cloud comparison shows as nearly level. So the speed scores are hand-tuned against that bench, and `activeParamsB` (a fact per checkpoint, read from each repo's config or model card) exists to CHECK them: a model that wakes more parameters per token can never be scored faster than one that wakes fewer. Ties are unconstrained, which is where 4-bit vs 8-bit and different expert-bank sizes legitimately differ, and is also where the real crossings land (Hunyuan 3 at 21B active measured 26 tok/s against Qwen 3.6 27B's 28 — scored equal rather than fudged). Speculative decode is excluded from the score on purpose: it is a property of how we run a model, it moves some picks 2-3× on their own, and every pick that has one already says so in its blurb. Models with no site entry (both Lagunas, Hunyuan 3) carry our estimate and render "estimated" beside the bar — there is no unrated state, because a missing bar reads as "bad" rather than "unknown". Context is the checkpoint's own `max_position_embeddings`, on a log scale between 32K and 1M, and deliberately NOT the RAM-clamped effective window: the bars compare models to each other, and the clamp is a property of the user's Mac.
 
 Verified by simulation rather than by reading the code: the three model roots (`~/.mlx-serve/models`, LM Studio's folder, the HF hub cache) moved aside under a restore trap, the app launched against the empty tree, and the flow driven through the accessibility API — welcome names the RAM-matched model, the gate's own AX contents read back verbatim, Cancel takes the window count to 0, and Download (with the real checkpoint staged where the transfer lands, so it size-matches and skips) reaches `"state":"ready"` on `/v1/models` with the sheet gone in under 5 s.
 
@@ -236,3 +236,541 @@ Fixes, both in `.github/workflows/release.yml`:
 Guard: `tests/test_release_workflow_gates.sh` — the stamp exists, uses `steps.version.outputs.version`, targets `$CONTENTS/Info.plist`, lands before `codesign`, and the two CalVer sites name the same zone. Hermetic (PyYAML parse, no runners). It folds backslash-continuations before scanning, because a guard should pin what a command does, not how it's wrapped.
 
 The `26.8.1` tag, release and Homebrew bump were deleted and the release re-cut as `v26.7.12` from a tag push, which takes the workflow's `else` branch (`version=${GITHUB_REF_NAME#v}`) and so never consults the clock at all.
+
+## The workaround the app could not reach (`--max-resident-mem`, 2026-08-07)
+
+The server has had a residency cap since Plan 05 Phase D, and every diagnosis of
+a refused load ends with "raise `--max-resident-mem`" — the 503 body says so, the
+refusal log says so. `ServerOptions.toCLIArgs` emitted forty-odd flags and not
+that one, and there is no extra-args passthrough, so from the GUI the cap was
+always `auto` (80% of Metal's recommended working set at startup) and a model
+that cap refuses was unloadable at any setting.
+
+`--skip-mem-preflight` looks like the escape hatch and is not: it gates
+`doLoadGenOnInferenceThread`'s media preflight and the MLX loader's, both of
+which run AFTER `ensureLoaded`'s registry gate. The gate is what returns the 503.
+
+Two things the field needed beyond the obvious:
+
+- **A value that cannot be malformed needs no validator.** `main.zig` calls
+  `std.process.exit(1)` on a `--max-resident-mem` it cannot parse, so a typo in a
+  free-text Settings field would stop the server from starting at all, with the
+  cause buried in a log nobody opens because the app never came up. The first cut
+  answered that with `ServerOptions.parsableSizeArg`, a Swift mirror of
+  `parseSizeArg`'s grammar (bare bytes, optional B/KB/MB/GB, `off`, `0`, plus
+  `auto` → omit) that dropped anything else. That is a second copy of a grammar,
+  in a second language, with its own test enumerating junk strings — all of it
+  defending a text field nobody needed. The field is a **slider** now:
+  `maxResidentMemGB: Int`, 0 = Auto, snapping to `residentMemPresets`, whose
+  ladder stops at the machine's physical RAM because a cap above it can never be
+  reached. The validator, its test, and the whole malformed-input class went with
+  it. Prefer deleting the input over defending it.
+
+  `snappingSlider` moved from `RequestDefaultsSectionContent` to file scope
+  rather than being copied — two sections render ladder-valued settings now, and
+  a second copy is how the two drift.
+
+- **A new `ServerOptions` field needs a `SettingsReset` section.**
+  `testEveryServerOptionsFieldBelongsToExactlyOneSection` fails otherwise — a
+  field owned by no section can never be restored by "Reset section to
+  defaults". Good tripwire; it caught this within one test run.
+
+## `mlx-serve` survived the app quitting it (#133, 2026-08-07)
+
+Reported against 26.8.2: quit MLX Core with ⌘Q or the Quit menu and the
+`mlx-serve` process stays up with a model loaded, holding gigabytes. The
+reporter also found the workaround, which is the diagnosis: "pressing the power
+button in the menubar pull-down menu quits the main GUI and closes mlx-serve."
+
+That button is the only quit path with an explicit teardown:
+
+```swift
+Button {
+    server.stop()
+    NSApplication.shared.terminate(nil)
+}
+```
+
+Every other route — ⌘Q, the app menu's Quit, Dock ▸ Quit, any other
+`terminate(nil)` — goes straight to termination, and nothing signals the child.
+
+`ServerManager.deinit` is the trap. It cancels the pollers and calls
+`proc.terminate()`, so it reads exactly like the safety net for this, and it is
+not: `ServerManager` is owned by an `AppState` held as a `@StateObject`, and
+those are not deallocated at app termination. The process image is torn down,
+`deinit` never runs, and the child is reparented to launchd still holding the
+model.
+
+The fix belongs to the object that spawned the process, not to a button:
+`ServerManager.init` observes `NSApplication.willTerminateNotification`. One
+`ServerManager` exists, so every quit route is covered by construction and a
+future quit affordance cannot forget the teardown.
+
+`queue: nil` is deliberate. `addObserver(forName:object:queue:)` with a queue
+ENQUEUES the block; during `applicationWillTerminate` the app may never turn its
+runloop again, so the teardown would be scheduled and then dropped — the same
+leak with extra steps. `queue: nil` delivers synchronously on the posting thread,
+which AppKit guarantees is the main one, so `MainActor.assumeIsolated` is sound.
+
+What makes the guard real rather than decorative: the test posts the
+notification and asserts `status == .stopped` with NO runloop turn, no `await`
+and no expectation in between. A `.main`-queued version of the fix fails it.
+
+`stop()` sends SIGTERM and the server handles it — verified against a running
+server with a model resident: it logs "Shutting down gracefully..." and exits.
+The tray button keeps its explicit `stop()`; it is idempotent, and belt-and-
+braces on the one path users already know works is cheap.
+
+## The truncation banner rode history as assistant prose (2026-08-11)
+
+The live capture behind the muse loop investigation had a second, app-side
+half: `TruncationNotice.text(...)` was APPENDED into `message.content` via
+`updateLastMessage(content:)`, and content is exactly what `plainHistoryDict`
+and `buildAgentHistory` send back. So after one repetition cut, every later
+request carried "⚠️ *Stopped — the model started repeating itself and the
+server cut the reply…*" as something the assistant SAID — the model reads a
+warning about looping, verbatim, every turn, in a chat already primed to
+repeat. Same class as the error-echo rule: our own UI text became the error.
+
+Fix: the notice is a FIELD (`ChatMessage.truncationNotice`, a
+`TruncationNotice.Notice` carrying cause + cap), set by the plain-chat path,
+both agent-loop exits and TestServer, and drawn by `MessageBubble` as a
+footnote under the reply — content never carries it, so history builders
+can't resend it by construction. Sessions saved BEFORE the change still hold
+the banner inside content (the capture does), so both builders scrub it at
+build time with `TruncationNotice.stripped(from:)`; the strip markers derive
+from the legacy `text(...)` string itself, so the two cannot drift apart.
+Decode is tolerant both directions: absent on every old message, and an
+unknown future cause nils the notice instead of failing the whole message.
+
+Relation to PR #147: its diagnosis (doubled banner) was a SERVER wire-shape
+bug — the include_usage chunk restated the ending (docs/gotchas/server-http.md)
+— and its `APIClient.TruncationGate` remains worthwhile hardening for
+third-party backends. Its ChatTurnEngine append-after-stream hunk is
+superseded by the field.
+
+Guards: `TruncationNoticeTests` (field + clean content, both-cause strip,
+history builders carry neither field nor legacy text, tolerant decode).
+
+## The badges stopped where the small window had ended (fullscreen, 2026-08-13)
+
+⌘-held numbers the sidebar's conversation rows, and only the rows in the
+CLEAR get one — the list scrolls under the pinned destination block, so a
+number behind frosted glass names a shortcut you cannot read. That band was
+measured from three `frame(in: .global)` readers: the block's bottom edge, the
+column's bottom edge, and each row's own span.
+
+In fullscreen the badge count stopped tracking the window. Reproduced in an
+isolated SwiftUI harness with the same structure (`ScrollView` of rows +
+`.safeAreaInset(.top)` block + the two background readers), stepped through
+900x600 → 900x1300 → fullscreen:
+
+```
+windowed    blockMaxY=370.0  rows 378…406, 408…436, …   in band 16
+TALL        blockMaxY=370.0  rows 378…406, …            in band 16
+FULLSCREEN  blockMaxY=370.0  rows 396…424, 426…454, …   in band 18
+```
+
+`blockMaxY` is the same 370.0 in every state while the rows genuinely move
+(378 → 396). **A `.global` frame is not re-published when a view merely MOVES
+rather than resizes** — entering fullscreen translates the whole column, and
+the pinned block keeps whatever global maxY it had in the window that last
+laid it out. The band's top edge is then a number from a different window
+size, which is exactly what it looked like: badges based on the geometry the
+feature happened to be written at.
+
+The second `SidebarClearBandTopKey` publisher, `frame.minY +
+safeAreaInsets.top`, was documented as the same line derived a second way. It
+never was — measured, it reports **104** against a frost line at **370**,
+because that reader sits below the toolbar (it has already lost that inset)
+and the block's height is not part of what it reads back. It was harmless only
+because the key reduces by `max` and the real number was always larger. A
+fallback that can only ever be wrong is worse than no fallback: deleted.
+
+Fix: one named coordinate space on the column (`ChatSidebar.bandSpace`), and
+all three measurements taken in it. In the column's own space the top edge is
+the block's HEIGHT and the bottom edge is the column's HEIGHT — neither can be
+invalidated by the window moving, and both re-publish when there is genuinely
+a new layout. Same harness, same three states, container space: top constant
+at 318, bottom 825 → 827 → 897, and fullscreen numbers 19 of 19 measured rows
+where the global version numbered 18.
+
+The filter itself moved out of the view to `ChatQuickSwitch.numbering(rowSpans:
+clearBandTop:clearBandBottom:)`, which is what makes "a taller window numbers
+more rows" a test rather than a screenshot. Guards: `ChatQuickSwitchTests`
+(band cases + a source scan pinning zero `.global` frames and exactly three
+readers in the named space — verified red by reverting one reader).
+
+## Continuing a reply filed itself as a new version of it (2026-08-14)
+
+Three features landed together and two of them meet on one message. Regenerate
+puts a version pager under a reply; Continue hands the reply back to the model
+to finish. Both end at the same place — `ChatTurnEngine.endTurn` →
+`AppState.finishRevisions`, the ONE turn exit — and that exit could not tell
+them apart:
+
+```swift
+let seed = pendingRevisionSeed.removeValue(forKey: sessionId)   // nil after a continuation
+guard seed != nil || !msg.revisions.isEmpty else { return }     // …but revisions is not
+```
+
+So a reply that had been regenerated once (pager reading 2/2) went to **3/3**
+the moment you continued it, with 2/3 holding the same reply minus the ending
+that had just been written. Nothing errors and nothing is lost — the text is in
+v3 — which is what makes it the quiet kind: the pager silently grew a page that
+is not another answer to the question.
+
+The rule is that **the pager counts REGENERATIONS**, and a continuation is not
+one. It is the reply you are reading, carrying on — the same relationship an
+edit has to the version it changes, which is why `MessageRevisions.applyingEdit`
+already exists and says so: stepping away and back reloads `content` from the
+stored revision, so any in-place change that does not sync into the list is
+discarded the first time you touch an arrow.
+
+The fact has to be HELD, for the same reason `pendingRevisionSeed` is held: the
+turn exit is the only place that knows the turn is over, and by then the request
+that started it is gone. `AppState.markContinuing(_:)` is that marker, and it
+carries the seed's ordering hazard too — `continueReply` opens with
+`stop(sessionId:)`, which IS a turn exit, so a mark set before it is consumed
+immediately and the continuation records itself as a new version anyway. Set
+after `stop`, pinned by a scan that reads the two statements in order.
+
+Two more things describing a message that a continuation changes and the first
+cut did not carry over. The truncation notice was already cleared (the reply was
+cut; it is being un-cut). Token usage was not: `updateLastMessage` **replaces**
+`completionTokens`, so a 900-token reply finished by a 42-token continuation
+reported 42 in its footnote. `addingCompletionTokens:` adds instead, driven by
+`runPlainTurn`'s own `continuing` flag — the prompt count and the rate stay the
+latest generation's, since a continuation's prompt already contains everything
+before it and a rate is not a quantity to sum.
+
+And the affordance itself: `ContinueReply.isEligible` takes the `ServerEngine`
+now. ds4 renders its chat template inside the embedded engine, where there is
+nowhere to append a prefill, so the server refuses by name
+(`continuationRejectReason`) — a live button over a guaranteed 400 is the
+dead-control class, and the same rule as a locked composer disc.
+
+Guards: `ContinuedReplyBookkeepingTests`, `ContinueReplyTests` engine cases,
+`RegenerationSeedWiringTests` continuation cases (both verified red by
+reverting each half separately — the AppState branch and the `markContinuing`
+ordering fail independently).
+
+## A typed `onDrop(of:)` never saw the Create panes' drops (2026-08-13)
+
+The media panes' shared drop target (`MediaDropTarget.swift`) shipped as
+`onDrop(of: [.fileURL])` with the type filtering done in the completion
+handler — after the providers had RESOLVED, which is after SwiftUI has
+accepted the drop and animated the file in. So a dropped `.txt` lit the
+dashed border, flew home, and nothing happened: the pane had already said
+yes to a file it then silently discarded.
+
+The obvious fix — name the kind's own UTTypes in `of:` (`.image` / `.movie` /
+`.audio`), the way the chat composer's drop reads — made it worse in the way
+that is hardest to argue with: the panes stopped accepting ANY file. A drag
+out of Finder puts `public.file-url` on the pasteboard and nothing else; the
+file's own content type is not there to match against. A target registered
+for `.image` is therefore never offered the drag, and no amount of correct
+filtering downstream matters. (The chat composer gets away with the typed
+list because its other source — an image dragged out of a browser — really is
+`public.png` DATA, and its fallback branch reads that with `NSImage`. It has
+never been the same question: the panes need a PATH on disk.)
+
+The two requirements are not in conflict, they just belong to different
+hooks. The target registers `.fileURL`, which is what a file drag actually
+is, and the refusal moves to `DropDelegate.validateDrop` — the one hook that
+answers while the drag is still in the air. It reads the drag pasteboard
+(`NSPasteboard(name: .drag)`, `.urlReadingFileURLsOnly`) and gets the real
+URLs synchronously, so the verdict is the pane's own extension allow-list
+rather than a UTType approximation of it: a `.tiff` the picker opens is
+accepted, a `.txt` bounces, and a full slot bounces too. `dropEntered` fires
+on validated drops only, so one verdict both refuses the file and decides
+whether the border lights.
+
+A drag the pasteboard tells us nothing about (`urls` empty while the drag
+still claims to carry files) is NO INFORMATION, not a refusal: it falls back
+to accepting and filtering after the resolve, which is exactly the old
+behaviour. Between the two failures, bouncing everything is the worse one —
+it is the one that makes the pane look broken.
+
+Guards: `MediaDropTests` (the verdict per kind and for the mixed H3 target,
+every allow-listed extension passing it, the full-slot and unreadable-drag
+cases, a real pasteboard round-trip proving the read recovers a
+`public.file-url` item and skips a web URL, and a source scan pinning
+`.onDrop(of: [.fileURL]` + `validateDrop` in the modifier).
+
+## The Hugging Face cache was "supported" and never worked (2026-08-14)
+
+Reported as "we don't account for `HF_HOME`". We did — `DownloadManager.huggingFaceRoot`
+read `HF_HUB_CACHE`, then `$HF_HOME/hub`, then `~/.cache/huggingface/hub`. The code
+was right and the feature was dead, because the read was
+`ProcessInfo.processInfo.environment` and a bundle launched from Finder or the Dock
+has none of the user's shell environment. Anything exported from `~/.zshrc` is simply
+not there. So the env branches only ever fired when the binary was run from a terminal,
+and everyone else silently got the default cache — an empty folder if they had moved
+theirs to an external drive.
+
+The tell that this was already known and had been solved twice, in two other places:
+
+* `hfToken`'s own comment — *"the token file `huggingface-cli login` writes is the one
+  that actually works in the app, because a bundle launched from Finder has NO shell
+  environment"*.
+* `CLIInstaller.userShellPathEntries()` — spawns `$SHELL -l -i -c` to print `$PATH`,
+  because *"Finder-launched apps get a minimal PATH that never contains
+  `~/.local/bin`"*.
+
+Neither generalized, so the third instance shipped broken. `LoginShellEnv` is now the
+one probe and `CLIInstaller` delegates to it.
+
+Mechanics worth keeping:
+
+* **Markers, not line parsing.** An interactive rc file prints banners. Each value comes
+  back between `__MLX_ENV_<NAME>_BEGIN__` / `__MLX_ENV_<NAME>_END__`.
+* **An unset variable is omitted, never returned as `""`.** Otherwise the shell's empty
+  answer shadows a value the process genuinely has, and the merge inverts.
+* **Process env wins.** A launch that does carry the variable (terminal, or an explicit
+  override) is authoritative; the shell only fills gaps.
+* **Off-main, watchdogged.** The probe spawns a shell and can be wedged by a pathological
+  rc file, so it is primed from a detached task at launch with a 5 s terminate, and
+  `refreshModels()` re-runs only if the resolved root actually moved. `huggingFaceRoot`
+  had to stop being a `let` for that.
+* **A configured-but-missing root is nil.** Falling back to `~/.cache/huggingface/hub`
+  when `HF_HOME` points at an unmounted drive would list the wrong library and read as
+  "your models vanished" rather than "that drive isn't mounted".
+* **`XDG_CACHE_HOME` was missing entirely** — `huggingface_hub` defaults `HF_HOME` to
+  `$XDG_CACHE_HOME/huggingface`, so a user who moves only that var was in the same hole.
+  It is now in the precedence for both the cache root and the token file.
+
+Under MAS the probe is gated off (`BuildFeatures.customModelFolders`): the app is
+sandboxed, `~` is the container, and a cache outside it is unreadable no matter what the
+shell reports — so there is nothing to find and no reason to spawn `/bin/zsh` (which is
+also why `HostEscapeAuditTests` needed a disposition entry for the new file).
+
+The class guard is the one that matters: a source scan asserting no file outside
+`LoginShellEnv.swift` reads an HF variable straight from `ProcessInfo`. That is exactly
+how the bug got in, and it is what the next `HF_*` variable will trip over. Verified red
+by injecting a single direct read into `CLIInstaller.swift`.
+
+### The pill showed a commit hash, then kept showing the wrong model for a minute (2026-08-14)
+
+Two reports about the composer's model picker, one cause each.
+
+**A registry id is not a display name.** A model in the Hugging Face cache lives at
+`models--<org>--<repo>/snapshots/<commit>/`, and nothing points the server at that root:
+it reaches an HF model by absolute path, either `--model` at launch or `/v1/load-model`
+on a hot switch. Both key the entry by DIRECTORY BASENAME (`ModelRegistry.registerByPath`
+→ `std.fs.path.basename`), and for a snapshot dir that basename is the commit hash. So
+`/v1/models` reports `9f0ea3c1d2`, and the pill — which preferred `chatModelInfo?.name`
+over everything else, deliberately, because the resident model is the one answering —
+rendered a hex string. The tray was fine and that is the tell: its rows come from our own
+scan (`LocalModel.displayLabel`), which reads the repo id out of the cache dir name. The
+fix is not to stop trusting the server: where the resident id names the model we PICKED
+(its `name`, or its path's last component — the two shapes a registry id can take), our
+label wins; where it names something else, the server's id stays, because a model another
+surface loaded is not ours to rename.
+
+**A hot switch is invisible from the outside.** It never moves `server.status` off
+`.running` (the process doesn't restart), and `chatModelInfo` keeps reporting the OLD
+model until the new one is resident — which on a 27B is a minute. The pill therefore sat
+on the previous model's name with a green dot beside it while the menu's checkmark had
+already moved to the new one, and nothing anywhere said a load was running.
+`AppState.pendingModelLoadTask` knew, but it was private and unpublished. It is now
+`@Published var loadingModelPath`, set beside that task and cleared in its `defer`, and
+the pill names the model being loaded with a spinner in place of the dot. A RESTART is
+deliberately not tracked there: that one does move the status, and
+`ChatServerStartControl` already reports it.
+
+Both answers live in one pure function (`ChatModelSelection.pillState`), next to the tag
+rules, for the reason the tag rules are there: a second copy is how one picker starts
+naming a model the other doesn't.
+
+
+### The download bar filled up once per file (2026-08-14)
+
+`DownloadState` carried two fractions: `progress` (bytes banked across the whole repo over
+its total) and `fileProgress` (the file currently in flight). Every bar in the app —
+the model pill's hairline, the browser rows, the welcome card, the starter card, the
+bundle bar, the chat gate — rendered `fileProgress`, and so did `percentFormatted`. A
+four-shard 18 GB pack therefore ran 0→100% four times, and the reports were all the same
+shape: "it says 100% and starts again, I don't think it's working". The bigger the model,
+the worse it reads, because more shards means more resets.
+
+Nothing was wrong with the producer: `progress` was already live and correct, fed by
+`(baseDownloaded + fileBytesTotal) / totalSize` on every transfer callback. It was simply
+the field nobody rendered.
+
+The fix is a deletion. Keeping both fractions in the struct and pointing the views at the
+right one leaves the wrong one sitting there for the next surface to reach for — and eight
+independent sites had already made exactly that mistake, which says the reflex is stronger
+than the comment would be. With `fileProgress` gone the compiler names every site, and the
+per-file detail is carried where it belongs: `currentFile` and `fileIndex`/`fileCount`,
+words rather than a bar that appears to lose its place.
+
+Two details the deletion had to preserve. `ChunkedFileDownloader.onProgress` reports bytes
+*of this file including resumed ones*, so the callback's arithmetic is the transfer's true
+position and needed no change. And the resume branch, which used to set only the per-file
+number, now banks its existing bytes into `progress` — otherwise the bar sits at the last
+completed file's mark for the fraction of a second before the first callback, which is not
+wrong but is not where the disk already is.
+
+Same file, same round, the other half of the same class: the hairline drew for ANY chat
+transfer, so downloading a second model in the background put a progress bar under the
+model that was already answering. Excluding media bundles had fixed the loudest instance of
+that and left the general one, because both times the check was "is something downloading"
+rather than "is THIS model downloading". Every other surface in the app keys its download
+by its own repo id; the pill now does too, matching against `selectedModelPath` through the
+layout the downloader writes (`<root>/<org>/<name>`, one level up for a `.gguf` file) since
+a model still arriving has no `LocalModel` to match on. The one exception is what the
+hairline was added for: with nothing chat-pickable on disk, the composer cannot answer at
+all and whatever is arriving is the reason.
+
+Media BUNDLES stay per-component: a bundle is N repos and the manager learns a repo's total
+only when it starts, so a weighted bundle fraction would need sizes it doesn't have. That
+bar resets once per model, and its label already says which one ("Downloading model 1/2").
+
+## The abandoned connect() leak (MCP stdio connect race, 2026-08-15)
+
+Symptom: user's RAG chat hung after 3-4 turns. Server idle and healthy (`/health` sub-2ms, `requests_running=0`, `last-agent-request.json` untouched 11+ min — rules out the server and the "ghost turn" class). App at ~160% CPU over 23h (spikes ~700%), 5326 threads. `sample <pid>`: two threads parked in `Client.connect(transport:)`, awaiting the stdio transport's `AsyncThrowingStream`. A completed connect RETURNS from that call — a thread still inside it after 23h never finished.
+
+Root cause: `connectOrFailFast` races `client.connect(transport:)` (Path A) against a death-watcher (Path B, 10 Hz) and a 30s hard cap. The winner resumes the outer continuation; Path A's Task is abandoned, never cancelled ("the loser keeps running" — deliberate, to avoid `withThrowingTaskGroup`'s destructor hanging on an unresponsive child). The gap: nothing on the losing paths called `client.disconnect()`. Per the swift-sdk (`Client.swift:287-320`), `disconnect()` is the ONLY thing that resumes a pending `withCheckedThrowingContinuation` — cancelling the Task or killing the child does not unstick it. `executeToolCall`'s watchdog, a few hundred lines above, already documents and applies this exact break-glass for tool calls; the connect race never got the same treatment.
+
+Each failed connect (server dead or no answer within 30s) leaks one permanently-scheduled task. They accumulate over the session, starve the cooperative thread pool, and the agent's next turn — which awaits a tool call on that same pool — can't complete. The spin and thread count are the leak; the hung chat is the starvation.
+
+Fix: both losing paths call `client.disconnect()` (via `Task.detached` so it doesn't block the resume closure); the timeout path also terminates the child first. `connectOrFailFast` gained an injectable `hardCapSeconds` (default 30) and `onPathASettled` hook, and went `private`→`internal` for `@testable import`. Guard: `MCPConnectLeakTests.testAbandonedConnectSettlesAfterLosingTheRace` — real `sleep 60` child (accepts pipes, never speaks MCP, so the death-watcher never fires), 0.3s cap, asserts Path A settles within 5s.
+
+Rule: any race that abandons one arm must ask whether the abandoned arm can unstick itself — here, only `disconnect()` does. A "loser keeps running" comment is a code smell: re-read it whenever a related watchdog is added nearby, in case the treatments have diverged (they did, for ~months, between the tool-call watchdog and this race). Diagnosis: `/health` + `requests_running` rule out the server in under a second; `sample <pid>` on the app is the fastest way to catch a CPU-spinning leak — a thread still inside a one-shot async call hours in is the tell.
+
+## MLX Core crashed on every equation: a SwiftPM resource bundle no signed .app can hold (issue #233, 2026-08-20)
+
+v26.8.9 shipped LaTeX rendering. A reporter on an M5 MacBook Pro could not launch the app
+at all: it restored a chat containing math and died on the spot, `EXC_BREAKPOINT` in
+`_assertionFailure` under `KaTeXFontProvider.makeUnitFont` → `Bundle.module`. Reproduced
+here in seconds by asking a model to show a formula — the display-math path
+(`MathCanvasContent.body`) trapped identically. It looked user-specific and was universal.
+
+The first read was that their copy of the app was missing the font bundle, because the
+shipped DMG has it: `Contents/Resources/SwaTex_SwaTexRender.bundle` is present, sealed in
+`CodeResources`, `codesign -v --deep --strict` passes, and the same binary UUID on the same
+OS build (26.5 25F71) resolved the fonts from a scratch Swift snippet. All true, and all
+beside the point.
+
+The accessor is what SwiftPM generates for a target with resources:
+
+```swift
+let mainPath = Bundle.main.bundleURL.appendingPathComponent("SwaTex_SwaTexRender.bundle").path
+let buildPath = "/Users/runner/work/mlx-serve/mlx-serve/app/.build/.../SwaTex_SwaTexRender.bundle"
+guard let bundle = Bundle(path: mainPath) ?? Bundle(path: buildPath) else { Swift.fatalError(...) }
+```
+
+For an app bundle `Bundle.main.bundleURL` is the **.app itself** (measured with a throwaway
+.app: `bundleURL=/…/T.app`, `resourceURL=/…/T.app/Contents/Resources`), so it looks for
+`MLX Core.app/SwaTex_SwaTexRender.bundle`. The second candidate is a CI runner's build
+directory. Neither exists on any user's machine, and the miss is a `fatalError` rather than
+a nil the caller can absorb — `makeUnitFont` itself degrades to a system font perfectly
+well, it just never gets the chance.
+
+The obvious fix does not exist. Copying the bundle to the .app root and re-signing:
+
+```
+MLX Core.app: unsealed contents present in the bundle root      # codesign -v --deep --strict, rc=1
+MLX Core.app: rejected (unsealed contents present in the bundle root)   # spctl
+```
+
+Only `Contents/` may live in a bundle root, so the one place the accessor looks is the one
+place nothing can ship. An Xcode-built app is fine because Xcode emits a different accessor
+that also searches `Bundle.main.resourceURL`; every mlx-serve path — the DMG lane in
+release.yml and the MAS lane in build.sh — uses `swift build`, so both were broken.
+
+The fix patches the dependency's single call site before it is compiled
+(`scripts/patch-swatex-font-lookup.sh`, wired into build.sh, release.yml and ci.yml ahead of
+`swift build`): `Bundle.module.url(...)` becomes a candidate search over
+`Bundle.main.resourceURL`, `Bundle.main.bundleURL`, the reading bundle's own two, and that
+bundle's parent (the `swift test` layout, where the resource bundle is the .xctest's
+sibling). It is idempotent, `chmod u+w`s the read-only checkout, and REFUSES rather than
+silently no-opping when the upstream source stops matching — a patch that quietly fails to
+apply ships a build that crashes exactly where it did before. Proof it works is a probe
+binary placed inside a real assembled bundle, so `Bundle.main` is the .app:
+
+```
+KaTeX_Main-Regular -> /…/MLX Core.app/Contents/Resources/SwaTex_SwaTexRender.bundle/Fonts/KaTeX_Main-Regular.ttf
+old Bundle.module path would be -> /…/MLX Core.app/SwaTex_SwaTexRender.bundle (MISSING -> fatalError)
+```
+
+App-side, `LaTeXFonts.isAvailable` asks the same question once and both entry points
+(`InlineLaTeXRenderer.attributedAttachment`, `DisplayLaTeXRenderer.canRender`) decline when
+it is false, so the segment renders as its exact source — the fallback malformed TeX already
+takes. A missing resource must cost the math, not the process.
+
+Two lessons worth more than the bug. **A packaging guard has to assert the destination the
+code READS, not that a copy happens**: `testSwaTexFontBundleShipsInBothDeveloperIDPackagingPaths`
+scanned build.sh for the string `SwaTex_SwaTexRender.bundle` and was green through every
+crashing release, because the bundle really was being copied — just to a path nothing looks
+in. And **"the artifact is correct" does not answer "the artifact works"**: the DMG passed
+every structural check that could be run against it while being unable to render a single
+equation.
+
+## A dropped frame is a failed mux (issue #170, 2026-08-28)
+H3 REF2VA renders above 124 frames intermittently produced a ~28 KB mp4 of black frames. The server side was clean every time (`[minimax-h3] video decoded`, `[video] -> 226f 1344x768 (699826176 rgb bytes)`), and `decodeFrames` validates `rgb.count == frames*h*w*3`, so the loss was inside `VideoGenService.writeMP4`: `CVPixelBufferPoolCreatePixelBuffer` returning nil hit `guard let pb else { continue }`, and `adaptor.append(...)`'s Bool was discarded. Either way the loop went on, `finishWriting` reported `.completed`, and the app called it a success. Same settings passed and failed across runs (209 frames 768x1344: 1 fail / 3 ok), which is what a pool-exhaustion race looks like, not a size threshold. Fix: pool miss falls back to a standalone `CVPixelBufferCreate`; a nil buffer or a refused append throws `MuxError.frameBuffer/frameAppend`, cancels the writer and removes the file, so the user gets an error instead of a black clip. Not reproduced hermetically (needs the encoder to starve the pool); the existing realistic-scale mux tests stay green.
+
+### Sandbox terminals moved into the chat sidebar; closing the window killed them (2026-09-02)
+The "MLX Sandbox" `Window` scene was the last standalone window for something used alongside chats, and it carried a structural bug: `EmbeddedTerminalView.dismantleNSView` called `terminate()`, so closing the window (or any re-layout that unmounted the view) SIGTERM'd the ssh under a live pi/hermes TUI. The ZStack + opacity "never unmount" rule inside the window only papered over the same fact for tab switches. Fix: the process is owned by `EmbeddedTerminalView.Handle` (creates the `LocalProcessTerminalView` and starts the process at init), held by `TerminalSessionStore` on `AppState`; the SwiftUI view only re-parents the handle's terminal into whichever window shows it, and dismantle un-parents — never terminates (scan-pinned). With that, sessions became rows of the Chats section (`TerminalSessionList` — the old `SandboxSessionTabs` minus selection/window title, plus `agentId`/`workspace`/`createdAt` and a `.failed(message)` phase that replaces the window's alerts; `SidebarChatRows.merge` interleaves them with conversations newest-first) and `ChatWorkspace.terminal(id)` renders `TerminalPane` in the detail column. Starting one asks for a workspace folder (`AppState.startTerminal(agentId:)`, the one door) which `startCliSession(workingDirectory:)` hot-mounts at `/projects/<slug>` via the existing `resolveAndMountProject` — never a `/workspace` remount, so terminals on different folders coexist; the bootstrap `cd`s to `VzGuest.shellQuote(cwd)` (an apostrophe in the folder name must stay ONE word — the ShellSentinel-desync class; pinned). Plain shell = `cd <q>; exec bash -l`. Dropped on purpose: the Activity pane (transcript + `$` input; `transcriptStore` keeps recording, nothing renders it), the tray's "Agent Sandbox" row, `pendingSandboxAgentLaunch`. Every `NSOpenPanel` now comes from `OpenPanel.make()` with `showsHiddenFiles = true` — the folder people point an agent at is often a dotfolder. libghostty was evaluated as the emulator: releases ship only `libghostty-vt` (the VT parser, no renderer); the full library needs the source tarball + Zig 0.15.2, so SwiftTerm stays behind the same one-file seam.
+
+## Every quantized repo read 4x too big in the Model Browser (HF metadata change, 2026-09-03)
+`HFModel.estimatedSizeBytes` priced HF's `safetensors.parameters` histogram by dtype: U32 = 4 bytes, the packed-word count. Some time between 2026-08-28 and 09-03 Hugging Face recomputed the histogram for every repo (2024 uploads included) so that U32 is the LOGICAL element count: `ddalcu/Qwen3.8-27B-MLX-Serve-4bit` and `-8bit` now carry the identical `{'BF16': 1.79e9, 'U32': 2.60e10}`. Four bytes per element made gemma-4-e2b-it-4bit (3.55 GB on disk) read 18.1 GB, and the RAM-fit colouring called every 4-bit row won't-fit.
+
+The fix prices packed elements by the width the repo id names (`quantizationLabel`, so NVFP4/MXFP4 = 4, MXFP8 = 8) plus the group scale/bias overhead: `(bits + 0.5) / 8` bytes per element. That reproduces the real sizes to within a percent (e2b 3.55 GB, 27B 4-bit 18.2 GB, 8-bit 31.2 GB). An id with no width (`-dwq`, a bare name) returns nil, so the row falls to the existing tree-API fallback fetch instead of a guess. `usedStorage` was not an option: the search endpoint refuses it, and it bills every revision (gemma-4-31b reports 36.9 GB for an 18.4 GB tree).
+
+Lesson: a size derived from a third party's METADATA is a contract the third party can change without a version bump; the only guard that saw this was the live `HFSearchIntegrationTests` bar against a known repo. Keep one live-metadata test per external contract.
+
+## The chat column became a setting, and the transcript was laid out around it (PR #339, 2026-09-05)
+The column was 80% of the window with prose wrapped early inside it by an absolute `tailIndent` (~45em), so one column had three edges: prose stopped mid-column, tables ran the full 80%, the user bubble did neither. The width is now the user's (`ChatColumnWidth`, fixed points, Wide = window) and every element takes the column. Trying to re-inset prose with paragraph indents does not work: an indent cannot reach an `NSTextTableBlock`, and a negative row padding hands `NSTextView` a container narrower than the table it already laid out, so the table is clipped on both sides.
+
+Things found on the way:
+- `columnFractions` weighted columns by content length only, so "Lifespan" beside a column of sentences got 3% and rendered as "Life spa n". Share is sqrt-compressed content, floored by the longest word, floor capped at 18 characters so one hash cannot claim the table.
+- The list parser matched "first char is a digit and `. ` appears somewhere", which made a list of `1 pes. A kočka spolu.` and dropped everything up to the stop. Numbered markers were also stripped and drawn as bullets. Anchored regex, marker carried on the block.
+- `blockSpacer` was the only newline between blocks. Suppressing it between list items to tighten rhythm ran the whole list into one paragraph with the markers inline. Items now end themselves.
+- Inline code looked like prose because the font-trait probe (`.monoSpace`) is false for `NSFont.monospacedSystemFont`; detection keys on `inlinePresentationIntent`. A `.backgroundColor` ground fills the line fragment and climbs into the descenders above at 1.4 leading, so the text view draws the ground at the font's own band.
+- The compact-mode leading change looked like a no-op because the render cache was keyed on theme and text size only.
+- Tool cards rendered the engine's `**name**(k: v…)` summary string (values cut at 80 chars) and could never show more than it had thrown away. Cards read `SerializedToolCall` from the message before the summary; results pair by index.
+- `bg1` is reassigned on every launch and the registry knows only the name, so a week-old card asking "is bg1 alive?" was told yes about today's process and offered to kill it. Ownership = last announcement in the transcript, and `isAlive(handle:sessionId:)` scopes it to the chat.
+- The first draft bound Compact mode to ⌃C. Menu key equivalents run before `keyDown`, and SwiftTerm handles Control only in `keyDown`, so ⌃C in an embedded sandbox terminal would have toggled the setting instead of sending SIGINT. Interface shortcuts carry ⌘ (⌘⌥1/2/3, ⌘⌥C).
+
+## One checkbox started a server and loaded 26 GB (issue #214, 2026-08-17)
+
+"Auto-start on launch" called `server.start(modelPath:)`, and `--model` is an eager, blocking load: every login read the selected checkpoint — tens of gigabytes — before anything asked for it, and nothing in the UI said so. The same launch made the model the registry's DEFAULT, so a server started from the tray or the chat Start reloaded it on the next request after an eject. The server has always started headless (`runHeadlessServe`, `no_initial_load`) and the app already hot-loaded on the first turn (`ensureDefaultChatModel`); one checkbox simply carried two decisions.
+
+**Fix.** `StartupModelChoice.launch` is the gate as a pure function (`.doNothing` / `.headless` / `.load`). Auto-start alone is headless. Settings ▸ Server ▸ "Load a model at start" (default OFF, no migration: stopping the login load is the fix) picks the model through `Mode` (`.lastUsed` / `.pinned`, in its own key — a rule spelled as a magic value in a path field is a sentinel every reader has to know). `resolved` answers both the gate and the Settings readout, so an uninstalled model starts headless rather than `--model <gone>` or a substitute nobody chose. "Last used" is recorded only for CONFIRMED loads of absolute paths (a registry id is a basename, a LAN id names another Mac). LAN duty at launch was a back door into the same load and takes `lanStartPath(plan:)`. Both Start buttons take `AppState.startServer(loadingSelection:)`: headless, then a hot-load with the pill and the tray button spinning on `loadingModelPath` (a hot-load leaves the status `.running`). `waitUntilRunning` ends on `.stopped`, so a Stop mid-start clears that spinner instead of holding it for the whole wait.
+
+**Still `--model`:** `ensureServerForLan()` outside launch, Settings' Restart Now, the Model Browser's Use, and task runs. Guards: `StartupModelChoiceTests`, `ServerControlButtonPresentationTests`, `ServerManagerStopTests`.
+
+## The transcript rendered blank until the mouse moved, and a long turn folds (2026-09-13)
+Folding a long user turn (`LongUserTurn`, a `lineLimit` with a fade) reproduced a defect the transcript had since its first commit: after a chat switch, a jump to the end or any large height change, the view showed white space, and moving the mouse filled rows in one layout pass at a time, from the bottom up. The scroller thumb even changed size while merely scrolling. Cause: the transcript was a `LazyVStack`, whose content height is an ESTIMATE from the rows it has built, and rows here run from one line to four screens. A trace showed the height dropping from 6764 to 1242 and back within two milliseconds of a fold. Every anchor, offset correction and `scrollTo` aimed at those numbers landed the visible rectangle outside the rows that existed. Two rounds of scroll arithmetic were built on the lie before the lie was measured.
+
+Fix, in order of weight:
+- `VStack`. Exact heights cost ~60 MB across ten long chats and ~10 ms per rendered reply: a synthetic 500-turn chat opened in 2.5 s (a 569-message agent chat in 0.5 s, tool cards are cheap). So a chat opens on its last `TranscriptWindow.rowLimit` (150) rows with "Show earlier messages" above them, an INDEX fixed when the chat opens so a streaming reply never pushes the oldest visible row out: 0.65 s. The lazy stack "opened" the same chat in 0.05 s, to an estimate that then changed 63 times as the reader scrolled, and 918 times on the chat with the 130k-character turn. Wrong heights cost every scroll decision in the file.
+- A chat opens at its end by LAYOUT (`defaultScrollAnchor(.bottom, for: .initialOffset)` on a scroll view whose identity carries the session id), so `transcriptShown` jumps nowhere.
+- A shrinking row keeps the control the reader clicked where it is: the offset drops by what the row lost (`rowWillResize` snapshots offset and height, `contentGeometry` corrects per frame, `rowDidResize` ends it; revealing earlier rows above the reader rides the same bracket with the opposite sign). The size-change anchor cannot do this: it holds the end only when you are already there.
+- The frame after a fold has content shorter than the stale offset, so the distance from the bottom reads deeply negative, which is the rubber-band shape. The pin rule read it as arrival, re-engaged following, and the bottom anchor plus the correction rule dragged every fold to the end. That one condition hid behind every earlier attempt. While a shrink is in progress, a negative distance is not the bottom.
+
+Smaller things found on the way: a `mask` over the fade renders the masked view into an offscreen layer, and an unfolded turn is a layer thousands of points tall, so the fade is an overlay in the bubble's colour. Fold state is row-local (writing it into the transcript's state re-evaluated every row per click) with `FoldStore` beside the transcript so a density change, which rebuilds every row, does not refold. A folded `Text` reports the width of the lines it shows, so a folding turn takes the full column in both states or it re-lays itself out at a new width on unfold. Handing the folded `Text` only a prefix of the string cut the layout cost and changed the geometry, which was worse. The click's feedback (a spinner in the button's place) is drawn one turn before the layout that makes the click slow, because that layout is the main thread. Guards: `ChatScrollTests`, `LongUserTurnTests`.
+
+## Audio clips rode the history as float32 (2026-09-14)
+The second half of #288: pictures had moved to `~/.mlx-serve/attachments/`, audio had not. `ChatAudio.pcm` was float32-LE 16 kHz mono, 64 kB per second, base64 in `chat-history.json` and re-written on every save; a minute of speech was 5 MB of a file that is loaded whole at launch. Fix: the same shape as `ChatImage`. `AudioClipFile` writes a canonical 16 kHz mono 16-bit WAV (half the bytes, playable by Finder) through the app's existing pure writer, and reads only that shape back; `ChatAudio` persists `id`, `name`, `path` and decodes `pcm` from the file, empty when the file is gone or the history predates the change, never a throw (one throw is `loadChatHistory`'s `?? []`, every conversation). The 16-bit round trip is taken once, on send, and the in-memory samples are re-read from the encoding, so the first turn and a regenerate after a relaunch hand the model the same bytes. A sample-less clip is filtered off the wire like a byte-less image, and its chip says the file is gone. Deletion reads `audio` beside `images` in the one sweep. Found on the way, not fixed here: the agent loop's `buildAgentHistory` builds multimodal content from images only and drops a user message whose text is empty, so an audio-only turn with tools on never reaches the model at all (the log shows no `Multimodal:` line and a history ending on the assistant's own reply). How to test it live, since the only audio model is Gemma 4 12B unified and its audio path is an embedder without an encoder: the model reads a clip as if it were typed text (it answers the recording's content, and asked "what is in the recording" it may insist it is text-only), and a clip under about two seconds is not recognised at all; four seconds of speech is. The server log's `Multimodal: ... N audio soft tokens` line is the proof the clip arrived. Guards: `AudioAttachmentTests`.
+## An interrupted turn had no footer, and the trash under a reply took one row of a dozen (2026-09-14)
+Stop a turn while the model thinks, or after a tool result, and the transcript ended on a bare thinking block or a tool card: no time, no Regenerate, no way to delete what was left. And the trash under a reply's footer removed that ONE message: under an agent turn of prose → six tool rounds → prose, it left the tool rounds and their hidden results standing on their own, which the model then read back as a call with no answer. The rule `app/CLAUDE.md` carried, "there is no turn in this app", was the cause: nothing could name the segment a reader means by "this reply".
+
+Fix: `ChatTurn`, one seam beside `ChatFork` and reading its boundary rule (`isBoundary`, moved out of the fork). A boundary is a message the model could be handed back: the reader's message, or a reply with prose and no tool calls, no error card, no summary. That narrows the fork's old rule in one place and the review bot caught it unstated: a thinking-only row (empty content, which history drops) is no longer a boundary, so a fork on it starts at the reply above instead of on a stranded thinking block; and the agent loop's generated-image row is ALSO empty content, so the first cut trimmed the picture and its whole round out of a fork made on it. A row carrying media is a boundary: the picture is that round's answer, delivered by a file. Both pinned in `ChatForkTests`. And a boundary without a footer is a trash you cannot see (mid-history the picture offered Delete Turn only from the context menu), so `hasOwnFooter` reads the same "said something" as the boundary rule and the picture gets time, Regenerate and the trash; Copy and Edit hide wherever `content` is empty, since they act on text. Known edge, left as is: the picture and the caption the model writes under it are two boundary rows, so the trash under the caption keeps the picture and the trash under the picture leaves the caption, which then has its own. The trash is drawn only on a footer where the transcript can be cut, a boundary or the last message (`footerDeletes`), and it removes everything back to the previous boundary, which stays (`deletionRange`); attachments the dropped messages owned go with them through the same `removablePaths` sweep `deleteMessage` uses. A thinking-only or tool-only row gets no trash and no Delete in its context menu, on purpose: cutting there would orphan its own card, and the nearest trash below takes it. When the transcript ends on the model's side without a footer of its own (`needsEndFooter`), the transcript draws `TurnEndFooter` under the last row: time, Regenerate (the existing `regenerateLastResponse`), trash. Never while the turn is in flight; its end moves. A row deleted above the reader is bracketed by `rowWillResize`/`rowDidResize`, like a fold, so the reader's place holds. Interrupted turns in the MIDDLE of a chat (followed by a later user message) still show no footer; same predicate at each boundary, owed. Guards: `ChatTurnTests`; `AttachmentStoreTests` now pins THREE removal sites.
+
+## The markdown a model writes, and the tint that ran to the margin (2026-09-15)
+Two things the transcript could not draw. An outline came out flat: `listItem(in:)` read the marker at the start of the LINE, so an indented item fell through to a paragraph, `---` between sections rendered as three hyphens, a checklist rendered as bullets followed by `[ ]`, and `~~struck~~` rendered as ordinary prose (Foundation parses it into an intent; nothing read the intent). Separately, an inline code span that wrapped tinted the whole first line out to the right margin.
+
+Fixes. Depth is a stack of indent stops (`ListDepth`), not a count of spaces: models write two or four for the same level, and both must read as one; any block that is not an item resets it. `---` is a one-cell `NSTextTable` with a top border, the same idiom as the quote bar. Task boxes are `□`/`☑` markers in `labelColor` (a box is the item's state, so it reads at the weight of the text, not of a bullet). Strikethrough maps the intent, beside the inline-code one.
+
+The two that cost the most were invisible in the attribute tree. An item's continuation line joined with `\n` still carried the item's paragraph style, so the test passed while the render was wrong: TextKit starts a new PARAGRAPH at every newline, and a paragraph takes `firstLineHeadIndent` (the margin) and a paragraph's air, while `headIndent` reaches only the lines that wrap. The join is U+2028, a break inside the paragraph. And the code ground came from `enumerateEnclosingRects`, which answers SELECTION geometry: a range continuing onto the next line takes its first fragment to the container's edge. `InlineCodeGround.rects` walks the line fragments instead and ends each rect at that line's last visible glyph, trailing space trimmed.
+
+Also found on the way: a headless layout test must hold the `NSTextStorage`. The storage owns the layout manager and the back reference is weak, so binding only the manager leaves `layoutManager.textStorage` nil and every geometry answer empty. Guards: `MarkdownListTests`, `MarkdownBlockStylingTests`, `InlineCodeGroundTests`.
+
+## Headless browser: outerWidth 0 (2026-09-15)
+
+The agent's `browse`/`webSearch` tools drive `BrowserManager.webView` with no Browser pane open, and pages read `window.outerWidth/outerHeight` as 0 — a headless-bot signal. First guess was the missing NSWindow: hosting the view in a hidden window (even ordered in, alpha 0) still read 0. Cause: WebKit's `UIDelegate::windowFrame` returns an empty rect unless the UI delegate implements the private `_webView:getWindowFrameWithCompletionHandler:`. Fix: `WindowFrameUIDelegate` answers with the host window's frame; the Browser pane re-parents the same view and hands it back via `returnToHost` on dismantle. Compiled out under `MAS_BUILD` (no private selector in the store binary), so that build keeps the old behaviour. `document.visibilityState` still reads `hidden` while the view is not on screen — a second signal, not addressed. Guard: `BrowserHostWindowTests` (JS-level, red without the delegate).
+
+Same round: the URL bar stopped following the page after the first tool navigation, because `navigate()` installed a fresh one-shot `WKNavigationDelegate` per call and overwrote the `BrowserView` coordinator's — link clicks, back/forward and SPA `pushState` then published nothing. One persistent delegate now lives on the manager and the bar's state is KVO on the webView (`url` fires for same-document navigations too). `navigate` also forced `https://` onto everything, so `localhost:3000` and `index.html` were unreachable; `resolveURL` decides per target and `browse{action:"show"}` opens the window for the user (confirm + title only, never the page text — the model asks for content when it wants it). Guard: `BrowserNavigationTests` (pushState case is the one that catches a delegate-only fix).

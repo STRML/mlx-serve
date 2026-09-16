@@ -1,16 +1,6 @@
 import Foundation
 
 /// The Model Browser's sidebar destinations.
-///
-/// These replace a single `Toggle("Downloaded")` push-button that used to swap
-/// the pane's entire data source in place — HuggingFace search results one
-/// moment, a filesystem listing the next — while sitting next to a "Downloads"
-/// column that meant HF pull count. Users read the button as a filter on the
-/// list in front of them, not as a mode switch, and the word appeared twice in
-/// one toolbar meaning two different things.
-///
-/// Naming rule: nothing here is called "Downloaded". `myModels` is what you
-/// have, `downloads` is what is transferring right now.
 enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
     /// Every curated Gemma 4 / Qwen 3.5-3.6 checkpoint, grouped by family and
     /// explained in plain English — the friendly front door for someone who
@@ -75,6 +65,18 @@ struct ModelBrowserBadgeCounts: Equatable {
     /// Media (image/audio/video/music) bundles fully on disk.
     let mediaReady: Int
 
+    /// The live counts, from the two objects that hold them. ONE place, because
+    /// the sidebar renders the badges and the panes render what they count — a
+    /// second copy of this arithmetic is how a badge starts disagreeing with the
+    /// list it sits next to.
+    static func live(localModelCount: Int,
+                     activeDownloadCount: Int,
+                     mediaReadyCount: Int) -> ModelBrowserBadgeCounts {
+        ModelBrowserBadgeCounts(myModels: localModelCount,
+                                activeDownloads: activeDownloadCount,
+                                mediaReady: mediaReadyCount)
+    }
+
     func badge(for section: ModelBrowserSection) -> String? {
         let n: Int
         switch section {
@@ -102,11 +104,6 @@ enum ModelRowAction: Equatable {
 
     /// Resolution order mirrors the original view's `if` ladder, so behaviour is
     /// unchanged apart from `.onDisk` rows staying visible in Discover.
-    ///
-    /// `.completed` maps to `.onDisk` even when `isReady` is false (a
-    /// half-written GGUF): the old code showed a trash can there too. The Use
-    /// button is gated separately on a resolvable local path, so a row that
-    /// isn't genuinely loadable simply doesn't offer it.
     static func resolve(
         isCompatible: Bool,
         isReady: Bool,
@@ -127,11 +124,6 @@ enum ModelRowAction: Equatable {
 }
 
 /// Feedback for the model the user picked with "Use".
-///
-/// Selecting a model is not the same as the server having loaded it: the pick
-/// triggers a hot-switch or a restart that takes seconds on a large checkpoint.
-/// Collapsing both into one "In use" label would claim the model is serving
-/// before it is, so the intermediate state gets its own rung.
 enum ModelUseState: Equatable {
     /// Not the selected model — offer the Use button.
     case idle
@@ -176,7 +168,14 @@ enum ModelUseState: Equatable {
 struct LocalModelGroup: Identifiable {
     let source: LocalModelSource
     let models: [LocalModel]
-    var id: String { source.rawValue }
+    /// Broken folders are grouped by their DEFECT, not by which tool's folder
+    /// they happen to sit in — they are not that tool's models, and padding a
+    /// tool's section with junk misreports what you have.
+    var isDefectGroup: Bool = false
+    var id: String { isDefectGroup ? "defect" : source.rawValue }
+    var title: String {
+        isDefectGroup ? ModelBrowserUse.defectGroupTitle : ModelBrowserUse.groupTitle(source)
+    }
 }
 
 /// Pure helpers for the "what do I already have, and can I load it?" side of
@@ -187,14 +186,25 @@ enum ModelBrowserUse {
     /// chat model. Drafters, encoders, and media checkpoints resolve to nil —
     /// they're real files worth listing and deleting, but "Use" would load a
     /// checkpoint that can't serve a completion.
-    ///
-    /// Paths are standardized before comparison: a repo dir resolved from
-    /// `DownloadManager` and one discovered by a filesystem scan can differ by a
-    /// trailing slash.
     static func pickableModel(atPath path: String?, in models: [LocalModel]) -> LocalModel? {
         guard let path, !path.isEmpty else { return nil }
         let wanted = normalize(path)
         return models.first { normalize($0.path) == wanted && $0.isChatPickable }
+    }
+
+    /// The media model at `path` and the pane it belongs to, if any.
+    ///
+    /// The sibling of `pickableModel` for the other half of the catalogue. Both
+    /// return nil for the other's kind, so a row asks both and gets at most one
+    /// answer — a media checkpoint is never chat-pickable and a chat model has
+    /// no modality. Every on-disk row can then offer a Use, instead of Discover
+    /// and the Media pane quietly ending at Delete the way My Models did (#228).
+    static func mediaModel(atPath path: String?, in models: [LocalModel]) -> (model: LocalModel, modality: MediaModality)? {
+        guard let path, !path.isEmpty else { return nil }
+        let wanted = normalize(path)
+        guard let m = models.first(where: { normalize($0.path) == wanted }),
+              let modality = MediaModality(modelType: m.modelType) else { return nil }
+        return (m, modality)
     }
 
     private static func normalize(_ path: String) -> String {
@@ -207,13 +217,19 @@ enum ModelBrowserUse {
     /// sections (`StatusMenuView`), which is the point — the old "Downloaded"
     /// tab filtered to `.mlxServe` only and so never matched what you could
     /// actually select.
-    static let sourceOrder: [LocalModelSource] = [.mlxServe, .lmStudio, .huggingFace, .custom]
+    static let sourceOrder: [LocalModelSource] = [.mlxServe, .lmStudio, .huggingFace, .mtplx, .osaurus, .custom]
+
+    /// Heading for the broken-folder group. Names the two things it holds —
+    /// folders that cannot load, and downloads that never finished.
+    static let defectGroupTitle = "Incomplete & Orphaned"
 
     static func groupTitle(_ source: LocalModelSource) -> String {
         switch source {
         case .mlxServe:    return "Downloaded by MLX Core"
-        case .lmStudio:    return "Other Discovered Models"
+        case .lmStudio:    return "LM Studio Models"
         case .huggingFace: return "Hugging Face Cache"
+        case .mtplx:       return LocalModelSource.mtplx.sectionTitle
+        case .osaurus:     return LocalModelSource.osaurus.sectionTitle
         case .custom:      return "Custom Folder"
         }
     }
@@ -226,9 +242,16 @@ enum ModelBrowserUse {
             ? models
             : models.filter { $0.name.localizedCaseInsensitiveContains(needle) }
 
-        return sourceOrder.compactMap { source in
-            let bucket = matching.filter { $0.source == source }
+        var out = sourceOrder.compactMap { source -> LocalModelGroup? in
+            let bucket = matching.filter { $0.source == source && $0.defect == nil }
             return bucket.isEmpty ? nil : LocalModelGroup(source: source, models: bucket)
         }
+        // Last: these are not what you came to pick, but they ARE the reason a
+        // folder you do not recognise is sitting in your library.
+        let broken = matching.filter { $0.defect != nil }
+        if let first = broken.first {
+            out.append(LocalModelGroup(source: first.source, models: broken, isDefectGroup: true))
+        }
+        return out
     }
 }

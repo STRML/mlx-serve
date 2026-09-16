@@ -1,5 +1,5 @@
 #!/bin/bash
-# /v1/embeddings end-to-end test (encoder-only BERT models).
+# /v1/embeddings end-to-end test (encoder-only BERT models; check 4c: a decoder-arch embedder).
 #
 # Embeddings are served by a batched GPU forward: every request's inputs are
 # tokenized up front, padded per EMBED_MAX_BATCH chunk, and run through ONE
@@ -14,13 +14,16 @@
 #      (>= 0.999), distinct texts stay distinct, order preserved
 #   3. a batch larger than EMBED_MAX_BATCH (80 inputs) round-trips intact
 #   4. generation endpoints reject encoder-only models with a 400
+#   4c. a decoder-arch embedder (Qwen3-Embedding) matches singles across
+#      sub-batches and survives them (skipped when the model is missing)
 #   5. hot-load: a chat-model server embeds via "model": "<encoder-id>"
 #      (skipped when the chat model is missing)
 #
 # Requires:
 #   - A built mlx-serve binary (zig build -Doptimize=ReleaseFast)
 #   - EMBED_TEST_MODEL or ~/.mlx-serve/models/mlx-community/bge-small-en-v1.5-8bit
-#   - (check 5 only) CHAT_TEST_MODEL or ~/.mlx-serve/models/Qwen3-0.6B-nvfp4
+#   - (check 4c only) QWEN3_EMBED_TEST_MODEL or ~/.mlx-serve/models/mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ
+#   - (check 5 only) CHAT_TEST_MODEL or ~/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4
 #
 # Usage: ./tests/test_embeddings.sh [port]
 
@@ -34,7 +37,7 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 EMBED_MODEL="${EMBED_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/bge-small-en-v1.5-8bit}"
-CHAT_MODEL="${CHAT_TEST_MODEL:-$HOME/.mlx-serve/models/Qwen3-0.6B-nvfp4}"
+CHAT_MODEL="${CHAT_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4}"
 if [ ! -d "$EMBED_MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_embeddings: encoder model not found at $EMBED_MODEL"
     exit 0
@@ -193,7 +196,114 @@ GEN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 30 "$BASE/v1/chat/completio
 check "chat completion on encoder-only model returns 400" \
     "$([ "$GEN_CODE" = "400" ] && echo 1 || echo 0)" "got HTTP $GEN_CODE"
 
+# --- 4b. pooling signal + embedding input ceiling (issues #116/#117) ---
+# bge-small is a CLS-pooling BERT (its card sets pooling_mode_cls_token); the
+# mlx-community conversion ships no pooling metadata, so the known-family name
+# fallback must engage — the boot log is the observable.
+if [ "$(basename "$EMBED_MODEL")" = "bge-small-en-v1.5-8bit" ]; then
+    check "CLS pooling inferred from checkpoint name at load (issue #116)" \
+        "$(grep -q 'pooling inferred from checkpoint name: cls' /tmp/test_embeddings_server.log && echo 1 || echo 0)"
+fi
+
+# Ready model surfaces the effective embedding input ceiling (issue #117):
+# with no --embedding-max-length flag, auto = the model's declared window.
+META_LIMIT=$(curl -s -m 30 "$BASE/v1/models" | python3 -c "
+import json, sys
+for m in json.load(sys.stdin)['data']:
+    meta = m.get('meta') or {}
+    if m.get('state') == 'ready' and meta.get('embedding_max_length') is not None:
+        print(meta['embedding_max_length']); break
+")
+check "ready encoder advertises meta.embedding_max_length (auto = model window)" \
+    "$([ -n "$META_LIMIT" ] && [ "$META_LIMIT" -gt 0 ] && echo 1 || echo 0)" "got '$META_LIMIT'"
+
+# Over-window input: an explicit structured 400 naming the input index and
+# both counts — never a silent truncation (issue #117). 600 words > any
+# BERT-class 512 window; the index must identify the SECOND input.
+LONG_INPUT=$(python3 -c "print(' '.join(['tokenized']*600))")
+OVER_RESP=$(embed "[\"short one\", \"$LONG_INPUT\"]")
+check "over-limit input earns a 400 naming index + counts (issue #117)" \
+    "$(echo "$OVER_RESP" | grep -q 'Input at index 1 exceeds the maximum embedding input length' && echo 1 || echo 0)" \
+    "$(echo "$OVER_RESP" | head -c 200)"
+
 stop_server
+
+# --- 4c. decoder-arch embedder across sub-batches ---
+# Qwen3-Embedding forwards through the KV cache, and a request past EMBED_TOKEN_BUDGET
+# (64 x 512 padded tokens) splits into sub-batches that must each start from an empty one.
+QWEN3_EMBED_MODEL="${QWEN3_EMBED_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ}"
+echo "=== /v1/embeddings: decoder-arch embedder across sub-batches ==="
+if [ ! -d "$QWEN3_EMBED_MODEL" ]; then
+    echo -e "  ${YELLOW}SKIP${NC} Qwen3-Embedding model not found at $QWEN3_EMBED_MODEL"
+else
+    start_server /tmp/test_embeddings_qwen3.log --model "$QWEN3_EMBED_MODEL" --log-level info
+    python3 - "$BASE" > /tmp/test_embeddings_qwen3.out <<'EOF'
+import json, math, random, sys, urllib.request
+
+base = sys.argv[1]
+rng = random.Random(7)
+syl = ["ka", "lo", "mi", "ren", "tu", "vas", "po", "shi", "den", "gal", "or", "fe"]
+def post(path, body):
+    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=300))
+def embed(inputs):
+    rows = sorted(post("/v1/embeddings", {"model": "mlx-serve", "input": inputs})["data"],
+                  key=lambda d: d["index"])
+    return [d["embedding"] for d in rows]
+def cos(a, b):
+    return sum(x*y for x, y in zip(a, b)) / math.sqrt(sum(x*x for x in a) * sum(y*y for y in b))
+# The embed path appends one token (EOS) to what /tokenize reports.
+ntok = lambda t: len(post("/tokenize", {"content": t})["tokens"]) + 1
+word = lambda: "".join(rng.choice(syl) for _ in range(rng.randint(1, 3)))
+def text(lo, hi):  # distinct pseudo-words until the token count lands in [lo, hi]
+    ws = [word()]
+    for _ in range(500):
+        n = ntok(" ".join(ws))
+        if lo <= n <= hi: return " ".join(ws)
+        if n < lo: ws += [word() for _ in range(max(1, (lo - n) // 4))]
+        else: ws.pop()
+    raise RuntimeError(f"no text of {lo}-{hi} tokens")
+
+# Sizes straddle EMBED_TOKEN_BUDGET: rows x padded length decides where a request splits.
+BUDGET = 64 * 512
+short = [text(8, 12) for _ in range(35)]
+
+# Equal sub-batches: 32 short, then 32 long that fit only 32 to a sub-batch. The later
+# sub-batch must match the same 32 inputs sent as their own request.
+try:
+    long_ = [text(BUDGET // 33 + 1, BUDGET // 32) for _ in range(32)]
+    scores = [cos(a, b) for a, b in zip(embed(short[:32] + long_)[32:], embed(long_))]
+    worst = min(scores) if all(map(math.isfinite, scores)) else float("nan")
+    print(f"equal {1 if worst >= 0.999 else 0} worst-cosine={worst:.5f}")
+except Exception as e:
+    print(f"equal 0 {e}")
+
+# A second sub-batch with more rows, on the Ollama route: 29 long that fit only 29, then 35 short.
+try:
+    inputs = [text(BUDGET // 30 + 1, BUDGET // 29) for _ in range(29)] + short
+    rows = post("/api/embed", {"model": "mlx-serve", "input": inputs})["embeddings"]
+    ok = len(rows) == 64 and all(cos(rows[i], embed([inputs[i]])[0]) >= 0.995 for i in (0, 28, 29, 63))
+    print(f"larger {1 if ok else 0} rows={len(rows)}")
+except Exception as e:
+    print(f"larger 0 {e}")
+try:
+    alive = len(embed(["still serving"])) == 1
+except Exception as e:
+    alive = False
+print(f"alive {1 if alive else 0}")
+EOF
+    check "equal sub-batches: the later one matches the same inputs sent alone (cosine >= 0.999)" \
+        "$(awk '/^equal/{print $2}' /tmp/test_embeddings_qwen3.out)" \
+        "$(grep '^equal' /tmp/test_embeddings_qwen3.out)"
+    check "second sub-batch with more rows (/api/embed) answers 200, sampled rows match singles" \
+        "$(awk '/^larger/{print $2}' /tmp/test_embeddings_qwen3.out)" \
+        "$(grep '^larger' /tmp/test_embeddings_qwen3.out)"
+    check "server still answers after the multi-sub-batch requests" \
+        "$(awk '/^alive/{print $2}' /tmp/test_embeddings_qwen3.out)" \
+        "$(tail -3 /tmp/test_embeddings_qwen3.log)"
+    stop_server
+fi
 
 # --- 5. hot-load encoder alongside a chat default ---
 echo "=== /v1/embeddings: hot-load alongside chat model ==="

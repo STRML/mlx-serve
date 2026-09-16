@@ -44,7 +44,7 @@ set -u
 
 PORT=${1:-8080}
 BASE="http://127.0.0.1:$PORT"
-MODEL="${LONG_AGENT_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}"
+MODEL="${LONG_AGENT_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
 DRAFTER="${LONG_AGENT_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
 
 RED='\033[0;31m'
@@ -73,7 +73,7 @@ if ! curl -sf "$BASE/health" > /dev/null 2>&1; then
     fi
     echo "Starting mlx-serve on port $PORT (log: $LOG)..."
     ./zig-out/bin/mlx-serve --model "$MODEL" --serve --port "$PORT" --log-level info \
-        "${DRAFTER_ARGS[@]}" ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$LOG" 2>&1 &
+        ${DRAFTER_ARGS[@]+"${DRAFTER_ARGS[@]}"} ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$LOG" 2>&1 &
     SERVER_PID=$!
     OWN_SERVER=1
     trap 'if [ "$OWN_SERVER" = "1" ]; then kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; fi' EXIT

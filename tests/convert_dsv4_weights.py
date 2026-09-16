@@ -45,6 +45,9 @@ def mx():
         import mlx.core
 
         _mx = mlx.core
+        # The converter runs beside the live server: every residual mx call
+        # (spine 8-bit requant, verification dequants) stays off the GPU.
+        _mx.set_default_device(_mx.cpu)
     return _mx
 
 
@@ -266,11 +269,45 @@ tags:
 pipeline_tag: text-generation
 ---
 
-# DeepSeek-V4-Flash-0731 — mixed 2/3/8-bit for mlx-serve
+# DeepSeek-V4-Flash-0731 — iQ-MLX {bpw} bpw
 
-A {gb} GB mixed-precision MLX conversion of
-[{base}](https://huggingface.co/{base}), built to run the full 284B-A13B model
-on a single Apple Silicon Mac with **128 GB or more** of unified memory.
+An **iQ-MLX** conversion of [{base}](https://huggingface.co/{base}) at
+**{bpw} bits per weight** ({gb} GB), built to run the full 284B-A13B model on
+a single Apple Silicon Mac with **128 GB or more** of unified memory.
+
+## What is iQ-MLX
+
+iQ-MLX brings llama.cpp's imatrix school of quantization to native MLX affine
+layouts: per-input-channel importance is measured on real calibration traffic
+(mean-squared activation over millions of tokens, per expert), every
+quantization group's scale/bias is chosen by an importance-weighted
+least-squares search instead of min/max, and the per-layer/per-projection bit
+widths themselves are allocated by a greedy error-per-byte knapsack over the
+measured error surface — the byte budget goes exactly where the calibration
+says it buys the most quality. The packs stay byte-compatible with stock MLX
+affine, so the result loads like any MLX model: no custom codec, no
+dequantize-on-load, no runtime cost.
+
+How it differs from what you may know:
+
+- **vs plain MLX 4bit / mixed_2_6**: those are uncalibrated min/max with
+  static recipes; iQ-MLX measures which channels and layers matter and fits
+  scales to that.
+- **vs DWQ**: DWQ distills against the fp teacher on a GPU (hours of training);
+  iQ-MLX is a CPU-only search you can run on the same box that serves the
+  model, at comparable calibration quality for MoE experts.
+- **vs AWQ**: activation-aware scale folding is a min/max compensation. We
+  measured it against the weighted search on this model: redundant on gate/up
+  (under 1 percent) and harmful on down projections — so iQ-MLX deliberately
+  does not fold.
+- **vs GGUF IQ/UD**: same philosophy (imatrix calibration, dynamic per-layer
+  bits), but emitting native MLX affine tensors instead of GGUF — no llama.cpp
+  in the serving path.
+
+The bpw figure in the name is the honest size metric: stored bits (weights +
+scales + biases) divided by parameters, comparable across iQ-MLX builds and
+against GGUF tiers (IQ2_XXS is 2.06, Q4_K_M is about 4.8). Higher bpw = less
+quantized.
 
 Runs on [**mlx-serve**](https://github.com/ddalcu/mlx-serve) — a native Zig
 inference server for MLX models on Apple Silicon, with no Python in the serving
@@ -294,20 +331,40 @@ than one global bit width:
 
 | Tensors | Precision |
 |---|---|
-| Routed expert gate/up (`w1`/`w3`) | affine **2-bit**, group size 64 |
-| Routed expert down (`w2`) | affine **3-bit**, group size 64 |
+| Routed expert gate/up (`w1`/`w3`), early layers | affine **2-bit**, group size 128, **imatrix-calibrated** |
+| Routed expert gate/up (`w1`/`w3`), layers 7-8 and 16-38 | affine **3-bit**, group size 128, **imatrix-calibrated** |
+| Routed expert down (`w2`) | affine **3-bit**, group size 128, **imatrix-calibrated** |
+| Routed experts, tail layers 39-42 (all projections) | affine **4-bit**, group size 64, **imatrix-calibrated** |
 | Attention, shared experts, indexer, `main_proj` | affine **8-bit**, group size 64 |
 | Embedding + LM head | affine **8-bit**, group size 64 |
 | DSpark draft stages (`mtp.*`) — experts | affine **4-bit**, group size 64 |
 | Compressor `wkv`/`wgate`, indexer `weights_proj`, router `gate.weight` | bf16 |
 | Norms, hyper-connection params, `ape`, attention sinks, router bias, hash table | verbatim |
 
-Two choices worth explaining. The down-projection keeps **3-bit** while gate/up
-drop to 2-bit: it is the most quantization-sensitive of the three, and decode on
-this model is latency-bound rather than bandwidth-bound, so shrinking it further
-buys disk rather than speed. The DSpark draft stages keep **4-bit** even though
-the trunk goes lower: they are a rounding error on disk, and a draft the trunk
-rejects costs a full verify forward, so their quality multiplies throughput.
+The layer/projection split is not hand-picked: the whole error surface (every
+layer x projection at every candidate width, sampled per expert against the
+imatrix objective) was measured, and the byte budget allocated greedily by
+error reduction per byte. The data put nearly all of it into gate/up on the
+later two thirds of the stack — consistent with what agent-level testing
+showed about late layers and decision quality. The 4-bit tail (layers 39-42)
+is kept from the previous build: it is what eliminated turn-level agent
+repetition loops in A/B testing.
+
+The routed experts — 277B of the 284B — are quantized with the iQ-MLX
+activation-calibrated search rather than plain min/max: per-input-channel
+importance comes from an importance matrix collected over **2.9M tokens** of
+chat-formatted traffic through the 0731 weights themselves (per-expert channel
+granularity), and each quantization group's scale/bias pair is chosen by a
+weighted multi-start search with alternating least-squares refinement (the
+llama.cpp `make_qkx2_quants` pattern). Channels that actually fire reconstruct
+better; at 2-3 bits this is worth more than finer group granularity, which is
+why the experts use group size 128 and spend the saved bytes on extra bits
+where the error surface says they matter.
+
+One more choice worth explaining: the DSpark draft stages keep **4-bit**,
+uncalibrated (the imatrix does not cover them). They are a rounding error on
+disk, and a draft the trunk rejects costs a full verify forward, so their
+quality multiplies throughput.
 
 The compressor path is fp32-sensitive by design and the router is read raw, so
 neither is quantized. Lookup tables (embeddings, the token→expert hash, DSpark's
@@ -315,8 +372,9 @@ Markov table) are never packed — they are gathered, not multiplied.
 
 Conversion is exact where it can be: the source's fp8 (e4m3 + e8m0 block scales)
 and fp4 (e2m1 + e8m0 group scales) formats all fit losslessly in bf16, so the
-weights are decoded exactly and re-packed with MLX's own affine quantizer. The
-mirror is engine-native — no dequantize-on-load step at runtime.
+weights are decoded exactly before requantization. The calibrated expert packs
+are byte-compatible with MLX's affine layout, so the mirror is engine-native —
+no dequantize-on-load step at runtime.
 
 ## What is included
 
@@ -327,17 +385,27 @@ drop-thinking, and all three reasoning-effort levels. `generation_config.json`
 carries the reference's own default sampling (temperature 0.6), not the wild
 1.0/1.0 signature the source ships.
 
-DSpark speculative-decoding weights (3 draft stages) are included and converted;
-mlx-serve does not drive them yet.
+DSpark speculative-decoding weights (3 draft stages) are included and
+converted; mlx-serve drives them with `--dspark` (block-parallel speculative
+decode, greedy and sampled).
 
 ## Requirements
 
-- Apple Silicon Mac, **128 GB+** unified memory (~110 GB resident)
+- Apple Silicon Mac, **128 GB+** unified memory (~118 GB resident; raise the
+  GPU limit with `sudo sysctl iogpu.wired_limit_mb=124000`). On 128 GB
+  machines mlx-serve auto-disables DSpark when the stages don't fit and
+  serves serial — `--dspark` engages on larger machines (192 GB+).
 - macOS 26.2 or newer
 - [mlx-serve](https://github.com/ddalcu/mlx-serve)
 
-Built with `tests/convert_dsv4_weights.py` from the mlx-serve repo.
+Built with `tests/convert_dsv4_weights.py` from the mlx-serve repo (the
+iQ-MLX pipeline: imatrix parser, weighted affine search, and the greedy
+bit-allocation sweep).
 """
+
+# The release's own headline parameter count (284B-A13B), EXCLUDING the DSpark
+# draft stages — the bpw denominator must match what the trunk bytes cover.
+N_PARAMS_MAIN = 284_000_000_000
 
 EXPERT_BITS = {"w1": 2, "w2": 3, "w3": 2}
 # DSpark draft stages (`mtp.*`) carry their own expert banks and are TINY next
@@ -346,12 +414,75 @@ EXPERT_BITS = {"w1": 2, "w2": 3, "w3": 2}
 # verify forward. So they get uniform 4-bit rather than the trunk's 2/3-bit
 # mix — ~1.5 GB more on disk to protect the acceptance rate.
 MTP_EXPERT_BITS = {"w1": 4, "w2": 4, "w3": 4}
-GROUP_SIZE = 64
+# Spine/embed/head and the DSpark draft stages keep gs 64 (the draft shard
+# must stay byte-identical across imatrix rebuilds). Trunk routed experts
+# moved to gs 128 in the imatrix round: at 2-3 bits, bit width beats group
+# granularity on this model's own weight distributions (3b/g128 = 0.193
+# rel-err at 3.25 bpw vs 2b/g32 = 0.364 at 3.00), so g64's extra scales were
+# ~8 GiB spent on the weaker lever.
+SPINE_GROUP = 64
+EXPERT_GROUP = 128
+
+
+# Per-layer (bits, gs) override for TRUNK routed experts, set from
+# --expert-override "A-B=BITS:GS". Draft stages (mtp.*) never consult it —
+# their shard must stay byte-identical across rebuilds.
+EXPERT_OVERRIDES = {}
+
+
+def parse_expert_override(spec):
+    """"37-42=4:64" (layer-wide) | "5=w2@4:128" (one projection) ->
+    {layer: {proj_or_'*': (bits, gs)}}. Comma-joined parts MERGE, so a mixed
+    plan ("0=w1@3:128,0=w2@4:128,39-42=4:64") lands per layer per projection."""
+    out = {}
+    for part in spec.split(","):
+        rng_s, _, bg = part.partition("=")
+        proj = "*"
+        if "@" in bg:
+            proj, _, bg = bg.partition("@")
+            assert proj in ("w1", "w2", "w3"), f"bad projection {proj!r} in {part!r}"
+        bits_s, _, gs_s = bg.partition(":")
+        lo, _, hi = rng_s.partition("-")
+        for li in range(int(lo), int(hi or lo) + 1):
+            out.setdefault(li, {})[proj] = (int(bits_s), int(gs_s))
+    return out
+
+
+def set_expert_overrides(ov):
+    """Accepts the parsed per-projection form; bare (bits, gs) values are
+    normalized to layer-wide entries for older call sites."""
+    global EXPERT_OVERRIDES
+    EXPERT_OVERRIDES = {li: (v if isinstance(v, dict) else {"*": tuple(v)})
+                        for li, v in ov.items()}
+
+
+def _trunk_override(pfx, proj):
+    if pfx.startswith("mtp."):
+        return None
+    m = re.match(r"^layers\.(\d+)\.", pfx)
+    if not m:
+        return None
+    ov = EXPERT_OVERRIDES.get(int(m.group(1)))
+    if ov is None:
+        return None
+    return ov.get(proj, ov.get("*"))
 
 
 def expert_bits(pfx, proj):
     """Expert bit width by MODULE: draft stages are not the trunk."""
+    ov = _trunk_override(pfx, proj)
+    if ov is not None:
+        return ov[0]
     return (MTP_EXPERT_BITS if pfx.startswith("mtp.") else EXPERT_BITS)[proj]
+
+
+def expert_group(pfx, proj):
+    """Expert group size by MODULE and projection: draft stages keep the
+    spine's gs 64; a per-projection override carries its own gs."""
+    ov = _trunk_override(pfx, proj)
+    if ov is not None:
+        return ov[1]
+    return SPINE_GROUP if pfx.startswith("mtp.") else EXPERT_GROUP
 
 
 def classify(name):
@@ -425,13 +556,14 @@ def dry_run_size(src):
                 continue
             out_d, in_d = shape[0], shape[1] * 2  # packed fp4
             bits = expert_bits(cls[1], cls[3])
-            n = out_d * (in_d * bits // 8 + in_d // GROUP_SIZE * 4)
-            key = f"expert.{cls[3]}({bits}b)"
+            gs = expert_group(cls[1], cls[3])
+            n = out_d * (in_d * bits // 8 + in_d // gs * 4)
+            key = f"expert.{cls[3]}({bits}b/g{gs})"
         else:
             if name.endswith(".scale"):
                 continue
             out_d, in_d = shape
-            n = out_d * (in_d + in_d // GROUP_SIZE * 4)
+            n = out_d * (in_d + in_d // SPINE_GROUP * 4)
             key = "8bit"
         total += n
         by_class[key] = by_class.get(key, 0) + n
@@ -449,7 +581,19 @@ def convert_tensor(name, arr, dt, out_tensors, verify_stats=None):
     raise AssertionError(f"convert_tensor called on {name} without pairing")
 
 
-def convert(src, out, only_groups=None, verify=False):
+def _trunk_expert_task(args):
+    """Worker: read one trunk expert's fp4 pair, dequant, weighted-quantize.
+    Pure numpy (never imports mlx), so a process pool is safe beside the live
+    server. Opens its own ShardReader — no shared fds."""
+    src, w_shard, s_shard, w_name, s_name, bits, gs, cw = args
+    w_i8, _ = ShardReader(os.path.join(src, w_shard)).read(w_name)
+    s_u8, _ = ShardReader(os.path.join(src, s_shard)).read(s_name)
+    f32 = dequant_fp4(w_i8, s_u8)
+    import dsv4_imatrix as imx
+    return imx.weighted_affine_quant(f32, bits, gs, cw)
+
+
+def convert(src, out, only_groups=None, verify=False, imatrix=None, imatrix_name=None):
     os.makedirs(out, exist_ok=True)
     wm = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
     cfg = json.load(open(os.path.join(src, "config.json")))
@@ -471,9 +615,12 @@ def convert(src, out, only_groups=None, verify=False):
     manifest_path = os.path.join(out, ".convert-manifest.json")
     manifest = json.load(open(manifest_path)) if os.path.exists(manifest_path) else {}
 
-    quant_cfg = {"group_size": GROUP_SIZE, "bits": 8, "mode": "affine"}
+    import dsv4_imatrix as imx
+    quant_cfg = {"group_size": SPINE_GROUP, "bits": 8, "mode": "affine"}
     index_map = {}
     total_size = 0
+    pool = None
+    workers = int(os.environ.get("MLX_SERVE_CONVERT_WORKERS", "6"))
 
     for gi, gname in enumerate(order):
         shard_file = f"model-{gname.replace('.', '-')}.safetensors"
@@ -497,22 +644,51 @@ def convert(src, out, only_groups=None, verify=False):
         # and only a per-stage tensor count showed the missing banks.
         n_exp = cfg["n_routed_experts"]
         for pfx in sorted({EXPERT_RE.match(n).group("pfx") for n in expert_members}):
+            is_trunk = not pfx.startswith("mtp.")
+            layer = int(re.match(r"^layers\.(\d+)\.", pfx).group(1)) if is_trunk else None
             for proj in ("w1", "w2", "w3"):
                     bits = expert_bits(pfx, proj)
+                    gs = expert_group(pfx, proj)
                     wq_l, sc_l, bi_l = [], [], []
-                    for eid in range(n_exp):
-                        w_i8, _ = read(f"{pfx}.experts.{eid}.{proj}.weight")
-                        s_u8, _ = read(f"{pfx}.experts.{eid}.{proj}.scale")
-                        f32 = dequant_fp4(w_i8, s_u8)
-                        (wq, sc, bi) = mlx_affine_quant(f32, bits, GROUP_SIZE)
-                        wq_l.append(wq); sc_l.append(sc); bi_l.append(bi)
-                        del f32, w_i8, s_u8
+                    if is_trunk:
+                        # Weighted (imatrix-calibrated) path; uniform weights
+                        # when no imatrix is in play. A provided imatrix with
+                        # a missing trunk entry is a HARD error inside
+                        # expert_channel_weights — never a silent minmax.
+                        w0 = f"{pfx}.experts.0.{proj}.weight"
+                        meta0 = ShardReader(os.path.join(src, wm[w0])).header[w0]
+                        in_dim = meta0["shape"][1] * 2  # packed fp4
+                        tasks = []
+                        for eid in range(n_exp):
+                            wn = f"{pfx}.experts.{eid}.{proj}.weight"
+                            sn = f"{pfx}.experts.{eid}.{proj}.scale"
+                            cw = (imx.expert_channel_weights(imatrix, layer, proj, eid, in_dim, n_exp)
+                                  if imatrix is not None
+                                  else np.ones(in_dim, dtype=np.float32))
+                            tasks.append((src, wm[wn], wm[sn], wn, sn, bits, gs, cw))
+                        if workers > 1 and n_exp >= 32:
+                            if pool is None:
+                                from concurrent.futures import ProcessPoolExecutor
+                                pool = ProcessPoolExecutor(max_workers=workers)
+                            results = pool.map(_trunk_expert_task, tasks)
+                        else:
+                            results = map(_trunk_expert_task, tasks)
+                        for wq, sc, bi in results:
+                            wq_l.append(wq); sc_l.append(sc); bi_l.append(bi)
+                    else:
+                        for eid in range(n_exp):
+                            w_i8, _ = read(f"{pfx}.experts.{eid}.{proj}.weight")
+                            s_u8, _ = read(f"{pfx}.experts.{eid}.{proj}.scale")
+                            f32 = dequant_fp4(w_i8, s_u8)
+                            (wq, sc, bi) = mlx_affine_quant(f32, bits, gs)
+                            wq_l.append(wq); sc_l.append(sc); bi_l.append(bi)
+                            del f32, w_i8, s_u8
                     for kind, parts in (("weight", wq_l), ("scales", sc_l), ("biases", bi_l)):
                         dtype = parts[0][0]
                         shape = [n_exp] + list(parts[0][1])
                         raw = b"".join(p[2] for p in parts)
                         out_tensors[f"{pfx}.experts.{proj}.{kind}"] = (dtype, shape, raw)
-                    quant_cfg[f"{pfx}.experts.{proj}"] = {"group_size": GROUP_SIZE, "bits": bits, "mode": "affine"}
+                    quant_cfg[f"{pfx}.experts.{proj}"] = {"group_size": gs, "bits": bits, "mode": "affine"}
                     del wq_l, sc_l, bi_l
                     gc.collect()
 
@@ -535,16 +711,16 @@ def convert(src, out, only_groups=None, verify=False):
             else:  # bf16_8
                 assert dt == "BF16", f"{name}: {dt}"
                 f32 = bf16_to_f32(arr)
-            wq, sc, bi = mlx_affine_quant(f32, 8, GROUP_SIZE)
+            wq, sc, bi = mlx_affine_quant(f32, 8, SPINE_GROUP)
             out_tensors[base + ".weight"] = wq
             out_tensors[base + ".scales"] = sc
             out_tensors[base + ".biases"] = bi
-            quant_cfg[base] = {"group_size": GROUP_SIZE, "bits": 8, "mode": "affine"}
+            quant_cfg[base] = {"group_size": SPINE_GROUP, "bits": 8, "mode": "affine"}
             if verify:
                 back = mlx_affine_dequant_f32(
                     np.frombuffer(wq[2], dtype=np.uint32).reshape(wq[1]),
                     np.frombuffer(sc[2], dtype=np.uint16).reshape(sc[1]),
-                    np.frombuffer(bi[2], dtype=np.uint16).reshape(bi[1]), 8, GROUP_SIZE)
+                    np.frombuffer(bi[2], dtype=np.uint16).reshape(bi[1]), 8, SPINE_GROUP)
                 cos = float((f32 * back).sum() / (np.linalg.norm(f32) * np.linalg.norm(back) + 1e-30))
                 assert cos > 0.999, f"{name}: 8-bit requant cosine {cos}"
             del f32, arr
@@ -565,6 +741,9 @@ def convert(src, out, only_groups=None, verify=False):
         except AttributeError:
             pass
 
+    if pool is not None:
+        pool.shutdown()
+
     if only_groups is None:
         # index + config + tokenizer files
         with open(os.path.join(out, "model.safetensors.index.json"), "w") as f:
@@ -573,7 +752,7 @@ def convert(src, out, only_groups=None, verify=False):
         # per-run accumulator misses groups converted by earlier --groups
         # invocations (they skip via manifest and never re-classify).
         stacked_re = re.compile(r"\.experts\.(w[123])\.weight$")
-        quant_cfg = {"group_size": GROUP_SIZE, "bits": 8, "mode": "affine"}
+        quant_cfg = {"group_size": SPINE_GROUP, "bits": 8, "mode": "affine"}
         for tn in index_map:
             if tn.endswith(".weight") and tn[:-7] + ".scales" in index_map:
                 m = stacked_re.search(tn)
@@ -581,13 +760,17 @@ def convert(src, out, only_groups=None, verify=False):
                 # what picks the draft-stage widths — the engine dequants from
                 # this dict, so a trunk-vs-draft mixup here is silent garbage.
                 bits = expert_bits(tn, m.group(1)) if m else 8
-                quant_cfg[tn[:-7]] = {"group_size": GROUP_SIZE, "bits": bits, "mode": "affine"}
+                gs = expert_group(tn, m.group(1)) if m else SPINE_GROUP
+                quant_cfg[tn[:-7]] = {"group_size": gs, "bits": bits, "mode": "affine"}
         out_cfg = dict(cfg)
         out_cfg.pop("quantization_config", None)  # fp8 source config must not leak
         out_cfg["quantization"] = quant_cfg
         out_cfg["mlx_serve_converter"] = {
             "source": "deepseek-ai/DeepSeek-V4-Flash",
-            "mix": "experts w1/w3 2-bit gs64, w2 3-bit gs64; spine/embed/head 8-bit gs64; compressor/router bf16",
+            "method": "iQ-MLX (imatrix-weighted affine search + greedy per-layer bit allocation)",
+            "mix": "experts base w1/w3 2-bit + w2 3-bit gs128, per-layer plan in `quantization`; "
+                   "spine/embed/head 8-bit gs64; DSpark stages 4-bit gs64; compressor/router bf16",
+            "calibration": imatrix_name if imatrix is not None else "uniform (no imatrix)",
         }
         with open(os.path.join(out, "config.json"), "w") as f:
             json.dump(out_cfg, f, indent=2)
@@ -613,9 +796,16 @@ def convert(src, out, only_groups=None, verify=False):
                "do_sample": True, "temperature": 0.6, "top_p": 1.0}
         with open(os.path.join(out, "generation_config.json"), "w") as f:
             json.dump(gen, f, indent=2)
+        # bpw headline: trunk bits over trunk params — the DSpark stages are
+        # extra parameters on top of the 284B main model, so both sides of the
+        # division exclude them. Computed from actual emitted bytes so the
+        # card can never drift from the files.
+        mtp_bytes = manifest.get("mtp", {}).get("size", 0)
+        bpw = (total_size - mtp_bytes) * 8 / N_PARAMS_MAIN
         with open(os.path.join(out, "README.md"), "w") as f:
-            f.write(README.format(base=SOURCE_REPO, gb=f"{total_size/1e9:.1f}"))
-        print(f"DONE: {total_size/1e9:.1f} GB -> {out}")
+            f.write(README.format(base=SOURCE_REPO, gb=f"{total_size/1e9:.1f}",
+                                  bpw=f"{bpw:.2f}"))
+        print(f"DONE: {total_size/1e9:.1f} GB ({bpw:.2f} bpw) -> {out}")
 
 
 # ============================================================
@@ -706,7 +896,7 @@ def self_test():
     # end-to-end mini conversion with a fabricated 1-layer checkpoint
     with tempfile.TemporaryDirectory() as td:
         src = os.path.join(td, "src"); os.makedirs(src)
-        n_exp, d_in, d_moe = 4, 128, 64
+        n_exp, d_in, d_moe = 4, 256, 128
         rng = np.random.default_rng(3)
         tensors = {}
         # experts fp4: random codes, scale 1.0. TWO DSpark stages share the
@@ -721,10 +911,10 @@ def self_test():
                     tensors[f"{pfx}.experts.{e}.{proj}.weight"] = ("I8", (o, i // 2), codes.tobytes())
                     s = np.full((o, i // 32), 127, dtype=np.uint8)
                     tensors[f"{pfx}.experts.{e}.{proj}.scale"] = ("F8_E8M0", s.shape, s.tobytes())
-        # one fp8 spine linear (128x128 -> single scale block)
+        # one fp8 spine linear (256x256 -> 2x2 scale blocks at block 128)
         wq_codes = rng.integers(0, 0x7F, size=(d_in, d_in), dtype=np.uint8)
         tensors["layers.0.attn.wq_a.weight"] = ("F8_E4M3", (d_in, d_in), wq_codes.tobytes())
-        tensors["layers.0.attn.wq_a.scale"] = ("F8_E8M0", (1, 1), np.array([[127]], dtype=np.uint8).tobytes())
+        tensors["layers.0.attn.wq_a.scale"] = ("F8_E8M0", (2, 2), np.full((2, 2), 127, dtype=np.uint8).tobytes())
         # keep-class tensors
         nw = rng.standard_normal(d_in).astype(np.float32)
         tensors["layers.0.attn_norm.weight"] = ("BF16", (d_in,), f32_to_bf16_u16(nw).tobytes())
@@ -757,6 +947,19 @@ def self_test():
         check(ocfg["quantization"]["mtp.1.ffn.experts.w2"]["bits"] == MTP_EXPERT_BITS["w2"]
               and ocfg["quantization"]["layers.0.ffn.experts.w2"]["bits"] == EXPERT_BITS["w2"],
               "e2e draft stages quantized apart from the trunk")
+        # Trunk experts move to gs 128 (imatrix round); draft stages and the
+        # spine keep gs 64 — the DSpark shard must stay byte-identical.
+        check(ocfg["quantization"]["layers.0.ffn.experts.w1"]["group_size"] == 128
+              and ocfg["quantization"]["layers.0.ffn.experts.w2"]["group_size"] == 128
+              and ocfg["quantization"]["mtp.1.ffn.experts.w2"]["group_size"] == 64
+              and ocfg["quantization"]["layers.0.attn.wq_a"]["group_size"] == 64
+              and ocfg["quantization"]["group_size"] == 64,
+              "e2e trunk experts gs128, draft stages + spine gs64")
+        # The model card carries the iQ-MLX brand and a computed bpw headline
+        # (from actual emitted bytes — the card can never drift from the files).
+        card = open(os.path.join(outd, "README.md")).read()
+        check("iQ-MLX" in card and "What is iQ-MLX" in card, "e2e card carries the iQ-MLX section")
+        check(" bpw" in card and "{bpw}" not in card, "e2e card bpw placeholder filled")
         # load bank via mlx, dequant expert 1 w1, compare vs direct source dequant
         shard = os.path.join(outd, "model-layer-0.safetensors")
         loaded = mx().load(shard)
@@ -764,7 +967,7 @@ def self_test():
         bank_back = m.dequantize(loaded["layers.0.ffn.experts.w1.weight"][1],
                                  loaded["layers.0.ffn.experts.w1.scales"][1],
                                  loaded["layers.0.ffn.experts.w1.biases"][1],
-                                 group_size=GROUP_SIZE, bits=2)
+                                 group_size=EXPERT_GROUP, bits=2)
         src_codes = np.frombuffer(tensors["layers.0.ffn.experts.1.w1.weight"][2],
                                   dtype=np.int8).reshape(d_moe, d_in // 2)
         src_scale = np.frombuffer(tensors["layers.0.ffn.experts.1.w1.scale"][2],
@@ -776,6 +979,121 @@ def self_test():
         # keep-class survived verbatim
         kept = np.array(loaded["layers.0.attn_norm.weight"].astype(m.float32))
         check(np.allclose(kept, bf16_to_f32(f32_to_bf16_u16(nw))), "e2e keep-class verbatim")
+
+        # imatrix-calibrated arm: fabricated per-expert channel weights for
+        # the trunk (draft stages have no entries — that must NOT error), and
+        # a missing TRUNK entry must be a hard error, never a silent minmax.
+        im = {}
+        rng_im = np.random.default_rng(9)
+        for proj, ind in (("w1", d_in), ("w3", d_in), ("w2", d_moe)):
+            stem = {"w1": "ffn_gate_exps", "w2": "ffn_down_exps", "w3": "ffn_up_exps"}[proj]
+            im[f"blk.0.{stem}.weight"] = (1, np.abs(rng_im.standard_normal(ind * n_exp)).astype(np.float32))
+        outd2 = os.path.join(td, "out-imx")
+        try:
+            convert(src, outd2, verify=True, imatrix=im)
+            idx2 = json.load(open(os.path.join(outd2, "model.safetensors.index.json")))
+            check("layers.0.ffn.experts.w1.weight" in idx2["weight_map"]
+                  and "mtp.1.ffn.experts.w1.weight" in idx2["weight_map"],
+                  "e2e imatrix conversion covers trunk + entry-less draft stages")
+            sizes_match = all(
+                json.load(open(os.path.join(outd, ".convert-manifest.json")))[g]["tensors"]
+                == json.load(open(os.path.join(outd2, ".convert-manifest.json")))[g]["tensors"]
+                for g in ("layer.0", "mtp"))
+            check(sizes_match, "e2e imatrix arm emits the same tensor set")
+            # The mtp group never consults the imatrix -> byte-identical shards.
+            mtp_a = open(os.path.join(outd, "model-mtp.safetensors"), "rb").read()
+            mtp_b = open(os.path.join(outd2, "model-mtp.safetensors"), "rb").read()
+            check(mtp_a == mtp_b, "e2e draft-stage shard byte-identical with/without imatrix")
+        except TypeError as e:
+            check(False, f"e2e imatrix conversion ({e})")
+        broken = {k: v for k, v in im.items() if "gate" not in k}
+        try:
+            convert(src, os.path.join(td, "out-broken"), imatrix=broken)
+            check(False, "e2e missing trunk imatrix entry is a hard error")
+        except (AssertionError, TypeError) as e:
+            check(isinstance(e, AssertionError) and "missing imatrix entry" in str(e),
+                  f"e2e missing trunk imatrix entry is a hard error ({e})")
+
+        # Per-layer expert override (--expert-override): trunk layers named in
+        # the spec re-quantize at the given bits/gs; everything else — other
+        # trunk layers, draft stages, spine — is untouched.
+        try:
+            ov = parse_expert_override("37-42=4:64")
+            check(ov == {li: {"*": (4, 64)} for li in range(37, 43)}, "override: range parse")
+            ov2 = parse_expert_override("5=3:32")
+            check(ov2 == {5: {"*": (3, 32)}}, "override: single-layer parse")
+            set_expert_overrides({37: (4, 64)})
+            check(expert_bits("layers.37.ffn", "w1") == 4
+                  and expert_bits("layers.37.ffn", "w2") == 4, "override: expert_bits hit")
+            check(expert_group("layers.37.ffn", "w1") == 64, "override: expert_group hit")
+            check(expert_bits("layers.36.ffn", "w1") == EXPERT_BITS["w1"]
+                  and expert_group("layers.36.ffn", "w1") == EXPERT_GROUP, "override: miss untouched")
+            check(expert_bits("mtp.0.ffn", "w1") == MTP_EXPERT_BITS["w1"]
+                  and expert_group("mtp.0.ffn", "w1") == SPINE_GROUP, "override: mtp untouched")
+            # full stacked path (quant-config rebuild spelling) also resolves
+            check(expert_bits("layers.37.ffn.experts.w1.weight", "w1") == 4,
+                  "override: stacked-path spelling hit")
+        except NameError as e:
+            check(False, f"override: helpers missing ({e})")
+        finally:
+            try:
+                set_expert_overrides({})
+            except NameError:
+                pass
+        # Per-PROJECTION override grammar "LAYER=PROJ@BITS:GS" (the greedy
+        # allocator emits mixed plans like w2-only upgrades): a named
+        # projection resolves to its own (bits, gs), the layer's OTHER
+        # projections stay on the defaults, and the layer-wide form still
+        # applies to all three. Specs merge across comma-joined parts.
+        try:
+            ov3 = parse_expert_override("5=w2@4:128")
+            check(ov3 == {5: {"w2": (4, 128)}}, "override: per-proj parse")
+            ov4 = parse_expert_override("0-1=w1@3:128,0=w2@4:128,39-40=4:64")
+            check(ov4 == {0: {"w1": (3, 128), "w2": (4, 128)},
+                          1: {"w1": (3, 128)},
+                          39: {"*": (4, 64)}, 40: {"*": (4, 64)}},
+                  "override: mixed per-proj + layer-wide merge")
+            set_expert_overrides(parse_expert_override("37=w2@4:128"))
+            check(expert_bits("layers.37.ffn", "w2") == 4
+                  and expert_bits("layers.37.ffn", "w1") == EXPERT_BITS["w1"]
+                  and expert_bits("layers.37.ffn", "w3") == EXPERT_BITS["w3"],
+                  "override: per-proj bits hit only the named projection")
+            check(expert_group("layers.37.ffn", "w2") == 128
+                  and expert_group("layers.37.ffn", "w1") == EXPERT_GROUP,
+                  "override: per-proj gs hit only the named projection")
+            check(expert_bits("mtp.0.ffn", "w2") == MTP_EXPERT_BITS["w2"],
+                  "override: per-proj mtp untouched")
+        except Exception as e:
+            check(False, f"override: per-proj grammar missing ({e})")
+        finally:
+            try:
+                set_expert_overrides({})
+            except NameError:
+                pass
+        # e2e: overriding the fixture's one trunk layer flips its banks to
+        # 4-bit gs64 in the emitted quant config; draft stages byte-identical.
+        try:
+            set_expert_overrides(parse_expert_override("0=4:64"))
+            outd3 = os.path.join(td, "out-ov")
+            convert(src, outd3, verify=True)
+            ocfg3 = json.load(open(os.path.join(outd3, "config.json")))
+            check(all(ocfg3["quantization"][f"layers.0.ffn.experts.{p}"] ==
+                      {"group_size": 64, "bits": 4, "mode": "affine"} for p in ("w1", "w2", "w3")),
+                  "override e2e: trunk banks 4-bit gs64 in quant config")
+            check(ocfg3["quantization"]["mtp.1.ffn.experts.w2"]["bits"] == MTP_EXPERT_BITS["w2"],
+                  "override e2e: draft stages untouched")
+            mtp_c = open(os.path.join(outd3, "model-mtp.safetensors"), "rb").read()
+            check(mtp_c == mtp_a, "override e2e: draft-stage shard byte-identical")
+            w4 = json.load(open(os.path.join(outd3, ".convert-manifest.json")))["layer.0"]
+            check(w4["size"] > json.load(open(os.path.join(outd, ".convert-manifest.json")))["layer.0"]["size"],
+                  "override e2e: 4-bit layer shard larger than 2/3-bit")
+        except NameError as e:
+            check(False, f"override e2e: helpers missing ({e})")
+        finally:
+            try:
+                set_expert_overrides({})
+            except NameError:
+                pass
 
     print(f"\n{len(failures)} failures" if failures else "\nALL SELF-TESTS PASS")
     return 1 if failures else 0
@@ -793,14 +1111,34 @@ if __name__ == "__main__":
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--groups", type=str, help="e.g. 'layer.0,layer.1' or '0-5'")
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--expert-override", type=str, default=None,
+                    help="per-layer trunk expert requant, e.g. '37-42=4:64'")
+    ap.add_argument("--imatrix", type=str, default=None,
+                    help="imatrix .dat for trunk-expert calibration (default: the "
+                         "staged antirez .dat; pass 'none' for an uncalibrated build)")
     args = ap.parse_args()
 
+    if args.expert_override:
+        set_expert_overrides(parse_expert_override(args.expert_override))
     if args.self_test:
         sys.exit(self_test())
 
     assert args.src and args.out, "--src and --out required"
     src = os.path.expanduser(args.src)
     out = os.path.expanduser(args.out)
+
+    import dsv4_imatrix as imx
+    imatrix = None
+    imatrix_name = None
+    if args.imatrix != "none" and not args.dry_run:
+        im_path = os.path.expanduser(args.imatrix) if args.imatrix else imx.IMATRIX_DEFAULT
+        # A missing imatrix must never fall back to a silent minmax build:
+        # demand the file or an explicit 'none'.
+        assert os.path.exists(im_path), \
+            f"imatrix not found at {im_path} — pass --imatrix none for an uncalibrated build"
+        imatrix = imx.load_imatrix(im_path)
+        imatrix_name = os.path.basename(im_path)
+        print(f"[imatrix] {imatrix_name}: {len(imatrix)} entries")
 
     if args.dry_run:
         total, by_class = dry_run_size(src)
@@ -818,4 +1156,5 @@ if __name__ == "__main__":
                 only.update(f"layer.{i}" for i in range(int(a), int(b) + 1))
             else:
                 only.add(part)
-    convert(src, out, only_groups=only, verify=args.verify)
+    convert(src, out, only_groups=only, verify=args.verify,
+            imatrix=imatrix, imatrix_name=imatrix_name)

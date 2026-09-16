@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import MLXCore
 
 /// LAN model sharing, app side: /v1/models entries badged `lan_peer` become
@@ -32,7 +33,15 @@ final class LanSharingTests: XCTestCase {
         XCTAssertEqual(LanPick.persisted(lanModel: "m@p", presetId: "x"), "lan:m@p")
         XCTAssertEqual(LanPick.persisted(lanModel: nil, presetId: "x"), "x")
         XCTAssertEqual(LanPick.peer(of: "gemma-4-e4b-it-4bit@Studio"), "Studio")
+        // `base(of:)` is peer(of:)'s mirror — the model id without the peer.
+        XCTAssertEqual(LanPick.base(of: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit@Studio"),
+                       "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit")
+        XCTAssertEqual(LanPick.base(of: "no-peer-suffix"), "no-peer-suffix")
     }
+
+    // The LAN-pick-adopts-its-preset rule (the H3-sent-LTX-shapes class) moved
+    // with the picker: `MediaModelChooserTests.testLanPickAdoptsCatalogThen-
+    // CustomFamilyPreset` pins it on the live `onSelectLan` path.
 
     @MainActor
     func testLanModelsFilterByBadgeAndCapability() {

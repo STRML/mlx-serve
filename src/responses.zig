@@ -10,7 +10,18 @@ const chat_mod = @import("chat.zig");
 // ─── small json helpers (intentionally duplicated from server.zig to avoid
 // ─── a circular import; identical behavior) ──────────────────────────────
 
+/// Escape into a JSON string literal. Every string here is built from model
+/// bytes, and a token is a BPE fragment — see the same chokepoint in server.zig.
 pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (!std.unicode.utf8ValidateSlice(input)) {
+        const clean = try chat_mod.utf8Sanitize(allocator, input);
+        defer allocator.free(clean);
+        return jsonEscapeValid(allocator, clean);
+    }
+    return jsonEscapeValid(allocator, input);
+}
+
+fn jsonEscapeValid(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     try buf.append(allocator, '"');
@@ -103,23 +114,25 @@ pub const ReasoningConfig = struct {
 };
 
 /// Map `reasoning.effort` → (enable_thinking, reasoning_budget).
-/// `null` / unknown → thinking disabled, budget unchanged.
+/// "none" is an explicit off, matching the chat and Anthropic surfaces;
+/// `null` / non-object → thinking disabled, budget unchanged.
 pub fn parseReasoning(reasoning_val: ?std.json.Value, default_budget: i32) ReasoningConfig {
     const v = reasoning_val orelse return .{ .enable = false, .budget = default_budget };
     if (v != .object) return .{ .enable = false, .budget = default_budget };
     const effort_val = v.object.get("effort") orelse return .{ .enable = true, .budget = default_budget };
     if (effort_val != .string) return .{ .enable = true, .budget = default_budget };
-    return .{ .enable = true, .budget = effortBudget(effort_val.string, default_budget), .effort = effort_val.string };
+    const word = effort_val.string;
+    if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = default_budget, .effort = word };
+    return .{ .enable = true, .budget = effortBudget(word, default_budget), .effort = word };
 }
 
 /// Effort → thinking-budget mapping shared by the Responses `reasoning.effort`
 /// object and the chat-completions `reasoning_effort` string. Unknown efforts
 /// (model-dependent spec values like "xhigh") fall back to the default budget.
 pub fn effortBudget(effort: []const u8, default_budget: i32) i32 {
-    if (std.mem.eql(u8, effort, "minimal")) return 128;
-    if (std.mem.eql(u8, effort, "low")) return 512;
-    if (std.mem.eql(u8, effort, "medium")) return 2048;
-    if (std.mem.eql(u8, effort, "high")) return 8192;
+    if (std.mem.eql(u8, effort, "minimal")) return 1024;
+    if (std.mem.eql(u8, effort, "low")) return 2048;
+    if (std.mem.eql(u8, effort, "medium")) return 8192;
     return default_budget;
 }
 
@@ -301,6 +314,7 @@ pub const ParsedInput = struct {
     owned_tool_calls: std.ArrayList([]chat_mod.ToolCall),
     owned_images: std.ArrayList([]chat_mod.ImageData),
     allocator: std.mem.Allocator,
+    image_decode_failed: bool = false,
 
     pub fn deinit(self: *ParsedInput) void {
         for (self.owned_strings.items) |s| self.allocator.free(s);
@@ -318,8 +332,17 @@ pub const ParsedInput = struct {
 
 /// Decode a single image_url string into preprocessed pixels. Provided as a
 /// callback because the actual decoder lives in `server.zig` (uses stb_image
-/// + libwebp). Returning null is fine — the input item will lack images.
-pub const ImageUrlDecoder = *const fn (allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData;
+/// + libwebp). Returns whether it appended anything; a false is recorded as
+/// `image_decode_failed` so the surface can refuse the request by name.
+/// Appends one entry per tower call an `image_url` expands into — usually one,
+/// but LFM2-VL splits a large source into tiles plus a thumbnail. Appending
+/// rather than returning is what lets a single URL produce several.
+pub const ImageUrlDecoder = *const fn (
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(chat_mod.ImageData),
+    url: []const u8,
+    vp: chat_mod.VisionPreproc,
+) bool;
 
 /// Translate a Responses `input` value (string or array of input items) into
 /// `chat_mod.Message`s. Optionally prepends `instructions` as the single leading
@@ -409,7 +432,7 @@ fn appendMessageItem(
 ) !void {
     const role_val = obj.get("role") orelse return;
     if (role_val != .string) return;
-    const role = role_val.string;
+    const role = chat_mod.canonicalRole(role_val.string);
 
     const content_val = obj.get("content") orelse return;
     var content: []const u8 = "";
@@ -443,11 +466,9 @@ fn appendMessageItem(
                         .object => |io| if (io.get("url")) |u| (if (u == .string) u.string else continue) else continue,
                         else => continue,
                     };
-                    if (image_decoder) |dec| {
-                        if (dec(allocator, url, vp)) |img| {
-                            try image_list.append(allocator, img);
-                        }
-                    }
+                    if (image_decoder) |dec| if (!dec(allocator, &image_list, url, vp)) {
+                        pi.image_decode_failed = true;
+                    };
                 }
             }
             if (text_parts.items.len > 0) {
@@ -736,14 +757,25 @@ const testing = std.testing;
 test "parseReasoning maps effort levels" {
     const v_low = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"low\"}", .{});
     defer v_low.deinit();
-    try testing.expectEqual(@as(i32, 512), parseReasoning(v_low.value, -1).budget);
+    try testing.expectEqual(@as(i32, 2048), parseReasoning(v_low.value, -1).budget);
 
+    // high is uncapped: the default budget rides through.
     const v_high = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"high\"}", .{});
     defer v_high.deinit();
-    try testing.expectEqual(@as(i32, 8192), parseReasoning(v_high.value, -1).budget);
+    try testing.expectEqual(@as(i32, -1), parseReasoning(v_high.value, -1).budget);
 
     try testing.expectEqual(false, parseReasoning(null, -1).enable);
     try testing.expectEqual(@as(i32, -1), parseReasoning(null, -1).budget);
+}
+
+// `none` is the OpenAI/gpt-5.1 spelling of an explicit thinking-off on the chat
+// and Anthropic surfaces; Responses must agree, not treat a present effort as on.
+test "parseReasoning: effort none is an explicit thinking-off" {
+    const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"none\"}", .{});
+    defer v.deinit();
+    const cfg = parseReasoning(v.value, -1);
+    try testing.expectEqual(false, cfg.enable);
+    try testing.expectEqualStrings("none", cfg.effort.?);
 }
 
 test "parseTextFormat extracts schema from flat shape" {
@@ -849,6 +881,34 @@ test "parseInput string becomes single user message" {
     try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
     try testing.expectEqualStrings("user", pi.messages.items[0].role);
     try testing.expectEqualStrings("hello", pi.messages.items[0].content);
+}
+
+test "parseInput reads a developer item as the system turn" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[{"role":"developer","content":"You are S."},{"role":"user","content":"hi"}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
+    try testing.expectEqualStrings("system", pi.messages.items[0].role);
+    try testing.expectEqualStrings("You are S.", pi.messages.items[0].content);
+}
+
+fn testRejectingDecoder(_: std.mem.Allocator, _: *std.ArrayList(chat_mod.ImageData), _: []const u8, _: chat_mod.VisionPreproc) bool {
+    return false;
+}
+
+test "parseInput records an input_image the decoder could not read" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[{"role":"user","content":[{"type":"input_text","text":"what is this"},{"type":"input_image","image_url":"http://example.invalid/x.png"}]}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(allocator, parsed.value, null, null, testRejectingDecoder, .{});
+    defer pi.deinit();
+    try std.testing.expect(pi.image_decode_failed);
+    try std.testing.expectEqual(@as(usize, 1), pi.messages.items.len);
 }
 
 test "parseInput with instructions prepends system" {

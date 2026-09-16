@@ -31,7 +31,7 @@ final class ChatRowBuilderTests: XCTestCase {
     func testCallAndResultFoldIntoOneRow() {
         let rows = ChatRowBuilder.rows(from: [call(), result()])
         XCTAssertEqual(rows.count, 1)
-        guard case .toolCall(_, let results) = rows[0] else { return XCTFail("expected toolCall row") }
+        guard case .toolCall(_, let results, _, _) = rows[0] else { return XCTFail("expected toolCall row") }
         XCTAssertEqual(results.count, 1)
     }
 
@@ -40,7 +40,7 @@ final class ChatRowBuilderTests: XCTestCase {
         // must be filtered out, and the call+result-summary still fold together.
         let rows = ChatRowBuilder.rows(from: [call(), hiddenToolMsg(), result()])
         XCTAssertEqual(rows.count, 1, "the hidden raw tool message must not produce a row")
-        guard case .toolCall(_, let results) = rows[0] else { return XCTFail("expected toolCall row") }
+        guard case .toolCall(_, let results, _, _) = rows[0] else { return XCTFail("expected toolCall row") }
         XCTAssertEqual(results.count, 1)
     }
 
@@ -51,7 +51,7 @@ final class ChatRowBuilderTests: XCTestCase {
         twoCalls.isAgentSummary = true
         let rows = ChatRowBuilder.rows(from: [twoCalls, result("a"), result("b")])
         XCTAssertEqual(rows.count, 1)
-        guard case .toolCall(_, let results) = rows[0] else { return XCTFail("expected toolCall row") }
+        guard case .toolCall(_, let results, _, _) = rows[0] else { return XCTFail("expected toolCall row") }
         XCTAssertEqual(results.count, 2)
     }
 
@@ -77,8 +77,27 @@ final class ChatRowBuilderTests: XCTestCase {
         streaming.isStreaming = true
         let rows = ChatRowBuilder.rows(from: [streaming])
         XCTAssertEqual(rows.count, 1)
-        guard case .toolCall(_, let results) = rows[0] else { return XCTFail("expected toolCall row") }
+        guard case .toolCall(_, let results, _, _) = rows[0] else { return XCTFail("expected toolCall row") }
         XCTAssertTrue(results.isEmpty)
+    }
+
+    /// Handle names restart at `bg1` every launch, so an old card and a new one
+    /// can both carry `bg1` — and the registry, which knows only the name, told
+    /// both of them it was alive. Only the newest row keeps the handle.
+    func testAReusedHandleReachesOnlyTheNewestRow() {
+        var old = call("shell", "command: sleep 1")
+        old.processHandles = ["bg1"]
+        var fresh = call("shell", "command: sleep 2")
+        fresh.processHandles = ["bg1"]
+
+        let rows = ChatRowBuilder.rows(from: [old, result("shell"), fresh, result("shell")])
+        XCTAssertEqual(rows.count, 2)
+        guard case .toolCall(_, _, _, let oldOwned) = rows[0],
+              case .toolCall(_, _, _, let freshOwned) = rows[1] else {
+            return XCTFail("expected two toolCall rows")
+        }
+        XCTAssertEqual(oldOwned, [])
+        XCTAssertEqual(freshOwned, ["bg1"])
     }
 
     func testClassificationDiscriminatesCallVsResult() {
@@ -119,5 +138,26 @@ final class ChatRowBuilderTests: XCTestCase {
         var m = ChatMessage(role: .assistant, content: summary)
         m.isAgentSummary = true
         XCTAssertTrue(ChatRowBuilder.isResultSummary(m))
+    }
+}
+
+/// Issue #227: rows are rebuilt on every body pass, so SwiftUI needs to be able
+/// to see that nothing changed. That needs `ChatRow` to be `Equatable`.
+@MainActor
+final class ChatRowEquatableTests: XCTestCase {
+    func testSameMessagesProduceEqualRows() {
+        var call = ChatMessage(role: .assistant, content: "**t**(x)")
+        call.isAgentSummary = true
+        var result = ChatMessage(role: .assistant, content: "**t** → ok")
+        result.isAgentSummary = true
+        let msgs = [ChatMessage(role: .user, content: "hi"), call, result]
+        XCTAssertEqual(ChatRowBuilder.rows(from: msgs), ChatRowBuilder.rows(from: msgs))
+    }
+
+    func testContentChangeMakesRowsUnequal() {
+        let a = ChatMessage(role: .assistant, content: "x")
+        var b = a
+        b.content = "xy"
+        XCTAssertNotEqual(ChatRowBuilder.rows(from: [a]), ChatRowBuilder.rows(from: [b]))
     }
 }

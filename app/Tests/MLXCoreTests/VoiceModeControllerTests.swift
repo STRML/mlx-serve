@@ -93,7 +93,7 @@ final class VoiceModeControllerTests: XCTestCase {
         private(set) var calls: [Call] = []
         private(set) var lastApproval: ((APIClient.ToolCall) async -> Bool)?
         private(set) var stopCount = 0
-        func runTurn(sessionId: UUID, userText: String, images: [ChatImage]?, audio: [ChatAudio]?,
+        func runTurn(sessionId: UUID, userText: String, images: [ChatImage]?, videos: [ChatVideo]?, audio: [ChatAudio]?,
                      config: ChatTurnEngine.TurnConfig,
                      approval: @escaping (APIClient.ToolCall) async -> Bool) {
             calls.append(Call(sessionId: sessionId, userText: userText, config: config))
@@ -341,6 +341,56 @@ final class VoiceModeControllerTests: XCTestCase {
 
         syn.simulateDrain()
         XCTAssertEqual(c.state, .listening)
+    }
+
+    func testStaleSessionRepublishAtTurnStartDoesNotReplayThePreviousAnswer() async {
+        // Issue #119: hands-free voice left ON re-read the previous reply before
+        // every new one. The engine publishes "turn active" BEFORE the user
+        // message lands in the session, so the Combine feed fires while the
+        // trailing message is still the last turn's answer — state `.thinking` —
+        // and the controller adopted it as a brand-new message and spoke all of
+        // it. Whatever is trailing at submit time is history, never voiced.
+        let (c, rec, syn, _, _) = makeRunnable()
+        var trailing: AnyHashable?
+        c.alreadyHeardMessage = { _ in trailing }
+        _ = await c.begin()
+
+        // Turn 1: answer A spoken once, turn finishes cleanly.
+        rec.onFinalTranscript?("what time is it")
+        c.observeAssistant(messageId: "A", content: "It is noon. ", generating: true)
+        c.observeAssistant(messageId: "A", content: "It is noon. ", generating: false)
+        syn.simulateDrain()
+        XCTAssertEqual(c.state, .listening)
+        XCTAssertEqual(syn.enqueued, ["It is noon."])
+
+        // Turn 2 submitted; the stale republish fires with A still trailing and
+        // the turn already flagged active. A must not be spoken again.
+        trailing = "A"
+        rec.onFinalTranscript?("and the date")
+        c.observeAssistant(messageId: "A", content: "It is noon. ", generating: true)
+        XCTAssertEqual(syn.enqueued, ["It is noon."],
+                       "the previous turn's answer must not be re-voiced")
+
+        // The real answer B streams and is spoken normally.
+        c.observeAssistant(messageId: "B", content: "August second. ", generating: true)
+        c.observeAssistant(messageId: "B", content: "August second. ", generating: false)
+        XCTAssertEqual(syn.enqueued, ["It is noon.", "August second."])
+        syn.simulateDrain()
+        XCTAssertEqual(c.state, .listening)
+    }
+
+    func testFirstVoiceTurnInAnExistingChatDoesNotReplayItsLastAnswer() async {
+        // Same class, other entry: voice enabled in a chat that already ends
+        // with a (typed) assistant answer. The first spoken turn must not read
+        // that old answer back before its own.
+        let (c, rec, syn, _, _) = makeRunnable()
+        c.alreadyHeardMessage = { _ in "old" }
+        _ = await c.begin()
+        rec.onFinalTranscript?("hello")
+        c.observeAssistant(messageId: "old", content: "Typed answer from earlier. ", generating: true)
+        XCTAssertTrue(syn.enqueued.isEmpty, "pre-existing history must not be voiced")
+        c.observeAssistant(messageId: "B", content: "Hi there. ", generating: false)
+        XCTAssertEqual(syn.enqueued, ["Hi there."])
     }
 
     func testReasoningIsNeverSpoken() async {

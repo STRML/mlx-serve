@@ -24,11 +24,31 @@ pub const MAX_PIXELS: u32 = 14 * 14 * 4 * 1280; // 1003520
 
 pub const Resized = struct { h: u32, w: u32 };
 
+/// Engine ceiling on the image area, whatever the checkpoint's processor
+/// declares. Qwen3.8 packs ship `longest_edge: 16777216` (16.7 Mpx); the
+/// reference survives that behind flash attention, while our ViT
+/// MATERIALIZES the full bidirectional score matrix per layer — a 5100x3300
+/// photo became 65k patches and an uncatchable Metal OOM (live, 26.8.9).
+/// 1536x1536: ~9.2k patches, ~2.7 GB of bf16 scores per layer at 16 heads;
+/// a 1920x1080 screenshot is barely touched (2.07 -> 2.36 Mpx cap).
+pub const ENGINE_MAX_PIXELS: u32 = 1536 * 1536;
+
+pub const PixelBounds = struct { min: u32, max: u32, clamped: bool };
+
+/// The bounds the resize actually uses: the checkpoint's when sane, the
+/// processor defaults otherwise, and never above ENGINE_MAX_PIXELS.
+pub fn effectivePixelBounds(cfg_min: u32, cfg_max: u32) PixelBounds {
+    const min = if (cfg_min > 0) cfg_min else MIN_PIXELS;
+    const declared = if (cfg_max >= min) cfg_max else @max(MAX_PIXELS, min);
+    const max = @max(min, @min(declared, ENGINE_MAX_PIXELS));
+    return .{ .min = min, .max = max, .clamped = max < declared };
+}
+
 /// Python `round()` is round-half-to-EVEN (banker's rounding); Zig's
 /// `std.math.round` is round-half-away-from-zero. `_smart_resize_image` uses the
 /// Python builtin, so we must match it for byte-faithful grids. Inputs here are
 /// always positive (image dimensions / factor).
-fn roundHalfEven(x: f64) f64 {
+pub fn roundHalfEven(x: f64) f64 {
     const fl = std.math.floor(x);
     const frac = x - fl;
     if (frac < 0.5) return fl;
@@ -66,15 +86,45 @@ pub fn smartResizeDefault(height: u32, width: u32) Resized {
     return smartResizeImage(height, width, FACTOR, MIN_PIXELS, MAX_PIXELS);
 }
 
-/// Keys bicubic kernel (a = -0.5), matching Pillow's BICUBIC filter.
-fn bicubicWeight(distance: f64) f64 {
-    const x = @abs(distance);
-    if (x <= 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
-    if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
-    return 0.0;
+/// Resampling kernels, matching Pillow's. Qwen's processor asks for BICUBIC,
+/// Muse-Glimmer's for LANCZOS.
+pub const Filter = enum {
+    bilinear,
+    bicubic,
+    lanczos,
+
+    fn support(self: Filter) f64 {
+        return switch (self) {
+            .bilinear => 1.0,
+            .bicubic => 2.0,
+            .lanczos => 3.0,
+        };
+    }
+
+    /// Triangle / Keys bicubic (a = -0.5) / Lanczos-3.
+    fn weight(self: Filter, distance: f64) f64 {
+        const x = @abs(distance);
+        switch (self) {
+            .bilinear => return if (x < 1.0) 1.0 - x else 0.0,
+            .bicubic => {
+                if (x <= 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
+                if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
+                return 0.0;
+            },
+            .lanczos => {
+                if (x >= 3.0) return 0.0;
+                return sinc(x) * sinc(x / 3.0);
+            },
+        }
+    }
+};
+
+fn sinc(x: f64) f64 {
+    if (x == 0.0) return 1.0;
+    const t = x * std.math.pi;
+    return @sin(t) / t;
 }
 
-const BICUBIC_SUPPORT: f64 = 2.0;
 const RESAMPLE_PRECISION_BITS: u6 = 22;
 const RESAMPLE_PRECISION_SCALE: f64 = @floatFromInt(@as(i64, 1) << RESAMPLE_PRECISION_BITS);
 const RESAMPLE_ROUNDING_BIAS: i64 = @as(i64, 1) << (RESAMPLE_PRECISION_BITS - 1);
@@ -99,17 +149,62 @@ const ResampleCoefficients = struct {
 /// Precompute one separable Pillow-style resize axis. Downscaling widens the
 /// filter footprint by `input_len / output_len`; this anti-aliasing step is the
 /// material difference between Image.resize(BICUBIC) and a fixed 4-tap sampler.
+/// Separable-axis geometry, shared by every consumer of this filter so the
+/// fixed-point image path and the float matrix path cannot drift apart.
+const AxisGeometry = struct {
+    scale: f64,
+    support: f64,
+    inverse_filter_scale: f64,
+
+    fn init(input_len: usize, output_len: usize, filter: Filter) AxisGeometry {
+        const scale = @as(f64, @floatFromInt(input_len)) / @as(f64, @floatFromInt(output_len));
+        const filter_scale = @max(scale, 1.0);
+        return .{
+            .scale = scale,
+            .support = filter.support() * filter_scale,
+            .inverse_filter_scale = 1.0 / filter_scale,
+        };
+    }
+
+    fn kernelSize(self: AxisGeometry) usize {
+        return @intFromFloat(@ceil(self.support) * 2.0 + 1.0);
+    }
+
+    /// The clipped input window contributing to one output coordinate, plus its
+    /// filter center. Pillow's half-pixel convention throughout.
+    fn window(self: AxisGeometry, output_index: usize, input_len: usize) !struct { start: usize, count: usize, center: f64 } {
+        const center = (@as(f64, @floatFromInt(output_index)) + 0.5) * self.scale;
+        const raw_start: i64 = @intFromFloat(center - self.support + 0.5);
+        const raw_end: i64 = @intFromFloat(center + self.support + 0.5);
+        const start = if (raw_start <= 0) 0 else @min(@as(usize, @intCast(raw_start)), input_len);
+        const end = if (raw_end <= 0) 0 else @min(@as(usize, @intCast(raw_end)), input_len);
+        if (end <= start) return error.InvalidResampleCoefficients;
+        return .{ .start = start, .count = end - start, .center = center };
+    }
+
+    /// Normalized (sum == 1) tap weights for one output coordinate.
+    fn taps(self: AxisGeometry, dst: []f64, start: usize, center: f64, filter: Filter) !void {
+        var total: f64 = 0.0;
+        for (dst, 0..) |*w, i| {
+            const source_center = @as(f64, @floatFromInt(start + i)) + 0.5;
+            w.* = filter.weight((source_center - center) * self.inverse_filter_scale);
+            total += w.*;
+        }
+        if (total == 0.0) return error.InvalidResampleCoefficients;
+        for (dst) |*w| w.* /= total;
+    }
+};
+
 fn buildResampleCoefficients(
     allocator: std.mem.Allocator,
     input_len: usize,
     output_len: usize,
+    filter: Filter,
 ) !ResampleCoefficients {
     if (input_len == 0 or output_len == 0) return error.InvalidImageDimensions;
 
-    const scale = @as(f64, @floatFromInt(input_len)) / @as(f64, @floatFromInt(output_len));
-    const filter_scale = @max(scale, 1.0);
-    const support = BICUBIC_SUPPORT * filter_scale;
-    const kernel_size: usize = @intFromFloat(@ceil(support) * 2.0 + 1.0);
+    const geo = AxisGeometry.init(input_len, output_len, filter);
+    const kernel_size = geo.kernelSize();
     const weights_len = try std.math.mul(usize, output_len, kernel_size);
 
     const bounds = try allocator.alloc(ResampleBound, output_len);
@@ -117,42 +212,52 @@ fn buildResampleCoefficients(
     const weights = try allocator.alloc(i32, weights_len);
     errdefer allocator.free(weights);
 
-    const inverse_filter_scale = 1.0 / filter_scale;
-    for (0..output_len) |output_index| {
-        const center = (@as(f64, @floatFromInt(output_index)) + 0.5) * scale;
-        const raw_start: i64 = @intFromFloat(center - support + 0.5);
-        const raw_end: i64 = @intFromFloat(center + support + 0.5);
-        const start = if (raw_start <= 0)
-            0
-        else
-            @min(@as(usize, @intCast(raw_start)), input_len);
-        const end = if (raw_end <= 0)
-            0
-        else
-            @min(@as(usize, @intCast(raw_end)), input_len);
-        const count = end - start;
-        if (count == 0) return error.InvalidResampleCoefficients;
+    const taps = try allocator.alloc(f64, kernel_size);
+    defer allocator.free(taps);
 
-        var total: f64 = 0.0;
-        for (0..count) |input_offset| {
-            const source_center = @as(f64, @floatFromInt(start + input_offset)) + 0.5;
-            total += bicubicWeight((source_center - center) * inverse_filter_scale);
-        }
-        if (total == 0.0) return error.InvalidResampleCoefficients;
+    for (0..output_len) |output_index| {
+        const win = try geo.window(output_index, input_len);
+        try geo.taps(taps[0..win.count], win.start, win.center, filter);
 
         // Pillow converts each normalized coefficient to signed 22-bit fixed
         // point before applying it to uint8 image rows.
-        const row = weights[output_index * kernel_size ..][0..count];
-        for (row, 0..) |*weight, input_offset| {
-            const source_center = @as(f64, @floatFromInt(start + input_offset)) + 0.5;
-            const value = bicubicWeight((source_center - center) * inverse_filter_scale);
-            const scaled = value / total * RESAMPLE_PRECISION_SCALE;
+        const row = weights[output_index * kernel_size ..][0..win.count];
+        for (row, taps[0..win.count]) |*weight, value| {
+            const scaled = value * RESAMPLE_PRECISION_SCALE;
             weight.* = @intFromFloat(if (scaled < 0.0) scaled - 0.5 else scaled + 0.5);
         }
-        bounds[output_index] = .{ .start = start, .len = count };
+        bounds[output_index] = .{ .start = win.start, .len = win.count };
     }
 
     return .{ .bounds = bounds, .weights = weights, .kernel_size = kernel_size };
+}
+
+/// Dense `[output_len, input_len]` row-major resample matrix in f32, so an
+/// axis can be resampled by a matmul instead of a gather. Same taps as the
+/// image path — including the anti-aliasing footprint widening on downscale,
+/// which is what makes this equal to torch's `interpolate(..., antialias=True)`
+/// and unequal to a fixed 2-tap bilinear.
+pub fn resampleWeightMatrix(
+    allocator: std.mem.Allocator,
+    dst: []f32,
+    input_len: usize,
+    output_len: usize,
+    filter: Filter,
+) !void {
+    if (input_len == 0 or output_len == 0) return error.InvalidImageDimensions;
+    std.debug.assert(dst.len == output_len * input_len);
+    @memset(dst, 0);
+
+    const geo = AxisGeometry.init(input_len, output_len, filter);
+    const taps = try allocator.alloc(f64, geo.kernelSize());
+    defer allocator.free(taps);
+
+    for (0..output_len) |output_index| {
+        const win = try geo.window(output_index, input_len);
+        try geo.taps(taps[0..win.count], win.start, win.center, filter);
+        const row = dst[output_index * input_len ..][0..input_len];
+        for (taps[0..win.count], 0..) |value, i| row[win.start + i] = @floatCast(value);
+    }
 }
 
 fn clipFixedResample(value: i64) u8 {
@@ -164,9 +269,6 @@ fn normalizeQwenPixel(value: u8) f32 {
     return @as(f32, @floatFromInt(value)) / 127.5 - 1.0;
 }
 
-/// Pillow-compatible bicubic resize of interleaved RGB, followed by Qwen's
-/// float32 CHW normalization (mean/std 0.5). Each separable pass is quantized
-/// to uint8, matching the reference processor's `PIL.Image.resize` boundary.
 pub fn resizeRgbBicubicNormalizedChw(
     allocator: std.mem.Allocator,
     dst: []f32,
@@ -175,6 +277,22 @@ pub fn resizeRgbBicubicNormalizedChw(
     source_w: u32,
     target_h: u32,
     target_w: u32,
+) !void {
+    return resizeRgbNormalizedChw(allocator, dst, rgb, source_h, source_w, target_h, target_w, .bicubic);
+}
+
+/// Pillow-compatible resize of interleaved RGB, followed by float32 CHW
+/// normalization (mean/std 0.5 — both processors use it). Each separable pass
+/// is quantized to uint8, matching the reference's `PIL.Image.resize` boundary.
+pub fn resizeRgbNormalizedChw(
+    allocator: std.mem.Allocator,
+    dst: []f32,
+    rgb: []const u8,
+    source_h: u32,
+    source_w: u32,
+    target_h: u32,
+    target_w: u32,
+    filter: Filter,
 ) !void {
     const source_plane: usize = @as(usize, source_h) * source_w;
     const target_plane: usize = @as(usize, target_h) * target_w;
@@ -190,7 +308,7 @@ pub fn resizeRgbBicubicNormalizedChw(
         const buffer = try allocator.alloc(u8, horizontal_len);
         horizontal_owned = buffer;
 
-        var coefficients = try buildResampleCoefficients(allocator, source_w, target_w);
+        var coefficients = try buildResampleCoefficients(allocator, source_w, target_w, filter);
         defer coefficients.deinit(allocator);
         for (0..source_h) |y| {
             for (0..target_w) |x| {
@@ -210,7 +328,7 @@ pub fn resizeRgbBicubicNormalizedChw(
     } else rgb;
 
     if (target_h != source_h) {
-        var coefficients = try buildResampleCoefficients(allocator, source_h, target_h);
+        var coefficients = try buildResampleCoefficients(allocator, source_h, target_h, filter);
         defer coefficients.deinit(allocator);
         for (0..target_h) |y| {
             const bound = coefficients.bounds[y];
@@ -247,21 +365,22 @@ pub fn imageTokenCount(resized: Resized, patch: u32, merge: u32) u32 {
     return (gh / merge) * (gw / merge);
 }
 
-/// Build the processor's `pixel_values` [N, C*tps*ps*ps] from a normalized CHW
-/// image, in merge-block token order with feature layout [C, tps, py, px] — the
-/// exact ordering of mlx-vlm's `_process_one` transpose. `img_chw` is
-/// `[C, rh, rw]` already rescaled+normalized ((x/255−0.5)/0.5). The temporal
-/// axis duplicates the single frame `tps` times. Caller owns the result.
-pub fn buildPixelValues(
+/// Build one temporal-patch group's `pixel_values` [N, C*tps*ps*ps] from `tps`
+/// REAL consecutive decoded frames, in merge-block token order with feature
+/// layout [C, tps, py, px] — the exact ordering of mlx-vlm's `_process_one`
+/// transpose. Each `frames[tt]` is `[C, rh, rw]`, already rescaled+normalized
+/// and resized to the SAME (rh, rw) as every other frame in the group (a
+/// video's whole frame set shares one patch grid). Caller owns `out`.
+pub fn buildPixelValuesVideo(
     out: []f32,
-    img_chw: []const f32,
+    frames: []const []const f32,
     C: u32,
     rh: u32,
     rw: u32,
     patch: u32,
-    tps: u32,
     merge: u32,
 ) void {
+    const tps: u32 = @intCast(frames.len);
     const gh = rh / patch;
     const gw = rw / patch;
     const mh = gh / merge;
@@ -287,14 +406,14 @@ pub fn buildPixelValues(
                     while (c < C) : (c += 1) {
                         var tt: u32 = 0;
                         while (tt < tps) : (tt += 1) {
+                            const frame = frames[tt];
                             var py: u32 = 0;
                             while (py < patch) : (py += 1) {
                                 const y = row * patch + py;
                                 var px: u32 = 0;
                                 while (px < patch) : (px += 1) {
                                     const x = col * patch + px;
-                                    // Temporal axis duplicates the single frame.
-                                    out[base + f] = img_chw[@as(usize, c) * plane + @as(usize, y) * rw + x];
+                                    out[base + f] = frame[@as(usize, c) * plane + @as(usize, y) * rw + x];
                                     f += 1;
                                 }
                             }
@@ -305,6 +424,26 @@ pub fn buildPixelValues(
             }
         }
     }
+}
+
+/// Build one still IMAGE's `pixel_values` — the `tps` slots the Conv3d-as-Linear
+/// weight expects are filled by duplicating the single frame, per Qwen's own
+/// image processor (there is no second real frame for a still image). Thin
+/// wrapper over `buildPixelValuesVideo`'s real per-frame path.
+pub fn buildPixelValues(
+    out: []f32,
+    img_chw: []const f32,
+    C: u32,
+    rh: u32,
+    rw: u32,
+    patch: u32,
+    tps: u32,
+    merge: u32,
+) void {
+    std.debug.assert(tps <= 8);
+    var reps: [8][]const f32 = undefined;
+    for (0..tps) |i| reps[i] = img_chw;
+    buildPixelValuesVideo(out, reps[0..tps], C, rh, rw, patch, merge);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -361,6 +500,13 @@ pub const QwenVision = struct {
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !QwenVision {
         const s = mlx.mlx_default_gpu_stream_new();
         var buf: [256]u8 = undefined;
+        var kbuf: [256]u8 = undefined;
+
+        const prefix = resolveVisionPrefix(weights) orelse {
+            log.warn("MISSING QWEN VISION WEIGHT: {s}patch_embed.proj.weight\n", .{VISION_PREFIXES[0]});
+            return error.MissingVisionWeights;
+        };
+        log.info("[vision] qwen tower prefix: {s}\n", .{prefix});
 
         const must = struct {
             fn f(w: *const Weights, b: *[256]u8, name: []const u8) !mlx.mlx_array {
@@ -371,44 +517,55 @@ pub const QwenVision = struct {
             }
         }.f;
 
-        // patch_embed.proj.weight is stored MLX-conv layout [out, kT, ps, ps, Cin].
-        // Transpose to [out, Cin, kT, ps, ps] then flatten to [out, Cin*kT*ps*ps]
-        // so it matches the processor's [C, tps, py, px] pixel_values feature order,
-        // turning the full-window Conv3d into a plain Linear.
-        const conv_w = try must(weights, &buf, "vision_tower.patch_embed.proj.weight");
+        // patch_embed.proj.weight is a Conv3d whose STORED axis order is the
+        // converter's choice. Either way it ends flattened to
+        // [out, Cin*kT*ps*ps], matching the processor's [C, tps, py, px]
+        // pixel_values feature order — a full-window Conv3d as a plain Linear.
+        const conv_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "patch_embed.proj.weight"));
         const cw_shape = mlx.getShape(conv_w);
         std.debug.assert(cw_shape.len == 5);
         const out_c = cw_shape[0];
         const flat_in = cw_shape[1] * cw_shape[2] * cw_shape[3] * cw_shape[4];
+        const layout = patchProjLayout(cw_shape, config.qv_temporal_patch, config.qv_patch) orelse {
+            log.warn("QWEN VISION: unreadable patch_embed.proj.weight shape (tps={d}, ps={d})\n", .{ config.qv_temporal_patch, config.qv_patch });
+            return error.MissingVisionWeights;
+        };
+        log.info("[vision] qwen patch_embed layout: {s}\n", .{@tagName(layout)});
         var patch_w = mlx.mlx_array_new();
         {
-            const perm = [_]c_int{ 0, 4, 1, 2, 3 }; // [out,kT,ps,ps,C] → [out,C,kT,ps,ps]
-            var transposed = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(transposed);
-            try mlx.check(mlx.mlx_transpose_axes(&transposed, conv_w, &perm, 5, s));
             const flat_shape = [_]c_int{ out_c, flat_in };
-            try mlx.check(mlx.mlx_reshape(&patch_w, transposed, &flat_shape, 2, s));
+            switch (layout) {
+                .channels_last => {
+                    const perm = [_]c_int{ 0, 4, 1, 2, 3 }; // [out,kT,ps,ps,C] → [out,C,kT,ps,ps]
+                    var transposed = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(transposed);
+                    try mlx.check(mlx.mlx_transpose_axes(&transposed, conv_w, &perm, 5, s));
+                    try mlx.check(mlx.mlx_reshape(&patch_w, transposed, &flat_shape, 2, s));
+                },
+                // Already [out, C, kT, ps, ps] — flatten as-is.
+                .channels_first => try mlx.check(mlx.mlx_reshape(&patch_w, conv_w, &flat_shape, 2, s)),
+            }
         }
-        const patch_b = try must(weights, &buf, "vision_tower.patch_embed.proj.bias");
-        const pos_embed = try must(weights, &buf, "vision_tower.pos_embed.weight");
+        const patch_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "patch_embed.proj.bias"));
+        const pos_embed = try must(weights, &buf, fmtKey(&kbuf, prefix, "pos_embed.weight"));
 
         const depth = config.qv_depth;
         var blocks = try allocator.alloc(QBlock, depth);
         errdefer allocator.free(blocks);
         for (0..depth) |i| {
             blocks[i] = .{
-                .norm1_w = try must(weights, &buf, fmtLayer(&buf, i, "norm1.weight")),
-                .norm1_b = try must(weights, &buf, fmtLayer(&buf, i, "norm1.bias")),
-                .norm2_w = try must(weights, &buf, fmtLayer(&buf, i, "norm2.weight")),
-                .norm2_b = try must(weights, &buf, fmtLayer(&buf, i, "norm2.bias")),
-                .qkv_w = try must(weights, &buf, fmtLayer(&buf, i, "attn.qkv.weight")),
-                .qkv_b = try must(weights, &buf, fmtLayer(&buf, i, "attn.qkv.bias")),
-                .proj_w = try must(weights, &buf, fmtLayer(&buf, i, "attn.proj.weight")),
-                .proj_b = try must(weights, &buf, fmtLayer(&buf, i, "attn.proj.bias")),
-                .fc1_w = try must(weights, &buf, fmtLayer(&buf, i, "mlp.linear_fc1.weight")),
-                .fc1_b = try must(weights, &buf, fmtLayer(&buf, i, "mlp.linear_fc1.bias")),
-                .fc2_w = try must(weights, &buf, fmtLayer(&buf, i, "mlp.linear_fc2.weight")),
-                .fc2_b = try must(weights, &buf, fmtLayer(&buf, i, "mlp.linear_fc2.bias")),
+                .norm1_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "norm1.weight")),
+                .norm1_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "norm1.bias")),
+                .norm2_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "norm2.weight")),
+                .norm2_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "norm2.bias")),
+                .qkv_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.qkv.weight")),
+                .qkv_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.qkv.bias")),
+                .proj_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.proj.weight")),
+                .proj_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "attn.proj.bias")),
+                .fc1_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc1.weight")),
+                .fc1_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc1.bias")),
+                .fc2_w = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc2.weight")),
+                .fc2_b = try must(weights, &buf, fmtLayer(&buf, prefix, i, "mlp.linear_fc2.bias")),
             };
         }
 
@@ -426,12 +583,12 @@ pub const QwenVision = struct {
             .patch_b = patch_b,
             .pos_embed = pos_embed,
             .blocks = blocks,
-            .merger_norm_w = try must(weights, &buf, "vision_tower.merger.norm.weight"),
-            .merger_norm_b = try must(weights, &buf, "vision_tower.merger.norm.bias"),
-            .merger_fc1_w = try must(weights, &buf, "vision_tower.merger.linear_fc1.weight"),
-            .merger_fc1_b = try must(weights, &buf, "vision_tower.merger.linear_fc1.bias"),
-            .merger_fc2_w = try must(weights, &buf, "vision_tower.merger.linear_fc2.weight"),
-            .merger_fc2_b = try must(weights, &buf, "vision_tower.merger.linear_fc2.bias"),
+            .merger_norm_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.norm.weight")),
+            .merger_norm_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.norm.bias")),
+            .merger_fc1_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc1.weight")),
+            .merger_fc1_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc1.bias")),
+            .merger_fc2_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.weight")),
+            .merger_fc2_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.bias")),
         };
     }
 
@@ -928,6 +1085,49 @@ pub const QwenVision = struct {
         try mlx.check(mlx.mlx_reshape(&out, m2, &oshape, 3, self.s));
         return out;
     }
+
+    /// Encode one VIDEO. `patches` is the concatenation of `grid_t` temporal-
+    /// patch groups' pixel_values (see `buildPixelValuesVideo`), each group's
+    /// `grid_h*grid_w` rows packed contiguously. mlx-vlm's `cu_seqlens`
+    /// boundaries fall exactly at temporal-patch-group edges — the ViT never
+    /// attends across frames — so a group is encoded by calling the existing,
+    /// UNCHANGED single-group `forward` (pos-embed and vision-rope are spatial
+    /// only and already correct per group), concatenating the merged token
+    /// outputs along the token axis.
+    pub fn forwardVideo(self: *QwenVision, patches: mlx.mlx_array, grid_t: u32, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+        std.debug.assert(grid_t > 0);
+        if (grid_t == 1) return self.forward(patches, grid_h, grid_w);
+
+        const n_per_group: c_int = @intCast(grid_h * grid_w);
+        const pshape = mlx.getShape(patches);
+        std.debug.assert(pshape.len == 2);
+        const feat = pshape[1];
+
+        var parts = try self.allocator.alloc(mlx.mlx_array, grid_t);
+        defer self.allocator.free(parts);
+        var built: usize = 0;
+        errdefer for (parts[0..built]) |p| { _ = mlx.mlx_array_free(p); };
+
+        var t: u32 = 0;
+        while (t < grid_t) : (t += 1) {
+            var group = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(group);
+            const ti: c_int = @intCast(t);
+            const start = [_]c_int{ ti * n_per_group, 0 };
+            const stop = [_]c_int{ (ti + 1) * n_per_group, feat };
+            const strides = [_]c_int{ 1, 1 };
+            try mlx.check(mlx.mlx_slice(&group, patches, &start, 2, &stop, 2, &strides, 2, self.s));
+            parts[t] = try self.forward(group, grid_h, grid_w);
+            built += 1;
+        }
+        defer for (parts) |p| { _ = mlx.mlx_array_free(p); };
+
+        const cat_vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+        defer _ = mlx.mlx_vector_array_free(cat_vec);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&out, cat_vec, 1, self.s));
+        return out;
+    }
 };
 
 fn getWeightLocal(weights: *const Weights, buf: *[256]u8, name: []const u8) ?mlx.mlx_array {
@@ -935,8 +1135,92 @@ fn getWeightLocal(weights: *const Weights, buf: *[256]u8, name: []const u8) ?mlx
     return weights.get(name);
 }
 
-fn fmtLayer(buf: *[256]u8, layer: usize, suffix: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "vision_tower.blocks.{d}.{s}", .{ layer, suffix }) catch unreachable;
+fn fmtLayer(buf: *[256]u8, prefix: []const u8, layer: usize, suffix: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}blocks.{d}.{s}", .{ prefix, layer, suffix }) catch unreachable;
+}
+
+fn fmtKey(buf: *[256]u8, prefix: []const u8, suffix: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, suffix }) catch unreachable;
+}
+
+/// Tower spellings we serve, most common first. Qwen3-VL checkpoints say
+/// `vision_tower.`; avlp12's Qwen3.8 "Alis" packs ship the same 333 tensors
+/// under `model.visual.` (pure rename, substructure identical).
+pub const VISION_PREFIXES = [_][]const u8{ "vision_tower.", "model.visual." };
+
+/// Stored axis order of `patch_embed.proj.weight`. mlx_lm's Conv3d writes
+/// channels LAST (`[out, kT, ps, ps, Cin]`); a straight torch export keeps
+/// channels FIRST (`[out, Cin, kT, ps, ps]` — avlp12's Alis packs). Reading
+/// one as the other produces a running tower that describes every image as
+/// black-and-white stripes, so the layout is DERIVED from the shape.
+pub const PatchProjLayout = enum { channels_last, channels_first };
+
+pub fn patchProjLayout(shape: []const c_int, temporal_patch: u32, patch: u32) ?PatchProjLayout {
+    if (shape.len != 5 or temporal_patch == 0 or patch == 0) return null;
+    const tps: c_int = @intCast(temporal_patch);
+    const ps: c_int = @intCast(patch);
+    if (shape[1] == tps and shape[2] == ps and shape[3] == ps) return .channels_last;
+    if (shape[2] == tps and shape[3] == ps and shape[4] == ps) return .channels_first;
+    return null;
+}
+
+/// Resolve the tower prefix by PROBING the loaded weights (model.resolveWeightPrefix
+/// pattern) — null when no spelling is present, which is what disables vision.
+pub fn resolveVisionPrefix(weights: *const Weights) ?[]const u8 {
+    var buf: [256]u8 = undefined;
+    for (VISION_PREFIXES) |p| {
+        if (weights.get(fmtKey(&buf, p, "patch_embed.proj.weight")) != null) return p;
+    }
+    return null;
+}
+
+test "qwen vision tower prefix and patch_embed layout are PROBED, not hardcoded" {
+    const allocator = std.testing.allocator;
+    const put = struct {
+        fn add(w: *Weights, alloc: std.mem.Allocator, key: []const u8) !void {
+            const k = try alloc.dupe(u8, key);
+            try w.map.put(k, mlx.mlx_array_new());
+        }
+    }.add;
+
+    // Qwen3-VL spelling.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "vision_tower.patch_embed.proj.weight");
+        try std.testing.expectEqualStrings("vision_tower.", resolveVisionPrefix(&w).?);
+    }
+    // avlp12 Alis spelling (live: vision silently disabled, 0.92 GB dead weight).
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.visual.patch_embed.proj.weight");
+        try std.testing.expectEqualStrings("model.visual.", resolveVisionPrefix(&w).?);
+    }
+    // No tower (text-only pack, or --no-vision dropped it) → vision disabled.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.layers.0.self_attn.q_proj.weight");
+        try std.testing.expect(resolveVisionPrefix(&w) == null);
+    }
+    // patch_embed.proj axis order is derived from the shape, not assumed.
+    {
+        // mlx-community/Qwen3.5-0.8B-MLX-4bit
+        try std.testing.expectEqual(PatchProjLayout.channels_last, patchProjLayout(&.{ 768, 2, 16, 16, 3 }, 2, 16).?);
+        // avlp12/Qwen3.8-27B-Alis-MLX-4bit
+        try std.testing.expectEqual(PatchProjLayout.channels_first, patchProjLayout(&.{ 1152, 3, 2, 16, 16 }, 2, 16).?);
+        try std.testing.expect(patchProjLayout(&.{ 1152, 3, 2, 16 }, 2, 16) == null);
+        try std.testing.expect(patchProjLayout(&.{ 1152, 5, 5, 5, 5 }, 2, 16) == null);
+    }
+    // Layer keys are built from the RESOLVED prefix.
+    {
+        var buf: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            "model.visual.blocks.7.attn.qkv.weight",
+            fmtLayer(&buf, "model.visual.", 7, "attn.qkv.weight"),
+        );
+    }
 }
 
 test "qwen smart_resize matches reference table" {
@@ -953,6 +1237,23 @@ test "qwen smart_resize matches reference table" {
         try std.testing.expectEqual(c.eh, r.h);
         try std.testing.expectEqual(c.ew, r.w);
     }
+}
+
+test "qwen: a checkpoint's 16.7 Mpx bound is clamped to what the ViT can attend" {
+    const b = effectivePixelBounds(65536, 16777216);
+    try std.testing.expectEqual(ENGINE_MAX_PIXELS, b.max);
+    try std.testing.expect(b.clamped);
+    // The live crash: 5100x3300 -> 16377 merged tokens. Under the cap it
+    // is ~2300, and the engine never builds a 65k-patch score matrix.
+    const r = smartResizeImage(3300, 5100, 32, b.min, b.max);
+    try std.testing.expect(imageTokenCount(r, 16, 2) <= ENGINE_MAX_PIXELS / (32 * 32));
+    try std.testing.expect(imageTokenCount(r, 16, 2) > 2000);
+    // Defaults and sane checkpoints pass through unchanged.
+    const d = effectivePixelBounds(0, 0);
+    try std.testing.expectEqual(MIN_PIXELS, d.min);
+    try std.testing.expectEqual(MAX_PIXELS, d.max);
+    try std.testing.expect(!d.clamped);
+    try std.testing.expectEqual(@as(u32, 1003520), effectivePixelBounds(3136, 1003520).max);
 }
 
 test "qwen smart_resize honors checkpoint processor pixel bounds" {
@@ -993,6 +1294,37 @@ test "qwen bicubic RGB preprocessing preserves colors and interpolates" {
     try std.testing.expectApproxEqAbs(pillow_center, upsampled[center], 1e-6);
     try std.testing.expectApproxEqAbs(pillow_center, upsampled[9 + center], 1e-6);
     try std.testing.expectApproxEqAbs(pillow_center, upsampled[18 + center], 1e-6);
+}
+
+test "resampleWeightMatrix reproduces torch's antialiased bilinear on one axis" {
+    // Reference: torch.nn.functional.interpolate(mode="bilinear",
+    // align_corners=False, antialias=True) on a 16-long signal — the exact call
+    // Siglip2 makes to resample its 16x16 position table onto an image's own
+    // patch grid. A grid axis SHORTER than 16 is a real downscale, where a
+    // fixed 2-tap bilinear (no footprint widening) diverges; 16 -> 8 below is
+    // that case, and its last entry (204.571426, not 210.5) is the clipped
+    // edge window renormalizing, which a hand-rolled sampler also misses.
+    const signal = [_]f64{ 0, 1, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 144, 169, 196, 225 };
+    const cases = [_]struct { out: usize, want: []const f32 }{
+        .{ .out = 14, .want = &.{ 0.166667, 1.833334, 5.944445, 12.500000, 21.500004, 32.944450, 47.736851, 65.894753, 86.277786, 108.166679, 132.500015, 159.277786, 188.500031, 220.166687 } },
+        .{ .out = 20, .want = &.{ 0.000000, 0.700000, 2.500000, 5.500000, 9.700001, 15.300001, 22.300003, 30.500000, 39.900002, 50.500000, 62.500008, 75.899994, 90.500000, 106.300011, 123.300011, 141.700012, 161.500000, 182.500000, 204.700012, 225.000000 } },
+        .{ .out = 8, .want = &.{ 1.000000, 7.000000, 21.000000, 43.000000, 73.000000, 111.000000, 157.000000, 204.571426 } },
+        .{ .out = 32, .want = &.{ 0.000000, 0.250000, 0.750000, 1.750000, 3.250000, 5.250000, 7.750000, 10.750000, 14.250000, 18.250000, 22.750000, 27.750000, 33.250000, 39.250000, 45.750000, 52.750000, 60.250000, 68.250000, 76.750000, 85.750000, 95.250000, 105.250000, 115.750000, 126.750000, 138.250000, 150.250000, 162.750000, 175.750000, 189.250000, 203.250000, 217.750000, 225.000000 } },
+    };
+    const a = std.testing.allocator;
+    for (cases) |c| {
+        const m = try a.alloc(f32, c.out * signal.len);
+        defer a.free(m);
+        try resampleWeightMatrix(a, m, signal.len, c.out, .bilinear);
+        for (0..c.out) |i| {
+            var acc: f64 = 0;
+            for (signal, 0..) |v, j| acc += v * m[i * signal.len + j];
+            std.testing.expectApproxEqAbs(c.want[i], @as(f32, @floatCast(acc)), 2e-4) catch |e| {
+                std.debug.print("16->{d} [{d}] = {d:.6}, want {d:.6}\n", .{ c.out, i, acc, c.want[i] });
+                return e;
+            };
+        }
+    }
 }
 
 test "qwen bicubic downscale matches Pillow anti-aliased RGB output" {
@@ -1039,6 +1371,32 @@ test "qwen buildPixelValues merge-order + [C,tps,py,px] feature layout" {
         1,   1,   101, 101, 201, 201, // token1 row0col1
         10,  10,  110, 110, 210, 210, // token2 row1col0
         11,  11,  111, 111, 211, 211, // token3 row1col1
+    };
+    try std.testing.expectEqualSlices(f32, &expect, pv);
+}
+
+test "qwen buildPixelValuesVideo reads REAL per-frame data, not one frame duplicated" {
+    const a = std.testing.allocator;
+    // Two distinct 2x2 "frames" (single channel, patch=1, merge=2 → one token
+    // covering the whole 2x2 grid). frame0[y,x] = y*10+x; frame1 = frame0+1000
+    // so the two temporal slots are trivially distinguishable in the output.
+    const C: u32 = 1;
+    const rh: u32 = 2;
+    const rw: u32 = 2;
+    var f0: [4]f32 = .{ 0, 1, 10, 11 };
+    var f1: [4]f32 = .{ 1000, 1001, 1010, 1011 };
+    const frames = [_][]const f32{ &f0, &f1 };
+    const pv = try a.alloc(f32, 4 * 2); // 4 tokens × feat 2 (C*tps*1*1)
+    defer a.free(pv);
+    buildPixelValuesVideo(pv, &frames, C, rh, rw, 1, 2);
+    // Merge-block order over the single 2x2 block; each token's feature is
+    // [frame0_px, frame1_px] — proving both real frames land in the output,
+    // not one frame duplicated tps times (that would make both slots equal).
+    const expect = [_]f32{
+        0,    1000, // token0 row0col0
+        1,    1001, // token1 row0col1
+        10,   1010, // token2 row1col0
+        11,   1011, // token3 row1col1
     };
     try std.testing.expectEqualSlices(f32, &expect, pv);
 }
@@ -1243,4 +1601,149 @@ test "qwen vision parity vs reference embeddings (QWEN_VISION_TEST_MODEL)" {
     // real bugs (a structural bug blows up mean_abs by 10-100x).
     try std.testing.expect(mean_abs < 0.02);
     try std.testing.expect(gt_030 < ref.len / 1000); // <0.1% of elements may exceed 0.30
+}
+
+test "qwen forwardVideo == per-group forward()+concat (self-consistency)" {
+    // No hermetic reference exists for ViT-forward CORRECTNESS (that needs a
+    // trained checkpoint — see the QWEN_VISION_TEST_MODEL-gated parity test
+    // above). What IS hermetically checkable, and what's new in this task, is
+    // the forwardVideo WRAPPER: does it slice `grid_t` temporal-patch groups
+    // out of the concatenated patches array and route each through the
+    // existing, unmodified single-group `forward` correctly? This builds a
+    // tiny synthetic tower (weight VALUES are arbitrary) and asserts
+    // forwardVideo(3 groups) is bit-identical to manually slicing+forward()ing
+    // each group and concatenating — the exact operation forwardVideo performs
+    // internally, so any slicing/indexing bug in the wrapper shows up here.
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+
+    const mkArr = struct {
+        fn f(shape: []const c_int, val_base: f32) mlx.mlx_array {
+            var buf: [64]f32 = undefined;
+            var total: usize = 1;
+            for (shape) |d| total *= @intCast(d);
+            for (0..total) |i| buf[i] = val_base + @as(f32, @floatFromInt(i)) * 0.01;
+            return mlx.mlx_array_new_data(&buf, shape.ptr, @intCast(shape.len), .float32);
+        }
+    }.f;
+
+    // hidden=4, 1 head of head_dim=4, depth=1, merge=1 (no reduction — keeps
+    // token counts trivial), grid 2x2 (n=4 patches/group) matching
+    // num_grid_per_side=2 exactly (identity pos-embed interpolation).
+    const hidden = [_]c_int{4};
+    const hidden2 = [_]c_int{ 4, 4 };
+    const qkv_w_shape = [_]c_int{ 12, 4 };
+    const qkv_b_shape = [_]c_int{12};
+    const patch_w_shape = [_]c_int{ 4, 1 };
+    const pos_shape = [_]c_int{ 4, 4 };
+
+    var qv = QwenVision{
+        .s = s,
+        .allocator = a,
+        .depth = 1,
+        .hidden = 4,
+        .heads = 1,
+        .head_dim = 4,
+        .merge = 1,
+        .num_grid_per_side = 2,
+        .out_hidden = 4,
+        .patch_w = mkArr(&patch_w_shape, 0.1),
+        .patch_b = mkArr(&hidden, 0.0),
+        .pos_embed = mkArr(&pos_shape, 0.2),
+        .blocks = try a.alloc(QBlock, 1),
+        .merger_norm_w = mkArr(&hidden, 1.0),
+        .merger_norm_b = mkArr(&hidden, 0.0),
+        .merger_fc1_w = mkArr(&hidden2, 0.05),
+        .merger_fc1_b = mkArr(&hidden, 0.0),
+        .merger_fc2_w = mkArr(&hidden2, 0.05),
+        .merger_fc2_b = mkArr(&hidden, 0.0),
+    };
+    qv.blocks[0] = .{
+        .norm1_w = mkArr(&hidden, 1.0),
+        .norm1_b = mkArr(&hidden, 0.0),
+        .norm2_w = mkArr(&hidden, 1.0),
+        .norm2_b = mkArr(&hidden, 0.0),
+        .qkv_w = mkArr(&qkv_w_shape, 0.03),
+        .qkv_b = mkArr(&qkv_b_shape, 0.0),
+        .proj_w = mkArr(&hidden2, 0.04),
+        .proj_b = mkArr(&hidden, 0.0),
+        .fc1_w = mkArr(&hidden2, 0.02),
+        .fc1_b = mkArr(&hidden, 0.0),
+        .fc2_w = mkArr(&hidden2, 0.02),
+        .fc2_b = mkArr(&hidden, 0.0),
+    };
+    defer {
+        _ = mlx.mlx_array_free(qv.patch_w);
+        _ = mlx.mlx_array_free(qv.patch_b);
+        _ = mlx.mlx_array_free(qv.pos_embed);
+        _ = mlx.mlx_array_free(qv.merger_norm_w);
+        _ = mlx.mlx_array_free(qv.merger_norm_b);
+        _ = mlx.mlx_array_free(qv.merger_fc1_w);
+        _ = mlx.mlx_array_free(qv.merger_fc1_b);
+        _ = mlx.mlx_array_free(qv.merger_fc2_w);
+        _ = mlx.mlx_array_free(qv.merger_fc2_b);
+        for (qv.blocks) |b| {
+            _ = mlx.mlx_array_free(b.norm1_w);
+            _ = mlx.mlx_array_free(b.norm1_b);
+            _ = mlx.mlx_array_free(b.norm2_w);
+            _ = mlx.mlx_array_free(b.norm2_b);
+            _ = mlx.mlx_array_free(b.qkv_w);
+            _ = mlx.mlx_array_free(b.qkv_b);
+            _ = mlx.mlx_array_free(b.proj_w);
+            _ = mlx.mlx_array_free(b.proj_b);
+            _ = mlx.mlx_array_free(b.fc1_w);
+            _ = mlx.mlx_array_free(b.fc1_b);
+            _ = mlx.mlx_array_free(b.fc2_w);
+            _ = mlx.mlx_array_free(b.fc2_b);
+        }
+        a.free(qv.blocks);
+    }
+
+    // grid_t=3 groups of a 2x2 grid (n=4 patches/group, feat=1) — 12 rows total.
+    const grid_t: u32 = 3;
+    const n_per_group: usize = 4;
+    var patches_buf: [12]f32 = undefined;
+    for (0..12) |i| patches_buf[i] = @as(f32, @floatFromInt(i)) * 0.1;
+    const all_shape = [_]c_int{ 12, 1 };
+    const patches_all = mlx.mlx_array_new_data(&patches_buf, &all_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(patches_all);
+
+    const out_video = try qv.forwardVideo(patches_all, grid_t, 2, 2);
+    defer _ = mlx.mlx_array_free(out_video);
+
+    // Manual reference: slice each group from the SAME source buffer, call
+    // forward() directly, concatenate along the token axis.
+    var manual_parts: [3]mlx.mlx_array = undefined;
+    for (0..grid_t) |g| {
+        const group_shape = [_]c_int{ @intCast(n_per_group), 1 };
+        const group_arr = mlx.mlx_array_new_data(patches_buf[g * n_per_group ..].ptr, &group_shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(group_arr);
+        manual_parts[g] = try qv.forward(group_arr, 2, 2);
+    }
+    defer for (manual_parts) |p| { _ = mlx.mlx_array_free(p); };
+    const cat_vec = mlx.mlx_vector_array_new_data(&manual_parts, manual_parts.len);
+    defer _ = mlx.mlx_vector_array_free(cat_vec);
+    var out_manual = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out_manual);
+    try mlx.check(mlx.mlx_concatenate_axis(&out_manual, cat_vec, 1, s));
+
+    var v_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_f32);
+    try mlx.check(mlx.mlx_astype(&v_f32, out_video, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(v_f32));
+    var m_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(m_f32);
+    try mlx.check(mlx.mlx_astype(&m_f32, out_manual, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(m_f32));
+
+    const v_shape = mlx.getShape(v_f32);
+    const m_shape = mlx.getShape(m_f32);
+    try std.testing.expectEqualSlices(c_int, m_shape, v_shape);
+    try std.testing.expectEqual(@as(c_int, 1), v_shape[0]);
+    try std.testing.expectEqual(@as(c_int, 12), v_shape[1]); // 3 groups × 4 merged tokens (merge=1)
+
+    const v_data = mlx.mlx_array_data_float32(v_f32) orelse return error.TestUnexpectedNullData;
+    const m_data = mlx.mlx_array_data_float32(m_f32) orelse return error.TestUnexpectedNullData;
+    const total: usize = 12 * 4; // tokens × out_hidden
+    try std.testing.expectEqualSlices(f32, m_data[0..total], v_data[0..total]);
 }

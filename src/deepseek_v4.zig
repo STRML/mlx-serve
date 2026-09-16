@@ -152,11 +152,6 @@ fn getReq(w: *const model.Weights, buf: *NameBuf, comptime fmt: []const u8, args
     };
 }
 
-fn getOpt(w: *const model.Weights, buf: *NameBuf, comptime fmt: []const u8, args: anytype) ?mlx.mlx_array {
-    const name = std.fmt.bufPrint(buf, fmt, args) catch return null;
-    return w.get(name);
-}
-
 /// Load a quantized triple `<base>.{weight,scales,biases}` and solve its
 /// quant params from geometry (mixed-mix checkpoints resolve per weight).
 fn getQ(cfg: *const ModelConfig, w: *const model.Weights, buf: *NameBuf, in_dim: u32, comptime base: []const u8, args: anytype) !Q {
@@ -224,16 +219,12 @@ fn loadDsv4Layer(cfg: *const ModelConfig, w: *const model.Weights, buf: *NameBuf
 
 /// DSpark stage count: ratio-table entries past the trunk (the release
 /// carries no n_mtp_layers key and a stale num_nextn_predict_layers=1 against
-/// 3 shipped stages), gated on dspark_block_size AND the stage weights
-/// actually being on disk (a mirror may drop them).
-fn dsparkStageCount(cfg: *const ModelConfig, w: *const model.Weights) u32 {
+/// 3 shipped stages), gated on dspark_block_size. A config that declares
+/// DSpark whose mtp.* weights are missing is a hard MissingWeight load error
+/// — only our converter's layout is supported, and it always ships them.
+fn dsparkStageCount(cfg: *const ModelConfig) u32 {
     if (cfg.dsv4_dspark_block_size == 0) return 0;
     if (cfg.dsv4_n_compress_ratios <= cfg.num_hidden_layers) return 0;
-    var buf: NameBuf = undefined;
-    if (getOpt(w, &buf, "mtp.0.attn_norm.weight", .{}) == null) {
-        log.warn("dsv4: config declares DSpark but mtp.0.* weights are absent — draft disabled\n", .{});
-        return 0;
-    }
     return cfg.dsv4_n_compress_ratios - cfg.num_hidden_layers;
 }
 
@@ -241,7 +232,7 @@ pub fn loadDsv4Weights(allocator: std.mem.Allocator, cfg: *const ModelConfig, w:
     var buf: NameBuf = undefined;
     const n_layers = cfg.num_hidden_layers;
     const hidden = cfg.hidden_size;
-    const n_mtp = dsparkStageCount(cfg, w);
+    const n_mtp = dsparkStageCount(cfg);
 
     const layers = try allocator.alloc(Dsv4Layer, n_layers + n_mtp);
     errdefer allocator.free(layers);
@@ -2696,11 +2687,14 @@ test "dsv4: forwardPrefill on the REAL mirror continues 'The capital of France i
     var ids = std.array_list.Managed(u32).init(allocator);
     defer ids.deinit();
     try ids.appendSlice(&.{ 671, 6102, 294, 8760, 344 }); // "The capital of France is"
-    // Ground truth RE-DERIVED on the 0731 weights (tests/dsv4_mlx_ref.py,
-    // 2026-07-31): 11111, 66910 = ' Paris', '.",'. The preview's second
-    // token was 16 ('.') — a weights-pinned expectation, so a checkpoint
-    // bump re-derives it from the oracle before anyone calls a diff a bug.
-    const want = [_]u32{ 11111, 66910 };
+    // Ground truth RE-DERIVED per MIRROR (tests/dsv4_mlx_ref.py) — the
+    // expectation is weights-pinned, so a checkpoint OR quant-recipe bump
+    // re-derives it from the oracle before anyone calls a diff a bug.
+    // imx-2-3-8bit (imatrix gs128, 2026-08-01): 11111, 16 = ' Paris', '.'.
+    // iQ-MLX-3.3bpw (greedy late-layer 3b plan, 2026-08-03): re-derived,
+    // SAME 11111, 16. The superseded mixed-2-3-8bit (minmax gs64) continued
+    // 11111, 66910 ('.",') — same first token, near-tie second.
+    const want = [_]u32{ 11111, 16 };
     for (want) |w| {
         const logits = try forwardPrefill(&mdl, allocator, ids.items);
         defer allocator.free(logits);
@@ -2735,8 +2729,9 @@ test "dsv4: forwardPrefill on the REAL mirror continues 'The capital of France i
             try testing.expect(std.math.isFinite(v));
             if (v > logits[best]) best = i;
         }
-        std.debug.print("dsv4 real decode after batched prefill -> token {d} (want 66910)\n", .{best});
-        try testing.expectEqual(@as(usize, 66910), best);
+        // Same weights-pinned second token as the prefill loop above.
+        std.debug.print("dsv4 real decode after batched prefill -> token {d} (want {d})\n", .{ best, want[1] });
+        try testing.expectEqual(@as(usize, want[1]), best);
     }
 }
 
@@ -3962,7 +3957,7 @@ test "dsv4: dsparkRound greedy-equivalence with serial decode (DSV4_MINI)" {
             var t: u32 = argmaxOf(pl);
             while (n_spec < T) {
                 const n_before = st.n;
-                var round = try dsparkRound(&mdl, allocator, &st, t);
+                var round = try dsparkRound(&mdl, allocator, &st, t, std.math.maxInt(usize));
                 defer round.deinit(allocator);
                 try testing.expectEqual(t, round.tokens[0]);
                 try testing.expect(round.accepted <= mdl.ds_block);
@@ -4091,7 +4086,7 @@ test "dsv4: the confidence gate truncates the block without changing tokens (DSV
     defer emitted.deinit(allocator);
     var guard: usize = 0;
     while (emitted.items.len < T and guard < 32) : (guard += 1) {
-        var round = try dsparkRound(&mdl, allocator, &st, t);
+        var round = try dsparkRound(&mdl, allocator, &st, t, std.math.maxInt(usize));
         defer round.deinit(allocator);
         try testing.expectEqual(@as(u32, 0), round.accepted); // gate shut
         try emitted.appendSlice(allocator, round.tokens);
@@ -4279,7 +4274,7 @@ test "dsv4: dsparkRound FULL-ACCEPT commits the block and leaves serial state (D
     @memset(rigged.logits, 0);
     @memset(rigged.confidence, 0);
     defer rigged.deinit(allocator);
-    var round = try dsparkRoundWith(&mdl, allocator, &st, chain[0], &rigged);
+    var round = try dsparkRoundWith(&mdl, allocator, &st, chain[0], &rigged, B);
     defer round.deinit(allocator);
     try testing.expectEqual(@as(u32, @intCast(B)), round.accepted); // FULL accept
     try testing.expectEqual(@as(usize, B + 1), round.tokens.len);
@@ -4295,6 +4290,21 @@ test "dsv4: dsparkRound FULL-ACCEPT commits the block and leaves serial state (D
         t = argmaxOf(l);
     }
     std.debug.print("dsv4 dsparkRound FULL-ACCEPT: {d}/{d} accepted, {d} serial tail tokens match\n", .{ round.accepted, B, TAIL });
+
+    // Token-budget cap: the same fully-accepted proposal must roll module
+    // state back to the capped prefix and choose its pending token at that
+    // boundary. Slicing round.tokens after return would leave st.n overrun.
+    var capped_st = try initDecodeState(&mdl, allocator);
+    defer deinitDecodeState(&capped_st);
+    const capped_pl = try prefillIntoState(&mdl, allocator, &capped_st, &prefix);
+    defer allocator.free(capped_pl);
+    const capped_entry = capped_st.n;
+    var capped = try dsparkRoundWith(&mdl, allocator, &capped_st, chain[0], &rigged, 2);
+    defer capped.deinit(allocator);
+    try testing.expectEqual(@as(u32, 2), capped.accepted);
+    try testing.expectEqualSlices(u32, chain[0..3], capped.tokens);
+    try testing.expectEqual(chain[3], capped.next_token);
+    try testing.expectEqual(capped_entry + 3, capped_st.n);
 }
 
 // ── incremental decode ─────────────────────────────────────────────────
@@ -8994,13 +9004,13 @@ pub fn dsparkObserve(m: *Dsv4Model, ph: DsparkPhases) void {
 /// pending rings are overwritten in place, so partial-position rollback has
 /// no anchor short of the snapshot). Exit: st = entry + tokens.len positions,
 /// next_token not in state — the entry invariant again.
-pub fn dsparkRound(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, t1: u32) !DsparkRound {
+pub fn dsparkRound(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, t1: u32, accepted_cap: usize) !DsparkRound {
     const prof_on = m.ds_prof != null;
     var clk: DsparkClock = if (prof_on) DsparkClock.init() else undefined;
     var draft = try dsparkDraft(m, gpa, st, t1);
     defer draft.deinit(gpa);
     const draft_ns: u64 = if (prof_on) clk.lap() else 0;
-    const round = try dsparkRoundWith(m, gpa, st, t1, &draft);
+    const round = try dsparkRoundWith(m, gpa, st, t1, &draft, accepted_cap);
     if (m.ds_prof != null) {
         var ph = round.phases;
         ph.draft_ns = draft_ns;
@@ -9015,7 +9025,7 @@ pub fn dsparkRound(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
 /// only this entry can exercise the no-rollback branch hermetically). Built
 /// ON TOP of the begin/finish split so the greedy and stochastic arms share
 /// one verify seam: begin → host read → argmax accept loop → finish.
-fn dsparkRoundWith(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, t1: u32, draft: *const DsparkDraft) !DsparkRound {
+fn dsparkRoundWith(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, t1: u32, draft: *const DsparkDraft, accepted_cap: usize) !DsparkRound {
     var pending = try dsparkBeginWith(m, gpa, st, t1, draft);
     defer pending.deinit();
     const B = pending.b;
@@ -9033,6 +9043,10 @@ fn dsparkRoundWith(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
         if (am != draft.ids[accepted + 1]) break;
         accepted += 1;
     }
+    // The always-emitted t1 consumes one request-budget token. Cap the draft
+    // prefix before choosing the pending token and before dsparkFinish commits
+    // or rolls module-owned state back to the accepted boundary.
+    accepted = @min(accepted, accepted_cap);
     const nrow = vl[accepted * m.vocab ..][0..m.vocab];
     var next_am: usize = 0;
     for (nrow, 0..) |v, j| {
@@ -9654,6 +9668,31 @@ test "dsv4: fused emission kernel matches the composed emission graph (GPU)" {
     }
 }
 
+/// Acquit a composed-vs-kernel fp4 mismatch ONLY when the pre-quant value
+/// sits at the rounding midpoint between the two returned grid points: the
+/// two arms sum the hadamard matmul in different orders, and a value a few
+/// ulps from the midpoint legitimately rounds to ADJACENT fp4 points on
+/// another machine (M5 measured composed -0.5 vs kernel -0.75, PR #223).
+/// Anything not at a midpoint is a real mismatch and still fails.
+fn fp4MidpointAcquits(composed: f32, kernel: f32, prequant: f32) bool {
+    const gap = @abs(composed - kernel);
+    if (gap == 0) return false;
+    const mid = (composed + kernel) * 0.5;
+    return @abs(prequant - mid) <= 0.05 * gap;
+}
+
+test "dsv4: fp4 midpoint acquittal accepts a rounding near-tie, rejects a real mismatch" {
+    // The M5 reading: adjacent grid points, pre-quant at the midpoint.
+    try testing.expect(fp4MidpointAcquits(-0.5, -0.75, -0.625));
+    // A few reduction-order ulps off the midpoint still acquits.
+    try testing.expect(fp4MidpointAcquits(-0.5, -0.75, -0.62501));
+    // A pre-quant value that rounds cleanly to one grid point is a bug.
+    try testing.expect(!fp4MidpointAcquits(-0.5, -0.75, -0.51));
+    try testing.expect(!fp4MidpointAcquits(-0.5, -0.75, -0.72));
+    // No gap: nothing to acquit.
+    try testing.expect(!fp4MidpointAcquits(1.0, 1.0, 1.0));
+}
+
 test "dsv4: fused decode-chain kernel matches the composed q/kv/idx/o chains (GPU)" {
     if (mlx.noGpuBackend()) return;
     const s = mlx.gpuStream();
@@ -9716,6 +9755,10 @@ test "dsv4: fused decode-chain kernel matches the composed q/kv/idx/o chains (GP
         defer _ = mlx.mlx_array_free(roped);
         var want_arr = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(want_arr);
+        // Pre-quant hadamard product (post==2 only): the fp4 midpoint
+        // acquittal below needs it to tell a rounding near-tie from a bug.
+        var prequant: ?[]f32 = null;
+        defer if (prequant) |p| alloc.free(p);
         switch (tc.post) {
             0 => try mlx.check(mlx.mlx_array_set(&want_arr, roped)),
             1 => {
@@ -9732,6 +9775,7 @@ test "dsv4: fused decode-chain kernel matches the composed q/kv/idx/o chains (GP
             else => {
                 const had = try gpuOp2(mlx.mlx_matmul, roped, hada, s);
                 defer _ = mlx.mlx_array_free(had);
+                prequant = try toHostF32(alloc, had, tc.h * tc.d, s);
                 const simd = try gpuFp4Sim(had, s);
                 defer _ = mlx.mlx_array_free(simd);
                 try mlx.check(mlx.mlx_array_set(&want_arr, simd));
@@ -9757,6 +9801,9 @@ test "dsv4: fused decode-chain kernel matches the composed q/kv/idx/o chains (GP
         defer alloc.free(got);
         for (want, got, 0..) |wv, gv, i| {
             if (!(@abs(wv - gv) <= 2e-3)) {
+                if (prequant) |pq| {
+                    if (fp4MidpointAcquits(wv, gv, pq[i])) continue;
+                }
                 std.debug.print("dec-chain mismatch h={d} d={d} post={d} i={d}: composed={e} kernel={e}\n", .{ tc.h, tc.d, tc.post, i, wv, gv });
                 try testing.expect(false);
             }
@@ -9903,6 +9950,86 @@ test "dsv4: fused MoE gate+up kernel is no worse than the composed gathers (GPU)
         std.debug.print("dsv4 moe gate+up bits={d}: err composed={e:.3} fused={e:.3}\n", .{ tc.bits, err_c, err_f });
         // no-worse-than-reference (house rule: never kernel-vs-kernel exact)
         try testing.expect(err_f <= err_c * 1.25 + 1e-3);
+    }
+}
+
+test "dsv4: gs-128 expert pack resolves per-weight and qmm matches the dequant reference" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const alloc = testing.allocator;
+    // The imatrix mirror ships trunk experts 2b/3b at gs 128 over a config
+    // whose top-level quantization block still says gs 64 — the loader owes
+    // the exact per-weight solve (getQ threads in_dim into
+    // computeQuantParams → affineParamsFromGeometry), and the qmm must serve
+    // the g128 pack through the resolved params. This is the "no Zig changes
+    // needed" proof for the g128 rebuild.
+    var cfg = model.ModelConfig{};
+    cfg.quant_bits = 8;
+    cfg.quant_group_size = 64;
+    cfg.quant_mode = .affine;
+    const K: usize = 256; // in_dim: 2 groups of 128
+    const N: usize = 16;
+    var rng = std.Random.DefaultPrng.init(41);
+    for ([_]u32{ 2, 3 }) |bits| {
+        const wf = try alloc.alloc(f32, N * K);
+        defer alloc.free(wf);
+        for (wf) |*v| v.* = (rng.random().float(f32) - 0.5) * 0.8;
+        const wshape = [_]c_int{ @intCast(N), @intCast(K) };
+        const w32 = uploadF32(wf, &wshape);
+        defer _ = mlx.mlx_array_free(w32);
+        var wb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wb);
+        try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+        var qv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(qv);
+        const empty = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(empty);
+        try mlx.check(mlx.mlx_quantize(&qv, wb, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(@intCast(bits)), "affine", empty, s));
+        var wq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wq);
+        try mlx.check(mlx.mlx_vector_array_get(&wq, qv, 0));
+        var sc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc);
+        try mlx.check(mlx.mlx_vector_array_get(&sc, qv, 1));
+        var bs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bs);
+        try mlx.check(mlx.mlx_vector_array_get(&bs, qv, 2));
+
+        const qp = transformer.computeQuantParams(&cfg, wq, sc, @intCast(K));
+        try testing.expectEqual(bits, qp.bits);
+        try testing.expectEqual(@as(u32, 128), qp.group_size);
+
+        const q = Q{ .w = wq, .s = sc, .b = bs, .qp = qp };
+        const xf = try alloc.alloc(f32, K);
+        defer alloc.free(xf);
+        for (xf) |*v| v.* = (rng.random().float(f32) - 0.5) * 2.0;
+        const xshape = [_]c_int{ 1, @intCast(K) };
+        const x32 = uploadF32(xf, &xshape);
+        defer _ = mlx.mlx_array_free(x32);
+        const y = try gpuQmmB(&q, x32, s);
+        defer _ = mlx.mlx_array_free(y);
+        const got = try toHostF32(alloc, y, N, s);
+        defer alloc.free(got);
+
+        // f32 dequant reference (no bf16 re-round — the qmm's in-kernel
+        // dequant computes in float) against the bf16-rounded x it sees.
+        var deq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(deq);
+        try mlx.check(mlx.mlx_dequantize(&deq, wq, sc, bs, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(@intCast(bits)), "affine", empty, .{ .value = .float32, .has_value = true }, s));
+        const dh = try toHostF32(alloc, deq, N * K, s);
+        defer alloc.free(dh);
+        var xb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xb);
+        try mlx.check(mlx.mlx_astype(&xb, x32, .bfloat16, s));
+        const xh = try toHostF32(alloc, xb, K, s);
+        defer alloc.free(xh);
+        for (0..N) |n| {
+            var t: f64 = 0;
+            for (0..K) |j| t += @as(f64, xh[j]) * dh[n * K + j];
+            try testing.expect(std.math.isFinite(got[n]));
+            try testing.expectApproxEqAbs(@as(f32, @floatCast(t)), got[n], 0.05);
+        }
     }
 }
 

@@ -55,22 +55,9 @@ private struct TestHFModel: Identifiable, Codable {
     }
     // Delegates to the real parser so this replica can't drift from it.
     var quantization: String? { HFModel.quantizationLabel(forId: id) }
+    // Delegates to the real estimator so this replica can't drift from it.
     var estimatedSizeBytes: Int64 {
-        guard let params = safetensors?.parameters else { return 0 }
-        var total: Int64 = 0
-        for (dtype, count) in params {
-            let bytesPerParam: Double
-            switch dtype.uppercased() {
-            case "F64": bytesPerParam = 8
-            case "F32", "U32", "I32": bytesPerParam = 4
-            case "F16", "BF16", "U16", "I16": bytesPerParam = 2
-            case "I8", "U8": bytesPerParam = 1
-            case let d where d.contains("4"): bytesPerParam = 0.5
-            default: bytesPerParam = 2
-            }
-            total += Int64(Double(count) * bytesPerParam)
-        }
-        return total
+        HFModel.estimateWeightBytes(parameters: safetensors?.parameters, id: id) ?? 0
     }
     var modelSize: String {
         let name = modelName
@@ -111,18 +98,30 @@ final class HFModelTests: XCTestCase {
         XCTAssertEqual(m.modelName, "gemma-4-e2b-it-4bit")
     }
 
-    func testSizeEstimation_BF16AndU32() {
-        let m = TestHFModel.make(
-            id: "test/model",
-            safetensors: TestHFSafetensors(
-                parameters: ["BF16": 631_148_099, "U32": 579_616_768],
-                total: 1_210_764_867
-            )
-        )
-        // BF16: 631M * 2 = 1.26 GB, U32: 579M * 4 = 2.32 GB → ~3.58 GB
-        let sizeGB = Double(m.estimatedSizeBytes) / (1024 * 1024 * 1024)
-        XCTAssertGreaterThan(sizeGB, 3.0)
-        XCTAssertLessThan(sizeGB, 4.0)
+    // HF reports packed U32 as the LOGICAL element count (a 27B 4-bit and
+    // 8-bit pack carry identical counts), so U32 is priced by the repo's bit
+    // width plus the group scale/bias overhead: (bits + 0.5) / 8 bytes each.
+    // Counts below are the live metadata; the bars are the repos' real sizes.
+    func testSizeEstimation_PackedU32PricedByRepoBits() {
+        let gb = 1024.0 * 1024 * 1024
+        let e2b = TestHFModel.make(
+            id: "mlx-community/gemma-4-e2b-it-4bit",
+            safetensors: TestHFSafetensors(parameters: ["BF16": 472_475_203, "U32": 4_631_822_336], total: nil))
+        XCTAssertEqual(Double(e2b.estimatedSizeBytes) / gb, 3.55 * 1e9 / gb, accuracy: 0.15)
+        let q27 = ["BF16": Int64(1_787_228_912), "U32": Int64(25_994_199_040)]
+        let q4 = TestHFModel.make(id: "ddalcu/Qwen3.8-27B-MLX-Serve-4bit", safetensors: TestHFSafetensors(parameters: q27, total: nil))
+        let q8 = TestHFModel.make(id: "ddalcu/Qwen3.8-27B-MLX-Serve-8bit", safetensors: TestHFSafetensors(parameters: q27, total: nil))
+        XCTAssertEqual(Double(q4.estimatedSizeBytes) / gb, 18.2 * 1e9 / gb, accuracy: 0.5)
+        XCTAssertEqual(Double(q8.estimatedSizeBytes) / gb, 31.2 * 1e9 / gb, accuracy: 0.5)
+        let fp4 = TestHFModel.make(id: "poolside/Laguna-XS-2.1-NVFP4-mlx", safetensors: TestHFSafetensors(parameters: q27, total: nil))
+        XCTAssertEqual(Double(fp4.estimatedSizeBytes) / gb, Double(q4.estimatedSizeBytes) / gb, accuracy: 0.01)
+        // No width in the id: the count is unpriceable, so the row falls to
+        // the tree-API fallback (estimatedSizeBytes 0 = needsFallbackFetch).
+        let unknown = TestHFModel.make(id: "test/model-dwq", safetensors: TestHFSafetensors(parameters: q27, total: nil))
+        XCTAssertEqual(unknown.estimatedSizeBytes, 0)
+        // Dense repos are unaffected.
+        let dense = TestHFModel.make(id: "test/model-bf16", safetensors: TestHFSafetensors(parameters: ["BF16": 1_000_000_000], total: nil))
+        XCTAssertEqual(dense.estimatedSizeBytes, 2_000_000_000)
     }
 
     func testSizeEstimation_NoSafetensors() {
@@ -660,6 +659,64 @@ final class HFModelQuantGateTests: XCTestCase {
         // Lockstep with the model_type gate the local (downloaded) rows use.
         XCTAssertTrue(supportedModelTypes.contains("laguna"))
     }
+
+    func testMuseGlimmerIsSupportedArchitecture() {
+        // meta-models Muse-Glimmer-30B (config.json model_type=muse_glimmer) is
+        // served by the MLX engine — same class as hy_v3/laguna: the model_type
+        // gate learned it, the HF tag gate never did. Tags verified live
+        // 2026-08-11: our 8-bit mirror carries ["mlx", "muse_glimmer", ...] and
+        // upstream carries ["transformers", "muse_glimmer", ...] — no
+        // gemma/qwen/llama prefix anywhere.
+        let m = mlx(id: "ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit",
+                    tags: ["mlx", "safetensors", "muse_glimmer", "mlx-serve",
+                           "text-generation", "conversational"])
+        XCTAssertTrue(m.isSupportedArchitecture,
+                      "muse_glimmer is served (supportedModelTypes + Zig supported_model_types) — the HF tag gate must accept it")
+        XCTAssertNil(m.incompatibleReason)
+        // Upstream is tagged image-text-to-text (vision weights ship but are
+        // dropped at load) — that pipeline tag is already compatible, so the
+        // row must come through clean there too.
+        let upstream = HFModel(id: "meta-models/Muse-Glimmer-30B", downloads: 1, likes: 1,
+                               lastModified: nil,
+                               tags: ["transformers", "safetensors", "muse_glimmer",
+                                      "image-text-to-text", "conversational"],
+                               safetensors: nil, pipelineTag: "image-text-to-text")
+        XCTAssertNil(upstream.incompatibleReason)
+        // Lockstep with the model_type gate the local (downloaded) rows use.
+        XCTAssertTrue(supportedModelTypes.contains("muse_glimmer"))
+    }
+
+    func testLfm2VlIsSupported() {
+        // LiquidAI LFM2.5-VL ships config.json `model_type: "lfm2_vl"` — with an
+        // UNDERSCORE. The app's set carried the hyphenated "lfm2-vl", which the
+        // exact-match gate never matches, so every LFM2-VL pack read as
+        // "Unsupported architecture" in the Downloaded tab while the server
+        // served it happily (Zig matches the "lfm2" PREFIX, so the two gates
+        // disagreed). Tags verified live 2026-08-13.
+        let m = mlx(id: "LiquidAI/LFM2.5-VL-3B-MLX-4bit",
+                    tags: ["mlx", "safetensors", "lfm2_vl", "image-text-to-text", "conversational"])
+        XCTAssertTrue(m.isSupportedArchitecture,
+                      "lfm2_vl is served (SigLIP2-NaFlex tower + projector) — the HF tag gate must accept it")
+        XCTAssertNil(m.incompatibleReason)
+        let upstream = HFModel(id: "LiquidAI/LFM2.5-VL-3B", downloads: 1, likes: 1,
+                               lastModified: nil,
+                               tags: ["transformers", "safetensors", "lfm2_vl",
+                                      "image-text-to-text", "conversational"],
+                               safetensors: nil, pipelineTag: "image-text-to-text")
+        XCTAssertNil(upstream.incompatibleReason)
+        // The gate a DOWNLOADED pack goes through is the model_type set, and
+        // that is where the spelling was wrong.
+        XCTAssertTrue(supportedModelTypes.contains("lfm2_vl"),
+                      "config.json spells it lfm2_vl; a hyphen here silently unsupports every LFM2-VL download")
+    }
+
+    func testGptOssTagIsSupportedArchitecture() {
+        let m = mlx(id: "mlx-community/gpt-oss-20b-MXFP4-Q8",
+                    tags: ["mlx", "safetensors", "gpt_oss", "text-generation", "conversational"])
+        XCTAssertTrue(m.isSupportedArchitecture,
+                      "gpt_oss tags should be treated as supported architecture")
+        XCTAssertNil(m.incompatibleReason)
+    }
 }
 
 // MARK: - HFModel.quantization label parsing
@@ -892,5 +949,39 @@ final class HFModelIsDrafterTests: XCTestCase {
     /// alone — the heuristic requires the gemma-4 shape too.
     func testNonGemma4ModelWithAssistantInNameIsNotADrafter() {
         XCTAssertFalse(hf(id: "someone/my-assistant-bot-7b").isDrafter)
+    }
+}
+
+// MARK: - Zig <-> Swift supported model_type sync
+
+/// The server's `supported_model_types` (src/model_discovery.zig) and the
+/// app's `supportedModelTypes` are the same list spelled twice. Every new
+/// arch has been added to one and forgotten on the other at least once, so
+/// this reads the Zig list and asserts the app knows every entry.
+final class SupportedModelTypeSyncTests: XCTestCase {
+    func testEveryZigSupportedModelTypeIsInTheAppSet() throws {
+        let zig = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("src/model_discovery.zig")
+        let src = try String(contentsOf: zig, encoding: .utf8)
+        guard let start = src.range(of: "const supported_model_types = [_][]const u8{"),
+              let end = src.range(of: "};", range: start.upperBound..<src.endIndex) else {
+            return XCTFail("supported_model_types list not found in model_discovery.zig")
+        }
+        var types: [String] = []
+        for line in src[start.upperBound..<end.lowerBound].split(separator: "\n") {
+            let code = line.split(separator: "/", maxSplits: 1).first.map(String.init) ?? ""
+            for m in code.split(separator: ",") {
+                let t = m.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("\"") && t.hasSuffix("\"") && t.count > 2 {
+                    types.append(String(t.dropFirst().dropLast()))
+                }
+            }
+        }
+        XCTAssertGreaterThan(types.count, 20, "parsed too few entries; the Zig list's shape changed")
+        let missing = types.filter { !supportedModelTypes.contains($0) }
+        XCTAssertTrue(missing.isEmpty,
+                      "served by Zig but missing from HFModels.swift supportedModelTypes: \(missing)")
     }
 }

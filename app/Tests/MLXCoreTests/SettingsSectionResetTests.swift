@@ -42,14 +42,14 @@ final class SettingsSectionResetTests: XCTestCase {
         o.prefixCacheMem = "9GB"; o.enablePrefixCacheDisk = true; o.prefixCacheDisk = "99GB"
         o.llamaKvQuant = .q4; o.llamaCacheEntries = 9
         o.ssdStreaming = true
-        o.tokenizeCacheEntries = 9
+        o.tokenizeCacheEntries = 9; o.idleEvictSecs = 900
         o.defaultMaxTokens = 99; o.defaultTemperature = 1.9; o.defaultTopP = 0.1
         o.defaultTopK = 9; o.defaultRepeatPenalty = 1.5; o.defaultPresencePenalty = 0.5
         o.defaultReasoningBudget = 99; o.defaultEnableThinking = true
         o.perRequestEnablePLD = .on; o.perRequestEnableDrafter = .off
         o.telegram.enabled = true; o.telegram.botToken = "123:secret"
         o.telegram.allowedChatIds = [42]; o.telegram.agentMode = true
-        o.sandbox.enabled = true
+        o.sandbox.enabled = true; o.toolsOnlyWhenAsked = true
         o.voiceClonePath = "/tmp/clip.wav"; o.voiceCloneEnabled = false
         o.voiceCloneLabel = "My clip"; o.wakePhrase = "hey robot"
         return o

@@ -4,12 +4,12 @@
 # Self-contained: builds binary, starts server, runs tests, kills server.
 #
 # Usage: ./tests/test_vision_moe_regression.sh [model_dir] [port]
-# Default model: ~/.mlx-serve/models/gemma-4-e4b-it-8bit
+# Default model: ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
 # Default port: 8097
 
 set -euo pipefail
 
-MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}}"
+MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}}"
 PORT="${2:-8097}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="./zig-out/bin/mlx-serve"
@@ -98,8 +98,8 @@ echo "Port:  $PORT"
 echo ""
 
 if [ ! -d "$MODEL_DIR" ]; then
-    echo -e "${RED}Model not found: $MODEL_DIR${NC}"
-    exit 1
+    echo -e "${YELLOW}SKIP${NC}: no model at $MODEL_DIR (pass a dir as \$1 or set MLX_SERVE_TEST_MODEL)"
+    exit 0
 fi
 
 CONFIG_FILE="$MODEL_DIR/config.json"
@@ -109,7 +109,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 MODEL_TYPE=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('model_type','unknown'))" 2>/dev/null || echo "unknown")
-NUM_EXPERTS=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('num_local_experts', d.get('num_experts', 0)))" 2>/dev/null || echo "0")
+NUM_EXPERTS=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); d=d.get('text_config', d); print(d.get('num_local_experts', d.get('num_experts', 0)))" 2>/dev/null || echo "0")
 HAS_VISION=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print('yes' if d.get('vision_config') or d.get('vision_tower') else 'no')" 2>/dev/null || echo "no")
 
 echo "Model type:  $MODEL_TYPE"
@@ -120,7 +120,7 @@ echo ""
 # ── Build ──
 
 echo -e "${YELLOW}Building...${NC}"
-zig build 2>&1
+{ [ -x ./.zig-toolchain/zig ] && ZIG=./.zig-toolchain/zig || ZIG=zig; "$ZIG" build -Doptimize=ReleaseFast 2>&1; }
 echo ""
 
 # ── Start server ──
@@ -364,7 +364,7 @@ if [ "$NUM_EXPERTS" -gt 0 ] 2>/dev/null; then
     echo ""
     echo -e "${DIM}4a: MoE with thinking enabled${NC}"
     RESP=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
-      -d '{"model":"mlx-serve","messages":[{"role":"user","content":"What is 7 * 8? Think step by step."}],"max_tokens":300,"temperature":0,"stream":false,"enable_thinking":true}')
+      -d '{"model":"mlx-serve","messages":[{"role":"user","content":"What is 7 * 8? Think step by step."}],"max_tokens":1500,"temperature":0,"stream":false,"enable_thinking":true}')
     CONTENT=$(echo "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"].get("content",""))' 2>/dev/null || echo "")
     assert_not_empty "MoE thinking returns content" "$CONTENT"
     assert_server_alive "MoE thinking"

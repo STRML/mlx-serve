@@ -135,11 +135,11 @@ final class MediaBundleTests: XCTestCase {
     func testMageFlowDiffusersLayoutReadyWithoutRootConfig() throws {
         let fm = FileManager.default
         let root = NSTemporaryDirectory() + "mageflowtest-\(UUID().uuidString)"
-        let modelDir = (root as NSString).appendingPathComponent("microsoft/Mage-Flow-Turbo")
+        let comp = ImageModelPreset.mageFlowTurbo.bundle.components[0]
+        let modelDir = (root as NSString).appendingPathComponent(comp.repo)
         try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
         defer { try? fm.removeItem(atPath: root) }
 
-        let comp = ImageModelPreset.mageFlowTurbo.bundle.components[0]
         // Empty dir → not ready.
         XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
         // The diffusers root marker + all four weight subdirs, plus a real
@@ -162,6 +162,291 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertEqual(b.primaryRepo, "dgrauet/ltx-2.3-mlx-q4")
         XCTAssertEqual(b.dependencyRepos, ["mlx-community/gemma-3-12b-it-4bit"])
         XCTAssertEqual(b.components[0].selection.keepSafetensors?.count, 8)   // allowlist (incl. audio VAE + vocoder + image encoder + two-stage weights)
+    }
+
+    /// 2.5 ships its own text encoder, so its bundle must NOT carry the shared
+    /// Gemma-3 chat model as a dependency (8 GB fetched for something the
+    /// server never opens) — and it must reach INTO the pack for the encoder
+    /// it does use, which needs a recursive fetch and a directory ready
+    /// marker. Every one of those follows from `shipsOwnTextEncoder`, which is
+    /// why the flag is what the bundle switches on.
+    func testLtx25ShipsItsOwnEncoderAndPullsNoSharedGemma() {
+        let b = VideoModelPreset.ltx25Q4.bundle
+        XCTAssertTrue(VideoModelPreset.ltx25Q4.shipsOwnTextEncoder)
+        XCTAssertEqual(b.components.count, 1)
+        XCTAssertEqual(b.primaryRepo, "ddalcu/LTX-2.5-MLX-Serve-4bit")
+        XCTAssertEqual(b.dependencyRepos, [])
+        XCTAssertFalse(b.dependencyRepos.contains(MediaBundle.ltxGemmaRepo))
+        XCTAssertTrue(b.components[0].selection.recursive)
+        // The encoder's weights are `model.safetensors` — an allowlist without
+        // it downloads a pack whose text path cannot load.
+        XCTAssertEqual(b.components[0].selection.keepSafetensors?.contains("model.safetensors"), true)
+        XCTAssertTrue(b.components[0].readyMarkers.contains(MediaBundle.ltx25TextEncoderDir))
+
+        // 2.3 keeps the shared encoder — the flag is what separates them, not
+        // the backend (both are `.ltx` and share the whole request surface).
+        XCTAssertFalse(VideoModelPreset.ltx23Q4.shipsOwnTextEncoder)
+        XCTAssertEqual(VideoModelPreset.ltx23Q4.bundle.dependencyRepos, [MediaBundle.ltxGemmaRepo])
+        XCTAssertEqual(VideoModelPreset.ltx25Q4.backend, VideoModelPreset.ltx23Q4.backend)
+
+        // First run pulls nothing extra, so the two size figures agree. On 2.3
+        // they must NOT — that difference is the shared encoder.
+        XCTAssertEqual(VideoModelPreset.ltx25Q4.approxDownloadGB,
+                       VideoModelPreset.ltx25Q4.approxFirstRunDownloadGB)
+        XCTAssertNotEqual(VideoModelPreset.ltx23Q4.approxDownloadGB,
+                          VideoModelPreset.ltx23Q4.approxFirstRunDownloadGB)
+    }
+
+    /// Every LTX pack that carries its own text encoder must ride the `ltx25`
+    /// bundle, and every LTX bundle must pull BOTH transformer variants — the
+    /// two-stage tiers need `dev` for stage 1 and `distilled` for the refine,
+    /// and a pack missing one 400s at generate time after a 40-60 GB download.
+    /// Written over `all` so a preset added later (an 8-bit pack, a 2.6) is
+    /// covered the day it lands rather than the day someone remembers.
+    func testEveryLtxPackPullsBothTransformersAndItsOwnEncoder() {
+        var checked = 0
+        for preset in VideoModelPreset.all where preset.backend == .ltx {
+            checked += 1
+            let files = Set(preset.bundle.components.flatMap { Array($0.selection.keepSafetensors ?? []) })
+            XCTAssertTrue(files.contains("transformer-dev.safetensors"), "\(preset.id) never fetches the dev transformer")
+            XCTAssertTrue(files.contains("transformer-distilled.safetensors"), "\(preset.id) never fetches the distilled transformer")
+            if preset.shipsOwnTextEncoder {
+                XCTAssertTrue(preset.bundle.id.hasPrefix("ltx25:"),
+                              "\(preset.id) ships its own encoder but uses \(preset.bundle.id) — the shared Gemma-3 fetch is 8 GB it never opens")
+                XCTAssertEqual(preset.bundle.components.count, 1, "\(preset.id) should have no second component")
+                XCTAssertTrue(preset.bundle.components[0].readyMarkers.contains(MediaBundle.ltx25TextEncoderDir),
+                              "\(preset.id) reads ready without its text encoder")
+            }
+        }
+        XCTAssertGreaterThanOrEqual(checked, 2, "no LTX preset found — guard is vacuous")
+    }
+
+    /// LTX-2.5's own pipeline defaults denoise a 1920x1088 canvas; our ladder
+    /// stopped at 768x512, which is 0.39 MP against the reference's 2.09 MP.
+    /// That is the whole "looks softer than the published clips" gap before
+    /// anything about quantization: a canvas the model was not asked to fill
+    /// cannot be sharpened by steps, guidance or a wider quant.
+    ///
+    /// Pins the ladder REACHES the reference canvas rather than pinning the
+    /// exact list — a future ladder may re-space its rungs, but dropping the
+    /// top one silently puts every user back on a preview-sized render.
+    func testTheLtxLadderReachesTheReferenceCanvas() {
+        for preset in VideoModelPreset.all where preset.backend == .ltx {
+            let best = preset.resolutions.map { $0.width * $0.height }.max() ?? 0
+            XCTAssertGreaterThanOrEqual(
+                best, 1920 * 1088,
+                "\(preset.id) tops out at \(best) px — below LTX's own 1920x1088 default canvas")
+            // And the rungs must be distinct enough to be worth offering: at
+            // least four separate pixel counts, or the menu is decoration.
+            let areas = Set(preset.resolutions.map { $0.width * $0.height })
+            XCTAssertGreaterThanOrEqual(areas.count, 4, "\(preset.id) ladder has \(areas.count) distinct sizes")
+        }
+    }
+
+    /// The one-stage tiers run the DISTILLED transformer, whose sigma table is
+    /// fixed at 8 steps — the server clamps anything else and logs it. A tier
+    /// asking for 12 is a dead knob: it reads as "more steps than Fast" in the
+    /// pane's own hint while both tiers run the identical schedule.
+    func testOneStageTiersAskForTheStepCountTheDistilledScheduleActuallyRuns() {
+        for preset in VideoModelPreset.all where preset.backend == .ltx {
+            for q in QualityPreset.allCases {
+                let s = preset.settings(q)
+                guard s.mode == .oneStage else { continue }
+                XCTAssertEqual(s.steps, 8,
+                               "\(preset.id) \(q.label): one-stage runs the fixed 8-step distilled table, tier asks \(s.steps)")
+            }
+        }
+    }
+
+    /// A two-stage tier denoises at HALF the requested size and upscales, so on
+    /// a small canvas "Quality" is a 384x256 render — worse than the one-stage
+    /// tier it sits below in the menu. The pane must be able to say so, which
+    /// means the rule is a function, not a comment.
+    func testTwoStageTierWarnsUntilTheCanvasIsBigEnoughToHalve() {
+        // 768x512 halves to 384x256 — below the model's smallest offered rung.
+        XCTAssertNotNil(VideoModelPreset.ltx25Q4.twoStageCanvasNote(width: 768, height: 512))
+        XCTAssertNotNil(VideoModelPreset.ltx25Q4.twoStageCanvasNote(width: 1024, height: 576))
+        // 1600x896 halves to 800x448, 1920x1088 to 960x544 — both at or above
+        // the smallest canvas the picker offers, so the tier pays for itself.
+        XCTAssertNil(VideoModelPreset.ltx25Q4.twoStageCanvasNote(width: 1600, height: 896))
+        XCTAssertNil(VideoModelPreset.ltx25Q4.twoStageCanvasNote(width: 1920, height: 1088))
+        // H3 has no two-stage pipeline, so it never carries the note.
+        XCTAssertNil(VideoModelPreset.minimaxH3.twoStageCanvasNote(width: 768, height: 512))
+    }
+
+    /// The default canvas is a per-MAC decision: 1920x1088 is right on this
+    /// 128 GB machine and unusable on a 16 GB one, and a single static default
+    /// has to be sized for the smallest Mac — which is how everyone ended up
+    /// rendering previews. Mirrors `RecommendedModelPick.starterPick`: a pure
+    /// function of physical memory, so it is testable off-machine.
+    func testDefaultCanvasScalesWithTheMacsMemory() {
+        let p = VideoModelPreset.ltx25Q4
+        // 16 GB cannot hold the 24 GB pack at all — it falls back to the
+        // smallest rung rather than to a canvas it definitely cannot render.
+        let small = p.recommendedResolution(totalGB: 16)
+        let mid   = p.recommendedResolution(totalGB: 36)
+        let big   = p.recommendedResolution(totalGB: 128)
+        XCTAssertEqual(small, p.resolutions.min { $0.width * $0.height < $1.width * $1.height })
+        XCTAssertLessThanOrEqual(small.width * small.height, 768 * 512,
+                                 "16 GB Mac must not default to a canvas it cannot hold")
+        XCTAssertGreaterThan(big.width * big.height, small.width * small.height,
+                             "a 128 GB Mac defaults to the same canvas as a 16 GB one")
+        XCTAssertGreaterThanOrEqual(mid.width * mid.height, small.width * small.height)
+        // Every pick must be a rung the picker actually offers, or the menu
+        // renders blank on first launch.
+        for r in [small, mid, big] {
+            XCTAssertTrue(p.resolutions.contains(r), "\(r.label) is not on the ladder")
+        }
+        // And the auto-pick stays inside what the frame ladder can serve: a
+        // default nobody can render at the default length is not a default.
+        let frames = p.settings(p.defaultQuality).numFrames
+        for (gb, r) in [(36, mid), (128, big)] {
+            XCTAssertGreaterThanOrEqual(
+                RAMChecker.safeFrameCap(model: p, width: r.width, height: r.height, available: gb), frames,
+                "\(gb) GB: default canvas \(r.label) cannot hold \(frames) frames")
+        }
+    }
+
+    /// The whole RGB volume comes back as ONE base64 blob (the server
+    /// base64s `frames.rgb` into the JSON body and the app decodes it in
+    /// memory), so a frame count is only offerable if its payload is. At
+    /// 1920x1088 a 193-frame clip is 1.2 GB of raw RGB — 1.6 GB base64, held
+    /// twice on each side. The ladder must shorten as the canvas grows.
+    ///
+    /// Hard cap rather than the existing soft RAM warning: an over-budget
+    /// pick does not run slowly, it hangs and then dies.
+    func testTheFrameLadderShortensAsTheCanvasGrows() {
+        let p = VideoModelPreset.ltx25Q4
+        let small = p.frameOptions(width: 768, height: 512)
+        let big = p.frameOptions(width: 1920, height: 1088)
+        XCTAssertEqual(small.last, p.maxFrames, "768x512 is nowhere near the payload budget")
+        XCTAssertLessThan(big.last ?? 0, small.last ?? 0, "1920x1088 must offer fewer frames than 768x512")
+        for opts in [small, big] {
+            XCTAssertFalse(opts.isEmpty)
+            for n in opts { XCTAssertEqual((n - 1) % 8, 0, "\(n) is off LTX's 8N+1 ladder") }
+        }
+        // Every offered combination stays inside the budget it was cut for.
+        for r in p.resolutions {
+            guard let longest = p.frameOptions(width: r.width, height: r.height).last else {
+                return XCTFail("\(r.label) offers no frame counts")
+            }
+            XCTAssertLessThanOrEqual(longest * r.width * r.height * 3, VideoModelPreset.maxFramePayloadBytes,
+                                     "\(r.label) x \(longest)f exceeds the response-payload budget")
+        }
+        // A canvas so large nothing fits still offers the ladder's first rung
+        // rather than an empty picker.
+        XCTAssertFalse(p.frameOptions(width: 4096, height: 4096).isEmpty)
+    }
+
+    /// Every LTX resolution must survive every QUALITY TIER, and two of the
+    /// four tiers run a two-stage pipeline whose stage 1 is HALF resolution —
+    /// so the server needs both edges divisible by 64 (the latent grid is /32,
+    /// halved). 704x480 and 480x704 are only /32, so picking Quality or Super
+    /// Quality on them earned a 400 with no way to tell from the pane which
+    /// combination was the bad one. The default was one of them.
+    ///
+    /// A resolution offered on a tier that refuses it is the dead-control
+    /// class: the pane must not present a combination the server rejects.
+    func testEveryLtxResolutionSurvivesTheTwoStagePipelines() {
+        // The server gates on the PIPELINE, not the backend, so this asks every
+        // video preset the same question and only holds those that actually
+        // offer a two-stage tier to the /64 rule. A future backend that adopts
+        // two-stage is covered the day it does; H3 (one-stage only) is not
+        // constrained by a rule that cannot apply to it.
+        var checked = 0
+        for preset in VideoModelPreset.all {
+            let twoStageTiers = QualityPreset.allCases.filter {
+                preset.settings($0).mode != .oneStage
+            }
+            guard !twoStageTiers.isEmpty else { continue }
+            checked += 1
+            // Every resolution offered must be legal for those tiers.
+            for r in preset.resolutions {
+                XCTAssertEqual(r.width % 64, 0,
+                               "\(preset.id): \(r.label) width \(r.width) is not /64 — 400s on \(twoStageTiers.map(\.label))")
+                XCTAssertEqual(r.height % 64, 0,
+                               "\(preset.id): \(r.label) height \(r.height) is not /64 — 400s on \(twoStageTiers.map(\.label))")
+            }
+            XCTAssertEqual(preset.defaultResolution.width % 64, 0, "\(preset.id) default resolution is not /64")
+            XCTAssertEqual(preset.defaultResolution.height % 64, 0, "\(preset.id) default resolution is not /64")
+        }
+        // Both LTX presets offer two-stage; a zero here means the loop went
+        // vacuous and the guard stopped guarding anything.
+        XCTAssertGreaterThanOrEqual(checked, 2, "no video preset offers a two-stage tier — guard is vacuous")
+    }
+
+    /// The published repo's ACTUAL file tree (ddalcu/LTX-2.5-MLX-Serve-4bit),
+    /// run through the real bundle selection. A 2.5 pack is only useful if the
+    /// download brings the whole engine AND the in-pack text encoder — and a
+    /// download that quietly misses one file fails 36 GB later, at load, with
+    /// a missing-weight error nobody can map back to the allowlist.
+    func testLtx25BundlePullsEveryFileThePublishedRepoNeeds() {
+        let entries: [[String: Any]] = [
+            ["path": ".gitattributes", "type": "file", "size": 1674],
+            ["path": "LICENSE.md", "type": "file", "size": 30938],
+            ["path": "README.md", "type": "file", "size": 5000],
+            ["path": "ltx-acceptable-use-policy-snapshot-2026-08-12.pdf", "type": "file", "size": 110423],
+            ["path": "config.json", "type": "file", "size": 1039],
+            ["path": "embedded_config.json", "type": "file", "size": 2529],
+            ["path": "quantize_config.json", "type": "file", "size": 100],
+            ["path": "split_model.json", "type": "file", "size": 412],
+            ["path": "spatial_upscaler_x2_v1_1_config.json", "type": "file", "size": 275],
+            ["path": "temporal_upscaler_x2_v1_0_config.json", "type": "file", "size": 273],
+            ["path": "transformer-distilled.safetensors", "type": "file", "size": 11_320_068_903],
+            ["path": "transformer-dev.safetensors", "type": "file", "size": 11_320_068_903],
+            ["path": "connector.safetensors", "type": "file", "size": 6_344_495_770],
+            ["path": "vae_decoder.safetensors", "type": "file", "size": 814_349_515],
+            ["path": "vae_encoder.safetensors", "type": "file", "size": 637_885_335],
+            ["path": "audio_vae.safetensors", "type": "file", "size": 106_509_020],
+            ["path": "vocoder.safetensors", "type": "file", "size": 258_314_115],
+            ["path": "spatial_upscaler_x2_v1_1.safetensors", "type": "file", "size": 995_745_061],
+            ["path": "temporal_upscaler_x2_v1_0.safetensors", "type": "file", "size": 261_945_581],
+            ["path": "gemma4-12b-ltx-v1/model.safetensors", "type": "file", "size": 6_699_162_168],
+            ["path": "gemma4-12b-ltx-v1/config.json", "type": "file", "size": 4438],
+            ["path": "gemma4-12b-ltx-v1/tokenizer.json", "type": "file", "size": 32_169_626],
+            ["path": "gemma4-12b-ltx-v1/tokenizer_config.json", "type": "file", "size": 3736],
+            ["path": "gemma4-12b-ltx-v1/generation_config.json", "type": "file", "size": 255],
+            ["path": "gemma4-12b-ltx-v1/chat_template.jinja", "type": "file", "size": 18683],
+            ["path": "gemma4-12b-ltx-v1/processor_config.json", "type": "file", "size": 1382],
+        ]
+        let sel = VideoModelPreset.ltx25Q4.bundle.components.first!.selection
+        let picked = Set(DownloadManager.selectNeededFiles(from: entries, selection: sel).map(\.0))
+
+        // Everything the LTX engine opens by name.
+        for f in ["config.json", "transformer-distilled.safetensors", "transformer-dev.safetensors",
+                  "connector.safetensors", "vae_decoder.safetensors", "vae_encoder.safetensors",
+                  "audio_vae.safetensors", "vocoder.safetensors",
+                  "spatial_upscaler_x2_v1_1.safetensors", "temporal_upscaler_x2_v1_0.safetensors"] {
+            XCTAssertTrue(picked.contains(f), "engine file \(f) would not be downloaded")
+        }
+        // The in-pack text encoder: weights AND the tokenizer the server loads
+        // beside them. Missing either is a pack that downloads and cannot encode.
+        for f in ["gemma4-12b-ltx-v1/model.safetensors", "gemma4-12b-ltx-v1/config.json",
+                  "gemma4-12b-ltx-v1/tokenizer.json", "gemma4-12b-ltx-v1/tokenizer_config.json"] {
+            XCTAssertTrue(picked.contains(f), "text-encoder file \(f) would not be downloaded")
+        }
+        // Every ready marker must be satisfiable from what was picked, or the
+        // pane offers Download forever on a complete install.
+        for marker in VideoModelPreset.ltx25Q4.bundle.components.first!.readyMarkers {
+            let satisfied = picked.contains(marker) || picked.contains { $0.hasPrefix(marker + "/") }
+            XCTAssertTrue(satisfied, "ready marker \(marker) is never downloaded")
+        }
+        XCTAssertEqual(picked.filter { $0.hasSuffix(".safetensors") }.count, 10)
+    }
+
+    /// The encoder subdir is a three-way contract — the server resolves it,
+    /// the bundle fetches it, the ready marker checks it — with no compiler
+    /// between the Swift and Zig halves. Renaming it on one side makes every
+    /// 2.5 pack fail to load with a message about a missing encoder, so the
+    /// name is scanned out of the server source (same shape as the
+    /// `turbo_lora.safetensors` guard).
+    func testLtx25TextEncoderDirMatchesTheServersOwnConstant() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let src = try String(contentsOf: root.appendingPathComponent("src/ltx_video.zig"), encoding: .utf8)
+        XCTAssertTrue(src.contains("\"\(MediaBundle.ltx25TextEncoderDir)\""),
+                      "src/ltx_video.zig does not name \(MediaBundle.ltx25TextEncoderDir) — the app would fetch an encoder the server never looks for")
     }
 
     func testFluxAndTtsBundlesAreRecursiveSingleComponent() {
@@ -305,7 +590,7 @@ final class MediaBundleTests: XCTestCase {
         // Mage-Flow uses the final hidden state — no rebalance UI.
         XCTAssertEqual(p.condWeightCount, 0)
         XCTAssertTrue(ImageModelPreset.all.contains { $0.variant == .mageFlowEditTurbo })
-        XCTAssertEqual(p.repo, "microsoft/Mage-Flow-Edit-Turbo")
+        XCTAssertEqual(p.repo, "mage-flow-community/Mage-Flow-Edit-Turbo")
         // Same diffusers-layout bundle shape as Turbo.
         let b = p.bundle
         XCTAssertEqual(b.components.count, 1)
@@ -317,14 +602,6 @@ final class MediaBundleTests: XCTestCase {
         for marker in ["transformer", "vae", "text_encoder", "scheduler"] {
             XCTAssertTrue(m.contains(marker), "missing readyMarker \(marker)")
         }
-    }
-
-    func testNsfwClassifierProvisioningDefaults() {
-        // Shared content-filter classifier: the original public Apache-2.0 repo.
-        XCTAssertEqual(DownloadManager.nsfwClassifierRepo, "Falconsai/nsfw_image_detection")
-        // Safe mode is ON by default on a generation request.
-        let r = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 512, height: 512, steps: 8)
-        XCTAssertTrue(r.safeMode)
     }
 
     // MARK: - 3D (Hunyuan3D) bundle + local-repo readiness
@@ -600,4 +877,25 @@ final class MediaBundleTests: XCTestCase {
         let bytes = UInt64(ImageModelPreset.krea2Turbo.approxRAMGB) * 1_073_741_824
         XCTAssertTrue(ImageModelPreset.krea2Turbo.meetsSystemRequirements(physicalMemoryBytes: bytes))
     }
+    func testMiniMaxH3FourBitPresetIsALowRAMAlternative() {
+        let all = VideoModelPreset.all
+        XCTAssertTrue(all.contains(where: { $0.id == VideoModelPreset.minimaxH3.id }))
+        guard let q4 = all.first(where: { $0.repo == "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit" }) else {
+            return XCTFail("no 4-bit H3 preset in VideoModelPreset.all")
+        }
+        XCTAssertNotEqual(q4.id, VideoModelPreset.minimaxH3.id)
+        // The point of the pack: it fits small Macs. Staged residency peaks at
+        // ~24.5 GB billed, so the guidance must sit well under the 8-bit's 44.
+        XCTAssertLessThanOrEqual(q4.approxRAMGB, 28)
+        XCTAssertLessThanOrEqual(q4.approxDownloadGB, 41)
+        // Same engine, same recipe surface as the 8-bit preset.
+        XCTAssertEqual(q4.backend, .minimaxH3)
+        XCTAssertTrue(q4.supportsFastRecipe)
+        XCTAssertTrue(q4.generatesAudio)
+        XCTAssertTrue(q4.supportsLoRA)
+        XCTAssertTrue(q4.supportsTurbo)
+        // Bundle rides the SAME minimax factory keyed on the 4-bit repo.
+        XCTAssertEqual(q4.bundle.id, "minimax-h3:ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit")
+    }
+
 }

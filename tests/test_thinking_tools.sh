@@ -6,7 +6,7 @@
 # Usage: ./tests/test_thinking_tools.sh [model_dir] [port]
 # Starts its own server, runs tests, kills it.
 
-MODEL_DIR=${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}}
+MODEL_DIR=${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}}
 PORT=${2:-8099}
 BASE="http://127.0.0.1:$PORT"
 BINARY="./zig-out/bin/mlx-serve"
@@ -82,8 +82,16 @@ RESP=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" 
   -d '{"model":"mlx-serve","messages":[{"role":"user","content":"What is 15 times 17?"}],"max_tokens":500,"temperature":0.1,"stream":false,"enable_thinking":true}')
 CONTENT=$(echo "$RESP" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=d["choices"][0]["message"];print(m.get("content",""))' 2>/dev/null)
 RC=$(echo "$RESP" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=d["choices"][0]["message"];rc=m.get("reasoning_content","");print(rc[:100] if rc else "NONE")' 2>/dev/null)
-run_test "Has content" "$([ -n "$CONTENT" ] && echo PASS || echo FAIL)" "content='${CONTENT:0:80}'"
-run_test "Has reasoning_content" "$([ "$RC" != "NONE" ] && echo PASS || echo FAIL)" "reasoning='${RC:0:80}'"
+FR2=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin)["choices"][0].get("finish_reason","?"))' 2>/dev/null)
+# A verbose reasoner can still be INSIDE its thought when max_tokens lands
+# (Laguna-XS spends >500 on 15x17). Empty content there is the truncated-thought
+# rule working, not a bug — so demand content only when the block actually closed.
+if [ "$FR2" = "length" ] && [ -z "$CONTENT" ]; then
+  run_test "cut mid-thought: reasoning kept, nothing leaked to content" "$([ "$RC" != "NONE" ] && echo PASS || echo FAIL)" "finish=length"
+else
+  run_test "Has content" "$([ -n "$CONTENT" ] && echo PASS || echo FAIL)" "content='${CONTENT:0:80}'"
+  run_test "Has reasoning_content" "$([ "$RC" != "NONE" ] && echo PASS || echo FAIL)" "reasoning='${RC:0:80}'"
+fi
 run_test "No thinking tags in content" "$(echo "$CONTENT" | grep -qE '<think>|<\|channel>' && echo FAIL || echo PASS)"
 
 # ─────────────────────────────────────────────────────
@@ -110,7 +118,14 @@ TC_NAME=$(echo "$RESP" | python3 -c 'import json,sys;d=json.load(sys.stdin);tcs=
 RC=$(echo "$RESP" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=d["choices"][0]["message"];rc=m.get("reasoning_content","");print(rc[:100] if rc else "NONE")' 2>/dev/null)
 CONTENT=$(echo "$RESP" | python3 -c 'import json,sys;d=json.load(sys.stdin);m=d["choices"][0]["message"];print(m.get("content") or "")' 2>/dev/null)
 run_test "Tool call present" "$([ "$TC_NAME" = "shell" ] && echo PASS || echo FAIL)" "got '$TC_NAME'"
-run_test "Has reasoning_content" "$([ "$RC" != "NONE" ] && echo PASS || echo FAIL)" "reasoning='${RC:0:80}'"
+# Thinking BEFORE a tool call is the model's choice: Laguna-XS closes its
+# pre-opened block immediately and calls the tool in ~35 tokens. The server
+# guarantee is SEPARATION, not that a thought exists.
+if [ "$RC" != "NONE" ]; then
+  run_test "Has reasoning_content" "PASS" "reasoning='${RC:0:80}'"
+else
+  run_test "no-think tool turn: call intact, nothing leaked to content" "$([ -z "$CONTENT" ] && echo PASS || echo FAIL)" "content='${CONTENT:0:40}'"
+fi
 run_test "No thinking tags in content" "$(echo "$CONTENT" | grep -qE '<think>|<\|channel>' && echo FAIL || echo PASS)"
 
 # ─────────────────────────────────────────────────────
@@ -138,6 +153,27 @@ NO_TAGS=$(echo "$STREAM" | grep '"content"' | grep -cE '<think>|<\|channel>thoug
 run_test "Has content deltas" "$([ "$HAS_CONTENT" -gt 0 ] && echo PASS || echo FAIL)"
 run_test "Has reasoning_content deltas" "$([ "$HAS_RC" -gt 0 ] && echo PASS || echo FAIL)" "$HAS_RC deltas"
 run_test "No thinking tags in content" "$([ "$NO_TAGS" -eq 0 ] && echo PASS || echo FAIL)"
+
+# ─────────────────────────────────────────────────────
+echo ""
+echo -e "${YELLOW}Test 6b: the same request streamed and not must split the SAME${NC}"
+# Gemma 4 opens its own thought channel mid-stream; the bar is the split, not a
+# tag grep: at temp 0 both surfaces must agree byte for byte.
+# ─────────────────────────────────────────────────────
+REQ='{"model":"mlx-serve","messages":[{"role":"user","content":"What is 15 times 17?"}],"max_tokens":500,"temperature":0,"enable_thinking":true}'
+NS=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$REQ" \
+  | python3 -c 'import json,sys;m=json.load(sys.stdin)["choices"][0]["message"];print(((m.get("reasoning_content") or "").strip()+"\x1e"+(m.get("content") or "").strip()))')
+ST=$(curl -sfN "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "${REQ%\}},\"stream\":true}" \
+  | python3 -c '
+import json,sys
+rc=c=""
+for l in sys.stdin:
+    if not l.startswith("data: ") or "[DONE]" in l: continue
+    d=json.loads(l[6:])["choices"][0]["delta"]
+    rc+=d.get("reasoning_content") or ""; c+=d.get("content") or ""
+print(rc.strip()+"\x1e"+c.strip())')
+run_test "stream and non-stream split identically" "$([ "$NS" = "$ST" ] && echo PASS || echo FAIL)" "non-stream='${NS:0:60}' stream='${ST:0:60}'"
+run_test "the answer is content, not reasoning" "$([ -n "${ST#*$'\x1e'}" ] && echo PASS || echo FAIL)" "content='${ST#*$'\x1e'}'"
 
 # ─────────────────────────────────────────────────────
 echo ""
@@ -170,17 +206,40 @@ HAS_CONTENT=$(echo "$STREAM" | grep -cE '"content":"[^"]' ; true)
 HAS_TC=$(echo "$STREAM" | grep -c '"tool_calls"' ; true)
 NO_TAGS_CONTENT=$(echo "$STREAM" | grep '"content"' | grep -cE '<think>|<\|channel>thought' ; true)
 NO_TAGS_RC=$(echo "$STREAM" | grep '"reasoning_content"' | grep -cE '<think>|<\|channel>thought' ; true)
-run_test "Has reasoning_content deltas" "$([ "$HAS_RC" -gt 0 ] && echo PASS || echo FAIL)" "$HAS_RC deltas"
+if [ "$HAS_RC" -gt 0 ]; then
+  run_test "Has reasoning_content deltas" "PASS" "$HAS_RC deltas"
+else
+  # Straight to the call (same model choice as Test 4) — Laguna-XS closes its
+  # pre-opened block empty and writes its working as VISIBLE prose, which is a
+  # legitimate turn: content alongside a tool call is normal. What must hold is
+  # that the call survived; the two tag checks below cover the leak side.
+  run_test "no-think tool stream: call still emitted" "$([ "$HAS_TC" -gt 0 ] && echo PASS || echo FAIL)" "tc=$HAS_TC content_chunks=$HAS_CONTENT"
+fi
 run_test "No thinking tags in content" "$([ "$NO_TAGS_CONTENT" -eq 0 ] && echo PASS || echo FAIL)"
 run_test "No raw thinking tags in reasoning" "$([ "$NO_TAGS_RC" -eq 0 ] && echo PASS || echo FAIL)"
 
-# Model may or may not use a tool — either tool_calls or content is fine
+# Model may or may not use a tool — either tool_calls or content is fine.
+# A verbose reasoner can also spend the whole 500-token budget INSIDE its
+# thought and finish with neither (LFM2.5 does this on ~2 of 3 runs). That is
+# the truncated-thought rule, not a failure — the reasoning must simply be
+# there, and nothing may have leaked out as content.
+FIN8=$(echo "$STREAM" | python3 -c 'import json,sys
+fin=None
+for line in sys.stdin:
+    if not line.startswith("data: "): continue
+    p=line[6:].strip()
+    if p=="[DONE]": break
+    try: fin=json.loads(p)["choices"][0].get("finish_reason") or fin
+    except Exception: pass
+print(fin)' 2>/dev/null)
 if [ "$HAS_TC" -gt 0 ]; then
     run_test "Model chose tool call" "PASS" "tool_calls present"
 elif [ "$HAS_CONTENT" -gt 0 ]; then
     run_test "Model answered directly" "PASS" "content present (no tool call)"
+elif [ "$FIN8" = "length" ] && [ "$HAS_RC" -gt 0 ]; then
+    run_test "budget spent mid-thought: reasoning kept, nothing leaked" "PASS" "finish=length, $HAS_RC reasoning deltas"
 else
-    run_test "Has tool_calls or content" "FAIL" "neither found"
+    run_test "Has tool_calls or content" "FAIL" "neither found (finish=$FIN8)"
 fi
 
 # ─────────────────────────────────────────────────────

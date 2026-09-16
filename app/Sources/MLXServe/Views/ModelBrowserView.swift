@@ -1,22 +1,18 @@
 import SwiftUI
 
-/// Model Browser: a sidebar over six destinations (`ModelBrowserSection`).
-///
-/// It used to be one pane with a `Toggle("Downloaded")` push-button that swapped
-/// the data source underneath you, and it deleted on-disk models from the search
-/// results — so the model you just finished downloading vanished at 100%. Now
-/// Discover marks what you own instead of hiding it, Downloads is a first-class
-/// queue rather than rows stapled to the top of a list, and My Models shows
-/// everything the tray picker offers rather than only what we fetched ourselves.
-struct ModelBrowserView: View {
+/// Model Browser: five sections (`ModelBrowserSection`), switched by the bar
+/// across the top of the content area.
+struct ModelBrowserPane: View {
+    /// Which section is showing. The pane's own bar drives it: the sidebar is
+    /// the conversation list (plus the Models row that gets you here), so the
+    /// sub-items live across the top of the content area.
+    @Binding var section: ModelBrowserSection
+
     @EnvironmentObject var searchService: HFSearchService
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
 
-    @State private var selection: ModelBrowserSection? = .recommended
     @State private var localFilter = ""
-
-    private var section: ModelBrowserSection { selection ?? .recommended }
 
     /// Downloading *or* failed — both belong in the queue and both earn a badge.
     private var activeDownloads: [(repoId: String, state: DownloadManager.DownloadState)] {
@@ -26,65 +22,40 @@ struct ModelBrowserView: View {
             .map { (repoId: $0.key, state: $0.value) }
     }
 
-    /// Media bundles fully on disk, across all four modality catalogs.
-    private var mediaReadyCount: Int {
+    /// Counts beside the section names, from the ONE shared builder so they
+    /// cannot drift from what the panes list.
+    private var badges: ModelBrowserBadgeCounts {
         func readyCount<P: MediaModelPreset>(_ presets: [P]) -> Int {
             presets.filter { downloads.bundleReady($0.bundle) }.count
         }
-        return readyCount(ImageModelPreset.all) + readyCount(AudioModelPreset.allIncludingVoiceOnly)
-            + readyCount(VideoModelPreset.all) + readyCount(MusicModelPreset.all)
-    }
-
-    private var badges: ModelBrowserBadgeCounts {
-        ModelBrowserBadgeCounts(
-            myModels: appState.localModels.count,
-            activeDownloads: activeDownloads.count,
-            mediaReady: mediaReadyCount
-        )
+        let media = readyCount(ImageModelPreset.all)
+            + readyCount(AudioModelPreset.allIncludingVoiceOnly)
+            + readyCount(VideoModelPreset.all)
+            + readyCount(MusicModelPreset.all)
+        return .live(localModelCount: appState.localModels.count,
+                     activeDownloadCount: activeDownloads.count,
+                     mediaReadyCount: media)
     }
 
     var body: some View {
-        NavigationSplitView {
-            List(ModelBrowserSection.allCases, selection: $selection) { item in
-                NavigationLink(value: item) {
-                    Label {
-                        HStack(spacing: 6) {
-                            Text(item.title)
-                            Spacer(minLength: 4)
-                            if item == .downloads, !activeDownloads.isEmpty {
-                                ProgressView()
-                                    .controlSize(.small)
-                                    .scaleEffect(0.6)
-                            }
-                            if let badge = badges.badge(for: item) {
-                                Text(badge)
-                                    .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 1)
-                                    .background(.quaternary, in: Capsule())
-                            }
-                        }
-                    } icon: {
-                        Image(systemName: item.systemImage)
-                    }
-                }
-            }
-            .navigationSplitViewColumnWidth(
-                min: ModelBrowserMetrics.sidebarMinWidth,
-                ideal: ModelBrowserMetrics.sidebarIdealWidth,
-                max: ModelBrowserMetrics.sidebarMaxWidth
-            )
-        } detail: {
+        VStack(spacing: 0) {
+            ModelBrowserSectionBar(section: $section, badges: badges,
+                                   isDownloading: !activeDownloads.isEmpty)
+            Divider()
             detail
-                .frame(minWidth: ModelBrowserMetrics.minDetailWidth)
         }
+        // The floor the browser's table needs, asserted from INSIDE the chat
+        // window's detail column: below it the action cell clips off the right
+        // edge (`ModelBrowserMetrics`). On the pane rather than the window, so
+        // it only applies while the browser is up — a chat transcript is happy
+        // much narrower.
+        .frame(minWidth: ModelBrowserMetrics.minDetailWidth)
         .task {
             if searchService.models.isEmpty {
                 await searchService.search()
             }
         }
-        .onChange(of: selection) { _, _ in appState.refreshModels() }
+        .onChange(of: section) { _, _ in appState.refreshModels() }
         // Live-refresh on-disk sizes while a disk-state pane is showing and a
         // download is in flight, so completion + growing size show up without
         // the user navigating away and back. The task id flips when the section
@@ -114,6 +85,62 @@ struct ModelBrowserView: View {
     }
 }
 
+// MARK: - Section bar
+
+/// The browser's five sections, across the top of the content area.
+private struct ModelBrowserSectionBar: View {
+    @Binding var section: ModelBrowserSection
+    let badges: ModelBrowserBadgeCounts
+    let isDownloading: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(ModelBrowserSection.allCases) { item in
+                chip(item)
+            }
+            Spacer(minLength: 8)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    private func chip(_ item: ModelBrowserSection) -> some View {
+        let isSelected = section == item
+        return Button {
+            section = item
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: item.systemImage)
+                    .font(.system(size: 11, weight: .medium))
+                Text(L10n.text(item.title)).font(.callout).lineLimit(1)
+                if item == .downloads, isDownloading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.55)
+                        .frame(width: 10)
+                }
+                if let badge = badges.badge(for: item) {
+                    Text(L10n.text(badge))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(isSelected ? .primary : .secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(.quaternary, in: Capsule())
+                }
+            }
+            .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.14) : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 // MARK: - Recommended
 
 /// Every curated Gemma 4 / Qwen 3.5-3.6 checkpoint, grouped by family and
@@ -126,215 +153,234 @@ private struct RecommendedPane: View {
     /// model used to mean choosing a vendor taxonomy before you could chat, and
     /// the answer for someone who has downloaded nothing is one model, not
     /// fourteen across four sections.
-    @State private var showsOtherModels = false
-
-    private var physicalMemory: UInt64 { ProcessInfo.processInfo.physicalMemory }
-    private var ramLabel: String { MemoryInfo.format(Int64(physicalMemory)) }
+    private var memory: SystemMemoryInfo { SystemMemoryInfo.current() }
     private var starter: RecommendedModelPick {
-        RecommendedModelPick.starterPick(physicalMemoryBytes: physicalMemory)
+        RecommendedModelPick.starterPick(physicalMemoryBytes: memory.totalBytes)
     }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Your Mac has \(ramLabel) of memory")
-                        .font(.title3.weight(.semibold))
-                    Text("\(starter.name) is the best fit — download it and start chatting.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.top, 4)
-
-                // The recommendation, as a full row: same bars, same RAM
-                // warning, same Download/Use control as everything below it.
-                ModelGroupSection(
-                    title: "Best for your Mac",
-                    subtitle: "Matched to this Mac's memory. Everything else is below.",
-                    systemImage: "sparkles",
-                    tint: .accentColor
-                ) {
-                    RecommendedModelListRow(pick: starter, physicalMemoryBytes: physicalMemory)
-                }
-
-                Button {
-                    withAnimation { showsOtherModels.toggle() }
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: showsOtherModels ? "chevron.down" : "chevron.right")
-                            .font(.caption.weight(.semibold))
-                        Text("Other models")
-                            .font(.subheadline.weight(.semibold))
-                        Spacer()
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
-                if showsOtherModels {
-                    otherModels
-                }
+            VStack(alignment: .leading, spacing: 18) {
+                MemorySummaryCard(memory: memory, recommended: starter)
+                RecommendedModelTable(memory: memory, recommendedId: starter.id)
             }
             .padding(16)
         }
         .navigationTitle("Recommended")
     }
+}
 
-    @ViewBuilder private var otherModels: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            ModelGroupSection(
-                title: "Gemma 4",
-                subtitle: "Google's Gemma 4 family.",
-                systemImage: "g.circle",
-                tint: .blue
-            ) {
-                RecommendedFamilyRows(picks: RecommendedModelPick.gemmaCatalog, physicalMemoryBytes: physicalMemory)
+/// The "what does this Mac have, and how much can a model use?" summary at the
+/// top of the Recommended pane: total RAM, the usable-for-models budget (the
+/// Metal working-set ceiling), a capacity bar, and the one recommended pick.
+private struct MemorySummaryCard: View {
+    let memory: SystemMemoryInfo
+    let recommended: RecommendedModelPick
+    @EnvironmentObject var server: ServerManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Image(systemName: "memorychip")
+                    .font(.title2)
+                    .foregroundStyle(.tint)
+                    .frame(width: 26)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Your Mac")
+                        .font(.headline)
+                    Text("\(memory.totalLabel) of memory · about \(memory.usableLabel) usable for models")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
             }
 
-            ModelGroupSection(
-                title: "Qwen",
-                subtitle: "Alibaba's Qwen 3.5/3.6 family — the larger checkpoints ship a native speed boost.",
-                systemImage: "q.circle",
-                tint: .teal
-            ) {
-                RecommendedFamilyRows(picks: RecommendedModelPick.qwenCatalog, physicalMemoryBytes: physicalMemory)
-            }
+            // The same GPU + Available RAM meter the menu bar shows.
+            MemoryMeter.live(server: server.memoryInfo)
 
-            ModelGroupSection(
-                title: "Laguna",
-                subtitle: "poolside's Laguna 2.1 coding models — mixture-of-experts specialists for code and agent work.",
-                systemImage: "chevron.left.forwardslash.chevron.right",
-                tint: .purple
-            ) {
-                RecommendedFamilyRows(picks: RecommendedModelPick.poolsideCatalog, physicalMemoryBytes: physicalMemory)
+            HStack(spacing: 6) {
+                Image(systemName: "sparkles")
+                    .font(.caption)
+                    .foregroundStyle(.tint)
+                Text("Recommended for your Mac:")
+                    .foregroundStyle(.secondary)
+                Text(recommended.name)
+                    .fontWeight(.semibold)
+                Spacer(minLength: 0)
             }
-
-            ModelGroupSection(
-                title: "Largest models (96 GB+ RAM)",
-                subtitle: "The biggest models this app runs — DeepSeek-V4-Flash (native MLX) and Tencent's 295B Hunyuan 3 — for Macs with a lot of memory.",
-                systemImage: "memorychip",
-                tint: .red
-            ) {
-                RecommendedFamilyRows(picks: RecommendedModelPick.largestCatalog, physicalMemoryBytes: physicalMemory)
-            }
+            .font(.callout)
         }
+        .padding(16)
+        .background(RoundedRectangle(cornerRadius: 12).fill(.quaternary.opacity(0.22)))
     }
 }
 
-/// A family's rows, split into what this Mac's RAM covers and what it
-/// doesn't. The first group renders inline; the second sits behind a
-/// collapsed "Requires more RAM" disclosure — nothing is ever dropped from
-/// the list, it's just deferred until the user asks to see it, rather than
-/// cluttering the default view (or, as an earlier iteration did, rendering
-/// inline at reduced opacity).
-private struct RecommendedFamilyRows: View {
-    let picks: [RecommendedModelPick]
-    let physicalMemoryBytes: UInt64
-    @State private var showsRequiresMoreRAM = false
-
-    var body: some View {
-        let split = picks.partitionedByRequirements(physicalMemoryBytes: physicalMemoryBytes)
-
-        ForEach(split.fits) { pick in
-            RecommendedModelListRow(pick: pick, physicalMemoryBytes: physicalMemoryBytes)
-            Divider().padding(.horizontal, 12)
-        }
-
-        if !split.requiresMoreRAM.isEmpty {
-            Button {
-                withAnimation { showsRequiresMoreRAM.toggle() }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: showsRequiresMoreRAM ? "chevron.down" : "chevron.right")
-                        .font(.caption2.weight(.semibold))
-                    Text("Requires more RAM (\(split.requiresMoreRAM.count))")
-                        .font(.caption.weight(.medium))
-                    Spacer()
-                }
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            Divider().padding(.horizontal, 12)
-
-            if showsRequiresMoreRAM {
-                ForEach(split.requiresMoreRAM) { pick in
-                    RecommendedModelListRow(pick: pick, physicalMemoryBytes: physicalMemoryBytes)
-                    Divider().padding(.horizontal, 12)
-                }
-            }
-        }
-    }
+/// Column widths shared by the table header and every row so they stay
+/// aligned. The Model column flexes; the rest are fixed.
+private enum RecTableMetrics {
+    static let capability: CGFloat = 92
+    static let size: CGFloat = 62
+    static let memory: CGFloat = 140
+    static let action: CGFloat = 116
+    static let spacing: CGFloat = 10
+    static let hPad: CGFloat = 12
 }
 
-/// The three comparative bars under a recommendation: Intelligence, Speed,
-/// Context. They replaced capability chips ("Fast replies", "Balanced",
-/// "Coding help") that repeated the blurb and said nothing about how one pick
-/// compares to the one above it — which is the only question this pane exists
-/// to answer.
-///
-/// No number is drawn. The scores are a hand-maintained comparison between
-/// these picks (see `RecommendedModels.swift`'s header for where each comes
-/// from), and printing "62" would claim a precision they don't have. An
-/// estimated intelligence score says so in the label instead of quietly
-/// reading like a measurement.
-private struct CapabilityBars: View {
-    let pick: RecommendedModelPick
+/// The Recommended pane's model table: a column header, then every curated pick
+/// grouped by family. Each row shows its capability, download size, and — the
+/// point of this pane — exactly how its memory requirement fits THIS Mac. Every
+/// model is visible (no "requires more RAM" disclosure): the fit badge is what
+/// makes the comparison scannable at a glance.
+private struct RecommendedModelTable: View {
+    let memory: SystemMemoryInfo
+    let recommendedId: String
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            bar("Intelligence", pick.intelligenceBar, .blue,
-                note: pick.intelligenceIsEstimated ? "estimated" : nil,
-                help: pick.intelligenceIsEstimated
-                    ? "Our estimate — this model has no Artificial Analysis Intelligence Index entry."
-                    : "Artificial Analysis Intelligence Index, for the original weights.")
-            bar("Speed", pick.speedBar, .green, note: nil,
-                help: "Roughly how fast it replies on an Apple Silicon Mac, relative to the other models here.")
-            bar("Context", pick.contextBar, .orange, note: nil,
-                help: "How much text it can hold at once. Your Mac's memory may lower this in practice.")
-        }
+    private struct Family: Identifiable {
+        let id: String
+        let title: String
+        let systemImage: String
+        let tint: Color
+        let picks: [RecommendedModelPick]
     }
 
-    private func bar(_ label: String, _ fill: Double, _ tint: Color, note: String?, help: String) -> some View {
-        HStack(spacing: 6) {
-            Text(label)
-                .font(.system(size: 9))
-                .foregroundStyle(.secondary)
-                .frame(width: 62, alignment: .leading)
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(.quaternary)
-                    Capsule().fill(tint.opacity(0.75))
-                        .frame(width: max(2, geo.size.width * fill))
+    private var families: [Family] {
+        [
+            Family(id: "gemma", title: "Gemma 4", systemImage: "g.circle", tint: .blue,
+                   picks: RecommendedModelPick.gemmaCatalog),
+            Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
+                   picks: RecommendedModelPick.qwenCatalog),
+            Family(id: "largest", title: "Largest models", systemImage: "memorychip", tint: .red,
+                   picks: RecommendedModelPick.largestCatalog),
+        ]
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            RecommendedTableHeader()
+            Divider()
+            ForEach(families) { family in
+                familyHeader(family)
+                ForEach(family.picks) { pick in
+                    Divider().padding(.leading, RecTableMetrics.hPad)
+                    RecommendedModelTableRow(
+                        pick: pick,
+                        memory: memory,
+                        isRecommended: pick.id == recommendedId
+                    )
                 }
             }
-            .frame(height: 4)
-            .frame(maxWidth: 120)
-            if let note {
-                Text(note)
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
-            }
+        }
+        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.15)))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary.opacity(0.4)))
+    }
+
+    private func familyHeader(_ family: Family) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: family.systemImage)
+                .font(.caption)
+                .foregroundStyle(family.tint)
+            Text(L10n.text(family.title))
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
             Spacer(minLength: 0)
         }
-        .help(help)
+        .padding(.horizontal, RecTableMetrics.hPad)
+        .padding(.vertical, 7)
+        .background(.quaternary.opacity(0.12))
     }
 }
 
-/// One list row for a chat-model recommendation: name, tagline, a plain-
-/// English description underneath, the three capability bars, and the
-/// Download/Use action — the list-style analogue of the Media pane's
-/// `MediaModelRow`, with the richer copy this pane needs.
-private struct RecommendedModelListRow: View {
+/// The column titles, aligned to the row columns via `RecTableMetrics`.
+private struct RecommendedTableHeader: View {
+    var body: some View {
+        HStack(spacing: RecTableMetrics.spacing) {
+            Text("Model")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("Capability")
+                .frame(width: RecTableMetrics.capability, alignment: .leading)
+            Text("Size")
+                .frame(width: RecTableMetrics.size, alignment: .trailing)
+            Text("Memory needed")
+                .frame(width: RecTableMetrics.memory, alignment: .leading)
+            Color.clear
+                .frame(width: RecTableMetrics.action, height: 1)
+        }
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .textCase(.uppercase)
+        .padding(.horizontal, RecTableMetrics.hPad)
+        .padding(.vertical, 8)
+    }
+}
+
+/// Two thin comparative bars — intelligence (blue) over speed (green) — the
+/// compact, table-cell form of the retired `CapabilityBars`. No number is
+/// drawn in the cell: the scores are a hand-maintained comparison between
+/// these picks (see `RecommendedModels.swift`'s header). Hovering floats a
+/// card that names each bar and prints its score — the bars alone cannot say
+/// which is which.
+private struct MiniCapability: View {
     let pick: RecommendedModelPick
-    let physicalMemoryBytes: UInt64
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            bar(pick.intelligenceBar, .blue)
+            bar(pick.speedBar, .green)
+        }
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .overlay(alignment: .bottomLeading) {
+            if hovering {
+                tip.offset(y: -18).fixedSize()
+            }
+        }
+        .zIndex(hovering ? 1 : 0)
+    }
+
+    private var tip: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(CapabilityTip.lines(for: pick), id: \.self) { line in
+                Text(L10n.text(line)).font(.caption)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
+        .shadow(radius: 4, y: 2)
+        .allowsHitTesting(false)
+    }
+
+    private func bar(_ fill: Double, _ tint: Color) -> some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule().fill(tint.opacity(0.8))
+                    .frame(width: max(2, geo.size.width * fill))
+            }
+        }
+        .frame(height: 4)
+    }
+}
+
+/// One table row for a chat-model recommendation: name + tagline, compact
+/// capability bars, download size, the memory-fit cell (the pane's whole
+/// point), and the Download/Use action. The full plain-English blurb moves to
+/// the row's hover tooltip so the table stays scannable.
+private struct RecommendedModelTableRow: View {
+    let pick: RecommendedModelPick
+    let memory: SystemMemoryInfo
+    let isRecommended: Bool
 
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @State private var confirmDelete = false
+    @State private var card: ModelCardRequest?
+
+    /// How this pick's memory requirement fits the Mac's usable budget.
+    private var fit: MemoryFit { memory.fit(neededGB: pick.approxRAMNeededGB) }
 
     /// For a GGUF pick, the specific quant file on disk (the repo ships many);
     /// nil until the folder resolves. Drives ready/use so a *different* quant of
@@ -352,14 +398,6 @@ private struct RecommendedModelListRow: View {
     }
     private var state: DownloadManager.DownloadState? { downloads.downloads[pick.repoId] }
 
-    /// Soft signal only — sorts the pick behind the family's "Requires more
-    /// RAM" disclosure and explains why there. Never blocks downloading or
-    /// using it (same "warn, don't gate" policy as Discover's RAM-fitness dot
-    /// and ImageGenView's oversized-model alert).
-    private var meetsRequirements: Bool {
-        pick.meetsSystemRequirements(physicalMemoryBytes: physicalMemoryBytes)
-    }
-
     /// The on-disk model this row's repo resolves to, once downloaded —
     /// mirrors `ModelBrowserRow.usableModel`.
     private var usableModel: LocalModel? {
@@ -369,45 +407,104 @@ private struct RecommendedModelListRow: View {
         return ModelBrowserUse.pickableModel(atPath: path, in: appState.localModels)
     }
 
+    /// The other half of the catalogue — see `ModelBrowserUse.mediaModel`.
+    private var usableMedia: (model: LocalModel, modality: MediaModality)? {
+        let path = pick.ggufFilename != nil ? ggufFilePath : downloads.existingModelDir(for: pick.repoId)
+        return ModelBrowserUse.mediaModel(atPath: path, in: appState.localModels)
+    }
+
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(pick.name)
-                        .font(.callout.weight(.medium))
-                    Text(pick.tagline)
+        HStack(spacing: RecTableMetrics.spacing) {
+            // Model — name + tagline; the full blurb is on hover.
+            Button { card = ModelCardRequest(repoId: pick.repoId, title: pick.name) } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(pick.name)
+                            .font(.callout.weight(.medium))
+                        if isRecommended {
+                            Text("Recommended")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+                                .foregroundStyle(.tint)
+                        }
+                    }
+                    Text(L10n.text(pick.tagline))
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-
-                Text(pick.blurb)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                CapabilityBars(pick: pick)
-                    .padding(.top, 2)
-
-                if !meetsRequirements {
-                    Label(
-                        "Needs about \(String(format: "%.0f", pick.approxRAMNeededGB)) GB of RAM — your Mac has \(MemoryInfo.format(Int64(physicalMemoryBytes)))",
-                        systemImage: "exclamationmark.triangle"
-                    )
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.orange)
-                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(L10n.text(pick.blurb))
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            VStack(alignment: .trailing, spacing: 4) {
-                Text(pick.sizeLabel)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                actionControl
+            // Capability — intelligence over speed.
+            MiniCapability(pick: pick)
+                .frame(width: RecTableMetrics.capability, alignment: .leading)
+
+            // Download size (on disk) and the quant it buys.
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(SystemMemoryInfo.preciseGB(pick.sizeGB))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                if let quant = pick.quantLabel {
+                    Text(L10n.text(quant))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
             }
+            .frame(width: RecTableMetrics.size, alignment: .trailing)
+
+            // Memory needed + fit against this Mac's usable budget.
+            memoryCell
+                .frame(width: RecTableMetrics.memory, alignment: .leading)
+
+            // Download / Use / progress.
+            actionControl
+                .frame(width: RecTableMetrics.action, alignment: .trailing)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, RecTableMetrics.hPad)
+        .padding(.vertical, 9)
+        .background(isRecommended ? Color.accentColor.opacity(0.07) : Color.clear)
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
+    }
+
+    /// The memory column: how much RAM the model needs, and a colored badge for
+    /// how that fits what this Mac can give a model.
+    private var memoryCell: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB))
+                .font(.caption.monospacedDigit().weight(.medium))
+            HStack(spacing: 3) {
+                Image(systemName: fitIcon)
+                    .font(.system(size: 9))
+                Text(L10n.text(fit.label))
+                    .font(.caption2)
+            }
+            .foregroundStyle(fitColor)
+        }
+        .help(L10n.format("Needs about %@ — your Mac can use about %@ for a model.",
+                          SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB), memory.usableLabel))
+    }
+
+    private var fitIcon: String {
+        switch fit {
+        case .comfortable: return "checkmark.circle.fill"
+        case .tight:       return "exclamationmark.circle.fill"
+        case .exceeds:     return "xmark.circle.fill"
+        }
+    }
+
+    private var fitColor: Color {
+        switch fit {
+        case .comfortable: return .green
+        case .tight:       return .orange
+        case .exceeds:     return .red
+        }
     }
 
     @ViewBuilder
@@ -424,6 +521,8 @@ private struct RecommendedModelListRow: View {
                     } else {
                         ModelUseBadge(state: use)
                     }
+                } else if let media = usableMedia {
+                    UseMediaModelButton(modality: media.modality, name: media.model.name)
                 } else {
                     Text("✓ On disk")
                         .font(.caption.weight(.medium))
@@ -443,6 +542,7 @@ private struct RecommendedModelListRow: View {
                         downloads.deleteModel(repoId: pick.repoId)
                         appState.refreshModels()
                     }
+                    .keyboardShortcut(.defaultAction)
                 } message: {
                     Text("Delete \(pick.name)? This will remove all downloaded files.")
                 }
@@ -450,7 +550,7 @@ private struct RecommendedModelListRow: View {
         } else if let state, state.status == .downloading {
             HStack(spacing: 6) {
                 VStack(alignment: .trailing, spacing: 1) {
-                    ProgressView(value: state.fileProgress)
+                    ProgressView(value: state.progress)
                         .frame(width: 70)
                     Text("\(state.percentFormatted) \(state.speedFormatted)")
                         .font(.system(size: 9).monospacedDigit())
@@ -468,7 +568,7 @@ private struct RecommendedModelListRow: View {
             }
         } else if let state, state.status == .failed {
             VStack(alignment: .trailing, spacing: 2) {
-                Button(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Retry") { startDownload() }
+                Button(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Retry")) { startDownload() }
                     .controlSize(.small)
                 if let error = state.error {
                     Text(error)
@@ -478,7 +578,7 @@ private struct RecommendedModelListRow: View {
                 }
             }
         } else {
-            Button(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Download") { startDownload() }
+            Button(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Download")) { startDownload() }
                 .controlSize(.small)
         }
     }
@@ -531,7 +631,7 @@ private struct DiscoverPane: View {
                 // ds4), or Both. Re-runs the search on change.
                 Picker("Format", selection: $searchService.format) {
                     ForEach(ModelFormat.allCases) { f in
-                        Text(f.label).tag(f)
+                        Text(L10n.text(f.label)).tag(f)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -635,6 +735,9 @@ private struct DiscoverPane: View {
 private struct MyModelsPane: View {
     @Binding var filter: String
     @EnvironmentObject var appState: AppState
+    @EnvironmentObject var downloads: DownloadManager
+
+    @State private var freeDiskSpace: String = ""
 
     private var groups: [LocalModelGroup] {
         ModelBrowserUse.groupedBySource(appState.localModels, filter: filter)
@@ -687,7 +790,7 @@ private struct MyModelsPane: View {
                                 Divider().padding(.horizontal, 12)
                             }
                         } header: {
-                            Text(ModelBrowserUse.groupTitle(group.source))
+                            Text(L10n.text(group.title))
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -698,7 +801,7 @@ private struct MyModelsPane: View {
                     }
 
                     if groups.isEmpty {
-                        Text(filter.isEmpty ? "No models on this Mac yet" : "No models match “\(filter)”")
+                        Text(L10n.text(filter.isEmpty ? "No models on this Mac yet" : "No models match “\(filter)”"))
                             .foregroundStyle(.secondary)
                             .padding(40)
                     }
@@ -712,11 +815,33 @@ private struct MyModelsPane: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                if !freeDiskSpace.isEmpty {
+                    Text("\(freeDiskSpace) available")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
         }
         .navigationTitle("My Models")
+        .onAppear {
+            updateDiskSpace()
+        }
+        .onChange(of: appState.localModels.count) { _, _ in
+            updateDiskSpace()
+        }
+        .onChange(of: downloads.modelsDir) { _, _ in
+            updateDiskSpace()
+        }
+    }
+
+    private func updateDiskSpace() {
+        let values = try? URL(fileURLWithPath: downloads.modelsDir)
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        freeDiskSpace = ModelBrowserMetrics.freeSpaceLabel(
+            availableBytes: values?.volumeAvailableCapacityForImportantUsage
+        )
     }
 }
 
@@ -775,7 +900,7 @@ private struct MediaPane: View {
                     systemImage: "photo",
                     tint: .pink
                 ) {
-                    ForEach(ImageModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                    ForEach(ImageModelPreset.all) { MediaModelRow(preset: $0, modality: .image, physicalMemoryBytes: physicalMemory) }
                 }
                 ModelGroupSection(
                     title: "Audio",
@@ -786,7 +911,7 @@ private struct MediaPane: View {
                     // The browser lists the FULL catalog — Kokoro is voice-mode
                     // only (out of `.all`, which the media panes offer) but is
                     // still a model the user can fetch from here.
-                    ForEach(AudioModelPreset.allIncludingVoiceOnly) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                    ForEach(AudioModelPreset.allIncludingVoiceOnly) { MediaModelRow(preset: $0, modality: .voice, physicalMemoryBytes: physicalMemory) }
                 }
                 ModelGroupSection(
                     title: "Video",
@@ -794,7 +919,7 @@ private struct MediaPane: View {
                     systemImage: "film",
                     tint: .indigo
                 ) {
-                    ForEach(VideoModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                    ForEach(VideoModelPreset.all) { MediaModelRow(preset: $0, modality: .video, physicalMemoryBytes: physicalMemory) }
                 }
                 ModelGroupSection(
                     title: "Music",
@@ -802,7 +927,7 @@ private struct MediaPane: View {
                     systemImage: "music.note",
                     tint: .orange
                 ) {
-                    ForEach(MusicModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                    ForEach(MusicModelPreset.all) { MediaModelRow(preset: $0, modality: .music, physicalMemoryBytes: physicalMemory) }
                 }
             }
             .padding(16)
@@ -828,8 +953,8 @@ private struct ModelGroupSection<Content: View>: View {
                     .foregroundStyle(tint)
                     .frame(width: 18)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(title).font(.subheadline.weight(.semibold))
-                    Text(subtitle).font(.caption2).foregroundStyle(.secondary)
+                    Text(L10n.text(title)).font(.subheadline.weight(.semibold))
+                    Text(L10n.text(subtitle)).font(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer()
             }
@@ -844,15 +969,23 @@ private struct ModelGroupSection<Content: View>: View {
 
 /// One row for any media preset (image/audio/video/music) — generic over
 /// `MediaModelPreset` so the four modalities share this instead of four
-/// near-duplicate views. Download/progress/retry mirrors `BundleDownloadBar`;
-/// unlike a chat model there's no "Use" (each gen pane keeps its own sticky
-/// model selection), so the terminal state is just on-disk + Delete.
+/// near-duplicate views. Download/progress/retry mirrors `BundleDownloadBar`.
+///
+/// The terminal state used to be on-disk + Delete and nothing else, on the
+/// reasoning that each gen pane keeps its own sticky model selection. But that
+/// left "throw it away" as the only verb the browser offered for a model it
+/// had just finished downloading (#228). `Use` opens the owning pane; the pane
+/// still keeps its own selection, so this is navigation, not a second loader.
+/// The modality is passed in rather than derived — the Media pane already
+/// groups by it, so the call site knows it exactly.
 private struct MediaModelRow<Preset: MediaModelPreset>: View {
     let preset: Preset
+    let modality: MediaModality
     let physicalMemoryBytes: UInt64
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
     @State private var confirmDelete = false
+    @State private var card: ModelCardRequest?
 
     private var bundle: MediaBundle { preset.bundle }
     private var isReady: Bool { downloads.bundleReady(bundle) }
@@ -868,11 +1001,12 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
+            Button { card = ModelCardRequest(repoId: bundle.primaryRepo, title: preset.name) } label: {
             VStack(alignment: .leading, spacing: 3) {
-                Text(preset.name)
+                Text(L10n.text(preset.name))
                     .font(.callout.weight(.medium))
 
-                Text(preset.description)
+                Text(L10n.text(preset.description))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -899,10 +1033,13 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
                         .lineLimit(1)
                 }
             }
+            .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             VStack(alignment: .trailing, spacing: 4) {
-                Text(bundle.approxSizeLabel)
+                Text(L10n.text(bundle.approxSizeLabel))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                 actionControl
@@ -910,15 +1047,14 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
     }
 
     @ViewBuilder
     private var actionControl: some View {
         if isReady {
             HStack(spacing: 6) {
-                Text("✓ On disk")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.green)
+                UseMediaModelButton(modality: modality, name: preset.name)
                 Button {
                     confirmDelete = true
                 } label: {
@@ -933,6 +1069,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
                         downloads.deleteModel(repoId: bundle.primaryRepo)
                         appState.refreshModels()
                     }
+                    .keyboardShortcut(.defaultAction)
                 } message: {
                     Text("Delete \(preset.name)? This will remove the downloaded files.")
                 }
@@ -940,7 +1077,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
         } else if let active, active.state.status == .downloading {
             HStack(spacing: 6) {
                 VStack(alignment: .trailing, spacing: 1) {
-                    ProgressView(value: active.state.fileProgress)
+                    ProgressView(value: active.state.progress)
                         .frame(width: 70)
                     Text("\(active.state.percentFormatted) \(active.state.speedFormatted)")
                         .font(.system(size: 9).monospacedDigit())
@@ -1010,6 +1147,30 @@ private struct UseModelButton: View {
     }
 }
 
+/// "Use" for a media checkpoint: open the pane that owns it.
+///
+/// `AppState.showCreate` is documented as the one way into a create page.
+/// Music needs a second step because it has no `GenExperiment` case of its own
+/// — it is a tab inside the Audio pane — and that tab is `@AppStorage`, so
+/// writing it here is what makes the pane come up on Music instead of Voice.
+private struct UseMediaModelButton: View {
+    let modality: MediaModality
+    let name: String
+    @EnvironmentObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
+    @AppStorage("audioGenTab") private var audioTab: AudioGenView.Tab = .voice
+
+    var body: some View {
+        Button("Use") {
+            if let tab = modality.audioTab { audioTab = tab }
+            appState.showCreate(modality.experiment)
+            AppActivation.openWindow(id: "chat", using: openWindow)
+        }
+        .controlSize(.small)
+        .help("Open \(name) in \(modality.paneName)")
+    }
+}
+
 // MARK: - In-use badge
 
 /// Replaces the "Use" button on the model the server is pointed at, so clicking
@@ -1043,7 +1204,7 @@ private struct ModelUseBadge: View {
             default:
                 EmptyView()
             }
-            Text(state.label)
+            Text(L10n.text(state.label))
                 .font(.caption.weight(.medium))
                 .foregroundStyle(tint)
                 .lineLimit(1)
@@ -1122,7 +1283,7 @@ private struct SortableHeader: View {
                 searchService.sort(by: field)
             } label: {
                 HStack(spacing: 2) {
-                    Text(title)
+                    Text(L10n.text(title))
                     if isActive {
                         Image(systemName: searchService.sortDescending ? "chevron.down" : "chevron.up")
                             .font(.system(size: 8))
@@ -1133,7 +1294,7 @@ private struct SortableHeader: View {
             .buttonStyle(.plain)
             .foregroundStyle(isActive ? .primary : .secondary)
         } else {
-            Text(title)
+            Text(L10n.text(title))
         }
     }
 }
@@ -1151,16 +1312,18 @@ private struct ModelBrowserRow: View {
     private var isReady: Bool { downloads.isReady(model.id) }
     private var state: DownloadManager.DownloadState? { downloads.downloads[model.id] }
     private var disabled: Bool { !model.isCompatible }
+    @State private var card: ModelCardRequest?
 
     var body: some View {
         HStack(spacing: ModelBrowserMetrics.columnSpacing) {
-            // Model name — takes all remaining space
+            // Model name — takes all remaining space; click opens the card.
+            Button { card = ModelCardRequest(repoId: model.id, title: model.modelName) } label: {
             VStack(alignment: .leading, spacing: 1) {
-                Text(model.modelName)
+                Text(L10n.text(model.modelName))
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
                 HStack(spacing: 6) {
-                    Text(model.author)
+                    Text(L10n.text(model.author))
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
@@ -1172,12 +1335,15 @@ private struct ModelBrowserRow: View {
                     }
                 }
             }
+            .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             // Quantization badge
             Group {
                 if let quant = model.quantization {
-                    Text(quant)
+                    Text(L10n.text(quant))
                         .font(.system(size: 10).weight(.medium))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
@@ -1191,7 +1357,7 @@ private struct ModelBrowserRow: View {
             .frame(width: ModelBrowserMetrics.quantWidth, alignment: .leading)
 
             // Size (parsed from model name)
-            Text(model.modelSize)
+            Text(L10n.text(model.modelSize))
                 .font(.callout.monospacedDigit())
                 .frame(width: ModelBrowserMetrics.sizeWidth, alignment: .trailing)
 
@@ -1217,7 +1383,7 @@ private struct ModelBrowserRow: View {
                 Circle()
                     .fill(fitnessColor)
                     .frame(width: 8, height: 8)
-                Text(model.ramEstimate)
+                Text(L10n.text(model.ramEstimate))
                     .font(.callout.monospacedDigit())
                     .lineLimit(1)
             }
@@ -1237,6 +1403,7 @@ private struct ModelBrowserRow: View {
         .padding(.horizontal, ModelBrowserMetrics.rowPaddingH)
         .padding(.vertical, 6)
         .opacity(disabled ? 0.4 : 1.0)
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
     }
 
     private var fitnessColor: Color {
@@ -1260,7 +1427,7 @@ private struct ModelBrowserRow: View {
             isReady: isReady,
             status: state?.status,
             hasPartial: downloads.hasPartialDownload(model.id),
-            progress: state?.fileProgress ?? 0
+            progress: state?.progress ?? 0
         )
     }
 
@@ -1275,14 +1442,58 @@ private struct ModelBrowserRow: View {
         )
     }
 
+    /// The other half of the catalogue — see `ModelBrowserUse.mediaModel`.
+    private var usableMedia: (model: LocalModel, modality: MediaModality)? {
+        ModelBrowserUse.mediaModel(
+            atPath: downloads.existingModelDir(for: model.id),
+            in: appState.localModels
+        )
+    }
+
+    /// A verified community media pack downloads as its FAMILY bundle — the
+    /// same allowlists + ready markers the catalog packs use — never the flat
+    /// chat-default pull, which would miss subdirs and grab repo junk. nil for
+    /// everything that isn't a served media repo.
+    private var mediaBundle: MediaBundle? {
+        guard model.mediaStructureVerified == true,
+              let arch = model.mediaFamilyModelType else { return nil }
+        return CustomMediaModels.bundle(arch: arch, repoId: model.id)
+    }
+
+    /// Start (or resume) this row's download. The media arm also asks the
+    /// running server to rescan afterward — boot-time discovery can't see a
+    /// model downloaded mid-session, and the media panes' "On This Mac" rows
+    /// read `/v1/models`.
+    private func startDownload() {
+        if let b = mediaBundle {
+            downloads.startBundle(b) {
+                appState.refreshModels()
+                server.rescanModels()
+            }
+        } else {
+            downloads.start(repoId: model.id) { appState.refreshModels() }
+        }
+    }
+
     @ViewBuilder
     private var actionCell: some View {
+        // Same shelf shape as GGUF, in directories instead of files: some MLX
+        // repos publish every quant as a subfolder (`LiquidAI/LFM2.5-2.6B-MLX`).
+        // Checked first — such a repo carries no `gguf` tag, so the two can't
+        // both match.
+        if model.isMlxVariantRepo, action != .unsupported {
+            if case .downloading(let progress) = action {
+                downloadingCell(progress: progress)
+            } else {
+                MlxVariantMenu(repoId: model.id, variants: model.mlxVariants, state: state)
+            }
+        }
         // A GGUF repo is a FOLDER OF QUANTS, not a model, so it never reaches a
         // terminal "on disk" state: owning Q4_K_M says nothing about whether you
         // also want Q8_0. Its cell stays a menu that marks what you have and
         // keeps offering what you don't — the old `.onDisk` collapse to
         // "✓ On disk" + trash left no way back to the quant picker.
-        if model.isGgufRepo, action != .unsupported {
+        else if model.isGgufRepo, action != .unsupported {
             if case .downloading(let progress) = action {
                 downloadingCell(progress: progress)
             } else {
@@ -1307,6 +1518,8 @@ private struct ModelBrowserRow: View {
                         } else {
                             ModelUseBadge(state: use)
                         }
+                    } else if let media = usableMedia {
+                        UseMediaModelButton(modality: media.modality, name: media.model.name)
                     } else {
                         Text("✓ On disk")
                             .font(.caption.weight(.medium))
@@ -1319,15 +1532,15 @@ private struct ModelBrowserRow: View {
                 downloadingCell(progress: progress)
 
             case .failed(let resumable):
-                Button(resumable ? "Resume" : "Retry") {
-                    downloads.start(repoId: model.id) { appState.refreshModels() }
+                Button(L10n.text(resumable ? "Resume" : "Retry")) {
+                    startDownload()
                 }
                 .font(.callout)
                 .controlSize(.small)
 
             case .notDownloaded(let resumable):
-                Button(resumable ? "Resume" : "Download") {
-                    downloads.start(repoId: model.id) { appState.refreshModels() }
+                Button(L10n.text(resumable ? "Resume" : "Download")) {
+                    startDownload()
                 }
                 .font(.callout)
                 .controlSize(.small)
@@ -1345,7 +1558,9 @@ private struct ModelBrowserRow: View {
                     .foregroundStyle(.secondary)
             }
             Button {
-                downloads.cancel(model.id)
+                // A bundle download's task is keyed by the BUNDLE id — a
+                // per-repo cancel would only wipe state, not stop the loop.
+                if let b = mediaBundle { downloads.cancelBundle(b) } else { downloads.cancel(model.id) }
                 appState.refreshModels()
             } label: {
                 Image(systemName: "xmark.circle.fill")
@@ -1372,6 +1587,7 @@ private struct ModelBrowserRow: View {
                 downloads.deleteModel(repoId: model.id)
                 appState.refreshModels()
             }
+            .keyboardShortcut(.defaultAction)
         } message: {
             Text("Delete \(model.modelName)? This will remove all downloaded files.")
         }
@@ -1380,13 +1596,6 @@ private struct ModelBrowserRow: View {
 
 /// The action cell for a GGUF repo: one menu covering every quant, in every
 /// state.
-///
-/// A GGUF repo ships a folder of quants and the user picks which to run, so this
-/// control never "completes". Quants on disk carry a ✓ and load on click; the
-/// rest download on click; each can be deleted individually. The repo's file
-/// list is fetched lazily from the HF tree API the first time the menu opens —
-/// what's on DISK, though, is read every render, so a finished download shows up
-/// without a refetch.
 private struct GgufQuantMenu: View {
     let repoId: String
     let state: DownloadManager.DownloadState?
@@ -1426,7 +1635,8 @@ private struct GgufQuantMenu: View {
                         } label: {
                             let selected = path(of: quant) == appState.selectedModelPath
                             Label(
-                                selected ? "\(quant.label) — in use" : "\(quant.label) — use",
+                                L10n.format(selected ? "%@ — in use" : "%@ — use",
+                                            L10n.text(quant.label)),
                                 systemImage: selected ? "checkmark.circle.fill" : "checkmark"
                             )
                         }
@@ -1434,14 +1644,14 @@ private struct GgufQuantMenu: View {
                 }
             }
 
-            Section(m.onDisk.isEmpty ? "Choose a quant" : "Download another") {
+            Section(L10n.text(m.onDisk.isEmpty ? "Choose a quant" : "Download another")) {
                 if !loaded {
                     Text("Loading quants…")
                 } else if m.available.isEmpty {
-                    Text(m.onDisk.isEmpty ? "No GGUF files found" : "Every quant is downloaded")
+                    Text(L10n.text(m.onDisk.isEmpty ? "No GGUF files found" : "Every quant is downloaded"))
                 } else {
                     ForEach(m.available) { quant in
-                        Button(quant.label) {
+                        Button(L10n.text(quant.label)) {
                             // Pass the whole quant — a sharded one pulls every
                             // shard into `<model>/<quant>/`.
                             downloads.startGguf(repoId: repoId, quant: quant) {
@@ -1457,16 +1667,18 @@ private struct GgufQuantMenu: View {
                 // user didn't ask to delete.
                 Menu("Delete") {
                     ForEach(m.onDisk) { quant in
-                        Button(quant.label, role: .destructive) { pendingDelete = quant }
+                        Button(L10n.text(quant.label), role: .destructive) { pendingDelete = quant }
                     }
                 }
             }
         } label: {
-            Text(GgufQuantMenuModel.buttonLabel(
+            Text(L10n.text(
+                GgufQuantMenuModel.buttonLabel(
                 onDisk: m.onDisk,
                 failed: state?.status == .failed,
                 hasPartial: downloads.hasPartialDownload(repoId)
-            ))
+            )
+))
         }
         .font(.callout)
         .controlSize(.small)
@@ -1486,8 +1698,109 @@ private struct GgufQuantMenu: View {
                 pendingDelete = nil
                 appState.refreshModels()
             }
+            .keyboardShortcut(.defaultAction)
         } message: { quant in
             Text("Delete the \(quant.label) quant? Other quants of this model stay on disk.")
+        }
+    }
+}
+
+/// The action cell for a multi-variant MLX repo — the directory-shaped twin of
+/// `GgufQuantMenu`.
+private struct MlxVariantMenu: View {
+    let repoId: String
+    let variants: [MlxVariant]
+    let state: DownloadManager.DownloadState?
+    @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+    @State private var pendingDelete: MlxVariant?
+
+    /// Each variant is its own ordinary model dir — see `MlxVariantScan.localRepoId`.
+    private func localId(_ v: MlxVariant) -> String {
+        MlxVariantScan.localRepoId(repoId: repoId, folder: v.folder)
+    }
+    private func path(of v: MlxVariant) -> String? { downloads.existingModelDir(for: localId(v)) }
+
+    private var menu: MlxVariantMenuModel.Menu {
+        MlxVariantMenuModel.build(
+            remote: variants,
+            onDisk: Set(variants.filter { downloads.isReady(localId($0)) }.map(\.folder))
+        )
+    }
+
+    private func title(_ v: MlxVariant) -> String {
+        v.sizeLabel.isEmpty ? v.label : "\(v.label) · \(v.sizeLabel)"
+    }
+
+    var body: some View {
+        let m = menu
+        Menu {
+            if !m.onDisk.isEmpty {
+                Section("On this Mac") {
+                    ForEach(m.onDisk) { v in
+                        Button {
+                            guard let p = path(of: v) else { return }
+                            Task { _ = await appState.useModelAndAwaitReady(atPath: p) }
+                        } label: {
+                            let selected = path(of: v) == appState.selectedModelPath
+                            Label(
+                                L10n.format(selected ? "%@ — in use" : "%@ — use",
+                                            L10n.text(v.label)),
+                                systemImage: selected ? "checkmark.circle.fill" : "checkmark"
+                            )
+                        }
+                    }
+                }
+            }
+
+            Section(L10n.text(m.onDisk.isEmpty ? "Choose a quantization" : "Download another")) {
+                if m.available.isEmpty {
+                    Text("Every quantization is downloaded")
+                } else {
+                    ForEach(m.available) { v in
+                        Button(L10n.text(title(v))) {
+                            downloads.startMlxVariant(repoId: repoId, variant: v) {
+                                appState.refreshModels()
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !m.onDisk.isEmpty {
+                // Deletes remove ONE variant. Its siblings are separate models
+                // the user didn't ask to delete.
+                Menu("Delete") {
+                    ForEach(m.onDisk) { v in
+                        Button(L10n.text(v.label), role: .destructive) { pendingDelete = v }
+                    }
+                }
+            }
+        } label: {
+            Text(L10n.text(
+                MlxVariantMenuModel.buttonLabel(
+                onDisk: m.onDisk,
+                failed: state?.status == .failed,
+                hasPartial: variants.contains { downloads.hasPartialDownload(localId($0)) }
+            )
+))
+        }
+        .font(.callout)
+        .controlSize(.small)
+        .fixedSize()
+        .alert("Delete Quantization", isPresented: .init(
+            get: { pendingDelete != nil },
+            set: { if !$0 { pendingDelete = nil } }
+        ), presenting: pendingDelete) { v in
+            Button("Cancel", role: .cancel) { pendingDelete = nil }
+            Button("Delete", role: .destructive) {
+                downloads.deleteModel(repoId: localId(v))
+                pendingDelete = nil
+                appState.refreshModels()
+            }
+            .keyboardShortcut(.defaultAction)
+        } message: { v in
+            Text("Delete the \(v.label) build? Other quantizations of this model stay on disk.")
         }
     }
 }
@@ -1500,6 +1813,24 @@ private struct LocalModelRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @State private var confirmDelete = false
+    /// Per-row, per-session: clicking the lock arms the trash for THIS row
+    /// only, and a refresh re-locks it. The friction is worth one click; the
+    /// old dead badge was not worth anything.
+    @State private var unlocked = false
+    @State private var card: ModelCardRequest?
+    @State private var settings: ModelSettingsRequest?
+    @State private var hasOverrides = false
+
+    private var settingsRequest: ModelSettingsRequest {
+        ModelSettingsRequest(path: model.path, title: ModelDisplayName.pretty(model.displayLabel))
+    }
+
+    /// nil for a bare folder that maps to no Hugging Face repo.
+    private var cardRequest: ModelCardRequest? {
+        ModelCard.repoId(localName: model.name).map {
+            ModelCardRequest(repoId: $0, title: ModelDisplayName.pretty(model.displayLabel))
+        }
+    }
 
     private var useState: ModelUseState {
         ModelUseState.resolve(
@@ -1508,19 +1839,49 @@ private struct LocalModelRow: View {
         )
     }
 
+    /// Open Finder with the model selected. `path` is the directory for a
+    /// safetensors checkpoint and the FILE for one GGUF quant, and
+    /// `activateFileViewerSelecting` selects either — which is the behaviour
+    /// you want: a quant row reveals its own file, not its repo folder.
+    private func refreshOverrides() {
+        hasOverrides = ModelSettingsFile.load().override(for: model.path)?.hasSettings ?? false
+    }
+
+    private func revealInFinder() {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.path)])
+    }
+
+    private func performDelete() {
+        downloads.deleteModel(model, unlocked: unlocked)
+        appState.refreshModels()
+    }
+
     var body: some View {
         HStack(spacing: 8) {
+            Button { card = cardRequest } label: {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
-                    // `displayLabel`, so two quants of one GGUF repo are two
-                    // distinguishable rows rather than two identical ones.
-                    Text(model.displayLabel)
+                    // The READABLE name. `displayLabel` (the repo id, plus a
+                    // quant suffix so two quants of one GGUF repo are two
+                    // distinguishable rows) survives as the subtext below —
+                    Text(L10n.text(ModelDisplayName.pretty(model.displayLabel)))
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
                     // Drafter checkpoints are real, supported models — they
                     // just aren't loadable as a target on their own. Show a
                     // distinct badge instead of the red "unsupported" warning
                     // that the generic check would otherwise render.
+                    // A folder that cannot load says so on the row itself. The
+                    // alternative — hiding it — is how two junk folders sat in
+                    // this library unnoticed while the server registered both.
+                    if let defect = model.defect {
+                        Text(L10n.text(defect.label))
+                            .font(.system(size: 10).weight(.medium))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.orange.opacity(0.15), in: Capsule())
+                            .help(defect.explanation)
+                    }
                     if model.kind == .drafter {
                         Text("Drafter")
                             .font(.system(size: 10).weight(.medium))
@@ -1530,11 +1891,20 @@ private struct LocalModelRow: View {
                             .help("Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own.")
                     }
                 }
+                // The id itself, under the readable name.
+                Text(L10n.text(model.displayLabel))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
                 // Metadata caption: params · quant · architecture · engine, so
                 // the row actually tells the user what the model is — previously
                 // it was just a name and a delete button.
                 HStack(spacing: 6) {
-                    Text(model.metadataSummary)
+                    // For a broken folder the architecture summary is noise —
+                    // what it IS matters less than why it cannot load.
+                    Text(L10n.text(model.defect?.explanation ?? model.metadataSummary))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1564,9 +1934,13 @@ private struct LocalModelRow: View {
                     }
                 }
             }
+            .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(cardRequest == nil)
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(model.sizeFormatted)
+            Text(L10n.text(model.sizeFormatted))
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 90, alignment: .trailing)
@@ -1583,16 +1957,40 @@ private struct LocalModelRow: View {
                     } else {
                         ModelUseBadge(state: useState)
                     }
+                } else if let modality = MediaModality(modelType: model.modelType) {
+                    // A media checkpoint is a real, loadable, servable model —
+                    // it just is not a CHAT model, and until now that meant the
+                    // only verb the browser offered for it was Delete. This
+                    // does NOT go through `useModelAndAwaitReady`: that starts
+                    // the server on the path as its primary chat model, which
+                    // for a diffusion checkpoint means the text loader. It
+                    // opens the pane that owns the model instead, and lets the
+                    // pane load it the way it always has.
+                    UseMediaModelButton(modality: modality, name: model.name)
                 }
-                if let reason = model.externalReadOnlyReason {
-                    // Read-only: this model lives outside ~/.mlx-serve (LM Studio,
-                    // the HF hub cache, or a user-added custom folder). The app
-                    // loads it but never deletes into another tool's / the user's
-                    // tree, so we surface a badge instead of a trash.
-                    Image(systemName: "externaldrive.badge.icloud")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .help(reason)
+                if model.isChatPickable {
+                    Button { settings = settingsRequest } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .foregroundStyle(hasOverrides ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                    }
+                    .buttonStyle(.plain)
+                    .font(.callout)
+                    .help(hasOverrides ? "Model settings (this model has its own context / KV settings)" : "Model settings")
+                }
+                if ModelRowActions.showsLock(model, unlocked: unlocked) {
+                    // Locked, not read-only. This slot used to hold an `Image`
+                    // of an external-drive/cloud glyph nobody could read, which
+                    // did nothing when clicked. It is a Button now, and clicking
+                    // it is how you get the trash. (The old symbol name is
+                    // deliberately not spelled here — a source scan in
+                    // `ModelRowActionsTests` asserts it is gone from this file.)
+                    Button { unlocked = true } label: {
+                        Image(systemName: "lock")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.callout)
+                    .help(ModelRowActions.lockHelp(model))
                 } else {
                     Button {
                         confirmDelete = true
@@ -1602,26 +2000,70 @@ private struct LocalModelRow: View {
                     }
                     .buttonStyle(.plain)
                     .font(.callout)
-                    .help(model.quantFile != nil ? "Delete this quant" : "Delete model")
-                    .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
-                        Button("Cancel", role: .cancel) {}
-                        Button("Delete", role: .destructive) {
-                            downloads.deleteModel(model)
-                            appState.refreshModels()
-                        }
-                    } message: {
-                        // A GGUF row is ONE quant of a repo — deleting it must not
-                        // promise (or perform) the removal of its siblings.
-                        Text(model.quantFile != nil
-                             ? "Delete \(model.displayLabel)? Other quants of this model stay on disk."
-                             : "Delete \(model.name)? This will remove all downloaded files.")
-                    }
+                    .help(model.defect != nil
+                          ? "Delete this broken folder"
+                          : (model.quantFile != nil ? "Delete this quant" : "Delete model"))
                 }
+
+                // Reveal in Finder — rightmost, on EVERY row. Six other panes
+                // already had this control; the one pane that is entirely about
+                // files on disk did not, so a model you did not recognise could
+                // not be located from the app that listed it.
+                Button(action: revealInFinder) {
+                    Image(systemName: "folder")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .font(.callout)
+                .help(ModelRowActions.revealHelp(model))
             }
-            .frame(width: 120, alignment: .trailing)
+            .frame(width: 150, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        // The alert lives on the ROW so both the trash and the context menu
+        // raise the same confirmation — two delete paths with two dialogs is
+        // two chances to word the consequence differently.
+        .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) { performDelete() }
+                .keyboardShortcut(.defaultAction)
+        } message: {
+            Text(ModelRowActions.deleteMessage(model))
+        }
+        .sheet(item: $card) { ModelDetailSheet(request: $0) }
+        .sheet(item: $settings, onDismiss: refreshOverrides) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
+        .onAppear(perform: refreshOverrides)
+        .contextMenu {
+            if model.isChatPickable, useState == .idle {
+                Button("Use This Model") {
+                    appState.selectedModelPath = model.path
+                }
+            }
+            if cardRequest != nil {
+                Button("Model Details\u{2026}") { card = cardRequest }
+            }
+            if model.isChatPickable {
+                Button("Model Settings\u{2026}") { settings = settingsRequest }
+            }
+            Button("Show in Finder", action: revealInFinder)
+            Button("Copy Path") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(model.path, forType: .string)
+            }
+            Button("Copy Model ID") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(model.displayLabel, forType: .string)
+            }
+            Divider()
+            if ModelRowActions.showsTrash(model, unlocked: unlocked) {
+                Button("Delete\u{2026}", role: .destructive) { confirmDelete = true }
+            } else {
+                // Same two-step as the lock button: the menu never deletes
+                // another app's model on one click.
+                Button("Unlock to Delete") { unlocked = true }
+            }
+        }
     }
 }
 
@@ -1640,7 +2082,7 @@ private struct ActiveDownloadRow: View {
     var body: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
-                Text(modelName)
+                Text(L10n.text(modelName))
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
 
@@ -1662,7 +2104,7 @@ private struct ActiveDownloadRow: View {
             if state.status == .downloading {
                 HStack(spacing: 4) {
                     VStack(alignment: .trailing, spacing: 1) {
-                        ProgressView(value: state.fileProgress)
+                        ProgressView(value: state.progress)
                             .frame(width: 80)
                         Text("\(state.percentFormatted) \(state.speedFormatted)")
                             .font(.system(size: 9).monospacedDigit())
@@ -1680,7 +2122,7 @@ private struct ActiveDownloadRow: View {
                 }
                 .frame(width: 116, alignment: .trailing)
             } else if state.status == .failed {
-                Button(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry") {
+                Button(L10n.text(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry")) {
                     downloads.start(repoId: repoId) { appState.refreshModels() }
                 }
                 .font(.callout)

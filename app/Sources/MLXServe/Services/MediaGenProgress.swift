@@ -88,11 +88,22 @@ enum MediaSSE {
         }
     }
 
+    /// JPEG bytes from an opt-in video `progress` event. The key is `preview`
+    /// (`preview.formatProgressJson` is the only emitter). Missing or
+    /// undecodable → nil, never a thrown error.
+    static func previewJPEG(_ ev: [String: Any]) -> Data? {
+        guard let b64 = ev["preview"] as? String else { return nil }
+
+        return Data(base64Encoded: b64)
+    }
+
     /// Readable label for the stage names the engines emit. An unknown stage is
     /// passed through verbatim — inventing a translation would mislabel it.
     static func stageLabel(_ stage: String) -> String {
         switch stage {
         case "encode":  return "Encoding prompt"
+        case "prefill": return "Encoding prompt"
+        case "frames":  return "Composing frames"
         case "diffuse": return "Composing"
         case "decode":  return "Rendering audio"
         default:        return stage

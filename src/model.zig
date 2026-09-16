@@ -1,15 +1,25 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+const qwen4_exp = @import("qwen4_exp.zig");
+const kv_quant_mod = @import("kv_quant.zig");
+const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 
-pub const HiddenAct = enum { gelu_approx, silu, relu_sq };
+pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
 /// MLX quantization mode from config.json's `quantization.mode`. All
 /// non-affine modes store NO `.biases` tensors (per-group fp8-encoded uint8
 /// scales only) but share the packed-u32 weight layout, so supporting them is
 /// a matter of skipping the biases fetch and passing the right mode string to
 /// the mlx quantized ops. Tag names match the mlx-c mode strings exactly.
+/// Upper bound on a vision tower's per-layer type table (muse ships 50).
+pub const MAX_VISION_LAYERS = 64;
+
+/// `MuseGlimmerImageProcessor.max_image_tokens` — MERGED tokens, not pixels.
+pub const MUSE_MAX_IMAGE_TOKENS = 4096;
+
 pub const QuantMode = enum {
     affine,
     nvfp4,
@@ -38,6 +48,77 @@ pub const QuantMode = enum {
 
 pub const LayerBlockType = enum { attention, gated_conv, mamba2, mlp, moe };
 
+/// Sentence-transformers pooling operation for embedding requests (issue
+/// #116): masked mean over real positions, the CLS token (position 0), or the
+/// last real (non-padding) token. Every mode is followed by L2 normalization.
+pub const PoolingMode = enum {
+    mean,
+    cls,
+    last_token,
+
+    pub fn fromString(s: []const u8) ?PoolingMode {
+        if (std.mem.eql(u8, s, "mean")) return .mean;
+        if (std.mem.eql(u8, s, "cls")) return .cls;
+        if (std.mem.eql(u8, s, "last_token")) return .last_token;
+        return null;
+    }
+};
+
+/// Parse a sentence-transformers `1_Pooling/config.json`. Returns the pooling
+/// mode when the file declares one we implement, null when the content isn't a
+/// pooling config at all (malformed JSON, unrelated object — best-effort, like
+/// generation_config.json), and `error.UnsupportedPoolingMode` when the file
+/// DOES declare pooling but only modes we don't implement (weighted-mean,
+/// max): serving those checkpoints mean-pooled would be silent corruption.
+pub fn parsePoolingSidecar(content: []const u8) !?PoolingMode {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), content, .{}) catch return null;
+    if (parsed != .object) return null;
+    const obj = parsed.object;
+
+    const getBool = struct {
+        fn get(o: std.json.ObjectMap, key: []const u8) bool {
+            if (o.get(key)) |v| {
+                if (v == .bool) return v.bool;
+            }
+            return false;
+        }
+    }.get;
+    // ST configs set exactly one mode true; check ours most-specific first.
+    if (getBool(obj, "pooling_mode_lasttoken")) return .last_token;
+    if (getBool(obj, "pooling_mode_cls_token")) return .cls;
+    if (getBool(obj, "pooling_mode_mean_tokens")) return .mean;
+    // Declares pooling, but none we support → refuse rather than mean-pool.
+    var it = obj.iterator();
+    while (it.next()) |e| {
+        if (std.mem.startsWith(u8, e.key_ptr.*, "pooling_mode_")) return error.UnsupportedPoolingMode;
+    }
+    return null;
+}
+
+/// Known-family pooling fallback for checkpoints that ship neither an explicit
+/// `pooling_mode` nor the ST sidecar (the mlx-community conversions strip it).
+/// Gated on the arch so a directory name can never flip an unrelated model:
+/// qwen3* named *embedding* → last-token (Qwen3-Embedding's contract), BERT
+/// bge-/mxbai-embed → CLS (their model cards' contract). Everything else null
+/// → the mean default.
+pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?PoolingMode {
+    var lower_buf: [256]u8 = undefined;
+    if (dir_basename.len > lower_buf.len) return null;
+    const lower = std.ascii.lowerString(&lower_buf, dir_basename);
+    if (std.mem.startsWith(u8, model_type, "qwen3")) {
+        if (std.mem.indexOf(u8, lower, "embedding") != null) return .last_token;
+        return null;
+    }
+    if (std.mem.eql(u8, model_type, "bert")) {
+        if (std.mem.indexOf(u8, lower, "bge-") != null) return .cls;
+        if (std.mem.indexOf(u8, lower, "mxbai-embed") != null) return .cls;
+        return null;
+    }
+    return null;
+}
+
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
@@ -59,6 +140,8 @@ pub const ModelConfig = struct {
     num_key_value_heads: u32 = 8,
     head_dim: u32 = 256,
     rms_norm_eps: f32 = 1e-6,
+    /// K2-Horizon: every RMS norm normalizes `hidden_size / norm_groups`-wide channel groups on their own rms, then applies the full weight.
+    norm_groups: u32 = 1,
 
     // RoPE
     rope_theta: f32 = 1000000.0,
@@ -88,6 +171,20 @@ pub const ModelConfig = struct {
     scale_embeddings: bool = true,
     has_pre_ff_norm: bool = true,
     has_qk_norm: bool = true,
+    // Learned per-head attention sinks (gpt_oss `self_attn.sinks`, [n_heads]):
+    // one extra logit column that lands in the softmax DENOMINATOR only, so
+    // every head can attend to "nothing". mlx's fused SDPA takes them
+    // natively (`mlx_fast_scaled_dot_product_attention`'s `sinks` argument);
+    // this flag is what makes the loader fetch the weight and the forward
+    // pass it instead of the null array.
+    has_attn_sinks: bool = false,
+    // gpt_oss clamped SwiGLU. Non-zero limit selects
+    //   clip(gate, max=limit) * sigmoid(alpha*gate) * (clip(up, ±limit) + 1)
+    // over the standard silu(gate)*up. The `+ 1` on the linear branch and the
+    // asymmetric clip are both load-bearing; `hidden_act` in a gpt_oss
+    // config.json says "silu" and is never read by the reference.
+    swiglu_limit: f32 = 0.0,
+    swiglu_alpha: f32 = 1.702,
 
     // MoE
     num_experts: u32 = 0,
@@ -107,6 +204,12 @@ pub const ModelConfig = struct {
     // Laguna-S-2.1 checkpoint sets moe_router_logit_softcapping: 0.0).
     moe_router_logit_softcapping: f32 = 0.0,
 
+    // Grouped ("noaux_tc") expert routing: split the biased scores into
+    // moe_n_group equal groups, keep the moe_topk_group best by their top-2
+    // sum, then take the global top-k inside the survivors. 1/1 = ungrouped.
+    moe_n_group: u32 = 1,
+    moe_topk_group: u32 = 1,
+
     // Linear attention (GatedDeltaNet)
     linear_num_key_heads: u32 = 0,
     linear_num_value_heads: u32 = 0,
@@ -114,10 +217,73 @@ pub const ModelConfig = struct {
     linear_value_head_dim: u32 = 128,
     linear_conv_kernel_dim: u32 = 4,
 
+    // KDA (Kimi Delta Attention, bailing_hybrid) variations on the
+    // GatedDeltaNet recurrence:
+    //   - the forget gate is PER CHANNEL ([B,T,H,Dk]) rather than per head, so
+    //     the fused kernel indexes `g` by the key channel (kda_vector_gate);
+    //   - a non-zero lower bound replaces the softplus gate entirely with
+    //     `g = bound * sigmoid(exp(A_log) * (a + dt_bias))`, which is bounded
+    //     in (bound, 0) instead of (-inf, 0) — it is NOT a clamp on the
+    //     softplus form (fla/ops/kda/fused_recurrent.py);
+    //   - the output gate is a plain sigmoid, not SiLU/swish.
+    kda_vector_gate: bool = false,
+    kda_gate_lower_bound: f32 = 0.0, // 0 = plain -exp(A_log)·softplus form
+    kda_sigmoid_out_gate: bool = false,
+
+    // Multi-head Latent Attention (bailing_hybrid's full-attention layers,
+    // DeepSeek-V3 shape): low-rank Q (q_a_proj → q_a_layernorm → q_b_proj) and
+    // a single compressed KV latent (kv_a_proj_with_mqa → kv_lora_rank latent
+    // + qk_rope_head_dim shared rope key) expanded per head by kv_b_proj.
+    // Query/key head dim is nope+rope; the value head dim is SMALLER, so the
+    // KV cache holds asymmetric K/V (MLX's SDPA has a 192/128 vector kernel).
+    // mla_head_gate: per-head sigmoid gate on the attention output (the
+    // checkpoint's `head_wise` gated_attention_proj_granularity_type).
+    mla_q_lora_rank: u32 = 0, // 0 = not an MLA arch
+    mla_kv_lora_rank: u32 = 0,
+    mla_qk_nope_head_dim: u32 = 0,
+    mla_qk_rope_head_dim: u32 = 0,
+    mla_v_head_dim: u32 = 0,
+    mla_head_gate: bool = false,
+    // RoPE rotates ADJACENT PAIRS (x[2i], x[2i+1]) instead of halves — mlx's
+    // `traditional` rope. Set by rope_interleave.
+    rope_interleaved_pairs: bool = false,
+
     // Hybrid attention
     full_attention_interval: u32 = 0,
+    // Hybrid archs: layers at or past this index are ALWAYS full
+    // attention, whatever the interval says. The reference's rule is
+    // `(idx+1) % group == 0 OR idx >= n_layers // group * group`, i.e. the
+    // ragged tail after the last WHOLE group never gets linear attention.
+    // 0 = no tail bound, which is every other hybrid arch (qwen3_next, lfm2).
+    linear_attn_tail_from: u32 = 0,
     partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
+
+    // Qwen4-Exp (Qwen3.8-Flash-Next): gated residual streams ("hyper
+    // connections", hc_count x hidden wide), a hashed n-gram embedding
+    // injected at ONE layer (PLE), and Qwen Sparse Attention (indexer-selected
+    // 4-token blocks past `indexer_budget` tokens). hc_count 0 = none.
+    hc_count: u32 = 0,
+    hc_lowrank: u32 = 0,
+    ple_layer_idx: i32 = -1, // 0-based; the config lists 1-based ids
+    ple_embed_dim: u32 = 0,
+    ple_conv_kernel: u32 = 4,
+    ngram_size: u32 = 3,
+    heads_per_ngram: u32 = 8,
+    ngram_vocab_base: u64 = 20_000_000,
+    ngram_vocab_divisor: u32 = 128,
+    ngram_seed: u64 = 1234,
+    indexer_n_heads: u32 = 0, // 0 = dense attention
+    indexer_head_dim: u32 = 0,
+    indexer_budget: u32 = 0,
+    indexer_compress_ratio: u32 = 0,
+    /// The TEXT config's own eos (its first entry): the n-gram hash's segment
+    /// reset token, independent of the generation-time stop set.
+    ngram_eos: u32 = 0,
+    /// `<model_dir>/ngram_table.bin` for the PLE table (mmapped by the
+    /// engine, never mlx-loaded). Set by `parseConfig`; lives as long as the
+    /// config does.
+    ngram_table_path: ?[]const u8 = null,
 
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
     // softplus(fp32) → per-head scalar × attn output (reshaped [..,H,D]) before
@@ -129,6 +295,26 @@ pub const ModelConfig = struct {
     num_attention_heads_per_layer: [128]u32 = @splat(0),
     has_per_layer_heads: bool = false,
 
+    // MuseGlimmer (muse_glimmer): weight-less shared QK RMS-norm with Q scaled
+    // by qk_scale_factor (folded into attnScale — a scalar commutes through
+    // RoPE and QK^T), elementwise sigmoid attention output gate from a
+    // separate self_attn.gate_proj read off the post-input-norm hidden,
+    // RMS-normed embeddings (NO sqrt(hidden) scale), Gemma2-centered sandwich
+    // norms whose POST norms use post_norm_eps while the FINAL norm is
+    // plain-scale (ones-init), logits scaled by output_multiplier before the
+    // tanh softcap, and NoPE on layers whose layer_rope_theta entry is 0
+    // (exactly the full-attention layers in the released checkpoint).
+    qk_scale_factor: f32 = 0.0, // 0 = off
+    output_multiplier: f32 = 0.0, // 0 = off
+    post_norm_eps: f32 = 0.0, // 0 = same as rms_norm_eps
+    final_norm_plain: bool = false, // final norm skips the (1+w) fold
+    qk_norm_weightless: bool = false, // param-free RMS on Q and K heads
+    normed_embeddings: bool = false, // param-free RMS after embedding lookup
+    attn_sigmoid_gate: bool = false, // attn_out *= sigmoid(gate_proj(normed))
+    attn_gate_headwise: bool = false, // the gate is ONE scalar per head (g_proj [heads, hidden])
+    attn_fused_qkv: bool = false, // checkpoint ships self_attn.q_k_v_proj = [q | k | v] rows
+    layer_no_rope: [128]bool = @splat(false),
+
     // Laguna YaRN RoPE (full-attention layers only; sliding layers use default
     // RoPE at rope_local_base_freq). rope_yarn gates the freqs + mscale
     // precompute at model load; the sliding/full split is by isGlobalLayer.
@@ -138,6 +324,9 @@ pub const ModelConfig = struct {
     yarn_beta_fast: f32 = 32.0,
     yarn_beta_slow: f32 = 1.0,
     yarn_attention_factor: f32 = 1.0,
+    /// HF's `truncate` (default true): floor/ceil the ramp correction bounds to
+    /// whole dims. Only the flat-`rope_parameters` readers set it.
+    yarn_truncate: bool = true,
 
     // Inkling (inkling_mm_model, Thinking Machines Inkling Small). NO RoPE:
     // position = the RelativeLogits bias (per-layer wr_du → [heads, d_rel]
@@ -214,6 +403,16 @@ pub const ModelConfig = struct {
     layer_norm_eps: f32 = 1e-12,
     type_vocab_size: u32 = 0,
 
+    /// Sentence-transformers pooling for /v1/embeddings (issue #116). null =
+    /// no explicit signal → masked mean (the historical behavior, correct for
+    /// MiniLM-class BERTs and EmbeddingGemma). Set from config.json
+    /// `pooling_mode`, the ST `1_Pooling/config.json` sidecar, or the
+    /// known-family name fallback (`poolingFromDirName`). A non-null mode on a
+    /// decoder arch (Qwen3-Embedding) also advertises the `embeddings`
+    /// capability WITHOUT flipping `is_encoder_only` — the forward stays the
+    /// arch's own causal pass.
+    pooling_mode: ?PoolingMode = null,
+
     // Bidirectional-attention embedding models (EmbeddingGemma): a decoder
     // arch (gemma3_text) trained as an encoder. Implies is_encoder_only.
     use_bidirectional_attention: bool = false,
@@ -234,6 +433,30 @@ pub const ModelConfig = struct {
     /// `--ctx-size` still wins over this.
     pinned_context: u32 = 0,
 
+    /// Per-model settings from `model-settings.json`, set at the load
+    /// construction site. `ctx_override` 0 = the process `--ctx-size`/auto;
+    /// `kv_quant_override` null = the process `--kv-quant`; `mtp_override`
+    /// true = head loaded AND on by default (the `--mtp` force, per model).
+    ctx_override: u32 = 0,
+    kv_quant_override: ?kv_quant_mod.KVQuantConfig = null,
+    mtp_override: ?bool = null,
+    /// null = the process `--mtp-typical`/`--mtp-tokenv3` (exact when neither).
+    mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
+
+    /// The prefill chunk this model was sized for, FROZEN at load
+    /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
+    /// launch/base chunk.
+    ///
+    /// The chunk is the multiplier on the biggest transient in the memory bill
+    /// (`8 x chunk x max(hidden, ffn) x 2`, three of them). Nothing used to size
+    /// it to the MACHINE, so a 16 GB Mac reserved the same 5-7 GB envelope a
+    /// 128 GB one does, which is most of its budget: the sizer then reported a
+    /// 1024-token context and the admission guard refused prompts whose real
+    /// peak was a third of the bill. The sizer, `checkAttentionMemory` and
+    /// `generate.effectivePrefillChunk` all read THIS field, so the bill and the
+    /// forward can never disagree. Explicit `--prefill-chunk` still wins.
+    pinned_prefill_chunk: u32 = 0,
+
     // Stop tokens (populated from config.json)
     eos_token_ids: [8]u32 = @splat(0),
     num_eos_tokens: u32 = 0,
@@ -247,6 +470,12 @@ pub const ModelConfig = struct {
     gen_temperature: ?f32 = null,
     gen_top_p: ?f32 = null,
     gen_top_k: ?u32 = null,
+
+    // The checkpoint's OWN thinking default, from generation_config.json's
+    // `default_chat_template_kwargs.enable_thinking`. null = the file or key
+    // is absent. Read by `defaultEnableThinking` for requests that name no
+    // thinking preference; an explicit request value still outranks it.
+    gen_enable_thinking: ?bool = null,
 
     // Gemma 4: explicit layer type map (bit = 1 means full/global attention)
     has_explicit_layer_types: bool = false,
@@ -304,6 +533,34 @@ pub const ModelConfig = struct {
     // 0 means absent: the Qwen processor defaults remain the fallback.
     qv_min_pixels: u32 = 0,
     qv_max_pixels: u32 = 0,
+    // Muse-Glimmer vision (src/muse_vision.zig). Shares the qv_* geometry but
+    // NOT the Qwen ViT: split qkv, learned pos table resampled per image,
+    // window/full attention per layer, and plain 1D text positions (no M-RoPE).
+    muse_vision: bool = false,
+    mv_pos_side: u32 = 0, // learned pos table is pos_side x pos_side
+    mv_projector_hidden: u32 = 0, // vision_adapter width
+    mv_ln_eps: f32 = 1e-5,
+    mv_rope_theta: f64 = 10000.0,
+    mv_max_image_tokens: u32 = 0, // processor cap, in MERGED tokens
+    mv_full_attn: [MAX_VISION_LAYERS]bool = @splat(false),
+    // LFM2-VL vision (src/lfm2_vision.zig). The tower's geometry comes from the
+    // generic vision_* fields above (it is a stock SigLIP2); these are LFM2-VL's
+    // own wrapper — the projector, and the NaFlex processor's token budget.
+    lfm2_vision: bool = false,
+    lv_pos_side: u32 = 0, // learned pos table is pos_side x pos_side
+    lv_downsample: u32 = 2, // projector pixel-unshuffle factor
+    lv_projector_hidden: u32 = 0,
+    lv_ln_eps: f32 = 1e-6,
+    lv_min_image_tokens: u32 = 64,
+    lv_max_image_tokens: u32 = 256,
+    lv_tile_size: u32 = 512,
+    lv_min_tiles: u32 = 2,
+    lv_max_tiles: u32 = 10,
+    lv_split_images: bool = true,
+    lv_use_thumbnail: bool = true,
+    lv_pixels_tolerance: f32 = 2.0,
+    lv_thumbnail_token_id: u32 = 0,
+    lv_row_col_base_id: u32 = 0, // id of `<|img_row_1_col_1|>`; the block is row-major
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
@@ -354,6 +611,13 @@ pub const ModelConfig = struct {
 
     // LFM2 gated convolution
     lfm_conv_kernel: u32 = 3,
+    /// LFM2.5-8B-A1B (`lfm2_moe`): the hybrid trunk's per-layer MLP is a
+    /// sparse MoE from `num_dense_layers` on. `model_type` collapses to
+    /// "lfm2" (same conv/attention mixers), so this flag is what tells the
+    /// layer loader which feed-forward to bind.
+    lfm2_moe: bool = false,
+    /// First N layers keep a DENSE feed-forward; the rest are MoE.
+    num_dense_layers: u32 = 0,
     lfm_conv_dim: u32 = 0, // 0 = hidden_size
 
     // Mamba2 SSM (Nemotron-H)
@@ -453,15 +717,234 @@ pub const ModelConfig = struct {
 
     pub fn isLinearLayer(self: ModelConfig, layer_idx: u32) bool {
         if (self.full_attention_interval == 0) return false;
+        if (self.linear_attn_tail_from != 0 and layer_idx >= self.linear_attn_tail_from) return false;
         return ((layer_idx + 1) % self.full_attention_interval) != 0;
+    }
+
+    /// Which `partial_rotary_factor` the YaRN table covers: laguna/gemma4 scale
+    /// only their full-attention layers and spell that one
+    /// `partial_rotary_factor_global`; every other YaRN arch (qwen4_exp) has a
+    /// single rope for the whole trunk.
+    pub fn yarnPartial(self: *const ModelConfig) f32 {
+        return if (self.isQwen4()) self.partial_rotary_factor else self.partial_rotary_factor_global;
+    }
+
+    /// `int(head_dim × yarnPartial())` — the rotating slice of a head, i.e. the
+    /// dims the YaRN frequency table covers (qwen4_exp: 256 × 0.25 = 64, whose
+    /// 32 frequencies are what `mrope_section` [11,11,10] sums to).
+    pub fn yarnRotaryDim(self: *const ModelConfig) u32 {
+        return @intFromFloat(@as(f32, @floatFromInt(self.head_dim)) * self.yarnPartial());
+    }
+
+    /// The longest sequence the rope can actually resolve. Plain:
+    /// `max_position_embeddings`. YaRN: `original_max_position_embeddings ×
+    /// factor` — the window HF and vLLM both derive `max_model_len` from — since
+    /// a position past it aliases back inside the ramp. 0 = no rope-derived cap.
+    pub fn contextCap(self: *const ModelConfig) u32 {
+        const declared = self.max_position_embeddings;
+        if (!self.rope_yarn) return declared;
+        const orig: f64 = @floatFromInt(self.yarn_orig_max_pos);
+        const factor: f64 = @floatCast(self.yarn_factor);
+        const scaled: f64 = @floor(orig * factor);
+        const max_u32: f64 = @floatFromInt(std.math.maxInt(u32));
+        const window: u32 = if (scaled >= max_u32) std.math.maxInt(u32) else @intFromFloat(scaled);
+        return if (declared == 0) window else @min(window, declared);
+    }
+
+    /// How many layers hold an attention KV cache. A hybrid arch interleaves
+    /// linear-attention layers, which carry a FIXED-SIZE recurrent state
+    /// instead of a per-token cache — billing them as attention layers made
+    /// the memory model charge a uniform arch's footprint for a model
+    /// carrying a fraction of it (bailing_hybrid: 6 of 24).
+    pub fn attnCacheLayerCount(self: *const ModelConfig) u32 {
+        // A `layer_block_types` hybrid (LFM2 via `layer_types`, Nemotron-H via
+        // `hybrid_override_pattern`) never sets `full_attention_interval`, so
+        // the interval arm below counted EVERY layer: lfm2 caches 8 of 30 and
+        // was billed 3.75x, Nemotron-H worse. Only the `.attention` blocks
+        // reach `ctx.cache` in the hybrid forward — gated_conv and mamba2 hold
+        // a fixed-size recurrent state in `ssm_entries` instead. Layers past
+        // the 128-entry table keep the array's `.attention` default, which is
+        // the direction that over-bills rather than OOMs.
+        if (self.has_hybrid_layers) {
+            var n: u32 = if (self.num_hidden_layers > self.layer_block_types.len)
+                self.num_hidden_layers - @as(u32, self.layer_block_types.len)
+            else
+                0;
+            var li: u32 = 0;
+            while (li < self.num_hidden_layers and li < self.layer_block_types.len) : (li += 1) {
+                if (self.layer_block_types[li] == .attention) n += 1;
+            }
+            return n;
+        }
+        if (self.full_attention_interval == 0) return self.num_hidden_layers;
+        var n: u32 = 0;
+        var i: u32 = 0;
+        while (i < self.num_hidden_layers) : (i += 1) {
+            if (!self.isLinearLayer(i)) n += 1;
+        }
+        return n;
+    }
+
+    /// Dense (bf16) KV-cache bytes ONE token occupies across the whole model.
+    /// The uniform `layers × 2 × kv_heads × head_dim` formula is wrong on a
+    /// hybrid MLA arch in both terms: only `attnCacheLayerCount` layers cache
+    /// at all, and MLA's key (nope+rope) is WIDER than its value. Every
+    /// memory estimate that sizes a KV cache reads this one helper so the
+    /// auto-context sizer and the prefill admission guard cannot disagree.
+    /// Whether the prefill chunk is resolved per request (by the admission bill) instead of
+    /// once at load. qwen4_exp only: a 1M session's load-time reserve pins every ordinary
+    /// prompt to a narrow rung.
+    pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
+        return self.longCtxGated();
+    }
+
+    pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
+        const widths: u64 = if (self.isMla())
+            @as(u64, self.mlaQkHeadDim()) + @as(u64, self.mla_v_head_dim)
+        else
+            2 * @as(u64, self.head_dim);
+        // MLA decompresses its latent to EVERY attention head before the write
+        // (`mlaAttnWith` broadcasts the MQA rope key to `num_attention_heads`
+        // and caches `[B, num_attention_heads, S, qk_dim]`), so its cache has
+        // no grouping to save on — `num_key_value_heads` is the GQA question
+        // and this arch never asks it. Equal on Ling 3.0 (16/16), so the
+        // spelling is invisible today and would UNDER-bill the first MLA
+        // checkpoint that groups — the direction that ends in an uncatchable
+        // Metal OOM rather than a 400.
+        const heads: u64 = if (self.isMla())
+            @as(u64, self.num_attention_heads)
+        else
+            @as(u64, self.num_key_value_heads);
+        return @as(u64, self.attnCacheLayerCount()) * heads * widths * 2;
+    }
+
+    /// Dense bf16 bytes of QSA indexer history ONE token occupies: the pooled
+    /// blocks `[kv/ratio, idx_hd]` per full-attn layer. The raw keys are a fixed
+    /// ring (`qsaRingBytes`, billed once per slot), not per token. Not
+    /// kv-quantized. Zero on archs without an indexer. ONE copy; the billed width
+    /// (copies + score bank) is `server.statePerTokenBilled`.
+    pub fn qsaHistoryBytesPerToken(self: *const ModelConfig) u64 {
+        if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
+        const n = @as(u64, self.attnCacheLayerCount());
+        const hd = @as(u64, self.indexer_head_dim);
+        const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
+        return n * hd * 2 / ratio;
+    }
+
+    /// The raw indexer keys every live slot holds: `QSA_RING_ROWS` rows per
+    /// full-attn layer, context-independent, billed once per slot.
+    pub fn qsaRingBytes(self: *const ModelConfig) u64 {
+        if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
+        const n = @as(u64, self.attnCacheLayerCount());
+        const hd = @as(u64, self.indexer_head_dim);
+        const rows = @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS));
+        return n * rows * hd * 2;
+    }
+
+    /// f32 bytes per token of the QSA block-score operand a live slot holds
+    /// (`SSMCacheEntry.qsa_score_bank`). Never in an entry. Zero without an indexer.
+    pub fn qsaScoreBankBytesPerToken(self: *const ModelConfig) u64 {
+        if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
+        if (@import("transformer.zig").qsaScoreFusedActiveFor(1, @intCast(self.indexer_n_heads), @intCast(self.indexer_head_dim))) return 0;
+        const n = @as(u64, self.attnCacheLayerCount());
+        const hd = @as(u64, self.indexer_head_dim);
+        const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
+        return n * hd * 4 / ratio;
+    }
+
+    /// Bytes one SSM checkpoint holds: recurrent state + conv window of every linear layer.
+    /// The QSA key history is not here (it lands on the newest checkpoint only).
+    pub fn ssmCheckpointBytes(self: *const ModelConfig) u64 {
+        if (self.linear_num_value_heads == 0) return 0;
+        const linear_layers: u64 = @as(u64, self.num_hidden_layers) -| self.attnCacheLayerCount();
+        if (linear_layers == 0) return 0;
+        const state: u64 = @as(u64, self.linear_num_value_heads) *
+            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * 2;
+        const conv_dim: u64 = 2 * @as(u64, self.linear_num_key_heads) * self.linear_key_head_dim +
+            @as(u64, self.linear_num_value_heads) * self.linear_value_head_dim;
+        const conv: u64 = @as(u64, self.linear_conv_kernel_dim) -| 1;
+        return linear_layers * (state + conv * conv_dim * 2);
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.num_experts > 0;
     }
 
+    /// True when the full-attention layers are Multi-head Latent Attention
+    /// (compressed KV latent + low-rank Q), not plain GQA projections.
+    pub fn isMla(self: *const ModelConfig) bool {
+        return self.mla_kv_lora_rank > 0;
+    }
+
+    /// Does Q go through a low-rank pair, or straight from the hidden state?
+    ///
+    /// `q_lora_rank: null` is DeepSeek-V3's documented option and what the
+    /// whole Ling 3.0 FLASH line ships (tiny ships 256). Those checkpoints
+    /// carry a plain `attention.q_proj` instead of
+    /// q_a_proj/q_a_layernorm/q_b_proj. 0 is the signal, since a real rank is
+    /// always positive.
+    pub fn mlaHasQLora(self: *const ModelConfig) bool {
+        return self.mla_q_lora_rank > 0;
+    }
+
+    /// MLA query/key head dim = the non-positional part plus the rope part.
+    /// This — not head_dim — is what the attention scale and the cached K's
+    /// last dim are measured in.
+    pub fn mlaQkHeadDim(self: *const ModelConfig) u32 {
+        return self.mla_qk_nope_head_dim + self.mla_qk_rope_head_dim;
+    }
+
+    /// Which of fla's two KDA gate arms this checkpoint declares. A non-zero
+    /// `kda_lower_bound` REPLACES the softplus form with the bounded sigmoid;
+    /// absent (0) means the softplus form, which the shared GatedDeltaNet chain
+    /// already computes elementwise and therefore serves a per-channel gate
+    /// unchanged. Feeding bound 0 to the bounded chain yields exp(0) = 1 — a
+    /// gate that never forgets — so the arm must be chosen, never defaulted.
+    pub fn kdaUsesBoundedGate(self: *const ModelConfig) bool {
+        return self.kda_vector_gate and self.kda_gate_lower_bound != 0.0;
+    }
+
+    /// The pooling op /v1/embeddings runs: the explicit signal, else masked
+    /// mean (the historical default — correct for MiniLM and EmbeddingGemma).
+    pub fn effectivePooling(self: *const ModelConfig) PoolingMode {
+        return self.pooling_mode orelse .mean;
+    }
+
+    /// Whether this model serves /v1/embeddings meaningfully: encoder-only
+    /// (BERT, EmbeddingGemma) or a decoder with a declared pooling contract
+    /// (Qwen3-Embedding). Drives capability advertising, never dispatch.
+    pub fn hasEmbeddingCapability(self: *const ModelConfig) bool {
+        return self.is_encoder_only or self.pooling_mode != null;
+    }
+
     pub fn isInkling(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "inkling_mm_model");
+    }
+
+    /// Qwen3.8-Flash-Next (`qwen4_exp`): the qwen3_5 GDN + MoE trunk wrapped
+    /// in hyper-connection residual streams, with the n-gram PLE and QSA.
+    pub fn isQwen4(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "qwen4_exp");
+    }
+
+    /// The long-context blast-radius predicate: every long-context mechanism (KV
+    /// reservation, pad-waste cap, checkpoint thinning, admission terms, chunk bar) was
+    /// measured on qwen4_exp only, so they are opt-in by arch. Never hand-roll it at a site.
+    pub fn longCtxGated(self: *const ModelConfig) bool {
+        return self.isQwen4();
+    }
+
+    pub fn batchedEffectiveKvLen(self: *const ModelConfig, kv: u32, gather_on: bool, gather_min_kv: u32) u32 {
+        if (!self.isQwen4() or !gather_on) return kv;
+        if (kv <= gather_min_kv) return kv;
+        const cap = self.indexer_budget + self.indexer_compress_ratio;
+        if (cap == 0) return kv;
+        return @min(kv, cap);
+    }
+
+    /// SSD-first prefix cache arch predicate; delegates to `longCtxGated`.
+    pub fn ssdFirstCapable(self: *const ModelConfig) bool {
+        return self.longCtxGated();
     }
 
     /// True when per-request SSM/conv cache entries must exist: hybrid
@@ -479,6 +962,36 @@ pub const ModelConfig = struct {
         return self.canvas_length > 0;
     }
 
+    /// Pure-config half of "can this arch ride the batched GatedDeltaNet
+    /// decode kernel?" (`Transformer.forwardMoeBatchedDecode`) — a dense
+    /// GDN trunk with periodic full attention, i.e. the qwen3_5 family.
+    ///
+    /// This exists because the answer is needed in TWO places that see
+    /// different things: `server.zig` decides whether `--max-concurrent`
+    /// clamps to 1 with only a ModelConfig in hand, while
+    /// `Transformer.supportsBatchedGdnDecode` also checks the built layer
+    /// set. Both MUST read this predicate — when they were hand-rolled
+    /// separately, the server kept clamping qwen3_5 to serial decode while
+    /// the scheduler was happily batching it, so `--max-concurrent 4` (the
+    /// obvious serving config) silently DISABLED the batched path.
+    ///
+    /// Says nothing about MoE/hybrid archs that merely share the same
+    /// forward — those stay serial, by name, in both callers.
+    pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
+        if (self.full_attention_interval == 0) return false; // not a GDN trunk
+        if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
+        if (self.is_encoder_only) return false;
+        // Routed experts are row-generic; a MoE trunk batches when its per-slot
+        // state is what the path merges (GDN pair, qwen4's PLE window + QSA keys).
+        if (self.isMoe() and !self.isQwen4() and !std.mem.eql(u8, self.model_type, "qwen3_5_moe")) return false;
+        if (self.isInkling() or self.isMla() or self.isGemma4Layers()) return false;
+        if (self.isDiffusion()) return false;
+        if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
+        if (std.mem.eql(u8, self.model_type, "laguna")) return false;
+        if (std.mem.eql(u8, self.model_type, "deepseek_v4")) return false;
+        return true;
+    }
+
     /// True when the trunk uses the Gemma 4 layer structure (dual FFN with
     /// shared-expert branch, sigma-MoE router, 7 norms, layer_scalar, v_norm,
     /// proportional RoPE on full layers). DiffusionGemma reuses the Gemma 4
@@ -487,6 +1000,11 @@ pub const ModelConfig = struct {
     pub fn isGemma4Layers(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "gemma4") or
             std.mem.eql(u8, self.model_type, "diffusion_gemma");
+    }
+
+    /// Additive + dedup-guarded, like every terminator merge here.
+    pub fn mergeEosTokens(self: *ModelConfig, ids: []const u32) void {
+        for (ids) |id| if (!self.isEosToken(id)) self.addEosToken(id);
     }
 
     pub fn addEosToken(self: *ModelConfig, id: u32) void {
@@ -510,6 +1028,40 @@ pub const ModelConfig = struct {
         if (!self.isEosToken(106)) self.addEosToken(106);
     }
 
+    /// MuseGlimmer terminators: <|end_of_text|> = 200001 and <|eot|> = 200008
+    /// (the chat template's turn terminator; <|eom|> 200007 is deliberately
+    /// NOT an eos — generation continues across channel segments). Additive +
+    /// dedup-guarded like ensureGemmaTerminators.
+    pub fn ensureMuseTerminators(self: *ModelConfig) void {
+        if (!self.isEosToken(200001)) self.addEosToken(200001);
+        if (!self.isEosToken(200008)) self.addEosToken(200008);
+    }
+
+    /// NoPE layers (muse_glimmer: layer_rope_theta[i] == 0). The released
+    /// checkpoint's NoPE layers are exactly its full-attention layers, but the
+    /// two facts stay independently parsed — layer_types drives masking,
+    /// layer_rope_theta drives rotation.
+    pub fn layerSkipsRope(self: *const ModelConfig, layer_idx: u32) bool {
+        return layer_idx < 128 and self.layer_no_rope[layer_idx];
+    }
+
+    /// Post-attention / post-feedforward norm epsilon (muse_glimmer separates
+    /// it from rms_norm_eps; everyone else shares one value).
+    pub fn postNormEps(self: *const ModelConfig) f32 {
+        return if (self.post_norm_eps > 0) self.post_norm_eps else self.rms_norm_eps;
+    }
+
+    /// SDPA softmax scale for the standard dense forward. MuseGlimmer
+    /// multiplies the unit-RMS Q by qk_scale_factor on top of the standard
+    /// 1/sqrt(head_dim); Gemma 4's QK-norm handles normalization (scale 1.0);
+    /// everything else keys on query_pre_attn_scalar.
+    pub fn attnScale(self: *const ModelConfig) f32 {
+        if (self.qk_scale_factor > 0)
+            return self.qk_scale_factor / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
+        if (std.mem.eql(u8, self.model_type, "gemma4")) return 1.0;
+        return 1.0 / @sqrt(@as(f32, @floatFromInt(self.query_pre_attn_scalar)));
+    }
+
     /// Hy3 (hy_v3) family terminator: <｜hy_eos:opensource｜> = 120025. Real
     /// MLX conversions (ox-ox 2-bit) ship NO eos in config.json and NO
     /// generation_config.json, so without this merge generation never halts.
@@ -517,6 +1069,82 @@ pub const ModelConfig = struct {
     /// known chat-terminator on "config provided no eos".
     pub fn ensureHy3Terminators(self: *ModelConfig) void {
         if (!self.isEosToken(120025)) self.addEosToken(120025);
+    }
+
+    /// gpt_oss / harmony terminators, merged ADDITIVELY onto whatever the
+    /// config declared. A harmony assistant turn can end two ways and the
+    /// config names only one of them:
+    ///   <|return|> (200002) — the declared eos, ends a normal answer.
+    ///   <|call|>   (200012) — ends a TOOL CALL. Never the eos, so a
+    ///                         tools request that stops only on eos runs to
+    ///                         max_tokens with the call already complete.
+    /// <|end|> (200007) is deliberately NOT here: it closes the analysis
+    /// channel MID-turn, immediately before `<|start|>assistant<|channel|>final`
+    /// opens. Terminating on it would truncate every thinking response to its
+    /// reasoning and never emit an answer.
+    pub fn ensureGptOssTerminators(self: *ModelConfig) void {
+        if (!self.isEosToken(200002)) self.addEosToken(200002);
+        if (!self.isEosToken(200012)) self.addEosToken(200012);
+    }
+
+    /// The head width the PREFILL SCORE tensor is actually built at. Normally
+    /// `head_dim`, but an arch can score at a different width than it stores
+    /// values at (an MLA q.k can contract over nope+rope widths while
+    /// `head_dim` stays the value width) — reading `head_dim` there puts such
+    /// an arch under the `<= 128` "fused SDPA covers it" early-out, so the
+    /// score budget that exists for exactly this materializing path never
+    /// applies. A new arch scoring wider than it stores adds its arm here.
+    pub fn prefillScoreHeadDim(self: *const ModelConfig) u32 {
+        if (self.isMla()) return self.mlaQkHeadDim();
+        return self.head_dim;
+    }
+
+    /// Whether a chat request that names NO thinking preference should render
+    /// with thinking on. Our server always passes `enable_thinking` explicitly,
+    /// so a template whose own default is 'on' is silently overridden to off
+    /// for every client that omits the field — the vendor's default mode
+    /// becomes unreachable without a vendor-specific flag. An EXPLICIT request
+    /// value always outranks this (see `server.resolveEnableThinking`); it
+    /// only fills a silent request.
+    ///
+    /// First the checkpoint's OWN declaration
+    /// (`generation_config.json` -> `default_chat_template_kwargs.enable_thinking`),
+    /// then the per-arch allowlist below, which stays opt-in and only where the
+    /// vendor documents thinking-on AND the shipped template agrees — never
+    /// inferred from "the template mentions enable_thinking".
+    pub fn defaultEnableThinking(self: *const ModelConfig, has_tools: bool) bool {
+        // The checkpoint's own declared default outranks the arch allowlist:
+        // it is the model author speaking, not our guess about the family.
+        if (self.gen_enable_thinking) |v| return v;
+        // muse_glimmer: tool turns keep thinking (a tool call is a `to=<fn>`
+        // header, so the recipient must stay free and the reasoning is
+        // delivered rather than paid-and-dropped). A plain chat request
+        // defaults to the prompt-committed to=user channel instead
+        // (chat.noThinkTailSuffix) — no reasoning pass runs at all.
+        // gpt_oss: UNCONDITIONALLY on. Harmony has no thinking-off mode — the
+        // template's `Reasoning: low|medium|high` sets depth, not presence, and
+        // the model opens `<|channel|>analysis<|message|>` on every turn no
+        // matter what we ask. Defaulting a silent request to off did not stop
+        // the reasoning pass, it just routed the analysis channel down the
+        // flush-text streaming branch, which leaked `<|channel|>analysis` and
+        // the reasoning itself into visible content (live 2026-08-12).
+        // Thinking-off here would have to be enforced in the PROMPT, and
+        // harmony offers no way to do it.
+        if (std.mem.eql(u8, self.model_type, "gpt_oss")) return true;
+        if (has_tools and std.mem.eql(u8, self.model_type, "muse_glimmer")) return true;
+        // bailing_hybrid (Ling 3.0): thinking-on with or without tools. The
+        // checkpoint's own template normalizes an undefined `enable_thinking`
+        // to `thinking_option = 'on'` unconditionally, and unlike muse there
+        // is no prompt-committed no-think channel to fall back to — so a
+        // tool-less silent request gated OFF just makes a reasoner answer
+        // without reasoning ("17 - 9 = 8" where the thinking arm works the
+        // word problem and answers "9 sheep are left").
+        if (std.mem.eql(u8, self.model_type, "bailing_hybrid")) return true;
+        // k2_horizon: the template opens a think marker on every assistant
+        // turn; thinking-off is the prompt-committed closer (chat.contentChannelTail).
+        if (std.mem.eql(u8, self.model_type, "k2_horizon")) return true;
+
+        return false;
     }
 
     /// Fill still-null sampling recommendations with the FAMILY's documented
@@ -539,6 +1167,7 @@ pub const ModelConfig = struct {
         const is_qwen = std.mem.eql(u8, t, "qwen3") or
             std.mem.eql(u8, t, "qwen3_moe") or
             std.mem.eql(u8, t, "qwen3_5_moe") or
+            std.mem.eql(u8, t, "qwen4_exp") or
             std.mem.eql(u8, t, "qwen3_next");
         const is_gemma = std.mem.eql(u8, t, "gemma3") or
             std.mem.eql(u8, t, "gemma4") or
@@ -557,6 +1186,27 @@ pub const ModelConfig = struct {
             // (2026-07-30) ran the hardcoded 1.0/1.0/off and degenerated
             // into duplicated tool calls.
             if (self.gen_top_p == null) self.gen_top_p = 0.95;
+        }
+    }
+
+    /// DeepSeek-V4 releases ship generation_config.json with the WILD
+    /// signature (temp 1.0 / top_p 1.0) that their own inference/generate.py
+    /// IGNORES — its default is temperature 0.6, the value our converter
+    /// writes into our mirrors. External conversions (pipenetwork REAP) copy
+    /// the source file verbatim, and an agent CLI that omits temperature then
+    /// samples the untruncated tail (live 2026-08-01: pi against REAP37
+    /// degenerated into token loops on its FIRST turn). When the reference
+    /// implementation deliberately ignores a config field, that field is not
+    /// the source of truth (the laguna YaRN class): the EXACT untouched
+    /// signature resolves to the reference's default; anything an author
+    /// actually tuned is left alone, and request/flag values always win.
+    pub fn applyDsv4ReferenceSampling(self: *ModelConfig) void {
+        if (!std.mem.eql(u8, self.model_type, "deepseek_v4")) return;
+        const t = self.gen_temperature orelse return;
+        const p = self.gen_top_p orelse return;
+        if (t == 1.0 and p == 1.0) {
+            log.info("deepseek_v4: generation_config carries the source's wild 1.0/1.0 signature — resolving to the reference default temp 0.6\n", .{});
+            self.gen_temperature = 0.6;
         }
     }
 
@@ -599,6 +1249,37 @@ pub const ModelConfig = struct {
         self.user_turn_marker_len = @intCast(ids.len);
         log.info("User turn marker: \"{s}\" -> {d} tokens\n", .{ prefix, ids.len });
     }
+
+    /// LFM2-VL wraps its image-token run in `<|image_start|>`/`<|image_end|>`,
+    /// labels every tile with `<|img_row_R_col_C|>` and marks the thumbnail
+    /// with `<|img_thumbnail|>`. NONE of those ids appear in config.json — the
+    /// tokenizer is the only place they exist — so they are resolved by STRING
+    /// at load, like the user-turn marker. A missing marker leaves its id 0,
+    /// which every consumer reads as "this checkpoint has no such token".
+    pub fn populateLfm2ImageTokens(self: *ModelConfig, tok: *const tokenizer_mod.Tokenizer) void {
+        if (!self.lfm2_vision) return;
+        if (tok.special_tokens.get("<|image_start|>")) |id| self.boi_token_id = id;
+        if (tok.special_tokens.get("<|image_end|>")) |id| self.eoi_token_id = id;
+        if (tok.special_tokens.get("<|img_thumbnail|>")) |id| self.lv_thumbnail_token_id = id;
+        // The row/col markers are one contiguous block laid out row-major over
+        // the max tile grid, so the first one plus (row, col) locates them all.
+        if (tok.special_tokens.get("<|img_row_1_col_1|>")) |id| self.lv_row_col_base_id = id;
+        if (self.image_token_id == 0) {
+            if (tok.special_tokens.get("<image>")) |id| self.image_token_id = id;
+        }
+        log.info("LFM2-VL image tokens: <image>={d} start={d} end={d} thumbnail={d} row_col_base={d}\n", .{
+            self.image_token_id, self.boi_token_id, self.eoi_token_id, self.lv_thumbnail_token_id, self.lv_row_col_base_id,
+        });
+    }
+
+    /// Free the one allocator-owned field (`ngram_table_path`, allocPrint'd by
+    /// `parseConfig`); everything else is plain data or a borrowed slice. Every
+    /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
+    /// path. Idempotent.
+    pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
+        if (self.ngram_table_path) |p| allocator.free(p);
+        self.ngram_table_path = null;
+    }
 };
 
 /// Pick the user-turn prefix string for a model based on what its chat template
@@ -618,6 +1299,9 @@ pub fn pickUserTurnPrefix(chat_template: []const u8) ?[]const u8 {
     if (std.mem.indexOf(u8, chat_template, "<|start_header_id|>") != null) {
         return "<|start_header_id|>user<|end_header_id|>\n\n"; // Llama 3
     }
+    if (std.mem.indexOf(u8, chat_template, "<|start|>user<|message|>") != null) {
+        return "<|start|>user<|message|>"; // Muse-Glimmer (harmony channels)
+    }
     return null;
 }
 
@@ -634,6 +1318,9 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     defer allocator.free(content);
 
     var config = try parseConfigFromJson(allocator, content);
+    if (config.isQwen4()) {
+        config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
+    }
 
     // Model-author sampling recommendations ride in a sibling file. Optional —
     // any failure (missing file, bad JSON) leaves the fields null.
@@ -649,17 +1336,48 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
             config.gen_temperature = gd.temperature;
             config.gen_top_p = gd.top_p;
             config.gen_top_k = gd.top_k;
+            config.gen_enable_thinking = gd.enable_thinking;
+            config.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
         } else |_| {}
     } else |_| {}
+    // Pooling (issue #116), priority: explicit config.json `pooling_mode`
+    // (already parsed) > the ST `1_Pooling/config.json` sidecar > the
+    // known-family name fallback. A sidecar declaring only unsupported modes
+    // fails the load here — explicitly, never a silent mean-pool.
+    if (config.pooling_mode == null) {
+        const pool_path = try std.fmt.allocPrint(allocator, "{s}/1_Pooling/config.json", .{model_dir});
+        defer allocator.free(pool_path);
+        if (std.Io.Dir.openFileAbsolute(io, pool_path, .{})) |pool_file| {
+            defer pool_file.close(io);
+            var pool_buf: [4096]u8 = undefined;
+            var pool_reader = pool_file.reader(io, &pool_buf);
+            if (pool_reader.interface.allocRemaining(allocator, .limited(1024 * 1024))) |pool_content| {
+                defer allocator.free(pool_content);
+                config.pooling_mode = try parsePoolingSidecar(pool_content);
+                if (config.pooling_mode) |m|
+                    log.info("[embed] pooling from 1_Pooling/config.json: {s}\n", .{@tagName(m)});
+            } else |_| {}
+        } else |_| {}
+    }
+    if (config.pooling_mode == null) {
+        if (poolingFromDirName(std.fs.path.basename(model_dir), config.model_type)) |m| {
+            config.pooling_mode = m;
+            log.info("[embed] pooling inferred from checkpoint name: {s}\n", .{@tagName(m)});
+        }
+    }
+
     // Community re-quants often ship NO generation_config.json; fill the
     // still-null truncation knobs with the family's documented defaults so
     // omitted-field resolution never bottoms out at untruncated sampling.
     config.applyFamilySamplingDefaults();
+    // ... and a dsv4 generation_config carrying the source's verbatim wild
+    // signature resolves to the reference implementation's own default.
+    config.applyDsv4ReferenceSampling();
 
     // Qwen image sizing is processor metadata rather than an architecture
     // constant. Prefer processor_config.json and fill any missing field from
     // the older preprocessor_config.json layout.
-    if (config.qwen_vision) {
+    if (config.qwen_vision or config.muse_vision) {
         var vision_defaults = VisionProcessorDefaults{};
         const processor_files = [_][]const u8{
             "processor_config.json",
@@ -679,6 +1397,8 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                         vision_defaults.min_pixels = parsed_defaults.min_pixels;
                     if (vision_defaults.max_pixels == null)
                         vision_defaults.max_pixels = parsed_defaults.max_pixels;
+                    if (vision_defaults.max_image_tokens == null)
+                        vision_defaults.max_image_tokens = parsed_defaults.max_image_tokens;
                 } else |_| {}
             } else |_| {}
         }
@@ -690,6 +1410,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         }
         config.qv_min_pixels = vision_defaults.min_pixels orelse 0;
         config.qv_max_pixels = vision_defaults.max_pixels orelse 0;
+        config.mv_max_image_tokens = vision_defaults.max_image_tokens orelse MUSE_MAX_IMAGE_TOKENS;
     }
 
     return config;
@@ -700,12 +1421,22 @@ pub const GenerationDefaults = struct {
     temperature: ?f32 = null,
     top_p: ?f32 = null,
     top_k: ?u32 = null,
+    /// `default_chat_template_kwargs.enable_thinking` — the checkpoint's own
+    /// thinking default. null when absent or not a bool.
+    enable_thinking: ?bool = null,
+    /// `eos_token_id` (scalar or list): HF stops generation on these, and a
+    /// checkpoint may name the chat terminator ONLY here (K2-Horizon's
+    /// `<|ifm|im_end|>` rides beside config.json's `<|ifm|endoftext|>`).
+    eos_token_ids: [8]u32 = @splat(0),
+    num_eos: usize = 0,
 };
 
 /// Image-area limits parsed from a Qwen processor configuration.
 pub const VisionProcessorDefaults = struct {
     min_pixels: ?u32 = null,
     max_pixels: ?u32 = null,
+    /// Muse: the cap is on MERGED tokens, not pixels.
+    max_image_tokens: ?u32 = null,
 };
 
 fn positiveJsonU32(value: ?std.json.Value) ?u32 {
@@ -735,6 +1466,7 @@ pub fn parseVisionProcessorDefaultsFromJson(content: []const u8) VisionProcessor
     var defaults = VisionProcessorDefaults{
         .min_pixels = positiveJsonU32(processor.get("min_pixels")),
         .max_pixels = positiveJsonU32(processor.get("max_pixels")),
+        .max_image_tokens = positiveJsonU32(processor.get("max_image_tokens")),
     };
     if (processor.get("size")) |value| {
         if (value == .object) {
@@ -795,13 +1527,280 @@ pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
             else => {},
         }
     }
+    if (root.get("eos_token_id")) |v| {
+        switch (v) {
+            .integer => |i| if (i >= 0) {
+                gd.eos_token_ids[0] = @intCast(i);
+                gd.num_eos = 1;
+            },
+            .array => |arr| for (arr.items) |item| {
+                if (item == .integer and item.integer >= 0 and gd.num_eos < gd.eos_token_ids.len) {
+                    gd.eos_token_ids[gd.num_eos] = @intCast(item.integer);
+                    gd.num_eos += 1;
+                }
+            },
+            else => {},
+        }
+    }
+    // The checkpoint's own chat-template kwargs. Only a real bool counts —
+    // anything else leaves the field null and the arch default in charge.
+    if (root.get("default_chat_template_kwargs")) |v| {
+        if (v == .object) {
+            if (v.object.get("enable_thinking")) |et| {
+                if (et == .bool) gd.enable_thinking = et.bool;
+            }
+        }
+    }
     return gd;
+}
+
+/// One qwen4_exp integer bound, read strictly: wrong-typed or negative refuses.
+fn qwen4ConfigU64(cfg_obj: std.json.ObjectMap, key: []const u8) !?u64 {
+    const v = cfg_obj.get(key) orelse return null;
+    if (v != .integer or v.integer < 0) return error.InvalidQwen4ConfigField;
+    return @intCast(v.integer);
+}
+
+fn qwen4ConfigU32(cfg_obj: std.json.ObjectMap, key: []const u8) !?u32 {
+    const v = try qwen4ConfigU64(cfg_obj, key) orelse return null;
+    if (v > std.math.maxInt(u32)) return error.InvalidQwen4ConfigField;
+    return @intCast(v);
+}
+
+/// Range-check every qwen4_exp bound the forward indexes a fixed array with or divides by.
+/// Names travel to the client as "Model load failed: <name>".
+fn validateQwen4Config(config: *const ModelConfig) !void {
+    // `NgramHash.multipliers` is [MAX_NGRAM_SIZE]i64; `ple_prev` is written ngram_size-1 deep.
+    if (config.ngram_size < 2 or config.ngram_size > qwen4_exp.MAX_NGRAM_SIZE) {
+        return error.InvalidQwen4NgramSize;
+    }
+    // `vocab`/`offsets` are [MAX_HEADS]i64, written n_heads deep.
+    if (config.heads_per_ngram == 0) return error.InvalidQwen4NgramHeads;
+    if ((config.ngram_size - 1) * config.heads_per_ngram > qwen4_exp.MAX_HEADS) {
+        return error.InvalidQwen4NgramHeads;
+    }
+    if (config.ngram_vocab_divisor == 0 or config.ngram_vocab_base < 2) {
+        return error.InvalidQwen4NgramVocab;
+    }
+    // The forward divides kv by the ratio and selects `budget / ratio` blocks.
+    if (config.indexer_n_heads > 0) {
+        if (config.indexer_head_dim == 0) return error.InvalidQwen4Indexer;
+        if (config.indexer_compress_ratio == 0) return error.InvalidQwen4Indexer;
+        if (config.indexer_budget < config.indexer_compress_ratio) return error.InvalidQwen4Indexer;
+    }
+    if (config.ple_layer_idx < 0 or config.ple_layer_idx >= @as(i32, @intCast(config.num_hidden_layers))) {
+        return error.InvalidQwen4PleLayer;
+    }
+}
+
+/// True when the layer loop installed the PLE on exactly the layer the config names. A negative
+/// index asks for no PLE (the MTP head's own layer) and is satisfied by a loop that installed none.
+pub fn qwen4PleInstalledAt(has_ple: []const bool, ple_layer_idx: i32) bool {
+    if (ple_layer_idx < 0) return std.mem.indexOfScalar(bool, has_ple, true) == null;
+    if (ple_layer_idx >= has_ple.len) return false;
+    const want: usize = @intCast(ple_layer_idx);
+    for (has_ple, 0..) |p, i| if (p != (i == want)) return false;
+    return true;
 }
 
 /// I/O-free variant for unit tests and for callers that already have the
 /// config.json bytes in memory. The full I/O-bound `parseConfig` delegates here.
+/// Qwen3-VL-family vision + M-RoPE fields, shared by the qwen3_5 and
+/// qwen4_exp arms (same `vision_config` keys, `rope_parameters.mrope_*`,
+/// vision token ids). The generic vision_config block already set
+/// `has_vision`; this reads Qwen's own keys into `qv_*`.
+fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) void {
+    if (root.get("vision_config")) |vc_val| {
+        if (vc_val == .object) {
+            const vc = vc_val.object;
+            config.qwen_vision = true;
+            if (vc.get("depth")) |v| {
+                if (v == .integer) config.qv_depth = @intCast(v.integer);
+            }
+            if (vc.get("hidden_size")) |v| {
+                if (v == .integer) config.qv_hidden = @intCast(v.integer);
+            }
+            if (vc.get("num_heads")) |v| {
+                if (v == .integer) config.qv_heads = @intCast(v.integer);
+            }
+            if (vc.get("intermediate_size")) |v| {
+                if (v == .integer) config.qv_intermediate = @intCast(v.integer);
+            }
+            if (vc.get("patch_size")) |v| {
+                if (v == .integer) config.qv_patch = @intCast(v.integer);
+            }
+            if (vc.get("temporal_patch_size")) |v| {
+                if (v == .integer) config.qv_temporal_patch = @intCast(v.integer);
+            }
+            if (vc.get("spatial_merge_size")) |v| {
+                if (v == .integer) config.qv_merge = @intCast(v.integer);
+            }
+            if (vc.get("num_position_embeddings")) |v| {
+                if (v == .integer) config.qv_num_pos_emb = @intCast(v.integer);
+            }
+            if (vc.get("out_hidden_size")) |v| {
+                if (v == .integer) config.qv_out_hidden = @intCast(v.integer);
+            }
+            if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
+            if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
+        }
+    }
+    // Interleaved M-RoPE sections (text_config.rope_parameters). rope_theta /
+    // partial_rotary_factor already parsed in the generic rope block above.
+    if (cfg_obj.get("rope_parameters")) |rp| {
+        if (rp == .object) {
+            if (rp.object.get("mrope_interleaved")) |v| {
+                if (v == .bool) config.mrope_interleaved = v.bool;
+            }
+            if (rp.object.get("mrope_section")) |v| {
+                if (v == .array) {
+                    for (v.array.items, 0..) |item, i| {
+                        if (i >= 3) break;
+                        if (item == .integer) config.mrope_section[i] = @intCast(item.integer);
+                    }
+                }
+            }
+        }
+    }
+    // Qwen vision token ids (top-level).
+    if (root.get("video_token_id")) |v| {
+        if (v == .integer) config.video_token_id = @intCast(v.integer);
+    }
+    if (root.get("vision_start_token_id")) |v| {
+        if (v == .integer) config.vision_start_token_id = @intCast(v.integer);
+    }
+    if (root.get("vision_end_token_id")) |v| {
+        if (v == .integer) config.vision_end_token_id = @intCast(v.integer);
+    }
+}
+
+/// Flat HF `rope_parameters` carrying `rope_type: "yarn"` — the YaRN context
+/// extension, i.e. exactly what vLLM's `--hf-overrides` recipe for Qwen3.5
+/// writes:
+///
+///   {"text_config": {"rope_parameters": {"rope_type": "yarn", "factor": 4.0,
+///     "original_max_position_embeddings": 262144, "rope_theta": 10000000,
+///     "partial_rotary_factor": 0.25, "mrope_interleaved": true,
+///     "mrope_section": [11,11,10]}}}
+///
+/// `factor` may be omitted, in which case HF derives it from
+/// `max_position_embeddings / original_max_position_embeddings` (as vLLM's
+/// `_get_and_verify_max_len` does). `attention_factor` is HF's key and
+/// REPLACES the computed mscale; `attn_factor` is vLLM's and MULTIPLIES
+/// `yarnMscale(factor)`. Neither is present in a vendor config, and per HF's
+/// default the mscale is then COMPUTED as 0.1·ln(factor)+1 — the value the
+/// scaling was calibrated with. Nested per-layer-type `rope_parameters`
+/// (laguna/gemma4) never reach here: they have no top-level `rope_type`.
+fn parseYarnRopeParameters(config: *ModelConfig, cfg_obj: std.json.ObjectMap) !void {
+    const rp_val = cfg_obj.get("rope_parameters") orelse return;
+    if (rp_val != .object) return;
+    const rp = rp_val.object;
+    const rt = rp.get("rope_type") orelse return;
+    if (!(rt == .string and std.mem.eql(u8, rt.string, "yarn"))) return;
+
+    if (rp.get("original_max_position_embeddings")) |v| {
+        if (v == .integer) config.yarn_orig_max_pos = @intCast(v.integer);
+    }
+    // A YaRN block with no window to scale FROM is not a scaling we can
+    // reproduce: the ramp bounds (and so every mid-band frequency) come from
+    // it. Refuse the load rather than serve a silently-wrong rotation.
+    if (config.yarn_orig_max_pos == 0) return error.YarnRopeNeedsOriginalMaxPos;
+    if (rp.get("factor")) |v| config.yarn_factor = jsonFloat(v);
+    if (rp.get("beta_fast")) |v| config.yarn_beta_fast = jsonFloat(v);
+    if (rp.get("beta_slow")) |v| config.yarn_beta_slow = jsonFloat(v);
+    if (rp.get("truncate")) |v| {
+        if (v == .bool) config.yarn_truncate = v.bool;
+    }
+    if (config.yarn_factor <= 0.0) return error.InvalidRopeScalingFactor;
+    // HF: `factor = max_position_embeddings / original_max_position_embeddings`
+    // when the block leaves it out (the config then only states the window).
+    if (rp.get("factor") == null and config.max_position_embeddings > config.yarn_orig_max_pos) {
+        config.yarn_factor = @as(f32, @floatFromInt(config.max_position_embeddings)) /
+            @as(f32, @floatFromInt(config.yarn_orig_max_pos));
+    }
+    // HF `attention_factor` replaces; vLLM `attn_factor` multiplies the
+    // computed 0.1·ln(factor)+1. Both present → HF wins.
+    if (rp.get("attention_factor")) |v| {
+        config.yarn_attention_factor = jsonFloat(v);
+    } else if (rp.get("attn_factor")) |v| {
+        config.yarn_attention_factor = yarnMscale(config.yarn_factor) * jsonFloat(v);
+    } else {
+        config.yarn_attention_factor = yarnMscale(config.yarn_factor);
+    }
+    config.rope_yarn = true;
+}
+
+/// HF's default YaRN mscale (`attention_factor`) for a scaling `factor`.
+fn yarnMscale(factor: f32) f32 {
+    if (factor <= 1.0) return 1.0;
+    return 0.1 * @log(@as(f32, factor)) + 1.0;
+}
+
+/// Launch-time JSON deep-merged into every `config.json` before it is parsed,
+/// set once from `--config-overrides`. vLLM's `--hf-overrides` analogue: the
+/// only way to re-shape a checkpoint's declared geometry — most often to scale
+/// its rope and widen the context — without editing the model directory, and
+/// therefore the way to A/B a scaling experiment on identical weights.
+var config_overrides: ?[]const u8 = null;
+
+pub fn setConfigOverrides(raw: ?[]const u8) void {
+    config_overrides = raw;
+}
+
+pub fn getConfigOverrides() ?[]const u8 {
+    return config_overrides;
+}
+
+/// Deep-merge `overrides` into a config.json document: objects merge key by key
+/// — so `{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4}}}`
+/// keeps every sibling it passes through, exactly like vLLM's
+/// `_apply_dict_overrides` — and anything else replaces. The whole merge lives
+/// in an arena that dies before this returns; only the re-serialized bytes (in
+/// `allocator`) escape.
+fn mergeConfigJson(allocator: std.mem.Allocator, base: []const u8, overrides: []const u8) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dst = try std.json.parseFromSliceLeaky(std.json.Value, a, base, .{});
+    const src = try std.json.parseFromSliceLeaky(std.json.Value, a, overrides, .{});
+    if (dst != .object or src != .object) return error.ConfigOverridesMustBeObject;
+    try mergeObjects(a, &dst.object, src.object);
+    var out: std.Io.Writer.Allocating = .init(a);
+    var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+    try dst.jsonStringify(&jws);
+    return allocator.dupe(u8, out.written());
+}
+
+fn mergeObjects(a: std.mem.Allocator, dst: *std.json.ObjectMap, src: std.json.ObjectMap) !void {
+    var it = src.iterator();
+    while (it.next()) |e| {
+        if (dst.getPtr(e.key_ptr.*)) |p| {
+            if (p.* == .object and e.value_ptr.* == .object) {
+                // The handle is copied, so a rehash inside the recursion would
+                // be lost — merge through the copy and store it back. `p` stays
+                // valid: `dst` itself is not written during the recursion.
+                var child = p.object;
+                try mergeObjects(a, &child, e.value_ptr.object);
+                p.* = .{ .object = child };
+                continue;
+            }
+        }
+        // Keys and values are arena-owned by the override document, which
+        // outlives this merge.
+        try dst.put(a, e.key_ptr.*, e.value_ptr.*);
+    }
+}
+
 pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !ModelConfig {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    // The launch-time overrides apply to EVERY parse (primary load, on-demand
+    // load, discovery stubs), so the advertised context and the loaded model
+    // can never disagree about what window the checkpoint has.
+    const merged: ?[]const u8 = if (config_overrides) |ov| blk: {
+        break :blk try mergeConfigJson(allocator, content, ov);
+    } else null;
+    defer if (merged) |m| allocator.free(m);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, merged orelse content, .{});
     defer parsed.deinit();
 
     const root = parsed.value.object;
@@ -830,11 +1829,21 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     if (cfg_obj.get("query_pre_attn_scalar")) |v| config.query_pre_attn_scalar = @intCast(v.integer);
 
     // MoE fields (guard against JSON null values)
-    if (cfg_obj.get("num_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
-    if (cfg_obj.get("num_experts_per_tok")) |v| { if (v == .integer) config.num_experts_per_tok = @intCast(v.integer); }
-    if (cfg_obj.get("top_k_experts")) |v| { if (v == .integer) config.num_experts_per_tok = @intCast(v.integer); }
-    if (cfg_obj.get("moe_intermediate_size")) |v| { if (v == .integer) config.moe_intermediate_size = @intCast(v.integer); }
-    if (cfg_obj.get("shared_expert_intermediate_size")) |v| { if (v == .integer) config.shared_expert_intermediate_size = @intCast(v.integer); }
+    if (cfg_obj.get("num_experts")) |v| {
+        if (v == .integer) config.num_experts = @intCast(v.integer);
+    }
+    if (cfg_obj.get("num_experts_per_tok")) |v| {
+        if (v == .integer) config.num_experts_per_tok = @intCast(v.integer);
+    }
+    if (cfg_obj.get("top_k_experts")) |v| {
+        if (v == .integer) config.num_experts_per_tok = @intCast(v.integer);
+    }
+    if (cfg_obj.get("moe_intermediate_size")) |v| {
+        if (v == .integer) config.moe_intermediate_size = @intCast(v.integer);
+    }
+    if (cfg_obj.get("shared_expert_intermediate_size")) |v| {
+        if (v == .integer) config.shared_expert_intermediate_size = @intCast(v.integer);
+    }
 
     // Linear attention (GatedDeltaNet) fields
     if (cfg_obj.get("linear_num_key_heads")) |v| config.linear_num_key_heads = @intCast(v.integer);
@@ -856,6 +1865,16 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (v == .bool and v.bool) {
             config.use_bidirectional_attention = true;
             config.is_encoder_only = true;
+        }
+    }
+    // Explicit pooling contract (issue #116): "mean" | "cls" | "last_token" in
+    // config.json marks a checkpoint as an embedding model and picks the pool
+    // op. An unknown value is a parse error, never a silent mean-pool —
+    // wrong-semantics vectors are harder to detect than a refused load.
+    if (root.get("pooling_mode")) |v| {
+        if (v == .string) {
+            config.pooling_mode = PoolingMode.fromString(v.string) orelse
+                return error.UnsupportedPoolingMode;
         }
     }
     if (cfg_obj.get("bos_token_id")) |v| {
@@ -1010,22 +2029,44 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (vc_val == .object) {
             config.has_vision = true;
             const vc = vc_val.object;
-            if (vc.get("hidden_size")) |v| { if (v == .integer) config.vision_hidden_size = @intCast(v.integer); }
-            if (vc.get("num_hidden_layers")) |v| { if (v == .integer) config.vision_num_layers = @intCast(v.integer); }
-            if (vc.get("num_attention_heads")) |v| { if (v == .integer) config.vision_num_heads = @intCast(v.integer); }
-            if (vc.get("head_dim")) |v| { if (v == .integer) config.vision_head_dim = @intCast(v.integer); }
-            if (vc.get("global_head_dim")) |v| { if (v == .integer) config.vision_head_dim = @intCast(v.integer); }
-            if (vc.get("intermediate_size")) |v| { if (v == .integer) config.vision_intermediate_size = @intCast(v.integer); }
-            if (vc.get("patch_size")) |v| { if (v == .integer) config.vision_patch_size = @intCast(v.integer); }
-            if (vc.get("pooling_kernel_size")) |v| { if (v == .integer) config.vision_pooling_kernel = @intCast(v.integer); }
-            if (vc.get("default_output_length")) |v| { if (v == .integer) config.vision_soft_tokens = @intCast(v.integer); }
-            if (vc.get("position_embedding_size")) |v| { if (v == .integer) config.vision_position_embedding_size = @intCast(v.integer); }
+            if (vc.get("hidden_size")) |v| {
+                if (v == .integer) config.vision_hidden_size = @intCast(v.integer);
+            }
+            if (vc.get("num_hidden_layers")) |v| {
+                if (v == .integer) config.vision_num_layers = @intCast(v.integer);
+            }
+            if (vc.get("num_attention_heads")) |v| {
+                if (v == .integer) config.vision_num_heads = @intCast(v.integer);
+            }
+            if (vc.get("head_dim")) |v| {
+                if (v == .integer) config.vision_head_dim = @intCast(v.integer);
+            }
+            if (vc.get("global_head_dim")) |v| {
+                if (v == .integer) config.vision_head_dim = @intCast(v.integer);
+            }
+            if (vc.get("intermediate_size")) |v| {
+                if (v == .integer) config.vision_intermediate_size = @intCast(v.integer);
+            }
+            if (vc.get("patch_size")) |v| {
+                if (v == .integer) config.vision_patch_size = @intCast(v.integer);
+            }
+            if (vc.get("pooling_kernel_size")) |v| {
+                if (v == .integer) config.vision_pooling_kernel = @intCast(v.integer);
+            }
+            if (vc.get("default_output_length")) |v| {
+                if (v == .integer) config.vision_soft_tokens = @intCast(v.integer);
+            }
+            if (vc.get("position_embedding_size")) |v| {
+                if (v == .integer) config.vision_position_embedding_size = @intCast(v.integer);
+            }
             if (vc.get("rope_parameters")) |rp| {
                 if (rp == .object) {
                     if (rp.object.get("rope_theta")) |v| config.vision_rope_theta = jsonFloat(v);
                 }
             }
-            if (vc.get("use_clipped_linears")) |v| { if (v == .bool) config.vision_use_clipped_linears = v.bool; }
+            if (vc.get("use_clipped_linears")) |v| {
+                if (v == .bool) config.vision_use_clipped_linears = v.bool;
+            }
             // vision_config.standardize is presence-only — the actual `std_scale`/`std_bias`
             // safetensors presence drives behavior in `VisionEncoder.init`, so the config
             // flag needs no field.
@@ -1034,20 +2075,32 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             // from the SigLIP tower: mm_embed_dim (vs hidden_size),
             // model_patch_size (48px merged patch vs 16px teacher patch_size),
             // num_soft_tokens (vs default_output_length), mm_posemb_size.
-            if (vc.get("mm_embed_dim")) |v| { if (v == .integer) config.vision_mm_embed_dim = @intCast(v.integer); }
-            if (vc.get("model_patch_size")) |v| { if (v == .integer) config.vision_model_patch_size = @intCast(v.integer); }
-            if (vc.get("num_soft_tokens")) |v| { if (v == .integer) config.vision_soft_tokens = @intCast(v.integer); }
-            if (vc.get("mm_posemb_size")) |v| { if (v == .integer) config.vision_mm_posemb_size = @intCast(v.integer); }
+            if (vc.get("mm_embed_dim")) |v| {
+                if (v == .integer) config.vision_mm_embed_dim = @intCast(v.integer);
+            }
+            if (vc.get("model_patch_size")) |v| {
+                if (v == .integer) config.vision_model_patch_size = @intCast(v.integer);
+            }
+            if (vc.get("num_soft_tokens")) |v| {
+                if (v == .integer) config.vision_soft_tokens = @intCast(v.integer);
+            }
+            if (vc.get("mm_posemb_size")) |v| {
+                if (v == .integer) config.vision_mm_posemb_size = @intCast(v.integer);
+            }
         }
     }
     // Audio config (Gemma 4 12B unified — raw-waveform projection, no conformer)
     if (root.get("audio_config")) |ac_val| {
         if (ac_val == .object) {
             const ac = ac_val.object;
-            if (ac.get("audio_embed_dim")) |v| { if (v == .integer) config.audio_embed_dim = @intCast(v.integer); }
+            if (ac.get("audio_embed_dim")) |v| {
+                if (v == .integer) config.audio_embed_dim = @intCast(v.integer);
+            }
             // audio_samples_per_token lives in processor_config, not config.json;
             // default 640 (40ms @ 16kHz) matches the only shipped unified checkpoint.
-            if (ac.get("audio_samples_per_token")) |v| { if (v == .integer) config.audio_samples_per_token = @intCast(v.integer); }
+            if (ac.get("audio_samples_per_token")) |v| {
+                if (v == .integer) config.audio_samples_per_token = @intCast(v.integer);
+            }
         }
     }
     if (root.get("audio_token_id")) |v| {
@@ -1189,12 +2242,18 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (root.get("generation_config")) |gc_val| {
             if (gc_val == .object) {
                 const gc = gc_val.object;
-                if (gc.get("max_denoising_steps")) |v| { if (v == .integer) config.diffusion_max_steps = @intCast(v.integer); }
+                if (gc.get("max_denoising_steps")) |v| {
+                    if (v == .integer) config.diffusion_max_steps = @intCast(v.integer);
+                }
                 if (gc.get("t_min")) |v| config.diffusion_t_min = jsonFloat(v);
                 if (gc.get("t_max")) |v| config.diffusion_t_max = jsonFloat(v);
                 if (gc.get("confidence_threshold")) |v| config.diffusion_confidence_threshold = jsonFloat(v);
-                if (gc.get("stability_threshold")) |v| { if (v == .integer) config.diffusion_stability_threshold = @intCast(v.integer); }
-                if (gc.get("pad_token_id")) |v| { if (v == .integer) config.diffusion_pad_token = @intCast(v.integer); }
+                if (gc.get("stability_threshold")) |v| {
+                    if (v == .integer) config.diffusion_stability_threshold = @intCast(v.integer);
+                }
+                if (gc.get("pad_token_id")) |v| {
+                    if (v == .integer) config.diffusion_pad_token = @intCast(v.integer);
+                }
                 if (gc.get("sampler_config")) |sc_val| {
                     if (sc_val == .object) {
                         if (sc_val.object.get("entropy_bound")) |v| config.diffusion_entropy_bound = jsonFloat(v);
@@ -1218,6 +2277,121 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // shouldKeepWeightKey) — never advertise vision for this arch.
         config.has_vision = false;
         config.ensureGemmaTerminators();
+    } else if (std.mem.eql(u8, model_type, "muse_glimmer") or
+        std.mem.eql(u8, model_type, "muse_glimmer_text"))
+    {
+        // Muse-Glimmer-30B (meta-models). Dense GQA trunk (32/2 heads, hd 128)
+        // with Gemma2-style sandwich-norm layers; every 4th layer counted
+        // backward from the last is full-attention AND NoPE (layer_rope_theta
+        // 0), the rest slide at 2048. "muse_glimmer_text" is the flat
+        // text-only sibling (bare "model" prefix, no text_config).
+        config.model_type = "muse_glimmer";
+        config.weight_prefix = if (root.get("text_config") != null) "model.language_model" else "model";
+        config.hidden_act = .silu;
+        config.norm_has_offset = true; // sandwich norms are Gemma2-centered (1+w)…
+        config.final_norm_plain = true; // …but model.norm is plain-scale (ones-init)
+        config.scale_embeddings = false; // embeddings are RMS-normed, not sqrt(hidden)-scaled
+        config.has_pre_ff_norm = true;
+        config.has_qk_norm = false; // no q_norm/k_norm tensors in the checkpoint —
+        config.qk_norm_weightless = true; // shared weight-less RMS on Q and K instead
+        config.normed_embeddings = true;
+        config.attn_sigmoid_gate = true;
+        // Reference-config class defaults, overridden by explicit keys below.
+        config.qk_scale_factor = 3.87;
+        config.output_multiplier = 0.19611613513818404;
+        config.post_norm_eps = 1e-8;
+        if (cfg_obj.get("qk_scale_factor")) |v| config.qk_scale_factor = jsonFloat(v);
+        if (cfg_obj.get("output_multiplier")) |v| config.output_multiplier = jsonFloat(v);
+        if (cfg_obj.get("post_norm_eps")) |v| config.post_norm_eps = jsonFloat(v);
+        // ONE theta for every roped layer: sliding layers read
+        // rope_local_base_freq in the forward, but muse ships its base only as
+        // rope_parameters.rope_theta — without this the Gemma-flavored 10000
+        // default mis-rotates all 39 roped layers (the 2026-08-11 first-turn
+        // repetition-loop root cause; global layers are NoPE so EVERY rotated
+        // layer ran at the wrong base).
+        if (cfg_obj.get("rope_local_base_freq") == null)
+            config.rope_local_base_freq = config.rope_theta;
+        if (cfg_obj.get("layer_rope_theta")) |lrt| {
+            if (lrt == .array) {
+                for (lrt.array.items, 0..) |item, i| {
+                    if (i >= 128) break;
+                    config.layer_no_rope[i] = jsonFloat(item) == 0;
+                }
+            }
+        }
+        // Vision tower (src/muse_vision.zig). Muse names its geometry keys its
+        // own way and the window/full pattern is a per-layer list, not a stride.
+        if (root.get("vision_config")) |vc_val| {
+            if (vc_val == .object) {
+                const vc = vc_val.object;
+                config.muse_vision = true;
+                if (vc.get("num_hidden_layers")) |v| {
+                    if (v == .integer) config.qv_depth = @intCast(v.integer);
+                }
+                if (vc.get("hidden_size")) |v| {
+                    if (v == .integer) config.qv_hidden = @intCast(v.integer);
+                }
+                if (vc.get("num_attention_heads")) |v| {
+                    if (v == .integer) config.qv_heads = @intCast(v.integer);
+                }
+                if (vc.get("intermediate_size")) |v| {
+                    if (v == .integer) config.qv_intermediate = @intCast(v.integer);
+                }
+                if (vc.get("patch_size")) |v| {
+                    if (v == .integer) config.qv_patch = @intCast(v.integer);
+                }
+                if (vc.get("patch_temporal")) |v| {
+                    if (v == .integer) config.qv_temporal_patch = @intCast(v.integer);
+                }
+                if (vc.get("merge_size")) |v| {
+                    if (v == .integer) config.qv_merge = @intCast(v.integer);
+                }
+                if (vc.get("pos_emb_height")) |v| {
+                    if (v == .integer) config.mv_pos_side = @intCast(v.integer);
+                }
+                if (vc.get("layer_norm_eps")) |v| config.mv_ln_eps = jsonFloat(v);
+                if (vc.get("rope_parameters")) |rp| {
+                    if (rp == .object) {
+                        if (rp.object.get("rope_theta")) |v| config.mv_rope_theta = jsonFloat(v);
+                    }
+                }
+                if (vc.get("layer_types")) |lt| {
+                    if (lt == .array) for (lt.array.items, 0..) |item, i| {
+                        if (i >= MAX_VISION_LAYERS) break;
+                        if (item == .string) config.mv_full_attn[i] = std.mem.eql(u8, item.string, "full_attention");
+                    };
+                }
+                if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
+                config.qv_out_hidden = config.hidden_size;
+                if (root.get("projector_hidden_size")) |v| {
+                    if (v == .integer) config.mv_projector_hidden = @intCast(v.integer);
+                }
+                // The processor wraps the pad run in <|image_start|>/<|image_end|>;
+                // config.json carries neither, so the ids come from the vocab.
+                config.boi_token_id = 200080;
+                config.eoi_token_id = 200081;
+            }
+        }
+        config.ensureMuseTerminators();
+    } else if (std.mem.eql(u8, model_type, "spark2_5")) {
+        // XHToken Spark-X2.5 (1.7B / 4B): dense GQA, hd 256, 3:1 sliding(512)/
+        // full layers with per-type RoPE (sliding: full rotary at 1e4; full:
+        // 25% rotary at 5e6), exact-erf GELU gated MLP, plain RMS norms,
+        // per-head sigmoid attention output gate, fused q_k_v_proj, tied head.
+        config.model_type = "spark2_5";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.hidden_act = .gelu;
+        config.attn_sigmoid_gate = true;
+        config.attn_gate_headwise = true;
+        config.attn_fused_qkv = true;
+        config.rope_scaling_factor = 1.0;
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
     } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
@@ -1237,45 +2411,68 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
-        // Qwen3-VL vision tower (separate fields from the Gemma SigLIP block;
-        // see src/qwen_vision.zig). The generic vision_config block above already
-        // set has_vision; here we read Qwen's distinct keys into qv_*.
-        if (root.get("vision_config")) |vc_val| {
-            if (vc_val == .object) {
-                const vc = vc_val.object;
-                config.qwen_vision = true;
-                if (vc.get("depth")) |v| { if (v == .integer) config.qv_depth = @intCast(v.integer); }
-                if (vc.get("hidden_size")) |v| { if (v == .integer) config.qv_hidden = @intCast(v.integer); }
-                if (vc.get("num_heads")) |v| { if (v == .integer) config.qv_heads = @intCast(v.integer); }
-                if (vc.get("intermediate_size")) |v| { if (v == .integer) config.qv_intermediate = @intCast(v.integer); }
-                if (vc.get("patch_size")) |v| { if (v == .integer) config.qv_patch = @intCast(v.integer); }
-                if (vc.get("temporal_patch_size")) |v| { if (v == .integer) config.qv_temporal_patch = @intCast(v.integer); }
-                if (vc.get("spatial_merge_size")) |v| { if (v == .integer) config.qv_merge = @intCast(v.integer); }
-                if (vc.get("num_position_embeddings")) |v| { if (v == .integer) config.qv_num_pos_emb = @intCast(v.integer); }
-                if (vc.get("out_hidden_size")) |v| { if (v == .integer) config.qv_out_hidden = @intCast(v.integer); }
-                if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
-                if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
-            }
+        parseQwenVisionFields(&config, root, cfg_obj);
+    } else if (std.mem.eql(u8, model_type, "qwen4_exp") or
+        std.mem.eql(u8, model_type, "qwen4_exp_text"))
+    {
+        config.model_type = "qwen4_exp";
+        config.weight_prefix = "language_model.model";
+        config.norm_has_offset = false; // the converter folds every (1 + w) norm
+        config.has_final_norm = false; // hyper_connection_mixer replaces model.norm
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.attn_output_gate = true;
+        config.kda_sigmoid_out_gate = true; // output_gate_type "sigmoid"
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
         }
-        // Interleaved M-RoPE sections (text_config.rope_parameters). rope_theta /
-        // partial_rotary_factor already parsed in the generic rope block above.
-        if (cfg_obj.get("rope_parameters")) |rp| {
-            if (rp == .object) {
-                if (rp.object.get("mrope_interleaved")) |v| { if (v == .bool) config.mrope_interleaved = v.bool; }
-                if (rp.object.get("mrope_section")) |v| {
-                    if (v == .array) {
-                        for (v.array.items, 0..) |item, i| {
-                            if (i >= 3) break;
-                            if (item == .integer) config.mrope_section[i] = @intCast(item.integer);
-                        }
-                    }
-                }
+        config.hc_count = 4;
+        config.hc_lowrank = 320;
+        config.ple_embed_dim = config.hidden_size;
+        parseQwenVisionFields(&config, root, cfg_obj);
+        // YaRN (262144 → e.g. 1048576) rides ONE rotary table for the whole
+        // trunk: attention, the QSA indexer and the MTP head all read it, so
+        // a scaled rotation cannot desync the block selector from attention.
+        try parseYarnRopeParameters(&config, cfg_obj);
+        // Read strictly; range-checked in `validateQwen4Config` once every field is in.
+        if (try qwen4ConfigU32(cfg_obj, "hc_count")) |v| config.hc_count = v;
+        if (try qwen4ConfigU32(cfg_obj, "hc_lowrank")) |v| config.hc_lowrank = v;
+        {
+            const v = cfg_obj.get("ple_layer_ids") orelse return error.InvalidQwen4PleLayer;
+            if (v != .array or v.array.items.len != 1 or v.array.items[0] != .integer) {
+                return error.InvalidQwen4PleLayer;
             }
+            const id = v.array.items[0].integer;
+            if (id < 1 or id > @as(i64, config.num_hidden_layers)) return error.InvalidQwen4PleLayer;
+            config.ple_layer_idx = @intCast(id - 1);
         }
-        // Qwen vision token ids (top-level).
-        if (root.get("video_token_id")) |v| { if (v == .integer) config.video_token_id = @intCast(v.integer); }
-        if (root.get("vision_start_token_id")) |v| { if (v == .integer) config.vision_start_token_id = @intCast(v.integer); }
-        if (root.get("vision_end_token_id")) |v| { if (v == .integer) config.vision_end_token_id = @intCast(v.integer); }
+        if (try qwen4ConfigU32(cfg_obj, "ple_embed_dim")) |v| config.ple_embed_dim = v;
+        if (try qwen4ConfigU32(cfg_obj, "ple_conv_kernel_size")) |v| config.ple_conv_kernel = v;
+        if (try qwen4ConfigU32(cfg_obj, "ngram_size")) |v| config.ngram_size = v;
+        if (try qwen4ConfigU32(cfg_obj, "heads_per_ngram")) |v| config.heads_per_ngram = v;
+        if (try qwen4ConfigU64(cfg_obj, "ngram_vocab_size_base")) |v| config.ngram_vocab_base = v;
+        if (try qwen4ConfigU32(cfg_obj, "make_ngram_vocab_size_divisible_by")) |v| config.ngram_vocab_divisor = v;
+        if (try qwen4ConfigU64(cfg_obj, "seed")) |v| config.ngram_seed = v;
+        if (try qwen4ConfigU32(cfg_obj, "indexer_n_heads")) |v| config.indexer_n_heads = v;
+        if (try qwen4ConfigU32(cfg_obj, "indexer_head_dim")) |v| config.indexer_head_dim = v;
+        if (try qwen4ConfigU32(cfg_obj, "indexer_budget")) |v| config.indexer_budget = v;
+        if (try qwen4ConfigU32(cfg_obj, "indexer_compress_ratio")) |v| config.indexer_compress_ratio = v;
+        if (cfg_obj.get("eos_token_id")) |v| {
+            switch (v) {
+                .integer => |i| config.ngram_eos = @intCast(i),
+                .array => |arr| if (arr.items.len > 0 and arr.items[0] == .integer) {
+                    config.ngram_eos = @intCast(arr.items[0].integer);
+                },
+                else => {},
+            }
+            if (config.num_eos_tokens == 0) config.addEosToken(config.ngram_eos);
+        }
+        try validateQwen4Config(&config);
     } else if (std.mem.eql(u8, model_type, "qwen3_moe") or
         std.mem.eql(u8, model_type, "qwen3_moe_text"))
     {
@@ -1305,6 +2502,79 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
+    } else if (std.mem.eql(u8, model_type, "gpt_oss")) {
+        // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B). A plain dense-attention MoE
+        // that rides the qwen3_moe forward arms — no linear/SSM layers, no
+        // module-owned decode state, so prefix cache, batched decode and spec
+        // decode all apply normally. Family-specific pieces:
+        //   1. Learned per-head attention SINKS (self_attn.sinks) — an extra
+        //      softmax-denominator column. mlx's fused SDPA takes them.
+        //   2. Clamped SwiGLU (swiglu_limit, alpha 1.702, +1 on the linear
+        //      branch) instead of silu(gate)*up.
+        //   3. Additive biases everywhere: q/k/v/o_proj.bias, mlp.router.bias
+        //      and per-expert gate/up/down bias — all living BESIDE the affine
+        //      quantizer's `.biases` tensors in the same checkpoint.
+        //   4. No QK norm.
+        // Router is softmax-over-top-k, which is algebraically identical to
+        // the existing softmax-all → top-k → renorm chain, so moe_route_norm
+        // stays true and moe_sigmoid_router stays false.
+        config.model_type = "gpt_oss";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.hidden_act = .silu;
+        config.has_attn_sinks = true;
+        // ONE theta for both layer types. The Gemma-flavored default of 10000
+        // would silently mis-base every sliding layer — the muse
+        // first-turn-repetition class (deterministic "coherent then loops").
+        config.rope_local_base_freq = config.rope_theta;
+        config.rope_scaling_factor = 1.0;
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
+        // Expert count rides `num_local_experts`; the generic block only knows
+        // `num_experts`. Top-k has two spellings and both appear in shipped
+        // configs (`num_experts_per_tok` is generic, `experts_per_token` is not).
+        if (cfg_obj.get("num_local_experts")) |v| {
+            if (v == .integer) config.num_experts = @intCast(v.integer);
+        }
+        if (cfg_obj.get("experts_per_token")) |v| {
+            if (v == .integer) config.num_experts_per_tok = @intCast(v.integer);
+        }
+        // There is no moe_intermediate_size key: the expert width IS
+        // intermediate_size (2880 on both sizes).
+        if (config.moe_intermediate_size == 0) {
+            config.moe_intermediate_size = config.intermediate_size;
+        }
+        if (cfg_obj.get("swiglu_limit")) |v| config.swiglu_limit = jsonFloat(v);
+        // Flat YaRN block. mscale is COMPUTED, never read: the config ships no
+        // "attention_factor" at all, and mlx-lm's YarnRoPE defaults
+        // (mscale 1 / mscale_all_dim 0) give 0.1*ln(factor) + 1. Laguna
+        // precedent — but note dsv4 is the same shape with the OPPOSITE
+        // answer, so this stays a per-arch decision.
+        if (cfg_obj.get("rope_scaling")) |rs| {
+            if (rs == .object) {
+                const is_yarn = if (rs.object.get("rope_type")) |rt|
+                    (rt == .string and std.mem.eql(u8, rt.string, "yarn"))
+                else
+                    false;
+                if (is_yarn) {
+                    config.rope_yarn = true;
+                    if (rs.object.get("factor")) |x| config.yarn_factor = jsonFloat(x);
+                    if (rs.object.get("beta_fast")) |x| config.yarn_beta_fast = jsonFloat(x);
+                    if (rs.object.get("beta_slow")) |x| config.yarn_beta_slow = jsonFloat(x);
+                    if (rs.object.get("original_max_position_embeddings")) |x| {
+                        if (x == .integer) config.yarn_orig_max_pos = @intCast(x.integer);
+                    }
+                    if (config.yarn_factor > 1.0) {
+                        config.yarn_attention_factor = 0.1 * @log(config.yarn_factor) + 1.0;
+                    }
+                }
+            }
+        }
+        config.ensureGptOssTerminators();
     } else if (std.mem.eql(u8, model_type, "hy_v3")) {
         // Tencent Hunyuan 3 (Hy3, 295B-A21B MoE; July 2026). Pure
         // full-attention MoE that rides the qwen3_moe forward arms: GQA with
@@ -1331,14 +2601,22 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.moe_sigmoid_router = true;
         // qk_norm / route_norm default TRUE when absent (mlx-lm ModelArgs
         // defaults) but an explicit false must win.
-        if (cfg_obj.get("qk_norm")) |v| { if (v == .bool) config.has_qk_norm = v.bool; }
-        if (cfg_obj.get("route_norm")) |v| { if (v == .bool) config.moe_route_norm = v.bool; }
+        if (cfg_obj.get("qk_norm")) |v| {
+            if (v == .bool) config.has_qk_norm = v.bool;
+        }
+        if (cfg_obj.get("route_norm")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
         if (cfg_obj.get("router_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
-        if (cfg_obj.get("first_k_dense_replace")) |v| { if (v == .integer) config.first_k_dense_replace = @intCast(v.integer); }
+        if (cfg_obj.get("first_k_dense_replace")) |v| {
+            if (v == .integer) config.first_k_dense_replace = @intCast(v.integer);
+        }
         // Expert width may ride as expert_hidden_dim when moe_intermediate_size
         // is absent (both = 1536 on the 295B).
         if (config.moe_intermediate_size == 0) {
-            if (cfg_obj.get("expert_hidden_dim")) |v| { if (v == .integer) config.moe_intermediate_size = @intCast(v.integer); }
+            if (cfg_obj.get("expert_hidden_dim")) |v| {
+                if (v == .integer) config.moe_intermediate_size = @intCast(v.integer);
+            }
         }
         // No explicit shared_expert_intermediate_size key in hy_v3 configs:
         // derive num_shared_experts × expert width. 0 shared experts leaves it
@@ -1351,6 +2629,227 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.query_pre_attn_scalar = config.head_dim;
         }
         config.ensureHy3Terminators();
+    } else if (std.mem.eql(u8, model_type, "bailing_hybrid")) {
+        // inclusionAI Ling 3.0 (bailing_hybrid; BailingMoeV3ForCausalLM). A
+        // KDA + MLA hybrid MoE: three Kimi-Delta-Attention linear layers for
+        // every Multi-head-Latent-Attention layer (layer_group_size 4, so
+        // layers 3/7/11/… are full attention), DeepSeek-V3-style grouped
+        // sigmoid routing with an expert bias, one ungated shared expert, and
+        // a dense MLP on the bottom first_k_dense_replace layers.
+        //
+        // Three things here are NOT the qwen3.5 GDN defaults and each has its
+        // own config field: the forget gate is per CHANNEL (kda_vector_gate),
+        // it uses the bounded sigmoid form rather than softplus
+        // (kda_gate_lower_bound), and the output gate is a plain sigmoid.
+        // RoPE covers only the qk_rope_head_dim slice of each query/key head
+        // and rotates ADJACENT PAIRS (rope_interleave).
+        //
+        // References: the checkpoint's own modeling_bailing_moe_v3.py, and
+        // fla/ops/kda/fused_recurrent.py for the gate. Mirror:
+        // rapid-mlx/Ling-3.0-tiny-MLX-4bit.
+        config.model_type = "bailing_hybrid";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false; // MLA norms the LATENTS, not the heads
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+
+        // Hybrid layout. `layer_group_size` counts layers per group with the
+        // LAST one full — exactly isLinearLayer's `(idx+1) % interval != 0`.
+        if (cfg_obj.get("layer_group_size")) |v| {
+            if (v == .integer) config.full_attention_interval = @intCast(v.integer);
+        }
+
+        // KDA: one linear head per attention head, key dim = value dim = head_dim.
+        config.linear_num_key_heads = config.num_attention_heads;
+        config.linear_num_value_heads = config.num_attention_heads;
+        config.linear_key_head_dim = config.head_dim;
+        config.linear_value_head_dim = config.head_dim;
+        if (cfg_obj.get("short_conv_kernel_size")) |v| {
+            if (v == .integer) config.linear_conv_kernel_dim = @intCast(v.integer);
+        }
+        // A per-head KDA (`num_kv_heads_for_linear_attn`) would give the linear
+        // layers their own head count instead of the attention heads' — the
+        // three lines above would then be wrong, so refuse rather than size the
+        // recurrent state off the wrong geometry.
+        if (cfg_obj.get("num_kv_heads_for_linear_attn")) |v| {
+            if (v == .integer and v.integer != 0 and v.integer != @as(i64, config.num_attention_heads)) {
+                log.err("bailing_hybrid: num_kv_heads_for_linear_attn {d} != num_attention_heads {d} (per-head KDA not supported)\n", .{ v.integer, config.num_attention_heads });
+                return error.UnsupportedBailingConfig;
+            }
+        }
+        config.kda_vector_gate = true;
+        config.kda_sigmoid_out_gate = true;
+        // fla's kernel has TWO gate arms and this key selects between them: a
+        // negative bound takes `exp(bound·σ(exp(A_log)·(a+dt_bias)))`, an absent
+        // key the plain `exp(-exp(A_log)·softplus(·))` (which the shared
+        // GatedDeltaNet chain already serves, elementwise, so a per-channel gate
+        // needs nothing new). A bound of exactly 0 would degenerate the bounded
+        // form to exp(0) = 1 — a gate that never forgets — so it is refused
+        // rather than served as the other arm by accident.
+        if (cfg_obj.get("kda_lower_bound")) |v| {
+            if (v != .null) {
+                const lb = jsonFloat(v);
+                if (lb >= 0.0) {
+                    log.err("bailing_hybrid: kda_lower_bound must be negative (got {d})\n", .{lb});
+                    return error.UnsupportedBailingConfig;
+                }
+                config.kda_gate_lower_bound = lb;
+            }
+        }
+        // `kda_safe_gate` is a numerics detail of the reference's own kernel
+        // launch, not a change of formula — both arms above are already
+        // evaluated in f32 here, so it is read as satisfied and ignored.
+        //
+        // The KDA LoRA gate variants (f_a_proj/f_b_proj, g_a_proj/g_b_proj)
+        // are a different weight layout; the shipped checkpoint sets
+        // no_kda_lora. Refuse rather than fail with a MISSING WEIGHT crash —
+        // and accept BOTH spellings, since a checkpoint that states only the
+        // positive one otherwise slips straight through to that crash.
+        if (cfg_obj.get("no_kda_lora")) |v| {
+            if (v == .bool and !v.bool) {
+                log.err("bailing_hybrid: low-rank KDA gates (no_kda_lora=false) not supported\n", .{});
+                return error.UnsupportedBailingConfig;
+            }
+        }
+        if (cfg_obj.get("use_kda_lora")) |v| {
+            if (v == .bool and v.bool) {
+                log.err("bailing_hybrid: low-rank KDA gates (use_kda_lora=true) not supported\n", .{});
+                return error.UnsupportedBailingConfig;
+            }
+        }
+
+        // MLA.
+        if (cfg_obj.get("q_lora_rank")) |v| {
+            if (v == .integer) config.mla_q_lora_rank = @intCast(v.integer);
+        }
+        if (cfg_obj.get("kv_lora_rank")) |v| {
+            if (v == .integer) config.mla_kv_lora_rank = @intCast(v.integer);
+        }
+        if (cfg_obj.get("qk_nope_head_dim")) |v| {
+            if (v == .integer) config.mla_qk_nope_head_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("qk_rope_head_dim")) |v| {
+            if (v == .integer) config.mla_qk_rope_head_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("v_head_dim")) |v| {
+            if (v == .integer) config.mla_v_head_dim = @intCast(v.integer);
+        }
+        if (config.mla_v_head_dim == 0) config.mla_v_head_dim = config.head_dim;
+        // `q_lora_rank: null` is a plain q_proj — a different weight layout,
+        // now served (see `mlaHasQLora`). The KV latent has no such fallback.
+        if (config.mla_kv_lora_rank == 0) {
+            log.err("bailing_hybrid: kv_lora_rank is required\n", .{});
+            return error.UnsupportedBailingConfig;
+        }
+        // The declared qk_head_dim must agree with nope+rope: everything
+        // downstream (the cached K's last dim, the attention scale, the q_b
+        // split) is derived from the two halves.
+        if (cfg_obj.get("qk_head_dim")) |v| {
+            if (v == .integer and @as(u32, @intCast(v.integer)) != config.mlaQkHeadDim()) {
+                log.err("bailing_hybrid: qk_head_dim {d} != qk_nope_head_dim + qk_rope_head_dim ({d})\n", .{ v.integer, config.mlaQkHeadDim() });
+                return error.UnsupportedBailingConfig;
+            }
+        }
+        // Attention scale is 1/sqrt(qk_head_dim) — the FULL query width,
+        // wider than head_dim. Not derivable from head_dim on this arch.
+        config.query_pre_attn_scalar = config.mlaQkHeadDim();
+        if (cfg_obj.get("gated_attention_proj_granularity_type")) |v| {
+            if (v == .string) {
+                if (std.mem.eql(u8, v.string, "head_wise")) {
+                    config.mla_head_gate = true;
+                } else {
+                    // element_wise gating is a differently-shaped g_proj.
+                    log.err("bailing_hybrid: only head_wise attention gating supported (got '{s}')\n", .{v.string});
+                    return error.UnsupportedBailingConfig;
+                }
+            }
+        }
+        if (cfg_obj.get("rope_interleave")) |v| {
+            if (v == .bool) config.rope_interleaved_pairs = v.bool;
+        }
+        // `use_mla_nope` makes the MLA layers positionless (Kimi-Linear ships
+        // exactly that: `rotary_emb=None`). `mlaAttnWith` always ropes the rope
+        // slice, so a NoPE checkpoint would be served with positions its
+        // reference never applies — refuse by name instead.
+        if (cfg_obj.get("use_mla_nope")) |v| {
+            if (v == .bool and v.bool) {
+                log.err("bailing_hybrid: NoPE MLA (use_mla_nope=true) not supported\n", .{});
+                return error.UnsupportedBailingConfig;
+            }
+        }
+        // partial_rotary_factor is stated against head_dim but the reference's
+        // rotary module overrides it to 1.0 over qk_rope_head_dim — rope covers
+        // that slice ENTIRELY, so the generic partial factor must not leak in.
+        config.partial_rotary_factor = 1.0;
+
+        // Three optional norms the forward does NOT implement. Each is a real
+        // BailingMoeV3 switch and each is FALSE in every shipped checkpoint, so
+        // they cost nothing here — but a variant flipping one would be served
+        // silently without it, which is the failure mode this whole block of
+        // named refusals exists to prevent.
+        const unsupported_flags = [_][]const u8{ "value_norm", "up_proj_norm", "use_nGPT" };
+        for (unsupported_flags) |key| {
+            if (cfg_obj.get(key)) |v| {
+                if (v == .bool and v.bool) {
+                    log.err("bailing_hybrid: {s}=true not supported\n", .{key});
+                    return error.UnsupportedBailingConfig;
+                }
+            }
+        }
+        // The KDA conv activation. True everywhere shipped; the shared
+        // GatedDeltaNet path applies silu after the causal conv unconditionally,
+        // so a checkpoint declaring otherwise would get an activation it never
+        // trained with.
+        if (cfg_obj.get("linear_silu")) |v| {
+            if (v == .bool and !v.bool) {
+                log.err("bailing_hybrid: linear_silu=false not supported (the conv activation is silu)\n", .{});
+                return error.UnsupportedBailingConfig;
+            }
+        }
+
+        // MoE: grouped sigmoid routing (noaux_tc) + one ungated shared expert.
+        config.moe_sigmoid_router = true;
+        if (cfg_obj.get("first_k_dense_replace")) |v| {
+            if (v == .integer) config.first_k_dense_replace = @intCast(v.integer);
+        }
+        if (cfg_obj.get("n_group")) |v| {
+            if (v == .integer) config.moe_n_group = @intCast(v.integer);
+        }
+        if (cfg_obj.get("topk_group")) |v| {
+            if (v == .integer) config.moe_topk_group = @intCast(v.integer);
+        }
+        if (cfg_obj.get("norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
+        // Shared expert width = num_shared_experts × its own intermediate size
+        // (which falls back to the routed expert width when absent).
+        if (config.shared_expert_intermediate_size == 0) {
+            var shared_width: u32 = config.moe_intermediate_size;
+            if (cfg_obj.get("moe_shared_expert_intermediate_size")) |v| {
+                if (v == .integer) shared_width = @intCast(v.integer);
+            }
+            var n_shared: u32 = 0;
+            if (cfg_obj.get("num_shared_experts")) |v| {
+                if (v == .integer) n_shared = @intCast(v.integer);
+            }
+            config.shared_expert_intermediate_size = shared_width * n_shared;
+        }
+        // Softmax routing is a different score function; only sigmoid ships.
+        if (cfg_obj.get("score_function")) |v| {
+            if (v == .string and !std.mem.eql(u8, v.string, "sigmoid")) {
+                log.err("bailing_hybrid: only sigmoid score_function supported (got '{s}')\n", .{v.string});
+                return error.UnsupportedBailingConfig;
+            }
+        }
+        // The MTP head ships disabled (num_nextn_predict_layers 0) and no
+        // mtp.* weights are in the checkpoint. The single terminator
+        // (`<|role_end|>`) rides the root eos_token_id — no additive merge.
     } else if (std.mem.eql(u8, model_type, "laguna")) {
         // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder; nvfp4 experts, 256K
         // ctx). Pure-attention MoE that rides the qwen3.5/hy_v3 MoE forward
@@ -1380,7 +2879,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.query_pre_attn_scalar = config.head_dim;
         }
         // Router: norm_topk_prob → route_norm; moe_routed_scaling_factor → scale.
-        if (cfg_obj.get("norm_topk_prob")) |v| { if (v == .bool) config.moe_route_norm = v.bool; }
+        if (cfg_obj.get("norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
         if (cfg_obj.get("moe_routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
         if (cfg_obj.get("moe_router_logit_softcapping")) |v| config.moe_router_logit_softcapping = jsonFloat(v);
         // Router logit soft-capping is off on the shipped checkpoint and untested;
@@ -1478,20 +2979,38 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 config.intermediate_size_declared = true;
             }
         }
-        if (cfg_obj.get("dense_mlp_idx")) |v| { if (v == .integer) config.first_k_dense_replace = @intCast(v.integer); }
-        if (cfg_obj.get("n_routed_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
-        if (cfg_obj.get("n_shared_experts")) |v| { if (v == .integer) config.inkling_n_shared_experts = @intCast(v.integer); }
+        if (cfg_obj.get("dense_mlp_idx")) |v| {
+            if (v == .integer) config.first_k_dense_replace = @intCast(v.integer);
+        }
+        if (cfg_obj.get("n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = @intCast(v.integer);
+        }
+        if (cfg_obj.get("n_shared_experts")) |v| {
+            if (v == .integer) config.inkling_n_shared_experts = @intCast(v.integer);
+        }
         if (cfg_obj.get("route_scale")) |v| config.router_scaling_factor = jsonFloat(v);
         // Position machinery.
-        if (cfg_obj.get("d_rel")) |v| { if (v == .integer) config.inkling_d_rel = @intCast(v.integer); }
-        if (cfg_obj.get("rel_extent")) |v| { if (v == .integer) config.inkling_rel_extent = @intCast(v.integer); }
-        if (cfg_obj.get("log_scaling_n_floor")) |v| { if (v == .integer) config.inkling_log_n_floor = @intCast(v.integer); }
+        if (cfg_obj.get("d_rel")) |v| {
+            if (v == .integer) config.inkling_d_rel = @intCast(v.integer);
+        }
+        if (cfg_obj.get("rel_extent")) |v| {
+            if (v == .integer) config.inkling_rel_extent = @intCast(v.integer);
+        }
+        if (cfg_obj.get("log_scaling_n_floor")) |v| {
+            if (v == .integer) config.inkling_log_n_floor = @intCast(v.integer);
+        }
         if (cfg_obj.get("log_scaling_alpha")) |v| config.inkling_log_alpha = jsonFloat(v);
-        if (cfg_obj.get("sconv_kernel_size")) |v| { if (v == .integer) config.inkling_sconv_kernel = @intCast(v.integer); }
-        if (cfg_obj.get("use_sconv")) |v| { if (v == .bool and !v.bool) config.inkling_sconv_kernel = 0; }
+        if (cfg_obj.get("sconv_kernel_size")) |v| {
+            if (v == .integer) config.inkling_sconv_kernel = @intCast(v.integer);
+        }
+        if (cfg_obj.get("use_sconv")) |v| {
+            if (v == .bool and !v.bool) config.inkling_sconv_kernel = 0;
+        }
         // Embedding norm (use_embed_norm, default true for this family).
         config.has_embedding_norm = true;
-        if (cfg_obj.get("use_embed_norm")) |v| { if (v == .bool) config.has_embedding_norm = v.bool; }
+        if (cfg_obj.get("use_embed_norm")) |v| {
+            if (v == .bool) config.has_embedding_norm = v.bool;
+        }
         // Hybrid sliding/global: the config names LOCAL (sliding) layers and
         // uses `sliding_window_size` (the generic block reads `sliding_window`).
         if (cfg_obj.get("sliding_window_size")) |v| {
@@ -1513,8 +3032,12 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
         // muP logits + padded vocab.
         if (cfg_obj.get("logits_mup_width_multiplier")) |v| config.logits_mup_width_multiplier = jsonFloat(v);
-        if (cfg_obj.get("unpadded_vocab_size")) |v| { if (v == .integer) config.unpadded_vocab_size = @intCast(v.integer); }
-        if (cfg_obj.get("model_max_length")) |v| { if (v == .integer) config.max_position_embeddings = @intCast(v.integer); }
+        if (cfg_obj.get("unpadded_vocab_size")) |v| {
+            if (v == .integer) config.unpadded_vocab_size = @intCast(v.integer);
+        }
+        if (cfg_obj.get("model_max_length")) |v| {
+            if (v == .integer) config.max_position_embeddings = @intCast(v.integer);
+        }
         // v1 is text-only: the hMLP vision_config must not arm the SigLIP path
         // (the generic vision_config block above set has_vision = true).
         config.has_vision = false;
@@ -1547,26 +3070,58 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.has_pre_ff_norm = false;
         config.has_qk_norm = false; // q-norm is on the lora rank + unweighted per-head RMS, handled in-arch
         config.hidden_act = .silu;
-        if (cfg_obj.get("n_routed_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
-        if (cfg_obj.get("num_hash_layers")) |v| { if (v == .integer) config.dsv4_hash_layers = @intCast(v.integer); }
+        if (cfg_obj.get("n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = @intCast(v.integer);
+        }
+        if (cfg_obj.get("num_hash_layers")) |v| {
+            if (v == .integer) config.dsv4_hash_layers = @intCast(v.integer);
+        }
         if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
-        if (cfg_obj.get("norm_topk_prob")) |v| { if (v == .bool) config.moe_route_norm = v.bool; }
-        if (cfg_obj.get("q_lora_rank")) |v| { if (v == .integer) config.dsv4_q_lora_rank = @intCast(v.integer); }
-        if (cfg_obj.get("o_lora_rank")) |v| { if (v == .integer) config.dsv4_o_lora_rank = @intCast(v.integer); }
-        if (cfg_obj.get("o_groups")) |v| { if (v == .integer) config.dsv4_o_groups = @intCast(v.integer); }
-        if (cfg_obj.get("qk_rope_head_dim")) |v| { if (v == .integer) config.dsv4_rope_head_dim = @intCast(v.integer); }
-        if (cfg_obj.get("index_n_heads")) |v| { if (v == .integer) config.dsv4_index_n_heads = @intCast(v.integer); }
-        if (cfg_obj.get("index_head_dim")) |v| { if (v == .integer) config.dsv4_index_head_dim = @intCast(v.integer); }
-        if (cfg_obj.get("index_topk")) |v| { if (v == .integer) config.dsv4_index_topk = @intCast(v.integer); }
-        if (cfg_obj.get("hc_mult")) |v| { if (v == .integer) config.dsv4_hc_mult = @intCast(v.integer); }
-        if (cfg_obj.get("hc_sinkhorn_iters")) |v| { if (v == .integer) config.dsv4_hc_sinkhorn_iters = @intCast(v.integer); }
+        if (cfg_obj.get("norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (cfg_obj.get("q_lora_rank")) |v| {
+            if (v == .integer) config.dsv4_q_lora_rank = @intCast(v.integer);
+        }
+        if (cfg_obj.get("o_lora_rank")) |v| {
+            if (v == .integer) config.dsv4_o_lora_rank = @intCast(v.integer);
+        }
+        if (cfg_obj.get("o_groups")) |v| {
+            if (v == .integer) config.dsv4_o_groups = @intCast(v.integer);
+        }
+        if (cfg_obj.get("qk_rope_head_dim")) |v| {
+            if (v == .integer) config.dsv4_rope_head_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("index_n_heads")) |v| {
+            if (v == .integer) config.dsv4_index_n_heads = @intCast(v.integer);
+        }
+        if (cfg_obj.get("index_head_dim")) |v| {
+            if (v == .integer) config.dsv4_index_head_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("index_topk")) |v| {
+            if (v == .integer) config.dsv4_index_topk = @intCast(v.integer);
+        }
+        if (cfg_obj.get("hc_mult")) |v| {
+            if (v == .integer) config.dsv4_hc_mult = @intCast(v.integer);
+        }
+        if (cfg_obj.get("hc_sinkhorn_iters")) |v| {
+            if (v == .integer) config.dsv4_hc_sinkhorn_iters = @intCast(v.integer);
+        }
         if (cfg_obj.get("hc_eps")) |v| config.dsv4_hc_eps = jsonFloat(v);
         if (cfg_obj.get("swiglu_limit")) |v| config.dsv4_swiglu_limit = jsonFloat(v);
         if (cfg_obj.get("compress_rope_theta")) |v| config.dsv4_compress_rope_theta = jsonFloat(v);
-        if (cfg_obj.get("num_nextn_predict_layers")) |v| { if (v == .integer) config.dsv4_mtp_layers = @intCast(v.integer); }
-        if (cfg_obj.get("dspark_block_size")) |v| { if (v == .integer) config.dsv4_dspark_block_size = @intCast(v.integer); }
-        if (cfg_obj.get("dspark_noise_token_id")) |v| { if (v == .integer) config.dsv4_dspark_noise_token_id = @intCast(v.integer); }
-        if (cfg_obj.get("dspark_markov_rank")) |v| { if (v == .integer) config.dsv4_dspark_markov_rank = @intCast(v.integer); }
+        if (cfg_obj.get("num_nextn_predict_layers")) |v| {
+            if (v == .integer) config.dsv4_mtp_layers = @intCast(v.integer);
+        }
+        if (cfg_obj.get("dspark_block_size")) |v| {
+            if (v == .integer) config.dsv4_dspark_block_size = @intCast(v.integer);
+        }
+        if (cfg_obj.get("dspark_noise_token_id")) |v| {
+            if (v == .integer) config.dsv4_dspark_noise_token_id = @intCast(v.integer);
+        }
+        if (cfg_obj.get("dspark_markov_rank")) |v| {
+            if (v == .integer) config.dsv4_dspark_markov_rank = @intCast(v.integer);
+        }
         if (cfg_obj.get("dspark_target_layer_ids")) |v| {
             if (v == .array) {
                 for (v.array.items, 0..) |item, i| {
@@ -1679,6 +3234,31 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             if (v == .bool) config.tie_word_embeddings = v.bool;
         }
         if (cfg_obj.get("norm_eps")) |v| config.rms_norm_eps = jsonFloat(v);
+        if (cfg_obj.get("conv_L_cache")) |v| {
+            if (v == .integer) config.lfm_conv_kernel = @intCast(v.integer);
+        }
+        if (std.mem.eql(u8, model_type, "lfm2_moe")) {
+            config.lfm2_moe = true;
+            if (cfg_obj.get("num_experts")) |v| {
+                if (v == .integer) config.num_experts = @intCast(v.integer);
+            }
+            if (cfg_obj.get("num_experts_per_tok")) |v| {
+                if (v == .integer) config.num_experts_per_tok = @intCast(v.integer);
+            }
+            if (cfg_obj.get("moe_intermediate_size")) |v| {
+                if (v == .integer) config.moe_intermediate_size = @intCast(v.integer);
+            }
+            if (cfg_obj.get("num_dense_layers")) |v| {
+                if (v == .integer) config.num_dense_layers = @intCast(v.integer);
+            }
+            if (cfg_obj.get("norm_topk_prob")) |v| {
+                if (v == .bool) config.moe_route_norm = v.bool;
+            }
+            if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
+            if (config.num_experts == 0 or config.num_experts_per_tok == 0 or config.moe_intermediate_size == 0) {
+                return error.IncompleteLfm2MoeConfig;
+            }
+        }
         if (cfg_obj.get("conv_dim")) |v| config.lfm_conv_dim = switch (v) {
             .integer => |i| @intCast(i),
             else => 0,
@@ -1702,6 +3282,58 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 if (v == .integer) config.addEosToken(@intCast(v.integer));
             }
         }
+        // LFM2-VL: a stock `siglip2_vision_model` tower (src/lfm2_vision.zig)
+        // plus LFM2-VL's own projector. The generic vision_config block above
+        // already read the tower's geometry; everything here is the wrapper.
+        // A `lfm2` checkpoint with no vision_config stays text-only.
+        if (root.get("vision_config")) |vc_val| {
+            if (vc_val == .object and std.mem.eql(u8, model_type, "lfm2_vl")) {
+                config.lfm2_vision = true;
+                const vc = vc_val.object;
+                config.lv_ln_eps = 1e-6;
+                if (vc.get("layer_norm_eps")) |v| config.lv_ln_eps = jsonFloat(v);
+                // The stored table is square: num_patches = pos_side².
+                var num_patches: u32 = 256;
+                if (vc.get("num_patches")) |v| {
+                    if (v == .integer) num_patches = @intCast(v.integer);
+                }
+                config.lv_pos_side = std.math.sqrt(num_patches);
+                if (root.get("downsample_factor")) |v| {
+                    if (v == .integer) config.lv_downsample = @intCast(v.integer);
+                }
+                if (root.get("projector_hidden_size")) |v| {
+                    if (v == .integer) config.lv_projector_hidden = @intCast(v.integer);
+                }
+                if (root.get("min_image_tokens")) |v| {
+                    if (v == .integer) config.lv_min_image_tokens = @intCast(v.integer);
+                }
+                if (root.get("max_image_tokens")) |v| {
+                    if (v == .integer) config.lv_max_image_tokens = @intCast(v.integer);
+                }
+                if (root.get("tile_size")) |v| {
+                    if (v == .integer) config.lv_tile_size = @intCast(v.integer);
+                }
+                if (root.get("min_tiles")) |v| {
+                    if (v == .integer) config.lv_min_tiles = @intCast(v.integer);
+                }
+                if (root.get("max_tiles")) |v| {
+                    if (v == .integer) config.lv_max_tiles = @intCast(v.integer);
+                }
+                if (root.get("do_image_splitting")) |v| {
+                    if (v == .bool) config.lv_split_images = v.bool;
+                }
+                if (root.get("use_thumbnail")) |v| {
+                    if (v == .bool) config.lv_use_thumbnail = v.bool;
+                }
+                if (root.get("max_pixels_tolerance")) |v| config.lv_pixels_tolerance = jsonFloat(v);
+                if (config.lv_projector_hidden == 0) config.lv_projector_hidden = config.hidden_size;
+            } else {
+                // `vision_config` present without the VL tag (mlx-community's
+                // text-only LFM2.5 packs ship an EMPTY one): never advertise a
+                // tower we have no weights for.
+                config.has_vision = false;
+            }
+        }
     } else if (std.mem.eql(u8, model_type, "nemotron_h")) {
         config.model_type = "nemotron_h";
         config.weight_prefix = "backbone";
@@ -1723,12 +3355,30 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.rms_norm_eps = jsonFloat(v);
         }
         // Mamba2-specific config
-        if (cfg_obj.get("mamba_num_heads")) |v| config.mamba_num_heads = switch (v) { .integer => |i| @intCast(i), else => 0 };
-        if (cfg_obj.get("mamba_head_dim")) |v| config.mamba_head_dim = switch (v) { .integer => |i| @intCast(i), else => 0 };
-        if (cfg_obj.get("n_groups")) |v| config.mamba_n_groups = switch (v) { .integer => |i| @intCast(i), else => 8 };
-        if (cfg_obj.get("ssm_state_size")) |v| config.ssm_state_size = switch (v) { .integer => |i| @intCast(i), else => 128 };
-        if (cfg_obj.get("conv_kernel")) |v| config.mamba_conv_kernel = switch (v) { .integer => |i| @intCast(i), else => 4 };
-        if (cfg_obj.get("expand")) |v| config.mamba_expand = switch (v) { .integer => |i| @intCast(i), else => 2 };
+        if (cfg_obj.get("mamba_num_heads")) |v| config.mamba_num_heads = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 0,
+        };
+        if (cfg_obj.get("mamba_head_dim")) |v| config.mamba_head_dim = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 0,
+        };
+        if (cfg_obj.get("n_groups")) |v| config.mamba_n_groups = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 8,
+        };
+        if (cfg_obj.get("ssm_state_size")) |v| config.ssm_state_size = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 128,
+        };
+        if (cfg_obj.get("conv_kernel")) |v| config.mamba_conv_kernel = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 4,
+        };
+        if (cfg_obj.get("expand")) |v| config.mamba_expand = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 2,
+        };
         // time_step_limit: Python defaults to (0.0, inf) if not in config.
         // config.json may have time_step_min/time_step_max fields but Python ignores them
         // for SSM clipping — only time_step_limit (a 2-element array) is used.
@@ -1741,7 +3391,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 }
             }
         }
-        if (cfg_obj.get("chunk_size")) |v| config.mamba_chunk_size = switch (v) { .integer => |i| @intCast(i), else => 256 };
+        if (cfg_obj.get("chunk_size")) |v| config.mamba_chunk_size = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 256,
+        };
         // Parse hybrid_override_pattern: "M-M-M-MM-M-M*-..."
         if (cfg_obj.get("hybrid_override_pattern")) |v| {
             if (v == .string) {
@@ -1800,6 +3453,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.model_type = "llama";
         } else if (std.mem.eql(u8, model_type, "mistral")) {
             config.model_type = "mistral";
+        } else if (std.mem.eql(u8, model_type, "k2_horizon")) {
+            // IFM K2-Horizon dense (0.9B/3.7B/7B/32B): a Llama trunk whose
+            // RMS norms are GROUPED (`layernorm_num_groups`). The MoVA MoE
+            // sizes (`mova_num_experts` > 0) are a different attention and
+            // are not served.
+            config.model_type = "k2_horizon";
+            if (cfg_obj.get("layernorm_num_groups")) |v| {
+                if (v == .integer and v.integer > 1) config.norm_groups = @intCast(v.integer);
+            }
         } else {
             config.model_type = "unknown";
         }
@@ -1879,6 +3541,56 @@ pub const Weights = struct {
     }
 };
 
+/// The generic nestings a text trunk ships under: flat, mlx-community's
+/// re-nest, and meta's VL original (Muse-Glimmer). `parseConfigFromJson`
+/// picks from config KEYS; this probe corrects it from the checkpoint.
+const FLAT_PREFIX = "model";
+const NESTED_PREFIX = "language_model.model";
+const VL_NESTED_PREFIX = "model.language_model";
+
+fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
+    var it = weights.map.keyIterator();
+    while (it.next()) |k| {
+        const key = k.*;
+        if (key.len > prefix.len and key[prefix.len] == '.' and std.mem.startsWith(u8, key, prefix)) return true;
+    }
+    return false;
+}
+
+/// Re-point `config.weight_prefix` at the nesting the CHECKPOINT actually uses.
+///
+/// Which of the two a converter emits is not reliably declared in config.json,
+/// so `parseConfigFromJson` guesses from `text_config` presence — wrong for any
+/// checkpoint that nests without declaring one (mlx-community LFM2.5-2.6B:
+/// `Lfm2ForCausalLM`, an EMPTY `vision_config`, every weight under
+/// `language_model.model.*`; the guess picked `model` and the load died on
+/// `MISSING WEIGHT: model.embed_tokens.weight`). The class has now shipped in
+/// both directions, so the weights get the last word.
+///
+/// Conservative by construction: only the generic spellings participate
+/// (never an arch with its own — `backbone`, `model.llm`, `""`), and a swap
+/// happens only when the configured one holds NOTHING, so every checkpoint
+/// that already loaded binds byte-identically. Scan order puts the most
+/// specific spelling first: a `model.language_model.*` checkpoint also
+/// satisfies the bare "model" probe.
+pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
+    const candidates = [_][]const u8{ NESTED_PREFIX, VL_NESTED_PREFIX, FLAT_PREFIX };
+    var known = false;
+    for (candidates) |p| {
+        if (std.mem.eql(u8, config.weight_prefix, p)) known = true;
+    }
+    if (!known) return;
+
+    if (hasWeightsUnder(weights, config.weight_prefix)) return;
+    for (candidates) |p| {
+        if (std.mem.eql(u8, config.weight_prefix, p)) continue;
+        if (!hasWeightsUnder(weights, p)) continue;
+        log.info("weight prefix: config implies \"{s}\", checkpoint uses \"{s}\" — using the checkpoint's\n", .{ config.weight_prefix, p });
+        config.weight_prefix = p;
+        return;
+    }
+}
+
 /// Load all safetensors files from model_dir.
 /// When `load_vision` is true, vision_tower and multi_modal_projector weights are included.
 pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
@@ -1928,6 +3640,12 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
 
+    // The index names the shards; anything else is dead weight (issue #274:
+    // a pack shipped two shards no weight_map entry names — RAM for nothing)
+    // or a foreign file whose parse failure would be an uncatchable MLX abort.
+    var referenced = model_discovery.indexShardSet(io, dir);
+    defer if (referenced) |*r| model_discovery.freeShardSet(r);
+
     var file_count: u32 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
@@ -1936,6 +3654,10 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         // resolves the link at the OS level, so a symlinked *.safetensors loads fine.
         if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (referenced) |r| if (!r.contains(entry.name)) {
+            log.warn("skipping {s}: not named by model.safetensors.index.json\n", .{entry.name});
+            continue;
+        };
 
         const path_slice = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, entry.name });
         defer allocator.free(path_slice);
@@ -2108,6 +3830,17 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // pass multiplies by them instead of the decoder's layer_scalar.
     if (std.mem.startsWith(u8, key, "model.encoder.vision_tower.") or
         std.mem.startsWith(u8, key, "model.encoder.embed_vision.")) return false;
+    // Muse-Glimmer nests its tower/adapter/projection under "model."; the
+    // mlx-community re-nest drops that prefix (its bare "vision_tower." already
+    // rides the is_vision gate above). Both follow --no-vision.
+    if (!load_vision and (std.mem.startsWith(u8, key, "model.vision_tower.") or
+        std.mem.startsWith(u8, key, "model.vision_adapter.") or
+        std.mem.startsWith(u8, key, "model.vision_projection.") or
+        std.mem.startsWith(u8, key, "vision_adapter.") or
+        std.mem.startsWith(u8, key, "vision_projection.") or
+        // avlp12's Qwen3.8 "Alis" packs spell the Qwen3-VL tower
+        // `model.visual.` (pure rename of `vision_tower.`).
+        std.mem.startsWith(u8, key, "model.visual."))) return false;
     if (is_vision and !load_vision) return false;
     return true;
 }
@@ -2207,6 +3940,191 @@ test "loadWeights on a weightless dir (incomplete download) errors clearly, not 
     );
 }
 
+test "loadWeights reads only the shards the index names (issue #274)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // One real (hand-built) shard + one garbage file that mlx would abort on.
+    const hdr = "{\"w\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var st: [8 + hdr.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, st[0..8], hdr.len, .little);
+    @memcpy(st[8 .. 8 + hdr.len], hdr);
+    @memset(st[8 + hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001.safetensors", .data = &st });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stray.safetensors", .data = "not a safetensors file" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"model-00001.safetensors\"}}" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, false);
+    defer w.deinit();
+    try std.testing.expectEqual(@as(u32, 1), w.count());
+}
+
+test "loadWeights ignores an index that names no shard on disk (re-sharded upload, stale index)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const hdr = "{\"w\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var st: [8 + hdr.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, st[0..8], hdr.len, .little);
+    @memcpy(st[8 .. 8 + hdr.len], hdr);
+    @memset(st[8 + hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00002.safetensors", .data = &st });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"model-00001-of-00005.safetensors\"}}" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, false);
+    defer w.deinit();
+    try std.testing.expectEqual(@as(u32, 1), w.count());
+}
+
+test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config keys" {
+    // mlx-community/LFM2.5-2.6B-{8bit,nvfp4} declare `Lfm2ForCausalLM` with NO
+    // text_config (just an empty `vision_config`), yet ship every weight under
+    // `language_model.model.*`. The config-key guess picked "model" and the
+    // load died on `MISSING WEIGHT: model.embed_tokens.weight` (live
+    // 2026-08-04). The same class shipped in the opposite direction before, so
+    // the probe corrects either way.
+    const allocator = testing.allocator;
+    const put = struct {
+        fn add(w: *Weights, alloc: std.mem.Allocator, key: []const u8) !void {
+            const k = try alloc.dupe(u8, key);
+            try w.map.put(k, mlx.mlx_array_new());
+        }
+    }.add;
+
+    // Nested checkpoint, flat guess → re-pointed (the LFM2.5 crash).
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "language_model.model.embed_tokens.weight");
+        try put(&w, allocator, "language_model.model.layers.0.self_attn.q_proj.weight");
+        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    }
+    // Flat checkpoint, nested guess → re-pointed the other way.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "language_model.model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("model", config.weight_prefix);
+    }
+    // Both present (a real VL checkpoint) → the configured prefix stands, so
+    // nothing that loads today can be re-pointed by this probe.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.embed_tokens.weight");
+        try put(&w, allocator, "language_model.model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "language_model.model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    }
+    // An arch with its OWN prefix is never touched, even when it holds nothing
+    // (a genuinely broken checkpoint must stay a clear MISSING WEIGHT).
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "language_model.model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "nemotron_h", .weight_prefix = "backbone" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("backbone", config.weight_prefix);
+    }
+    // A prefix that is a strict PREFIX of the key's first segment must not
+    // count as a hit ("model" vs "model_extra.*").
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model_extra.embed_tokens.weight");
+        try put(&w, allocator, "language_model.model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    }
+    // mlx-community/Muse-Glimmer-30B-4bit (live 2026-08-11): meta's config
+    // keeps text_config, so the guess is the VL-original "model.language_model"
+    // — but mlx_lm convert re-nests every text weight under
+    // "language_model.model.*". The third spelling joins the probe.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "language_model.model.embed_tokens.weight");
+        try put(&w, allocator, "language_model.lm_head.weight");
+        try put(&w, allocator, "vision_tower.layers.0.norm1.weight");
+        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "model.language_model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    }
+    // Our own mirror layout (meta-original nesting) stays put.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.language_model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "model.language_model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("model.language_model", config.weight_prefix);
+    }
+    // Ordering: a "model.language_model.*" checkpoint ALSO matches the bare
+    // "model" probe (the '.' check passes at "model.language_model"), so the
+    // most specific spelling must win the scan.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.language_model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "muse_glimmer", .weight_prefix = "language_model.model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("model.language_model", config.weight_prefix);
+    }
+}
+
+test "applyDsv4ReferenceSampling: the source's wild signature resolves to the reference's temp 0.6" {
+    // DeepSeek-V4 releases ship generation_config.json with temp 1.0/top_p
+    // 1.0 — the wild signature their own inference/generate.py IGNORES (its
+    // default is 0.6, which our converter writes into our mirrors). External
+    // conversions (pipenetwork REAP) copy the file verbatim; pi (omits
+    // temperature) against REAP37 degenerated into token loops on its first
+    // turn (live 2026-08-01). The exact untouched signature resolves to the
+    // reference default; anything an author actually tuned is untouched.
+    var wild = ModelConfig{ .model_type = "deepseek_v4" };
+    wild.gen_temperature = 1.0;
+    wild.gen_top_p = 1.0;
+    wild.applyDsv4ReferenceSampling();
+    try testing.expectEqual(@as(?f32, 0.6), wild.gen_temperature);
+    try testing.expectEqual(@as(?f32, 1.0), wild.gen_top_p);
+
+    // A tuned config is not the signature — untouched.
+    var tuned = ModelConfig{ .model_type = "deepseek_v4" };
+    tuned.gen_temperature = 1.0;
+    tuned.gen_top_p = 0.9;
+    tuned.applyDsv4ReferenceSampling();
+    try testing.expectEqual(@as(?f32, 1.0), tuned.gen_temperature);
+
+    // Other archs never touched, even with the signature values.
+    var other = ModelConfig{ .model_type = "llama" };
+    other.gen_temperature = 1.0;
+    other.gen_top_p = 1.0;
+    other.applyDsv4ReferenceSampling();
+    try testing.expectEqual(@as(?f32, 1.0), other.gen_temperature);
+
+    // No generation_config at all (both null) — nothing to resolve.
+    var bare = ModelConfig{ .model_type = "deepseek_v4" };
+    bare.applyDsv4ReferenceSampling();
+    try testing.expectEqual(@as(?f32, null), bare.gen_temperature);
+}
+
 test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the checkpoint ships no generation_config" {
     // Live soak capture 2026-07-13 (stamsam Qwen3.6-35B distill, served to pi):
     // the community re-quant ships NO generation_config.json, so omitted-field
@@ -2260,6 +4178,96 @@ test "applyFamilySamplingDefaults never overrides explicit generation_config val
     partial.applyFamilySamplingDefaults();
     try testing.expectEqual(@as(?u32, 20), partial.gen_top_k);
     try testing.expectEqual(@as(?f32, 0.8), partial.gen_top_p);
+}
+
+test "defaultEnableThinking: opt-in per arch, and every existing arch stays off" {
+    // No prior arch opts in — including the families whose templates merely
+    // MENTION enable_thinking, which is not evidence of a thinking-on default.
+    for ([_][]const u8{ "qwen3", "qwen3_5_moe", "gemma4", "gemma3_text", "laguna", "deepseek_v4", "inkling_mm_model", "llama", "hy_v3", "lfm2" }) |t| {
+        const c = ModelConfig{ .model_type = t };
+        try testing.expect(!c.defaultEnableThinking(false));
+        try testing.expect(!c.defaultEnableThinking(true));
+    }
+    // muse_glimmer opts in only WITH tools: recipient selection is where its
+    // reasoning earns its keep. A plain chat request defaults to the
+    // prompt-committed to=user channel (chat.noThinkTailSuffix) — a real
+    // skip, so there is nothing to deliver or drop.
+    const muse = ModelConfig{ .model_type = "muse_glimmer" };
+    try testing.expect(!muse.defaultEnableThinking(false));
+    try testing.expect(muse.defaultEnableThinking(true));
+    // bailing_hybrid opts IN on BOTH arms: Ling 3.0 ships as a reasoner and
+    // its template normalizes an undefined enable_thinking to 'on' with no
+    // reference to tools. Gating it on has_tools (as muse is) contradicted the
+    // checkpoint and left a tool-less silent request answering without
+    // reasoning — muse can do that because its prompt commits a to=user
+    // channel, and this arch has no such fallback.
+    const ling = ModelConfig{ .model_type = "bailing_hybrid" };
+    try testing.expect(ling.defaultEnableThinking(false));
+    try testing.expect(ling.defaultEnableThinking(true));
+    // k2_horizon: the template opens a think marker on every assistant turn
+    // and the pack declares no default; a declared off still wins.
+    const k2 = ModelConfig{ .model_type = "k2_horizon" };
+    try testing.expect(k2.defaultEnableThinking(false));
+    try testing.expect(k2.defaultEnableThinking(true));
+    const k2_off = ModelConfig{ .model_type = "k2_horizon", .gen_enable_thinking = false };
+    try testing.expect(!k2_off.defaultEnableThinking(false));
+    // gpt_oss opts in with AND without tools. Unlike muse there is no
+    // thinking-off prompt to commit: harmony's `Reasoning: low|medium|high`
+    // sets depth, not presence, so the model opens an analysis channel on
+    // every turn. Defaulting a silent request off did not skip the reasoning
+    // pass — it sent the analysis channel down the flush-text streaming
+    // branch, leaking `<|channel|>analysis` and the reasoning into content.
+    const goss = ModelConfig{ .model_type = "gpt_oss" };
+    try testing.expect(goss.defaultEnableThinking(false));
+    try testing.expect(goss.defaultEnableThinking(true));
+}
+
+test "defaultEnableThinking: the checkpoint's own generation_config default outranks the arch allowlist" {
+    // A thinking model whose arch is not on the allowlist still thinks when
+    // its own generation_config declares it — this is the case a silent
+    // request used to lose (3 tokens and no reasoning where the same weights
+    // reason for ~1000 tokens under a runner that obeys the template).
+    var on = ModelConfig{ .model_type = "qwen3" };
+    on.gen_enable_thinking = true;
+    try testing.expect(on.defaultEnableThinking(false));
+    try testing.expect(on.defaultEnableThinking(true));
+    // And a checkpoint that declares thinking OFF turns an opted-in arch off.
+    var off = ModelConfig{ .model_type = "bailing_hybrid" };
+    off.gen_enable_thinking = false;
+    try testing.expect(!off.defaultEnableThinking(false));
+    try testing.expect(!off.defaultEnableThinking(true));
+}
+
+test "parseGenerationDefaultsFromJson: reads default_chat_template_kwargs.enable_thinking" {
+    const on = parseGenerationDefaultsFromJson(
+        "{\"default_chat_template_kwargs\": {\"enable_thinking\": true}}",
+    );
+    try testing.expectEqual(@as(?bool, true), on.enable_thinking);
+    const off = parseGenerationDefaultsFromJson(
+        "{\"default_chat_template_kwargs\": {\"enable_thinking\": false}}",
+    );
+    try testing.expectEqual(@as(?bool, false), off.enable_thinking);
+    // Absent, wrong shape, or a non-bool value: null, arch default stays.
+    try testing.expectEqual(@as(?bool, null), parseGenerationDefaultsFromJson("{\"top_k\": 20}").enable_thinking);
+    try testing.expectEqual(@as(?bool, null), parseGenerationDefaultsFromJson(
+        "{\"default_chat_template_kwargs\": \"on\"}",
+    ).enable_thinking);
+    try testing.expectEqual(@as(?bool, null), parseGenerationDefaultsFromJson(
+        "{\"default_chat_template_kwargs\": {\"enable_thinking\": \"yes\"}}",
+    ).enable_thinking);
+}
+
+test "parseGenerationDefaultsFromJson: eos_token_id list merges additively into the stop set" {
+    const gd = parseGenerationDefaultsFromJson("{\"eos_token_id\": [1, 250019]}");
+    try testing.expectEqual(@as(usize, 2), gd.num_eos);
+    var config = ModelConfig{};
+    config.addEosToken(1);
+    config.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
+    try testing.expectEqual(@as(u32, 2), config.num_eos_tokens);
+    try testing.expect(config.isEosToken(250019));
+    const scalar = parseGenerationDefaultsFromJson("{\"eos_token_id\": 7}");
+    try testing.expectEqual(@as(u32, 7), scalar.eos_token_ids[0]);
+    try testing.expectEqual(@as(usize, 0), parseGenerationDefaultsFromJson("{\"eos_token_id\": \"x\"}").num_eos);
 }
 
 test "ModelConfig addEosToken" {
@@ -2402,6 +4410,32 @@ test "ModelConfig isLinearLayer" {
     try testing.expect(config.isLinearLayer(4));
 }
 
+test "linear_attn_tail_from forces full attention past the last whole group" {
+    // A layer count that is NOT a multiple of the group size is where the
+    // reference's second clause bites: with 40 layers, 40//6*6 = 36, so layers
+    // 36..39 are ALL full attention even though (idx+1) % 6 != 0. Dropping the
+    // clause would run four layers through the wrong attention type silently.
+    var config = ModelConfig{};
+    config.num_hidden_layers = 40;
+    config.full_attention_interval = 6;
+    config.linear_attn_tail_from = 40 / 6 * 6; // 36
+    try testing.expect(config.isLinearLayer(34));
+    try testing.expect(!config.isLinearLayer(35)); // (35+1) % 6 == 0
+    try testing.expect(!config.isLinearLayer(36)); // tail clause
+    try testing.expect(!config.isLinearLayer(37));
+    try testing.expect(!config.isLinearLayer(38));
+    try testing.expect(!config.isLinearLayer(39));
+}
+
+test "linear_attn_tail_from is off by default so no existing arch moves" {
+    // qwen3_next/lfm2 set full_attention_interval without a tail bound.
+    var config = ModelConfig{};
+    config.full_attention_interval = 4;
+    try testing.expectEqual(@as(u32, 0), config.linear_attn_tail_from);
+    try testing.expect(config.isLinearLayer(100));
+    try testing.expect(config.isLinearLayer(1000));
+}
+
 test "ModelConfig isLinearLayer disabled" {
     var config = ModelConfig{};
     config.full_attention_interval = 0;
@@ -2517,6 +4551,9 @@ test "shouldKeepWeightKey filters audio and gated vision weights" {
     // vision when load_vision is false.
     try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
     try testing.expect(!shouldKeepWeightKey("vision_tower.encoder.layer.0.weight", false));
+    // qwen4_exp / Alis packs spell the Qwen3-VL tower `model.visual.` — --no-vision drops it too.
+    try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.attn.qkv.weight", false));
+    try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.attn.qkv.weight", true));
     try testing.expect(shouldKeepWeightKey("vision_tower.encoder.layer.0.weight", true));
     try testing.expect(shouldKeepWeightKey("language_model.model.layers.0.self_attn.q_proj.weight", false));
 }
@@ -2534,6 +4571,29 @@ test "shouldKeepWeightKey keeps Gemma 4 12B unified embedder weights when vision
     try testing.expect(!shouldKeepWeightKey("embed_audio.embedding_projection.weight", false));
     // The conformer audio tower is never wired — always dropped.
     try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
+}
+
+test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nestings" {
+    // Ours nests the tower under `model.`; mlx-community re-nests it bare.
+    // Both spellings ride the same gate --no-vision flips.
+    try testing.expect(!shouldKeepWeightKey("model.vision_tower.layers.0.norm1.weight", false));
+    try testing.expect(!shouldKeepWeightKey("model.vision_adapter.fc1.weight", false));
+    try testing.expect(!shouldKeepWeightKey("model.vision_projection.weight", false));
+    try testing.expect(!shouldKeepWeightKey("vision_adapter.fc1.weight", false));
+    try testing.expect(!shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", false));
+    try testing.expect(shouldKeepWeightKey("model.vision_tower.layers.0.norm1.weight", true));
+    try testing.expect(shouldKeepWeightKey("model.vision_adapter.fc1.weight", true));
+    try testing.expect(shouldKeepWeightKey("model.vision_projection.weight", true));
+    try testing.expect(shouldKeepWeightKey("vision_adapter.fc1.weight", true));
+    try testing.expect(shouldKeepWeightKey("vision_tower.layers.0.norm1.weight", true));
+    // avlp12 Alis spells the Qwen3-VL tower `model.visual.` — same gate, or
+    // --no-vision cannot drop it and we hold ~0.9 GB we never read.
+    try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", false));
+    try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", true));
+    // Text weights are never touched either way.
+    try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
+    try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));
+    try testing.expect(shouldKeepWeightKey("language_model.lm_head.weight", false));
 }
 
 test "ModelConfig parses gemma4_unified text_config" {
@@ -2695,6 +4755,106 @@ test "ModelConfig parses laguna (poolside Laguna-S-2.1): per-layer heads, softpl
     try testing.expectEqual(@as(u32, 24), eos[1]);
 }
 
+test "ModelConfig: gpt_oss (OpenAI gpt-oss-20b) config parse" {
+    // Trimmed from mlx-community/gpt-oss-20b-MXFP4-Q8/config.json. The 120B is
+    // the same shape (36 layers, 128 experts), so one block serves both.
+    const json =
+        \\{
+        \\  "architectures": ["GptOssForCausalLM"],
+        \\  "model_type": "gpt_oss",
+        \\  "attention_bias": true,
+        \\  "head_dim": 64,
+        \\  "hidden_act": "silu",
+        \\  "hidden_size": 2880,
+        \\  "initial_context_length": 4096,
+        \\  "intermediate_size": 2880,
+        \\  "layer_types": ["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
+        \\  "max_position_embeddings": 131072,
+        \\  "num_attention_heads": 64,
+        \\  "num_hidden_layers": 24,
+        \\  "num_key_value_heads": 8,
+        \\  "num_local_experts": 32,
+        \\  "num_experts_per_tok": 4,
+        \\  "experts_per_token": 4,
+        \\  "rms_norm_eps": 1e-05,
+        \\  "rope_scaling": {
+        \\    "beta_fast": 32.0, "beta_slow": 1.0, "factor": 32.0,
+        \\    "original_max_position_embeddings": 4096,
+        \\    "rope_type": "yarn", "truncate": false
+        \\  },
+        \\  "rope_theta": 150000,
+        \\  "sliding_window": 128,
+        \\  "swiglu_limit": 7.0,
+        \\  "tie_word_embeddings": false,
+        \\  "vocab_size": 201088,
+        \\  "eos_token_id": 200002,
+        \\  "quantization": {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("gpt_oss", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    // Qwen-style norm/embedding flags; gpt-oss has NO QK norm.
+    try testing.expect(!config.norm_has_offset);
+    try testing.expect(!config.scale_embeddings);
+    try testing.expect(!config.has_pre_ff_norm);
+    try testing.expect(!config.has_qk_norm);
+    // MoE dims: num_local_experts is the spelling, and the expert width is
+    // plain intermediate_size (no moe_intermediate_size key).
+    try testing.expectEqual(@as(u32, 32), config.num_experts);
+    try testing.expectEqual(@as(u32, 4), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 2880), config.moe_intermediate_size);
+    // Router is a plain softmax-over-top-k with an ADDITIVE bias, not hy3's
+    // sigmoid+selection-bias chain.
+    try testing.expect(!config.moe_sigmoid_router);
+    try testing.expect(config.moe_route_norm);
+    // Attention shape: hd 64, GQA 64/8, scale = head_dim^-0.5.
+    try testing.expectEqual(@as(u32, 64), config.head_dim);
+    try testing.expectEqual(@as(u32, 64), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 8), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 64), config.query_pre_attn_scalar);
+    // Learned per-head attention sinks (self_attn.sinks) — the softmax
+    // denominator gets an extra column; SDPA takes them natively.
+    try testing.expect(config.has_attn_sinks);
+    // Alternating layer types, sliding FIRST (layer 0 is local).
+    try testing.expect(config.has_explicit_layer_types);
+    try testing.expect(!config.isGlobalLayer(0));
+    try testing.expect(config.isGlobalLayer(1));
+    try testing.expect(config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 128), config.sliding_window);
+    // ONE theta for both layer types. Leaving rope_local_base_freq at the
+    // Gemma-flavored 10000 default would mis-base every sliding layer — the
+    // muse first-turn-repetition class (deterministic "coherent then loops").
+    try testing.expectApproxEqAbs(@as(f32, 150000.0), config.rope_theta, 1.0);
+    try testing.expectApproxEqAbs(@as(f32, 150000.0), config.rope_local_base_freq, 1.0);
+    // YaRN: mscale is COMPUTED (0.1*ln(32)+1), matching mlx-lm's YarnRoPE
+    // defaults (mscale 1 / mscale_all_dim 0) — the config ships no
+    // attention_factor at all. Laguna precedent.
+    try testing.expect(config.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 32.0), config.yarn_factor, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 32.0), config.yarn_beta_fast, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), config.yarn_beta_slow, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.3465735902799727), config.yarn_attention_factor, 1e-9);
+    try testing.expectEqual(@as(u32, 4096), config.yarn_orig_max_pos);
+    // Clamped SwiGLU: clip(gate, max=limit) * sigmoid(alpha*gate) * (clip(up, ±limit) + 1).
+    // `hidden_act: "silu"` in the config is a lie — the reference never uses it.
+    try testing.expectApproxEqAbs(@as(f32, 7.0), config.swiglu_limit, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.702), config.swiglu_alpha, 1e-6);
+    // Quant: mxfp4 gs32 for the expert banks (attention/embed/lm_head ride
+    // per-tensor affine-8 overrides resolved at weight-load time).
+    try testing.expectEqual(QuantMode.mxfp4, config.quant_mode);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 32), config.quant_group_size);
+    // Terminators merge ADDITIVELY: <|return|> (200002, the declared eos) and
+    // <|call|> (200012, which ends a tool call and is NEVER the eos).
+    // <|end|> (200007) is deliberately absent — it closes the analysis channel
+    // MID-generation, before the final channel opens.
+    const eos = config.eosTokenSlice();
+    try testing.expectEqual(@as(usize, 2), eos.len);
+    try testing.expectEqual(@as(u32, 200002), eos[0]);
+    try testing.expectEqual(@as(u32, 200012), eos[1]);
+}
+
 test "ModelConfig: laguna YaRN mscale is COMPUTED, never read from attention_factor (Laguna-XS ships 1.0)" {
     // Laguna-XS-2.1-NVFP4-mlx's config.json carries "attention_factor": 1.0,
     // but both vendored MLX Laguna implementations deliberately drop that field
@@ -2739,6 +4899,218 @@ test "ModelConfig: laguna YaRN mscale is COMPUTED, never read from attention_fac
     try testing.expectApproxEqAbs(@as(f32, 32.0), config.yarn_factor, 1e-6);
     // 0.1 * ln(32) + 1 — the same value S's config ships literally.
     try testing.expectApproxEqAbs(@as(f32, 1.3465735902799727), config.yarn_attention_factor, 1e-6);
+}
+
+test "ModelConfig parses spark2_5 (Spark-X2.5): fused qkv, headwise sigmoid gate, exact gelu, dual rope" {
+    const json =
+        \\{
+        \\  "model_type": "spark2_5",
+        \\  "hidden_size": 2560, "intermediate_size": 10240, "num_hidden_layers": 8,
+        \\  "num_attention_heads": 16, "num_key_value_heads": 4, "head_dim": 256,
+        \\  "hidden_act": "gelu", "rms_norm_eps": 1e-06, "vocab_size": 131072,
+        \\  "gate_attn_act_mode": "sigmoid", "headwise_attn_output_gate": true,
+        \\  "bos_token_id": 0, "eos_token_id": 1, "pad_token_id": 2,
+        \\  "max_position_embeddings": 1048576, "tie_word_embeddings": true,
+        \\  "sliding_window": 512,
+        \\  "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+        \\                  "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        \\  "rope_parameters": {
+        \\    "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 5000000},
+        \\    "sliding_attention": {"partial_rotary_factor": 1.0, "rope_theta": 10000}
+        \\  },
+        \\  "quantization": {"group_size": 64, "bits": 8, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("spark2_5", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expectEqual(HiddenAct.gelu, config.hidden_act);
+    try testing.expect(config.attn_sigmoid_gate);
+    try testing.expect(config.attn_gate_headwise);
+    try testing.expect(config.attn_fused_qkv);
+    try testing.expect(!config.norm_has_offset);
+    try testing.expect(!config.has_pre_ff_norm);
+    try testing.expect(!config.has_qk_norm);
+    try testing.expect(!config.scale_embeddings);
+    try testing.expect(config.tie_word_embeddings);
+    try testing.expectEqual(@as(u32, 256), config.query_pre_attn_scalar);
+    try testing.expect(config.has_explicit_layer_types);
+    try testing.expect(config.layer_is_global[3] and !config.layer_is_global[2]);
+    try testing.expectEqual(@as(u32, 512), config.sliding_window);
+    try testing.expectApproxEqAbs(@as(f32, 5000000.0), config.rope_theta, 1.0);
+    try testing.expectApproxEqAbs(@as(f32, 10000.0), config.rope_local_base_freq, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), config.partial_rotary_factor_global, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), config.rope_scaling_factor, 1e-6);
+    try testing.expect(config.isEosToken(1));
+}
+
+test "ModelConfig parses muse_glimmer (Muse-Glimmer-30B): NoPE full layers, qk scale, mixed norm offsets" {
+    // Trimmed but faithful copy of meta-models/Muse-Glimmer-30B config.json.
+    // 8 layers = two sliding/full groups; full attention every 4th layer
+    // counted backward from the last (i%4==3 for 8 layers), and exactly those
+    // layers have layer_rope_theta 0 (NoPE).
+    const json =
+        \\{
+        \\  "model_type": "muse_glimmer",
+        \\  "image_token_id": 200092,
+        \\  "text_config": {
+        \\    "model_type": "muse_glimmer_text",
+        \\    "hidden_size": 6656,
+        \\    "intermediate_size": 19968,
+        \\    "num_hidden_layers": 8,
+        \\    "num_attention_heads": 32,
+        \\    "num_key_value_heads": 2,
+        \\    "head_dim": 128,
+        \\    "hidden_activation": "silu",
+        \\    "rms_norm_eps": 1e-05,
+        \\    "post_norm_eps": 1e-08,
+        \\    "qk_scale_factor": 3.87,
+        \\    "output_multiplier": 0.19611613513818404,
+        \\    "final_logit_softcapping": 20.0,
+        \\    "vocab_size": 202048,
+        \\    "max_position_embeddings": 131072,
+        \\    "tie_word_embeddings": false,
+        \\    "bos_token_id": 200000,
+        \\    "eos_token_id": 200001,
+        \\    "sliding_window": 2048,
+        \\    "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+        \\                    "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        \\    "layer_rope_theta": [500000.0, 500000.0, 500000.0, 0, 500000.0, 500000.0, 500000.0, 0],
+        \\    "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"}
+        \\  },
+        \\  "vision_config": {"model_type": "muse_glimmer_vision"},
+        \\  "quantization": {"group_size": 64, "bits": 8}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("muse_glimmer", config.model_type);
+    try testing.expectEqualStrings("model.language_model", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 32), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 2), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 128), config.head_dim);
+    try testing.expect(config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 2048), config.sliding_window);
+    try testing.expect(config.has_explicit_layer_types);
+    try testing.expect(config.layer_is_global[3]);
+    try testing.expect(config.layer_is_global[7]);
+    try testing.expect(!config.layer_is_global[2]);
+    // NoPE: exactly the full-attention layers skip RoPE (layer_rope_theta 0).
+    try testing.expect(config.layerSkipsRope(3));
+    try testing.expect(config.layerSkipsRope(7));
+    try testing.expect(!config.layerSkipsRope(0));
+    try testing.expectApproxEqAbs(@as(f32, 500000.0), config.rope_theta, 1e-3);
+    // Sliding layers read rope_local_base_freq in EVERY forward path, and muse
+    // ships ONE theta for all roped layers (rope_parameters.rope_theta) — the
+    // Gemma-flavored 10000 default silently mis-rotated all 39 roped layers
+    // (2026-08-11 first-turn repetition-loop root cause).
+    try testing.expectApproxEqAbs(@as(f32, 500000.0), config.rope_local_base_freq, 1e-3);
+    // Attention scale folds the post-qk-norm Q multiplier into 1/sqrt(head_dim).
+    try testing.expectApproxEqAbs(@as(f32, 3.87 / 11.313708), config.attnScale(), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.19611613513818404), config.output_multiplier, 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 20.0), config.final_logit_softcapping, 1e-6);
+    // Sandwich norms are Gemma2-centered (1+w) at eps 1e-5 / post-norms 1e-8;
+    // the FINAL norm is plain-scale (Gemma4 style, ones-init).
+    try testing.expect(config.norm_has_offset);
+    try testing.expect(config.final_norm_plain);
+    try testing.expectApproxEqAbs(@as(f32, 1e-08), config.postNormEps(), 1e-12);
+    try testing.expect(config.has_pre_ff_norm);
+    // Weight-less shared qk-norm (no q_norm/k_norm tensors in the checkpoint),
+    // RMS-normed embeddings with NO sqrt(hidden) scale, sigmoid attn out gate.
+    try testing.expect(!config.has_qk_norm);
+    try testing.expect(config.qk_norm_weightless);
+    try testing.expect(!config.scale_embeddings);
+    try testing.expect(config.normed_embeddings);
+    try testing.expect(config.attn_sigmoid_gate);
+    try testing.expect(!config.tie_word_embeddings);
+    try testing.expectEqual(HiddenAct.silu, config.hidden_act);
+    // <|end_of_text|>(200001) from config + <|eot|>(200008), the template's
+    // turn terminator, merged additively.
+    try testing.expectEqual(@as(u32, 2), config.num_eos_tokens);
+    try testing.expectEqual(@as(u32, 200001), config.eos_token_ids[0]);
+    try testing.expectEqual(@as(u32, 200008), config.eos_token_ids[1]);
+    try testing.expectEqual(@as(u32, 8), config.quant_bits);
+}
+
+test "ModelConfig parses the muse_glimmer vision tower (own key spellings, window/full pattern)" {
+    // Trimmed copy of the real vision_config: muse names its geometry keys
+    // differently from Qwen (patch_temporal, merge_size, pos_emb_*), and the
+    // window/full pattern is per-layer, not a stride.
+    const json =
+        \\{
+        \\  "model_type": "muse_glimmer",
+        \\  "image_token_id": 200092,
+        \\  "out_hidden_size": 6144,
+        \\  "projector_hidden_size": 4096,
+        \\  "projector_hidden_act": "gelu",
+        \\  "text_config": {"model_type": "muse_glimmer_text", "hidden_size": 6656, "head_dim": 128,
+        \\                  "num_attention_heads": 32, "num_key_value_heads": 2, "rms_norm_eps": 1e-05},
+        \\  "vision_config": {
+        \\    "model_type": "muse_glimmer_vision",
+        \\    "hidden_act": "gelu",
+        \\    "hidden_size": 1536,
+        \\    "intermediate_size": 8960,
+        \\    "layer_norm_eps": 1e-05,
+        \\    "layer_types": ["window_attention", "window_attention", "window_attention", "full_attention",
+        \\                    "window_attention", "full_attention"],
+        \\    "merge_size": 2,
+        \\    "num_attention_heads": 16,
+        \\    "num_hidden_layers": 6,
+        \\    "patch_size": 14,
+        \\    "patch_temporal": 2,
+        \\    "pos_emb_height": 32,
+        \\    "pos_emb_width": 32,
+        \\    "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
+        \\  }
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.muse_vision);
+    try testing.expect(config.has_vision);
+    try testing.expect(!config.qwen_vision); // no M-RoPE, no vision_start/end
+    try testing.expectEqual(@as(u32, 6), config.qv_depth);
+    try testing.expectEqual(@as(u32, 1536), config.qv_hidden);
+    try testing.expectEqual(@as(u32, 16), config.qv_heads);
+    try testing.expectEqual(@as(u32, 96), config.qv_head_dim);
+    try testing.expectEqual(@as(u32, 8960), config.qv_intermediate);
+    try testing.expectEqual(@as(u32, 14), config.qv_patch);
+    try testing.expectEqual(@as(u32, 2), config.qv_temporal_patch);
+    try testing.expectEqual(@as(u32, 2), config.qv_merge);
+    try testing.expectEqual(@as(u32, 32), config.mv_pos_side);
+    try testing.expectEqual(@as(u32, 4096), config.mv_projector_hidden);
+    // The tower's own output width is the TEXT hidden size — `out_hidden_size`
+    // is the adapter's INPUT (hidden x merge^2), not the spliced width.
+    try testing.expectEqual(@as(u32, 6656), config.qv_out_hidden);
+    try testing.expectApproxEqAbs(@as(f32, 1e-05), config.mv_ln_eps, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 10000.0), config.mv_rope_theta, 1e-6);
+    // Every 4th layer is full attention; the rest window. Read per layer, since
+    // the released 50-layer tower ends on an off-stride full layer.
+    try testing.expect(!config.mv_full_attn[0]);
+    try testing.expect(config.mv_full_attn[3]);
+    try testing.expect(!config.mv_full_attn[4]);
+    try testing.expect(config.mv_full_attn[5]);
+    // muse wraps the pad run with <|image_start|>/<|image_end|>, so the generic
+    // BOI/EOI inserter needs no muse arm.
+    try testing.expectEqual(@as(u32, 200092), config.image_token_id);
+    try testing.expectEqual(@as(u32, 200080), config.boi_token_id);
+    try testing.expectEqual(@as(u32, 200081), config.eoi_token_id);
+}
+
+test "ModelConfig muse_glimmer_text flat sibling collapses onto muse_glimmer with bare prefix" {
+    const json =
+        \\{
+        \\  "model_type": "muse_glimmer_text",
+        \\  "hidden_size": 6656,
+        \\  "num_hidden_layers": 8,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 128,
+        \\  "vocab_size": 202048,
+        \\  "sliding_window": 2048
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("muse_glimmer", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
 }
 
 test "ModelConfig parses inkling_mm_model (Thinking Machines Inkling Small REAP25)" {
@@ -3409,7 +5781,7 @@ test "ModelConfig gemma3 merges <end_of_turn> (106) even with scalar eos_token_i
         \\}
     ;
     const config = try parseConfigFromJson(testing.allocator, json);
-    try testing.expect(config.isEosToken(1));   // config-declared eos preserved
+    try testing.expect(config.isEosToken(1)); // config-declared eos preserved
     try testing.expect(config.isEosToken(106)); // <end_of_turn> merged in
 }
 
@@ -3567,6 +5939,182 @@ test "parseConfigFromJson dense bf16 qwen3_5_moe → quant_bits 0" {
     try testing.expectEqual(@as(u32, 256), config.num_experts);
 }
 
+test "parseConfigFromJson bailing_hybrid (Ling 3.0) KDA/MLA/MoE fields" {
+    // rapid-mlx/Ling-3.0-tiny-MLX-4bit's config.json, trimmed to the keys the
+    // arch actually reads. Every derived quantity here is load-bearing: the
+    // linear_* block sizes the KDA state, the mla_* block sizes the MLA
+    // projections and the KV cache's asymmetric K/V head dims, and the MoE
+    // block picks the grouped (noaux_tc) router.
+    const json =
+        \\{
+        \\  "model_type": "bailing_hybrid",
+        \\  "hidden_size": 1536,
+        \\  "intermediate_size": 4608,
+        \\  "num_hidden_layers": 24,
+        \\  "num_attention_heads": 16,
+        \\  "num_key_value_heads": 16,
+        \\  "head_dim": 128,
+        \\  "layer_group_size": 4,
+        \\  "short_conv_kernel_size": 4,
+        \\  "kda_lower_bound": -5,
+        \\  "kda_safe_gate": true,
+        \\  "q_lora_rank": 256,
+        \\  "kv_lora_rank": 512,
+        \\  "qk_nope_head_dim": 128,
+        \\  "qk_rope_head_dim": 64,
+        \\  "qk_head_dim": 192,
+        \\  "v_head_dim": 128,
+        \\  "gated_attention_proj_granularity_type": "head_wise",
+        \\  "rope_interleave": true,
+        \\  "rope_theta": 6000000,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "num_experts": 128,
+        \\  "num_experts_per_tok": 8,
+        \\  "moe_intermediate_size": 512,
+        \\  "moe_shared_expert_intermediate_size": 512,
+        \\  "num_shared_experts": 1,
+        \\  "first_k_dense_replace": 1,
+        \\  "n_group": 8,
+        \\  "topk_group": 4,
+        \\  "norm_topk_prob": true,
+        \\  "routed_scaling_factor": 2.5,
+        \\  "score_function": "sigmoid",
+        \\  "vocab_size": 157184,
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {"bits": 4, "group_size": 64, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("bailing_hybrid", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+
+    // Hybrid layout: layer_group_size 4 ⇒ layers 3/7/11/15/19/23 are MLA,
+    // every other layer is KDA.
+    try testing.expectEqual(@as(u32, 4), config.full_attention_interval);
+    try testing.expect(config.isLinearLayer(0));
+    try testing.expect(config.isLinearLayer(2));
+    try testing.expect(!config.isLinearLayer(3));
+    try testing.expect(!config.isLinearLayer(23));
+    try testing.expect(config.needsSsmEntries());
+
+    // KDA geometry: one head per attention head, key dim == value dim == head_dim.
+    try testing.expectEqual(@as(u32, 16), config.linear_num_key_heads);
+    try testing.expectEqual(@as(u32, 16), config.linear_num_value_heads);
+    try testing.expectEqual(@as(u32, 128), config.linear_key_head_dim);
+    try testing.expectEqual(@as(u32, 128), config.linear_value_head_dim);
+    try testing.expectEqual(@as(u32, 4), config.linear_conv_kernel_dim);
+    try testing.expect(config.kda_vector_gate);
+    try testing.expectEqual(@as(f32, -5), config.kda_gate_lower_bound);
+
+    // MLA geometry.
+    try testing.expectEqual(@as(u32, 256), config.mla_q_lora_rank);
+    try testing.expectEqual(@as(u32, 512), config.mla_kv_lora_rank);
+    try testing.expectEqual(@as(u32, 128), config.mla_qk_nope_head_dim);
+    try testing.expectEqual(@as(u32, 64), config.mla_qk_rope_head_dim);
+    try testing.expectEqual(@as(u32, 128), config.mla_v_head_dim);
+    try testing.expectEqual(@as(u32, 192), config.mlaQkHeadDim());
+    try testing.expect(config.mla_head_gate);
+    try testing.expect(config.rope_interleaved_pairs);
+    try testing.expect(config.isMla());
+
+    // MoE: sigmoid + expert bias + group-limited (noaux_tc) routing.
+    try testing.expect(config.isMoe());
+    try testing.expect(config.moe_sigmoid_router);
+    try testing.expectEqual(@as(u32, 128), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 512), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 512), config.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(u32, 1), config.first_k_dense_replace);
+    try testing.expectEqual(@as(u32, 8), config.moe_n_group);
+    try testing.expectEqual(@as(u32, 4), config.moe_topk_group);
+    try testing.expect(config.moe_route_norm);
+    try testing.expectEqual(@as(f32, 2.5), config.router_scaling_factor);
+
+    // Attention scale is over the FULL qk head dim (192), not head_dim.
+    try testing.expectEqual(@as(u32, 192), config.query_pre_attn_scalar);
+
+    // A negative bound selects fla's bounded-sigmoid arm.
+    try testing.expect(config.kdaUsesBoundedGate());
+}
+
+test "bailing_hybrid gate arm is SELECTED by the bound, never defaulted" {
+    // `kdaGateChain` with bound 0 computes exp(0) = 1: a decay that never
+    // forgets, on a checkpoint that merely omitted the key. The arms are fla's
+    // two, and the absent case belongs to the softplus chain (which is
+    // elementwise, so it serves a per-channel gate unchanged).
+    var bounded = ModelConfig{ .model_type = "bailing_hybrid" };
+    bounded.kda_vector_gate = true;
+    bounded.kda_gate_lower_bound = -5;
+    try testing.expect(bounded.kdaUsesBoundedGate());
+
+    var unbounded = ModelConfig{ .model_type = "bailing_hybrid" };
+    unbounded.kda_vector_gate = true; // per-channel gate, softplus form
+    try testing.expect(!unbounded.kdaUsesBoundedGate());
+
+    // A per-HEAD gate is never the bounded arm regardless of the field.
+    var per_head = ModelConfig{ .model_type = "qwen3_5_moe" };
+    per_head.kda_gate_lower_bound = -5;
+    try testing.expect(!per_head.kdaUsesBoundedGate());
+}
+
+test "parseConfigFromJson bailing_hybrid refuses by NAME every variant it cannot serve" {
+    // The arch's policy is refuse-loudly over serve-wrong: each key below
+    // selects math this port does not implement, and each is at its harmless
+    // value in every shipped mirror — so the ONLY thing standing between a
+    // future variant and silently wrong output is this list. `use_kda_lora` is
+    // the positive spelling of `no_kda_lora` (a checkpoint stating only that one
+    // otherwise runs straight into a MISSING WEIGHT crash), and
+    // `kda_lower_bound: 0` is the degenerate gate.
+    const cases = [_][]const u8{
+        "\"use_mla_nope\": true",
+        "\"value_norm\": true",
+        "\"up_proj_norm\": true",
+        "\"use_nGPT\": true",
+        "\"linear_silu\": false",
+        "\"use_kda_lora\": true",
+        "\"no_kda_lora\": false",
+        "\"kda_lower_bound\": 0",
+        "\"num_kv_heads_for_linear_attn\": 4",
+        "\"score_function\": \"softmax\"",
+        "\"gated_attention_proj_granularity_type\": \"element_wise\"",
+        "\"qk_head_dim\": 256",
+    };
+    for (cases) |extra| {
+        const json = try std.fmt.allocPrint(testing.allocator,
+            \\{{
+            \\  "model_type": "bailing_hybrid",
+            \\  "hidden_size": 1536, "num_hidden_layers": 24,
+            \\  "num_attention_heads": 16, "num_key_value_heads": 16, "head_dim": 128,
+            \\  "layer_group_size": 4,
+            \\  "q_lora_rank": 256, "kv_lora_rank": 512,
+            \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+            \\  "num_experts": 128, "num_experts_per_tok": 8, "moe_intermediate_size": 512,
+            \\  "vocab_size": 157184, {s}
+            \\}}
+        , .{extra});
+        defer testing.allocator.free(json);
+        try testing.expectError(error.UnsupportedBailingConfig, parseConfigFromJson(testing.allocator, json));
+    }
+
+    // And the shipped shape still loads: an ABSENT kda_lower_bound is the
+    // softplus arm, not a refusal.
+    const softplus =
+        \\{
+        \\  "model_type": "bailing_hybrid",
+        \\  "hidden_size": 1536, "num_hidden_layers": 24,
+        \\  "num_attention_heads": 16, "num_key_value_heads": 16, "head_dim": 128,
+        \\  "layer_group_size": 4,
+        \\  "q_lora_rank": 256, "kv_lora_rank": 512,
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "num_experts": 128, "num_experts_per_tok": 8, "moe_intermediate_size": 512,
+        \\  "vocab_size": 157184, "num_kv_heads_for_linear_attn": 0
+        \\}
+    ;
+    const ok = try parseConfigFromJson(testing.allocator, softplus);
+    try testing.expect(ok.kda_vector_gate);
+    try testing.expect(!ok.kdaUsesBoundedGate());
+}
+
 test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
     // Same arch but with a "quantization" block: quant_bits must reflect it so
     // the mandatory scale/bias fetches still fire (a missing scale is a clear
@@ -3582,6 +6130,27 @@ test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
     try testing.expectEqual(@as(u32, 4), config.quant_bits);
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
     try testing.expectEqual(QuantMode.affine, config.quant_mode);
+}
+
+test "a qwen3_5_moe trunk batches decode: its only per-slot state is the GDN pair" {
+    // Bar: routed experts are row-generic (the sorted gather path takes B*S rows),
+    // so a qwen3_5 MoE batches like the dense trunk; MoE trunks with other
+    // per-slot state (hy3, laguna, lfm2_moe, bailing) stay refused.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5_moe",
+        \\  "text_config": {"hidden_size": 2048, "num_experts": 256, "full_attention_interval": 4}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.isMoe());
+    try testing.expect(config.supportsBatchedGdnDecode());
+
+    var laguna = std.mem.zeroes(ModelConfig);
+    laguna.model_type = "laguna";
+    laguna.num_experts = 64;
+    laguna.full_attention_interval = 4;
+    try testing.expect(!laguna.supportsBatchedGdnDecode());
 }
 
 test "parseConfigFromJson rejects affine bits MLX has no kernels for" {
@@ -3992,6 +6561,86 @@ test "parseGenerationDefaultsFromJson: reads model sampling recommendations" {
     try testing.expectEqual(@as(?u32, 20), gd.top_k);
 }
 
+test "pooling: config.json pooling_mode key parses; unknown value rejected at parse" {
+    // Explicit converter/operator contract for checkpoints whose config alone
+    // can't reveal pooling (Qwen3-Embedding declares plain `qwen3`).
+    const base = "{{\"model_type\":\"qwen3\",\"hidden_size\":64,\"num_attention_heads\":8,\"num_hidden_layers\":2,\"pooling_mode\":\"{s}\"}}";
+    inline for (.{ .{ "last_token", PoolingMode.last_token }, .{ "cls", PoolingMode.cls }, .{ "mean", PoolingMode.mean } }) |case| {
+        const json = try std.fmt.allocPrint(testing.allocator, base, .{case[0]});
+        defer testing.allocator.free(json);
+        const config = try parseConfigFromJson(testing.allocator, json);
+        try testing.expectEqual(@as(?PoolingMode, case[1]), config.pooling_mode);
+        try testing.expect(config.hasEmbeddingCapability());
+        try testing.expect(!config.is_encoder_only); // pooling never flips the arch
+    }
+    // An unknown mode is a parse error, not a silent mean-pool: wrong-semantics
+    // vectors are harder to detect than a refused load.
+    const bad = try std.fmt.allocPrint(testing.allocator, base, .{"weighted_mean"});
+    defer testing.allocator.free(bad);
+    try testing.expectError(error.UnsupportedPoolingMode, parseConfigFromJson(testing.allocator, bad));
+}
+
+test "pooling: sentence-transformers 1_Pooling sidecar parses all three modes" {
+    // Verbatim shape of ST `1_Pooling/config.json` (Qwen3-Embedding sets
+    // lasttoken, bge/mxbai set cls_token, MiniLM sets mean_tokens).
+    const last =
+        \\{"word_embedding_dimension": 2560, "pooling_mode_cls_token": false,
+        \\ "pooling_mode_mean_tokens": false, "pooling_mode_max_tokens": false,
+        \\ "pooling_mode_mean_sqrt_len_tokens": false, "pooling_mode_lasttoken": true}
+    ;
+    try testing.expectEqual(@as(?PoolingMode, .last_token), try parsePoolingSidecar(last));
+    const cls =
+        \\{"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": false, "pooling_mode_lasttoken": false}
+    ;
+    try testing.expectEqual(@as(?PoolingMode, .cls), try parsePoolingSidecar(cls));
+    const mean =
+        \\{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": true}
+    ;
+    try testing.expectEqual(@as(?PoolingMode, .mean), try parsePoolingSidecar(mean));
+}
+
+test "pooling: sidecar demanding an unsupported mode errors; non-pooling JSON is ignored" {
+    // A sidecar that DOES declare pooling but none we implement (weighted-mean,
+    // max) must refuse the load — mean-pooling it anyway is silent corruption.
+    const unsupported =
+        \\{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": false,
+        \\ "pooling_mode_max_tokens": true, "pooling_mode_lasttoken": false}
+    ;
+    try testing.expectError(error.UnsupportedPoolingMode, parsePoolingSidecar(unsupported));
+    // Malformed / unrelated JSON: best-effort null, like generation_config.json.
+    try testing.expectEqual(@as(?PoolingMode, null), try parsePoolingSidecar("not json"));
+    try testing.expectEqual(@as(?PoolingMode, null), try parsePoolingSidecar("{\"dimension\": 384}"));
+}
+
+test "pooling: known-family directory-name fallback" {
+    // The mlx-community conversions ship NO sidecar and a plain chat
+    // model_type, so a metadata-less checkpoint falls back to the family
+    // table — gated on the arch so a name can never flip an unrelated model.
+    try testing.expectEqual(@as(?PoolingMode, .last_token), poolingFromDirName("Qwen3-Embedding-4B-4bit-DWQ", "qwen3"));
+    try testing.expectEqual(@as(?PoolingMode, .last_token), poolingFromDirName("qwen3-embedding-0.6b", "qwen3"));
+    try testing.expectEqual(@as(?PoolingMode, null), poolingFromDirName("Qwen3-8B-4bit", "qwen3"));
+    try testing.expectEqual(@as(?PoolingMode, null), poolingFromDirName("Qwen3-Embedding-4B", "llama"));
+    // bge / mxbai are CLS-pooling BERTs (their cards say so); MiniLM stays mean.
+    try testing.expectEqual(@as(?PoolingMode, .cls), poolingFromDirName("bge-small-en-v1.5-8bit", "bert"));
+    try testing.expectEqual(@as(?PoolingMode, .cls), poolingFromDirName("mxbai-embed-large-v1", "bert"));
+    try testing.expectEqual(@as(?PoolingMode, null), poolingFromDirName("all-MiniLM-L6-v2", "bert"));
+    // EmbeddingGemma is mean-pooled via its own bidirectional path — the name
+    // fallback must not touch non-qwen3 archs on the "embedding" substring.
+    try testing.expectEqual(@as(?PoolingMode, null), poolingFromDirName("embeddinggemma-300m-8bit", "gemma3_text"));
+}
+
+test "pooling: effectivePooling defaults to mean; encoder capability unions" {
+    var config = ModelConfig{};
+    try testing.expectEqual(PoolingMode.mean, config.effectivePooling());
+    try testing.expect(!config.hasEmbeddingCapability());
+    config.is_encoder_only = true;
+    try testing.expect(config.hasEmbeddingCapability());
+    config.is_encoder_only = false;
+    config.pooling_mode = .last_token;
+    try testing.expectEqual(PoolingMode.last_token, config.effectivePooling());
+    try testing.expect(config.hasEmbeddingCapability());
+}
+
 test "parseGenerationDefaultsFromJson: missing keys and malformed input give nulls" {
     const partial = parseGenerationDefaultsFromJson("{\"eos_token_id\": [1, 2]}");
     try testing.expectEqual(@as(?f32, null), partial.temperature);
@@ -4007,4 +6656,644 @@ test "parseGenerationDefaultsFromJson: missing keys and malformed input give nul
     try testing.expectEqual(@as(?f32, null), insane.temperature);
     try testing.expectEqual(@as(?f32, null), insane.top_p);
     try testing.expectEqual(@as(?u32, null), insane.top_k);
+}
+
+test "attnCacheLayerCount: a layer_block_types hybrid counts only its ATTENTION layers" {
+    // LFM2.5-2.6B's real shape: 30 layers, 22 gated-conv + 8 full-attention,
+    // 8 KV heads at head_dim 64. `isLinearLayer` keys on
+    // `full_attention_interval`, which this family never sets (it populates
+    // `layer_block_types` instead), so every memory estimate billed a KV cache
+    // for all 30 — 3.75x the bytes the model can ever store, spent out of the
+    // auto-context budget on exactly the arch small Macs are pointed at.
+    // Nemotron-H is the same class through `hybrid_override_pattern` (only its
+    // `*` layers cache) and over-bills harder still.
+    var config = ModelConfig{};
+    config.num_hidden_layers = 30;
+    config.num_key_value_heads = 8;
+    config.head_dim = 64;
+    config.has_hybrid_layers = true;
+    // The shipped LFM2.5-2.6B layer_types, verbatim.
+    const lfm2_attn = [_]u32{ 2, 5, 9, 13, 17, 21, 24, 27 };
+    for (0..30) |i| config.layer_block_types[i] = .gated_conv;
+    for (lfm2_attn) |i| config.layer_block_types[i] = .attention;
+    try testing.expectEqual(@as(u32, 8), config.attnCacheLayerCount());
+    try testing.expectEqual(@as(u64, 8 * 8 * 2 * 64 * 2), config.kvBytesPerToken());
+
+    // Nemotron-H: mamba2 and mlp blocks hold a fixed-size recurrent state, not
+    // a per-token cache — only the attention blocks are billed.
+    var nemo = ModelConfig{};
+    nemo.num_hidden_layers = 12;
+    nemo.num_key_value_heads = 8;
+    nemo.head_dim = 128;
+    nemo.has_hybrid_layers = true;
+    const pattern = [_]LayerBlockType{ .mamba2, .mlp, .mamba2, .attention, .mamba2, .mlp, .mamba2, .mlp, .mamba2, .attention, .mamba2, .mlp };
+    for (pattern, 0..) |b, i| nemo.layer_block_types[i] = b;
+    try testing.expectEqual(@as(u32, 2), nemo.attnCacheLayerCount());
+
+    // A hybrid checkpoint that ships no layer_types leaves the array at its
+    // `.attention` default and keeps the whole-model bill — the safe direction.
+    var bare = ModelConfig{};
+    bare.num_hidden_layers = 16;
+    bare.num_key_value_heads = 4;
+    bare.head_dim = 128;
+    bare.has_hybrid_layers = true;
+    try testing.expectEqual(@as(u32, 16), bare.attnCacheLayerCount());
+}
+
+test "bailing_hybrid: a null q_lora_rank is the direct-q_proj arm, not a refusal" {
+    // Ling 3.0 FLASH ships `"q_lora_rank": null` where tiny ships 256, and its
+    // MLA layers carry a plain `attention.q_proj` instead of the
+    // q_a_proj/q_a_layernorm/q_b_proj triple. That is DeepSeek-V3's documented
+    // option, not a broken export — refusing it meant the whole flash line was
+    // unloadable while tiny worked.
+    const json =
+        \\{
+        \\  "model_type": "bailing_hybrid",
+        \\  "hidden_size": 2560, "num_hidden_layers": 42,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 32, "head_dim": 128,
+        \\  "layer_group_size": 6,
+        \\  "q_lora_rank": null, "kv_lora_rank": 512,
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "num_experts": 512, "num_experts_per_tok": 8, "moe_intermediate_size": 768,
+        \\  "vocab_size": 157184, "kda_lower_bound": -5.0
+        \\}
+    ;
+    const cfg = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(cfg.isMla());
+    // 0 IS the signal: no low-rank Q, project straight from the hidden state.
+    try testing.expectEqual(@as(u32, 0), cfg.mla_q_lora_rank);
+    try testing.expect(!cfg.mlaHasQLora());
+    try testing.expectEqual(@as(u32, 512), cfg.mla_kv_lora_rank);
+    // The attention scale still comes from the FULL query width, unchanged.
+    try testing.expectEqual(@as(u32, 192), cfg.mlaQkHeadDim());
+    try testing.expectEqual(@as(u32, 192), cfg.query_pre_attn_scalar);
+
+    // kv_lora_rank is still genuinely required — the latent has no fallback.
+    const no_kv =
+        \\{
+        \\  "model_type": "bailing_hybrid",
+        \\  "hidden_size": 2560, "num_hidden_layers": 42,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 32, "head_dim": 128,
+        \\  "layer_group_size": 6, "q_lora_rank": null,
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "num_experts": 512, "num_experts_per_tok": 8, "moe_intermediate_size": 768,
+        \\  "vocab_size": 157184
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedBailingConfig, parseConfigFromJson(testing.allocator, no_kv));
+
+    // And tiny's low-rank arm is untouched.
+    const tiny =
+        \\{
+        \\  "model_type": "bailing_hybrid",
+        \\  "hidden_size": 1536, "num_hidden_layers": 24,
+        \\  "num_attention_heads": 16, "num_key_value_heads": 16, "head_dim": 128,
+        \\  "layer_group_size": 4,
+        \\  "q_lora_rank": 256, "kv_lora_rank": 512,
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "num_experts": 128, "num_experts_per_tok": 8, "moe_intermediate_size": 512,
+        \\  "vocab_size": 157184
+        \\}
+    ;
+    const t = try parseConfigFromJson(testing.allocator, tiny);
+    try testing.expect(t.mlaHasQLora());
+    try testing.expectEqual(@as(u32, 256), t.mla_q_lora_rank);
+}
+
+test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connection, PLE, QSA and text-config eos fields" {
+    const json =
+        \\{"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp",
+        \\ "text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,
+        \\ "full_attention_interval":4,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,
+        \\ "hc_count":4,"hc_lowrank":320,"ple_layer_ids":[2],"ple_embed_dim":2560,"ple_conv_kernel_size":4,
+        \\ "ngram_size":3,"heads_per_ngram":8,"ngram_vocab_size_base":20000000,"make_ngram_vocab_size_divisible_by":128,
+        \\ "indexer_n_heads":4,"indexer_kv_heads":1,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4,
+        \\ "linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,
+        \\ "num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,
+        \\ "eos_token_id":248044,"vocab_size":248320,"rms_norm_eps":1e-6,"output_gate_type":"sigmoid",
+        \\ "rope_parameters":{"rope_theta":10000000,"partial_rotary_factor":0.25,"mrope_section":[11,11,10],"mrope_interleaved":true}},
+        \\ "quantization":{"group_size":64,"bits":4,"mode":"affine"}}
+    ;
+    const c = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(c.isQwen4());
+    try testing.expectEqualStrings("language_model.model", c.weight_prefix);
+    try testing.expectEqual(@as(u32, 4), c.hc_count);
+    try testing.expectEqual(@as(u32, 320), c.hc_lowrank);
+    try testing.expectEqual(@as(i32, 1), c.ple_layer_idx); // 1-based [2] → layer 1
+    try testing.expectEqual(@as(u32, 2560), c.ple_embed_dim);
+    try testing.expectEqual(@as(u32, 4), c.indexer_n_heads);
+    try testing.expectEqual(@as(u32, 2048), c.indexer_budget);
+    try testing.expectEqual(@as(u32, 4), c.indexer_compress_ratio);
+    try testing.expectEqual(@as(u32, 248044), c.ngram_eos);
+    try testing.expectEqual(@as(u32, 4), c.full_attention_interval);
+    try testing.expect(c.isLinearLayer(0) and !c.isLinearLayer(3));
+    try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
+    try testing.expectEqual(@as(u64, 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
+    try testing.expectEqual(@as(u64, 12 * @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS)) * 128 * 2), c.qsaRingBytes());
+    try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
+    try testing.expect(c.isMoe() and c.supportsBatchedGdnDecode()); // per-slot state on the SSMCacheEntry: batches
+    try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);
+    try testing.expectEqual(@as(f32, 10000000.0), c.rope_theta);
+    try testing.expect(!c.qwen_vision and !c.has_vision);
+}
+
+test "parseConfigFromJson: qwen4_exp with vision_config reads the Qwen3-VL tower, M-RoPE and vision token ids" {
+    const json =
+        \\{"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp",
+        \\ "image_token_id":248056,"video_token_id":248057,"vision_start_token_id":248053,"vision_end_token_id":248054,
+        \\ "vision_config":{"depth":27,"hidden_size":1152,"num_heads":16,"intermediate_size":4304,"patch_size":16,
+        \\   "temporal_patch_size":2,"spatial_merge_size":2,"num_position_embeddings":2304,"out_hidden_size":2560,"model_type":"qwen4_exp_vision"},
+        \\ "text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,
+        \\ "full_attention_interval":4,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,
+        \\ "ple_layer_ids":[2],"indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4,
+        \\ "num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,
+        \\ "eos_token_id":248044,"vocab_size":248320,"rms_norm_eps":1e-6,
+        \\ "rope_parameters":{"rope_theta":10000000,"partial_rotary_factor":0.25,"mrope_section":[11,11,10],"mrope_interleaved":true}},
+        \\ "quantization":{"group_size":64,"bits":4,"mode":"affine"}}
+    ;
+    const c = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(c.isQwen4() and c.has_vision and c.qwen_vision);
+    try testing.expectEqual(@as(u32, 27), c.qv_depth);
+    try testing.expectEqual(@as(u32, 1152), c.qv_hidden);
+    try testing.expectEqual(@as(u32, 16), c.qv_heads);
+    try testing.expectEqual(@as(u32, 72), c.qv_head_dim);
+    try testing.expectEqual(@as(u32, 4304), c.qv_intermediate);
+    try testing.expectEqual(@as(u32, 16), c.qv_patch);
+    try testing.expectEqual(@as(u32, 2), c.qv_temporal_patch);
+    try testing.expectEqual(@as(u32, 2), c.qv_merge);
+    try testing.expectEqual(@as(u32, 2304), c.qv_num_pos_emb);
+    try testing.expectEqual(@as(u32, 2560), c.qv_out_hidden);
+    try testing.expect(c.mrope_interleaved);
+    try testing.expectEqual([3]u32{ 11, 11, 10 }, c.mrope_section);
+    try testing.expectEqual(@as(u32, 248056), c.image_token_id);
+    try testing.expectEqual(@as(u32, 248057), c.video_token_id);
+    try testing.expectEqual(@as(u32, 248053), c.vision_start_token_id);
+    try testing.expectEqual(@as(u32, 248054), c.vision_end_token_id);
+}
+
+// ── qwen4_exp YaRN context extension (262144 → 1048576) ──────────────────
+//
+// Both documents below are the SHIPPED checkpoint's text config (Qwen3.8-Flash-
+// Next, `model_type: qwen4_exp`) — one as it ships (plain rope, 262144) and one
+// with the YaRN block vLLM's `--hf-overrides` recipe writes. Keeping them as
+// literals means the parser is tested against the real file shape, braces and
+// all, rather than a synthesized one.
+
+/// The checkpoint as it ships: `rope_type: "default"`, a 262144 window.
+const QWEN4_SHIPPED =
+    \\{
+    \\  "architectures": ["Qwen4ExpForConditionalGeneration"],
+    \\  "model_type": "qwen4_exp",
+    \\  "text_config": {
+    \\    "model_type": "qwen4_exp_text",
+    \\    "hidden_size": 2560, "num_hidden_layers": 48, "full_attention_interval": 4,
+    \\    "num_attention_heads": 24, "num_key_value_heads": 2, "head_dim": 256,
+    \\    "num_experts": 512, "num_experts_per_tok": 10, "moe_intermediate_size": 640,
+    \\    "ple_layer_ids": [2],
+    \\    "vocab_size": 248320, "eos_token_id": 248044, "max_position_embeddings": 262144,
+    \\    "rope_parameters": {
+    \\      "rope_type": "default", "rope_theta": 10000000, "partial_rotary_factor": 0.25,
+    \\      "mrope_section": [11, 11, 10], "mrope_interleaved": true
+    \\    }
+    \\  }
+    \\}
+;
+
+/// The same checkpoint with its rope scaled 4× and the window widened — exactly
+/// `vllm serve ... --hf-overrides '{"text_config": {"rope_parameters": {...}}}'
+/// --max-model-len 1010000` expressed as config instead of a flag.
+const QWEN4_YARN =
+    \\{
+    \\  "architectures": ["Qwen4ExpForConditionalGeneration"],
+    \\  "model_type": "qwen4_exp",
+    \\  "text_config": {
+    \\    "model_type": "qwen4_exp_text",
+    \\    "hidden_size": 2560, "num_hidden_layers": 48, "full_attention_interval": 4,
+    \\    "num_attention_heads": 24, "num_key_value_heads": 2, "head_dim": 256,
+    \\    "num_experts": 512, "num_experts_per_tok": 10, "moe_intermediate_size": 640,
+    \\    "ple_layer_ids": [2],
+    \\    "vocab_size": 248320, "eos_token_id": 248044, "max_position_embeddings": 1048576,
+    \\    "rope_parameters": {
+    \\      "rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144,
+    \\      "rope_theta": 10000000, "partial_rotary_factor": 0.25,
+    \\      "mrope_section": [11, 11, 10], "mrope_interleaved": true
+    \\    }
+    \\  }
+    \\}
+;
+
+test "parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048576" {
+    const c = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    try testing.expect(c.isQwen4());
+    // The scaling is recognised and lands where the engine reads it —
+    // transformer.yarnSpec() consumes exactly these fields.
+    try testing.expect(c.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), c.yarn_factor, 1e-9);
+    try testing.expectEqual(@as(u32, 262_144), c.yarn_orig_max_pos);
+    try testing.expectApproxEqAbs(@as(f32, 32.0), c.yarn_beta_fast, 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), c.yarn_beta_slow, 1e-9);
+    try testing.expect(c.yarn_truncate); // HF's default, absent from the block
+    // The mscale is COMPUTED (no `attention_factor` in the block, so HF's
+    // default applies): 0.1·ln 4 + 1 — the value the extension is calibrated to.
+    try testing.expectApproxEqAbs(@as(f32, 1.138629436111989), c.yarn_attention_factor, 1e-6);
+    // qwen4_exp has ONE rope for the trunk, so the YaRN table spans exactly the
+    // 64 dims attention rotates: `partial_rotary_factor`, NOT laguna's
+    // `partial_rotary_factor_global` (1.0 here — reading it would scale all 256
+    // dims and rotate the pass-through slice).
+    try testing.expectApproxEqAbs(@as(f32, 0.25), c.yarnPartial(), 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), c.partial_rotary_factor_global, 1e-9);
+    try testing.expectEqual(@as(u32, 64), c.yarnRotaryDim());
+    try testing.expectApproxEqAbs(@as(f32, 10_000_000.0), c.rope_theta, 1.0);
+    // The 32 frequencies of the scaled table are the 32 halves the interleaved
+    // M-RoPE selector splits [11,11,10] across. If they disagreed, half the
+    // table would rotate against an axis the position table doesn't have.
+    try testing.expectEqual(
+        c.mrope_section[0] + c.mrope_section[1] + c.mrope_section[2],
+        c.yarnRotaryDim() / 2,
+    );
+    // The window the server may advertise: original × factor, and the config's
+    // own declaration agrees.
+    try testing.expectEqual(@as(u32, 1_048_576), c.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 1_048_576), c.contextCap());
+    // Cost of that window: only the 12 interval-full layers bill KV, so
+    // 12 layers × 2 kv heads × (K+V) × 256 dims × 2 bytes = 24 KiB per token.
+    try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
+    try testing.expectEqual(@as(u64, 24_576), c.kvBytesPerToken());
+}
+
+test "parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched" {
+    // The regression guard for every checkpoint that predates the extension:
+    // no YaRN, and `contextCap` is just max_position_embeddings, so no server
+    // sizing path can shift for a model that did not ask to be scaled.
+    const c = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expect(c.isQwen4());
+    try testing.expect(!c.rope_yarn);
+    try testing.expectEqual(@as(f32, 1.0), c.yarn_factor);
+    try testing.expectEqual(@as(u32, 262_144), c.max_position_embeddings);
+    try testing.expectEqual(c.max_position_embeddings, c.contextCap());
+    try testing.expectApproxEqAbs(@as(f32, 1.0), c.yarn_attention_factor, 1e-9);
+    // Same geometry otherwise — YaRN is a rotation, not an architecture change.
+    const y = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    try testing.expectEqual(c.kvBytesPerToken(), y.kvBytesPerToken());
+    try testing.expectEqual(c.num_hidden_layers, y.num_hidden_layers);
+    try testing.expectEqual(c.head_dim, y.head_dim);
+    try testing.expectEqual(c.mrope_section, y.mrope_section);
+}
+
+test "parseConfigFromJson: YaRN reads beta_fast/beta_slow/truncate and honours a pinned mscale" {
+    defer setConfigOverrides(null);
+    // HF's `attention_factor` REPLACES the computed 0.1·ln(factor)+1.
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\  "original_max_position_embeddings":262144,"attention_factor":1.25}}}
+    );
+    const pinned = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expect(pinned.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 1.25), pinned.yarn_attention_factor, 1e-9);
+    // Still reads theta/partial from the merged block (the base config's values).
+    try testing.expectApproxEqAbs(@as(f32, 0.25), pinned.yarnPartial(), 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 10_000_000.0), pinned.rope_theta, 1.0);
+
+    // vLLM's `attn_factor` MULTIPLIES the computed 0.1·ln(factor)+1.
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\  "original_max_position_embeddings":262144,"attn_factor":0.5}}}
+    );
+    const vl = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expectApproxEqAbs(@as(f32, 0.5 * 1.138629436111989), vl.yarn_attention_factor, 1e-6);
+
+    // Both keys present: HF's attention_factor wins (replace, not multiply).
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\  "original_max_position_embeddings":262144,
+        \\  "attention_factor":1.25,"attn_factor":0.5}}}
+    );
+    const both = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expectApproxEqAbs(@as(f32, 1.25), both.yarn_attention_factor, 1e-9);
+
+    // The ramp knobs are read too — they move the blend, and so every frequency
+    // between the bands.
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\  "original_max_position_embeddings":262144,
+        \\  "beta_fast":16,"beta_slow":2,"truncate":false}}}
+    );
+    const tuned = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expectApproxEqAbs(@as(f32, 16.0), tuned.yarn_beta_fast, 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), tuned.yarn_beta_slow, 1e-9);
+    try testing.expect(!tuned.yarn_truncate);
+    // With no pinned mscale, the computed default returns.
+    try testing.expectApproxEqAbs(@as(f32, 1.138629436111989), tuned.yarn_attention_factor, 1e-6);
+}
+
+test "parseConfigFromJson: YaRN derives factor from the window when the block omits it (HF)" {
+    defer setConfigOverrides(null);
+    // HF: `factor = max_position_embeddings / original_max_position_embeddings`
+    // when the block names only the window. Here the override widens the
+    // declared window to 2M out of 262144 → factor 8, mscale 0.1·ln 8 + 1.
+    setConfigOverrides(
+        \\{"text_config":{"max_position_embeddings":2097152,
+        \\  "rope_parameters":{"rope_type":"yarn","original_max_position_embeddings":262144}}}
+    );
+    const c = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expect(c.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 8.0), c.yarn_factor, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.2079441541679836), c.yarn_attention_factor, 1e-6);
+    try testing.expectEqual(@as(u32, 2_097_152), c.contextCap());
+}
+
+test "parseConfigFromJson: YaRN with no pre-trained window, or a zero factor, fails the load" {
+    defer setConfigOverrides(null);
+    // The ramp bounds come from `original_max_position_embeddings`. Without it
+    // every blended frequency is a guess — refuse the load rather than serve a
+    // rope that looks fine at short contexts and decays beyond the window.
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4.0}}}
+    );
+    try testing.expectError(
+        error.YarnRopeNeedsOriginalMaxPos,
+        parseConfigFromJson(testing.allocator, QWEN4_SHIPPED),
+    );
+    // A zero factor is not "no scaling", it is a divide-by-zero waiting to run.
+    setConfigOverrides(
+        \\{"text_config":{"rope_parameters":{"rope_type":"yarn","factor":0.0,
+        \\  "original_max_position_embeddings":262144}}}
+    );
+    try testing.expectError(
+        error.InvalidRopeScalingFactor,
+        parseConfigFromJson(testing.allocator, QWEN4_SHIPPED),
+    );
+}
+
+test "ModelConfig.contextCap: the rope-derived window binds what the server advertises" {
+    const scaled = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    // Over-advertised: a config claiming 2M tokens on a factor-4 ramp out of
+    // 262144 still cannot resolve past 1048576 — past there positions alias back
+    // inside the window, which is the failure this clamps against.
+    var c = scaled;
+    c.max_position_embeddings = 2_000_000;
+    try testing.expectEqual(@as(u32, 1_048_576), c.contextCap());
+    // Under-advertised: serving LESS than the scaled window is legal — the ramp
+    // is fixed by the pre-trained length, not by what you choose to run.
+    c.max_position_embeddings = 400_000;
+    try testing.expectEqual(@as(u32, 400_000), c.contextCap());
+    // Declaring nothing: the ramp still says how far the rope reaches.
+    c.max_position_embeddings = 0;
+    try testing.expectEqual(@as(u32, 1_048_576), c.contextCap());
+    // A fractional factor floors (vLLM's `int()` of the same product).
+    c.yarn_factor = 3.5;
+    try testing.expectEqual(@as(u32, 917_504), c.contextCap()); // floor(262144*3.5)
+}
+
+test "parseConfigFromJson: --config-overrides deep-merges a nested block without clobbering siblings" {
+    // The merge is what makes the flag usable for rope at all: `rope_parameters`
+    // is written as a whole object, and a REPLACE would drop the
+    // `partial_rotary_factor` / `mrope_section` keys beside it — silently
+    // rotating 256 dims instead of 64, or the wrong axes. vLLM has the same
+    // rule (`_update_nested` merges, `_apply_dict_overrides` only replaces
+    // non-config values), and the same trap is documented in its source.
+    defer setConfigOverrides(null);
+    // Pre-override: the shipped config really does have no scaling.
+    try testing.expect(!(try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED)).rope_yarn);
+    setConfigOverrides(
+        \\{"text_config":{"max_position_embeddings":1048576,
+        \\  "rope_parameters":{"rope_type":"yarn","factor":4.0,
+        \\    "original_max_position_embeddings":262144}}}
+    );
+    const c = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expect(c.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), c.yarn_factor, 1e-9);
+    try testing.expectEqual(@as(u32, 1_048_576), c.contextCap());
+    // Keys the override never mentioned survived at BOTH levels of the merge.
+    try testing.expectApproxEqAbs(@as(f32, 0.25), c.partial_rotary_factor, 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 10_000_000.0), c.rope_theta, 1.0);
+    try testing.expect(c.mrope_interleaved);
+    try testing.expectEqual([3]u32{ 11, 11, 10 }, c.mrope_section);
+    try testing.expectEqual(@as(u32, 262_144), c.yarn_orig_max_pos);
+    // The result is indistinguishable from the hand-written extended config.
+    const written = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    try testing.expectApproxEqAbs(written.yarn_factor, c.yarn_factor, 1e-9);
+    try testing.expectEqual(written.contextCap(), c.contextCap());
+    try testing.expectApproxEqAbs(written.yarn_attention_factor, c.yarn_attention_factor, 1e-9);
+}
+
+test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creates new keys, rejects junk" {
+    defer setConfigOverrides(null);
+    // Scalars and arrays replace wholesale (vLLM's base case); an array nested
+    // in an object that is otherwise merged still replaces the array it meets.
+    setConfigOverrides(
+        \\{"text_config":{"num_hidden_layers":8,"head_dim":128,
+        \\  "rope_parameters":{"mrope_section":[9,9,9]}}}
+    );
+    const c = try parseConfigFromJson(testing.allocator, QWEN4_YARN);
+    try testing.expectEqual(@as(u32, 8), c.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 128), c.head_dim);
+    try testing.expectEqual([3]u32{ 9, 9, 9 }, c.mrope_section);
+    try testing.expect(c.rope_yarn); // the block's other keys survived
+    try testing.expectApproxEqAbs(@as(f32, 4.0), c.yarn_factor, 1e-9);
+
+    // A key the document never had is created at the level the parser reads
+    // (qwen4's fields come from `text_config`, so that's where it must land).
+    setConfigOverrides(
+        \\{"text_config":{"ngram_size":5}}
+    );
+    const n = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expectEqual(@as(u32, 5), n.ngram_size);
+
+    // Only an object is a document; a bare array must not half-apply.
+    setConfigOverrides(
+        \\[1,2,3]
+    );
+    try testing.expectError(
+        error.ConfigOverridesMustBeObject,
+        parseConfigFromJson(testing.allocator, QWEN4_SHIPPED),
+    );
+    // Clearing the seam restores the shipped document exactly.
+    setConfigOverrides(null);
+    const clean = try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED);
+    try testing.expectEqual(@as(u32, 48), clean.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 256), clean.head_dim);
+    try testing.expectEqual(@as(u32, 3), clean.ngram_size);
+    try testing.expectEqual([3]u32{ 11, 11, 10 }, clean.mrope_section);
+    try testing.expect(!clean.rope_yarn);
+}
+
+test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, qwen4_exp only" {
+    const t = std.testing;
+    var qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
+    try t.expect(qwen4.longCtxGated());
+    try t.expect(qwen4.ssdFirstCapable());
+
+    for ([_][]const u8{
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_next",
+        "lfm2",
+        "nemotron_h",
+        "bailing_hybrid",
+        "llama",
+        "mistral",
+        "gemma3",
+        "gemma4",
+        "deepseek_v4",
+        "muse_glimmer",
+    }) |mt| {
+        var cfg = ModelConfig{ .model_type = mt };
+        try t.expect(!cfg.longCtxGated());
+        try t.expect(!cfg.ssdFirstCapable());
+    }
+}
+
+/// One qwen4_exp config document with `extra` fields spliced in.
+fn qwen4CaseJson(comptime extra: []const u8) []const u8 {
+    return "{\"model_type\":\"qwen4_exp\",\"hidden_size\":2560,\"num_hidden_layers\":48," ++
+        "\"full_attention_interval\":4,\"num_attention_heads\":24,\"num_key_value_heads\":2,\"head_dim\":256," ++
+        "\"hc_count\":4,\"hc_lowrank\":320,\"ple_embed_dim\":2560,\"ple_conv_kernel_size\":4," ++
+        "\"num_experts\":512,\"num_experts_per_tok\":10,\"moe_intermediate_size\":640," ++
+        "\"eos_token_id\":248044,\"vocab_size\":248320,\"rms_norm_eps\":1e-6," ++
+        extra ++ "}";
+}
+
+const QWEN4_GOOD_FIELDS =
+    "\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":8," ++
+    "\"ngram_vocab_size_base\":20000000,\"make_ngram_vocab_size_divisible_by\":128," ++
+    "\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2048,\"indexer_compress_ratio\":4";
+
+test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load error" {
+    const good = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));
+    try testing.expectEqual(@as(u32, 3), good.ngram_size);
+    try testing.expectEqual(@as(u32, 8), good.heads_per_ngram);
+
+    try testing.expectError(error.InvalidQwen4NgramSize, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":9,\"heads_per_ngram\":8"),
+    ));
+    try testing.expectError(error.InvalidQwen4NgramSize, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":1,\"heads_per_ngram\":8"),
+    ));
+    try testing.expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":0"),
+    ));
+    try testing.expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":5,\"heads_per_ngram\":16"),
+    ));
+    try testing.expectError(error.InvalidQwen4NgramVocab, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"make_ngram_vocab_size_divisible_by\":0"),
+    ));
+}
+
+test "qwen4_exp config: a wrong-typed or negative bound is a refusal, never a silent default" {
+    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":-1"),
+    ));
+    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":\"3\""),
+    ));
+    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"heads_per_ngram\":3.5"),
+    ));
+    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_compress_ratio\":-4"),
+    ));
+}
+
+test "qwen4_exp config: an armed QSA indexer must carry a usable budget and ratio" {
+    try testing.expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2048"),
+    ));
+    try testing.expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2,\"indexer_compress_ratio\":4"),
+    ));
+    try testing.expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_budget\":2048,\"indexer_compress_ratio\":4"),
+    ));
+    const dense = try parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":8"),
+    );
+    try testing.expectEqual(@as(u32, 0), dense.indexer_n_heads);
+    try testing.expectEqual(@as(u32, 0), dense.indexer_compress_ratio);
+}
+
+test "qwen4_exp config: the PLE layer id must name exactly one layer that exists" {
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ngram_size\":3"),
+    ));
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[0]"),
+    ));
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[49]"),
+    ));
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2,5]"),
+    ));
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[]"),
+    ));
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":2"),
+    ));
+    const c = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));
+    try testing.expectEqual(@as(i32, 1), c.ple_layer_idx);
+}
+
+test "qwen4 PLE placement: the layer loop must install exactly one PLE, at the configured layer" {
+    try testing.expect(qwen4PleInstalledAt(&.{ false, true, false, false }, 1));
+    try testing.expect(!qwen4PleInstalledAt(&.{ false, false, false, false }, 1));
+    try testing.expect(!qwen4PleInstalledAt(&.{ true, true, false, false }, 1));
+    try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, 2));
+    try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, 4));
+    // A negative index is a build that asks for no PLE (`loadQwen4Mtp` sets -1 for the head's layer).
+    try testing.expect(qwen4PleInstalledAt(&.{false}, -1));
+    try testing.expect(!qwen4PleInstalledAt(&.{true}, -1));
+    try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, -1));
+    try testing.expect(qwen4PleInstalledAt(&.{ false, false }, -1));
+    // ...while a config that DOES name a layer is unchanged.
+    try testing.expect(!qwen4PleInstalledAt(&.{false}, 0));
+    try testing.expect(qwen4PleInstalledAt(&.{true}, 0));
+}
+
+test "ModelConfig parses k2_horizon (K2-Horizon-7B): llama trunk with grouped RMS norms" {
+    const json =
+        \\{
+        \\  "model_type": "k2_horizon",
+        \\  "hidden_size": 4096, "intermediate_size": 12288, "num_hidden_layers": 36,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+        \\  "hidden_act": "silu", "rms_norm_eps": 1e-06, "vocab_size": 250624,
+        \\  "layernorm_num_groups": 4, "query_key_norm": false, "attention_gate_func": null,
+        \\  "num_experts": 0, "sliding_window": null, "tie_word_embeddings": false,
+        \\  "max_position_embeddings": 524288, "rope_head_dim": 128,
+        \\  "rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("k2_horizon", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 4), config.norm_groups);
+    try testing.expectEqual(HiddenAct.silu, config.hidden_act);
+    try testing.expectEqual(@as(u32, 128), config.head_dim);
+    try testing.expectEqual(@as(f32, 10000000.0), config.rope_theta);
+    try testing.expect(!config.has_qk_norm);
+    try testing.expect(!config.has_sliding_window);
+    try testing.expect(!config.tie_word_embeddings);
+    try testing.expect(!config.norm_has_offset);
+    try testing.expect(!config.has_pre_ff_norm);
 }

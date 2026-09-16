@@ -13,6 +13,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     case modelFolders
     case server
     case lanSharing
+    case providers
     case specDecode
     /// The universal knobs AND the MLX-only ones, in one section: two adjacent
     /// cards both called "Performance" was a distinction only the maintainers
@@ -20,13 +21,22 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     /// model is serving (they'd silently no-op), so the section always has
     /// something in it while never offering a knob that does nothing.
     case performance
+    /// The Neural Engine offloads: LM prefill plus the three media DiT seams.
+    /// Always listed — the media rows apply to generation models, which are
+    /// not the text `engine` the other gates key on.
+    case neuralEngine
     case ggufPerformance
     case ds4
     case requestDefaults
+    case interface
     case voice
     case sandbox
     case messaging
     case updates
+    /// Links out to the project. Deliberately its own category rather than
+    /// rows inside Updates: that section is `selfUpdate`-gated, so on a Mac
+    /// App Store build these would never render.
+    case about
 
     var id: String { rawValue }
 
@@ -37,15 +47,19 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .modelFolders:      return "Model Folders"
         case .server:            return "Server"
         case .lanSharing:        return "LAN Sharing"
+        case .providers:         return "Providers"
         case .performance:       return "Performance"
+        case .neuralEngine:      return "Neural Engine"
         case .specDecode:        return "Speculative Decoding (MLX only)"
         case .ggufPerformance:   return "GGUF Performance (llama.cpp)"
         case .ds4:               return "DeepSeek-V4 (ds4 engine)"
         case .requestDefaults:   return "Per-Request Defaults"
+        case .interface:         return "Interface"
         case .voice:             return "Voice"
         case .sandbox:           return "Agent Sandbox"
         case .messaging:         return "Messaging — Telegram bot"
         case .updates:           return "Updates"
+        case .about:             return "About mlx-serve"
         }
     }
 
@@ -67,15 +81,19 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .modelFolders:      return "folder"
         case .server:            return "server.rack"
         case .lanSharing:        return "antenna.radiowaves.left.and.right"
+        case .providers:         return "cloud"
         case .performance:       return "speedometer"
+        case .neuralEngine:      return "cpu"
         case .specDecode:        return "hare"
         case .ggufPerformance:   return "shippingbox"
         case .ds4:               return "cube"
         case .requestDefaults:   return "slider.horizontal.3"
+        case .interface:         return "paintbrush"
         case .voice:             return "waveform"
         case .sandbox:           return "shield.lefthalf.filled"
         case .messaging:         return "paperplane"
         case .updates:           return "arrow.down.circle"
+        case .about:             return "star"
         }
     }
 

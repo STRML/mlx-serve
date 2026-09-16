@@ -64,14 +64,21 @@ final class AppActivationTests: XCTestCase {
     /// bypass `openAndFocus` couldn't reach it.
     func testWindowTitleMapCoversEveryOpenableWindow() {
         XCTAssertEqual(AppActivation.windowTitle(for: "chat"), "MLX Core")
-        XCTAssertEqual(AppActivation.windowTitle(for: "modelBrowser"), "Model Browser")
-        XCTAssertEqual(AppActivation.windowTitle(for: "settings"), "Settings")
-        XCTAssertEqual(AppActivation.windowTitle(for: "imageGen"), "Image Generation")
-        XCTAssertEqual(AppActivation.windowTitle(for: "videoGen"), "Video Generation")
-        XCTAssertEqual(AppActivation.windowTitle(for: "audioGen"), "Audio Generation")
-        XCTAssertEqual(AppActivation.windowTitle(for: "model3dGen"), "3D Generation")
+        // "modelBrowser" is deliberately absent: the Model Browser is a MODE
+        // of the chat window now (`ChatWorkspace`), not a window to raise.
+        XCTAssertNotEqual(AppActivation.windowTitle(for: "modelBrowser"), "Model Browser")
+        // "settings" is retired: Settings renders in the chat window's detail
+        // column (`ChatWorkspace.settings`), never as a second window.
+        XCTAssertEqual(AppActivation.windowTitle(for: "settings"), "Browser")
+        // The four media generators went the way of the Model Browser: pages of
+        // the chat window (`ChatWorkspace.create`), not windows to raise.
+        for retired in ["imageGen", "videoGen", "audioGen", "model3dGen"] {
+            XCTAssertEqual(AppActivation.windowTitle(for: retired), "Browser",
+                           "\(retired) is retired — it must fall through to the default")
+        }
         XCTAssertEqual(AppActivation.windowTitle(for: "serverLog"), "Server Log")
-        XCTAssertEqual(AppActivation.windowTitle(for: "tasks"), "Tasks")
+        // "tasks" is retired too — the Tasks pane lives in the chat window.
+        XCTAssertEqual(AppActivation.windowTitle(for: "tasks"), "Browser")
     }
 
     // MARK: - Raising the right window
@@ -86,8 +93,8 @@ final class AppActivationTests: XCTestCase {
     }
 
     func testWindowMatchesByTitleWhenTitled() {
-        XCTAssertTrue(AppActivation.windowMatches(id: "settings", title: "Settings", identifier: nil))
-        XCTAssertTrue(AppActivation.windowMatches(id: "tasks", title: "Tasks", identifier: nil))
+        XCTAssertTrue(AppActivation.windowMatches(id: "agents", title: "Agents", identifier: "agents"))
+        XCTAssertTrue(AppActivation.windowMatches(id: "serverLog", title: "Server Log", identifier: nil))
     }
 
     /// Never grab an unrelated window — raising the wrong one is its own focus bug.
@@ -97,19 +104,11 @@ final class AppActivationTests: XCTestCase {
                        "a blank, unidentified window is not evidence it's ours")
     }
 
-    /// The Sandbox window has its own title case. Without one, "sandboxTerminal"
-    /// fell through to the "Browser" default — and the raise pass would
-    /// makeKeyAndOrderFront an open BROWSER window (title "Browser") instead of
-    /// the Sandbox window the tray's "pi in Sandbox" shortcut just opened.
-    func testSandboxSceneMatchesItsOwnWindowNeverABrowser() {
-        XCTAssertEqual(AppActivation.windowTitle(for: "sandboxTerminal"), "MLX Sandbox")
-        XCTAssertFalse(AppActivation.windowMatches(id: "sandboxTerminal", title: "Browser", identifier: nil),
-                       "a Browser window must never satisfy the sandbox scene lookup")
-        XCTAssertTrue(AppActivation.windowMatches(id: "sandboxTerminal", title: "MLX Sandbox", identifier: nil))
-        // A live session retitles the window ("pi — MLX Sandbox") — the scene
-        // identifier fallback covers that; title alone rightly does not.
-        XCTAssertTrue(AppActivation.windowMatches(id: "sandboxTerminal", title: "pi — MLX Sandbox",
-                                                  identifier: "sandboxTerminal-AppWindow-1"))
+    /// The sandbox terminal window is retired (terminals are rows of the chat
+    /// window, 2026-09-02): its id falls through like every other retired
+    /// scene, so nothing can raise a window that no longer exists.
+    func testSandboxTerminalSceneIsRetired() {
+        XCTAssertEqual(AppActivation.windowTitle(for: "sandboxTerminal"), "Browser")
     }
 
     // MARK: - Source audit (the universal part)

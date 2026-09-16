@@ -5,14 +5,19 @@ on:
     tags:
       - 'v*'
   # PR builds run the FULL packaging pipeline — sign, notarize, DMG — and
-  # upload the result as a workflow artifact. They never tag, never create a
-  # GitHub release, never push Homebrew formulas (step gates below). Fork PRs
-  # skip the whole job (no access to signing secrets — job-level `if`).
+  # upload the result as a workflow artifact. They never tag and never create
+  # a GitHub release (step gates below). The Homebrew formula push lives in
+  # homebrew.yml, fired when a release is published. Fork PRs skip the whole
+  # job (no access to signing secrets — job-level `if`).
   pull_request:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Build + test + package only — skip tag, notarize, release, and formula push. Use to verify the workflow on a branch before cutting a real release."
+        description: "Build + test + package only — skip tag, notarize, and release. Use to verify the workflow on a branch before cutting a real release."
+        type: boolean
+        default: false
+      pre_release:
+        description: "Cut this as a pre-release: tag v<YY.M.N>-pre-release.<n> instead of v<YY.M.N>"
         type: boolean
         default: false
 
@@ -125,6 +130,21 @@ jobs:
               --jq "[.[] | .tagName | select(test(\"^v${PREFIX}\\\\.[0-9]+$\")) | sub(\"^v${PREFIX}\\\\.\"; \"\") | tonumber] | max // 0")
             N=$((LAST_N + 1))
             VERSION="${PREFIX}.${N}"
+            # A pre-release does NOT consume the version number: it tags
+            # v<VERSION>-pre-release.<P>, which the `^vYY.M.[0-9]+$` match above
+            # ignores, so the next run still mints the same N for the real
+            # release. P counts the pre-releases of THIS version from 1, read
+            # off the existing tags the same way N is, so a sequence reads
+            # v26.8.10-pre-release.1, .2, .3 and then v26.8.10. Every
+            # pre-release is numbered, including the first — an unnumbered one
+            # sorts ambiguously against .2 and reads like a different kind of
+            # thing rather than the first of a series.
+            if [ "${{ inputs.pre_release }}" = "true" ]; then
+              LAST_P=$(git ls-remote --tags origin "v${VERSION}-pre-release.*" \
+                | sed -n "s#.*refs/tags/v${VERSION}-pre-release\\.\\([0-9][0-9]*\\)\$#\\1#p" \
+                | sort -n | tail -1)
+              VERSION="${VERSION}-pre-release.$(( ${LAST_P:-0} + 1 ))"
+            fi
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -149,7 +169,7 @@ jobs:
         run: bash scripts/fetch-llama.sh
 
       - name: Build mlx-serve (Zig)
-        run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }}
+        run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }} -Dgit-sha=${{ github.sha }}
 
       # The Agent Sandbox's guest-side binary (static aarch64-linux ELF). It
       # rides inside the .app at Resources/guest/vz-agent — without it the
@@ -179,18 +199,23 @@ jobs:
 
       - name: Build Swift app
         working-directory: app
-        # Xcode 26 on the macos-26 runner is Swift 6.3; the swift-sdk 0.10.x pin
-        # needs Swift 5 language mode (matches app/build.sh) or its
-        # NetworkTransport.swift fails to compile with [#SendingRisksDataRace].
+        # Package manifests own their language modes. A global Swift 5 override
+        # would also reach SwaTex, whose source correctly requires Swift 6.1.
         run: |
-          swift build -c release -Xswiftc -swift-version -Xswiftc 5
-          echo "SWIFT_BIN_PATH=$(swift build -c release -Xswiftc -swift-version -Xswiftc 5 --show-bin-path)" >> "$GITHUB_ENV"
+          # SwaTexRender's generated `Bundle.module` looks for its KaTeX fonts
+          # beside the .app, a spot codesign refuses to seal, so it never finds
+          # them in a hand-assembled bundle and traps on the first equation
+          # (issue #233). Mirrors app/build.sh.
+          swift package resolve
+          bash ../scripts/patch-swatex-font-lookup.sh .build/checkouts/SwaTex
+          swift build -c release
+          echo "SWIFT_BIN_PATH=$(swift build -c release --show-bin-path)" >> "$GITHUB_ENV"
 
       - name: Run Swift tests
         # Same rationale as the Zig tests — ci.yml covers the PR commit.
         if: github.event_name != 'pull_request'
         working-directory: app
-        run: swift test -Xswiftc -swift-version -Xswiftc 5
+        run: swift test
 
       # ── CLI tarball (standalone binary + libs) ──
       - name: Package CLI binary
@@ -201,6 +226,14 @@ jobs:
           mkdir -p "$STAGING/lib"
 
           cp zig-out/bin/mlx-serve "$STAGING/"
+
+          # License + third-party attributions. The tarball links Apache-2.0
+          # code (MTPLX/dflash/oMLX kernels, jinja.cpp) whose section 4 wants
+          # the license text and the NOTICE attributions to reach whoever
+          # receives the binary — a NOTICE that only lives in the git repo
+          # reaches nobody who downloads a release.
+          cp LICENSE LICENSE-APACHE-2.0 NOTICE "$STAGING/"
+
           # Self-built mlx + mlx-c (scripts/build-mlx.sh): libmlxc + libmlx +
           # sibling deps like libjaccl (@rpath-referenced — missing them causes
           # a "no such file" dyld error at startup) + the NAX-enabled metallib.
@@ -276,6 +309,20 @@ jobs:
           # App resources (tray icon etc.)
           cp -R app/Sources/MLXServe/Resources/* "$CONTENTS/Resources/" 2>/dev/null || true
 
+          # This .app is assembled by hand, so SwiftPM's SwaTex font bundle
+          # must be embedded explicitly (Xcode normally does this for us).
+          SWATEX_RESOURCE_BUNDLE="$SWIFT_BIN_PATH/SwaTex_SwaTexRender.bundle"
+          if [ ! -d "$SWATEX_RESOURCE_BUNDLE" ]; then
+            echo "::error::SwaTex font resource bundle missing"
+            exit 1
+          fi
+          cp -R "$SWATEX_RESOURCE_BUNDLE" "$CONTENTS/Resources/"
+
+          # License + third-party attributions inside the bundle (same reason
+          # as the CLI tarball above: the .app embeds the same Apache-2.0
+          # kernels and jinja.cpp). Mirrors app/build.sh.
+          cp LICENSE LICENSE-APACHE-2.0 NOTICE "$CONTENTS/Resources/"
+
           # vz-agent guest binary — required in EVERY build variant or the
           # sandbox boots the legacy console shell and MCP servers can never
           # connect (issue #89). Mirrors app/build.sh.
@@ -290,8 +337,8 @@ jobs:
           # Without the stamp the bundle ships whatever the committed plist
           # happens to say: v26.8.1 shipped an app reporting 26.7.12, so
           # UpdateChecker saw a permanently newer release and installing it
-          # never helped (the new DMG said 26.7.12 too). Stamp the COPY — the
-          # Homebrew step later rebases, which refuses a dirty tree.
+          # never helped (the new DMG said 26.7.12 too). Stamp the COPY —
+          # the committed plist stays clean.
           cp app/Info.plist "$CONTENTS/"
           /usr/libexec/PlistBuddy -c \
             "Set :CFBundleVersion ${{ steps.version.outputs.version }}" \
@@ -301,14 +348,14 @@ jobs:
             "$CONTENTS/Info.plist"
 
           # App icon
-          if [ -f app/appiconb.png ]; then
+          if [ -f app/appicon.png ]; then
             ICON_DIR=$(mktemp -d)
             ICONSET="$ICON_DIR/AppIcon.iconset"
             mkdir -p "$ICONSET"
             for size in 16 32 64 128 256 512; do
-              sips -z $size $size app/appiconb.png --out "$ICONSET/icon_${size}x${size}.png" > /dev/null 2>&1
+              sips -z $size $size app/appicon.png --out "$ICONSET/icon_${size}x${size}.png" > /dev/null 2>&1
               double=$((size * 2))
-              sips -z $double $double app/appiconb.png --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null 2>&1
+              sips -z $double $double app/appicon.png --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null 2>&1
             done
             iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/AppIcon.icns" 2>/dev/null || true
             rm -rf "$ICON_DIR"
@@ -469,6 +516,9 @@ jobs:
             echo "CHANGELOG_EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # The release is created as a DRAFT; the Homebrew formula push happens in
+      # homebrew.yml when the draft is PUBLISHED — pushing it here advertised a
+      # version whose assets weren't downloadable yet.
       - name: Create Release
         if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
         uses: softprops/action-gh-release@v2
@@ -492,34 +542,3 @@ jobs:
             mlx-serve-bin-macos-arm64.tar.gz
             MLXCore.dmg
           retention-days: 7
-
-      - name: Update Homebrew formulas
-        if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          DMG_SHA=$(shasum -a 256 MLXCore.dmg | awk '{print $1}')
-          CLI_SHA=$(shasum -a 256 mlx-serve-bin-macos-arm64.tar.gz | awk '{print $1}')
-
-          sed -i '' "s/version \".*\"/version \"$VERSION\"/" Casks/mlx-core.rb
-          sed -i '' "s/sha256 \".*\"/sha256 \"$DMG_SHA\"/" Casks/mlx-core.rb
-
-          sed -i '' "s/version \".*\"/version \"$VERSION\"/" Formula/mlx-serve.rb
-          sed -i '' "s/sha256 \".*\"/sha256 \"$CLI_SHA\"/" Formula/mlx-serve.rb
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Casks/mlx-core.rb Formula/mlx-serve.rb
-          git commit -m "brew: update to v$VERSION"
-
-          # Retry with rebase in case main advanced during the build
-          for i in 1 2 3 4 5; do
-            if git push origin HEAD:main; then
-              exit 0
-            fi
-            echo "push attempt $i rejected; rebasing on latest main and retrying..."
-            git fetch origin main
-            git rebase origin/main
-            sleep $((i * 2))
-          done
-          echo "failed to push Homebrew formula update after 5 attempts" >&2
-          exit 1

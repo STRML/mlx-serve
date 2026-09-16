@@ -134,6 +134,12 @@ final class VoiceModeController: ObservableObject {
     /// Make an agent active. Returns nil when the switch happened, or a sentence
     /// to SAY when it can't (its model isn't downloaded, a peer is offline).
     var selectAgent: ((UUID) -> String?)?
+    /// The session's trailing speakable assistant message, consulted at turn
+    /// submission (issue #119): whatever is already on the transcript when a
+    /// turn is submitted is history the user has heard, never something to
+    /// voice. Wired by `bind(appState:)`; nil in tests that drive
+    /// `observeAssistant` directly.
+    var alreadyHeardMessage: ((UUID) -> AnyHashable?)?
 
     private let recognizer: any SpeechRecognizing
     private let synthesizer: any SpeechSynthesizing
@@ -150,6 +156,13 @@ final class VoiceModeController: ObservableObject {
     /// Which assistant message we're currently voicing — when it changes (e.g. a
     /// new message in an agent loop) we restart sentence chunking for it.
     private var speakingMessageId: AnyHashable?
+    /// The assistant message that was already trailing the transcript when the
+    /// current turn was submitted (issue #119: the ghost-replay bug). The engine
+    /// flags the turn active BEFORE the user message lands in the session, so
+    /// the Combine feed re-fires with the PREVIOUS turn's answer still trailing
+    /// while we're `.thinking` — without this, that stale answer was adopted as
+    /// a brand-new message and re-read in full before every reply.
+    private var heardMessageId: AnyHashable?
 
     init(recognizer: any SpeechRecognizing,
          synthesizer: any SpeechSynthesizing,
@@ -229,6 +242,11 @@ final class VoiceModeController: ObservableObject {
         agentPhrases = { [weak appState] in
             guard let appState else { return [] }
             return appState.agents.wakePhrases
+        }
+        alreadyHeardMessage = { [weak appState] sid in
+            guard let appState,
+                  let session = appState.chatSessions.first(where: { $0.id == sid }) else { return nil }
+            return Self.messageToVoice(in: session.messages)?.id
         }
         selectAgent = { [weak appState, weak self] id in
             guard let appState, let agent = appState.agents.agent(id: id) else { return nil }
@@ -489,6 +507,10 @@ final class VoiceModeController: ObservableObject {
     private func submitTurn(_ text: String) {
         guard let runner, let ctx = turnContext?() else { return }
         boundSessionId = ctx.sessionId
+        // Mark the transcript's current trailing answer as heard BEFORE the
+        // engine publishes anything: the stale republish at turn start (turn
+        // active, user message not yet appended) must not re-voice it.
+        if let heard = alreadyHeardMessage?(ctx.sessionId) { heardMessageId = heard }
         // One builder, like every other turn site: the active agent's persona,
         // tools, sampling and workspace, with the voice-scoped toggles as the
         // defaults it overrides.
@@ -500,7 +522,7 @@ final class VoiceModeController: ObservableObject {
             thinkingEnabled: enableThinking,
             workingDirectory: ctx.workingDirectory)
         let config = ChatTurnEngine.TurnConfig.from(resolved, voiceStyle: true)
-        runner.runTurn(sessionId: ctx.sessionId, userText: text, images: nil, audio: nil,
+        runner.runTurn(sessionId: ctx.sessionId, userText: text, images: nil, videos: nil, audio: nil,
                        config: config, approval: { [weak self] tc in
             await self?.approvalDecision(for: tc) ?? false
         })
@@ -538,6 +560,9 @@ final class VoiceModeController: ObservableObject {
     /// just a single message's streaming flag).
     func observeAssistant(messageId: AnyHashable?, content: String, generating: Bool) {
         guard state == .thinking || state == .speaking else { return }
+        // A message that was already on the transcript when this turn was
+        // submitted is history — never re-voice it (issue #119's ghost replay).
+        if let messageId, messageId == heardMessageId { return }
 
         if messageId != speakingMessageId {
             // Switching messages (e.g. agent loop): speak the previous message's

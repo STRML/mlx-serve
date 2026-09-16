@@ -33,22 +33,76 @@ final class MusicGenService: ObservableObject {
 
     /// The `/v1/audio/music-generations` request body. Static + pure so unit
     /// tests pin the wire contract (omit-empty fields, seed resolution).
-    nonisolated static func requestBody(_ request: MusicGenRequest, modelName: String) -> [String: Any] {
+    nonisolated static func requestBody(_ request: MusicGenRequest, modelName: String, refAudioB64: String? = nil, srcAudioB64: String? = nil) -> [String: Any] {
+        // Sticky settings outlive a model switch: clamp the duration into THIS
+        // model's server-valid range rather than earn a 400.
+        let range = request.model.durationRange
+        let duration = Int(min(max(Double(request.durationSeconds), range.lowerBound), range.upperBound))
         var body: [String: Any] = [
             "model": modelName,
             "prompt": request.prompt,
-            "duration_seconds": request.durationSeconds,
+            "duration_seconds": duration,
             "stream": true,
         ]
-        let lyrics = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !lyrics.isEmpty { body["lyrics"] = lyrics }
-        let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !lang.isEmpty { body["vocal_language"] = lang }
-        if let bpm = request.bpm { body["bpm"] = bpm }
-        let ks = request.keyscale.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !ks.isEmpty { body["keyscale"] = ks }
-        let ts = request.timesignature.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !ts.isEmpty { body["timesignature"] = ts }
+        // `instrumental` and lyrics are a named 400 on BOTH backends, so the
+        // flag WINS here rather than letting the pair reach the server. On
+        // Music 3 an omitted lyrics field is the only spelling of "no words"
+        // that is accepted at all.
+        if request.instrumental {
+            body["instrumental"] = true
+        } else {
+            let lyrics = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !lyrics.isEmpty { body["lyrics"] = lyrics }
+        }
+        // Only the backend that reads `steps` gets it — ACE-Step Turbo ignores
+        // the field. Clamping mirrors the duration clamp above: sticky settings
+        // outlive a model switch and must not earn a 400.
+        if request.model.supportsSteps, let steps = request.steps {
+            let r = request.model.stepsRange
+            body["steps"] = min(max(steps, r.lowerBound), r.upperBound)
+        }
+        // The musical-metadata knob set is ACE-Step's; Music 3 names each
+        // field a 400 — gate the FIELDS here, not just the pane's controls
+        // (values may linger from an ACE session).
+        // Tempo and key go to BOTH engines; the server decides whether they
+        // are conditioning fields (ACE-Step) or caption text (Music 3).
+        if request.model.supportsTempoAndKey {
+            if let bpm = request.bpm { body["bpm"] = bpm }
+            let ks = request.keyscale.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ks.isEmpty { body["keyscale"] = ks }
+        }
+        // These two remain ACE-Step-only and are a named 400 elsewhere, so the
+        // FIELDS are gated here and not just the pane's controls — values
+        // linger in @State across a model switch.
+        if request.model.supportsMusicalMeta {
+            let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !lang.isEmpty { body["vocal_language"] = lang }
+            let ts = request.timesignature.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ts.isEmpty { body["timesignature"] = ts }
+        }
+        // Reference audio is ACE-Step's timbre slot; Music 3 names the field a
+        // 400, so the FIELD is gated like `steps` (a clip lingers in @State
+        // across a model switch).
+        if request.model.supportsReferenceAudio, let refAudioB64, !refAudioB64.isEmpty {
+            body["ref_audio"] = refAudioB64
+        }
+        // Source-audio tasks are ACE-Step's; the task decides which of its
+        // knobs travel (the server names a stray one a 400), and without a
+        // source clip the request stays plain text2music.
+        if request.model.supportsSourceAudio, request.task.needsSource, let srcAudioB64, !srcAudioB64.isEmpty {
+            body["task"] = request.task.rawValue
+            body["src_audio"] = srcAudioB64
+            switch request.task {
+            case .cover:
+                body["cover_strength"] = min(max(request.coverStrength, 0), 1)
+                body["cover_noise_strength"] = min(max(request.coverNoiseStrength, 0), 1)
+            case .complete:
+                let classes = request.trackClasses.filter { MusicTask.trackClasses.contains($0) }
+                if !classes.isEmpty { body["track_classes"] = classes }
+            case .text2music:
+                break
+            }
+        }
         // -1 = fresh random seed, resolved HERE so the log can show it.
         body["seed"] = request.seed >= 0 ? request.seed : Int.random(in: 0..<1_000_000_000)
         return body
@@ -63,18 +117,67 @@ final class MusicGenService: ObservableObject {
             "duration_seconds: \(request.durationSeconds)",
             "seed: \(resolvedSeed)",
         ]
-        let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !lang.isEmpty, lang != "unknown" { lines.append("vocal_language: \(lang)") }
-        if let bpm = request.bpm { lines.append("bpm: \(bpm)") }
-        let ks = request.keyscale.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !ks.isEmpty { lines.append("keyscale: \(ks)") }
-        let ts = request.timesignature.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !ts.isEmpty { lines.append("timesignature: \(ts)") }
+        // A setting that changed the output but not the sidecar is a silent
+        // setting — the .txt is what makes a track reproducible.
+        if request.instrumental { lines.append("instrumental: true") }
+        if request.model.supportsSteps, let steps = request.steps {
+            let r = request.model.stepsRange
+            lines.append("steps: \(min(max(steps, r.lowerBound), r.upperBound))")
+        }
+        if request.model.supportsTempoAndKey {
+            if let bpm = request.bpm { lines.append("bpm: \(bpm)") }
+            let ks = request.keyscale.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ks.isEmpty { lines.append("keyscale: \(ks)") }
+        }
+        if request.model.supportsMusicalMeta {
+            let lang = request.vocalLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !lang.isEmpty, lang != "unknown" { lines.append("vocal_language: \(lang)") }
+            let ts = request.timesignature.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ts.isEmpty { lines.append("timesignature: \(ts)") }
+        }
+        if request.model.supportsReferenceAudio, let ref = request.refAudioPath, !ref.isEmpty {
+            lines.append("ref_audio: \((ref as NSString).lastPathComponent)")
+        }
+        if request.model.supportsSourceAudio, request.task.needsSource, let src = request.srcAudioPath, !src.isEmpty {
+            lines.append("task: \(request.task.rawValue)")
+            lines.append("src_audio: \((src as NSString).lastPathComponent)")
+            if request.task == .cover {
+                lines.append("cover_strength: \(request.coverStrength)")
+                lines.append("cover_noise_strength: \(request.coverNoiseStrength)")
+            } else if !request.trackClasses.isEmpty {
+                lines.append("track_classes: \(request.trackClasses.joined(separator: ", "))")
+            }
+        }
         var out = lines.joined(separator: "\n")
         out += "\n\n# Style prompt\n" + request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let lyr = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
-        out += "\n\n# Lyrics\n" + (lyr.isEmpty ? "[Instrumental]" : lyr)
+        out += "\n\n# Lyrics\n" + (request.instrumental || lyr.isEmpty ? "[Instrumental]" : lyr)
         return out + "\n"
+    }
+
+    /// The reference clip (already a 48 kHz stereo WAV from
+    /// `AudioReference.referenceWav`) as base64 for `ref_audio`; nil when the
+    /// model has no timbre slot or no clip is attached.
+    nonisolated static func referenceB64(_ request: MusicGenRequest) -> String? {
+        guard request.model.supportsReferenceAudio, let path = request.refAudioPath, !path.isEmpty else { return nil }
+        return (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
+    }
+
+    /// The cover / complete source as base64; nil unless the model and task
+    /// take one.
+    nonisolated static func sourceB64(_ request: MusicGenRequest) -> String? {
+        guard request.model.supportsSourceAudio, request.task.needsSource,
+              let path = request.srcAudioPath, !path.isEmpty else { return nil }
+        return (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
+    }
+
+    /// Cover mode reads the FSQ tokenizer, shipped as `fsq.safetensors` beside
+    /// `model.safetensors`. Packs downloaded before it exist without the file.
+    /// `CoverWeightsFetch` owns the name — one spelling, or the app fetches a
+    /// file the server never looks for.
+    nonisolated static let coverWeightsFile = CoverWeightsFetch.fileName
+    nonisolated static func coverWeightsMissing(packDir: String) -> Bool {
+        !FileManager.default.fileExists(atPath: (packDir as NSString).appendingPathComponent(coverWeightsFile))
     }
 
     /// `<track>.wav` → `<track>.txt` companion path.
@@ -85,9 +188,31 @@ final class MusicGenService: ObservableObject {
     /// Generate through the ONE main server: ensure running (headless if
     /// needed), load the music model on demand, stream
     /// `/v1/audio/music-generations`, then unload unless "Keep loaded" is set.
-    func generate(_ request: MusicGenRequest, server: ServerManager) {
+    func generate(_ request: MusicGenRequest, server: ServerManager, downloads: DownloadManager? = nil) {
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             phase = .failed("Prompt is empty.")
+            return
+        }
+        if request.model.supportsSourceAudio, request.task.needsSource, request.srcAudioPath == nil {
+            phase = .failed("\(request.task.label) needs a source audio file.")
+            return
+        }
+        // TEMPORARY migration (2026-08-22): a pack downloaded before cover mode
+        // lacks fsq.safetensors; fetch just that file into the pack from the
+        // same repo, then generate. Drop once installs have re-downloaded.
+        if let downloads, request.lanModelId == nil, request.task == .cover,
+           let dir = ServerManager.resolveModelDir(repo: request.model.repo),
+           Self.coverWeightsMissing(packDir: dir) {
+            task?.cancel()
+            phase = .running(step: 0, total: 0, message: "Downloading cover weights (\(Self.coverWeightsFile))…")
+            downloads.startPackFile(repoId: request.model.repo, fileName: Self.coverWeightsFile) { [weak self] in
+                self?.generate(request, server: server)
+            }
+            return
+        }
+        if !MusicGenRequest.lyricsSatisfied(model: request.model, lyrics: request.lyrics,
+                                            instrumental: request.instrumental) {
+            phase = .failed("\(request.model.name) needs lyrics — put structure tags like [verse] on their own lines, or tick Instrumental.")
             return
         }
         guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
@@ -101,6 +226,8 @@ final class MusicGenService: ObservableObject {
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
         let keep = request.keepResident
+        let refB64 = Self.referenceB64(request)
+        let srcB64 = Self.sourceB64(request)
 
         task = Task {
             var loadedId: String? = nil
@@ -115,7 +242,7 @@ final class MusicGenService: ObservableObject {
                 // SSE stages: encode (conditioning) → diffuse (8 turbo steps)
                 // → decode (VAE chunks); the `complete` event carries the WAV.
                 var wav: Data? = nil
-                let reqJson = Self.requestBody(request, modelName: modelId)
+                let reqJson = Self.requestBody(request, modelName: modelId, refAudioB64: refB64, srcAudioB64: srcB64)
                 let resolvedSeed = reqJson["seed"] as? Int ?? request.seed
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/audio/music-generations",
@@ -127,7 +254,8 @@ final class MusicGenService: ObservableObject {
                         let stage = ev["stage"] as? String ?? "Generating"
                         let label: String
                         switch stage {
-                        case "encode": label = "Encoding prompt…"
+                        case "encode", "prefill": label = "Encoding prompt…"
+                        case "frames": label = "Composing (frame \(step)/\(total))…"
                         case "diffuse": label = "Composing (step \(step)/\(total))…"
                         case "decode": label = "Rendering audio (\(step)/\(total))…"
                         default: label = "\(stage)…"
@@ -176,12 +304,17 @@ final class MusicGenService: ObservableObject {
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MediaGenError.emptyInput("Prompt")
         }
+        if !MusicGenRequest.lyricsSatisfied(model: request.model, lyrics: request.lyrics,
+                                            instrumental: request.instrumental) {
+            throw MediaGenError.emptyInput("Lyrics (this model is lyric-conditioned; or set instrumental)")
+        }
         guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
             throw MediaGenError.notDownloaded(request.model.name)
         }
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
         let keep = request.keepResident
+        let refB64 = Self.referenceB64(request)
         let startedAt = Date()
         func report(_ step: Int, _ total: Int, _ message: String) {
             onProgress?(MediaGenProgress(kind: .music, step: step, total: total,
@@ -196,7 +329,7 @@ final class MusicGenService: ObservableObject {
         }
         do {
             var wav: Data? = nil
-            let reqJson = Self.requestBody(request, modelName: modelId)
+            let reqJson = Self.requestBody(request, modelName: modelId, refAudioB64: refB64)
             let resolvedSeed = reqJson["seed"] as? Int ?? request.seed
             for try await ev in api.streamGeneration(
                 port: port, path: "/v1/audio/music-generations", json: reqJson) {

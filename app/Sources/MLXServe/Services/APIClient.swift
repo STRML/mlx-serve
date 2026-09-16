@@ -12,7 +12,10 @@ enum SSEEvent {
     case reasoning(String)
     case usage(TokenUsage)
     case toolCalls([APIClient.ToolCall])
-    case maxTokensReached
+    /// The reply was CUT — `finish_reason: "length"`, whose cause comes from
+    /// the server's sibling `finish_details` (a max_tokens cap and a
+    /// degenerate-tail loop cut share the one OpenAI value).
+    case truncated(TruncationNotice.Cause)
     case done
 }
 
@@ -37,8 +40,23 @@ enum APIError: LocalizedError {
             if detail.isEmpty {
                 return "HTTP \(code) from mlx-serve. Check the server log (menu bar → log icon)."
             }
-            return "HTTP \(code) from mlx-serve\(detail)"
+            return "HTTP \(code) from mlx-serve: \(detail)"
         }
+    }
+
+    /// The server's error bodies are `{"error":{"message":"…"}}`, and its
+    /// named 400s exist to tell the user what to do — extract the message,
+    /// degrade to a trimmed snippet for foreign bodies, and never return
+    /// empty (an empty detail renders as a bare status code).
+    static func errorDetail(fromBody data: Data) -> String {
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let err = obj["error"] as? [String: Any],
+           let msg = err["message"] as? String, !msg.isEmpty {
+            return msg
+        }
+        let s = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return s.isEmpty ? "stream start failed" : String(s.prefix(300))
     }
 
     private static func looksLikeContextOverflow(_ detail: String) -> Bool {
@@ -66,6 +84,11 @@ struct RetryPolicy {
 }
 
 class APIClient {
+    /// Host used to reach the server. Set to `ServerOptions.host` at launch so
+    /// a server bound to a specific interface address is still reachable;
+    /// wide binds stay on loopback (the no-api-key trust boundary).
+    var host: String = "127.0.0.1"
+
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 600
@@ -75,8 +98,25 @@ class APIClient {
     }()
     private let decoder = JSONDecoder()
 
+    /// Build a URL pointing at the server, honouring `host`. The settings
+    /// field is free text, so anything that does not form a valid URL falls
+    /// back to loopback instead of trapping — a 1 s health poll must be able
+    /// to report the server down, not crash the app.
+    func serverURL(port: UInt16, path: String) -> URL {
+        var effectiveHost = host
+        if effectiveHost.isEmpty || effectiveHost == "0.0.0.0" || effectiveHost == "::" {
+            effectiveHost = "127.0.0.1"
+        }
+        if effectiveHost.hasPrefix("[") && effectiveHost.hasSuffix("]") {
+            effectiveHost = String(effectiveHost.dropFirst().dropLast())
+        }
+        let authority = effectiveHost.contains(":") ? "[\(effectiveHost)]" : effectiveHost
+        return URL(string: "http://\(authority):\(port)\(path)")
+            ?? URL(string: "http://127.0.0.1:\(port)\(path)")!
+    }
+
     func checkHealth(port: UInt16) async throws -> Bool {
-        let url = URL(string: "http://127.0.0.1:\(port)/health")!
+        let url = serverURL(port: port, path: "/health")
         let (data, response) = try await session.data(from: url)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             return false
@@ -99,7 +139,7 @@ class APIClient {
     /// callers prefer this over `fetchModels(port:)` so the picker UI can
     /// show loaded/unloaded badges per model.
     func fetchAllModels(port: UInt16) async throws -> [ModelInfo] {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/models")!
+        let url = serverURL(port: port, path: "/v1/models")
         let (data, _) = try await session.data(from: url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let dataArr = json["data"] as? [[String: Any]] else { return [] }
@@ -131,6 +171,11 @@ class APIClient {
         // server runs with `--no-vision` (the encoder isn't loaded), so this is
         // the live "can this model see images right now?" signal.
         let supportsVision = caps.contains("vision") || mods.contains("image")
+        // Video rides input_modalities only (no separate "video" capability —
+        // that string is already claimed by media-GENERATION models); it can
+        // never be true without supportsVision, since video piggybacks the
+        // same vision tower server-side.
+        let supportsVideo = supportsVision && mods.contains("video")
         // Encoder-only entries advertise "embeddings" even as unloaded stubs
         // (the server peeks model_type at discovery); architecture is the
         // belt-and-suspenders signal for loaded entries.
@@ -149,11 +194,14 @@ class APIClient {
             isMoE: meta["is_moe"] as? Bool ?? false,
             supportsAudio: supportsAudio,
             supportsVision: supportsVision,
+            supportsVideo: supportsVideo,
             supportsEmbeddings: supportsEmbeddings,
             capabilities: caps,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
             drafterPath: meta["drafter_path"] as? String,
             mtpLoaded: meta["mtp_loaded"] as? Bool ?? false,
+            mtpAvailable: meta["mtp_available"] as? Bool,
+            kvQuant: meta["kv_quant"] as? String ?? "",
             loaded: topLoaded,
             state: topState,
             bytesResident: topBytesResident,
@@ -164,22 +212,35 @@ class APIClient {
             recTemperature: meta["gen_temperature"] as? Double,
             recTopP: meta["gen_top_p"] as? Double,
             recTopK: meta["gen_top_k"] as? Int,
-            lanPeer: first["lan_peer"] as? String
+            lanPeer: (first["lan_peer"] as? String) ?? (first["provider"] as? String),
+            provider: first["provider"] as? String
         )
     }
 
     /// Plan 05 Phase G — POST /v1/load-model. Returns the resulting
     /// `ModelInfo` after the load completes (blocks for seconds on a cold
     /// load). Throws if the id is unknown (404) or load fails (500).
-    func loadModel(port: UInt16, id: String, drafterPath: String? = nil) async throws -> ModelInfo {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/load-model")!
+    /// The /v1/load-model request body. `setDefault` rides only on a model
+    /// SWITCH: it re-points the server's default (requests that omit `model`,
+    /// the "mlx-serve" alias, /v1/models' default-first sort). A media-gen
+    /// side-load must NOT carry it — it loads BESIDE the chat model, and
+    /// stealing the default would re-route every aliased chat request to a
+    /// model that 400s them.
+    static func loadModelBody(id: String, drafterPath: String?, setDefault: Bool) -> [String: Any] {
+        var body: [String: Any] = ["model": id]
+        if let drafterPath { body["drafter_path"] = drafterPath }
+        if setDefault { body["default"] = true }
+        return body
+    }
+
+    func loadModel(port: UInt16, id: String, drafterPath: String? = nil, setDefault: Bool = false) async throws -> ModelInfo {
+        let url = serverURL(port: port, path: "/v1/load-model")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // Load can take 10–60 s on a fresh model; raise above the default.
         request.timeoutInterval = 180
-        var body: [String: Any] = ["model": id]
-        if let drafterPath { body["drafter_path"] = drafterPath }
+        let body = Self.loadModelBody(id: id, drafterPath: drafterPath, setDefault: setDefault)
         // withoutEscapingSlashes: `id` may be an absolute path (the
         // auto-downloaded encoder registers by path) — keep it readable in
         // logs. The server unescapes either form.
@@ -201,8 +262,41 @@ class APIClient {
     /// keeps the stub so it can reload). Used by the media-gen
     /// load→generate→unload flow. Idempotent server-side; a non-resident model
     /// returns 200.
+    /// Ask the server to absorb models downloaded after it booted (discovery
+    /// only walks the roots at startup). Add-only and idempotent server-side.
+    func reloadProviders(port: UInt16) async throws {
+        let url = serverURL(port: port, path: "/v1/providers/reload")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw APIError.badStatus(code: (response as? HTTPURLResponse)?.statusCode ?? -1,
+                                     detail: String(decoding: data, as: UTF8.self))
+        }
+    }
+
+    func providerStatus(port: UInt16) async throws -> [ProviderStatus] {
+        let url = serverURL(port: port, path: "/v1/providers")
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        let (data, _) = try await session.data(for: request)
+        return ProviderStatus.decodeList(data)
+    }
+
+    func rescanModels(port: UInt16) async throws {
+        let url = serverURL(port: port, path: "/v1/models/rescan")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        let (_, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw APIError.badStatus(code: (response as? HTTPURLResponse)?.statusCode ?? -1, detail: "")
+        }
+    }
+
     func unloadModel(port: UInt16, id: String) async throws {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/unload-model")!
+        let url = serverURL(port: port, path: "/v1/unload-model")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -226,15 +320,30 @@ class APIClient {
                 do {
                     var body = json
                     body["stream"] = true
-                    var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!)
+                    var req = URLRequest(url: serverURL(port: port, path: path))
                     req.httpMethod = "POST"
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
-                    req.timeoutInterval = 900
+                    // Byte-silence timeout, reset by every SSE byte. One H3
+                    // denoise step at large sizes can be silent for ~50 min
+                    // and the VAE decode tail sends nothing (#152/#157), so
+                    // 900 killed the render mid-step. Stop still cancels:
+                    // task cancel → socket close → server peerClosed abort.
+                    req.timeoutInterval = 86_400
                     let (bytes, resp) = try await URLSession.shared.bytes(for: req)
                     let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
-                    guard code == 200 else { throw APIError.badStatus(code: code, detail: "stream start failed") }
+                    guard code == 200 else {
+                        // Read the error body: the server's named 400s say
+                        // what to do, and throwing without them left the
+                        // Failed card pointing at nothing.
+                        var raw = Data()
+                        for try await b in bytes {
+                            raw.append(b)
+                            if raw.count > 2048 { break }
+                        }
+                        throw APIError.badStatus(code: code, detail: APIError.errorDetail(fromBody: raw))
+                    }
                     for try await line in bytes.lines {
                         guard line.hasPrefix("data: ") else { continue }
                         let payload = String(line.dropFirst(6))
@@ -256,7 +365,7 @@ class APIClient {
     /// (the server runs one padded masked GPU forward per 64-text chunk).
     /// Returns one vector per input, in input order.
     func embeddings(port: UInt16, model: String, input: [String]) async throws -> [[Double]] {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/embeddings")!
+        let url = serverURL(port: port, path: "/v1/embeddings")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -281,12 +390,30 @@ class APIClient {
         }
     }
 
-    func fetchProps(port: UInt16) async throws -> MemoryInfo? {
-        let url = URL(string: "http://127.0.0.1:\(port)/props")!
+    struct PropsSnapshot {
+        let memory: MemoryInfo
+        /// nil when the server published no measured curve (the per-silicon
+        /// tables applied), which the UI reads as "nothing to show".
+        let specCost: SpecCostInfo?
+        let batching: BatchingInfo?
+    }
+
+    func fetchProps(port: UInt16) async throws -> PropsSnapshot? {
+        let url = serverURL(port: port, path: "/props")
         let (data, _) = try await session.data(from: url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mem = json["memory"] as? [String: Any] else { return nil }
-        return MemoryInfo.parse(mem)
+        return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json))
+    }
+
+    /// Live throughput feed. 503s when the server was launched without
+    /// `--metrics`, which reads as nil (the tray hides the rows).
+    func fetchThroughput(port: UInt16) async throws -> ThroughputSnapshot? {
+        let url = serverURL(port: port, path: "/metrics.json")
+        let (data, response) = try await session.data(from: url)
+        guard (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return ThroughputSnapshot.parse(json, at: Date().timeIntervalSinceReferenceDate)
     }
 
     // MARK: - Benchmarking
@@ -396,11 +523,26 @@ class APIClient {
         let rawArguments: String
     }
 
+    /// Read a cut's cause out of one streamed choice. Explicit repetition-loop
+    /// details take precedence over finish_reason: current servers use "stop"
+    /// for loop cuts, while older servers used "length". Without a recognized
+    /// loop cause, only "length" indicates a max_tokens cut.
+    ///
+    /// Static and dictionary-shaped so it is testable without a live stream.
+    static func truncationCause(fromChoice choice: [String: Any]?) -> TruncationNotice.Cause? {
+        guard let choice else { return nil }
+        if let details = choice["finish_details"] as? [String: Any],
+           let type = details["type"] as? String, type == "repetition_loop" {
+            return .repetitionLoop
+        }
+        return choice["finish_reason"] as? String == "length" ? .maxTokens : nil
+    }
+
     /// Per-request overrides that come from the user's saved ServerOptions.
     /// Each field is optional — `nil` = leave it out of the request body and
     /// let the server's default win. Pre-built once at the call site (usually
     /// from `ServerOptions`) and passed through unchanged.
-    struct RequestDefaults {
+    struct RequestDefaults: Equatable {
         var topP: Double? = nil
         var topK: Int? = nil
         var repeatPenalty: Double? = nil
@@ -413,9 +555,19 @@ class APIClient {
 
         /// Build from the user's saved settings: per-request TriState overrides
         /// translate to optional booleans; numeric defaults are forwarded only
-        /// when they differ from the canonical "off" value (e.g. topK=0 stays
-        /// nil — the server already treats 0 as disabled and we want to avoid
-        /// gratuitously bloating every request body).
+        /// when they differ from the canonical "off" value.
+        ///
+        /// topK=0 stays nil, and OMITTING it is not the same as sending 0 —
+        /// the earlier comment here had that backwards. The server resolves an
+        /// absent field through body > launch flags > the model's own
+        /// `generation_config.json` (`resolveSamplingDefault`), so omitting
+        /// hands the checkpoint's recommended cut to the request, while
+        /// sending 0 DISABLES the cut. That matters more than it sounds:
+        /// measured 2026-08-05 on a collapse-prone 4-bit MoE, off-distribution
+        /// tokens spliced into generated code at 1.20 per 1000 tokens with
+        /// top_k 0 against 0.04 with the card's top_k 20 — same model, same
+        /// temperature. Omitting is the behaviour we want; the reason is the
+        /// opposite of what was written here.
         static func from(_ opts: ServerOptions) -> RequestDefaults {
             var r = RequestDefaults()
             r.topP = opts.defaultTopP
@@ -435,11 +587,16 @@ class APIClient {
         maxTokens: Int = 2048,
         temperature: Double = 0.8,
         enableThinking: Bool = false,
+        reasoningEffort: String? = nil,
         tools: [[String: Any]]? = nil,
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
         retryPolicy: RetryPolicy = .default,
-        modelId: String? = nil
+        modelId: String? = nil,
+        /// Extend the trailing assistant message rather than answering after
+        /// it. The server needs this stated: a trailing assistant message is
+        /// ordinary history on this endpoint unless the request says otherwise.
+        continueFinalMessage: Bool = false
     ) -> AsyncThrowingStream<SSEEvent, Error> {
         AsyncThrowingStream { continuation in
             // Cancellation plumbing: AsyncThrowingStream does NOT propagate
@@ -462,10 +619,12 @@ class APIClient {
                         try await self.performStream(
                             port: port, messages: messages,
                             maxTokens: maxTokens, temperature: temperature,
-                            enableThinking: enableThinking, tools: tools,
+                            enableThinking: enableThinking,
+                            reasoningEffort: reasoningEffort, tools: tools,
                             toolsJSON: toolsJSON,
                             defaults: defaults,
                             modelId: modelId,
+                            continueFinalMessage: continueFinalMessage,
                             continuation: continuation
                         )
                         return  // success
@@ -505,13 +664,15 @@ class APIClient {
         maxTokens: Int,
         temperature: Double,
         enableThinking: Bool,
+        reasoningEffort: String? = nil,
         tools: [[String: Any]]? = nil,
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
         modelId: String? = nil,
+        continueFinalMessage: Bool = false,
         continuation: AsyncThrowingStream<SSEEvent, Error>.Continuation
     ) async throws {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
+        let url = serverURL(port: port, path: "/v1/chat/completions")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -549,6 +710,7 @@ class APIClient {
             // generation to the remaining context window.
             if maxTokens > 0 { parts.append("\"max_tokens\":\(maxTokens)") }
             if enableThinking { parts.append("\"enable_thinking\":true") }
+            if let v = reasoningEffort { parts.append("\"reasoning_effort\":\"\(v)\"") }
             if let v = defaults.topK { parts.append("\"top_k\":\(v)") }
             if let v = defaults.repeatPenalty { parts.append("\"repeat_penalty\":\(v)") }
             if let v = defaults.presencePenalty { parts.append("\"presence_penalty\":\(v)") }
@@ -569,6 +731,8 @@ class APIClient {
             // maxTokens <= 0 means "Auto": omit so the server pegs to context.
             if maxTokens > 0 { body["max_tokens"] = maxTokens }
             if enableThinking { body["enable_thinking"] = true }
+            if continueFinalMessage { body["continue_final_message"] = true }
+            if let v = reasoningEffort { body["reasoning_effort"] = v }
             if let v = defaults.topK { body["top_k"] = v }
             if let v = defaults.repeatPenalty { body["repeat_penalty"] = v }
             if let v = defaults.presencePenalty { body["presence_penalty"] = v }
@@ -602,17 +766,26 @@ class APIClient {
             return
         }
 
+        try await Self.consumeChatLines(bytes.lines, streamStart: streamStart, continuation: continuation)
+    }
+
+    static func consumeChatLines<Lines: AsyncSequence>(
+        _ lines: Lines,
+        streamStart: Date = Date(),
+        continuation: AsyncThrowingStream<SSEEvent, Error>.Continuation
+    ) async throws where Lines.Element == String {
         var firstTokenTime: Date?
         // Accumulate tool call deltas across chunks, keyed by index
         var pendingToolCalls: [String: (id: String, name: String, args: String)] = [:]
         var hasToolCalls = false
         var emittedToolCalls = false
+        var loopCut = false
         // Accumulated assistant content — used as last-resort source for tool-call
         // recovery when the server streams <tool_call> blocks as plain content
         // (e.g. some Qwen MoE outputs an older binary failed to parse).
         var contentAccumulator = ""
 
-        for try await line in bytes.lines {
+        for try await line in lines {
             guard line.hasPrefix("data: ") else { continue }
             let payload = String(line.dropFirst(6))
             if payload == "[DONE]" {
@@ -660,10 +833,14 @@ class APIClient {
                 )))
             }
 
-            guard let choices = chunk["choices"] as? [[String: Any]],
-                  let delta = choices.first?["delta"] as? [String: Any] else {
-                continue
+            guard let choices = chunk["choices"] as? [[String: Any]] else { continue }
+            // Explicit loop details identify an intentional cut even with
+            // finish_reason "stop"; bare "length" identifies a max_tokens cap.
+            if let cause = Self.truncationCause(fromChoice: choices.first) {
+                loopCut = loopCut || TruncationNotice.endsTurn(cause: cause)
+                continuation.yield(.truncated(cause))
             }
+            let delta = choices.first?["delta"] as? [String: Any] ?? [:]
             if firstTokenTime == nil {
                 firstTokenTime = Date()
             }
@@ -707,17 +884,13 @@ class APIClient {
                 }
             }
 
-            // Check finish_reason
-            if let fr = choices.first?["finish_reason"] as? String, fr == "length" {
-                continuation.yield(.maxTokensReached)
-            }
             // "length" + accumulated calls = a TRUNCATED tool call (max_tokens or
             // server stall-timeout cut it mid-args). Deliver the salvaged calls so
             // the agent loop's truncation branch (maxTokensHit && !calls.isEmpty)
             // fires the chunk-and-retry nudge — before this, the server hid the
             // cut behind finish_reason "tool_calls" and the model got blamed for
             // "omitting" content it actually generated.
-            if let fr = choices.first?["finish_reason"] as? String, fr == "tool_calls" || fr == "length" {
+            if !loopCut, let fr = choices.first?["finish_reason"] as? String, fr == "tool_calls" || fr == "length" {
                 var calls: [ToolCall] = []
                 for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
                     Self.appendToolLog("EMIT: name=\(tc.name) rawArgs=\(tc.args.prefix(500))")
@@ -733,7 +906,7 @@ class APIClient {
         }
 
         // Fallback: emit tool calls if stream ended without finish_reason
-        if hasToolCalls && !pendingToolCalls.isEmpty && !emittedToolCalls {
+        if !loopCut && hasToolCalls && !pendingToolCalls.isEmpty && !emittedToolCalls {
             Self.appendToolLog("FALLBACK_EMIT: no finish_reason, pending=\(pendingToolCalls.count)")
             var calls: [ToolCall] = []
             for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
@@ -751,7 +924,7 @@ class APIClient {
         // Last-resort: server emitted no tool_calls deltas at all but the
         // assistant content contains <tool_call>...</tool_call> blocks (older
         // server binary / unrecognized format). Recover them from content.
-        if !emittedToolCalls && contentAccumulator.contains("<tool_call>") {
+        if !loopCut && !emittedToolCalls && contentAccumulator.contains("<tool_call>") {
             let recovered = Self.extractToolCallsFromContent(contentAccumulator)
             if !recovered.isEmpty {
                 Self.appendToolLog("CONTENT_SCAN_RECOVER: count=\(recovered.count)")

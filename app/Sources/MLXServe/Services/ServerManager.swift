@@ -21,21 +21,45 @@ class ServerManager: ObservableObject {
     /// The model id chat requests should carry: the LAN selection when set,
     /// else the local default. Every chat surface reads THIS, never
     /// `modelInfo?.name` directly, so a LAN selection applies everywhere.
-    var chatModelId: String? { lanChatModelId ?? modelInfo?.name }
+    var chatModelId: String? { lanChatModelId ?? residentChatModel?.name }
     /// Metadata for the chat model (context length, vision, architecture):
     /// the LAN entry when one is selected and discovered, else the local
-    /// default's info.
+    /// model that can actually hold a conversation.
     var chatModelInfo: ModelInfo? {
         if let lan = lanChatModelId, let info = allModels.first(where: { $0.name == lan }) { return info }
-        return modelInfo
+        return residentChatModel
+    }
+    /// The local entry that can ANSWER a chat request. Also the benchmark
+    /// target: `modelInfo` is whatever loaded first (an image model counts),
+    /// and a LAN entry would measure another Mac under this one's hardware row.
+    var residentChatModel: ModelInfo? {
+        if let m = modelInfo, m.servesChat, m.loaded { return m }
+        return allModels.first { $0.servesChat && $0.loaded && $0.lanPeer == nil }
     }
     /// Discovered LAN models advertising `capability` ("chat", "image",
     /// "video", "music", "audio", "3d"). Empty when the server is down or
     /// discovery is off — pickers then show local models only.
+    /// What is resident on THIS Mac — the tray's "In Memory" list. A remote
+    /// row (LAN peer or provider) may report `loaded` from where it runs, but
+    /// nothing here holds it and nothing here can eject it.
+    var residentModels: [ModelInfo] {
+        allModels.filter { $0.loaded && $0.lanPeer == nil }
+    }
+
     func lanModels(capability: String) -> [ModelInfo] {
         allModels.filter { $0.lanAdvertises(capability) }
     }
     @Published var memoryInfo: MemoryInfo?
+    /// What the server's measured spec-decode cost model resolved for the
+    /// resident model. nil = the per-silicon tables applied.
+    @Published var specCost: SpecCostInfo?
+    @Published var batching: BatchingInfo?
+    /// Live throughput, nil when the server runs without `--metrics`.
+    @Published var throughput: ThroughputSnapshot?
+    /// Live decode / prefill tok/s, derived from the gauge delta between the
+    /// last two polls.
+    @Published var decodeTPSNow: Double?
+    @Published var prefillTPSNow: Double?
     @Published var port: UInt16 = 11234
     @Published var currentModelPath: String = ""
     @Published var lastError: String = ""
@@ -44,7 +68,7 @@ class ServerManager: ObservableObject {
     private var healthTimer: Timer?
     private var healthTask: Task<Void, Never>?
     private var pollSource: DispatchSourceTimer?
-    private let api = APIClient()
+    let api = APIClient()
     /// True while the tray popover is on screen. Drives the live /props
     /// ticker — when the popover is closed there's nothing to render, so we
     /// stop polling entirely instead of burning 3 s ticks in the background.
@@ -53,21 +77,6 @@ class ServerManager: ObservableObject {
     private var menuIsVisible = false
 
     /// Off-main raw stderr buffer. **There is no `@Published` mirror.**
-    ///
-    /// Why: SwiftUI's `@EnvironmentObject` re-evaluates a view's `body` on
-    /// any `@Published` change of the observed object, regardless of which
-    /// properties the body actually reads. `ChatView` observes
-    /// `ServerManager` (for status / model info), so a `@Published` log
-    /// would force a ChatView body recompute on every flush — competing
-    /// with the SSE token loop on the main thread. Even throttled to
-    /// ~10 Hz that was enough to make generation visibly choppy when the
-    /// log window was open.
-    ///
-    /// Instead, the log views own a small `LogPoller` (`@StateObject`)
-    /// that ticks at its own rate and reads `currentServerLogSnapshot()`.
-    /// Only those views re-render on log activity; everything else
-    /// (ChatView, Settings, the menu popover header) is fully insulated
-    /// from stderr volume.
     let logBuffer = ThrottledLogBuffer(maxBytes: serverLogMaxBytes)
     /// Hard cap on the retained stderr tail shown in the Server Log window.
     /// Was 64 KB (~800 lines) — a single chunked-prefill trace or a model-load
@@ -109,8 +118,7 @@ class ServerManager: ObservableObject {
     func start(modelPath: String, options: ServerOptions) {
         guard status != .running, status != .starting else { return }
 
-        // Resolve symlinks for the model path
-        let resolvedModel = (modelPath as NSString).resolvingSymlinksInPath
+        let resolvedModel = Self.launchModelPath(modelPath)
         currentModelPath = resolvedModel
 
         var args = ["--model", resolvedModel]
@@ -120,41 +128,37 @@ class ServerManager: ObservableObject {
         // (`<root>/<org>/<model>`); the selected model still loads via `--model`
         // and dedups against its discovered entry by path. (Was: the selected
         // model's parent dir, which scoped discovery to one org.)
-        let modelDir = Self.discoveryModelDir(selectedModel: resolvedModel, modelsRoot: Self.modelsRoot)
-        args += options.toCLIArgs(modelDirOverride: modelDir.isEmpty ? nil : modelDir)
+        args += options.toCLIArgs(modelDirs: Self.launchModelDirs(selectedModel: resolvedModel))
         launch(args: args, options: options)
     }
-
-    /// Has a headless server already had the selected chat model hot-loaded
-    /// by `ensureDefaultChatModel`? Reset on every launch; only consulted for
-    /// headless launches (`currentModelPath` empty).
-    private var chatDefaultEnsured = false
 
     /// Should a chat surface hot-load the selected model before its turn?
     /// True exactly when: the server is running, it was launched HEADLESS
     /// (media-first — no `--model`, so the registry has NO default and the
-    /// "mlx-serve" alias 503s with no_model), we haven't already ensured it,
+    /// "mlx-serve" alias 503s with no_model), no chat model is resident (an unload
+    /// or idle eviction drops the default, so a once-per-process latch 503'd),
     /// and the app actually has a selected model to offer. Pure + static so
     /// the gen-first→chat-later hole (live 2026-07-05) stays unit-pinned.
     nonisolated static func shouldEnsureChatDefault(running: Bool, launchedModelPath: String,
-                                                    alreadyEnsured: Bool, selectedModelPath: String) -> Bool {
-        running && launchedModelPath.isEmpty && !alreadyEnsured && !selectedModelPath.isEmpty
+                                                    chatResident: Bool, selectedModelPath: String) -> Bool {
+        running && launchedModelPath.isEmpty && !chatResident && !selectedModelPath.isEmpty
     }
 
     /// Called by chat surfaces (chat window / quick launcher via
     /// ChatTurnEngine, the avatar) before a turn: when the running server was
     /// started headless for media generation, hot-load the user's selected
     /// chat model by ABSOLUTE PATH (works for org/name two-level dirs; the
-    /// server dedups by path and promotes the first chat-capable load to its
+    /// server dedups by path and promotes the latest chat-capable load to its
     /// default, so the alias-addressed request that follows resolves).
     /// Failures are left to the request itself to surface.
     func ensureDefaultChatModel(selectedModelPath: String) async {
         guard Self.shouldEnsureChatDefault(running: status == .running,
                                            launchedModelPath: currentModelPath,
-                                           alreadyEnsured: chatDefaultEnsured,
+                                           chatResident: residentChatModel != nil,
                                            selectedModelPath: selectedModelPath) else { return }
         if (try? await loadModel(id: selectedModelPath)) != nil {
-            chatDefaultEnsured = true
+            // Recorded here, not in `loadModel`: this hot-load passes no `setDefault`.
+            StartupModelChoice.recordLoaded(path: selectedModelPath)
         }
     }
 
@@ -166,7 +170,12 @@ class ServerManager: ObservableObject {
     func startHeadless(modelsDir: String, options: ServerOptions) {
         guard status != .running, status != .starting else { return }
         currentModelPath = ""
-        let args = options.toCLIArgs(modelDirOverride: modelsDir.isEmpty ? nil : modelsDir)
+        // `modelsDir` is the caller's primary root; the rest of the library's
+        // folders ride along so a headless boot discovers everything the picker
+        // shows, not just one folder (`launchModelDirs` de-dups).
+        var dirs = ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected())
+        if !modelsDir.isEmpty, !dirs.contains(modelsDir) { dirs.insert(modelsDir, at: 0) }
+        let args = options.toCLIArgs(modelDirs: Array(dirs.prefix(ModelRoots.serverRootLimit)))
         launch(args: args, options: options)
     }
 
@@ -175,9 +184,9 @@ class ServerManager: ObservableObject {
     /// termination handler, and health polling.
     private func launch(args: [String], options: ServerOptions) {
         port = options.port
+        api.host = options.host
         status = .starting
         lastError = ""
-        chatDefaultEnsured = false
         clearServerLog()
 
         // Reap orphaned mlx-serve processes still bound to our port (e.g. left
@@ -243,6 +252,23 @@ class ServerManager: ObservableObject {
         }
     }
 
+    /// The server is a CHILD PROCESS, so quitting the app has to signal it or
+    /// it survives with the whole model resident (#133: ⌘Q and the Quit menu
+    /// left `mlx-serve` holding gigabytes; the tray's power button was the only
+    /// path that worked, because it was the only one calling `stop()` first).
+    /// The teardown belongs here rather than on a button or in the app
+    /// delegate: this object spawned the process, and there is exactly one of
+    /// it, so every quit route is covered by construction.
+    init() {
+        quitObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stop() }
+        }
+    }
+
+    private var quitObserver: NSObjectProtocol?
+
     func stop() {
         pollSource?.cancel()
         pollSource = nil
@@ -268,15 +294,19 @@ class ServerManager: ObservableObject {
         process = nil
         status = .stopped
         modelInfo = nil
+        // `residentChatModel` falls back to `allModels.first { loaded }` when
+        // `modelInfo` is nil — leaving this stale after a stop meant a picker
+        // switch made while stopped still reported the OLD model resident
+        // (nothing had reloaded `allModels` yet), so the pill kept naming the
+        // model that was resident before the stop instead of the one just
+        // picked, and Start looked like it might launch either one.
+        allModels = []
         memoryInfo = nil
-    }
-
-    func toggle(modelPath: String, options: ServerOptions) {
-        if status == .running || status == .starting {
-            stop()
-        } else {
-            start(modelPath: modelPath, options: options)
-        }
+        specCost = nil
+        batching = nil
+        throughput = nil
+        decodeTPSNow = nil
+        prefillTPSNow = nil
     }
 
     /// Distill a crashed server's stderr tail into one human-meaningful line for
@@ -303,8 +333,9 @@ class ServerManager: ObservableObject {
             return "Out of GPU memory while loading the model — free memory (close other models/apps) and try again."
         }
         // Otherwise surface the most meaningful fatal line, scanning from the end.
+        // Request/tool-result preview lines are conversation text, never a cause.
         let needles = ["terminating due to", "MLX error", "MISSING WEIGHT", "[fatal]", "panic", "error:"]
-        for line in lines.reversed() {
+        for line in lines.reversed() where !isRequestPreviewLine(line) {
             if needles.contains(where: { line.localizedCaseInsensitiveContains($0) }) {
                 // Strip the C++ "...uncaught exception of type T: " preamble.
                 if let r = line.range(of: "std::runtime_error: ") {
@@ -313,7 +344,24 @@ class ServerManager: ObservableObject {
                 return line
             }
         }
-        return lines.last ?? "exit code \(exitCode)"
+        return lines.last(where: { !isRequestPreviewLine($0) }) ?? "exit code \(exitCode)"
+    }
+
+    /// A server request/tool-result preview line (`> "..."`) echoes the
+    /// conversation's own text into the log — its content can match any error
+    /// needle without being the crash cause.
+    nonisolated static func isRequestPreviewLine(_ line: String) -> Bool {
+        line.trimmingCharacters(in: .whitespaces).hasPrefix("> \"")
+    }
+
+    /// Whether a crashed server's log is a memory failure — either our own
+    /// pre-flight refusal or a Metal GPU out-of-memory. Mirrors the two
+    /// memory branches of `summarizeCrash`; drives the "here's what's using
+    /// memory" advice in the crash alert. Pure + testable.
+    nonisolated static func isMemoryFailure(_ log: String) -> Bool {
+        if log.contains("Insufficient memory to load model") { return true }
+        return log.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory")
+            || (log.contains("[METAL]") && log.localizedCaseInsensitiveContains("Insufficient Memory"))
     }
 
     private func handleTermination(exitCode: Int32) {
@@ -436,7 +484,22 @@ class ServerManager: ObservableObject {
     private func presentCrashAlert(title: String, log: String, exitCode: Int32) {
         let alert = NSAlert()
         alert.messageText = title
-        alert.informativeText = "Exit code \(exitCode). Full server log below — select & copy, or use the Copy Log button."
+
+        var info = ""
+        // A memory failure is fixable from here, so lead with what to do about
+        // it — which apps to quit (with how much that frees), and the two other
+        // levers — before the raw exit-code/log line.
+        if Self.isMemoryFailure(log) {
+            let apps = RunningAppsMemory.topApps(limit: 4)
+            if apps.isEmpty {
+                info = "Not enough free memory to load the model. Quit some other apps to free memory, or turn on Settings ▸ Skip memory preflight, or pick a smaller model.\n\n"
+            } else {
+                let freed = MemoryInfo.format(RunningAppsMemory.totalBytes(apps))
+                info = "Not enough free memory to load the model. Using the most right now: \(RunningAppsMemory.summaryLine(apps)) — quitting these frees about \(freed). You can also turn on Settings ▸ Skip memory preflight, or pick a smaller model.\n\n"
+            }
+        }
+        info += "Exit code \(exitCode). Full server log below — select & copy, or use the Copy Log button."
+        alert.informativeText = info
         alert.alertStyle = .warning
 
         // Scrollable, selectable, monospaced log view as the accessory.
@@ -458,13 +521,14 @@ class ServerManager: ObservableObject {
     private func startHealthPolling() {
         healthTask?.cancel()
         let checkPort = port
+        let healthURL = api.serverURL(port: checkPort, path: "/health")
         // Use a GCD timer on the main queue — guaranteed to fire even during init.
         // URLSession completion runs on a background queue and dispatches back to main.
         let source = DispatchSource.makeTimerSource(queue: .main)
         source.schedule(deadline: .now() + 1, repeating: 1.0)
         source.setEventHandler { [weak self] in
             guard let self else { source.cancel(); return }
-            let url = URL(string: "http://127.0.0.1:\(checkPort)/health")!
+            let url = healthURL
             URLSession.shared.dataTask(with: url) { data, response, error in
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200,
                       let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -503,6 +567,8 @@ class ServerManager: ObservableObject {
     private func transitionToRunning() {
         guard status != .running else { return }
         status = .running
+        // A `--model` launch gets here only once loaded; headless leaves the path empty.
+        StartupModelChoice.recordLoaded(path: currentModelPath)
         Task { await self.refreshModels() }
         // If the user has the menu open at the exact moment the server comes
         // up, start the live /props ticker now so the GPU-memory bar fills in
@@ -521,15 +587,6 @@ class ServerManager: ObservableObject {
     /// Wire the popover's open/close into the live-polling state. Called
     /// from `StatusMenuView`'s `onAppear`/`onDisappear`. Drives the /props
     /// ticker so it only runs when there's a UI on screen to consume it.
-    ///
-    /// - When the menu opens while the server is `.running`: immediate
-    ///   `refreshStatus()` + start the 3 s ticker.
-    /// - When the menu closes while the server is `.running`: cancel the
-    ///   ticker.
-    /// - During `.starting` / `.stopped`: no-op on close (we'd cancel the
-    ///   health-check poll by accident otherwise). On open during `.starting`,
-    ///   the health source is already ticking; we just record the visibility
-    ///   for when the server transitions.
     func setMenuVisible(_ visible: Bool) {
         guard menuIsVisible != visible else { return }
         menuIsVisible = visible
@@ -549,8 +606,17 @@ class ServerManager: ObservableObject {
     }
 
     private func refreshStatus() async {
-        if let mem = try? await api.fetchProps(port: port) {
-            memoryInfo = mem
+        if let props = try? await api.fetchProps(port: port) {
+            memoryInfo = props.memory
+            specCost = props.specCost
+            batching = props.batching
+        }
+        if let snap = try? await api.fetchThroughput(port: port) {
+            if let prev = throughput {
+                decodeTPSNow = snap.decodeTPS(since: prev)
+                prefillTPSNow = snap.prefillTPS(since: prev)
+            }
+            throughput = snap
         }
         // Intentionally do NOT poll /v1/models here. The registry snapshot is
         // already populated once on `transitionToRunning` and again after every
@@ -565,15 +631,52 @@ class ServerManager: ObservableObject {
     func refreshModels() async {
         if let all = try? await api.fetchAllModels(port: port) {
             allModels = all
-            if let first = all.first { modelInfo = first }
+            // Headless servers sort no default first, so the head row can be an unloaded stub.
+            modelInfo = all.first { $0.loaded && $0.lanPeer == nil }
+        }
+    }
+
+    /// Fire-and-forget: have the running server pick up models downloaded
+    /// after it booted (POST /v1/models/rescan), then refresh the list so the
+    /// media panes' "On This Mac" rows see them. No-op when stopped — the
+    /// next boot's discovery covers it.
+    /// Ask the running server to re-read providers.json and re-probe, then
+    /// pick up the new rows.
+    func reloadProviders() async {
+        guard status == .running else { return }
+        try? await api.reloadProviders(port: port)
+        await refreshModels()
+    }
+
+    func providerStatus() async -> [ProviderStatus] {
+        guard status == .running else { return [] }
+        return (try? await api.providerStatus(port: port)) ?? []
+    }
+
+    func rescanModels() {
+        guard status == .running else { return }
+        Task {
+            try? await api.rescanModels(port: port)
+            await refreshModels()
         }
     }
 
     /// Plan 05 Phase G — explicit hot-load. Posts /v1/load-model and
     /// refreshes the model list on success. Throws on 404/500/timeout so
     /// callers can fall back to a server restart if hot-switch fails.
-    func loadModel(id: String, drafterPath: String? = nil) async throws -> ModelInfo {
-        let info = try await api.loadModel(port: port, id: id, drafterPath: drafterPath)
+    /// `setDefault` = a model SWITCH: the server re-points its default, so
+    /// the refreshed list sorts the new model first (`modelInfo` follows) and
+    /// aliased requests route to it — the parts a restart used to provide.
+    func loadModel(id: String, drafterPath: String? = nil, setDefault: Bool = false) async throws -> ModelInfo {
+        let info = try await api.loadModel(port: port, id: id, drafterPath: drafterPath, setDefault: setDefault)
+        // A switch moves what the process is serving without restarting it;
+        // keep `currentModelPath` honest for the readers that gate on it
+        // (TaskScheduler's pinned-model check, TestServer's status).
+        if setDefault, id.hasPrefix("/") {
+            currentModelPath = id
+            // Only a chat switch records: media models hot-load through here too.
+            StartupModelChoice.recordLoaded(path: id)
+        }
         await refreshModels()
         return info
     }
@@ -629,23 +732,23 @@ class ServerManager: ObservableObject {
         _ = dir
         if status == .running { return port }
         if status != .starting {
-            let modelsRoot = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
-            startHeadless(modelsDir: modelsRoot, options: lastLaunchedOptions ?? ServerOptions())
+            startHeadless(modelsDir: Self.modelsRoot, options: lastLaunchedOptions ?? ServerOptions())
         }
         try await waitUntilRunning(timeout: 240)
         return port
     }
 
-    /// Poll `status` until the health loop flips it to `.running` (or `.error`).
-    /// Internal (not `private`) — `AppState.useModelAndAwaitReady` awaits this
-    /// too, for the Model Browser's "Use" button.
+    /// Poll `status` until the health loop flips it to `.running`. `.error` and
+    /// `.stopped` end the wait: every caller starts the server first, so a stop
+    /// seen here ended the launch being waited on.
     func waitUntilRunning(timeout: TimeInterval) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             switch status {
             case .running: return
             case .error(let m): throw GenServerError.startFailed(m)
-            default: break
+            case .stopped: throw GenServerError.startFailed("server was stopped")
+            case .starting: break
             }
             try? await Task.sleep(nanoseconds: 300_000_000)
         }
@@ -654,31 +757,58 @@ class ServerManager: ObservableObject {
 
     /// The canonical download store — the SINGLE source of truth for models the
     /// app manages. `--model-dir` points here so discovery sees everything.
-    nonisolated static let modelsRoot = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
+    /// Where the app's own downloads live. Reads the configured destination
+    /// (`ModelRoots`) rather than hardcoding the path a second time — this was
+    /// a private copy of `DownloadManager`'s string, and two copies of a path
+    /// the user can now change is one that gets missed.
+    nonisolated static var modelsRoot: String { ModelRoots().downloadRoot }
 
-    /// The `--model-dir` to launch with so the registry discovers the user's
-    /// whole library (making `/v1/models` match the model dropdown), not just
-    /// the selected model's org folder. When the selected model lives under the
-    /// models root, scan the WHOLE root (`<root>/<org>/<model>` two-level
-    /// discovery). When it lives OUTSIDE (LM Studio / a custom folder the app
-    /// can point at), fall back to its parent so at least its siblings surface —
-    /// the server takes a single `--model-dir`, so the mlx-serve root is the
-    /// right default for everything the app itself downloaded. Pure + testable.
-    nonisolated static func discoveryModelDir(selectedModel: String, modelsRoot: String) -> String {
-        let model = (selectedModel as NSString).standardizingPath
-        let root = (modelsRoot as NSString).standardizingPath
-        if model == root || model.hasPrefix(root + "/") { return modelsRoot }
-        return (selectedModel as NSString).deletingLastPathComponent
+    /// The `--model` spelling of the selected model path. Standardizes (`~`,
+    /// `..`, `//`) but NEVER follows symlinks: an HF-cache GGUF quant is a
+    /// `<quant>.gguf` symlink to an extensionless `blobs/<sha256>` file, and
+    /// the server routes GGUF by the `.gguf` extension — the resolved blob
+    /// path fell through to the MLX directory loader and died `NotDir` (#158).
+    nonisolated static func launchModelPath(_ selected: String) -> String {
+        (selected as NSString).standardizingPath
     }
 
-    /// Resolve a HuggingFace repo id to its local model directory under
-    /// `~/.mlx-serve/models` — the SINGLE source of truth for downloaded
-    /// models. No HF-cache fallback: the app owns downloads (chat + media), so
-    /// a model the user hasn't downloaded through us simply isn't available.
-    /// nil when the model dir isn't present. The media-gen services call this
-    /// before loading.
+    /// Every `--model-dir` a launch should carry: all configured library
+    /// folders, plus the selected model's own parent when it lives outside all
+    /// of them.
+    nonisolated static func launchModelDirs(selectedModel: String,
+                                            roots: [String]? = nil) -> [String] {
+        var dirs = roots ?? ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected())
+        let model = (selectedModel as NSString).standardizingPath
+        guard !model.isEmpty else { return dirs }
+        let covered = dirs.contains { root in
+            let r = (root as NSString).standardizingPath
+            return model == r || model.hasPrefix(r + "/")
+        }
+        if !covered, dirs.count < ModelRoots.serverRootLimit {
+            let parent = (selectedModel as NSString).deletingLastPathComponent
+            if !parent.isEmpty, !dirs.contains(parent) { dirs.append(parent) }
+        }
+        return dirs
+    }
+
+    /// Resolve a HuggingFace repo id to its local model directory, checking
+    /// every SERVED root (`ModelRoots.readRoots`) — the download destination
+    /// first, then the built-in `~/.mlx-serve/models`, LM Studio and the
+    /// custom scan folder, so a pack in any folder the server serves doesn't
+    /// read as `.modelMissing` and get offered as a full re-download. No
+    /// HF-cache fallback: the app owns downloads (chat + media), so a model
+    /// the user hasn't downloaded through us simply isn't available. nil when
+    /// no root holds it. The media-gen services call this before loading.
     static func resolveModelDir(repo: String) -> String? {
-        resolveModelDir(repo: repo, modelsRoot: modelsRoot)
+        resolveModelDir(repo: repo, roots: ModelRoots.readRoots())
+    }
+
+    /// Multi-root form of the pure core below; first root holding the repo wins.
+    nonisolated static func resolveModelDir(repo: String, roots: [String]) -> String? {
+        for root in roots {
+            if let dir = resolveModelDir(repo: repo, modelsRoot: root) { return dir }
+        }
+        return nil
     }
 
     /// Pure, root-injectable core (testable against a temp dir). "Is it on
@@ -749,7 +879,12 @@ class ServerManager: ObservableObject {
         return "mlx-serve"
     }
 
+    /// Note this never runs at app exit — a `@StateObject` is not deallocated
+    /// on termination, the process simply goes away. That is why killing the
+    /// child on quit rides `willTerminateNotification` (see `init`) and not
+    /// this; deinit only covers a ServerManager that is genuinely discarded.
     deinit {
+        if let o = quitObserver { NotificationCenter.default.removeObserver(o) }
         pollSource?.cancel()
         healthTask?.cancel()
         healthTimer?.invalidate()
@@ -765,9 +900,6 @@ class ServerManager: ObservableObject {
 /// append without hopping to main on every chunk — that hop was the
 /// per-token bottleneck that starved ChatView's SSE loop when the log
 /// window was open.
-///
-/// `@unchecked Sendable` is honest here: the only shared state (`content`)
-/// is fully guarded by `lock`. There are no escaping references.
 final class ThrottledLogBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var content = ""
@@ -779,11 +911,6 @@ final class ThrottledLogBuffer: @unchecked Sendable {
     /// Only re-trim once the buffer exceeds the cap by 25%, then cut back to
     /// the cap. That amortizes the O(n) `suffix` copy over `maxBytes / 4`
     /// appended characters instead of paying it on every append.
-    ///
-    /// CONTRACT: the buffer always retains AT LEAST the last `maxBytes`
-    /// characters and never exceeds `maxRetained`. Trimming down to a
-    /// low-water mark instead would keep a strict `maxBytes` ceiling but throw
-    /// away a quarter of the tail every cycle — worse for a log.
     var maxRetained: Int { maxBytes + maxBytes / 4 }
     private var highWater: Int { maxRetained }
 
@@ -825,13 +952,6 @@ final class ThrottledLogBuffer: @unchecked Sendable {
 
 /// Pull-based bridge from `ThrottledLogBuffer` (off-main, lock-guarded
 /// source of truth) to a SwiftUI view that wants to render the log.
-///
-/// `ServerManager` deliberately does NOT publish the log — see the
-/// comment above `logBuffer` for why. Views that want live log content
-/// own a `LogPoller` as `@StateObject`, call `start()` on appear and
-/// `stop()` on disappear. The view re-renders on each `text` change at
-/// its own rate (default ~2 Hz); the rest of the app — ChatView,
-/// Settings, the menu popover — is fully insulated from log volume.
 @MainActor
 final class LogPoller: ObservableObject {
     /// Latest snapshot fetched from the source. Only assigned when

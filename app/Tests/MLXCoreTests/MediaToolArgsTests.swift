@@ -104,7 +104,7 @@ final class MediaToolArgsTests: XCTestCase {
         let req = try! MediaToolArgs.image(["prompt": "a fox"],
                                            model: .mageFlowTurbo8bit,
                                            saved: ImageModelPreset.mageFlowTurbo8bit.defaultResolution,
-                                           seed: -1, safeMode: true, keepResident: false, lanId: nil)
+                                           seed: -1, keepResident: false, lanId: nil)
         XCTAssertEqual(req.steps, ImageModelPreset.mageFlowTurbo8bit.fixedSteps)
     }
 
@@ -112,7 +112,7 @@ final class MediaToolArgsTests: XCTestCase {
         let m = ImageModelPreset.flux2Klein4B_Q4
         let req = try! MediaToolArgs.image(["prompt": "a fox"], model: m,
                                            saved: m.defaultResolution,
-                                           seed: -1, safeMode: true, keepResident: false, lanId: nil)
+                                           seed: -1, keepResident: false, lanId: nil)
         XCTAssertEqual(req.steps, m.settings(MediaChatDefaults.imageQuality).steps)
         XCTAssertEqual(req.prompt, "a fox")
     }
@@ -121,7 +121,7 @@ final class MediaToolArgsTests: XCTestCase {
         XCTAssertThrowsError(try MediaToolArgs.image(["size": "1024x1024"],
                                                      model: .flux2Klein4B_Q4,
                                                      saved: ImageModelPreset.flux2Klein4B_Q4.defaultResolution,
-                                                     seed: -1, safeMode: true, keepResident: false, lanId: nil)) { err in
+                                                     seed: -1, keepResident: false, lanId: nil)) { err in
             XCTAssertTrue("\(err)".contains("prompt"), "\(err)")
         }
     }
@@ -158,6 +158,29 @@ final class MediaToolArgsTests: XCTestCase {
         XCTAssertEqual(MediaToolArgs.musicSeconds("45"), 45)
         XCTAssertEqual(MediaToolArgs.musicSeconds(nil), MediaChatDefaults.musicSeconds)
         XCTAssertEqual(MediaToolArgs.musicSeconds("a while"), MediaChatDefaults.musicSeconds)
+    }
+
+    // An omitted duration used to be a flat 30 s — which the tool description
+    // actively invited ("omit for 30") — so a full lyric sheet was cut off
+    // mid-song. With lyrics in hand the fallback is derived from them; the
+    // model's own number still wins whenever it sends one.
+    func testAnOmittedDurationIsSizedToTheLyrics() {
+        let sheet = (1...24).map { "line \($0)" }.joined(separator: "\n")
+        let sized = MediaToolArgs.musicSeconds(nil, lyrics: "[verse]\n" + sheet)
+        XCTAssertGreaterThan(sized, 100, "24 sung lines do not fit in 30 seconds")
+        XCTAssertLessThanOrEqual(sized, MediaChatDefaults.musicSecondsRange.upperBound)
+
+        // Section tags are not sung, so they don't buy time.
+        XCTAssertEqual(MediaToolArgs.musicSeconds(nil, lyrics: "[verse]\n[chorus]\n[outro]"),
+                       MediaChatDefaults.musicSeconds)
+        // No lyrics → the short instrumental preview, unchanged.
+        XCTAssertEqual(MediaToolArgs.musicSeconds(nil, lyrics: ""), MediaChatDefaults.musicSeconds)
+        // An explicit request is never second-guessed.
+        XCTAssertEqual(MediaToolArgs.musicSeconds("45", lyrics: sheet), 45)
+        // A novel's worth of lyrics still lands in the server's range.
+        let huge = (1...5000).map { "line \($0)" }.joined(separator: "\n")
+        XCTAssertEqual(MediaToolArgs.musicSeconds(nil, lyrics: huge),
+                       MediaChatDefaults.musicSecondsRange.upperBound)
     }
 
     func testMusicDefaultsToAShortPreviewNotTheWindowsSixtySeconds() {
@@ -297,8 +320,23 @@ final class MediaToolArgsTests: XCTestCase {
                                           saved: VideoModelPreset.ltx23Q4.defaultResolution,
                                           keepResident: false, lanId: nil)
         XCTAssertEqual(req.mode, .oneStage)
-        XCTAssertEqual(req.steps, MediaChatDefaults.videoSteps)
+        XCTAssertEqual(req.steps, MediaChatDefaults.videoSteps(for: .ltx23Q4))
         XCTAssertEqual(req.numFrames, MediaToolArgs.videoFrames(nil, model: .ltx23Q4))
+    }
+
+    /// Chat previews run each model's own FAST tier, never a shared constant:
+    /// 8 steps is LTX's fast preset, but H3 is not step-distilled — its
+    /// validated floor is 16 — so the LTX-shaped constant produced a bad clip
+    /// after 15+ minutes of GPU. LTX stays byte-identical at 8.
+    func testVideoStepsFollowTheModelsOwnFastTier() throws {
+        XCTAssertEqual(MediaChatDefaults.videoSteps(for: .ltx23Q4), 8)
+        XCTAssertEqual(MediaChatDefaults.videoSteps(for: .minimaxH3),
+                       VideoModelPreset.minimaxH3.settings(.fast).steps)
+        let h3 = try MediaToolArgs.video(["prompt": "clouds"], model: .minimaxH3,
+                                         saved: VideoModelPreset.minimaxH3.defaultResolution,
+                                         keepResident: false, lanId: nil)
+        XCTAssertEqual(h3.steps, VideoModelPreset.minimaxH3.settings(.fast).steps)
+        XCTAssertGreaterThanOrEqual(h3.steps, 16, "below H3's validated floor")
     }
 
     func testVideoSizeSnapsToATrainedBucket() throws {

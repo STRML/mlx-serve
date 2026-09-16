@@ -83,7 +83,14 @@ enum MediaChatDefaults {
     /// preview and every extra second is another ~30 s of GPU.
     static let videoSeconds: Double = 2
     static let videoMaxSeconds: Double = 4
-    static let videoSteps = 8
+    /// Preview steps are the MODEL's own fast tier, never a shared constant:
+    /// the old `videoSteps = 8` was LTX's fast preset applied to everything,
+    /// and H3 is not step-distilled — its validated floor is 16, so a chat
+    /// preview burned 15+ minutes of GPU on an off-recipe clip. LTX still
+    /// resolves to 8.
+    static func videoSteps(for model: VideoModelPreset) -> Int {
+        model.settings(.fast).steps
+    }
     static let videoMode: VideoPipelineMode = .oneStage
 }
 
@@ -236,7 +243,7 @@ enum MediaToolArgs {
     }
 
     static func image(_ args: [String: String], model: ImageModelPreset,
-                      saved: ResolutionOption, seed: Int, safeMode: Bool,
+                      saved: ResolutionOption, seed: Int,
                       keepResident: Bool, lanId: String?) throws -> ImageGenRequest {
         let prompt = try required(args, "prompt", tool: "generate_image",
                                   example: #"{"prompt": "a red fox in the snow at golden hour"}"#)
@@ -248,7 +255,7 @@ enum MediaToolArgs {
         return ImageGenRequest(
             model: model, prompt: prompt, seed: seed,
             width: resolution.width, height: resolution.height, steps: steps,
-            keepResident: keepResident, lanModelId: lanId, safeMode: safeMode)
+            keepResident: keepResident, lanModelId: lanId)
     }
 
     // MARK: - Speech
@@ -271,14 +278,36 @@ enum MediaToolArgs {
 
     // MARK: - Music
 
-    static func musicSeconds(_ raw: String?) -> Int {
+    static func musicSeconds(_ raw: String?, lyrics: String = "") -> Int {
         // Models write "45" but also "45 seconds" and "45.0" — read the leading
         // number rather than refusing a perfectly clear request.
         guard let raw, let v = Double(raw.prefix(while: { $0.isNumber || $0 == "." })), v.isFinite else {
-            return MediaChatDefaults.musicSeconds
+            return clampMusicSeconds(secondsForLyrics(lyrics) ?? MediaChatDefaults.musicSeconds)
         }
-        return min(max(Int(v), MediaChatDefaults.musicSecondsRange.lowerBound),
-                   MediaChatDefaults.musicSecondsRange.upperBound)
+        return clampMusicSeconds(Int(v))
+    }
+
+    private static func clampMusicSeconds(_ v: Int) -> Int {
+        min(max(v, MediaChatDefaults.musicSecondsRange.lowerBound),
+            MediaChatDefaults.musicSecondsRange.upperBound)
+    }
+
+    /// Seconds a lyric sheet needs, or nil when there is nothing sung. The
+    /// flat 30 s default cut full songs off mid-verse (and the tool schema
+    /// invited it: "omit for 30"), so an omitted duration is derived from the
+    /// words instead: ~4 s a sung line plus 15 for intro/outro, rounded up to
+    /// a quarter minute. Section tags are directives, not lines to sing.
+    /// Erring long is the cheap direction — Music 3 treats the duration as an
+    /// upper bound and ACE-Step fills the tail, while erring short truncates
+    /// the song the user asked for.
+    static func secondsForLyrics(_ lyrics: String) -> Int? {
+        let sung = lyrics.split(separator: "\n").filter { line in
+            let t = line.trimmingCharacters(in: .whitespaces)
+            return !t.isEmpty && !(t.hasPrefix("[") && t.hasSuffix("]"))
+        }
+        guard !sung.isEmpty else { return nil }
+        let raw = 15 + sung.count * 4
+        return (raw + 14) / 15 * 15
     }
 
     /// Beats per minute, clamped to the engine's `[30,300]` — outside it the
@@ -341,7 +370,7 @@ enum MediaToolArgs {
             bpm: musicBpm(args["bpm"]),
             keyscale: musicKeyscale(args["keyscale"]),
             timesignature: musicTimeSignature(args["time_signature"]),
-            durationSeconds: musicSeconds(args["duration_seconds"]),
+            durationSeconds: musicSeconds(args["duration_seconds"], lyrics: text(args, "lyrics") ?? ""),
             keepResident: keepResident, lanModelId: lanId)
     }
 
@@ -354,10 +383,15 @@ enum MediaToolArgs {
         let seconds = min(max(requested?.isFinite == true ? requested! : MediaChatDefaults.videoSeconds,
                               1.0 / Double(max(model.fps, 1))),
                           MediaChatDefaults.videoMaxSeconds)
-        let ladderFloor = model.frameOptions.first ?? 9
+        // The pane's ladder reaches below the model's trained range on purpose
+        // — with a warning under the slider. Chat has no such slider and nobody
+        // is watching, so an unattended preview stays inside the tested range:
+        // the floor here is the model's verdict floor, not the ladder's.
+        let ladderFloor = model.frameOptions.first { $0 >= model.testedFrameFloor }
+            ?? model.frameOptions.first ?? 9
         let cap = model.framesCovering(durationSeconds: MediaChatDefaults.videoMaxSeconds) ?? ladderFloor
         let n = model.framesCovering(durationSeconds: seconds) ?? ladderFloor
-        return min(n, cap)
+        return min(max(n, ladderFloor), max(cap, ladderFloor))
     }
 
     static func video(_ args: [String: String], model: VideoModelPreset,
@@ -372,7 +406,7 @@ enum MediaToolArgs {
             numFrames: videoFrames(args["seconds"], model: model),
             fps: model.fps,
             mode: MediaChatDefaults.videoMode,
-            steps: MediaChatDefaults.videoSteps,
+            steps: MediaChatDefaults.videoSteps(for: model),
             cfgScale: 1.0,
             keepResident: keepResident,
             lanModelId: lanId)

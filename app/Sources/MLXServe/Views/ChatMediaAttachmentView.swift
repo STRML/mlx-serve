@@ -36,19 +36,16 @@ struct ChatMediaAttachmentView: View {
 
     var body: some View {
         if !ref.exists {
-            // An image's BYTES live in the transcript, so the picture is still
-            // on screen when its file is gone — a warning row under a perfectly
-            // visible image is noise, and the Reveal button would open nothing.
-            // A track or a clip has nothing left to show, so it says so.
-            if ref.kind != .image { missingRow }
+            // Every kind says so now. An image used to be the exception because
+            // its bytes rode the transcript, so the picture stayed on screen
+            // with the file gone; it is drawn FROM the file today, and a
+            // silently blank space is the one thing worse than a warning row.
+            missingRow
         } else {
             switch ref.kind {
             case .audio: ChatAudioAttachment(ref: ref)
             case .video: ChatVideoAttachment(ref: ref)
-            // The picture itself rides `ChatMessage.images`; this is the caption
-            // + Reveal-in-Finder row that sits under it, the same one a track
-            // and a clip get.
-            case .image: ChatMediaCaption(ref: ref).frame(maxWidth: 400)
+            case .image: ChatImageAttachment(ref: ref)
             }
         }
     }
@@ -64,28 +61,81 @@ struct ChatMediaAttachmentView: View {
     }
 }
 
-/// Prompt + Reveal-in-Finder, shared by the audio and video rows. The prompt is
-/// what makes a bare timestamped filename mean something months later.
+/// A generated picture in the transcript, drawn from its file.
+///
+/// The file in `~/.mlx-serve/generations` is what the generator wrote, so this
+/// shows the original rather than the re-encoded JPEG the history used to
+/// carry beside it. Double-click opens it, the same gesture an uploaded image
+/// has in the bubble above.
+private struct ChatImageAttachment: View {
+    let ref: ChatMediaRef
+
+    /// Read ONCE on appear. Reading it in `body` would re-open the file on
+    /// every render, and the transcript re-renders on every streamed token.
+    @State private var image: NSImage?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let image {
+                let box = ChatImagePreview.displaySize(
+                    for: image,
+                    maxHeight: ChatMetrics.generatedImageHeight,
+                    maxWidth: ChatMetrics.generatedMediaMaxWidth)
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    // The picture's own box, so the corners round the picture.
+                    .frame(width: box.width, height: box.height)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .onTapGesture(count: 2) {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: ref.path))
+                    }
+                    .help("Double-click to open")
+            }
+            // Compact tightens the caption to one line rather than dropping it.
+            ChatMediaCaption(ref: ref, lines: ChatMetrics.compactMode ? 1 : 2)
+        }
+        // Leading: `maxWidth` alone centres.
+        .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth, alignment: .leading)
+        .onAppear {
+            if image == nil { image = NSImage(contentsOfFile: ref.path) }
+        }
+    }
+}
+
+/// Reveal the generated file in Finder.
+private struct RevealInFinderButton: View {
+    let path: String
+
+    var body: some View {
+        Button {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        } label: {
+            Image(systemName: "folder")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Reveal in Finder")
+    }
+}
+
+/// Prompt + Reveal-in-Finder, shared by the image, audio and video rows. The
+/// prompt is what makes a bare timestamped filename mean something months later.
 private struct ChatMediaCaption: View {
     let ref: ChatMediaRef
+    var lines: Int = 2
 
     var body: some View {
         HStack(spacing: 6) {
             Text(ref.prompt.isEmpty ? ref.filename : ref.prompt)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
+                .lineLimit(lines)
                 .truncationMode(.tail)
             Spacer(minLength: 4)
-            Button {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: ref.path)])
-            } label: {
-                Image(systemName: "folder")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .help("Reveal in Finder")
+            RevealInFinderButton(path: ref.path)
         }
     }
 }
@@ -121,22 +171,24 @@ private struct ChatAudioAttachment: View {
                 .help(isPlaying ? "Stop" : "Play")
 
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(ref.filename)
+                    Text(L10n.text(ref.filename))
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     if let duration {
-                        Text(duration)
+                        Text(L10n.text(duration))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 }
                 Spacer(minLength: 4)
+                // Compact drops the caption, so the button joins the play row.
+                if ChatMetrics.compactMode { RevealInFinderButton(path: ref.path) }
             }
-            ChatMediaCaption(ref: ref)
+            if !ChatMetrics.compactMode { ChatMediaCaption(ref: ref) }
         }
         .padding(10)
-        .frame(maxWidth: 420, alignment: .leading)
+        .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth, alignment: .leading)
         .background(Color(.controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .onAppear { if duration == nil { duration = Self.durationText(ref.path) } }
@@ -167,10 +219,14 @@ private struct ChatVideoAttachment: View {
                     Color.black.opacity(0.15)
                 }
             }
-            .frame(maxWidth: 420, minHeight: 220, maxHeight: 260)
+            // Fixed box: the clip's ratio is unknown until the asset loads.
+            .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth,
+                   minHeight: ChatMetrics.generatedVideoHeight,
+                   maxHeight: ChatMetrics.generatedVideoHeight)
             .clipShape(RoundedRectangle(cornerRadius: 10))
-            ChatMediaCaption(ref: ref)
-                .frame(maxWidth: 420)
+            // An AVPlayerView's own controls own all four corners.
+            ChatMediaCaption(ref: ref, lines: ChatMetrics.compactMode ? 1 : 2)
+                .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth, alignment: .leading)
         }
         // Built on appear, not in the initializer: a transcript can hold many
         // clips and an AVPlayer per row would be built during every view update.
@@ -197,7 +253,7 @@ struct MediaProgressCard: View {
                     Image(systemName: progress.kind.icon)
                         .font(.callout)
                         .foregroundStyle(.tint)
-                    Text(progress.title)
+                    Text(L10n.text(progress.title))
                         .font(.caption.weight(.semibold))
                     Spacer(minLength: 8)
                     TimelineView(.periodic(from: progress.startedAt, by: 1)) { context in
@@ -216,7 +272,7 @@ struct MediaProgressCard: View {
                 }
                 .frame(maxWidth: .infinity)
 
-                Text(progress.detailText)
+                Text(L10n.text(progress.detailText))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

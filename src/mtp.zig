@@ -33,6 +33,8 @@ const mrope = @import("mrope.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const log = @import("log.zig");
+const io_util_mod = @import("io_util.zig");
+const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -53,6 +55,54 @@ const Weights = model_mod.Weights;
 pub const DEFAULT_DEPTH: u32 = 3;
 pub const MAX_DEPTH: u32 = 8;
 
+/// `--max-mtp-ctx`: MTP stays off past this many prompt tokens (inclusive; 0 = unlimited).
+/// A machine limit: `enable_mtp:true` in the body does not lift it. MTP only.
+pub fn mtpCtxWithinLimit(max: u32, ctx_tokens: usize) bool {
+    if (max == 0) return true;
+    return ctx_tokens <= @as(usize, max);
+}
+
+/// Per-silicon adaptive depth cap for machines on the `.generic` cost
+/// surface. The cap is a MACHINE measurement, so each row is one, never
+/// interpolated between chips; an unmeasured chip keeps the default row.
+///   M1 Pro: 4 (2026-08-20, Qwen3.8-27B iQ-3.8bpw, forced-depth sweep:
+///     13.01 tok/s at depth 4 vs 10.78/9.63 at 5/6 — the verify width 6
+///     cliff; auto at cap 6 measured 10.64, barely over --no-mtp's 10.57).
+/// `chip` is sysctl machdep.cpu.brand_string via `ane_mod.chipBrand`
+/// (the GPU arch string cannot tell Ultra from Max); "" lands on default.
+/// The row carries its own LABEL so the resolve site can say which one it
+/// applied: a bare depth=4 in the spec-stats line is indistinguishable from
+/// the EV controller having picked 4 on its own, or from `--mtp-depth 4`.
+/// `measured` marks a row a HUMAN swept as realized throughput. Those beat the
+/// boot probe's cost ladder, which cannot see acceptance or the extension sync
+/// — see `generate.mtpDepthCapResolved`.
+pub const DepthCap = struct { cap: u32, label: []const u8, measured: bool = false };
+
+pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
+    if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return .{ .cap = 4, .label = "m1-pro", .measured = true };
+    // Base M4 (2026-08-22, tester report, Qwen3.5-9B-MTPLX 6-bit, 16 GB):
+    // saturated echo, median of 5, decode tok/s by forced depth —
+    //   3: 47.44   4: 55.50   5: 47.50   6: 47.28
+    // Depth 4 is the only width where the cap BINDS (m_lo == cap), so the
+    // plan collapses to one chunk and pays no extension sync; from 5 on every
+    // round pays it to buy ~1 more accepted token (4.00 -> 4.96/round) and
+    // that trade is a 17% net LOSS there. Novel content sits at depth ~2
+    // whatever the cap is, so capping at 4 costs nothing outside the echo
+    // regime. The boot probe picks 6 on this chip — a cost ladder cannot see
+    // either half of that sentence.
+    if (std.mem.indexOf(u8, chip, "M4") != null and
+        std.mem.indexOf(u8, chip, "M4 Pro") == null and
+        std.mem.indexOf(u8, chip, "M4 Max") == null and
+        std.mem.indexOf(u8, chip, "M4 Ultra") == null) return .{ .cap = 4, .label = "m4-base", .measured = true };
+    if (std.mem.indexOf(u8, chip, "M4 Max") != null) return .{ .cap = default_cap, .label = "m4-max", .measured = true };
+    // Base M5 only — the Pro/Max/Ultra dies are their own (unmeasured) rows.
+    if (std.mem.indexOf(u8, chip, "M5") != null and
+        std.mem.indexOf(u8, chip, "M5 Pro") == null and
+        std.mem.indexOf(u8, chip, "M5 Max") == null and
+        std.mem.indexOf(u8, chip, "M5 Ultra") == null) return .{ .cap = 4, .label = "m5", .measured = true };
+    return .{ .cap = default_cap, .label = "default" };
+}
+
 /// Exact full-round cost surfaces known to the adaptive MTP controller.
 /// Selection is based on runtime tensor geometry, never a model/repository
 /// name. `generic` retains the conservative M1-M4 surface and auto cap.
@@ -60,17 +110,328 @@ pub const MtpCostProfile = enum {
     generic,
     g17_nax_q8_gs32,
     g17_nax_q4_gs32,
+    g17_nax_q4_gs64,
+    g17_nax_q6_gs64,
+    g17_nax_q8_gs64,
     g17_nax_oq4e_q4_gs64,
+    g17_nax_qwen4_q4_gs64,
+    g17_nax_qwen4_mixed_4_8_gs64,
 };
 
-fn m5NaxCostProfileForQuant(bits: u32, group_size: u32) MtpCostProfile {
-    if (bits == 4 and group_size == 64) return .g17_nax_oq4e_q4_gs64;
-    if (group_size == 32) return switch (bits) {
-        8 => .g17_nax_q8_gs32,
-        4 => .g17_nax_q4_gs32,
-        else => .generic,
+/// Target-side tensors that contribute materially to a complete MTP round.
+/// This is deliberately a single classification rather than independent
+/// booleans: one bound target can match at most one measured cost surface.
+pub const MtpNaxTargetSurface = enum {
+    none,
+    uniform_quantized_embedding,
+    uniform_bf16_embedding,
+    uniform_q6_quantized_embedding,
+    uniform_q8_bf16_embedding,
+    oqe_quantized_embedding,
+};
+
+/// Pure first-stage classifier for a complete sidecar/target fingerprint.
+/// Runtime tensor-shape validation below must still pass before the returned
+/// calibrated profile is used.
+pub fn m5NaxCostProfileForFingerprint(
+    bits: u32,
+    group_size: u32,
+    target_surface: MtpNaxTargetSurface,
+) MtpCostProfile {
+    return switch (target_surface) {
+        .uniform_quantized_embedding => if (group_size == 32) switch (bits) {
+            8 => .g17_nax_q8_gs32,
+            4 => .g17_nax_q4_gs32,
+            else => .generic,
+        } else .generic,
+        .uniform_bf16_embedding => if (bits == 4 and group_size == 64)
+            .g17_nax_q4_gs64
+        else
+            .generic,
+        .uniform_q6_quantized_embedding => if (bits == 6 and group_size == 64)
+            .g17_nax_q6_gs64
+        else
+            .generic,
+        .uniform_q8_bf16_embedding => if (bits == 8 and group_size == 64)
+            .g17_nax_q8_gs64
+        else
+            .generic,
+        .oqe_quantized_embedding => if (bits == 4 and group_size == 64)
+            .g17_nax_oq4e_q4_gs64
+        else
+            .generic,
+        .none => .generic,
     };
-    return .generic;
+}
+
+/// Pure first-stage classifier for the qwen4_exp in-checkpoint head. The
+/// trunk is MoE, so the sidecar fingerprint path above can never match it;
+/// this is its own measured surface, not a widening of the sidecar ones.
+pub fn qwen4G17CostProfileForFingerprint(
+    trunk_affine: bool,
+    trunk_bits: u32,
+    trunk_group_size: u32,
+    head_packs_match: bool,
+    nax_lane_live: bool,
+) MtpCostProfile {
+    if (!trunk_affine or trunk_bits != 4 or trunk_group_size != 64) return .generic;
+    if (!head_packs_match) return .generic;
+    if (!nax_lane_live) return .generic;
+    return .g17_nax_qwen4_q4_gs64;
+}
+
+const Qwen4MixedGeometry = struct {
+    hidden: u32 = 2560,
+    layers: u32 = 48,
+    hc: u32 = 4,
+    experts: u32 = 512,
+    top_k: u32 = 10,
+    expert_width: u32 = 640,
+    vocab: u32 = 248320,
+    ple_layer: i32 = 1,
+    kv_bits: u32 = 8,
+    kv_group: u32 = 64,
+    head_kv_bits: u32 = 8,
+    head_kv_group: u32 = 64,
+};
+
+fn qwen4MixedCostProfileForFingerprint(geometry: Qwen4MixedGeometry, packs_match: bool, rerank_ready: bool, nax_live: bool) MtpCostProfile {
+    if (!std.meta.eql(geometry, Qwen4MixedGeometry{}) or !packs_match or !rerank_ready or !nax_live) return .generic;
+    return .g17_nax_qwen4_mixed_4_8_gs64;
+}
+
+fn qwen4MixedPackMatches(w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, logical: []const c_int, bits: u32) bool {
+    if (logical.len < 2 or logical.len > 3 or (bits != 4 and bits != 8)) return false;
+    if (w.ctx == null or s.ctx == null or b.ctx == null) return false;
+    if (mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(s) != .bfloat16 or mlx.mlx_array_dtype(b) != .bfloat16) return false;
+    const ws = mlx.getShape(w);
+    const ss = mlx.getShape(s);
+    const bs = mlx.getShape(b);
+    if (ws.len != logical.len or ss.len != logical.len or !std.mem.eql(c_int, ss, bs)) return false;
+    const last = logical.len - 1;
+    for (logical[0..last], ws[0..last], ss[0..last]) |want, wc, sc| {
+        if (want <= 0 or wc != want or sc != want) return false;
+    }
+    const k = logical[last];
+    if (k <= 0 or @mod(k, 64) != 0) return false;
+    return @as(i64, ws[last]) * 32 == @as(i64, k) * bits and ss[last] == @divExact(k, 64);
+}
+
+test "Qwen4 mixed pack matcher pins actual quantization geometry" {
+    const stream = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    for ([_]u32{ 4, 8 }) |bits| for ([_]bool{ false, true }) |stacked| {
+        const words: c_int = @intCast(bits * 2);
+        const logical: []const c_int = if (stacked) &.{ 2, 16, 64 } else &.{ 16, 64 };
+        const ws: []const c_int = if (stacked) &.{ 2, 16, words } else &.{ 16, words };
+        const ss: []const c_int = if (stacked) &.{ 2, 16, 1 } else &.{ 16, 1 };
+        var w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w);
+        var scales = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(scales);
+        var biases = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(biases);
+        try mlx.check(mlx.mlx_zeros(&w, ws.ptr, @intCast(ws.len), .uint32, stream));
+        try mlx.check(mlx.mlx_zeros(&scales, ss.ptr, @intCast(ss.len), .bfloat16, stream));
+        try mlx.check(mlx.mlx_zeros(&biases, ss.ptr, @intCast(ss.len), .bfloat16, stream));
+        try testing.expect(qwen4MixedPackMatches(w, scales, biases, logical, bits));
+        try testing.expect(!qwen4MixedPackMatches(w, scales, biases, logical, if (bits == 4) 8 else 4));
+        try testing.expect(!qwen4MixedPackMatches(w, scales, .{}, logical, bits));
+        try testing.expect(!qwen4MixedPackMatches(w, scales, biases, &.{ 16, 128 }, bits));
+        var wrong_dtype = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wrong_dtype);
+        try mlx.check(mlx.mlx_zeros(&wrong_dtype, ss.ptr, @intCast(ss.len), .float32, stream));
+        try testing.expect(!qwen4MixedPackMatches(w, wrong_dtype, biases, logical, bits));
+        try testing.expect(!qwen4MixedPackMatches(w, scales, wrong_dtype, logical, bits));
+    };
+}
+
+test "Qwen4 mixed MTP profile requires its measured geometry and packs" {
+    try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_mixed_4_8_gs64, qwen4MixedCostProfileForFingerprint(.{}, true, true, true));
+    inline for (.{ "hidden", "layers", "hc", "experts", "top_k", "expert_width", "vocab", "ple_layer", "kv_bits", "kv_group", "head_kv_bits", "head_kv_group" }) |field| {
+        var geometry: Qwen4MixedGeometry = .{};
+        @field(geometry, field) += 1;
+        try testing.expectEqual(MtpCostProfile.generic, qwen4MixedCostProfileForFingerprint(geometry, true, true, true));
+    }
+    for ([_]bool{ false, true }) |packs| for ([_]bool{ false, true }) |rerank| for ([_]bool{ false, true }) |nax| {
+        if (packs and rerank and nax) continue;
+        try testing.expectEqual(MtpCostProfile.generic, qwen4MixedCostProfileForFingerprint(.{}, packs, rerank, nax));
+    };
+}
+
+test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" {
+    const path = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !transformer_mod.verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, a, std.mem.span(path));
+    defer if (config.ngram_table_path) |name| a.free(name);
+    var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    const old_kv_flag = Transformer.mtp_head_kv_quant_flag;
+    defer Transformer.mtp_head_kv_quant_flag = old_kv_flag;
+    Transformer.mtp_head_kv_quant_flag = true;
+    try xfm.cache.reinit(config.num_hidden_layers, transformer_mod.KVQuantConfig.affine(8));
+    try xfm.qwen4MtpApplyKvQuant(transformer_mod.KVQuantConfig.affine(8));
+    try testing.expect(xfm.qwen4BuildDraftRerank());
+    try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_mixed_4_8_gs64, qwen4G17CostProfile(&xfm));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, transformer_mod.KVQuantConfig.dense));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, transformer_mod.KVQuantConfig.affine(4)));
+    const old_bias = xfm.qwen4_mtp.?.fc_emb_b;
+    defer xfm.qwen4_mtp.?.fc_emb_b = old_bias;
+    xfm.qwen4_mtp.?.fc_emb_b = .{};
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfile(&xfm));
+}
+
+var qwen4_g17_profile_logged: bool = false;
+var qwen4_mixed_profile_logged: bool = false;
+var qwen4_g17_env_cache: ?bool = null;
+
+fn qwen4MixedHcMatches(hc: anytype) bool {
+    return qwen4MixedPackMatches(hc.down_w, hc.down_s, hc.down_b, &.{ 320, 10240 }, 8) and
+        qwen4MixedPackMatches(hc.up_w, hc.up_s, hc.up_b, &.{ 10240, 320 }, 8);
+}
+
+fn qwen4MixedLayerMatches(layer: anytype) bool {
+    const mw = switch (layer.mlp) {
+        .moe => |value| value,
+        else => return false,
+    };
+    if (!qwen4MixedPackMatches(mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, &.{ 512, 640, 2560 }, 4) or
+        !qwen4MixedPackMatches(mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, &.{ 512, 640, 2560 }, 4) or
+        !qwen4MixedPackMatches(mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, &.{ 512, 2560, 640 }, 4) or
+        !qwen4MixedPackMatches(mw.shared_gate_w, mw.shared_gate_s, mw.shared_gate_b, &.{ 640, 2560 }, 8) or
+        !qwen4MixedPackMatches(mw.shared_up_w, mw.shared_up_s, mw.shared_up_b, &.{ 640, 2560 }, 8) or
+        !qwen4MixedPackMatches(mw.shared_down_w, mw.shared_down_s, mw.shared_down_b, &.{ 2560, 640 }, 8) or
+        !qwen4MixedPackMatches(mw.router_w, mw.router_s, mw.router_b, &.{ 512, 2560 }, 8)) return false;
+    if (!qwen4MixedHcMatches(layer.hc_attn orelse return false) or !qwen4MixedHcMatches(layer.hc_mlp orelse return false)) return false;
+    if (layer.ple) |ple| {
+        if (!qwen4MixedPackMatches(ple.key_w, ple.key_s, ple.key_b, &.{ 10240, 2560 }, 8) or
+            !qwen4MixedPackMatches(ple.value_w, ple.value_s, ple.value_b, &.{ 2560, 2560 }, 8)) return false;
+    }
+    return switch (layer.attn) {
+        .full => |f| qwen4MixedPackMatches(f.q_w, f.q_s, f.q_b, &.{ 12288, 2560 }, 8) and
+            qwen4MixedPackMatches(f.k_w, f.k_s, f.k_b, &.{ 512, 2560 }, 8) and
+            qwen4MixedPackMatches(f.v_w, f.v_s, f.v_b, &.{ 512, 2560 }, 8) and
+            qwen4MixedPackMatches(f.o_w, f.o_s, f.o_b, &.{ 2560, 6144 }, 8) and
+            qwen4MixedPackMatches(f.idx_qk_w, f.idx_qk_s, f.idx_qk_b, &.{ 640, 2560 }, 8),
+        .linear => |l| qwen4MixedPackMatches(l.qkv_w, l.qkv_s, l.qkv_b, &.{ 10240, 2560 }, 8) and
+            qwen4MixedPackMatches(l.z_w, l.z_s, l.z_b, &.{ 6144, 2560 }, 8) and
+            qwen4MixedPackMatches(l.a_w, l.a_s, l.a_b, &.{ 48, 2560 }, 8) and
+            qwen4MixedPackMatches(l.b_w, l.b_s, l.b_b, &.{ 48, 2560 }, 8) and
+            qwen4MixedPackMatches(l.out_w, l.out_s, l.out_b, &.{ 2560, 6144 }, 8),
+    };
+}
+
+fn qwen4MixedModelPacksMatch(target: *const Transformer) bool {
+    if (target.qwen4 == null or target.qwen4_stream_f32 or target.config.quant_mode != .affine or target.config.quant_group_size != 64) return false;
+    const cfg = &target.config;
+    if (cfg.linear_key_head_dim != 128 or cfg.linear_value_head_dim != 128 or cfg.linear_num_key_heads != 16 or
+        cfg.linear_num_value_heads != 48 or cfg.linear_conv_kernel_dim != 4 or cfg.ple_embed_dim != 2560) return false;
+    const head = target.qwen4_mtp orelse return false;
+    if (!qwen4MixedPackMatches(target.emb_w, target.emb_s, target.emb_b, &.{ 248320, 2560 }, 4) or
+        !qwen4MixedPackMatches(target.lm_head_w, target.lm_head_s, target.lm_head_b, &.{ 248320, 2560 }, 8) or
+        !qwen4MixedPackMatches(head.fc_emb_w, head.fc_emb_s, head.fc_emb_b, &.{ 2560, 2560 }, 8) or
+        !qwen4MixedPackMatches(head.fc_hid_w, head.fc_hid_s, head.fc_hid_b, &.{ 2560, 2560 }, 8)) return false;
+    if (!qwen4MixedHcMatches(target.qwen4_mixer orelse return false) or !qwen4MixedHcMatches(head.mixer) or
+        head.layer.is_linear or !qwen4MixedLayerMatches(&head.layer)) return false;
+    const layers = target.moe_layers orelse return false;
+    if (layers.len != 48) return false;
+    for (layers, 0..) |*layer, i| {
+        if (layer.is_linear != (i % 4 != 3) or (layer.ple != null) != (i == 1) or !qwen4MixedLayerMatches(layer)) return false;
+    }
+    return true;
+}
+
+/// Profile-only revocation (MLX_SERVE_MTP_QWEN4_PROFILE=0): planning falls
+/// back to `generic` while every compute lane stays exactly as shipped —
+/// the isolation arm for cost-surface A/Bs, where killing the vqmm NAX lane
+/// would change the very costs under test.
+fn qwen4G17EnvEnabled() bool {
+    if (qwen4_g17_env_cache) |v| return v;
+    var on = true;
+    if (std.c.getenv("MLX_SERVE_MTP_QWEN4_PROFILE")) |p| {
+        const val = std.mem.span(p);
+        if (val.len > 0 and val[0] == '0') on = false;
+    }
+    qwen4_g17_env_cache = on;
+    return on;
+}
+
+/// Live resolver for the qwen4_exp head: validates the runtime fingerprint
+/// the G17 surface was measured on — uniform affine-4/gs-64 config and both
+/// head fc packs at that width (K derived from the scales, so no input-dim
+/// formula is assumed). Revoked by MLX_SERVE_VERIFY_QMM_NAX=0 like the
+/// sidecar profiles: auto depth never assumes a lane the environment
+/// disabled.
+pub fn qwen4G17CostProfile(target: *const Transformer) MtpCostProfile {
+    return qwen4G17CostProfileForKv(target, target.cache.config);
+}
+
+/// Mixed-pack prices use the request's actual KV format, including a slot
+/// override. The original all-4-bit classifier retains its existing scope.
+pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.KVQuantConfig) MtpCostProfile {
+    if (!qwen4G17EnvEnabled()) return .generic;
+    const head = if (target.qwen4_mtp) |*h| h else return .generic;
+    const cfg = &target.config;
+    const geometry = Qwen4MixedGeometry{
+        .hidden = cfg.hidden_size,
+        .layers = cfg.num_hidden_layers,
+        .hc = cfg.hc_count,
+        .experts = cfg.num_experts,
+        .top_k = cfg.num_experts_per_tok,
+        .expert_width = cfg.moe_intermediate_size,
+        .vocab = cfg.vocab_size,
+        .ple_layer = cfg.ple_layer_idx,
+        .kv_bits = if (kv.scheme == .affine) kv.bits else 0,
+        .kv_group = kv.group_size,
+        .head_kv_bits = if (head.cache.config.scheme == .affine) head.cache.config.bits else 0,
+        .head_kv_group = head.cache.config.group_size,
+    };
+    const rerank_ready = if (head.rerank) |r| r.bits == 3 and r.group_size == 64 and r.rows == 248320 else false;
+    const mixed = qwen4MixedCostProfileForFingerprint(geometry, std.meta.eql(geometry, Qwen4MixedGeometry{}) and qwen4MixedModelPacksMatch(target), rerank_ready, mlx.streamIsGpu(target.s) and transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable());
+    if (mixed != .generic) {
+        if (!qwen4_mixed_profile_logged) {
+            qwen4_mixed_profile_logged = true;
+            log.info("[mtp] cost profile g17-nax-qwen4-mixed-4-8-gs64 engaged (affine8 target/head KV)\n", .{});
+        }
+        return mixed;
+    }
+    if (cfg.hidden_size == 0 or cfg.hidden_size > std.math.maxInt(c_int)) return .generic;
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    const packs = qwen4PackTripleMatches(head.fc_emb_w, head.fc_emb_s, head.fc_emb_b, hidden) and
+        qwen4PackTripleMatches(head.fc_hid_w, head.fc_hid_s, head.fc_hid_b, hidden);
+    const profile = qwen4G17CostProfileForFingerprint(
+        cfg.quant_mode == .affine,
+        cfg.quant_bits,
+        cfg.quant_group_size,
+        packs,
+        transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable(),
+    );
+    if (profile != .generic and !qwen4_g17_profile_logged) {
+        qwen4_g17_profile_logged = true;
+        log.info("[mtp] cost profile g17-nax-qwen4-q4-gs64 engaged (MLX_SERVE_VERIFY_QMM_NAX=0 restores generic)\n", .{});
+    }
+    return profile;
+}
+
+/// One packed projection of the qwen4 head: uint32 codes [N, K*4/32] with
+/// bf16 scales and biases [N, K/64], N == hidden. K comes from the scales.
+fn qwen4PackTripleMatches(w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, hidden: c_int) bool {
+    if (w.ctx == null or s.ctx == null or b.ctx == null) return false;
+    if (mlx.mlx_array_dtype(w) != .uint32) return false;
+    if (mlx.mlx_array_dtype(s) != .bfloat16 or mlx.mlx_array_dtype(b) != .bfloat16) return false;
+    const ws = mlx.getShape(w);
+    const ss = mlx.getShape(s);
+    const bs = mlx.getShape(b);
+    if (ws.len != 2 or ss.len != 2 or bs.len != 2) return false;
+    if (ws[0] != hidden or ss[0] != hidden or bs[0] != hidden) return false;
+    if (ss[1] <= 0 or ss[1] != bs[1]) return false;
+    const k = @as(u64, @intCast(ss[1])) * 64;
+    return @as(u64, @intCast(ws[1])) * 32 == k * 4;
 }
 
 /// Prefill history windowing (OPT-IN via `--mtp-history-window <n>`; mirrors
@@ -90,17 +451,32 @@ pub const HISTORY_WINDOW_THRESHOLD: usize = 16384;
 
 /// One linear: quantized (w packed u32, s/b bf16) when `s.ctx != null`,
 /// otherwise a pre-transposed bf16 weight `[in, out]` for plain matmul.
-const QLinear = struct {
+pub const QLinear = struct {
     w: mlx.mlx_array,
     s: mlx.mlx_array,
     b: mlx.mlx_array,
 
-    fn deinit(self: *QLinear) void {
+    pub fn deinit(self: *QLinear) void {
         _ = mlx.mlx_array_free(self.w);
         _ = mlx.mlx_array_free(self.s);
         _ = mlx.mlx_array_free(self.b);
     }
 };
+
+/// Does the Qwen head's concat projection map `[2H] -> [H]` for this trunk?
+/// Dense arm: the pre-transposed weight is literally `[2H, H]`. Quantized arm:
+/// the packed weight is `[H, in_packed]`, so the logical input width is solved
+/// from geometry (`affineParamsFromGeometry` succeeds only when the packed
+/// columns and the scales groups both agree with `2H`).
+fn fcMatchesHidden(fc: *const QLinear, hidden_size: u32) bool {
+    if (fc.w.ctx == null or hidden_size == 0 or hidden_size > std.math.maxInt(c_int) / 2) return false;
+    const shape = mlx.getShape(fc.w);
+    if (shape.len != 2) return false;
+    const h: c_int = @intCast(hidden_size);
+    if (fc.s.ctx == null) return shape[0] == h * 2 and shape[1] == h;
+    if (shape[0] != h) return false;
+    return transformer_mod.quantParamsFromGeometry(fc.w, fc.s, fc.b.ctx != null, hidden_size * 2) != null;
+}
 
 fn m5NaxQLinearMatches(q: *const QLinear, in_dim: u32, out_dim: u32, bits: u32, group_size: u32) bool {
     if (q.w.ctx == null or q.s.ctx == null or q.b.ctx == null) return false;
@@ -220,8 +596,17 @@ pub const MtpModel = struct {
     /// trunk, e.g. group 32 over a group-64 trunk, or 8-bit over 4-bit).
     quant_bits: u32,
     quant_group_size: u32,
+    /// Quant MODE the sidecar's packed weights are in. A sidecar file carries
+    /// no config, so this is solved from geometry at load
+    /// (`transformer_mod.quantParamsFromGeometry`) and handed to every
+    /// `mlx_quantized_matmul` — passing "affine" over fp8 scales throws.
+    quant_mode: model_mod.QuantMode = .affine,
 
-    fc_w_t: mlx.mlx_array, // [2H, H] bf16, pre-transposed (Qwen heads; empty for Hy3)
+    /// Qwen heads' concat projection (empty for Hy3). Dense bf16 ships
+    /// pre-transposed `[2H, H]` for plain matmul; a checkpoint that ships it
+    /// QUANTIZED (avlp12 Alis) keeps `(w, scales, biases)` verbatim — packed
+    /// `[out=H, in=2H]` is already what quantized_matmul(transpose) wants.
+    fc: QLinear,
     /// Hy3 (hy_v3) heads: the concat projection ships QUANTIZED as
     /// `mtp.eh_proj` instead of Qwen's bf16 `mtp.fc`. Non-null selects the
     /// Hy3 layer shape everywhere it differs: eh_proj replaces the fc matmul
@@ -250,6 +635,14 @@ pub const MtpModel = struct {
     draft_head_bits: u32 = 0,
     draft_head_group: u32 = 0,
 
+    /// Draft-rerank scheme (MLX_SERVE_MTP_DRAFT_RERANK): a coarse 2-bit/gs64
+    /// requant of the trunk lm_head; greedy drafts shortlist its top-32 and
+    /// re-score them through the trunk head's own rows (`draftSelect`). When
+    /// built, the 3-bit draft head is dropped — non-greedy draft paths fall
+    /// back to the trunk head.
+    rerank_coarse: ?RerankCoarse = null,
+    rerank_logged: bool = false,
+
     /// Cross-request EV controller seed (inference thread only, like every
     /// mutable field here): the last HEALTHY request's per-index acceptance
     /// EMAs + base depth, written by `Generator.deinit`, consumed by the
@@ -262,9 +655,10 @@ pub const MtpModel = struct {
     ev_seed_m_lo: u32 = 1,
 
     pub fn deinit(self: *MtpModel) void {
+        if (self.rerank_coarse) |*rc| rc.deinit();
         if (self.draft_head) |*dh| dh.deinit();
         if (self.eh_proj) |*ep| ep.deinit();
-        _ = mlx.mlx_array_free(self.fc_w_t);
+        self.fc.deinit();
         _ = mlx.mlx_array_free(self.pre_fc_norm_emb);
         _ = mlx.mlx_array_free(self.pre_fc_norm_hidden);
         _ = mlx.mlx_array_free(self.final_norm);
@@ -287,27 +681,43 @@ pub const MtpModel = struct {
     }
 
     /// Select the exact full-round cost surface for this bound sidecar and
-    /// target. Both G17 profiles require the successfully built 3-bit/gs-64
-    /// draft-only lm_head and a homogeneous dense Qwen3.6-27B sidecar; their
-    /// q8/gs-32 and q4/gs-32 draft costs are calibrated independently.
+    /// target. Every G17 profile requires the successfully built 3-bit/gs-64
+    /// draft-only lm_head and an exact dense 27B sidecar. Uniform q4/q6/q8
+    /// gs64 trunks and mixed-q4/q5/q6 oQ4e trunks remain separate profiles;
+    /// target embedding storage is part of the fingerprint too.
     /// Compatible but off-profile geometry remains correct under `generic`.
     pub fn m5NaxCostProfile(self: *const MtpModel, target: *const Transformer) MtpCostProfile {
         if (self.eh_proj != null) return .generic;
-        const profile = m5NaxCostProfileForQuant(self.quant_bits, self.quant_group_size);
-        switch (profile) {
-            .g17_nax_oq4e_q4_gs64 => if (!target.mtpOqeNaxProfileEnabled()) return .generic,
-            .g17_nax_q8_gs32, .g17_nax_q4_gs32 => if (!target.mtpNaxProfileEnabled()) return .generic,
-            .generic => return .generic,
-        }
+        const target_surface: MtpNaxTargetSurface = if (target.mtpNaxQ4Gs64ProfileEnabled())
+            .uniform_bf16_embedding
+        else if (target.mtpNaxQ6Gs64ProfileEnabled())
+            .uniform_q6_quantized_embedding
+        else if (target.mtpNaxQ8Gs64ProfileEnabled())
+            .uniform_q8_bf16_embedding
+        else if (target.mtpNaxProfileEnabled())
+            .uniform_quantized_embedding
+        else if (target.mtpOqeNaxProfileEnabled())
+            .oqe_quantized_embedding
+        else
+            .none;
+        const profile = m5NaxCostProfileForFingerprint(
+            self.quant_bits,
+            self.quant_group_size,
+            target_surface,
+        );
+        if (profile == .generic) return .generic;
         const sidecar_bits: u32 = switch (profile) {
-            .g17_nax_q8_gs32 => 8,
-            .g17_nax_q4_gs32, .g17_nax_oq4e_q4_gs64 => 4,
-            .generic => return .generic,
+            .g17_nax_q8_gs32, .g17_nax_q8_gs64 => 8,
+            .g17_nax_q6_gs64 => 6,
+            .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_oq4e_q4_gs64 => 4,
+            // The sidecar fingerprint classifier above never returns the
+            // qwen4 profile; keep the fallback honest anyway.
+            .generic, .g17_nax_qwen4_q4_gs64, .g17_nax_qwen4_mixed_4_8_gs64 => return .generic,
         };
         const sidecar_group_size: u32 = switch (profile) {
             .g17_nax_q8_gs32, .g17_nax_q4_gs32 => 32,
-            .g17_nax_oq4e_q4_gs64 => 64,
-            .generic => return .generic,
+            .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 => 64,
+            .generic, .g17_nax_qwen4_q4_gs64, .g17_nax_qwen4_mixed_4_8_gs64 => return .generic,
         };
 
         const cfg = &target.config;
@@ -321,8 +731,8 @@ pub const MtpModel = struct {
         const q_out: u32 = @intCast(q_out_wide);
         const kv_out: u32 = @intCast(kv_out_wide);
 
-        const fc_shape = mlx.getShape(self.fc_w_t);
-        if (mlx.mlx_array_dtype(self.fc_w_t) != .bfloat16 or
+        const fc_shape = mlx.getShape(self.fc.w);
+        if (mlx.mlx_array_dtype(self.fc.w) != .bfloat16 or
             fc_shape.len != 2 or
             fc_shape[0] != @as(c_int, @intCast(cfg.hidden_size * 2)) or
             fc_shape[1] != @as(c_int, @intCast(cfg.hidden_size))) return .generic;
@@ -398,18 +808,16 @@ pub const MtpModel = struct {
             self.buildDraftHead(target) catch |err| {
                 log.warn("[mtp] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
             };
+            self.maybeBuildDraftRerank(target);
             return;
         }
         if (!cfg.attn_output_gate) return error.UnsupportedMtpArch;
-        const fc_shape = mlx.getShape(self.fc_w_t);
-        if (fc_shape.len != 2 or
-            fc_shape[0] != @as(c_int, @intCast(cfg.hidden_size * 2)) or
-            fc_shape[1] != @as(c_int, @intCast(cfg.hidden_size)))
-            return error.MtpTargetMismatch;
+        if (!fcMatchesHidden(&self.fc, cfg.hidden_size)) return error.MtpTargetMismatch;
 
         self.buildDraftHead(target) catch |err| {
             log.warn("[mtp] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
         };
+        self.maybeBuildDraftRerank(target);
         // NOTE (2026-07-13): mlx_compile'ing the offset-free front/back
         // halves of the seq-1 draft step (the compileMoeRouting pattern,
         // weights captured via payload) was built, verified equivalent at
@@ -473,7 +881,561 @@ pub const MtpModel = struct {
         self.draft_head_group = group;
         log.info("[mtp] draft-only lm_head requantized to {d}-bit/gs{d}\n", .{ bits, group });
     }
+
+    /// MLX_SERVE_MTP_DRAFT_RERANK: "0" off, "1" force-on, absent/other →
+    /// auto (on where the cost surface is generic; the calibrated G17 NAX
+    /// surfaces keep the 3-bit draft head they were measured with).
+    pub fn draftRerankMode() enum { auto, on, off } {
+        const p = std.c.getenv("MLX_SERVE_MTP_DRAFT_RERANK") orelse return .auto;
+        const raw = std.mem.span(p);
+        if (std.mem.eql(u8, raw, "0")) return .off;
+        if (std.mem.eql(u8, raw, "1")) return .on;
+        return .auto;
+    }
+
+    /// Build the coarse 2-bit rerank head (see the draft-rerank section
+    /// below). Infallible by design: any refusal keeps the draft-head path.
+    fn maybeBuildDraftRerank(self: *MtpModel, target: *Transformer) void {
+        const mode = draftRerankMode();
+        if (mode == .off) return;
+        if (target.lm_head_s.ctx == null) return; // dense bf16 head — row-gather rerank unbuilt/unmeasured
+        if (mode == .auto and self.m5NaxCostProfile(target) != .generic) return;
+        const w_shape = mlx.getShape(target.lm_head_w);
+        if (w_shape.len != 2 or w_shape[0] < TOP32_MIN_ROWS) return;
+        const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+        if (head_qp.bits <= 2) return; // nothing coarser to gain
+
+        // The ONE env read: the built head carries its width from here on.
+        const rc = buildRerankCoarse(self.s, target, rerankCoarseBits()) orelse return;
+
+        if (self.draft_head) |*dh| {
+            dh.deinit();
+            self.draft_head = null;
+            self.draft_head_bits = 0;
+            self.draft_head_group = 0;
+        }
+        self.rerank_coarse = rc;
+        log.info("[mtp] draft rerank: coarse {d}-bit/gs{d} head built ({d} rows); greedy drafts re-rank through the trunk head\n", .{ rc.bits, rc.group_size, rc.rows });
+    }
+
+    pub fn canRerankDrafts(self: *const MtpModel) bool {
+        return self.rerank_coarse != null;
+    }
+
+    /// One greedy draft proposal via the rerank scheme: coarse 2-bit
+    /// full-vocab readout → exact top-32 shortlist (two dispatches) → the
+    /// trunk head's own 32 rows re-score → argmax. Returns a lazy [1,1]
+    /// int32 token id. PROPOSAL SIDE ONLY — verification still reads the
+    /// trunk forward's logits, so a coarse miss costs acceptance, never
+    /// output. A shortlist-kernel failure permanently drops back to the
+    /// trunk-head readout (this call included).
+    pub fn draftSelect(
+        self: *MtpModel,
+        target: *Transformer,
+        x: mlx.mlx_array,
+        suppress_mask: ?mlx.mlx_array,
+    ) !mlx.mlx_array {
+        // The scheme itself is head-agnostic (it only ever touches the
+        // TARGET's lm_head), so it lives in `rerankSelect` and the qwen4_exp
+        // in-checkpoint head calls exactly the same code. Null = the coarse
+        // head is gone (never built, or a shortlist failure just dropped it):
+        // this arm's own full readout answers, and it can still use the
+        // low-bit draft head when one is resident.
+        if (try rerankSelect(self.s, target, &self.rerank_coarse, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
+        return self.draftFallbackArgmax(target, x, suppress_mask);
+    }
+
+    /// The exact re-scored top-32 shortlist for a SAMPLED draft, or null when
+    /// the coarse head is gone (the caller proposes greedily instead). Same
+    /// coarse readout as `draftSelect`; only the tail differs.
+    pub fn draftShortlist(
+        self: *MtpModel,
+        target: *Transformer,
+        x: mlx.mlx_array,
+        suppress_mask: ?mlx.mlx_array,
+    ) !?Shortlist {
+        return rerankShortlist(self.s, target, &self.rerank_coarse, &self.rerank_logged, x, suppress_mask);
+    }
+
+    /// Rerank's failure fallback: full trunk-head readout + argmax, same
+    /// [1,1] int32 shape as `draftSelect`.
+    fn draftFallbackArgmax(
+        self: *const MtpModel,
+        target: *Transformer,
+        x: mlx.mlx_array,
+        suppress_mask: ?mlx.mlx_array,
+    ) !mlx.mlx_array {
+        const s = self.s;
+        const logits = try targetLmHead(self, target, x, s);
+        defer _ = mlx.mlx_array_free(logits);
+        return maskAndArgmax(s, logits, suppress_mask);
+    }
 };
+
+// ── Draft rerank: the head-agnostic half ──
+//
+// Nothing in this scheme is MTP-head-shaped. It reads the TARGET's lm_head
+// and a vector `x` in that head's input space, and answers with a token id —
+// so the qwen3.5/3.6 sidecar (`MtpModel`) and the qwen4_exp in-checkpoint
+// head (`Transformer.qwen4_mtp`) share it verbatim instead of the qwen4 arm
+// growing a second copy that could drift from the measured one.
+//
+// What `x` IS, is per-arm and load-bearing: whatever the lm_head consumes.
+// On the sidecar that is the head's own post-norm hidden; on qwen4_exp it is
+// the MIXER output, NOT the pre-mixer stream the head hands back as
+// `hidden_next`.
+
+/// Coarse-head width AT BUILD TIME. The default is `draftHeadBitsFromEnv` (3),
+/// so MLX_SERVE_MTP_DRAFT_HEAD_BITS retunes it and "0"/"off" disables the build
+/// entirely. 2 is what the sidecar scheme was measured at and is the obvious
+/// second A/B arm; a coarser head is fewer bytes and a longer tail of
+/// shortlist misses, and a miss costs acceptance, never output.
+///
+/// Read exactly ONCE, where a head is built. The width a head is READ at is a
+/// property of its packed weights (`RerankCoarse.bits`), never of the
+/// environment at draft time — packed geometry implies K, so a re-read that
+/// disagrees with the build reads a different vocab entirely.
+pub fn rerankCoarseBits() u32 {
+    return MtpModel.draftHeadBitsFromEnv();
+}
+
+/// Group size every coarse head is packed at.
+pub const RERANK_COARSE_GROUP: u32 = 64;
+
+/// A BUILT coarse readout head: the packed weights plus the geometry they
+/// were packed with. Both live together because `mlx_quantized_matmul` needs
+/// all three and only the build knows them.
+pub const RerankCoarse = struct {
+    q: QLinear,
+    bits: u32,
+    group_size: u32,
+    rows: c_int,
+
+    pub fn deinit(self: *RerankCoarse) void {
+        self.q.deinit();
+    }
+};
+
+/// The coarse readout head: a low-bit/gs64 requantized copy of the target's
+/// lm_head, materialized so the first draft does not pay for it. Infallible —
+/// every refusal returns null and the caller keeps its full-readout path.
+pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?RerankCoarse {
+    if (bits == 0) return null;
+    if (target.lm_head_s.ctx == null) return null; // dense bf16 - row-gather rerank unbuilt/unmeasured
+    const w_shape = mlx.getShape(target.lm_head_w);
+    if (w_shape.len != 2 or w_shape[0] < TOP32_MIN_ROWS) return null;
+    const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    if (bits >= head_qp.bits) return null; // no byte saving over the head we already read
+
+    var rc = requantizeRows(
+        s,
+        target.lm_head_w,
+        target.lm_head_s,
+        target.lm_head_b,
+        head_qp.group_size,
+        head_qp.bits,
+        head_qp.mode.cstr(),
+        RERANK_COARSE_GROUP,
+        bits,
+        32768,
+    ) catch |err| {
+        log.warn("[mtp] draft rerank coarse build failed ({s}) - keeping the full-readout path\n", .{@errorName(err)});
+        return null;
+    };
+    const eval_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(eval_vec);
+    _ = mlx.mlx_vector_array_append_value(eval_vec, rc.w);
+    _ = mlx.mlx_vector_array_append_value(eval_vec, rc.s);
+    _ = mlx.mlx_vector_array_append_value(eval_vec, rc.b);
+    mlx.check(mlx.mlx_eval(eval_vec)) catch {
+        rc.deinit();
+        log.warn("[mtp] draft rerank coarse eval failed - keeping the full-readout path\n", .{});
+        return null;
+    };
+    return .{ .q = rc, .bits = bits, .group_size = RERANK_COARSE_GROUP, .rows = w_shape[0] };
+}
+
+/// Resident bytes of a coarse head over `rows` x `hidden` at `bits`/gs64:
+/// packed weights plus bf16 scales AND biases. Reported at build so the log
+/// line carries the number the change is claiming.
+pub fn rerankCoarseBytes(rows: c_int, hidden: c_int, bits: u32) u64 {
+    const r: u64 = @intCast(rows);
+    const h: u64 = @intCast(hidden);
+    const packed_bytes = r * h * @as(u64, bits) / 8;
+    const groups = h / 64;
+    return packed_bytes + 2 * (r * groups * 2);
+}
+
+/// `argmax(where(mask, -inf, logits))` as a lazy [.., 1] int32 id - the tail
+/// every full-readout draft path shares.
+pub fn maskAndArgmax(s: mlx.mlx_stream, logits_in: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
+    var logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_array_set(&logits, logits_in));
+    if (suppress_mask) |m| {
+        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        defer _ = mlx.mlx_array_free(neg_inf);
+        var masked = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits, s));
+        _ = mlx.mlx_array_free(logits);
+        logits = masked;
+    }
+    var amax = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(amax);
+    try mlx.check(mlx.mlx_argmax_axis(&amax, logits, -1, false, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, amax, .int32, s));
+    return out;
+}
+
+/// Full trunk-lm_head readout + argmax. The qwen4 arm's fallback: unlike the
+/// sidecar's, there is no low-bit draft head to prefer.
+pub fn fullReadoutArgmax(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !mlx.mlx_array {
+    var logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits);
+    if (target.lm_head_s.ctx == null) {
+        const axes = [_]c_int{ 1, 0 };
+        var wt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wt);
+        try mlx.check(mlx.mlx_transpose_axes(&wt, target.lm_head_w, &axes, 2, s));
+        try mlx.check(mlx.mlx_matmul(&logits, x, wt, s));
+    } else {
+        const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &logits,
+            x,
+            target.lm_head_w,
+            target.lm_head_s,
+            target.lm_head_b,
+            true,
+            mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+            mlx.mlx_optional_int.some(@intCast(qp.bits)),
+            qp.mode.cstr(),
+            s,
+        ));
+    }
+    return maskAndArgmax(s, logits, suppress_mask);
+}
+
+/// `-inf` on every suppressed id of a coarse readout, in place.
+fn rerankMaskCoarse(s: mlx.mlx_stream, logits: *mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !void {
+    // The mask goes on the COARSE row: a reserved id that never enters the
+    // shortlist cannot be re-scored back into the draft.
+    const m = suppress_mask orelse return;
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    var masked = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits.*, s));
+    _ = mlx.mlx_array_free(logits.*);
+    logits.* = masked;
+}
+
+/// The exact re-scored shortlist behind every rerank draft: the coarse head's
+/// top-32 candidate ids plus their trunk-head logits. A greedy draft is the
+/// argmax over `exact`; a sampled draft is drawn from the filtered softmax over
+/// it, so q's support is exactly these ids.
+pub const Shortlist = struct {
+    /// `[32]` uint32 vocab ids.
+    cands: mlx.mlx_array,
+    /// `[.., 32]` trunk-head logits for those ids.
+    exact: mlx.mlx_array,
+    /// The head's vocab rows — the width a dense proposal row must have.
+    rows: c_int,
+
+    pub fn deinit(self: *Shortlist) void {
+        _ = mlx.mlx_array_free(self.cands);
+        _ = mlx.mlx_array_free(self.exact);
+    }
+};
+
+/// Shortlist one coarse row `flat` `[rows]` and re-score it through the trunk head.
+/// Null retires the coarse head, so every later step lands on the caller's fallback.
+fn rerankShortlistRow(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    coarse: *?RerankCoarse,
+    flat: mlx.mlx_array,
+    rows: c_int,
+    x_row: mlx.mlx_array,
+) !?Shortlist {
+    const cands = draftTop32(s, flat, rows) catch |err| {
+        log.warn("[mtp] draft rerank shortlist failed ({s}) - dropping to the full readout\n", .{@errorName(err)});
+        var dead = coarse.*.?;
+        dead.deinit();
+        coarse.* = null;
+        return null;
+    };
+    errdefer _ = mlx.mlx_array_free(cands);
+
+    // Re-score the shortlist through the trunk head's own rows: gathered
+    // packed rows are self-contained (w [V, K*bits/32], scales/biases
+    // [V, K/gs]), so a 32-row quantized matmul is exact.
+    const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    var w32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w32);
+    var s32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(s32);
+    var b32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b32);
+    try mlx.check(mlx.mlx_take_axis(&w32, target.lm_head_w, cands, 0, s));
+    try mlx.check(mlx.mlx_take_axis(&s32, target.lm_head_s, cands, 0, s));
+    if (target.lm_head_b.ctx != null)
+        try mlx.check(mlx.mlx_take_axis(&b32, target.lm_head_b, cands, 0, s));
+
+    var exact = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(exact);
+    try mlx.check(mlx.mlx_quantized_matmul(
+        &exact,
+        x_row,
+        w32,
+        s32,
+        b32,
+        true,
+        mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+        mlx.mlx_optional_int.some(@intCast(qp.bits)),
+        qp.mode.cstr(),
+        s,
+    ));
+    return .{ .cands = cands, .exact = exact, .rows = rows };
+}
+
+/// The greedy draft's tail: argmax over the re-scored shortlist, mapped back to
+/// a vocab id as a lazy int32 array.
+pub fn shortlistArgmax(s: mlx.mlx_stream, sl: Shortlist) !mlx.mlx_array {
+    var amax = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(amax);
+    try mlx.check(mlx.mlx_argmax_axis(&amax, sl.exact, -1, false, s));
+    var picked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(picked);
+    try mlx.check(mlx.mlx_take_axis(&picked, sl.cands, amax, 0, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, picked, .int32, s));
+    return out;
+}
+
+fn rerankRescoreRow(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    coarse: *?RerankCoarse,
+    flat: mlx.mlx_array,
+    rows: c_int,
+    x_row: mlx.mlx_array,
+) !?mlx.mlx_array {
+    var sl = (try rerankShortlistRow(s, target, coarse, flat, rows, x_row)) orelse return null;
+    defer sl.deinit();
+    return try shortlistArgmax(s, sl);
+}
+
+/// The coarse full-vocab readout of one row as a flat `[rows]` array, reserved
+/// ids already at `-inf` — the front half every rerank draft shares.
+fn rerankCoarseFlat(
+    s: mlx.mlx_stream,
+    rc: *const RerankCoarse,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !mlx.mlx_array {
+    var coarse_logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(coarse_logits);
+    try mlx.check(mlx.mlx_quantized_matmul(
+        &coarse_logits,
+        x,
+        rc.q.w,
+        rc.q.s,
+        rc.q.b,
+        true,
+        mlx.mlx_optional_int.some(@intCast(rc.group_size)),
+        // The BUILT width and group, never `rerankCoarseBits()`: the packed
+        // geometry implies K, so a per-step env re-read that disagrees with the
+        // build does not read a coarser vocab - it reads a different one.
+        mlx.mlx_optional_int.some(@intCast(rc.bits)),
+        "affine",
+        s,
+    ));
+    try rerankMaskCoarse(s, &coarse_logits, suppress_mask);
+    var flat = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(flat);
+    const flat_shape = [_]c_int{rc.rows};
+    try mlx.check(mlx.mlx_reshape(&flat, coarse_logits, &flat_shape, 1, s));
+    return flat;
+}
+
+/// `rerankSelect` without its argmax tail: the caller owns the shortlist and
+/// decides the proposal over it (argmax for a greedy request, a draw from the
+/// draft sampler's filtered softmax for a sampled one). Null means the coarse
+/// head is unavailable, exactly as in `rerankSelect`.
+pub fn rerankShortlist(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    coarse: *?RerankCoarse,
+    logged: *bool,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !?Shortlist {
+    const rc = if (coarse.*) |*p| p else return null;
+    const coarse_bits = rc.bits;
+    const rows = rc.rows;
+
+    const flat = try rerankCoarseFlat(s, rc, x, suppress_mask);
+    defer _ = mlx.mlx_array_free(flat);
+
+    const sl = (try rerankShortlistRow(s, target, coarse, flat, rows, x)) orelse return null;
+    if (!logged.*) {
+        log.info("[mtp] draft rerank engaged ({d}-bit coarse -> top-32 -> trunk re-score)\n", .{coarse_bits});
+        logged.* = true;
+    }
+    return sl;
+}
+
+/// One greedy draft proposal via the rerank scheme: coarse full-vocab readout
+/// -> exact top-32 shortlist (two dispatches) -> the trunk head's own 32 rows
+/// re-score -> argmax. Returns a lazy [1,1] int32 token id, or NULL when the
+/// coarse head is unavailable - never built, or a shortlist-kernel failure
+/// just dropped it (`coarse` is freed and nulled in that case, so every later
+/// step of the same chain lands on the caller's fallback too).
+///
+/// PROPOSAL SIDE ONLY: verification still reads the trunk forward's logits, so
+/// a coarse miss costs acceptance, never output.
+pub fn rerankSelect(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    coarse: *?RerankCoarse,
+    logged: *bool,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !?mlx.mlx_array {
+    var sl = (try rerankShortlist(s, target, coarse, logged, x, suppress_mask)) orelse return null;
+    defer sl.deinit();
+    return try shortlistArgmax(s, sl);
+}
+
+fn rerankCoarseRows(s: mlx.mlx_stream, x: mlx.mlx_array, rc: *const RerankCoarse) !mlx.mlx_array {
+    const shape = mlx.getShape(x);
+    if (shape.len < 2 or shape.len > 3 or shape[0] < 1 or shape[0] > 32) return error.MtpRerankBatchTooWide;
+    if (shape.len == 3 and shape[1] != 1) return error.MtpRerankInputShape;
+    if (try transformer_mod.mtpCoarsePairs(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) |out| return out;
+    if (try @import("transformer.zig").msvQmvRows(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) |out| return out;
+    const n: usize = @intCast(shape[0]);
+    var parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });
+    defer for (parts[0..n]) |p| {
+        if (p.ctx != null) _ = mlx.mlx_array_free(p);
+    };
+    for (0..n) |i| {
+        var start: [3]c_int = @splat(0);
+        var stop: [3]c_int = @splat(0);
+        const strides: [3]c_int = @splat(1);
+        @memcpy(stop[0..shape.len], shape);
+        start[0] = @intCast(i);
+        stop[0] = @intCast(i + 1);
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_slice(&row, x, &start, @intCast(shape.len), &stop, @intCast(shape.len), &strides, @intCast(shape.len), s));
+        parts[i] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_quantized_matmul(&parts[i], row, rc.q.w, rc.q.s, rc.q.b, true, mlx.mlx_optional_int.some(@intCast(rc.group_size)), mlx.mlx_optional_int.some(@intCast(rc.bits)), "affine", s));
+    }
+    const vec = mlx.mlx_vector_array_new_data(parts[0..n].ptr, n);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
+    return out;
+}
+/// Per-row exact re-scored shortlists from mixer rows `x` `[N,1,H]`: ONE coarse
+/// readout over N, then the top-32 select and the 32-row re-score per row.
+/// False = the coarse head is unavailable (nothing is written to `out`).
+pub fn rerankShortlistsBatched(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    coarse: *?RerankCoarse,
+    logged: *bool,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+    out: []Shortlist,
+) !bool {
+    const rc = if (coarse.*) |*p| p else return false;
+    const xsh = mlx.getShape(x);
+    const N: usize = @intCast(xsh[0]);
+    if (N != out.len) return error.MtpRerankBatchLengthMismatch;
+    if (N > 32) return error.MtpRerankBatchTooWide;
+
+    var coarse_logits = try rerankCoarseRows(s, x, rc);
+    defer _ = mlx.mlx_array_free(coarse_logits);
+    try rerankMaskCoarse(s, &coarse_logits, suppress_mask);
+    if (!logged.*) {
+        log.info("[mtp] draft rerank engaged ({d}-bit coarse -> top-32 -> trunk re-score)\n", .{rc.bits});
+        logged.* = true;
+    }
+
+    const rows = rc.rows;
+    var built: usize = 0;
+    errdefer for (out[0..built]) |*sl| sl.deinit();
+    const csh = mlx.getShape(coarse_logits);
+    const last = csh[csh.len - 1];
+    for (0..N) |i| {
+        const i_c: c_int = @intCast(i);
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        if (csh.len == 3) {
+            try mlx.check(mlx.mlx_slice(&row, coarse_logits, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, last }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        } else {
+            try mlx.check(mlx.mlx_slice(&row, coarse_logits, &[_]c_int{ i_c, 0 }, 2, &[_]c_int{ i_c + 1, last }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        }
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_reshape(&flat, row, &[_]c_int{rows}, 1, s));
+        var xi = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xi);
+        try mlx.check(mlx.mlx_slice(&xi, x, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, xsh[xsh.len - 1] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        // A shortlist failure retires the coarse head mid-loop; the caller's
+        // fallback answers for the whole group, so the rows already built go.
+        out[i] = (try rerankShortlistRow(s, target, coarse, flat, rows, xi)) orelse {
+            for (out[0..built]) |*sl| sl.deinit();
+            return false;
+        };
+        built = i + 1;
+    }
+    return true;
+}
+
+/// Batched greedy draft ids from mixer rows `x` `[N,1,H]`. Same scheme as
+/// `rerankSelect` per row; one coarse readout over N.
+pub fn rerankSelectBatched(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    coarse: *?RerankCoarse,
+    logged: *bool,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !?mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    const N: usize = @intCast(xsh[0]);
+    if (N <= 1) return rerankSelect(s, target, coarse, logged, x, suppress_mask);
+    if (N > 32) return error.MtpRerankBatchTooWide;
+
+    var shortlists: [32]Shortlist = undefined;
+    if (!try rerankShortlistsBatched(s, target, coarse, logged, x, suppress_mask, shortlists[0..N])) return null;
+    defer for (shortlists[0..N]) |*sl| sl.deinit();
+
+    var id_parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });
+    defer for (id_parts[0..N]) |p| {
+        if (p.ctx != null) _ = mlx.mlx_array_free(p);
+    };
+    for (0..N) |i| {
+        const id = try shortlistArgmax(s, shortlists[i]);
+        defer _ = mlx.mlx_array_free(id);
+        id_parts[i] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&id_parts[i], id, &[_]c_int{ 1, 1 }, 2, s));
+    }
+    const vec = mlx.mlx_vector_array_new_data(id_parts[0..N].ptr, N);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var stacked = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&stacked, vec, 0, s));
+    return stacked;
+}
 
 /// Sidecar file layouts we accept, in priority order. The native layout wins
 /// so a repo shipping several keeps loading exactly what it loaded before.
@@ -629,6 +1591,21 @@ pub fn resolveMtpSource(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Di
     return null;
 }
 
+/// Qwen3.8-Flash-Next's head is the checkpoint's own layer, loaded by the
+/// trunk (`loadQwen4Mtp`), never through `resolveMtpSource`.
+const qwen4_mtp_marker = "\"language_model.mtp.fc_hidden.weight\"";
+
+fn indexJsonHasQwen4Mtp(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
+    const bytes = readDirFileAlloc(io, allocator, dir, "model.safetensors.index.json", checkpoint_header_limit) orelse return false;
+    defer allocator.free(bytes);
+    return std.mem.indexOf(u8, bytes, qwen4_mtp_marker) != null;
+}
+
+/// Advertisement probe: ANY head the server can run, including qwen4's.
+pub fn dirAdvertisesMtp(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
+    return resolveMtpSource(io, allocator, dir) != null or indexJsonHasQwen4Mtp(io, allocator, dir);
+}
+
 /// True when `model_dir` carries an MTP head we know how to load — a
 /// sidecar file OR in-checkpoint tensors. `model_dir` is absolute (same
 /// contract as `model.parseConfig`).
@@ -713,8 +1690,12 @@ fn mtpNormsAreDeltaEncoded(w: *const Weights, p: []const u8, s: mlx.mlx_stream) 
         const nf = negFraction(arr, s) catch continue;
         if (nf > max_neg) max_neg = nf;
     }
-    return max_neg > 0.05;
+    return max_neg > NORM_DELTA_NEG_FRACTION;
 }
+
+/// Negative-fraction bar that separates a delta-encoded gamma (~30-50%
+/// negative) from a folded one (positive by construction).
+pub const NORM_DELTA_NEG_FRACTION: f32 = 0.05;
 
 /// Own an RMSNorm weight, folding `+1` when the head stores delta-encoded norms.
 fn ownNorm(w: *const Weights, key: []const u8, s: mlx.mlx_stream, fold: bool) !mlx.mlx_array {
@@ -748,7 +1729,16 @@ fn arrayMeanF32(arr: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
 /// sits more than the margin below its backbone anchor. A correctly-stored head
 /// norm sits at/above its anchor (gap ≤ 0 → false); idempotent — after the `+1`
 /// the mean lands above the anchor, so a second pass is a no-op.
-fn mtpNormNeedsRepair(head_mean: f32, anchor: f32) bool {
+/// `neg_frac` is the norm's OWN negative fraction. A FOLDED gamma is strictly
+/// positive by construction (the same evidence `mtpNormsAreDeltaEncoded`
+/// reads, one tensor at a time); a delta one always carries some negatives —
+/// only ~0.2-0.8% on the vulnerable norms (q/k_norm, post_attn, final), which
+/// is why the whole-head detector needs its 5% bar and this one must not use
+/// it. The anchor gap alone cannot tell the two apart: a backbone
+/// mean-of-means spans layers from 0.02 to 2.24, so a correctly folded head
+/// norm can sit a long way under it.
+fn mtpNormNeedsRepair(head_mean: f32, anchor: f32, neg_frac: f32) bool {
+    if (neg_frac <= 0) return false;
     return anchor - head_mean > MTP_NORM_REPAIR_MARGIN;
 }
 
@@ -792,7 +1782,8 @@ fn ownHeadNormWithRepair(
     if (fold) return owned;
     const anchor = mtpBackboneAnchorMean(w, backbone_suffix, s) orelse return owned;
     const head_mean = arrayMeanF32(owned, s) catch return owned;
-    if (!mtpNormNeedsRepair(head_mean, anchor)) return owned;
+    const neg_frac = negFraction(owned, s) catch return owned;
+    if (!mtpNormNeedsRepair(head_mean, anchor, neg_frac)) return owned;
     defer _ = mlx.mlx_array_free(owned);
     log.info("[mtp] repairing head norm {s}: mean {d:.3} < backbone anchor {d:.3} (+1)\n", .{ head_key, head_mean, anchor });
     return foldNormPlusOne(owned, s);
@@ -809,8 +1800,42 @@ fn ownAndTranspose2D(w: *const Weights, key: []const u8, s: mlx.mlx_stream) !mlx
     return t;
 }
 
-/// Load a (possibly quantized) linear `<prefix>.{weight,scales,biases}`.
+/// Head-trunk requantization width (`MLX_SERVE_MTP_HEAD_QUANT_BITS`): dense
+/// bf16 trunk weights (q/k/v/o, gate/up/down) are affine-quantized to this
+/// width at group 64 during load — the head only PROPOSES tokens (verify
+/// corrects), so the cost is acceptance, never output. 0 disables. Idea from
+/// Layr-Labs/qwen-3.8-mtp-challenge @ deb63ad (see NOTICE). Test seam:
+/// `head_quant_override`.
+pub const DEFAULT_HEAD_QUANT_BITS: u32 = 4;
+pub const HEAD_QUANT_GROUP: u32 = 64;
+pub var head_quant_override: ?u32 = null;
+fn headQuantBits() u32 {
+    if (head_quant_override) |v| return v;
+    const p = std.c.getenv("MLX_SERVE_MTP_HEAD_QUANT_BITS") orelse return DEFAULT_HEAD_QUANT_BITS;
+    const v = std.fmt.parseInt(u32, std.mem.sliceTo(p, 0), 10) catch return DEFAULT_HEAD_QUANT_BITS;
+    return switch (v) {
+        0, 2, 3, 4, 5, 6, 8 => v,
+        else => DEFAULT_HEAD_QUANT_BITS,
+    };
+}
+
+/// Per-load accounting for the head-trunk requant log line.
+const HeadQuantStats = struct {
+    n: u32 = 0,
+    before_bytes: u64 = 0,
+    after_bytes: u64 = 0,
+};
+
+/// Load a (possibly quantized) linear `<prefix>.{weight,scales,biases?}`.
 /// bf16 weights (no scales) are pre-transposed for plain matmul.
+///
+/// `.biases` is optional PER TENSOR: affine is the only mode whose
+/// checkpoints carry per-group biases, so an nvfp4/mxfp4/mxfp8 sidecar ships
+/// `(weight, scales)` pairs only. Demanding the triple unconditionally made
+/// every fp-quantized head fail at load with `missing tensor: mtp.fc.biases`
+/// and silently disable MTP (ollama's `*-mlx` packs and mlx-community's
+/// `*-nvfp4` sidecars are all nvfp4). A null-ctx `b` is the trunk's own
+/// convention for an absent bias and rides straight into `qLinearFwd`.
 fn loadLinear(w: *const Weights, allocator: std.mem.Allocator, prefix: []const u8, s: mlx.mlx_stream) !QLinear {
     var key_buf: [256]u8 = undefined;
     const scales_key = try std.fmt.bufPrint(&key_buf, "{s}.scales", .{prefix});
@@ -819,7 +1844,7 @@ fn loadLinear(w: *const Weights, allocator: std.mem.Allocator, prefix: []const u
         return .{
             .w = try ownWeight(w, try std.fmt.bufPrint(&key_buf2, "{s}.weight", .{prefix})),
             .s = try ownWeight(w, try std.fmt.bufPrint(&key_buf2, "{s}.scales", .{prefix})),
-            .b = try ownWeight(w, try std.fmt.bufPrint(&key_buf2, "{s}.biases", .{prefix})),
+            .b = ownWeightOpt(w, try std.fmt.bufPrint(&key_buf2, "{s}.biases", .{prefix})),
         };
     }
     _ = allocator;
@@ -831,12 +1856,47 @@ fn loadLinear(w: *const Weights, allocator: std.mem.Allocator, prefix: []const u
     };
 }
 
+/// Trunk flavor of `loadLinear` (q/k/v/o, gate/up/down): a dense bf16 weight
+/// whose contraction dim divides HEAD_QUANT_GROUP is requantized to
+/// `headQuantBits()`/g64 packed at load (`stats` accounts it for the one log
+/// line). Quantized checkpoints, indivisible widths and lever-off load
+/// exactly as `loadLinear` does. fc, norms, routers and embeddings never
+/// come through here (NEVER_QUANTIZE class / m5Nax fc contract).
+fn loadTrunkLinear(w: *const Weights, allocator: std.mem.Allocator, prefix: []const u8, s: mlx.mlx_stream, stats: *HeadQuantStats) !QLinear {
+    const bits = headQuantBits();
+    if (bits != 0) {
+        var key_buf: [256]u8 = undefined;
+        const scales_key = try std.fmt.bufPrint(&key_buf, "{s}.scales", .{prefix});
+        if (w.get(scales_key) == null) {
+            const weight_key = try std.fmt.bufPrint(&key_buf, "{s}.weight", .{prefix});
+            if (w.get(weight_key)) |raw| {
+                const shape = mlx.getShape(raw);
+                if (shape.len == 2 and shape[1] > 0 and @rem(shape[1], @as(c_int, @intCast(HEAD_QUANT_GROUP))) == 0) {
+                    const none = mlx.mlx_array{ .ctx = null };
+                    const lin = try requantizeRows(s, raw, none, none, 0, 0, "affine", HEAD_QUANT_GROUP, bits, 4096);
+                    const rows: u64 = @intCast(shape[0]);
+                    const cols: u64 = @intCast(shape[1]);
+                    stats.n += 1;
+                    stats.before_bytes += rows * cols * 2;
+                    stats.after_bytes += rows * cols * bits / 8 + 2 * rows * (cols / HEAD_QUANT_GROUP) * 2;
+                    return lin;
+                }
+            }
+        }
+    }
+    return loadLinear(w, allocator, prefix, s);
+}
+
 /// Requantize a row-quantized affine weight `(w, scales, biases)` from
 /// `(from_gs, from_bits)` to `(to_gs, to_bits)`, chunk-wise over rows so the
 /// dequantized bf16 transient stays bounded (~chunk_rows × in_features × 2 B
 /// instead of the whole matrix — a 248K×5120 lm_head would otherwise
 /// materialize 2.5 GB). Rows quantize independently in MLX's affine packing,
 /// so per-chunk triples concatenate along axis 0 into a valid whole.
+///
+/// A DENSE source (`scales.ctx == null`, e.g. a bf16 lm_head) skips the
+/// dequantize and quantizes the row chunk directly — same chunking, one
+/// requantizer.
 pub fn requantizeRows(
     s: mlx.mlx_stream,
     w: mlx.mlx_array,
@@ -866,7 +1926,12 @@ pub fn requantizeRows(
 
         var dense = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(dense);
-        {
+        if (scales.ctx == null) {
+            var raw = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(raw);
+            try sliceRows(&raw, w, r0, r1, s);
+            try mlx.check(mlx.mlx_astype(&dense, raw, .bfloat16, s));
+        } else {
             var wq = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(wq);
             var sq = mlx.mlx_array_new();
@@ -950,9 +2015,13 @@ fn inferGroupSize(q: *const QLinear, bits: u32) ?u32 {
     const packed_cols: u32 = @intCast(w_shape[w_shape.len - 1]);
     const scale_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
     if (scale_cols == 0) return null;
-    const expanded = packed_cols * (32 / bits);
+    const packed_bits = @as(u64, packed_cols) * 32;
+    if (packed_bits % bits != 0) return null;
+    const expanded = packed_bits / bits;
     if (expanded % scale_cols != 0) return null;
-    return expanded / scale_cols;
+    const group_size = expanded / scale_cols;
+    if (group_size > std.math.maxInt(u32)) return null;
+    return @intCast(group_size);
 }
 
 /// Infer the quant BIT WIDTH from packed-weight geometry. The MTP layer's
@@ -964,11 +2033,22 @@ fn inferBits(q: *const QLinear, hidden: u32) ?u32 {
     const w_shape = mlx.getShape(q.w);
     if (w_shape.len < 2) return null;
     const packed_cols: u32 = @intCast(w_shape[w_shape.len - 1]);
-    const bits = (32 * packed_cols) / hidden;
+    const packed_bits = 32 * packed_cols;
+    if (packed_bits % hidden != 0) return null;
+    const bits = packed_bits / hidden;
     return switch (bits) {
-        2, 4, 8 => bits,
+        2, 3, 4, 5, 6, 8 => bits,
         else => null,
     };
+}
+
+/// Model-wide quant MODE of a sidecar, read off its `q_proj` — the one
+/// contracted weight whose input width is known exactly (`hidden`). Per-weight
+/// modes still resolve individually in `qLinearFwd`; this is only the fallback
+/// for geometry that will not solve.
+fn sidecarQuantMode(q: *const QLinear, hidden: u32) model_mod.QuantMode {
+    const qp = transformer_mod.quantParamsFromGeometry(q.w, q.s, q.b.ctx != null, hidden) orelse return .affine;
+    return qp.mode;
 }
 
 /// Root prefix the sidecar's keys carry: mlx-serve-native sidecars use bare
@@ -1084,12 +2164,16 @@ pub fn loadMtp(
     const fold_norms = mtpNormsAreDeltaEncoded(&weights, p, s);
     if (fold_norms) log.info("[mtp] delta-encoded norms detected; folding +1 at load\n", .{});
 
+    var hq_stats: HeadQuantStats = .{};
     var m = MtpModel{
         .allocator = allocator,
         .s = s,
         .quant_bits = 0, // inferred from tensor geometry below
         .quant_group_size = 0,
-        .fc_w_t = try ownAndTranspose2D(&weights, K.k(&kb, p, "fc.weight"), s),
+        // fc via loadLinear (never loadTrunkLinear — the m5Nax profile
+        // contract wants a bf16 fc): dense gets the pre-transpose, a
+        // quantized one (Alis) loads verbatim.
+        .fc = try loadLinear(&weights, allocator, K.k(&kb, p, "fc"), s),
         .pre_fc_norm_emb = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_embedding.weight"), s, fold_norms),
         .pre_fc_norm_hidden = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_hidden.weight"), s, fold_norms),
         // The 4 norms an oQ `mean<0.5 → +1` conversion can leave a full +1 too
@@ -1102,10 +2186,10 @@ pub fn loadMtp(
         .post_attn_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.post_attention_layernorm.weight"), ".post_attention_layernorm.weight", s, fold_norms),
         .q_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.self_attn.q_norm.weight"), ".self_attn.q_norm.weight", s, fold_norms),
         .k_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.self_attn.k_norm.weight"), ".self_attn.k_norm.weight", s, fold_norms),
-        .q = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.q_proj"), s),
-        .k = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.k_proj"), s),
-        .v = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.v_proj"), s),
-        .o = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.o_proj"), s),
+        .q = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.q_proj"), s, &hq_stats),
+        .k = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.k_proj"), s, &hq_stats),
+        .v = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.v_proj"), s, &hq_stats),
+        .o = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.o_proj"), s, &hq_stats),
         .mlp = if (is_moe) blk: {
             // Router (`mlp.gate`) via loadLinear: a bf16 router gets
             // pre-transposed for the trunk's dense-matmul fallback, a
@@ -1117,9 +2201,9 @@ pub fn loadMtp(
             const sg = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj"));
             const su = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.up_proj"));
             const sd = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.down_proj"));
-            const shg = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.gate_proj"), s);
-            const shu = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.up_proj"), s);
-            const shd = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.down_proj"), s);
+            const shg = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.gate_proj"), s, &hq_stats);
+            const shu = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.up_proj"), s, &hq_stats);
+            const shd = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.down_proj"), s, &hq_stats);
             const seg = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert_gate"), s);
             break :blk .{ .moe = .{
                 .router_w = router.w,
@@ -1148,12 +2232,22 @@ pub fn loadMtp(
                 .shared_expert_gate_b = seg.b,
             } };
         } else .{ .dense = .{
-            .gate = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.gate_proj"), s),
-            .up = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.up_proj"), s),
-            .down = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.down_proj"), s),
+            .gate = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.gate_proj"), s, &hq_stats),
+            .up = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.up_proj"), s, &hq_stats),
+            .down = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.down_proj"), s, &hq_stats),
         } },
     };
     errdefer m.deinit();
+
+    if (hq_stats.n > 0) {
+        log.info("[mtp] head trunk quantized: {d} weights bf16→{d}b/g{d} ({d}→{d} MB)\n", .{
+            hq_stats.n,                           headQuantBits(),
+            HEAD_QUANT_GROUP,                     hq_stats.before_bytes / (1024 * 1024),
+            hq_stats.after_bytes / (1024 * 1024),
+        });
+    } else if (headQuantBits() != 0) {
+        log.debug("[mtp] head trunk already quantized — requant skipped\n", .{});
+    }
 
     // Sidecars carry no quant metadata — infer bits from packed-column
     // geometry against the hidden size (exact: the bf16 fc weight pins
@@ -1162,10 +2256,19 @@ pub fn loadMtp(
     // affineParamsFromGeometry, since sidecars mix bits AND group sizes
     // (the 35B-A3B head: q/k 5-bit gs-128, v 6-bit gs-128, o 4-bit gs-64).
     {
-        const fc_shape = mlx.getShape(m.fc_w_t); // [2H, H] (pre-transposed)
-        const hidden: u32 = if (fc_shape.len == 2) @intCast(fc_shape[1]) else 0;
+        // Dense fc is pre-transposed [2H, H]; a quantized one keeps its
+        // [out=H, in_packed] orientation — read hidden off the axis that is
+        // H in both spellings, never the packed column count.
+        const fc_shape = mlx.getShape(m.fc.w);
+        const hidden: u32 = if (fc_shape.len != 2)
+            0
+        else if (m.fc.s.ctx == null)
+            @intCast(fc_shape[1])
+        else
+            @intCast(fc_shape[0]);
         m.quant_bits = inferBits(&m.q, hidden) orelse 4;
         m.quant_group_size = inferGroupSize(&m.q, m.quant_bits) orelse 64;
+        m.quant_mode = sidecarQuantMode(&m.q, hidden);
     }
 
     // Materialize all weights now so first-token latency doesn't pay for it.
@@ -1173,11 +2276,14 @@ pub fn loadMtp(
         const eval_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(eval_vec);
         const base = [_]mlx.mlx_array{
-            m.fc_w_t,     m.pre_fc_norm_emb, m.pre_fc_norm_hidden, m.final_norm,
-            m.input_norm, m.post_attn_norm,  m.q_norm,             m.k_norm,
-            m.q.w,        m.k.w,             m.v.w,                m.o.w,
+            m.fc.w,               m.fc.s,       m.fc.b,       m.pre_fc_norm_emb,
+            m.pre_fc_norm_hidden, m.final_norm, m.input_norm, m.post_attn_norm,
+            m.q_norm,             m.k_norm,     m.q.w,        m.k.w,
+            m.v.w,                m.o.w,
         };
-        for (base) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+        for (base) |a| if (a.ctx != null) {
+            _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+        };
         switch (m.mlp) {
             .dense => |*d| {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, d.gate.w);
@@ -1241,7 +2347,7 @@ fn loadHy3Mtp(
         .s = s,
         .quant_bits = 0,
         .quant_group_size = 0,
-        .fc_w_t = .{ .ctx = null },
+        .fc = .{ .w = .{ .ctx = null }, .s = .{ .ctx = null }, .b = .{ .ctx = null } },
         .eh_proj = try loadLinear(weights, allocator, K.k(&kb, p, "eh_proj"), s),
         .pre_fc_norm_emb = try ownWeight(weights, K.k(&kb, p, "enorm.weight")),
         .pre_fc_norm_hidden = try ownWeight(weights, K.k(&kb, p, "hnorm.weight")),
@@ -1289,6 +2395,7 @@ fn loadHy3Mtp(
         const hidden: u32 = if (en_shape.len == 1) @intCast(en_shape[0]) else 0;
         m.quant_bits = inferBits(&m.q, hidden) orelse 8;
         m.quant_group_size = inferGroupSize(&m.q, m.quant_bits) orelse 64;
+        m.quant_mode = sidecarQuantMode(&m.q, hidden);
     }
 
     // Materialize now so the first draft doesn't pay for it.
@@ -1339,21 +2446,27 @@ fn qLinearFwd(self: *const MtpModel, x: mlx.mlx_array, lin: *const QLinear) !mlx
     }
     var bits = self.quant_bits;
     var group = self.quant_group_size;
+    var mode = self.quant_mode;
     const x_shape = mlx.getShape(x);
     if (x_shape.len > 0 and x_shape[x_shape.len - 1] > 0) {
         const in_dim: u32 = @intCast(x_shape[x_shape.len - 1]);
-        if (transformer_mod.affineParamsFromGeometry(lin.w, lin.s, in_dim)) |qp| {
+        if (transformer_mod.quantParamsFromGeometry(lin.w, lin.s, lin.b.ctx != null, in_dim)) |qp| {
             bits = qp.bits;
             group = qp.group_size;
+            mode = qp.mode;
         }
     }
     // Multi-row head forwards (the merged history+draft consume, prefill
     // history rebuilds) ride the same verify-width split-K kernel as the
     // trunk; ineligible shapes (seq 1 drafts, 5/6-bit MoE sidecars) fall
     // through to stock.
-    if (try transformer_mod.verifyQmm(self.s, x, lin.w, lin.s, lin.b, bits, group)) |vy| {
-        _ = mlx.mlx_array_free(out);
-        return vy;
+    // The verify lanes are affine-only kernels (they unpack affine
+    // scales/biases); fp modes fall straight through to stock.
+    if (mode == .affine) {
+        if (try transformer_mod.verifyQmm(self.s, x, lin.w, lin.s, lin.b, bits, group)) |vy| {
+            _ = mlx.mlx_array_free(out);
+            return vy;
+        }
     }
     try mlx.check(mlx.mlx_quantized_matmul(
         &out,
@@ -1364,7 +2477,7 @@ fn qLinearFwd(self: *const MtpModel, x: mlx.mlx_array, lin: *const QLinear) !mlx
         true,
         mlx.mlx_optional_int.some(@intCast(group)),
         mlx.mlx_optional_int.some(@intCast(bits)),
-        "affine",
+        mode.cstr(),
         self.s,
     ));
     return out;
@@ -1497,7 +2610,7 @@ const FrontOut = struct {
     q_t: mlx.mlx_array, // [1, H, L, D] normed, pre-rope
     k_t: mlx.mlx_array, // [1, Hkv, L, D] normed, pre-rope
     v_t: mlx.mlx_array, // [1, Hkv, L, D]
-    gate: mlx.mlx_array, // [1, L, H*D] raw output gate (pre-sigmoid)
+    gate: mlx.mlx_array, // [1, L, H, D] raw output gate (pre-sigmoid, strided split view)
     x: mlx.mlx_array, // [1, L, H] fc output — the residual input
 
     fn deinit(self: *FrontOut) void {
@@ -1513,18 +2626,11 @@ const FrontOut = struct {
 /// input_norm, q/k/v projections, q/gate split, per-head norms, transposes.
 /// Offset-free — the body the compiled front closure traces AND the
 /// uncompiled fallback.
-fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array) !FrontOut {
+/// The fusion stub shared by the full layer forward and the KV-only history
+/// append: x = fc(concat([norm(embed ids), norm(hidden)])). Returns owned x.
+fn fcConcat(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, seq_len: c_int) !mlx.mlx_array {
     const s = self.s;
-    const cfg = &target.config;
-    const h_count: c_int = @intCast(cfg.num_attention_heads);
-    const kv_h: c_int = @intCast(cfg.num_key_value_heads);
-    const hd: c_int = @intCast(cfg.head_dim);
-    const eps = cfg.rms_norm_eps;
-    const h_shape = mlx.getShape(hidden);
-    const seq_len: c_int = h_shape[1];
-    const flat_shape = [_]c_int{ 1, seq_len, h_count * hd };
-
-    // fc(concat([norm(embed), norm(hidden)]))
+    const eps = target.config.rms_norm_eps;
     const emb = try embedTargetTokens(target, id_arr, seq_len, s);
     defer _ = mlx.mlx_array_free(emb);
     const e_normed = try rmsNormFn(emb, self.pre_fc_norm_emb, eps, s);
@@ -1541,15 +2647,26 @@ fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array
         _ = mlx.mlx_vector_array_append_value(vec, h_normed);
         try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 2, s));
     }
-    var x = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(x);
     if (self.eh_proj) |*ep| {
         // Hy3: the concat projection is quantized (mtp.eh_proj, 8-bit).
-        _ = mlx.mlx_array_free(x);
-        x = try qLinearFwd(self, cat, ep);
-    } else {
-        try mlx.check(mlx.mlx_matmul(&x, cat, self.fc_w_t, s));
+        return qLinearFwd(self, cat, ep);
     }
+    // Dense fc keeps the plain matmul (qLinearFwd's own dense arm); a
+    // quantized fc (Alis packs) takes the quantized path unchanged.
+    return qLinearFwd(self, cat, &self.fc);
+}
+
+fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array) !FrontOut {
+    const s = self.s;
+    const cfg = &target.config;
+    const h_count: c_int = @intCast(cfg.num_attention_heads);
+    const kv_h: c_int = @intCast(cfg.num_key_value_heads);
+    const hd: c_int = @intCast(cfg.head_dim);
+    const eps = cfg.rms_norm_eps;
+    const h_shape = mlx.getShape(hidden);
+    const seq_len: c_int = h_shape[1];
+    const x = try fcConcat(self, target, id_arr, hidden, seq_len);
+    errdefer _ = mlx.mlx_array_free(x);
 
     // ── Decoder layer: full attention (Qwen: gated q; Hy3: plain q) ──
     const normed = try rmsNormFn(x, self.input_norm, eps, s);
@@ -1580,10 +2697,9 @@ fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array
         if (mlx.mlx_vector_array_size(split_vec) != 2) return error.UnexpectedSplitCount;
         try mlx.check(mlx.mlx_vector_array_get(&queries, split_vec, 0));
 
-        var gate_4d = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(gate_4d);
-        try mlx.check(mlx.mlx_vector_array_get(&gate_4d, split_vec, 1));
-        try mlx.check(mlx.mlx_reshape(&gate, gate_4d, &flat_shape, 3, s));
+        // The gate STAYS 4-D — flattening the split view is a REAL Copy
+        // kernel per draft step (backChain multiplies it strided for free).
+        try mlx.check(mlx.mlx_vector_array_get(&gate, split_vec, 1));
     }
 
     const k_proj = try qLinearFwd(self, normed, &self.k);
@@ -1634,21 +2750,27 @@ fn backChain(self: *const MtpModel, target: *Transformer, attn_out: mlx.mlx_arra
     var attn_t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn_t);
     try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm, 4, s));
-    var attn_flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(attn_flat);
-    try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, s));
 
     // Output gate: o_proj(attn * sigmoid(gate)); ungated archs (Hy3) pass a
-    // null-ctx gate → straight o_proj(attn).
-    const o_out = if (gate.ctx == null)
-        try qLinearFwd(self, attn_flat, &self.o)
-    else blk: {
+    // null-ctx gate → straight o_proj(attn). The gated arm multiplies 4-D
+    // (strided views are copy-free in the elementwise kernel) and flattens
+    // the CONTIGUOUS product — flattening attn_t/gate first paid two REAL
+    // Copy kernels per draft step.
+    const o_out = if (gate.ctx == null) blk: {
+        var attn_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_flat);
+        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, s));
+        break :blk try qLinearFwd(self, attn_flat, &self.o);
+    } else blk: {
         var gate_sig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gate_sig);
         try mlx.check(mlx.mlx_sigmoid(&gate_sig, gate, s));
+        var gated_4d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gated_4d);
+        try mlx.check(mlx.mlx_multiply(&gated_4d, attn_t, gate_sig, s));
         var gated = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gated);
-        try mlx.check(mlx.mlx_multiply(&gated, attn_flat, gate_sig, s));
+        try mlx.check(mlx.mlx_reshape(&gated, gated_4d, &flat_shape, 3, s));
         break :blk try qLinearFwd(self, gated, &self.o);
     };
     defer _ = mlx.mlx_array_free(o_out);
@@ -1691,13 +2813,31 @@ fn backChain(self: *const MtpModel, target: *Transformer, attn_out: mlx.mlx_arra
 }
 
 pub const StepOut = struct {
-    /// `[1, 1, vocab]` LAST-row logits, or `.ctx == null` when `want_logits`
-    /// was false (multi-row calls never project the history rows — only the
-    /// last row feeds the draft chain).
+    /// `[1, 1, vocab]` LAST-row logits, or `.ctx == null` when the caller did
+    /// not ask for `.logits` (multi-row calls never project the history rows —
+    /// only the last row feeds the draft chain).
     logits: mlx.mlx_array,
     /// MTP post-norm hidden — the next depth's `hidden` input. `[1, 1, H]`
-    /// (last row) when `want_logits`, the full `[1, L, H]` otherwise.
+    /// (last row) under `.logits`, the full `[1, L, H]` otherwise.
     hidden_next: mlx.mlx_array,
+    /// The vector the TARGET's lm_head consumes, for `.mixed` steps. Null on
+    /// every arm where that is just `hidden_next` (the sidecar); non-null on
+    /// qwen4_exp, whose `hidden_next` is the PRE-mixer stream and whose
+    /// lm_head input is the mixer output. Owned by the caller when non-null.
+    rerank_x: mlx.mlx_array = .{ .ctx = null },
+};
+
+/// What a head step owes its caller. `want_logits: bool` could not tell the
+/// two zero-logits cases apart: a history append wants nothing past the
+/// stream, while a rerank draft still needs the vector the lm_head consumes.
+pub const StepWant = enum {
+    /// Last-row logits (and the last-row hidden).
+    logits,
+    /// No logits, but the lm_head's INPUT vector for the last row — the
+    /// rerank draft path.
+    mixed,
+    /// Nothing past the stream: committed-history appends.
+    none,
 };
 
 pub const MropeContext = mrope.PositionContext;
@@ -1727,6 +2867,101 @@ pub fn forward(
 /// to the target's M-RoPE positions. Image-prompt positions use the explicit
 /// three-axis table. Once decoding moves past that table, generated text uses
 /// the scalar `absolute + delta` fast-RoPE path.
+pub var mtp_kv_only_override: ?bool = null; // test seam
+var mtp_kv_only_env: ?bool = null;
+
+/// KV-only history rows ship ON (mlxfast-challenge lastHiddenWithKVOnlyHistory
+/// class): a committed-history row's layer OUTPUT has no consumer — only its
+/// K/V entries matter — so the q(+gate) projection, the attention, and the
+/// whole post-attention half are dead work for every row but the last.
+/// MLX_SERVE_MTP_KV_ONLY=0 restores the full-forward history path.
+fn mtpKvOnlyEnabled() bool {
+    if (mtp_kv_only_override) |v| return v;
+    if (mtp_kv_only_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_MTP_KV_ONLY");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    mtp_kv_only_env = enabled;
+    return enabled;
+}
+
+/// Append `hidden`/`id_arr` rows to the head's cache through the K/V-only
+/// path: fc fusion + input_norm + K/V projections + k_norm + rope + cache
+/// update. No query, no attention, no MLP — nothing downstream reads those
+/// rows' outputs. Byte parity with the full path is NOT the bar (a different
+/// GEMM M reorders reductions); the head only proposes, so the cost of any
+/// near-tie flip is acceptance, which the live equivalence script gates.
+fn appendKvOnly(
+    self: *const MtpModel,
+    target: *Transformer,
+    cache: *KVCache,
+    id_arr: mlx.mlx_array,
+    hidden: mlx.mlx_array,
+    rope_offset: c_int,
+    mrope_ctx: ?MropeContext,
+) !void {
+    const s = self.s;
+    const cfg = &target.config;
+    const kv_h: c_int = @intCast(cfg.num_key_value_heads);
+    const hd: c_int = @intCast(cfg.head_dim);
+    const eps = cfg.rms_norm_eps;
+    const h_shape = mlx.getShape(hidden);
+    const seq_len: c_int = h_shape[1];
+    const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
+
+    const x = try fcConcat(self, target, id_arr, hidden, seq_len);
+    defer _ = mlx.mlx_array_free(x);
+    const normed = try rmsNormFn(x, self.input_norm, eps, s);
+    defer _ = mlx.mlx_array_free(normed);
+
+    const k_proj = try qLinearFwd(self, normed, &self.k);
+    defer _ = mlx.mlx_array_free(k_proj);
+    const v_proj = try qLinearFwd(self, normed, &self.v);
+    defer _ = mlx.mlx_array_free(v_proj);
+
+    const kv_shape = [_]c_int{ 1, seq_len, kv_h, hd };
+    var k_r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_r);
+    var v_r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_r);
+    try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, s));
+    try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, s));
+
+    const k_normed = try rmsNormFn(k_r, self.k_norm, eps, s);
+    defer _ = mlx.mlx_array_free(k_normed);
+    const perm = [_]c_int{ 0, 2, 1, 3 };
+    var k_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_t);
+    var v_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_t);
+    try mlx.check(mlx.mlx_transpose_axes(&k_t, k_normed, &perm, 4, s));
+    try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, s));
+
+    var k_rope = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_rope);
+    const relative_offset: usize = @intCast(rope_offset);
+    const needs_explicit_mrope = if (mrope_ctx) |positions|
+        positions.absolutePosition(relative_offset) < positions.total
+    else
+        false;
+    if (needs_explicit_mrope) {
+        const positions = mrope_ctx.?;
+        const cs = try target.buildMropeCosSin(positions, relative_offset, @intCast(seq_len));
+        defer _ = mlx.mlx_array_free(cs.cos);
+        defer _ = mlx.mlx_array_free(cs.sin);
+        _ = mlx.mlx_array_free(k_rope);
+        k_rope = try target.applyMrope(k_t, cs.cos, cs.sin, rope_dims);
+    } else {
+        const effective_offset: c_int = if (mrope_ctx) |positions|
+            @intCast(@as(i64, @intCast(positions.absolutePosition(relative_offset))) + positions.delta)
+        else
+            rope_offset;
+        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, effective_offset, .{ .ctx = null }, s));
+    }
+
+    var kv_view = try cache.update(0, k_rope, v_t, s, 0);
+    kv_view.deinit();
+}
+
 pub fn forwardWithMrope(
     self: *const MtpModel,
     target: *Transformer,
@@ -1742,6 +2977,42 @@ pub fn forwardWithMrope(
     const hidden_size: c_int = @intCast(cfg.hidden_size);
     const h_shape = mlx.getShape(hidden);
     const seq_len: c_int = h_shape[1];
+
+    // Merged history+draft forward: only the LAST row's output has a consumer
+    // (the logits slice below already said so). Flush the leading rows
+    // through the K/V-only path, then run the full layer on the last row
+    // alone — it attends the whole cache, so the math it feeds the draft
+    // chain sees the same history.
+    if (want_logits and seq_len > 1 and mtpKvOnlyEnabled()) {
+        const strides1 = [_]c_int{1};
+        var ids_head = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_head);
+        var ids_last = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_last);
+        {
+            const start0 = [_]c_int{0};
+            const stop0 = [_]c_int{seq_len - 1};
+            try mlx.check(mlx.mlx_slice(&ids_head, id_arr, &start0, 1, &stop0, 1, &strides1, 1, s));
+            const start1 = [_]c_int{seq_len - 1};
+            const stop1 = [_]c_int{seq_len};
+            try mlx.check(mlx.mlx_slice(&ids_last, id_arr, &start1, 1, &stop1, 1, &strides1, 1, s));
+        }
+        const strides3 = [_]c_int{ 1, 1, 1 };
+        var hid_head = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hid_head);
+        var hid_last = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hid_last);
+        {
+            const start0 = [_]c_int{ 0, 0, 0 };
+            const stop0 = [_]c_int{ 1, seq_len - 1, hidden_size };
+            try mlx.check(mlx.mlx_slice(&hid_head, hidden, &start0, 3, &stop0, 3, &strides3, 3, s));
+            const start1 = [_]c_int{ 0, seq_len - 1, 0 };
+            const stop1 = [_]c_int{ 1, seq_len, hidden_size };
+            try mlx.check(mlx.mlx_slice(&hid_last, hidden, &start1, 3, &stop1, 3, &strides3, 3, s));
+        }
+        try appendKvOnly(self, target, cache, ids_head, hid_head, rope_offset, mrope_ctx);
+        return forwardWithMrope(self, target, cache, ids_last, hid_last, rope_offset + seq_len - 1, true, mrope_ctx);
+    }
     const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
     const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
 
@@ -1792,19 +3063,19 @@ pub fn forwardWithMrope(
     }
     if (!fused_done) {
         const mask_mode: [*:0]const u8 = if (seq_len > 1) "causal" else "";
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, seq_len > 1 and transformer_mod.sdpaForceFused(q_rope, kv_view.k), s));
     }
 
     const post = try backChain(self, target, attn_out, front.gate, front.x, seq_len);
 
-    if (!want_logits) {
-        return .{ .logits = .{ .ctx = null }, .hidden_next = post };
-    }
     // Logits (and the chained hidden) are only ever consumed for the LAST
     // row — the draft chain's next token / confidence. Multi-row calls (the
     // merged history+draft forward) slice to the last row BEFORE the vocab
     // head projection: projecting the history rows through a 248k-vocab head
     // is pure waste, and a [1,L,H] hidden_next would break the L=1 chain.
+    // The slice applies on the want_logits=false arm too: the rerank draft
+    // path chains hidden_next without ever asking for logits, and
+    // appendHistory (the other no-logits caller) frees hidden_next unused.
     var post_last = post;
     if (seq_len > 1) {
         var sliced = mlx.mlx_array_new();
@@ -1818,6 +3089,9 @@ pub fn forwardWithMrope(
         };
         _ = mlx.mlx_array_free(post);
         post_last = sliced;
+    }
+    if (!want_logits) {
+        return .{ .logits = .{ .ctx = null }, .hidden_next = post_last };
     }
     const logits = targetLmHead(self, target, post_last, s) catch |err| {
         _ = mlx.mlx_array_free(post_last);
@@ -1856,14 +3130,16 @@ pub fn appendHistoryWithMrope(
     const id_arr = mlx.mlx_array_new_data(ids_i32.ptr, &id_shape, 1, .int32);
     defer _ = mlx.mlx_array_free(id_arr);
 
+    // Pure history: EVERY row's output is dead — K/V-only for all of them.
+    if (mtpKvOnlyEnabled()) {
+        return appendKvOnly(self, target, cache, id_arr, hidden, rope_offset, mrope_ctx);
+    }
     // KVCache.update advances `cache.step` (layer 0) by the batch length.
     var out = try forwardWithMrope(self, target, cache, id_arr, hidden, rope_offset, false, mrope_ctx);
     _ = mlx.mlx_array_free(out.hidden_next);
     out.hidden_next = .{ .ctx = null };
 }
 
-/// One lazy draft step: `[1]`-shaped (possibly lazy) token id + `[1,1,H]`
-/// hidden → logits + next hidden. Appends one entry to `cache`.
 pub fn stepArr(
     self: *const MtpModel,
     target: *Transformer,
@@ -1886,6 +3162,298 @@ pub fn stepArrWithMrope(
 ) !StepOut {
     // KVCache.update advances `cache.step` (layer 0) by 1.
     return forwardWithMrope(self, target, cache, prev_token_arr, hidden, rope_offset, true, mrope_ctx);
+}
+
+// ── Draft-rerank shortlist (port of the mlx.fast challenge draft-rerank
+// scheme, submission 942e5ab2 in mlx.fast-qwen-3.8-mtp-challenge) ──
+//
+// PROPOSAL SIDE ONLY: a coarse 2-bit requant of the trunk lm_head scores the
+// full vocab, an exact top-32 shortlist is taken in TWO dispatches (MLX's
+// GPU argpartition is a full multi-block argsort — 14 dependent dispatches
+// for 32 read values), and the trunk head's own 32 rows re-score the
+// shortlist. The draft is the trunk's argmax over those rows, so whenever
+// the coarse top-32 contains the trunk argmax the draft IS the trunk's
+// choice — acceptance rides the trunk's order at ~2-bit readout cost.
+// Verification is untouched: a coarse miss costs acceptance, never output.
+//
+// Ordinal: a monotone map from float into uint32 inducing (value asc, NaN
+// above every number, -0.0 == +0.0). Real values never map to 0, so the
+// zero-initialized empty slots below can never be selected while a
+// simdgroup still has real candidates (guaranteed by rows >= TILES*TG).
+const TOP32_ORDINAL_HEADER =
+    \\inline uint msv_top32_ordinal(float v) {
+    \\    if (isnan(v))  { return 0xFFFFFFFFu; }
+    \\    if (v == 0.0f) { return 0x80000000u; }
+    \\    uint u = as_type<uint>(v);
+    \\    return (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
+    \\}
+;
+
+// Stage 1: TILES threadgroups partition [0, RC); each emits its local top 32
+// as (ordinal, index) pairs — TILES * 32 candidates. Selection is 32 rounds
+// of simd_max over per-thread slots with a `taken` bitmask (hence the
+// PER_THREAD <= 32 static_assert), then one simdgroup reduces the
+// threadgroup's per-simd lists the same way.
+const TOP32_PARTIAL_SRC =
+    \\constexpr uint REAL_COUNT = (uint)RC;
+    \\constexpr uint TG_SIZE    = 256;
+    \\constexpr uint STRIDE     = 64u * 256u;
+    \\constexpr uint PER_THREAD = (REAL_COUNT + STRIDE - 1u) / STRIDE;
+    \\constexpr uint TOPK       = 32;
+    \\constexpr uint SIMD_SIZE  = 32;
+    \\constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
+    \\constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
+    \\static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
+    \\static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
+    \\
+    \\uint tile = threadgroup_position_in_grid.x;
+    \\uint tid  = thread_position_in_threadgroup.x;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint sg   = simdgroup_index_in_threadgroup;
+    \\
+    \\uint ord[PER_THREAD];
+    \\uint idx[PER_THREAD];
+    \\for (uint t = 0; t < PER_THREAD; ++t) { ord[t] = 0u; idx[t] = 0u; }
+    \\uint n = 0;
+    \\for (uint i = tile * TG_SIZE + tid; i < REAL_COUNT; i += STRIDE) {
+    \\    ord[n] = msv_top32_ordinal(float(logits[i]));
+    \\    idx[n] = i;
+    \\    n++;
+    \\}
+    \\
+    \\threadgroup uint sc_ord[NSIMD * TOPK];
+    \\threadgroup uint sc_idx[NSIMD * TOPK];
+    \\
+    \\uint taken = 0u;
+    \\for (uint r = 0; r < TOPK; ++r) {
+    \\    uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+    \\    for (uint t = 0; t < PER_THREAD; ++t) {
+    \\        if ((taken & (1u << t)) != 0u) { continue; }
+    \\        if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
+    \\            bo = ord[t]; bi = idx[t]; bs = t;
+    \\        }
+    \\    }
+    \\    uint mo = simd_max(bo);
+    \\    uint mi = simd_max((bo == mo) ? bi : 0u);
+    \\    if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+    \\        taken |= (1u << bs);
+    \\    }
+    \\    if (lane == 0) {
+    \\        sc_ord[sg * TOPK + r] = mo;
+    \\        sc_idx[sg * TOPK + r] = mi;
+    \\    }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\if (sg == 0) {
+    \\    uint o2[PB];
+    \\    uint i2[PB];
+    \\    for (uint t = 0; t < PB; ++t) {
+    \\        uint p = t * SIMD_SIZE + lane;
+    \\        o2[t] = sc_ord[p];
+    \\        i2[t] = sc_idx[p];
+    \\    }
+    \\    uint tk2 = 0u;
+    \\    for (uint r = 0; r < TOPK; ++r) {
+    \\        uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+    \\        for (uint t = 0; t < PB; ++t) {
+    \\            if ((tk2 & (1u << t)) != 0u) { continue; }
+    \\            if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
+    \\                bo = o2[t]; bi = i2[t]; bs = t;
+    \\            }
+    \\        }
+    \\        uint mo = simd_max(bo);
+    \\        uint mi = simd_max((bo == mo) ? bi : 0u);
+    \\        if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+    \\            tk2 |= (1u << bs);
+    \\        }
+    \\        if (lane == 0) {
+    \\            cand_ord[tile * TOPK + r] = mo;
+    \\            cand_idx[tile * TOPK + r] = mi;
+    \\        }
+    \\    }
+    \\}
+;
+
+// Stage 2: one threadgroup reduces the TILES*32 candidates to the final 32
+// ids (written ascending by (value, index) — consumers are order-blind).
+const TOP32_FINAL_SRC =
+    \\constexpr uint TG_SIZE    = 256;
+    \\constexpr uint PER_THREAD = 8;
+    \\constexpr uint TOPK       = 32;
+    \\constexpr uint SIMD_SIZE  = 32;
+    \\constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
+    \\constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
+    \\
+    \\uint tid  = thread_position_in_threadgroup.x;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint sg   = simdgroup_index_in_threadgroup;
+    \\
+    \\uint ord[PER_THREAD];
+    \\uint idx[PER_THREAD];
+    \\for (uint t = 0; t < PER_THREAD; ++t) {
+    \\    uint p = t * TG_SIZE + tid;
+    \\    ord[t] = cand_ord[p];
+    \\    idx[t] = cand_idx[p];
+    \\}
+    \\
+    \\threadgroup uint sc_ord[NSIMD * TOPK];
+    \\threadgroup uint sc_idx[NSIMD * TOPK];
+    \\
+    \\uint taken = 0u;
+    \\for (uint r = 0; r < TOPK; ++r) {
+    \\    uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+    \\    for (uint t = 0; t < PER_THREAD; ++t) {
+    \\        if ((taken & (1u << t)) != 0u) { continue; }
+    \\        if (ord[t] > bo || (ord[t] == bo && idx[t] > bi)) {
+    \\            bo = ord[t]; bi = idx[t]; bs = t;
+    \\        }
+    \\    }
+    \\    uint mo = simd_max(bo);
+    \\    uint mi = simd_max((bo == mo) ? bi : 0u);
+    \\    if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+    \\        taken |= (1u << bs);
+    \\    }
+    \\    if (lane == 0) {
+    \\        sc_ord[sg * TOPK + r] = mo;
+    \\        sc_idx[sg * TOPK + r] = mi;
+    \\    }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\if (sg == 0) {
+    \\    uint o2[PB];
+    \\    uint i2[PB];
+    \\    for (uint t = 0; t < PB; ++t) {
+    \\        uint p = t * SIMD_SIZE + lane;
+    \\        o2[t] = sc_ord[p];
+    \\        i2[t] = sc_idx[p];
+    \\    }
+    \\    uint tk2 = 0u;
+    \\    for (uint r = 0; r < TOPK; ++r) {
+    \\        uint bo = 0u, bi = 0u, bs = 0xFFFFFFFFu;
+    \\        for (uint t = 0; t < PB; ++t) {
+    \\            if ((tk2 & (1u << t)) != 0u) { continue; }
+    \\            if (o2[t] > bo || (o2[t] == bo && i2[t] > bi)) {
+    \\                bo = o2[t]; bi = i2[t]; bs = t;
+    \\            }
+    \\        }
+    \\        uint mo = simd_max(bo);
+    \\        uint mi = simd_max((bo == mo) ? bi : 0u);
+    \\        if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
+    \\            tk2 |= (1u << bs);
+    \\        }
+    \\        if (lane == 0) { token_ids[TOPK - 1u - r] = mi; }
+    \\    }
+    \\}
+;
+
+const TOP32_K: c_int = 32;
+const TOP32_TG: c_int = 256;
+const TOP32_TILES: c_int = 64;
+const TOP32_CANDS: c_int = TOP32_TILES * TOP32_K;
+/// Minimum row count: below TILES*TG some simdgroups hold fewer than 32 real
+/// candidates and the zero-initialized empty slots become reachable.
+pub const TOP32_MIN_ROWS: c_int = TOP32_TILES * TOP32_TG;
+
+var top32_partial_cached: ?mlx.mlx_fast_metal_kernel = null;
+var top32_final_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getTop32Partial() !mlx.mlx_fast_metal_kernel {
+    if (top32_partial_cached) |k| return k;
+    const input_names = [_][*:0]const u8{"logits"};
+    const output_names = [_][*:0]const u8{ "cand_ord", "cand_idx" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_mtp_top32_partial",
+        in_vec,
+        out_vec,
+        TOP32_PARTIAL_SRC,
+        TOP32_ORDINAL_HEADER,
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    top32_partial_cached = kernel;
+    return kernel;
+}
+
+fn getTop32Final() !mlx.mlx_fast_metal_kernel {
+    if (top32_final_cached) |k| return k;
+    const input_names = [_][*:0]const u8{ "cand_ord", "cand_idx" };
+    const output_names = [_][*:0]const u8{"token_ids"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_mtp_top32_finalize",
+        in_vec,
+        out_vec,
+        TOP32_FINAL_SRC,
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    top32_final_cached = kernel;
+    return kernel;
+}
+
+/// Exact top-32 ids of `row` ([rows], any float dtype) as a lazy [32] uint32
+/// array, ascending by (value, index) — ties break toward the higher index,
+/// NaN above every number. `rows` rides as a template int (stable per model,
+/// so MLX caches one specialization per vocab width).
+pub fn draftTop32(s: mlx.mlx_stream, row: mlx.mlx_array, rows: c_int) !mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return error.MetalKernelNeedsGpuStream;
+    if (rows < TOP32_MIN_ROWS) return error.UnsupportedTop32Shape;
+    const per_thread = @divTrunc(rows + TOP32_TILES * TOP32_TG - 1, TOP32_TILES * TOP32_TG);
+    if (per_thread > 32) return error.UnsupportedTop32Shape;
+
+    const pk = try getTop32Partial();
+    var cand_ord = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_ord);
+    var cand_idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_idx);
+    {
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        const cand_shape = [_]c_int{TOP32_CANDS};
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &cand_shape, 1, .uint32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &cand_shape, 1, .uint32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, TOP32_TILES * TOP32_TG, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, TOP32_TG, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RC", rows));
+        const inputs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(inputs);
+        _ = mlx.mlx_vector_array_append_value(inputs, row);
+        var outputs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outputs);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, pk, inputs, cfg, s));
+        try mlx.check(mlx.mlx_vector_array_get(&cand_ord, outputs, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&cand_idx, outputs, 1));
+    }
+
+    const fk = try getTop32Final();
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const out_shape = [_]c_int{TOP32_K};
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, TOP32_TG, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, TOP32_TG, 1, 1));
+    const inputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    _ = mlx.mlx_vector_array_append_value(inputs, cand_ord);
+    _ = mlx.mlx_vector_array_append_value(inputs, cand_idx);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, fk, inputs, cfg, s));
+    var token_ids = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&token_ids, outputs, 0));
+    return token_ids;
 }
 
 // ── Tests ──
@@ -1972,7 +3540,7 @@ test "mtp: loadMtp detects the Hy3 layout (eh_proj + full decoder layer + sigmoi
     // Hy3 shape: quantizable eh_proj bound, no bf16 fc, MoE mlp with the
     // sigmoid-router extras, UNGATED shared expert.
     try testing.expect(m.eh_proj != null);
-    try testing.expect(m.fc_w_t.ctx == null);
+    try testing.expect(m.fc.w.ctx == null);
     try testing.expect(m.mlp == .moe);
     try testing.expect(m.mlp.moe.expert_bias != null);
     try testing.expect(m.mlp.moe.shared_ungated);
@@ -2232,10 +3800,19 @@ fn maxAbsDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
 test "mtp: reference-based head-norm repair rule (oMLX norm_repair)" {
     // Gap beyond the margin (an oQ-broken head, ~1 below its backbone anchor)
     // → repair; a head at/above its anchor → no-op; idempotent after the +1.
-    try testing.expect(mtpNormNeedsRepair(0.75, 1.45)); // gap 0.70 → repair
-    try testing.expect(!mtpNormNeedsRepair(1.30, 1.45)); // gap 0.15 → no-op
-    try testing.expect(!mtpNormNeedsRepair(1.50, 1.45)); // above anchor → no-op
-    try testing.expect(!mtpNormNeedsRepair(0.75 + 1.0, 1.45)); // post-shift → no-op
+    // Delta-encoded (some negatives) + gap beyond the margin → repair.
+    try testing.expect(mtpNormNeedsRepair(0.75, 1.45, 0.008)); // gap 0.70 → repair
+    try testing.expect(!mtpNormNeedsRepair(1.30, 1.45, 0.008)); // gap 0.15 → no-op
+    try testing.expect(!mtpNormNeedsRepair(1.50, 1.45, 0.008)); // above anchor → no-op
+    try testing.expect(!mtpNormNeedsRepair(0.75 + 1.0, 1.45, 0.0)); // post-shift → no-op
+
+    // A STRICTLY POSITIVE norm is folded by construction, whatever the anchor
+    // says: avlp12's Alis head ships post_attention_layernorm at 1.206 — the
+    // exact value the delta fold produces — against a 1.93 mean-of-means
+    // anchor whose own layers span 0.02..2.24. The gap rule alone convicted
+    // it, double-shifted it to 2.21 and dropped per-draft acceptance from
+    // ~86% to 33% (live 2026-08-19).
+    try testing.expect(!mtpNormNeedsRepair(1.206, 1.930, 0.0));
 }
 
 test "mtp: inferGroupSize geometry" {
@@ -2254,6 +3831,23 @@ test "mtp: inferGroupSize geometry" {
     try testing.expectEqual(@as(?u32, 8), inferBits(&q, 16));
     try testing.expectEqual(@as(?u32, null), inferBits(&q, 0));
     try testing.expectEqual(@as(?u32, null), inferBits(&q, 100));
+    // Every affine width accepted by the shared geometry solver must also be
+    // a valid sidecar fallback; q3/q5/q6 used to silently fall back to q4.
+    var q_mixed = QLinear{
+        .w = mlx.mlx_array_new_data(&@as([12]i32, @splat(0)), &[_]c_int{ 2, 6 }, 2, .int32),
+        .s = mlx.mlx_array_new_data(&@as([4]f32, @splat(0)), &[_]c_int{ 2, 2 }, 2, .float32),
+        .b = mlx.mlx_array_new(),
+    };
+    defer q_mixed.deinit();
+    try testing.expectEqual(@as(?u32, 3), inferBits(&q_mixed, 64));
+    try testing.expectEqual(@as(?u32, 6), inferBits(&q_mixed, 32));
+    try testing.expectEqual(@as(?u32, 32), inferGroupSize(&q_mixed, 3));
+    try testing.expectEqual(@as(?u32, 16), inferGroupSize(&q_mixed, 6));
+    const q5_w = mlx.mlx_array_new_data(&@as([10]i32, @splat(0)), &[_]c_int{ 2, 5 }, 2, .int32);
+    _ = mlx.mlx_array_free(q_mixed.w);
+    q_mixed.w = q5_w;
+    try testing.expectEqual(@as(?u32, 5), inferBits(&q_mixed, 32));
+    try testing.expectEqual(@as(?u32, 16), inferGroupSize(&q_mixed, 5));
     // The real sidecar geometry: in=5120 packed to 640 u32 cols at 4 bits,
     // scales 160 cols → group 32.
     try testing.expectEqual(@as(u32, 32), (5120 / 160));
@@ -2339,11 +3933,34 @@ test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geome
         }
     };
 
-    try testing.expectEqual(MtpCostProfile.g17_nax_q8_gs32, m5NaxCostProfileForQuant(8, 32));
-    try testing.expectEqual(MtpCostProfile.g17_nax_q4_gs32, m5NaxCostProfileForQuant(4, 32));
-    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForQuant(8, 64));
-    try testing.expectEqual(MtpCostProfile.g17_nax_oq4e_q4_gs64, m5NaxCostProfileForQuant(4, 64));
-    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForQuant(3, 32));
+    try testing.expectEqual(MtpCostProfile.g17_nax_q8_gs32, m5NaxCostProfileForFingerprint(8, 32, .uniform_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.g17_nax_q4_gs32, m5NaxCostProfileForFingerprint(4, 32, .uniform_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(8, 64, .uniform_quantized_embedding));
+    // Qwen3.8's resident bf16 embedding is part of its measured q4/gs64
+    // round surface. A uniformly-quantized embedding is a different, still
+    // unmeasured surface and must remain generic.
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(4, 64, .uniform_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.g17_nax_q4_gs64, m5NaxCostProfileForFingerprint(4, 64, .uniform_bf16_embedding));
+    try testing.expectEqual(MtpCostProfile.g17_nax_q6_gs64, m5NaxCostProfileForFingerprint(6, 64, .uniform_q6_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.g17_nax_q8_gs64, m5NaxCostProfileForFingerprint(8, 64, .uniform_q8_bf16_embedding));
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(8, 64, .uniform_q6_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(6, 64, .uniform_q8_bf16_embedding));
+    // It must not be mistaken for the older mixed-q4/q5/q6 oQ4e trunk merely
+    // because both native sidecars are q4/gs64.
+    try testing.expectEqual(MtpCostProfile.g17_nax_oq4e_q4_gs64, m5NaxCostProfileForFingerprint(4, 64, .oqe_quantized_embedding));
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(4, 64, .none));
+    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForFingerprint(3, 32, .uniform_quantized_embedding));
+
+    // qwen4_exp in-checkpoint head: its own classifier — the MoE trunk can
+    // never reach the sidecar fingerprint path above. Only the measured
+    // uniform affine-4/gs-64 runtime with the NAX lane live is calibrated;
+    // every degraded condition falls back to generic, one at a time.
+    try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_q4_gs64, qwen4G17CostProfileForFingerprint(true, 4, 64, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(false, 4, 64, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 8, 64, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 32, true, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, false, true));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForFingerprint(true, 4, 64, true, false));
 
     var sidecar = try mk.qlinear(IN, OUT, 8, 32, s);
     defer sidecar.deinit();
@@ -2531,7 +4148,7 @@ test "loadMtp: MoE sidecar layout (language_model. prefix, switch_mlp experts)" 
         },
     }
     // fc transposed to [H, 2H].
-    const fcs = mlx.getShape(m.fc_w_t);
+    const fcs = mlx.getShape(m.fc.w);
     try testing.expectEqual(@as(c_int, 8), fcs[0]);
     try testing.expectEqual(@as(c_int, 16), fcs[1]);
 }
@@ -2549,6 +4166,11 @@ test "mtp: multi-row forward projects the LAST row only and equals appendHistory
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
+    // Pin the KV-only history path ON regardless of the env, so the merged
+    // and appendHistory arms below exercise it; the last arm flips it OFF
+    // for the full-path cross-check.
+    mtp_kv_only_override = true;
+    defer mtp_kv_only_override = null;
 
     // ── synthetic DENSE sidecar (random bf16; zeros would make every rms-norm
     // output zero and the equivalence trivially true) ──
@@ -2761,6 +4383,39 @@ test "mtp: multi-row forward projects the LAST row only and equals appendHistory
     try testing.expectEqual(cache_b.step, cache_c.step);
     try close(positioned.logits, merged.logits, 16, s);
     try close(positioned.hidden_next, merged.hidden_next, 8, s);
+
+    // ── KV-only vs FULL history path: the committed rows' layer outputs are
+    // dead, so the KV-only append must leave the same cache length and a
+    // last-row result within reduction-order tolerance of the full forward
+    // (a different GEMM M reorders reductions — byte parity is not the bar).
+    mtp_kv_only_override = false;
+    var cache_d = try m.makeCache(allocator);
+    defer cache_d.deinit();
+    const full = try forward(&m, &xfm, &cache_d, ids3_arr, hidden3, 0, true);
+    defer {
+        _ = mlx.mlx_array_free(full.logits);
+        _ = mlx.mlx_array_free(full.hidden_next);
+    }
+    try testing.expectEqual(cache_b.step, cache_d.step);
+    try close(full.logits, merged.logits, 16, s);
+    try close(full.hidden_next, merged.hidden_next, 8, s);
+
+    // Same cross-check through the mrope table (appendKvOnly's explicit-table
+    // branch vs the full path's).
+    var cache_e = try m.makeCache(allocator);
+    defer cache_e.deinit();
+    const full_pos = try forwardWithMrope(&m, &xfm, &cache_e, ids3_arr, hidden3, 0, true, .{
+        .pos = &sequential_pos,
+        .total = 2,
+        .delta = 0,
+    });
+    defer {
+        _ = mlx.mlx_array_free(full_pos.logits);
+        _ = mlx.mlx_array_free(full_pos.hidden_next);
+    }
+    try testing.expectEqual(cache_c.step, cache_e.step);
+    try close(full_pos.logits, positioned.logits, 16, s);
+    try close(full_pos.hidden_next, positioned.hidden_next, 8, s);
 }
 
 test "mtp: index.json shard sweep is marker-gated (in-checkpoint heads)" {
@@ -2927,6 +4582,22 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
                 try mlx.check(mlx.mlx_array_eval(bf));
                 _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
             }
+            // A delta-encoded gamma: mostly `value`, with the single negative
+            // entry that is all a real one carries on these norms (~0.2-0.8%).
+            fn putDelta(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, len: usize, value: f32, neg: f32, st: mlx.mlx_stream) !void {
+                const data = try std.testing.allocator.alloc(f32, len);
+                defer std.testing.allocator.free(data);
+                for (data) |*x| x.* = value;
+                data[len - 1] = neg;
+                const shape = [_]c_int{@intCast(len)};
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, &shape, 1, .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
         };
         try H.put(map, "language_model.mtp.fc.weight", &.{ 8, 16 }, s);
         try H.put(map, "language_model.mtp.pre_fc_norm_embedding.weight", &.{8}, s);
@@ -2934,9 +4605,11 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
         try H.put(map, "language_model.mtp.norm.weight", &.{8}, s);
         try H.put(map, "language_model.mtp.layers.0.input_layernorm.weight", &.{8}, s);
         try H.put(map, "language_model.mtp.layers.0.post_attention_layernorm.weight", &.{8}, s);
-        // Head q_norm sits a full +1 below its backbone anchor (0.7 vs 1.4) —
-        // the oQ conversion bug; k_norm sits at/above (1.5 vs 1.4) — correct.
-        try H.putConst(map, "language_model.mtp.layers.0.self_attn.q_norm.weight", &.{4}, 0.7, s);
+        // Head q_norm sits a full +1 below its backbone anchor (mean 0.7 vs
+        // 1.4) and is DELTA-encoded (one negative entry, like every real
+        // unfolded gamma) — the oQ conversion bug; k_norm sits at/above
+        // (1.5 vs 1.4) — correct.
+        try H.putDelta(map, "language_model.mtp.layers.0.self_attn.q_norm.weight", 32, 0.745, -0.7, s);
         try H.putConst(map, "language_model.mtp.layers.0.self_attn.k_norm.weight", &.{4}, 1.5, s);
         try H.put(map, "language_model.mtp.layers.0.self_attn.q_proj.weight", &.{ 8, 8 }, s);
         try H.put(map, "language_model.mtp.layers.0.self_attn.k_proj.weight", &.{ 4, 8 }, s);
@@ -2981,8 +4654,8 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
 
     // Dense flavor, bf16 fc bound and pre-transposed to [2H, H].
     try testing.expect(m.mlp == .dense);
-    try testing.expect(m.fc_w_t.ctx != null);
-    const fc_shape = mlx.getShape(m.fc_w_t);
+    try testing.expect(m.fc.w.ctx != null);
+    const fc_shape = mlx.getShape(m.fc.w);
     try testing.expectEqual(@as(c_int, 16), fc_shape[0]);
     try testing.expectEqual(@as(c_int, 8), fc_shape[1]);
 
@@ -2992,4 +4665,973 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
     try testing.expect(q_mean > 1.6 and q_mean < 1.8);
     const k_mean = try arrayMeanF32(m.k_norm, s);
     try testing.expect(k_mean > 1.45 and k_mean < 1.55);
+    // post_attention_layernorm is strictly positive (already folded) and sits
+    // far below the 1.4 anchor — the gap alone must NOT convict it (the Alis
+    // false repair: a correct 1.206 double-shifted to 2.206).
+    const pa_mean = try arrayMeanF32(m.post_attn_norm, s);
+    try testing.expect(pa_mean > 0.2 and pa_mean < 0.4);
+
+    // …and binds against a hidden-8 trunk.
+    try testing.expect(fcMatchesHidden(&m.fc, 8));
+    try testing.expect(!fcMatchesHidden(&m.fc, 16));
+}
+
+test "mtp: a QUANTIZED fc loads verbatim and binds (avlp12 Alis layout)" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+
+    // Toy dense head at hidden 16 (2 heads x hd 8, 1 kv head, inter 6) whose
+    // `fc` ships QUANTIZED 4-bit/gs-32: w u32 [16, 4] + scales/biases [16, 1]
+    // (4 packed cols x 8 values = 32 logical = 2H). Everything else is the
+    // ordinary dense in-checkpoint layout.
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/model-00002-of-00002.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const H = struct {
+            fn bf16(shape: []const c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 5)) * 0.1 + 0.1;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                return bf;
+            }
+            fn put(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+                const bf = try bf16(shape, st);
+                defer _ = mlx.mlx_array_free(bf);
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
+        };
+        {
+            const dense_fc = try H.bf16(&.{ 16, 32 }, s);
+            defer _ = mlx.mlx_array_free(dense_fc);
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, dense_fc, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+            const names = [_][*:0]const u8{
+                "language_model.mtp.fc.weight",
+                "language_model.mtp.fc.scales",
+                "language_model.mtp.fc.biases",
+            };
+            for (names, 0..) |name, i| {
+                var a = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(a);
+                try mlx.check(mlx.mlx_vector_array_get(&a, triple, i));
+                try mlx.check(mlx.mlx_array_eval(a));
+                _ = mlx.mlx_map_string_to_array_insert(map, name, a);
+            }
+        }
+        try H.put(map, "language_model.mtp.pre_fc_norm_embedding.weight", &.{16}, s);
+        try H.put(map, "language_model.mtp.pre_fc_norm_hidden.weight", &.{16}, s);
+        try H.put(map, "language_model.mtp.norm.weight", &.{16}, s);
+        try H.put(map, "language_model.mtp.layers.0.input_layernorm.weight", &.{16}, s);
+        try H.put(map, "language_model.mtp.layers.0.post_attention_layernorm.weight", &.{16}, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.q_norm.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.k_norm.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.q_proj.weight", &.{ 16, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.k_proj.weight", &.{ 8, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.v_proj.weight", &.{ 8, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.o_proj.weight", &.{ 16, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.gate_proj.weight", &.{ 6, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.up_proj.weight", &.{ 6, 16 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.down_proj.weight", &.{ 16, 6 }, s);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{
+        \\ "language_model.model.embed_tokens.weight":"model-00001-of-00002.safetensors",
+        \\ "language_model.mtp.fc.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.fc.scales":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.fc.biases":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.pre_fc_norm_embedding.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.pre_fc_norm_hidden.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.input_layernorm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.post_attention_layernorm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.q_norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.k_norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.q_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.k_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.v_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.o_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.gate_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.up_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.down_proj.weight":"model-00002-of-00002.safetensors"}}
+    });
+
+    var m = try loadMtp(io, allocator, s, dir_path);
+    defer m.deinit();
+
+    // fc kept verbatim: packed [out=H, in_packed], NOT transposed, NOT dequantized.
+    try testing.expect(m.fc.s.ctx != null);
+    try testing.expect(m.fc.b.ctx != null);
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(m.fc.w));
+    const fc_shape = mlx.getShape(m.fc.w);
+    try testing.expectEqual(@as(c_int, 16), fc_shape[0]);
+    try testing.expectEqual(@as(c_int, 4), fc_shape[1]);
+
+    // …and binds against a hidden-16 trunk (this is what used to 400 the head
+    // with MtpTargetMismatch: a packed shape compared against hidden_size * 2).
+    try testing.expect(fcMatchesHidden(&m.fc, 16));
+    try testing.expect(!fcMatchesHidden(&m.fc, 8));
+}
+
+fn fpSidecarCase(mode: [*:0]const u8, bits: c_int, group: c_int, want: model_mod.QuantMode) !void {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+
+    // Every fp quant mode ships a `(weight, scales)` PAIR: affine is the only
+    // mode whose checkpoints carry per-group biases. `loadLinear` demanded
+    // `.biases` whenever `.scales` was present, so the whole head failed with
+    // `missing tensor: mtp.fc.biases` and MTP silently disabled — and
+    // `qLinearFwd` then passed a literal "affine" to mlx_quantized_matmul,
+    // which throws over fp8 scales. nvfp4 is the mode that shipped broken
+    // (ollama's `*-mlx` tags, mlx-community's `*-nvfp4`); mxfp4 and mxfp8
+    // are the same bug waiting, so the case runs for all three.
+    // Hidden 128 so every group size under test divides both H and fc's 2H.
+    const H: c_int = 128;
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const Hlp = struct {
+            fn bf16(shape: []const c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.1 + 0.1;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                return bf;
+            }
+            fn put(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+                const bf = try bf16(shape, st);
+                defer _ = mlx.mlx_array_free(bf);
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
+            /// fp-quantize a dense weight and insert ONLY `(weight, scales)`.
+            fn putFp(m: mlx.mlx_map_string_to_array, prefix: []const u8, shape: []const c_int, st: mlx.mlx_stream, md: [*:0]const u8, bt: c_int, gp: c_int) !void {
+                const dense = try bf16(shape, st);
+                defer _ = mlx.mlx_array_free(dense);
+                var pair = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(pair);
+                try mlx.check(mlx.mlx_quantize(&pair, dense, mlx.mlx_optional_int.some(gp), mlx.mlx_optional_int.some(bt), md, .{}, st));
+                const suffixes = [_][]const u8{ "weight", "scales" };
+                for (suffixes, 0..) |suf, i| {
+                    var a = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(a);
+                    try mlx.check(mlx.mlx_vector_array_get(&a, pair, i));
+                    try mlx.check(mlx.mlx_array_eval(a));
+                    var key_buf: [128]u8 = undefined;
+                    const key = try std.fmt.bufPrintSentinel(&key_buf, "{s}.{s}", .{ prefix, suf }, 0);
+                    _ = mlx.mlx_map_string_to_array_insert(m, key.ptr, a);
+                }
+            }
+        };
+        // fc: [out=H, in=2H] nvfp4, no biases — the tensor that used to fail.
+        try Hlp.putFp(map, "mtp.fc", &.{ H, H * 2 }, s, mode, bits, group);
+        try Hlp.put(map, "mtp.pre_fc_norm_embedding.weight", &.{H}, s);
+        try Hlp.put(map, "mtp.pre_fc_norm_hidden.weight", &.{H}, s);
+        try Hlp.put(map, "mtp.norm.weight", &.{H}, s);
+        try Hlp.put(map, "mtp.layers.0.input_layernorm.weight", &.{H}, s);
+        try Hlp.put(map, "mtp.layers.0.post_attention_layernorm.weight", &.{H}, s);
+        try Hlp.put(map, "mtp.layers.0.self_attn.q_norm.weight", &.{64}, s);
+        try Hlp.put(map, "mtp.layers.0.self_attn.k_norm.weight", &.{64}, s);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.q_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.k_proj", &.{ 64, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.v_proj", &.{ 64, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.self_attn.o_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.mlp.gate_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.mlp.up_proj", &.{ H, H }, s, mode, bits, group);
+        try Hlp.putFp(map, "mtp.layers.0.mlp.down_proj", &.{ H, H }, s, mode, bits, group);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    var m = try loadMtp(io, allocator, s, dir_path);
+    defer m.deinit();
+
+    // The head loaded at all — biases are optional PER TENSOR, not mandatory.
+    try testing.expect(m.fc.s.ctx != null);
+    try testing.expect(m.fc.b.ctx == null);
+    try testing.expect(m.q.s.ctx != null);
+    try testing.expect(m.q.b.ctx == null);
+
+    // Geometry resolves to nvfp4's 4 bits / group 16, and the mode is carried
+    // so `qLinearFwd` does not hand fp8 scales to an "affine" matmul.
+    try testing.expectEqual(@as(u32, @intCast(bits)), m.quant_bits);
+    try testing.expectEqual(@as(u32, @intCast(group)), m.quant_group_size);
+    try testing.expectEqual(want, m.quant_mode);
+
+    // A packed fp fc still binds against its trunk — nvfp4's group of 16 is
+    // outside `affineParamsFromGeometry`'s 32/64/128 set, so the affine solve
+    // alone would reject it outright.
+    try testing.expect(fcMatchesHidden(&m.fc, @intCast(H)));
+    try testing.expect(!fcMatchesHidden(&m.fc, @intCast(H * 2)));
+
+    // And the forward actually runs in the checkpoint's own mode — an
+    // "affine" matmul over bias-less fp8 scales throws inside MLX.
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    const x_shape = [_]c_int{ 1, H * 2 };
+    try mlx.check(mlx.mlx_zeros(&x, &x_shape, 2, .bfloat16, s));
+    const y = try qLinearFwd(&m, x, &m.fc);
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_array_eval(y));
+    const y_shape = mlx.getShape(y);
+    try testing.expectEqual(@as(c_int, 1), y_shape[0]);
+    try testing.expectEqual(H, y_shape[1]);
+}
+
+test "mtp: an nvfp4 sidecar loads bias-less and forwards in its own mode (ollama -mlx packs)" {
+    try fpSidecarCase("nvfp4", 4, 16, .nvfp4);
+}
+
+test "mtp: an mxfp4 sidecar loads bias-less and forwards in its own mode" {
+    try fpSidecarCase("mxfp4", 4, 32, .mxfp4);
+}
+
+test "mtp: an mxfp8 sidecar loads bias-less and forwards in its own mode" {
+    try fpSidecarCase("mxfp8", 8, 32, .mxfp8);
+}
+
+test "mtp: dense bf16 head trunk is requantized at load (4b/g64); indivisible widths stay dense" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+
+    // Dense bf16 sidecar with a 64-divisible hidden (64): q/k/v/o + gate/up
+    // quantize; down's contraction dim is 96 (not 64-divisible) — per-weight
+    // skip, stays dense pre-transposed. fc stays bf16 by contract (the m5Nax
+    // cost profile demands it).
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const H = struct {
+            fn put(m2: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.1 - 0.3;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                _ = mlx.mlx_map_string_to_array_insert(m2, key, bf);
+            }
+        };
+        try H.put(map, "mtp.fc.weight", &.{ 64, 128 }, s);
+        try H.put(map, "mtp.pre_fc_norm_embedding.weight", &.{64}, s);
+        try H.put(map, "mtp.pre_fc_norm_hidden.weight", &.{64}, s);
+        try H.put(map, "mtp.norm.weight", &.{64}, s);
+        try H.put(map, "mtp.layers.0.input_layernorm.weight", &.{64}, s);
+        try H.put(map, "mtp.layers.0.post_attention_layernorm.weight", &.{64}, s);
+        try H.put(map, "mtp.layers.0.self_attn.q_norm.weight", &.{32}, s);
+        try H.put(map, "mtp.layers.0.self_attn.k_norm.weight", &.{32}, s);
+        try H.put(map, "mtp.layers.0.self_attn.q_proj.weight", &.{ 128, 64 }, s);
+        try H.put(map, "mtp.layers.0.self_attn.k_proj.weight", &.{ 32, 64 }, s);
+        try H.put(map, "mtp.layers.0.self_attn.v_proj.weight", &.{ 32, 64 }, s);
+        try H.put(map, "mtp.layers.0.self_attn.o_proj.weight", &.{ 64, 64 }, s);
+        try H.put(map, "mtp.layers.0.mlp.gate_proj.weight", &.{ 96, 64 }, s);
+        try H.put(map, "mtp.layers.0.mlp.up_proj.weight", &.{ 96, 64 }, s);
+        try H.put(map, "mtp.layers.0.mlp.down_proj.weight", &.{ 64, 96 }, s);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    {
+        var m = try loadMtp(io, allocator, s, dir_path);
+        defer m.deinit();
+
+        // q packed to 4-bit g64: uint32 codes, geometry re-solves.
+        try testing.expect(m.q.s.ctx != null);
+        try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(m.q.w));
+        const qp = transformer_mod.affineParamsFromGeometry(m.q.w, m.q.s, 64) orelse return error.NoGeometry;
+        try testing.expectEqual(@as(u32, 4), qp.bits);
+        try testing.expectEqual(@as(u32, 64), qp.group_size);
+        try testing.expect(m.mlp == .dense);
+        try testing.expect(m.mlp.dense.gate.s.ctx != null);
+        // down: contraction 96 not 64-divisible — stays dense pre-transposed.
+        try testing.expect(m.mlp.dense.down.s.ctx == null);
+        const down_shape = mlx.getShape(m.mlp.dense.down.w);
+        try testing.expectEqual(@as(c_int, 96), down_shape[0]);
+        // fc bf16 by contract.
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(m.fc.w));
+    }
+
+    // Lever off (0): everything stays dense.
+    head_quant_override = 0;
+    defer head_quant_override = null;
+    {
+        var m = try loadMtp(io, allocator, s, dir_path);
+        defer m.deinit();
+        try testing.expect(m.q.s.ctx == null);
+        try testing.expect(m.mlp.dense.gate.s.ctx == null);
+    }
+}
+
+/// A bare Transformer carrying nothing but a quantized lm_head + the config
+/// fields `headQuantParams` reads. Every function under test touches exactly
+/// those, which is the property that let the qwen4_exp head reuse the scheme.
+/// A minimal target for the rerank scheme: a Transformer carrying nothing
+/// but a quantized `lm_head`, which is all the scheme ever reads. `pub` so
+/// the qwen4 arm's tests in generate.zig build the same target.
+pub const RerankFixture = struct {
+    xfm: Transformer,
+    dense: mlx.mlx_array,
+    vocab: c_int,
+    hidden: c_int,
+
+    pub fn init(s: mlx.mlx_stream, vocab: c_int, hidden: c_int, bits: u32, gs: u32, seed: u64) !RerankFixture {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rand = prng.random();
+        const n: usize = @intCast(vocab * hidden);
+        const buf = try testing.allocator.alloc(f32, n);
+        defer testing.allocator.free(buf);
+        // bf16-exact levels: the dense reference and the requantized source
+        // must not differ by a rounding the test would read as a rerank miss.
+        for (buf) |*v| v.* = @as(f32, @floatFromInt(rand.intRangeAtMost(i32, -128, 127))) * 0.0078125;
+        const shape = [_]c_int{ vocab, hidden };
+        const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(f32_arr);
+        var dense = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&dense, f32_arr, .bfloat16, s));
+
+        var qv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(qv);
+        try mlx.check(mlx.mlx_quantize(
+            &qv,
+            dense,
+            mlx.mlx_optional_int.some(@intCast(gs)),
+            mlx.mlx_optional_int.some(@intCast(bits)),
+            "affine",
+            .{ .ctx = null },
+            s,
+        ));
+        var xfm: Transformer = undefined;
+        xfm.config = .{};
+        xfm.config.hidden_size = @intCast(hidden);
+        xfm.config.quant_mode = .affine;
+        xfm.config.quant_bits = bits;
+        xfm.config.quant_group_size = gs;
+        xfm.s = s;
+        xfm.lm_head_w = mlx.mlx_array_new();
+        xfm.lm_head_s = mlx.mlx_array_new();
+        xfm.lm_head_b = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&xfm.lm_head_w, qv, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&xfm.lm_head_s, qv, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&xfm.lm_head_b, qv, 2));
+        return .{ .xfm = xfm, .dense = dense, .vocab = vocab, .hidden = hidden };
+    }
+
+    pub fn deinit(self: *RerankFixture) void {
+        _ = mlx.mlx_array_free(self.dense);
+        _ = mlx.mlx_array_free(self.xfm.lm_head_w);
+        _ = mlx.mlx_array_free(self.xfm.lm_head_s);
+        _ = mlx.mlx_array_free(self.xfm.lm_head_b);
+    }
+
+    /// `[1, 1, hidden]` bf16 activation.
+    fn randomX(self: *const RerankFixture, s: mlx.mlx_stream, seed: u64) !mlx.mlx_array {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rand = prng.random();
+        const buf = try testing.allocator.alloc(f32, @intCast(self.hidden));
+        defer testing.allocator.free(buf);
+        for (buf) |*v| v.* = @as(f32, @floatFromInt(rand.intRangeAtMost(i32, -64, 63))) * 0.015625;
+        const shape = [_]c_int{ 1, 1, self.hidden };
+        const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
+        defer _ = mlx.mlx_array_free(f32_arr);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&out, f32_arr, .bfloat16, s));
+        return out;
+    }
+
+    /// The full-vocab logits the real head would produce — the exact answer
+    /// the rerank is judged against.
+    fn exactLogits(self: *const RerankFixture, s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array {
+        const qp = headQuantParams(&self.xfm.config, self.xfm.lm_head_w, self.xfm.lm_head_s);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &out,
+            x,
+            self.xfm.lm_head_w,
+            self.xfm.lm_head_s,
+            self.xfm.lm_head_b,
+            true,
+            mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+            mlx.mlx_optional_int.some(@intCast(qp.bits)),
+            qp.mode.cstr(),
+            s,
+        ));
+        return out;
+    }
+};
+
+fn readIdScalar(arr: mlx.mlx_array) !u32 {
+    try mlx.check(mlx.mlx_array_eval(arr));
+    var v: i32 = 0;
+    try mlx.check(mlx.mlx_array_item_int32(&v, arr));
+    return @intCast(v);
+}
+
+fn readRow(allocator: std.mem.Allocator, s: mlx.mlx_stream, arr: mlx.mlx_array, n: usize) ![]f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f));
+    const ptr = mlx.mlx_array_data_float32(f) orelse return error.NoData;
+    const out = try allocator.alloc(f32, n);
+    @memcpy(out, ptr[0..n]);
+    return out;
+}
+
+test "mtp: draft rerank returns the exact argmax whenever it is inside the coarse shortlist" {
+    // The scheme's whole contract. The coarse head only SHORTLISTS; the 32
+    // survivors are re-scored through the real head's own rows, so the pick is
+    // exact given the shortlist — and matches the full-vocab argmax exactly
+    // when the coarse pass kept it. A miss costs ACCEPTANCE (the trunk verify
+    // rejects a bad draft), never output, which is why the bar is conditional
+    // rather than an equality on every draw.
+    //
+    // The bar is on the drafted token's exact LOGIT, not its id. A random
+    // small head ties constantly — 256-wide dot products of bf16-exact levels
+    // through an 8-bit quantizer collide, and the tie rate is scale-invariant
+    // — and under a tie the host's first-max and a GPU argmax over the
+    // shortlist's own ordering disagree on the id while agreeing on the value.
+    // Two ids with the same logit are the same draft as far as acceptance is
+    // concerned; convicting on the id would be judging our output against our
+    // output's ordering. Id equality is still demanded wherever the reference's
+    // OWN margin says the winner is unique.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    // Vocab must clear TOP32_MIN_ROWS with a ragged tail, like the top32 test.
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0x5EED);
+    defer fx.deinit();
+
+    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    var slot: ?RerankCoarse = coarse;
+    defer if (slot) |*q| q.deinit();
+    var logged = false;
+
+    // Two different fp paths read the same rows (a full-width qmm vs a 32-row
+    // gathered one), so equality between them is approximate by construction.
+    const eps: f32 = 1e-3;
+    var kept: u32 = 0;
+    var decisive: u32 = 0;
+    var draws: u32 = 0;
+    var seed: u64 = 1;
+    while (seed <= 8) : (seed += 1) {
+        const x = try fx.randomX(s, seed);
+        defer _ = mlx.mlx_array_free(x);
+
+        const exact = try fx.exactLogits(s, x);
+        defer _ = mlx.mlx_array_free(exact);
+        const ex = try readRow(allocator, s, exact, @intCast(fx.vocab));
+        defer allocator.free(ex);
+        var want: u32 = 0;
+        for (ex, 0..) |v, i| if (v > ex[want]) {
+            want = @intCast(i);
+        };
+
+        const picked_arr = (try rerankSelect(s, &fx.xfm, &slot, &logged, x, null)) orelse
+            return error.RerankDeclined;
+        defer _ = mlx.mlx_array_free(picked_arr);
+        const picked = try readIdScalar(picked_arr);
+        draws += 1;
+
+        // What the coarse pass actually shortlisted, read the same way the
+        // scheme reads it.
+        var coarse_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(coarse_logits);
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &coarse_logits,
+            x,
+            slot.?.q.w,
+            slot.?.q.s,
+            slot.?.q.b,
+            true,
+            mlx.mlx_optional_int.some(64),
+            mlx.mlx_optional_int.some(3),
+            "affine",
+            s,
+        ));
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const flat_shape = [_]c_int{fx.vocab};
+        try mlx.check(mlx.mlx_reshape(&flat, coarse_logits, &flat_shape, 1, s));
+        const cands = try draftTop32(s, flat, fx.vocab);
+        defer _ = mlx.mlx_array_free(cands);
+        try mlx.check(mlx.mlx_array_eval(cands));
+        const cand_ptr = mlx.mlx_array_data_uint32(cands) orelse return error.NoData;
+
+        var picked_in_list = false;
+        var best_in_list: u32 = cand_ptr[0];
+        var runner_up: f32 = -std.math.inf(f32);
+        for (cand_ptr[0..32]) |c| {
+            if (c == picked) picked_in_list = true;
+            if (ex[c] > ex[best_in_list]) best_in_list = c;
+        }
+        // The reference's OWN margin: the gap between the shortlist's best and
+        // the best OTHER value in it. Zero means the winner is not unique and
+        // no id assertion is decidable.
+        for (cand_ptr[0..32]) |c| {
+            if (c == best_in_list) continue;
+            if (ex[c] > runner_up) runner_up = ex[c];
+        }
+        const unique = (ex[best_in_list] - runner_up) > eps;
+
+        // Unconditional: the pick is always FROM the shortlist and always
+        // carries the shortlist's best exact logit. That is the re-scoring
+        // step's own bar and it holds whether or not the coarse pass kept the
+        // true argmax.
+        try testing.expect(picked_in_list);
+        try testing.expectApproxEqAbs(ex[best_in_list], ex[picked], eps);
+        // Under a unique winner the id is decidable, so demand it.
+        if (unique) {
+            decisive += 1;
+            try testing.expectEqual(best_in_list, picked);
+        }
+
+        // Conditional: the shortlist kept a row scoring the global max => the
+        // drafted token scores the global max. This is the property acceptance
+        // actually depends on — the trunk verify compares TOKENS, and two rows
+        // with the same logit are the same draft.
+        if (@abs(ex[best_in_list] - ex[want]) <= eps) {
+            try testing.expectApproxEqAbs(ex[want], ex[picked], eps);
+            kept += 1;
+        }
+    }
+    // A coarse head that never keeps the argmax would satisfy every assertion
+    // above while proposing garbage every step — the acceptance collapse this
+    // change would otherwise ship silently.
+    try testing.expect(kept * 2 >= draws);
+    // And a fixture that ties on every draw would make the id bar vacuous.
+    try testing.expect(decisive > 0);
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "mtp: the coarse rerank head drafts at its BUILT width, not the env's current one" {
+    // The width a coarse head is READ at is a property of the BUILT weights.
+    // `rerankCoarseBits()` is the env-backed BUILD default; re-reading it per
+    // draft step means a head packed at one width gets dispatched at another
+    // the moment the variable moves — a retune between build and draft, or any
+    // caller passing `buildRerankCoarse` an explicit width, which both the
+    // sidecar and the qwen4 arm do. Packed geometry implies K, so a mismatched
+    // width does not degrade gracefully: it reads a different vocab entirely.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0x5EED);
+    defer fx.deinit();
+
+    // Built at 3 bits...
+    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    var slot: ?RerankCoarse = coarse;
+    defer if (slot) |*q| q.deinit();
+    // ...and the head SAYS so, without asking the environment.
+    try testing.expectEqual(@as(u32, 3), slot.?.bits);
+    try testing.expectEqual(@as(u32, 64), slot.?.group_size);
+    try testing.expectEqual(fx.vocab, slot.?.rows);
+
+    // ...while the environment now says 2. Every draft below must still be
+    // dispatched at 3.
+    _ = setenv("MLX_SERVE_MTP_DRAFT_HEAD_BITS", "2", 1);
+    defer _ = unsetenv("MLX_SERVE_MTP_DRAFT_HEAD_BITS");
+    try testing.expectEqual(@as(u32, 2), rerankCoarseBits());
+
+    var logged = false;
+    const eps: f32 = 1e-3;
+    var kept: u32 = 0;
+    var draws: u32 = 0;
+    var seed: u64 = 1;
+    while (seed <= 8) : (seed += 1) {
+        const x = try fx.randomX(s, seed);
+        defer _ = mlx.mlx_array_free(x);
+
+        const exact = try fx.exactLogits(s, x);
+        defer _ = mlx.mlx_array_free(exact);
+        const ex = try readRow(allocator, s, exact, @intCast(fx.vocab));
+        defer allocator.free(ex);
+        var want: u32 = 0;
+        for (ex, 0..) |v, i| if (v > ex[want]) {
+            want = @intCast(i);
+        };
+
+        const picked_arr = (try rerankSelect(s, &fx.xfm, &slot, &logged, x, null)) orelse
+            return error.RerankDeclined;
+        defer _ = mlx.mlx_array_free(picked_arr);
+        const picked = try readIdScalar(picked_arr);
+        draws += 1;
+
+        // The shortlist the 3-bit head actually produces — read at 3 bits,
+        // which is the whole point.
+        var coarse_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(coarse_logits);
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &coarse_logits,
+            x,
+            slot.?.q.w,
+            slot.?.q.s,
+            slot.?.q.b,
+            true,
+            mlx.mlx_optional_int.some(64),
+            mlx.mlx_optional_int.some(3),
+            "affine",
+            s,
+        ));
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const flat_shape = [_]c_int{fx.vocab};
+        try mlx.check(mlx.mlx_reshape(&flat, coarse_logits, &flat_shape, 1, s));
+        const cands = try draftTop32(s, flat, fx.vocab);
+        defer _ = mlx.mlx_array_free(cands);
+        try mlx.check(mlx.mlx_array_eval(cands));
+        const cand_ptr = mlx.mlx_array_data_uint32(cands) orelse return error.NoData;
+
+        var picked_in_list = false;
+        var best_in_list: u32 = cand_ptr[0];
+        for (cand_ptr[0..32]) |c| {
+            if (c == picked) picked_in_list = true;
+            if (ex[c] > ex[best_in_list]) best_in_list = c;
+        }
+        // The draft came from the BUILT head's shortlist and carries its best
+        // exact logit. Dispatched at any other width it comes from somewhere
+        // else entirely.
+        try testing.expect(picked_in_list);
+        try testing.expectApproxEqAbs(ex[best_in_list], ex[picked], eps);
+        if (@abs(ex[best_in_list] - ex[want]) <= eps) kept += 1;
+    }
+    // And the 3-bit head is still a USEFUL shortlister — a mis-dispatched read
+    // that happened to stay in range would not be.
+    try testing.expect(kept * 2 >= draws);
+}
+
+test "mtp: batched rerank ids equal N solo rerankSelect" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0xBA7C);
+    defer fx.deinit();
+    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    var slot: ?RerankCoarse = coarse;
+    defer if (slot) |*q| q.deinit();
+    var logged = false;
+    const xa = try fx.randomX(s, 11);
+    defer _ = mlx.mlx_array_free(xa);
+    const xb = try fx.randomX(s, 23);
+    defer _ = mlx.mlx_array_free(xb);
+    const sa = (try rerankSelect(s, &fx.xfm, &slot, &logged, xa, null)) orelse return error.SoloRerankDeclined;
+    defer _ = mlx.mlx_array_free(sa);
+    const sb = (try rerankSelect(s, &fx.xfm, &slot, &logged, xb, null)) orelse return error.SoloRerankDeclined;
+    defer _ = mlx.mlx_array_free(sb);
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    _ = mlx.mlx_vector_array_append_value(vec, xa);
+    _ = mlx.mlx_vector_array_append_value(vec, xb);
+    var stacked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(stacked);
+    try mlx.check(mlx.mlx_concatenate_axis(&stacked, vec, 0, s));
+    const bat = (try rerankSelectBatched(s, &fx.xfm, &slot, &logged, stacked, null)) orelse return error.BatchedRerankDeclined;
+    defer _ = mlx.mlx_array_free(bat);
+    var a0 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a0);
+    var a1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a1);
+    try mlx.check(mlx.mlx_slice(&a0, bat, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ 1, 1 }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    try mlx.check(mlx.mlx_slice(&a1, bat, &[_]c_int{ 1, 0 }, 2, &[_]c_int{ 2, 1 }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    try testing.expectEqual(try readIdScalar(sa), try readIdScalar(a0));
+    try testing.expectEqual(try readIdScalar(sb), try readIdScalar(a1));
+}
+
+test "mtp: rerankSelect declines without a coarse head, and the full readout is the exact argmax" {
+    // The fallback is not decoration: `canRerankDrafts` false, a build refusal
+    // and a mid-chain shortlist failure all land here, and the answer must
+    // still be a legal draft — the full-vocab argmax, which is what the qwen4
+    // head did before this change.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0xA11CE);
+    defer fx.deinit();
+
+    var none: ?RerankCoarse = null;
+    var logged = false;
+    const x = try fx.randomX(s, 7);
+    defer _ = mlx.mlx_array_free(x);
+    try testing.expect((try rerankSelect(s, &fx.xfm, &none, &logged, x, null)) == null);
+    try testing.expect(!logged);
+
+    const exact = try fx.exactLogits(s, x);
+    defer _ = mlx.mlx_array_free(exact);
+    const ex = try readRow(allocator, s, exact, @intCast(fx.vocab));
+    defer allocator.free(ex);
+    var want: u32 = 0;
+    for (ex, 0..) |v, i| if (v > ex[want]) {
+        want = @intCast(i);
+    };
+
+    const got = try fullReadoutArgmax(s, &fx.xfm, x, null);
+    defer _ = mlx.mlx_array_free(got);
+    try testing.expectEqual(want, try readIdScalar(got));
+}
+
+test "mtp: a suppressed id is never drafted, through the coarse shortlist or the full readout" {
+    // The mask goes on the COARSE row, not the re-scored 32: a reserved id
+    // that never enters the shortlist cannot be re-scored back into the draft.
+    // Both paths are checked because a rerank build refusal silently routes
+    // every draft through the other one.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0xBEEF);
+    defer fx.deinit();
+    const x = try fx.randomX(s, 3);
+    defer _ = mlx.mlx_array_free(x);
+
+    const exact = try fx.exactLogits(s, x);
+    defer _ = mlx.mlx_array_free(exact);
+    const ex = try readRow(allocator, s, exact, @intCast(fx.vocab));
+    defer allocator.free(ex);
+    var want: u32 = 0;
+    for (ex, 0..) |v, i| if (v > ex[want]) {
+        want = @intCast(i);
+    };
+
+    // Suppress exactly the winner.
+    const mask_buf = try allocator.alloc(bool, @intCast(fx.vocab));
+    defer allocator.free(mask_buf);
+    @memset(mask_buf, false);
+    mask_buf[want] = true;
+    const mask_shape = [_]c_int{fx.vocab};
+    const mask = mlx.mlx_array_new_data(mask_buf.ptr, &mask_shape, 1, .bool_);
+    defer _ = mlx.mlx_array_free(mask);
+
+    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    var slot: ?RerankCoarse = coarse;
+    defer if (slot) |*q| q.deinit();
+    var logged = false;
+    const picked_arr = (try rerankSelect(s, &fx.xfm, &slot, &logged, x, mask)) orelse
+        return error.RerankDeclined;
+    defer _ = mlx.mlx_array_free(picked_arr);
+    try testing.expect((try readIdScalar(picked_arr)) != want);
+
+    const full = try fullReadoutArgmax(s, &fx.xfm, x, mask);
+    defer _ = mlx.mlx_array_free(full);
+    try testing.expect((try readIdScalar(full)) != want);
+}
+
+test "mtp: rerankCoarseBytes prices the packed weights AND both bf16 group tables" {
+    // The build log claims a size; a bill that forgot scales+biases would
+    // under-report the qwen4 coarse head by 40 MB.
+    // 248320 x 2560 at 3 bits = 238.4 MiB packed, + 2 x (248320 x 40 x 2 B).
+    const packed_mib: u64 = 248320 * 2560 * 3 / 8;
+    const tables: u64 = 2 * (248320 * (2560 / 64) * 2);
+    try testing.expectEqual(packed_mib + tables, rerankCoarseBytes(248320, 2560, 3));
+    // 2-bit is exactly two thirds of the packed half, tables unchanged.
+    try testing.expectEqual(248320 * 2560 * 2 / 8 + tables, rerankCoarseBytes(248320, 2560, 2));
+}
+
+test "mtp: draftTop32 matches a host top-32 reference (bf16, ties, -inf)" {
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+
+    // Two widths: the guard edge (just past TILES*TG with a ragged tail) and
+    // the live Qwen3.5-family vocab.
+    const counts = [_]c_int{ TOP32_MIN_ROWS + 7, 248320 };
+    var prng = std.Random.DefaultPrng.init(0x7031);
+    const rand = prng.random();
+
+    for (counts) |n| {
+        const un: usize = @intCast(n);
+        // bf16-exact values with deliberate duplicates (ties) and a few -inf
+        // (the suppress-mask spelling).
+        const vals = try allocator.alloc(f32, un);
+        defer allocator.free(vals);
+        for (vals) |*v| {
+            const level: f32 = @floatFromInt(rand.intRangeAtMost(i32, -512, 511));
+            v.* = level * 0.125; // exact in bf16
+        }
+        vals[0] = -std.math.inf(f32);
+        vals[un / 2] = -std.math.inf(f32);
+
+        const shape = [_]c_int{n};
+        const row_f32 = mlx.mlx_array_new_data(vals.ptr, &shape, 1, .float32);
+        defer _ = mlx.mlx_array_free(row_f32);
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_astype(&row, row_f32, .bfloat16, s));
+
+        const ids = try draftTop32(s, row, n);
+        defer _ = mlx.mlx_array_free(ids);
+        try mlx.check(mlx.mlx_array_eval(ids));
+        const ids_ptr = mlx.mlx_array_data_uint32(ids) orelse return error.NoData;
+
+        // Host reference: (value asc, index asc), take the tail 32.
+        const Entry = struct { v: f32, i: u32 };
+        const entries = try allocator.alloc(Entry, un);
+        defer allocator.free(entries);
+        for (vals, 0..) |v, i| entries[i] = .{ .v = v, .i = @intCast(i) };
+        std.mem.sort(Entry, entries, {}, struct {
+            fn lt(_: void, a: Entry, b: Entry) bool {
+                if (a.v != b.v) return a.v < b.v;
+                return a.i < b.i;
+            }
+        }.lt);
+
+        var expect_set = std.AutoHashMap(u32, void).init(allocator);
+        defer expect_set.deinit();
+        for (entries[un - 32 ..]) |e| try expect_set.put(e.i, {});
+
+        for (0..32) |k| {
+            const id = ids_ptr[k];
+            try testing.expect(expect_set.contains(id));
+            _ = expect_set.remove(id); // no duplicates either
+        }
+        try testing.expectEqual(@as(u32, 0), expect_set.count());
+    }
+}
+
+test "adaptiveDepthCapForMachine names the row it applied" {
+    // The cap must be nameable at runtime or an M1 Pro's depth=4 is
+    // indistinguishable from the EV controller having chosen 4 by itself —
+    // same reason `dflash.blockCapForMachine` carries a label.
+    try testing.expectEqualStrings("m1-pro", adaptiveDepthCapForMachine("Apple M1 Pro", 6).label);
+    try testing.expectEqualStrings("m4-max", adaptiveDepthCapForMachine("Apple M4 Max", 6).label);
+    try testing.expectEqualStrings("default", adaptiveDepthCapForMachine("", 6).label);
+}
+
+test "base M4 caps at 4 where M4 Pro/Max keep the default (2026-08-22 sweep)" {
+    // Depth 4 is the only width where the cap BINDS, collapsing the plan to
+    // one chunk; from 5 on every round pays an extension sync for ~1 more
+    // accepted token and loses 17%. The probe's cost cliff says 6 here.
+    try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M4", 6).cap);
+    try testing.expectEqualStrings("m4-base", adaptiveDepthCapForMachine("Apple M4", 6).label);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Pro", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Max", 6).cap);
+    // Every row above is a HUMAN sweep and outranks the boot probe.
+    for ([_][]const u8{ "Apple M4", "Apple M4 Max", "Apple M1 Pro", "Apple M5" }) |c| {
+        try testing.expect(adaptiveDepthCapForMachine(c, 6).measured);
+    }
+    try testing.expect(!adaptiveDepthCapForMachine("Apple M2 Pro", 6).measured);
+}
+
+test "adaptiveDepthCapForMachine: measured rows only, unmeasured chips keep the default" {
+    try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M1 Pro", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M1 Max", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("", 6).cap);
+}
+
+test "adaptiveDepthCapForMachine: base M5 caps at 4, Pro/Max/Ultra keep the default" {
+    try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M5", 6).cap);
+    try testing.expectEqualStrings("m5", adaptiveDepthCapForMachine("Apple M5", 6).label);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Pro", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Max", 6).cap);
+    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Ultra", 6).cap);
+}
+
+test "mtpCtxWithinLimit: 0 is unlimited and the ceiling is inclusive" {
+    try testing.expect(mtpCtxWithinLimit(0, 0));
+    try testing.expect(mtpCtxWithinLimit(0, 1_000_000));
+
+    try testing.expect(mtpCtxWithinLimit(4096, 4095));
+    try testing.expect(mtpCtxWithinLimit(4096, 4096));
+    try testing.expect(!mtpCtxWithinLimit(4096, 4097));
+    try testing.expect(!mtpCtxWithinLimit(4096, 1_000_000));
+
+    try testing.expect(mtpCtxWithinLimit(1, 1));
+    try testing.expect(!mtpCtxWithinLimit(1, 2));
+}
+
+test "mtp: row-axis coarse logits equal each solo readout" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 2560, 8, 64, 0x3B17);
+    defer fx.deinit();
+    var rc = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    defer rc.deinit();
+    const tx = @import("transformer.zig");
+    {
+        for ([_]usize{ 2, 4, 8, 17 }) |n| {
+            var parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });
+            defer for (parts[0..n]) |x| {
+                if (x.ctx != null) _ = mlx.mlx_array_free(x);
+            };
+            for (0..n) |i| parts[i] = try fx.randomX(s, 17 + i);
+            const vec = mlx.mlx_vector_array_new_data(parts[0..n].ptr, n);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var x = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_concatenate_axis(&x, vec, 0, s));
+            const before = tx.mtp_head_row_dispatches;
+            const got = try rerankCoarseRows(s, x, &rc);
+            defer _ = mlx.mlx_array_free(got);
+            try testing.expectEqual(@as(usize, if (n <= 16) 1 else 0), tx.mtp_head_row_dispatches - before);
+            for (parts[0..n], 0..) |input, i| {
+                var want = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(want);
+                try mlx.check(mlx.mlx_quantized_matmul(&want, input, rc.q.w, rc.q.s, rc.q.b, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(3), "affine", s));
+                var row = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(row);
+                try mlx.check(mlx.mlx_slice(&row, got, &[_]c_int{ @intCast(i), 0, 0 }, 3, &[_]c_int{ @intCast(i + 1), 1, rc.rows }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+                var same = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(same);
+                try mlx.check(mlx.mlx_array_equal(&same, row, want, false, s));
+                try mlx.check(mlx.mlx_array_eval(same));
+                var equal: bool = false;
+                try mlx.check(mlx.mlx_array_item_bool(&equal, same));
+                if (!equal) std.debug.print("coarse logits differ: N={d} row={d}\n", .{ n, i });
+                try testing.expect(equal);
+            }
+        }
+    }
 }

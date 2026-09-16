@@ -2,16 +2,7 @@ import SwiftUI
 import PDFKit
 import UniformTypeIdentifiers
 import AppKit
-
-private struct ContentBottomKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
-}
-
-private struct ScrollViewHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
-}
+import SwaTexRender
 
 /// A tool-call awaiting user approval. The agent loop suspends on
 /// `continuation` while the SwiftUI sheet shows the request; the sheet's
@@ -79,7 +70,7 @@ struct ToolApprovalSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Allow this tool call?")
                         .font(.headline)
-                    Text(headline)
+                    Text(L10n.text(headline))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -92,7 +83,7 @@ struct ToolApprovalSheet: View {
                     .foregroundStyle(.secondary)
                 if argPairs.isEmpty && !request.rawArguments.isEmpty {
                     ScrollView {
-                        Text(request.rawArguments)
+                        Text(L10n.text(request.rawArguments))
                             .font(.system(size: 11, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -110,10 +101,10 @@ struct ToolApprovalSheet: View {
                         VStack(alignment: .leading, spacing: 4) {
                             ForEach(argPairs, id: \.0) { (k, v) in
                                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                    Text(k)
+                                    Text(L10n.text(k))
                                         .font(.system(size: 11, design: .monospaced).weight(.semibold))
                                         .foregroundStyle(.secondary)
-                                    Text(v)
+                                    Text(L10n.text(v))
                                         .font(.system(size: 11, design: .monospaced))
                                         .textSelection(.enabled)
                                         .lineLimit(8)
@@ -164,19 +155,24 @@ struct ToolApprovalSheet: View {
 /// above the message input. Extracted from `ChatDetailView` so its body stays
 /// within the Swift type-checker's complexity budget.
 private struct AttachmentPreviewRow: View {
-    @Binding var images: [NSImage]
+    @Binding var images: [PendingImage]
     @Binding var pdfs: [(name: String, text: String)]
+    @Binding var videos: [ChatVideo]
     @Binding var audio: [ChatAudio]
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                ForEach(Array(images.enumerated()), id: \.offset) { idx, img in
-                    imageChip(idx: idx, img: img)
+                ForEach(Array(images.enumerated()), id: \.offset) { idx, pending in
+                    imageChip(idx: idx, img: pending.image)
                 }
                 ForEach(Array(pdfs.enumerated()), id: \.offset) { idx, pdf in
                     fileChip(idx: idx, name: pdf.name, detail: "PDF · \(pdf.text.count) chars",
                              icon: "doc.text.fill", tint: .red) { pdfs.remove(at: idx) }
+                }
+                ForEach(Array(videos.enumerated()), id: \.offset) { idx, vid in
+                    fileChip(idx: idx, name: vid.name, detail: "Video · \(vid.frameCount) frames",
+                             icon: "video.fill", tint: .orange) { videos.remove(at: idx) }
                 }
                 ForEach(Array(audio.enumerated()), id: \.offset) { idx, clip in
                     fileChip(idx: idx, name: clip.name, detail: String(format: "Audio · %.1fs", clip.durationSeconds),
@@ -226,7 +222,7 @@ private struct AttachmentPreviewRow: View {
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(detail)
+                    Text(L10n.text(detail))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -257,11 +253,11 @@ private struct DocumentFolderChip: View {
                 .background(tint.opacity(0.85))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
             VStack(alignment: .leading, spacing: 1) {
-                Text(index.folderName)
+                Text(L10n.text(index.folderName))
                     .font(.caption.weight(.medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(statusText)
+                Text(L10n.text(statusText))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -359,14 +355,15 @@ private struct MicButton: View {
 /// A top-level (non-`@MainActor`) type so the routing is unit-testable without
 /// the rendered view — it mirrors the attach button's dispatch (see ChatPasteTests).
 enum PasteFileKind: String, Equatable {
-    case folder, pdf, audio, image, unhandled
+    case folder, pdf, audio, video, image, unhandled
 
-    static func classify(ext: String, isDirectory: Bool, audioSupported: Bool) -> PasteFileKind {
+    static func classify(ext: String, isDirectory: Bool, audioSupported: Bool, videoSupported: Bool = false) -> PasteFileKind {
         if isDirectory { return .folder }
         let e = ext.lowercased()
         if e == "pdf" { return .pdf }
         if let ut = UTType(filenameExtension: e) {
             if ut.conforms(to: .audio) { return audioSupported ? .audio : .unhandled }
+            if ut.conforms(to: .movie) { return videoSupported ? .video : .unhandled }
             if ut.conforms(to: .image) { return .image }
         }
         return .unhandled
@@ -377,18 +374,16 @@ struct ChatView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @Environment(\.dismissWindow) private var dismissWindow
+    /// The two-column (chat) split's visibility.
     @State private var columnVisibility = NavigationSplitViewVisibility.automatic
+    /// The three-column (Tasks / Agents) split's visibility. `.all` is the only
+    /// value that means "show all three" — the state above cannot supply it.
+    @State private var tasksColumnVisibility = NavigationSplitViewVisibility.all
+    /// The Agents pane's editing state, owned here so it survives while the
+    /// user moves between agents. The standalone Agents window owns its own —
+    /// two surfaces editing one draft would fight over it.
+    @StateObject private var agentsModel = AgentsWorkspaceModel()
     /// Flipped by the gate sheet's Cancel, and by nothing else.
-    ///
-    /// The sheet was first presented on a `.constant(true)` binding, which made
-    /// it properly blocking and made Cancel UNIMPLEMENTABLE: AppKit refuses to
-    /// close a window that has an attached sheet, so the click did nothing and
-    /// the user was stuck (measured through the accessibility API — the sheet
-    /// was still on screen afterwards). The binding's setter still swallows
-    /// SwiftUI's own dismissals, so Esc and click-away can't drop the user onto
-    /// the dead composer underneath; Cancel is the one door, and it ends the
-    /// sheet before closing the window. Window scenes rebuild their content on
-    /// reopen, so this resets itself.
     @State private var gateCancelled = false
 
     /// The starter recommendation this Mac gets — same function the welcome
@@ -408,16 +403,86 @@ struct ChatView: View {
     }
 
     var body: some View {
+        // Tasks gets a THIRD column: its list belongs beside the app's sidebar,
+        // not inside the content area — a list of tasks is navigation, and
+        // nesting it in the detail column made the window look like it had two
+        // unrelated sidebars stacked horizontally.
+        Group {
+            if appState.chatWorkspace.isThreeColumn {
+                threeColumnSplitView
+            } else {
+                standardSplitView
+            }
+        }
+        // ⌘L, on the WINDOW rather than on one split: the picker has to open
+        // over Tasks and Agents too, which are the other `NavigationSplitView`.
+        // Environment injected AT the sheet — a sheet inherits none.
+        .sheet(isPresented: $appState.modelPalettePresented) {
+            ModelPaletteSheet()
+                .environmentObject(appState)
+                .environmentObject(server)
+        }
+    }
+
+    /// The three-column modes (Tasks, Agents), in ONE split view.
+    @ViewBuilder
+    private var threeColumnSplitView: some View {
+        NavigationSplitView(columnVisibility: $tasksColumnVisibility) {
+            ChatSidebar()
+                .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
+        } content: {
+            // A pane TYPE, never `SomeView().someProperty`: an environment
+            // reader has to be the column itself, or its @EnvironmentObject is
+            // read out of a value SwiftUI never installed (see `TaskListPane`).
+            Group {
+                if appState.chatWorkspace.isAgents {
+                    AgentListPane(model: agentsModel)
+                } else {
+                    TaskListPane()
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
+        } detail: {
+            Group {
+                if appState.chatWorkspace.isAgents {
+                    AgentDetailPane(model: agentsModel)
+                } else {
+                    TaskDetailPane()
+                }
+            }
+        }
+        .navigationTitle("")
+        // Nothing lives in the toolbar here — each pane draws its own title
+        // row — so the band carries no material. Its BAR still has to exist:
+        .toolbarBackground(.hidden, for: .windowToolbar)
+        .onAppear { AppActivation.focus() }
+    }
+
+    private var standardSplitView: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             ChatSidebar()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
-                // Both columns carry the window's toolbar material, so the bar
-                // reads as one surface across the split rather than appearing
-                // only over the detail side. It is also what the list's
-                // scroll-edge effect attaches to.
-                .toolbarBackground(.visible, for: .windowToolbar)
         } detail: {
-            if let sessionId = appState.activeChatId,
+            // Two modes in one column: the transcript, or the model browser
+            // (`ChatWorkspace`). The browser used to be its own Window, so
+            // every route to it was a route OUT of this one — and a window the
+            // user then had to find their own way back from.
+            if case .models(let section) = appState.chatWorkspace {
+                // Content only — the sections and the way back are the SIDEBAR
+                // while this mode is up (`ChatSidebar.modelsRow`).
+                ModelBrowserPane(section: Binding(
+                    get: { section },
+                    set: { appState.selectModelSection($0) }))
+            } else if appState.chatWorkspace.isSettings {
+                SettingsView()
+            } else if case .terminal(let id) = appState.chatWorkspace {
+                TerminalPane(sessionId: id)
+            } else if case .create(let experiment) = appState.chatWorkspace {
+                // The four generators were four Window scenes; they are pages
+                // of this window now. Each keeps its own view untouched — only
+                // the hosting moved.
+                createPane(experiment)
+            } else if let sessionId = appState.activeChatId,
                appState.chatSessions.contains(where: { $0.id == sessionId }) {
                 ChatDetailView(sessionId: sessionId)
             } else {
@@ -435,11 +500,26 @@ struct ChatView: View {
             }
         }
         .navigationTitle("")
+        // No toolbar material in ANY of this split's modes — the transcript,
+        // Models, Settings and the Create pages alike (the three-column split
+        // carries the same modifier). On the SPLIT, not on ChatDetailView:
+        // there it covered only conversation mode, and the chrome flipped as
+        // you switched panes. The BAR itself stays — the traffic lights and
+        // the sidebar-collapse button live in it (live 2026-08-09); see the
+        // long note above `threeColumnSplitView` and ChatDetailView's body.
+        .toolbarBackground(.hidden, for: .windowToolbar)
         // Blocking: the setter drops SwiftUI's own dismissals, so nothing but
         // Cancel takes this sheet down. The getter is recomputed every update,
         // so it also clears ITSELF the moment a chat model lands.
-        .sheet(isPresented: Binding(get: { gateIsBlocking && !gateCancelled },
-                                    set: { _ in })) {
+        .sheet(isPresented: Binding(
+            get: {
+                ChatWorkspace.gateShouldPresent(gateIsBlocking: gateIsBlocking,
+                                                cancelled: gateCancelled,
+                                                workspace: appState.chatWorkspace,
+                                                welcomePresented: appState.showWelcome,
+                                                palettePresented: appState.modelPalettePresented)
+            },
+            set: { _ in })) {
             ChatModelGateSheet(pick: starterPick, onCancel: cancelGate)
                 .environmentObject(appState)
                 .environmentObject(appState.downloads)
@@ -460,6 +540,21 @@ struct ChatView: View {
         }
     }
 
+    /// One generator page. `GenExperiment` is the shared catalogue (tray tiles,
+    /// discovery chips, Tools menu), so this switch is the only place that maps
+    /// a case to its view and cannot fall out of sync with what is offered.
+    @ViewBuilder
+    private func createPane(_ experiment: GenExperiment) -> some View {
+        switch experiment {
+        case .image:   ImageGenView().environmentObject(appState.imageGen)
+        case .video:   VideoGenView().environmentObject(appState.videoGen)
+        case .audio:   AudioGenView()
+                           .environmentObject(appState.audioGen)
+                           .environmentObject(appState.musicGen)
+        case .model3d: Model3DGenView().environmentObject(appState.model3dGen)
+        }
+    }
+
     /// Cancel on the gate: end the sheet, THEN close the window. Both halves
     /// are required and the order is load-bearing — a window with an attached
     /// sheet can't be closed, and dismissing to the composer underneath is the
@@ -470,179 +565,1220 @@ struct ChatView: View {
     }
 }
 
-// MARK: - Sidebar
+/// Drag-to-reorder for one sidebar row: the row is a drag source carrying its
+/// id, and a drop target that takes the dragged row into its slot the moment
+/// the drag ENTERS it. `onDrag`/`onDrop` rather than `.draggable`, because the
+/// live reorder needs `dropEntered`, which only a `DropDelegate` gets.
+struct SidebarReorder: ViewModifier {
+    let id: UUID
+    @Binding var dragging: UUID?
+    let move: (UUID, UUID) -> Void
 
-struct ChatSidebar: View {
-    @EnvironmentObject var appState: AppState
-    @Environment(\.openWindow) private var openWindow
-    @State private var hoveredSessionId: UUID?
+    func body(content: Content) -> some View {
+        content
+            .onDrag {
+                dragging = id
+                return NSItemProvider(object: id.uuidString as NSString)
+            }
+            .onDrop(of: [.text], delegate: Delegate(id: id, dragging: $dragging, move: move))
+    }
+
+    private struct Delegate: DropDelegate {
+        let id: UUID
+        @Binding var dragging: UUID?
+        let move: (UUID, UUID) -> Void
+
+        func dropEntered(info: DropInfo) {
+            guard let moved = dragging, moved != id else { return }
+            move(moved, id)
+        }
+        func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+        func performDrop(info: DropInfo) -> Bool {
+            dragging = nil
+            return true
+        }
+        func dropExited(info: DropInfo) {}
+    }
+}
+
+/// A sidebar destination's chrome: nothing drawn until you hover it, and the
+/// SAME gray when it is the selected one.
+struct DestinationRowButton<Label: View>: View {
+    let selected: Bool
+    let action: () -> Void
+    @ViewBuilder var label: Label
+
+    @State private var hovering = false
 
     var body: some View {
-        List(selection: $appState.activeChatId) {
-            ForEach(appState.visibleChatSessions) { session in
-                let isSelected = session.id == appState.activeChatId
-                HStack(spacing: 0) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 4) {
-                            if session.isExternalBridge {
-                                Image(systemName: "paperplane.fill")
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
-                                    .help("Telegram conversation (view only)")
-                            }
-                            Text(session.title)
-                                .font(.subheadline.weight(isSelected ? .semibold : .regular))
-                                .lineLimit(1)
-                                .foregroundStyle(isSelected ? .white : .primary)
+        Button(action: action) { label }
+            .buttonStyle(.plain)
+            .frame(height: ChatMetrics.sidebarButtonHeight)
+            .background(
+                RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
+                    .fill(SidebarRowStyle.fill(selected: selected, hovering: hovering))
+            )
+            .onHover { hovering = $0 }
+    }
+}
+
+/// The one place the panel's row fill is decided — destinations and
+/// conversations both read it, so "selected" cannot look like two things.
+enum SidebarRowStyle {
+    static func fill(selected: Bool, hovering: Bool) -> Color {
+        if selected { return Color.primary.opacity(0.10) }
+        return hovering ? Color.primary.opacity(0.05) : Color.clear
+    }
+}
+
+/// The conversation list's modifier-aware selection maths. Pure, and at file
+/// scope rather than inside `ChatSidebar`, so it can be driven from
+/// `SidebarMultiSelectTests` without a rendered view — same reason
+/// `ChatRowBuilder` and `ChatModeToggles` live out here.
+///
+/// The list stopped being a `List` (see `conversationsSidebar`), and with it
+/// went the cmd/shift behaviour a `selection:` binding gives you for free.
+/// This is that behaviour, written out.
+enum SidebarMultiSelect {
+    struct Outcome: Equatable {
+        var selection: Set<UUID>
+        /// What a subsequent shift-click ranges FROM.
+        var anchor: UUID?
+        /// The chat the detail column should show, or nil to leave it where it
+        /// is — a cmd-click that deselects some OTHER row changes what is
+        /// selected without changing where you are.
+        var activate: UUID?
+    }
+
+    /// - Parameters:
+    ///   - ordered: every visible row id in panel order, both sections
+    ///     flattened — a shift-range crosses the Agents/Chats boundary.
+    ///   - active: the chat currently on screen.
+    static func click(_ id: UUID,
+                      ordered: [UUID],
+                      selection: Set<UUID>,
+                      anchor: UUID?,
+                      active: UUID?,
+                      command: Bool,
+                      shift: Bool) -> Outcome {
+        // Shift wins when both are held, as it does in every macOS list.
+        if shift, let anchor, anchor != id,
+           let from = ordered.firstIndex(of: anchor),
+           let to = ordered.firstIndex(of: id) {
+            let span = from <= to ? from...to : to...from
+            // The range REPLACES the selection and the anchor stays put, so
+            // shift-clicking around re-ranges from one origin instead of
+            // accumulating every range you passed through.
+            return Outcome(selection: Set(ordered[span]), anchor: anchor, activate: id)
+        }
+        guard command else {
+            return Outcome(selection: [id], anchor: id, activate: id)
+        }
+        guard selection.contains(id) else {
+            return Outcome(selection: selection.union([id]), anchor: id, activate: id)
+        }
+        // Cmd-clicking the ONLY selected row is a no-op: this selection is also
+        // the panel's "you are here", and emptying it would leave a transcript
+        // on screen with nothing in the list pointing at it.
+        guard selection.count > 1 else {
+            return Outcome(selection: selection, anchor: id, activate: nil)
+        }
+        var next = selection
+        next.remove(id)
+        // Deselecting the row you were READING moves to the nearest survivor —
+        // otherwise the transcript belongs to a row that is no longer lit.
+        let activate = active == id ? nearest(to: id, in: ordered, within: next) : nil
+        return Outcome(selection: next, anchor: id, activate: activate)
+    }
+
+    /// What the selection becomes when the composer takes the keyboard, or nil
+    /// when it already says that.
+    ///
+    /// Typing is a statement that you are working in ONE conversation. Without
+    /// this the multi-selection stayed lit behind the field, and since a
+    /// multi-selection outranks focus for ⌘⌫ (`ChatDeleteShortcut.route`) the
+    /// chord kept raising a delete dialog mid-message — two rules each reading
+    /// a true fact and disagreeing about which one meant "the user is deleting
+    /// chats". The chat you are typing IN is the survivor: its transcript is
+    /// the one on screen above the field.
+    ///
+    /// Nil rather than an equal set, so a focus event that changes nothing does
+    /// not publish.
+    static func focusingComposer(in sessionId: UUID, selection: Set<UUID>) -> Set<UUID>? {
+        selection == [sessionId] ? nil : [sessionId]
+    }
+
+    private static func nearest(to id: UUID, in ordered: [UUID], within set: Set<UUID>) -> UUID? {
+        guard let origin = ordered.firstIndex(of: id) else { return set.first }
+        return ordered.enumerated()
+            .filter { set.contains($0.element) }
+            .min { abs($0.offset - origin) < abs($1.offset - origin) }?
+            .element
+    }
+}
+
+/// Which deletions stop and ask first. Pure, and beside `SidebarMultiSelect`
+/// for the same reason — the rule is worth pinning, and there is nothing to
+/// see on screen until you have already lost the conversations.
+enum SidebarDeleteConfirm {
+    /// ⌘⌫ ALWAYS asks: the key names no row, so its target is implicit — every
+    /// selected row, or, with nothing selected, whichever chat you happen to be
+    /// reading. And any BULK delete asks whichever control started it, because
+    /// N conversations go on one action and nothing undoes it. A single
+    /// deliberate delete on a named row (the row's ✕, its context menu) still
+    /// goes straight through, as it always has.
+    static func required(count: Int, keyboard: Bool) -> Bool {
+        count > 0 && (keyboard || count > 1)
+    }
+
+    /// What ⌘⌫ acts on: the sidebar's selection, or — with nothing selected —
+    /// the chat being read. Nil when there is nothing to delete, which is also
+    /// what disables the menu item, since a command that does nothing when you
+    /// pick it is the dead-control class.
+    static func target(selection: Set<UUID>, activeChatId: UUID?) -> Set<UUID>? {
+        let ids = selection.isEmpty ? (activeChatId.map { Set([$0]) } ?? []) : selection
+        return ids.isEmpty ? nil : ids
+    }
+
+    /// The count is the thing to check before agreeing, so it is in the title.
+    static func title(count: Int) -> String {
+        count == 1 ? "Delete this chat?" : "Delete \(count) chats?"
+    }
+}
+
+/// Where ⌘⌫ goes.
+///
+/// A menu item's key equivalent is offered the keystroke by
+/// `performKeyEquivalent` BEFORE the first responder ever sees it, so a Delete
+/// Chat command in the menu bar takes ⌘⌫ away from every text field in the app
+/// — including the composer, where it has meant "delete to the start of the
+/// line" since long before this app existed. Typing it mid-message raised a
+/// delete-chat dialog, and `.disabled(chatDeletionTarget == nil)` cannot help:
+/// a chat is open in exactly the state where you are typing into one.
+///
+/// So the command ROUTES rather than claims. The keyboard's own owner wins
+/// while it has focus, and the menu item keeps its slot — which is the half
+/// that made the shortcut discoverable in the first place.
+enum ChatDeleteShortcut {
+    enum Route: Equatable {
+        /// Hand it back to the text being edited (see `deleteToBeginningOfLine`
+        /// — the menu has already swallowed the event, so returning early
+        /// would make ⌘⌫ do nothing at all in the composer).
+        case deleteToLineStart
+        case deleteChats
+    }
+
+    /// - Parameter selectedChats: how many rows the sidebar has picked. Several
+    ///   is unambiguous — you were working in the list — and it OUTRANKS focus,
+    ///   because focus alone is not a signal this window can be trusted to get
+    ///   right: nothing in it takes the keyboard off the composer except
+    ///   `KeyboardFocus.resignTextEditor`, and one stuck reading would
+    ///   otherwise make ⌘⌫ a line delete forever with a dozen chats selected
+    ///   behind it. Belt and braces on a key that deletes conversations.
+    static func route(editingText: Bool, selectedChats: Int) -> Route {
+        if selectedChats > 1 { return .deleteChats }
+        return editingText ? .deleteToLineStart : .deleteChats
+    }
+}
+
+/// Who holds the keyboard.
+///
+/// The chat window has no real focus model: its conversation rows are
+/// `.buttonStyle(.plain)` Buttons, which take no first responder under macOS's
+/// default keyboard navigation — the same fact that made `.onDeleteCommand` on
+/// that column never fire. So clicking a chat moved the selection while the
+/// COMPOSER kept the keyboard, and every keystroke-owning decision downstream
+/// read "the user is typing" forever (live 2026-08-12: after one click in the
+/// composer, ⌘⌫ never deleted a chat again).
+enum KeyboardFocus {
+
+    /// Whether the responder holding the keyboard is text being typed into.
+    ///
+    /// `NSTextView` covers both cases and is the only type that needs naming: a
+    /// focused `NSTextField` never becomes first responder itself — the
+    /// window's FIELD EDITOR does, and that is an `NSTextView`.
+    static func isTextEditor(_ responder: NSResponder?) -> Bool {
+        responder is NSTextView
+    }
+
+    /// Move the keyboard out of a text field, because nothing else in this
+    /// window will. Only when a text editor actually has it — an unconditional
+    /// `makeFirstResponder(nil)` would yank focus off whatever else legitimately
+    /// holds it.
+    static func resignTextEditor(in window: NSWindow?) {
+        guard let window, isTextEditor(window.firstResponder) else { return }
+        window.makeFirstResponder(nil)
+    }
+}
+
+// MARK: - Sidebar
+
+/// Every measured row, so the quick-switch can number only the ones in the
+/// clear. Published per row and merged on the way up.
+struct SidebarRowSpansKey: PreferenceKey {
+    static let defaultValue: [UUID: SidebarRowSpan] = [:]
+    static func reduce(value: inout [UUID: SidebarRowSpan],
+                       nextValue: () -> [UUID: SidebarRowSpan]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// The bottom edge of the frosted destination block, measured in the column's
+/// own space — rows above this line are behind glass.
+struct SidebarClearBandTopKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// The bottom edge of the panel — rows below this line are off the fold.
+struct SidebarClearBandBottomKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+struct ChatSidebar: View {
+    /// The one coordinate space the three band measurements share.
+    ///
+    /// Load-bearing that it is the COLUMN's own space and not `.global`: a
+    /// global frame is not re-published when a view merely MOVES, and entering
+    /// fullscreen translates the whole column without resizing the pinned
+    /// destination block — so the block went on reporting the maxY it had in
+    /// the smaller window while the rows slid out from under it, and rows in
+    /// plain sight lost their badges. Measured here, the top edge is the
+    /// block's own height and the bottom edge is the column's, both of which
+    /// change only when there is genuinely a new layout to report.
+    static let bandSpace = "chatSidebarBand"
+
+    @EnvironmentObject var appState: AppState
+    /// Observed directly — AppState forwards objectWillChange only for the
+    /// server and the agent store, so a badge reading `appState.downloads`
+    /// never repainted while a transfer started, progressed or finished.
+    @EnvironmentObject var downloads: DownloadManager
+    /// Sandbox terminals share the Chats section with the conversations.
+    @EnvironmentObject var terminals: TerminalSessionStore
+    @Environment(\.openWindow) private var openWindow
+    @State private var hoveredSessionId: UUID?
+    /// The row being dragged to a new slot, nil outside a drag.
+    @State private var draggingRowId: UUID?
+    /// The rename dialog's text.
+    @State private var renameDraft = ""
+    /// Where a shift-click ranges FROM. Moved by every plain / cmd click, left
+    /// alone by shift itself so dragging a range up and down keeps re-ranging
+    /// from the same origin instead of walking away from it.
+    @State private var selectionAnchor: UUID?
+    /// Scans for installed agent CLIs — the Code Launcher row renders the tray's
+    /// shared menu body, which needs it.
+    @StateObject private var cliDetector = CLILauncher()
+    /// Holding ⌘ numbers the conversation rows. A modifier held down is STATE,
+    /// which SwiftUI does not report outside a hovered view — see the monitor.
+    @StateObject private var modifiers = ModifierKeyMonitor()
+    /// Where the frosted destination block ENDS, and where the panel ends, in
+    /// the column's own space — the band a conversation row has to sit inside
+    /// to be readable. Measured rather than derived from the inset's height:
+    /// the block's contents vary (the Create list, the download badge), so the
+    /// one number that cannot go stale is the one the block reports itself.
+    @State private var clearBandTop: CGFloat = 0
+    @State private var clearBandBottom: CGFloat = 0
+    /// Each conversation row's vertical extent, reported only while ⌘ is down.
+    @State private var rowSpans: [UUID: SidebarRowSpan] = [:]
+
+    /// The rows a number may land on: those fully clear of the frosted block
+    /// and inside the panel. `nil` means "not measured" — before the first
+    /// layout after ⌘ goes down — and numbers everything, which is the old
+    /// behaviour rather than a sidebar of blank rows for one frame.
+    private var numberedRows: Set<UUID>? {
+        guard modifiers.commandHeld else { return nil }
+        return ChatQuickSwitch.numbering(rowSpans: rowSpans,
+                                         clearBandTop: clearBandTop,
+                                         clearBandBottom: clearBandBottom)
+    }
+
+    var body: some View {
+        conversationsSidebar
+    }
+
+    /// ⌘1…⌘9 jumps to the row wearing that number; ⌃⌘1…⌃⌘9 ranges to it from
+    /// where you are, selecting everything in between.
+    ///
+    /// Zero-size hidden buttons, the same idiom as ⌘R regenerate: they need
+    /// THIS view's session list, and a key equivalent works wherever focus is,
+    /// including while the composer's text view has it.
+    ///
+    /// **Ranging is ⌃⌘, not the ⇧⌘ every macOS list uses, because macOS took
+    /// those digits first**: ⇧⌘3/4/5 are screen capture and ⇧⌘6 grabs the
+    /// Touch Bar, all system-level, so they never reach an app — four of the
+    /// nine ranged silently and the other five worked, which is worse than a
+    /// shortcut that is simply somewhere else. Control is the replacement
+    /// rather than Option because it is the one modifier that does not rewrite
+    /// the character its key produces (⌥4 is ¢), so key-equivalent matching
+    /// stays boring. ⌃ alone would collide with Mission Control's
+    /// switch-to-desktop-N; with ⌘ it does not.
+    private var quickSwitchShortcuts: some View {
+        ForEach(1...ChatQuickSwitch.maxSlots, id: \.self) { slot in
+            let key = KeyEquivalent(Character("\(slot)"))
+            Group {
+                Button { quickSwitch(to: slot, extend: false) } label: { EmptyView() }
+                    .keyboardShortcut(key, modifiers: .command)
+                Button { quickSwitch(to: slot, extend: true) } label: { EmptyView() }
+                    .keyboardShortcut(key, modifiers: [.command, .control])
+            }
+            .frame(width: 0, height: 0)
+            .opacity(0)
+        }
+    }
+
+    /// Go to a numbered chat, or range to it. Not `selectRow`: that one reads
+    /// the CURRENT event's modifier flags, and the event behind these always
+    /// has ⌘ down — every jump would toggle the row into a multi-selection
+    /// instead of going to it. The flags are stated explicitly instead, and the
+    /// decision itself is `ChatQuickSwitch.outcome`.
+    private func quickSwitch(to slot: Int, extend: Bool) {
+        let rows = panelRows
+        switch ChatQuickSwitch.target(
+            slot: slot,
+            visible: rows.visible,
+            chats: rows.chats,
+            numbering: numberedRows,
+            selection: appState.sidebarSelection,
+            anchor: selectionAnchor,
+            active: appState.activeChatId,
+            extend: extend) {
+        case .chat(let outcome)?: apply(outcome)
+        case .terminal(let id)?: showTerminal(id)
+        case nil: break
+        }
+    }
+
+    /// The panel top to bottom: Agents rows, then Sessions rows (chats and
+    /// terminals interleaved), both in the ONE dragged order. `visible` is
+    /// what the ⌘ numbers and a drop read; `chats` is the conversation subset
+    /// a shift-range runs over — the split is a heading, not a wall.
+    private var panelRows: (agents: [SidebarChatRows.Row], sessions: [SidebarChatRows.Row],
+                            visible: [UUID], chats: [UUID]) {
+        let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
+        let agents = SidebarChatRows.merge(chats: groups.agents, terminals: [],
+                                           order: appState.sidebarOrder)
+        let sessions = SidebarChatRows.merge(chats: groups.chats,
+                                             terminals: terminals.sessions.sessions,
+                                             order: appState.sidebarOrder)
+        let all = agents + sessions
+        let chats = all.compactMap { row -> UUID? in
+            if case .chat(let s) = row { return s.id }
+            return nil
+        }
+        return (agents, sessions, all.map(\.id), chats)
+    }
+
+    /// Write a selection outcome back. Selection BEFORE `activeChatId`, for the
+    /// same reason `selectRow` does it in that order.
+    private func apply(_ outcome: SidebarMultiSelect.Outcome) {
+        appState.showConversation()
+        selectionAnchor = outcome.anchor
+        if appState.sidebarSelection != outcome.selection {
+            appState.sidebarSelection = outcome.selection
+        }
+        if let target = outcome.activate, appState.activeChatId != target {
+            appState.activeChatId = target
+        }
+    }
+
+    private var conversationsSidebar: some View {
+        // No `selection:` binding: a List draws its own selection tint UNDER
+        // `listRowBackground`, which is the double highlight — two grays, the
+        // inner one a different value from the destinations above, and an accent
+        // agent label sitting on whichever won. Selection is ours now, drawn by
+        // the one `SidebarRowStyle` both halves of this panel read — and the
+        // cmd/shift behaviour the binding used to supply is `SidebarMultiSelect`.
+        // A ScrollView, not a List. These rows draw everything themselves —
+        // background, hover, selection, separators — so the only thing
+        // `.listStyle(.sidebar)` still contributed was its own horizontal
+        // margin around the content, which held every row ~18pt in from the
+        // panel edge while the destinations above sat at the 8pt gutter. That
+        // margin is NOT what `listRowInsets` controls (zeroing those changed
+        // nothing), and there is no API to remove it. A plain stack takes the
+        // same `.padding(.horizontal, sidebarGutter)` the destination column
+        // takes, so the two halves line up because they are laid out the same
+        // way — not because two numbers were talked into agreeing.
+        ScrollView {
+            // Two sections, one row builder. Agent threads sit above the plain
+            // chats — the section is HIDDEN when there are none, because an
+            // empty heading is a promise of content that isn't there.
+            // Conversations and sandbox terminals, one list (`panelRows`).
+            // Terminals take no part in multi-select; they do wear ⌘ numbers.
+            let rows = panelRows
+            let agentRows = rows.agents, sessionRows = rows.sessions
+            let visible = rows.visible, ordered = rows.chats
+            LazyVStack(alignment: .leading, spacing: 2) {
+                if !agentRows.isEmpty {
+                    sectionHeader("Agents")
+                    ForEach(agentRows) { row in
+                        if case .chat(let session) = row {
+                            sessionRow(session, ordered: ordered)
+                                .modifier(reorderable(session.id, visible: visible))
                         }
-                        // Who this chat is talking to, when it isn't the app
-                        // defaults. Sits on the timestamp line rather than the
-                        // title's so a long agent name can never squeeze the
-                        // title, which is what the row is FOR — and it answers
-                        // "why does this thread behave differently" without
-                        // opening it.
-                        HStack(spacing: 4) {
-                            if let agent = appState.agents.agent(id: session.agentId) {
-                                Image(systemName: agent.symbol)
-                                    .font(.system(size: 9))
-                                    .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
-                                Text(agent.name)
-                                    .font(.caption2)
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                                    .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
-                                Text("·")
-                                    .font(.caption2)
-                                    .foregroundStyle(isSelected ? Color.white.opacity(0.5) : Color.secondary.opacity(0.4))
-                            }
-                            Text(relativeTime(session.updatedAt))
-                                .font(.caption2)
-                                .foregroundStyle(isSelected ? Color.white.opacity(0.7) : Color.secondary.opacity(0.5))
-                        }
-                    }
-                    Spacer(minLength: 4)
-                    if hoveredSessionId == session.id {
-                        Button {
-                            appState.deleteSession(session.id)
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 14))
-                                .symbolRenderingMode(.hierarchical)
-                                .foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Delete chat")
                     }
                 }
-                .tag(session.id)
-                .onHover { isHovered in
-                    hoveredSessionId = isHovered ? session.id : nil
-                }
-                .listRowBackground(
-                    Group {
-                        if isSelected {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(Color.accentColor)
-                                .padding(.horizontal, 6)
-                        } else {
-                            Color.clear
-                        }
-                    }
-                )
-                .listRowSeparator(.visible)
-                .contextMenu {
-                    Button("Delete", role: .destructive) {
-                        appState.deleteSession(session.id)
+                sectionHeader("Sessions") { newSessionMenu }
+                ForEach(sessionRows) { row in
+                    switch row {
+                    case .chat(let session):
+                        sessionRow(session, ordered: ordered)
+                            .modifier(reorderable(session.id, visible: visible))
+                    case .terminal(let t):
+                        terminalRow(t)
+                            .modifier(reorderable(t.id, visible: visible))
                     }
                 }
             }
+            .padding(.horizontal, ChatMetrics.sidebarGutter)
+            .padding(.bottom, 8)
         }
-        .listStyle(.sidebar)
+        .onAppear {
+            // The rows READ the selection to decide their highlight, so it has
+            // to be primed: `activeChatId` is usually set long before this panel
+            // first appears, and an .onChange can't fire for a value that was
+            // already there.
+            if appState.sidebarSelection.isEmpty, let id = appState.activeChatId {
+                appState.sidebarSelection = [id]
+                selectionAnchor = id
+            }
+        }
+        // Deletions from anywhere else (the tray, a task run, another window)
+        // must not leave ids in the selection that no longer name a chat — a
+        // stale one would be counted by the context menu's "Delete N Chats" and
+        // handed straight back to `deleteSessions` by ⌫.
+        .onChange(of: appState.visibleChatSessions.count) { _, _ in
+            let live = Set(appState.visibleChatSessions.map(\.id))
+            if !appState.sidebarSelection.isSubset(of: live) {
+                appState.sidebarSelection.formIntersection(live)
+            }
+            if let anchor = selectionAnchor, !live.contains(anchor) { selectionAnchor = nil }
+        }
+        .onChange(of: appState.sidebarSelection) { _, newSelection in
+            // When the sidebar's selection becomes a single id, make that the
+            // active chat so the detail column follows the user's intent.
+            if newSelection.count == 1, let id = newSelection.first {
+                if appState.activeChatId != id { appState.activeChatId = id }
+            }
+        }
+        .onChange(of: appState.activeChatId) { _, newActive in
+            // Keep the sidebar selection in sync when other parts of the app
+            // change the active chat (open-from-tray, quick launcher, etc.).
+            // Only COLLAPSE it when the new active chat isn't already IN it:
+            // this ran unconditionally, so a cmd-click that added a second row
+            // was overwritten by `[id]` on its way out and the panel could never
+            // hold more than one — the multi-select bug. A chat the selection
+            // already contains is a move WITHIN the selection, and leaves it be.
+            guard let id = newActive else {
+                appState.sidebarSelection.removeAll()
+                selectionAnchor = nil
+                return
+            }
+            if !appState.sidebarSelection.contains(id) {
+                appState.sidebarSelection = [id]
+                selectionAnchor = id
+            }
+        }
+        // NO `.onDeleteCommand`: it only fires while its view is in the
+        // responder chain, which is why it is List API — a `List(selection:)`
+        // becomes first responder when you click a row. This column stopped
+        // being a List (see above) and its rows are `.buttonStyle(.plain)`
+        // Buttons, which take no focus under macOS's default keyboard
+        // navigation, so the modifier sat here reading like a working ⌫ and
+        // never once ran. The keyboard route is the File menu's Delete Chat
+        // (⌘⌫, Finder's own shortcut), which is a menu command and therefore
+        // needs no focus at all — and being IN a menu, it is also visible.
+        //
+        // The dialog it raises is the one every delete control shares, so its
+        // state lives on AppState where the menu command can reach it.
+        .confirmationDialog(
+            SidebarDeleteConfirm.title(count: appState.pendingChatDeletion?.count ?? 1),
+            isPresented: Binding(get: { appState.pendingChatDeletion != nil },
+                                 set: { if !$0 { appState.pendingChatDeletion = nil } }),
+            presenting: appState.pendingChatDeletion
+        ) { ids in
+            Button("Delete", role: .destructive) {
+                deleteChats(ids)
+                appState.pendingChatDeletion = nil
+            }
+            // Return deletes. The dialog is the second time you have said so
+            // (a menu command or a row's Delete raised it), and reaching for
+            // the trackpad to confirm a decision already made is the whole
+            // reason this asked to be a keyboard app. Escape still cancels —
+            // AppKit gives the `.cancel` role that for free.
+            .keyboardShortcut(.defaultAction)
+            Button("Cancel", role: .cancel) { appState.pendingChatDeletion = nil }
+        } message: { _ in
+            Text("This can't be undone.")
+        }
+        // ⌘1…⌘9. In the sidebar rather than the window's `.commands` because
+        // they address THIS view's conversation list; hidden in a background so
+        // they cost no layout.
+        .background(quickSwitchShortcuts)
+        .background(renameDialog)
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
         // so content scrolls beneath it), and a soft edge is how macOS frosts
         // that overlap. Not a hand-drawn band — a custom strip pulled into this
         // area once looked native and swallowed every click in it.
         .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
-        // No Agents / Models entries here: both windows are reachable from the
-        // chat toolbar now — "Manage Agents…" in the composer's agent chip and
-        // "Manage Models…" in the model picker — and each sat next to the
-        // control it configures. The sidebar is the conversation list, and a
-        // second route to the same two windows only competed with it.
-        .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 8) {
-                Button {
-                    _ = appState.newChatSession()
-                } label: {
-                    Label("New Chat", systemImage: "plus")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .contentShape(Rectangle())
+        // No blanket `.onChange(of: activeChatId) { showConversation() }`:
+        // every deliberate route into a conversation (the row button above,
+        // New Chat, the quick launcher) calls showConversation() itself, and
+        // the id ALSO moves on deleteSession's fallback — which yanked the
+        // user out of the Models/Create/Settings pane they were browsing when
+        // they deleted the active chat from the sidebar.
+        // No Agents entry here: "Manage Agents…" lives in the composer's agent
+        // chip, next to the control it configures, and a second route to the
+        // same window only competed with the conversation list. Models is a
+        // different animal — it is not a window any more but a MODE of this
+        // one, so this row is the mode switch, not a duplicate route.
+        // Destinations above the conversation list, in one column: what the
+        // window can BE, then what you've said. Selecting any of them changes
+        // only the content area — the sidebar never rearranges itself, so the
+        // list of places stays where the eye learned it.
+        .safeAreaInset(edge: .top) {
+            VStack(spacing: 2) {
+                // Starting something new (a chat, a coding CLI) is the +
+                // beside the Sessions heading — one place, next to the list
+                // it adds to — rather than two destination rows up here.
+                destinationRow("Models", icon: "square.stack.3d.up",
+                               selected: appState.chatWorkspace.isModels,
+                               badge: activeDownloadCount) {
+                    appState.chatWorkspace.isModels ? appState.showConversation() : appState.showModels()
                 }
-                // `.plain` + our own frame and background, NOT `.bordered` —
-                // see `ChatMetrics.sidebarButtonHeight`. It is the only way the
-                // two controls are the same height by construction rather than
-                // by whatever a style style decides their labels are worth.
-                .buttonStyle(.plain)
-                .sidebarActionButton()
-                newAgentChatMenu
+                destinationRow("Settings", icon: "gearshape",
+                               selected: appState.chatWorkspace.isSettings) {
+                    appState.chatWorkspace.isSettings ? appState.showConversation() : appState.showSettings()
+                }
+
+                // The Create pages, from the SAME catalogue the discovery chips
+                // and the Tools menu iterate (`sidebarCreateItems` — a filter on
+                // `mediaItems`, so the three surfaces cannot drift). Each row is
+                // the mode switch for its generator page, exactly like Models.
+                sectionHeader("Create")
+                ForEach(ChatEmptyState.sidebarCreateItems) { item in
+                    if case .create(let experiment) = item.action {
+                        destinationRow(item.title, icon: item.systemImage,
+                                       selected: appState.chatWorkspace.experiment == experiment) {
+                            if appState.chatWorkspace.experiment == experiment {
+                                appState.showConversation()
+                            } else {
+                                appState.showCreate(experiment)
+                            }
+                        }
+                    }
+                }
+
+                // The agent/automation cluster, below Create. A GAP on its
+                // first row instead of a heading: nothing here is a Create
+                // item, and proximity is what would say otherwise.
+                agentsRow
+                    .padding(.top, 10)
+                destinationRow("Tasks", icon: "clock.badge.checkmark",
+                               selected: appState.chatWorkspace.isTasks) {
+                    appState.chatWorkspace.isTasks ? appState.showConversation() : appState.showTasks()
+                }
+                // No "Chats" heading here: the list carries its own section
+                // headers ("Agents", "Sessions"), and one of them appears only
+                // when it has rows. A heading pinned in this inset could not
+                // do that — it would sit above an empty list announcing a
+                // section that isn't there.
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            // One gutter for the whole panel — the conversation rows below
+            // apply the same constant, so the two halves are the same width by
+            // construction rather than by two numbers that happen to agree.
+            .padding(.horizontal, ChatMetrics.sidebarGutter)
+            .padding(.top, 10)
+            .padding(.bottom, 8)
+            // Where the frost ENDS. This block is what conversation rows scroll
+            // under, so its own bottom edge is the line between "readable" and
+            // "behind glass" — no constant to keep in step with its contents.
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: SidebarClearBandTopKey.self,
+                        value: proxy.frame(in: .named(ChatSidebar.bandSpace)).maxY)
+                }
+            }
+            // No backdrop: the toolbar's BAR is back, so `scrollEdgeEffectStyle`
+            // has something to attach to again and the platform frosts what
+            // scrolls beneath this block.
+        }
+        // The panel's own bottom edge closes the band — in this space that is
+        // the column's HEIGHT, which is the whole "how much window is there?"
+        // question the badge count answers. Applied OUTSIDE the safeAreaInset
+        // so it measures the whole column, and so the three readers below are
+        // ancestors of the block that publishes the top edge — a preference
+        // only travels up.
+        //
+        // There was a second publisher for the TOP edge here, `frame.minY +
+        // safeAreaInsets.top`, described as the same line derived a second way.
+        // It never was: measured, it reported 104 against a frost line at 370,
+        // because this reader sits below the toolbar (so it has already lost
+        // that inset) and the block's height is not part of what it reads back.
+        // It was harmless only because the key reduces by `max` and the real
+        // measurement was always larger — a fallback that could only ever be
+        // wrong is worse than none.
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: SidebarClearBandBottomKey.self,
+                    value: proxy.frame(in: .named(ChatSidebar.bandSpace)).maxY)
+            }
+        }
+        // Declared here, OUTSIDE both readers and the inset, so the block, the
+        // column and every row resolve against the same origin.
+        .coordinateSpace(.named(ChatSidebar.bandSpace))
+        .onPreferenceChange(SidebarClearBandTopKey.self) { value in
+            applyMeasurement(value, to: $clearBandTop)
+        }
+        .onPreferenceChange(SidebarClearBandBottomKey.self) { value in
+            applyMeasurement(value, to: $clearBandBottom)
+        }
+        .onPreferenceChange(SidebarRowSpansKey.self) { value in
+            guard rowSpans != value else { return }
+            // Async for the same reason the transcript's scroll correction is
+            // (issue #136): a geometry-driven write that lands inside the
+            // layout flush re-enters layout, and under a scroll it does so
+            // every frame. One turn later it coalesces instead.
+            DispatchQueue.main.async { rowSpans = value }
         }
     }
 
-    /// Start a chat AS an agent.
+    /// Store a measured edge, ignoring sub-pixel noise. The equality gate is
+    /// load-bearing, not an optimisation: a write per layout would re-enter
+    /// layout and never settle.
+    private func applyMeasurement(_ value: CGFloat, to binding: Binding<CGFloat>) {
+        guard abs(binding.wrappedValue - value) > 0.5 else { return }
+        DispatchQueue.main.async { binding.wrappedValue = value }
+    }
+
+    // MARK: Selection
+
+    /// Whether a conversation row can be lit at ALL in the current workspace
+    /// mode. Asked of the active chat against itself, so the answer is the mode
+    /// question alone — the per-row half is now selection membership.
+    private var conversationsAreLit: Bool {
+        guard let active = appState.activeChatId else { return false }
+        return SidebarSelection.isConversationSelected(
+            sessionId: active, activeChatId: active, workspace: appState.chatWorkspace)
+    }
+
+    /// One click on a conversation row. The modifier maths is pure and lives in
+    /// `SidebarMultiSelect`; this is only the wiring — read the flags off the
+    /// event AppKit is currently dispatching (a SwiftUI Button action has no
+    /// other way to see them), then apply the outcome.
     ///
-    /// Next to New Chat because that is WHEN the choice is made: a session's
-    /// agent is fixed once the session exists (there is no `setAgent` any more),
-    /// so this is the only place it can be picked. It used to be a chip in the
-    /// composer, where it configured the whole conversation from the row that
-    /// configures one message — and a mid-thread switch silently re-pointed the
-    /// prompt, tools, model and voice of a conversation already underway.
-    private var newAgentChatMenu: some View {
+    /// Selection is written BEFORE `activeChatId` on purpose: the sync above
+    /// collapses the selection for an active chat it doesn't already contain,
+    /// so the other order would undo a cmd-click on its way out.
+    private func selectRow(_ id: UUID, ordered: [UUID]) {
+        // Clicking a row means you are working in the LIST, so the keyboard
+        // comes with you. Nothing else moves it: these rows take no first
+        // responder, so the composer keeps the keyboard while you click around
+        // the sidebar — which is what made ⌘⌫ a line delete forever after one
+        // click in the field. Deliberately NOT done by `quickSwitch`: ⌘\<digit\>
+        // is for jumping to a chat and typing in it, so the composer stays
+        // armed there (a multi-selection is what tells ⌘⌫ otherwise).
+        KeyboardFocus.resignTextEditor(in: NSApp.keyWindow)
+        let flags = (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags)
+            .intersection(.deviceIndependentFlagsMask)
+        let outcome = SidebarMultiSelect.click(
+            id, ordered: ordered,
+            selection: appState.sidebarSelection,
+            anchor: selectionAnchor,
+            active: appState.activeChatId,
+            command: flags.contains(.command),
+            shift: flags.contains(.shift))
+        apply(outcome)
+    }
+
+    /// Every control that deletes conversations comes through here, so which
+    /// ones ask first is `SidebarDeleteConfirm`'s decision and not a per-button
+    /// habit. `keyboard` is what separates ⌘⌫ — which names no row — from a
+    /// click on one.
+    private func requestDeleteChats(_ ids: Set<UUID>, keyboard: Bool) {
+        guard !ids.isEmpty else { return }
+        if SidebarDeleteConfirm.required(count: ids.count, keyboard: keyboard) {
+            appState.pendingChatDeletion = ids
+        } else {
+            deleteChats(ids)
+        }
+    }
+
+    /// Delete a set of conversations and leave the panel's own state consistent
+    /// — the ids go out of the selection and the anchor FIRST, so nothing that
+    /// reads them (the ⌫ handler, the context menu's count) can name a chat that
+    /// is already gone.
+    private func deleteChats(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        appState.sidebarSelection.subtract(ids)
+        if let anchor = selectionAnchor, ids.contains(anchor) { selectionAnchor = nil }
+        appState.deleteSessions(ids)
+    }
+
+    /// A section heading, sitting on the same left edge as the rows under it.
+    private func sectionHeader(_ title: String) -> some View {
+        sectionHeader(title) { EmptyView() }
+    }
+
+    /// A heading with an optional trailing control (the Sessions +).
+    private func sectionHeader<T: View>(_ title: String,
+                                        @ViewBuilder trailing: () -> T) -> some View {
+        HStack(spacing: 4) {
+        Text(L10n.text(title))
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            trailing()
+        }
+        // The stack owns the gutter; the heading owes only the row's inner
+        // inset, so it sits on the same left line as the labels under it.
+        .padding(.horizontal, ChatMetrics.sidebarRowInset)
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+    }
+
+    /// The + beside Sessions: a new chat first, then the coding CLIs (the
+    /// tray's own list, shared, so the two cannot drift; DMG-only — the App
+    /// Store build can't detect or launch other apps' CLIs).
+    private var newSessionMenu: some View {
         Menu {
-            if appState.agents.allAgents.isEmpty {
-                Text("No agents yet")
+            Button {
+                appState.showConversation()
+                _ = appState.newChatSession()
+            } label: {
+                Label("New Chat", systemImage: "square.and.pencil")
             }
-            ForEach(appState.agents.allAgents) { agent in
-                let decision = appState.agentModelDecision(for: agent)
-                Button {
-                    appState.startChat(withAgent: agent.id)
-                } label: {
-                    // Same rule as the old chip: an agent whose pinned model
-                    // isn't downloaded says so rather than failing at send.
-                    Label(AgentModelSwitch.isSelectable(decision)
-                          ? agent.name : "\(agent.name) — model not downloaded",
-                          systemImage: agent.symbol)
-                }
-                .disabled(!AgentModelSwitch.isSelectable(decision))
-            }
-            Divider()
-            Button("Manage Agents…") {
-                AppActivation.openWindow(id: "agents", using: openWindow)
+            if BuildFeatures.current.cliLauncher {
+                Divider()
+                CLILauncherMenuItems(
+                    detector: cliDetector,
+                    baseURL: appState.server.baseURL,
+                    servedModelId: appState.server.chatModelId ?? "mlx-serve",
+                    serverContextLength: appState.server.chatModelInfo?.contextLength,
+                    models: appState.server.allModels,
+                    openSandboxAgent: { appState.startTerminal(agentId: $0) },
+                    openHostCLI: { appState.startTerminal(hostCLI: $0) })
             }
         } label: {
-            Image(systemName: "person.badge.plus")
-                .frame(width: 34, height: ChatMetrics.sidebarButtonHeight)
+            Image(systemName: "plus")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 22, height: 22)
                 .contentShape(Rectangle())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .sidebarActionButton()
-        .help("New chat with an agent — its prompt, tools, model and voice")
+        .fixedSize()
+        .help("New chat, or a coding agent in a terminal")
     }
 
-    private func relativeTime(_ date: Date) -> String {
-        let seconds = Int(-date.timeIntervalSinceNow)
-        if seconds < 60 { return "just now" }
-        let minutes = seconds / 60
-        if minutes < 60 { return "\(minutes)m ago" }
-        let hours = minutes / 60
-        if hours < 24 { return "\(hours)h ago" }
-        let days = hours / 24
-        return "\(days)d ago"
+    /// One conversation row, shared by both sections. `ordered` is the panel's
+    /// flattened visual order, which shift-click ranges over.
+    @ViewBuilder
+    private func sessionRow(_ session: ChatSession, ordered: [UUID]) -> some View {
+        // Lit rows are the SELECTION, not just the active chat — otherwise a
+        // cmd-clicked second row is selected (⌫ deletes it) while looking
+        // exactly like an unselected one. A conversation is still only lit while
+        // the window is showing conversations: otherwise opening Tasks left the
+        // last chat lit alongside the Tasks destination, two "you are here"
+        // marks for one window.
+        let isSelected = conversationsAreLit && appState.sidebarSelection.contains(session.id)
+        // The button IS the row: it carries the padding, the height floor and
+        // the contentShape, so every pixel of the fill is clickable. As a
+        // sibling sized by an outer frame, the label was CENTRED in the row's
+        // height and only its own text band answered a click — the dead strip
+        // along the top and bottom of the highlight.
+        Button {
+            selectRow(session.id, ordered: ordered)
+        } label: {
+            // An agent thread is named for its AGENT, with the agent's own
+            // symbol beside it — the Agents section is a list of who you talk
+            // to, so that answer belongs on the first line rather than in a
+            // caption under a title derived from whatever you typed first.
+            let agent = appState.agents.agent(id: session.agentId)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    if session.isExternalBridge {
+                        Image(systemName: "paperplane.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
+                            .help("Telegram conversation (view only)")
+                    }
+                    if let agent {
+                        Image(systemName: agent.symbol)
+                            .font(.system(size: 10))
+                            .foregroundStyle(Color.accentColor)
+                    } else if !session.isExternalBridge {
+                        // Every row in this column carries a glyph saying what
+                        // it is — a terminal, an agent, a plain conversation.
+                        Image(systemName: "bubble.left")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                    let displayTitle = ChatSessionTitle.display(title: session.title,
+                                                                agentName: agent?.name)
+                    Text(displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle)
+                        .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+                }
+                // What this particular conversation is about, displaced from
+                // the title line by the agent's name. It is also the only
+                // thing telling a second thread with the same agent apart
+                // from the first — without it the sidebar draws two identical
+                // rows. Absent until the thread has said something, so a new
+                // one is a single line exactly like a destination row.
+                if let subject = ChatSessionTitle.subject(title: session.title,
+                                                          agentName: agent?.name) {
+                    Text(L10n.text(subject))
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            // Room kept for the delete button at ALL times, not only while
+            // hovering: reserving it on hover reflows the title under the
+            // pointer, right as you are aiming at it.
+            .padding(.leading, ChatMetrics.sidebarRowInset)
+            .padding(.trailing, ChatMetrics.sidebarRowInset + 18)
+            .padding(.vertical, 5)
+            // A row is as tall as what is IN it: one line matches a
+            // destination row exactly, and only the rows carrying an agent
+            // subtitle grow. The floor lives on the LABEL so the button — the
+            // thing that answers clicks — is the full height of the fill.
+            // `minHeight` is a floor, never a fixed height.
+            .frame(maxWidth: .infinity, minHeight: ChatMetrics.sidebarButtonHeight,
+                   alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        // Where this row sits, so the numbering can skip whatever is under the
+        // frosted block. Attached ONLY while ⌘ is down: a probe on every row is
+        // a preference write per row per scroll frame, and outside this
+        // transient mode nothing reads the answer.
+        .background(rowSpanProbe(session.id))
+        // One meaning for gray in this panel, and one SHAPE: the fill rides the
+        // row's own content inside the stack's gutter, exactly as a
+        // destination's `.background` does. (It was a `listRowBackground` once,
+        // which fills the whole row rect and ignores the insets beside it — a
+        // selected chat ran edge to edge under a column of inset destinations.)
+        .background(
+            RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
+                .fill(SidebarRowStyle.fill(selected: isSelected,
+                                           hovering: hoveredSessionId == session.id))
+        )
+        // A real Button laid OVER the row, never a tap gesture around one: an
+        // overlay is hit-tested first, so its clicks reach it rather than the
+        // row underneath, and the row keeps its whole area clickable.
+        //
+        // The badge and the delete button share this one reserved slot, and the
+        // badge WINS while ⌘ is down: they would otherwise draw on top of each
+        // other on the hovered row, which is exactly the row the pointer is on
+        // whenever anyone reads a number. ⌘-click is also how a second row
+        // joins the selection, so the pointer is regularly here with ⌘ held —
+        // and the ✕ is one pixel away from a click meaning "delete this".
+        .overlay(alignment: .trailing) {
+            if let badge = quickSwitchBadge(for: session.id) {
+                badge
+            } else if hoveredSessionId == session.id {
+                Button {
+                    requestDeleteChats([session.id], keyboard: false)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, ChatMetrics.sidebarRowInset)
+                .help("Delete chat")
+            }
+        }
+        .onHover { isHovered in
+            hoveredSessionId = isHovered ? session.id : nil
+        }
+        .contextMenu {
+            Button("Rename…") { beginRename(session.id, current: session.title) }
+            // Right-clicking INSIDE a multi-selection acts on all of it, and
+            // says how many; right-clicking outside one is a single delete.
+            if appState.sidebarSelection.count > 1,
+               appState.sidebarSelection.contains(session.id) {
+                Button("Delete \(appState.sidebarSelection.count) Chats", role: .destructive) {
+                    requestDeleteChats(appState.sidebarSelection, keyboard: false)
+                }
+            } else {
+                Button("Delete", role: .destructive) {
+                    requestDeleteChats([session.id], keyboard: false)
+                }
+            }
+        }
     }
+
+    /// One sandbox terminal row: the same chrome as a conversation row, a
+    /// terminal glyph tinted by phase, the workspace's folder as the caption.
+    @ViewBuilder
+    private func terminalRow(_ t: TerminalSessionList.Session) -> some View {
+        let isSelected = appState.chatWorkspace == .terminal(t.id)
+        Button {
+            KeyboardFocus.resignTextEditor(in: NSApp.keyWindow)
+            showTerminal(t.id)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: t.isInOwnWindow ? "macwindow" : "terminal")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(terminalTint(t.phase))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(L10n.text(t.displayName))
+                        .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+                    Text((t.workspace as NSString).lastPathComponent)
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.leading, ChatMetrics.sidebarRowInset)
+            .padding(.trailing, ChatMetrics.sidebarRowInset + 18)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, minHeight: ChatMetrics.sidebarButtonHeight,
+                   alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(rowSpanProbe(t.id))
+        .background(
+            RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
+                .fill(SidebarRowStyle.fill(selected: isSelected,
+                                           hovering: hoveredSessionId == t.id))
+        )
+        .overlay(alignment: .trailing) {
+            if let badge = quickSwitchBadge(for: t.id) {
+                badge
+            } else if hoveredSessionId == t.id {
+                Button {
+                    requestCloseTerminal(t.id)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, ChatMetrics.sidebarRowInset)
+                .help(t.isActive ? "End session" : "Close")
+            }
+        }
+        .onHover { isHovered in
+            hoveredSessionId = isHovered ? t.id : nil
+        }
+        .contextMenu {
+            Button("Rename…") { beginRename(t.id, current: t.displayName) }
+            if t.isInOwnWindow {
+                Button("Show Window") { showTerminal(t.id) }
+            } else {
+                Button("Move Tab to New Window") { moveToNewWindow(t.id) }
+            }
+            Menu("Theme") {
+                Toggle("App Default", isOn: Binding(
+                    get: { t.themeId == nil },
+                    set: { _ in terminals.setTheme(t.id, themeId: nil) }))
+                Divider()
+                ForEach(TerminalTheme.all) { theme in
+                    Toggle(theme.name, isOn: Binding(
+                        get: { t.themeId == theme.id },
+                        set: { _ in terminals.setTheme(t.id, themeId: theme.id) }))
+                }
+            }
+            Button(L10n.text(t.isActive ? "End Session" : "Close"), role: .destructive) {
+                requestCloseTerminal(t.id)
+            }
+        }
+        // Per row, so only the row asked presents; a live session's ✕ is a
+        // small target and a misclick must not kill a TUI.
+        .confirmationDialog(
+            "End the \(t.displayName) session?",
+            isPresented: Binding(get: { appState.pendingTerminalClose == t.id },
+                                 set: { if !$0 { appState.pendingTerminalClose = nil } })
+        ) {
+            Button("End Session", role: .destructive) { appState.closeTerminal(t.id) }
+                .keyboardShortcut(.defaultAction)
+            Button("Cancel", role: .cancel) { appState.pendingTerminalClose = nil }
+        } message: {
+            Text("The session running inside the sandbox will be terminated. Files it wrote are kept.")
+        }
+    }
+
+    /// Drag a row onto another to take its slot. Reorders LIVE as the drag
+    /// passes over rows (the `dropEntered` idiom), so the list shows where the
+    /// row will land; the drop itself only ends the drag.
+    private func reorderable(_ id: UUID, visible: [UUID]) -> SidebarReorder {
+        SidebarReorder(id: id, dragging: $draggingRowId) { moved, target in
+            appState.moveSidebarRow(moved, onto: target, visible: visible)
+        }
+    }
+
+    /// Where a row sits, so the numbering can skip whatever is under the
+    /// frosted block. Attached ONLY while ⌘ is down: a probe on every row is
+    /// a preference write per row per scroll frame, and outside this
+    /// transient mode nothing reads the answer.
+    @ViewBuilder
+    private func rowSpanProbe(_ id: UUID) -> some View {
+        if modifiers.commandHeld {
+            GeometryReader { proxy in
+                let frame = proxy.frame(in: .named(ChatSidebar.bandSpace))
+                Color.clear.preference(
+                    key: SidebarRowSpansKey.self,
+                    value: [id: SidebarRowSpan(top: frame.minY, bottom: frame.maxY)])
+            }
+        }
+    }
+
+    /// The ⌘-digit badge for a row, nil when it wears none (⌘ up, or the row
+    /// is under the frost). Shared by chat and terminal rows — one panel, one
+    /// numbering.
+    private func quickSwitchBadge(for id: UUID) -> AnyView? {
+        guard modifiers.commandHeld,
+              let slot = ChatQuickSwitch.slot(for: id, visible: panelRows.visible,
+                                              numbering: numberedRows) else { return nil }
+        return AnyView(
+            Text("\(slot)")
+                .font(.caption2.weight(.semibold).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color.primary.opacity(0.08))
+                )
+                .padding(.trailing, ChatMetrics.sidebarRowInset)
+                // Decoration: it must never eat the click that selects the
+                // row it is drawn on.
+                .allowsHitTesting(false)
+                .transition(AnyTransition.asymmetric(
+                    insertion: .opacity.animation(.easeIn(duration: 0.25).delay(0.2)),
+                    removal: .opacity.animation(.easeOut(duration: 0.15))
+                 ))
+                .animation(.easeInOut(duration: 0.25), value: modifiers.commandHeld))
+    }
+
+    private func beginRename(_ id: UUID, current: String) {
+        renameDraft = ChatSessionTitle.isPlaceholder(current) ? "" : current
+        appState.pendingRename = id
+    }
+
+    /// The one rename dialog, for chats and terminals alike.
+    private var renameDialog: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .alert("Rename Session",
+                   isPresented: Binding(get: { appState.pendingRename != nil },
+                                        set: { if !$0 { appState.pendingRename = nil } }),
+                   presenting: appState.pendingRename) { id in
+                TextField("Name", text: $renameDraft)
+                Button("Rename") {
+                    appState.renameSession(id, to: renameDraft)
+                    appState.pendingRename = nil
+                }
+                .keyboardShortcut(.defaultAction)
+                Button("Cancel", role: .cancel) { appState.pendingRename = nil }
+            } message: { _ in
+                Text("Leave it empty to go back to the automatic name.")
+            }
+    }
+
+    /// A terminal shows in the detail column, or — once moved out — in its
+    /// own window, which a repeat open only raises.
+    private func showTerminal(_ id: UUID) {
+        if terminals.sessions.session(id)?.isInOwnWindow == true {
+            AppActivation.openWindow(id: "terminalWindow", value: id, using: openWindow)
+        } else {
+            appState.showTerminal(id)
+        }
+    }
+
+    private func moveToNewWindow(_ id: UUID) {
+        if appState.chatWorkspace == .terminal(id) { appState.showConversation() }
+        terminals.setInOwnWindow(id, true)
+        AppActivation.openWindow(id: "terminalWindow", value: id, using: openWindow)
+    }
+
+    private func terminalTint(_ phase: TerminalSessionList.Session.Phase) -> Color {
+        switch phase {
+        case .preparing: return .orange
+        case .live: return .green
+        case .exited: return .secondary
+        case .failed: return .red
+        }
+    }
+
+    /// Instant for exited/failed rows, confirmed while a session is alive.
+    private func requestCloseTerminal(_ id: UUID) {
+        if terminals.sessions.closeNeedsConfirmation(id) {
+            appState.pendingTerminalClose = id
+        } else {
+            appState.closeTerminal(id)
+        }
+    }
+
+    /// One destination row. All of them are the same shape by construction —
+    /// the mockup's point is that this column reads as ONE list of places, not
+    /// as a pile of controls that happen to be stacked.
+    private func destinationRow(_ title: String, icon: String, selected: Bool,
+                                badge: Int = 0,
+                                action: @escaping () -> Void) -> some View {
+        DestinationRowButton(selected: selected, action: action) {
+            destinationLabel(title, icon: icon, selected: selected, badge: badge)
+        }
+    }
+
+    @ViewBuilder
+    private func destinationLabel(_ title: String, icon: String, selected: Bool,
+                                  badge: Int = 0) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 16)
+            Text(L10n.text(title)).font(.subheadline.weight(.medium))
+            Spacer(minLength: 4)
+            if badge > 0 {
+                Text("\(badge)")
+                    .font(.caption2.monospacedDigit())
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.quaternary, in: Capsule())
+            }
+        }
+        .foregroundStyle(Color.primary)
+        // The SAME inner inset a conversation row uses, so a destination's icon
+        // and a chat's title start on one line down the column.
+        .padding(.horizontal, ChatMetrics.sidebarRowInset)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+    }
+
+    /// The Agents row. A MENU, because "Agents" is two things: the agents you
+    /// can start a conversation as, and the editor for them.
+    private var agentsRow: some View {
+        destinationRow("Agents", icon: "person.2",
+                       selected: appState.chatWorkspace.isAgents) {
+            appState.chatWorkspace.isAgents ? appState.showConversation() : appState.showAgents()
+        }
+    }
+
+    private var activeDownloadCount: Int {
+        downloads.downloads.values.filter { $0.status == .downloading }.count
+    }
+
 }
 
 // MARK: - Chat Detail
@@ -650,40 +1786,60 @@ struct ChatSidebar: View {
 struct ChatDetailView: View {
     let sessionId: UUID
     @EnvironmentObject var appState: AppState
+    @State private var modelSettings: ModelSettingsRequest?
+    /// Observed directly (AppState does not forward download publishes) — the
+    /// create banner's "not downloaded" pill and the held-prompt readiness
+    /// checks must repaint when the bytes land.
+    @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var toolExecutor: ToolExecutor
     @EnvironmentObject var mcpManager: MCPManager
     @EnvironmentObject var chatEngine: ChatTurnEngine
     @Environment(\.openWindow) private var openWindow
+    // Settings ▸ Interface, observed HERE because `ChatMetrics` reads these
+    // keys straight off UserDefaults with no SwiftUI dependency: without a
+    // real observer a size change reaches only rows that happen to re-render,
+    // leaving the transcript in two fonts at once. The values feed the `.id`
+    // on the row stack, which is what forces the rebuild.
+    @AppStorage(InterfacePrefKey.textSize) private var interfaceTextSize = ChatTextSize.medium.rawValue
+    @AppStorage(InterfacePrefKey.compactMode) private var interfaceCompact = false
+    /// Read only to rebuild the transcript when it changes.
+    @AppStorage(InterfacePrefKey.chatColumn) private var interfaceChatColumn = ChatColumnWidth.wide.rawValue
     @State private var inputText = ""
+    /// Where ↑/↓ have walked back to in this chat's own history. Per-tab state
+    /// like everything else here — `ChatDetailView` is REUSED across tabs, so a
+    /// walk left running would resume in someone else's conversation. Stale
+    /// indexes are harmless by construction (`ComposerHistory` treats one that
+    /// no longer names an entry as no walk at all), but resetting on the switch
+    /// is what makes the first ↑ in a new tab mean what it says.
+    @State private var composerWalk = ComposerHistory.Walk.idle
     // The three toolbar toggles mirror the visible session's persisted state
     // (`ChatSession.enableThinking` / `.mode` / `.useMCP`). They're loaded from
     // the session on appear AND on every `sessionId` change, and written back on
     // toggle — so each chat tab remembers its own Think/Agent/MCP choice instead
     // of leaking the active tab's value into the reused ChatDetailView.
     @State private var enableThinking = false
+    @State private var reasoningEffort = ReasoningEffort.low
     @State private var isAgentMode = false
     @State private var mcpMode = false
     @State private var showMCPMarketplace = false
-    @State private var showThinkingInAgentConfirm = false
     @State private var executingPlanMessageId: UUID?
-    @State private var isNearBottom = true
-    @State private var scrollViewHeight: CGFloat = 0
-    @State private var contentBottom: CGFloat = 0
-    @State private var scrollMonitor: Any?
+    // Follow-the-newest-line. The decision core is pure (`ChatScrollState`,
+    // pinned by ChatScrollTests); the model holds it in a class so per-frame
+    // scroll geometry doesn't re-evaluate the whole chat body — only the
+    // pinned flag is published. `scrollPosition` is the one handle that moves
+    // the transcript, so no view needs a `ScrollViewProxy` passed around.
+    @StateObject private var scrollModel = ChatScrollModel()
+    @State private var scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
     @State private var pasteMonitor: Any?
-    @State private var pendingImages: [NSImage] = []
+    @State private var pendingImages: [PendingImage] = []
     @State private var pendingPDFs: [(name: String, text: String)] = []
+    @State private var pendingVideos: [ChatVideo] = []
     @State private var pendingAudio: [ChatAudio] = []
     @StateObject private var recorder = AudioRecorder()
     // Tool-approval gate state. `pendingApproval` is set right before each
     // tool call when Agent mode is on; the sheet at the bottom of `body`
     // observes it and resumes `approvalContinuation` with the user's choice.
-    // `toolAllowList` is the soft "Allow all tools this session" decision, keyed
-    // by session id so it is remembered PER TAB: SwiftUI reuses this view across
-    // `sessionId` changes, so a per-session set survives switching tabs (a plain
-    // Bool was shared across tabs and got wiped on every switch). A session
-    // re-arms only when the user toggles Agent off in that tab.
     @State private var pendingApproval: ToolApprovalRequest?
     @State private var toolAllowList = SessionToolAllowList()
     // Plain Bool (not @FocusState): the composer is an NSTextView wrapper, so
@@ -691,13 +1847,41 @@ struct ChatDetailView: View {
     // it back into this flag. The Cmd+V attach monitor reads it; on-appear and
     // post-generation code set it true to (re)focus the field.
     @State private var inputFocused = false
+    /// The detail column's measured width — the panel next to the session
+    /// sidebar, not the whole window. Drives `contentWidth` below. Zero until
+    /// `body`'s root view reports its first `onGeometryChange`.
+    @State private var columnWidth: CGFloat = 0
+
+    /// The reading column (Settings ▸ Interface ▸ Chat Column) every capped
+    /// site shares: transcript, composer, empty-state greeting.
+    private var contentWidth: CGFloat {
+        ChatMetrics.proseWidth(panelWidth: columnWidth)
+    }
     @State private var composerHeight: CGFloat = 36
+    // The composer's "create mode" (the chip rewired the composer into a
+    // generator) is GONE: a media chip navigates to the Create pane, exactly
+    // like the Tools menu. In-chat media generation is the agent tools' job
+    // (`generate_image` & co.) — one way to drive a generator from a chat,
+    // not two.
     // Pre-send intent nudge: when a message looks agentic / MCP-bound but the
     // matching mode is off, confirm before sending. `intentSuppress` remembers a
     // per-session "Send anyway" so we stop nagging that chat (keyed by session
     // id — the view is reused across tabs).
     @State private var pendingIntentPrompt: IntentPrompt?
     @State private var intentSuppress = SessionIntentSuppression()
+    // Issue #227: built once per messages change, not per body pass. Rebuilding
+    // inside the ForEach handed SwiftUI a fresh array on every layout pass and
+    // the LazyVStack could spin forever.
+    @State private var rows: [ChatRow] = []
+    @State private var foldStore = FoldStore()
+    /// The transcript lays out `rows[firstVisibleRow...]`; see `TranscriptWindow`.
+    @State private var firstVisibleRow = 0
+    /// Which conversation the cut belongs to. The messages observer cuts on
+    /// first appearance (it is the one with `initial: true`); the session
+    /// observer cuts on every switch, with its own copy of the rows, so
+    /// neither depends on the other having run.
+    @State private var windowSession: UUID?
+    @State private var isRevealingEarlier = false
 
 
     private var session: ChatSession? {
@@ -707,6 +1891,45 @@ struct ChatDetailView: View {
     /// Generation state for THIS chat. The engine runs one turn at a time, so a
     /// chat that doesn't own the active turn must show Send (idle), not the Stop
     /// button — and its Send is disabled while another chat is mid-turn.
+    // MARK: - "/" skill menu
+
+    /// Highlighted row; Escape hides the menu without clearing what was typed.
+    @State private var slashSelection: Int = 0
+    @State private var slashDismissed: Bool = false
+
+    /// Skills answering the half-typed command, or none when the menu is
+    /// closed. Guarded by `SlashCommands.query` FIRST: the skills folder is
+    /// stat-ed on read, and this property is evaluated on every body pass
+    /// (including ~20 Hz while a reply streams).
+    private var slashMatches: [SkillSummary] {
+        guard !slashDismissed, let q = SlashCommands.query(in: inputText) else { return [] }
+        return SlashCommands.matches(query: q, in: AgentPrompt.skillManager.summaries)
+    }
+
+    /// Up/Down/Return/Tab/Escape while the menu is open. Returns false when
+    /// it is closed, so the composer keeps every key it owns today.
+    private func handleSlashKey(_ command: ComposerKeyCommand) -> Bool {
+        let matches = slashMatches
+        guard !matches.isEmpty else { return false }
+        switch command {
+        case .up:
+            slashSelection = (slashSelection - 1 + matches.count) % matches.count
+        case .down:
+            slashSelection = (slashSelection + 1) % matches.count
+        case .accept:
+            pickSlashSkill(matches[min(slashSelection, matches.count - 1)])
+        case .cancel:
+            slashDismissed = true
+        }
+        return true
+    }
+
+    private func pickSlashSkill(_ skill: SkillSummary) {
+        inputText = SlashCommands.accept(skill.name, in: inputText)
+        slashSelection = 0
+        inputFocused = true
+    }
+
     private var composerState: ChatTurnEngine.ComposerState {
         chatEngine.composerState(for: sessionId)
     }
@@ -720,6 +1943,7 @@ struct ChatDetailView: View {
         guard !isExternalBridgeSession else { return }
         isAgentMode = session?.mode == .agent
         enableThinking = session?.enableThinking ?? false
+        reasoningEffort = session?.reasoningEffort ?? .low
         mcpMode = session?.useMCP ?? false
     }
 
@@ -738,16 +1962,11 @@ struct ChatDetailView: View {
             isExternalBridge: isExternalBridgeSession,
             telegramThinking: tg.enableThinking, telegramAgent: tg.agentMode, telegramMCP: tg.useMCP,
             inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: mcpMode,
-            agentLock: agentModeLock)
+            agentLock: agentModeLock,
+            apple: appState.useAppleModel)
     }
 
     /// What this tab's agent decided about Think / Tools / MCP, nil with no agent.
-    ///
-    /// Built from the SAME `resolvedAgentSettings` the turn runs under, not from
-    /// the agent's `capabilities` directly: a second copy of that rule is exactly
-    /// how the discs ended up disagreeing with what ran (every agent defaults
-    /// `web: true`, so resolution forced the tool loop on while the wrench still
-    /// rendered OFF). Cheap — the resolution is a pure fold.
     private var agentModeLock: AgentModeLock? {
         guard let agent = activeAgent else { return nil }
         let resolved = appState.resolvedAgentSettings(
@@ -765,73 +1984,19 @@ struct ChatDetailView: View {
     }
 
     // MARK: Mode controls (Think / Tools / MCP)
-    //
-    // Icon-only, rendered in the COMPOSER row next to the paperclip — see
-    // `modeIcon` for why state has to read from colour alone once the captions
-    // are gone, and `composerControls` for the row itself.
 
-    /// The chat pane's ONE toolbar resident: model picker, voice, settings, as a
-    /// single floating capsule at the leading edge.
-    ///
-    /// It rides a real `ToolbarItem` because that band's own layer swallows
-    /// clicks from anything else placed in it (a custom strip pulled in via
-    /// ignoresSafeArea looked native and was completely dead). What changed is
-    /// the BACKGROUND: the band no longer paints a 100%-width strip across the
-    /// window, so this cluster carries its own material and reads as floating
-    /// over the transcript. That material is load-bearing — without it, content
-    /// scrolling under the cluster bleeds through the controls, which is exactly
-    /// why the band used to be painted at 0.8 opacity.
-    ///
-    /// The three mode controls that used to sit here are in the COMPOSER row
-    /// now: their captions were most of this cluster's width budget, and they
-    /// configure the message being written, not the window.
-    private var floatingToolbar: some View {
-        // Voice moved OUT to the composer row (`voiceToggle`): it configures
-        // the conversation you're having, not the window — and it freed this
-        // cluster's width budget.
-        HStack(spacing: 4) {
-            ChatModelPill(showsBackground: false)
-            // The server being down is discovered HERE — you type and nothing
-            // answers — so the fix is offered here too, next to the picker,
-            // instead of only in the tray. Transient by construction: it is
-            // gone the moment the server is up, so it costs the cluster's width
-            // budget only while it has something to say.
-            serverStartControl
-            Divider().frame(height: 14)
-            Button {
-                AppActivation.openWindow(id: "settings", using: openWindow)
-            } label: {
-                Image(systemName: "gear")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.primary)
-                    .frame(width: 22, height: 22)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Open Settings (⌘,) — server flags, speculative decoding, performance (continuous batching, KV-quant, prefix cache), and per-request defaults.")
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().stroke(Color.secondary.opacity(0.20), lineWidth: 0.5))
-    }
-
-    /// Start the server from the chat window. Drawn rather than styled
-    /// (`.plain` + explicit padding/fill) — a `.bordered` control keeps its
-    /// intrinsic size and would sit at a different height to the pill beside
-    /// it, which is the sidebar New Chat lesson.
     @ViewBuilder private var serverStartControl: some View {
         let control = ChatServerStartControl.resolve(
             status: server.status,
-            hasStartableModel: !appState.selectedModelPath.isEmpty || server.lanChatModelId != nil
+            // Nothing to start for the on-device model — it needs no server.
+            hasStartableModel: !appState.useAppleModel
+                && (!appState.selectedModelPath.isEmpty || server.lanChatModelId != nil)
         )
         if control != .hidden {
             Button {
-                // ONE start path, shared with the LAN toggle: it loads the
-                // selected checkpoint, or boots headless when the model
-                // answering is on another Mac. A second `server.start` call
-                // site here is how the two would drift.
-                appState.ensureServerForLan()
+                // The one button-start path; a second `server.start` call site
+                // here is how the start paths would drift.
+                appState.startServer(loadingSelection: true)
             } label: {
                 HStack(spacing: 4) {
                     if control == .starting {
@@ -839,7 +2004,7 @@ struct ChatDetailView: View {
                     } else {
                         Image(systemName: "play.fill").font(.system(size: 9, weight: .bold))
                     }
-                    Text(control.title)
+                    Text(L10n.text(control.title))
                         .font(.caption.weight(.semibold))
                 }
                 .foregroundStyle(control.isRed ? Color.white : Color.secondary)
@@ -857,27 +2022,21 @@ struct ChatDetailView: View {
     }
 
     // The per-tab agent PICKER used to sit here, between the paperclip and the
-    // mode discs. It's next to New Chat now (`ChatSidebar.newAgentChatMenu`):
-    // it configures the whole conversation rather than the message being
-    // written, and a session's agent is fixed once the session exists — a
-    // mid-thread switch left half a conversation running under someone else's
-    // prompt, tools, model and voice, and flipped the three discs beside it
-    // while it did. The chat still SHOWS who it's talking to (the sidebar row,
-    // and the locked discs name the agent on hover).
+    // mode discs. Starting a chat as an agent lives in the sidebar's Agents
+    // destination now:
 
     /// The agent this tab is talking to (nil = none).
     private var activeAgent: Agent? { appState.agents.agent(id: session?.agentId) }
 
-    /// Images/PDFs/audio for this message, or a folder to ask questions about.
-    /// Its own property (rather than inline in `composerControls`) so it carries
-    /// a hover card like every other glyph in the row.
+    /// Images/videos/PDFs/audio for this message, or a folder to ask questions
+    /// about. Its own property (rather than inline in `composerControls`) so
+    /// it carries a hover card like every other glyph in the row.
     private var attachmentMenu: some View {
         Menu {
             Button {
                 pickAttachment()
             } label: {
-                Label(audioSupported ? "Attach Image, PDF, or Audio…" : "Attach Image or PDF…",
-                      systemImage: "photo.on.rectangle")
+                Label(L10n.text(attachmentMenuLabel), systemImage: "photo.on.rectangle")
             }
             Button {
                 pickDocumentFolder()
@@ -899,19 +2058,19 @@ struct ChatDetailView: View {
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
-        .composerTip(.attachments(audioSupported: audioSupported))
+        .composerTip(.attachments(audioSupported: audioSupported, videoSupported: videoSupported))
+    }
+
+    private var attachmentMenuLabel: String {
+        switch (videoSupported, audioSupported) {
+        case (true, true): return "Attach Image, Video, PDF, or Audio…"
+        case (true, false): return "Attach Image, Video, or PDF…"
+        case (false, true): return "Attach Image, PDF, or Audio…"
+        case (false, false): return "Attach Image or PDF…"
+        }
     }
 
     /// Shared look for the composer's icon-only mode controls.
-    ///
-    /// Captioned pills in the toolbar became bare glyphs here, so the state has
-    /// to read from COLOR alone: tinted glyph on a tinted disc when on, secondary
-    /// on the same neutral disc as the paperclip when off. Same circle geometry
-    /// as every other composer control, so the row stays on one baseline.
-    /// `lockedBy` draws an inset ring inside the disc — the control still reads
-    /// its state from colour, and the ring says the state isn't yours to change.
-    /// A dimmed-out glyph was the alternative and it loses the ON/OFF reading,
-    /// which is the one thing the disc has to keep saying.
     private func modeIcon(_ icon: String, isOn: Bool, onColor: Color,
                           lockedBy: String? = nil) -> some View {
         Image(systemName: icon)
@@ -942,16 +2101,24 @@ struct ChatDetailView: View {
     /// as the tool menu's "not in <agent>'s capabilities" rows.
     @ViewBuilder
     private func lockedModeMenu(_ agentName: String) -> some View {
-        Text("Set by \(agentName)")
-        Button("Edit Agent…") {
-            // ON that agent — the window otherwise opens on whoever sorts
-            // first, which is the wrong one every time you got here from a card
-            // that just named a different name.
-            guard let id = activeAgent?.id else { return }
-            appState.openAgentSettings(id, using: openWindow)
+        if agentName == AppleFoundationChat.displayName {
+            // Not an agent, and nothing to edit: the on-device model simply
+            // does not have these.
+            Text("Not available on \(AppleFoundationChat.displayName)")
+        } else {
+            Text("Set by \(agentName)")
+            Button("Edit Agent…") {
+                // ON that agent — the window otherwise opens on whoever sorts
+                // first, which is the wrong one every time you got here from a
+                // card that just named a different name.
+                guard let id = activeAgent?.id else { return }
+                appState.openAgentSettings(id, using: openWindow)
+            }
         }
     }
 
+    /// One brain: CLICK flips thinking, secondary-click picks the reasoning
+    /// effort — same idiom as the wrench.
     private var thinkToggle: some View {
         Group {
             if let owner = toolbarToggles.thinkingLockedBy {
@@ -960,45 +2127,46 @@ struct ChatDetailView: View {
                 } label: {
                     modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue, lockedBy: owner)
                 }
-                .menuStyle(.button)
-                .buttonStyle(.plain)
-                .menuIndicator(.hidden)
-            } else {
+            } else if isExternalBridgeSession {
+                // Telegram session: write the shared config so the toggle stays
+                // in sync with Settings and the bridge reads it live. No effort
+                // menu — the bridge sends the plain boolean.
                 Button {
-                    if isExternalBridgeSession {
-                        // Telegram session: write the shared config so the toggle
-                        // stays in sync with Settings and the bridge reads it live.
-                        appState.serverOptions.telegram.enableThinking.toggle()
-                    } else if !enableThinking && isAgentMode {
-                        showThinkingInAgentConfirm = true
-                    } else {
-                        enableThinking.toggle()
-                    }
+                    appState.serverOptions.telegram.enableThinking.toggle()
                 } label: {
                     modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue)
                 }
-                .buttonStyle(.plain)
+            } else {
+                Menu {
+                    reasoningEffortMenu
+                } label: {
+                    modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue)
+                } primaryAction: {
+                    enableThinking.toggle()
+                }
+                .contextMenu { reasoningEffortMenu }
             }
         }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
         .composerTip(.thinking(isOn: toolbarToggles.thinking,
                                lockedBy: toolbarToggles.thinkingLockedBy))
     }
 
+    /// The brain disc's secondary-click menu: how hard the model thinks while
+    /// the toggle is on (`reasoning_effort`).
+    @ViewBuilder private var reasoningEffortMenu: some View {
+        Picker("Reasoning", selection: $reasoningEffort) {
+            ForEach(ReasoningEffort.allCases) { effort in
+                Text(L10n.text(effort.label)).tag(effort)
+            }
+        }
+        .pickerStyle(.inline)
+    }
+
     /// One wrench: CLICK flips the tool loop, secondary-click opens the per-tool
     /// switches and the workspace.
-    ///
-    /// It used to open the menu on click, with on/off as the first row. This is
-    /// the composer's most-flipped control, so the frequent action was paying a
-    /// click plus a scan down a long list every time. A bare glyph meaning two
-    /// things by WHERE you click is still out (that was the split-pill problem);
-    /// meaning two things by WHICH button is the standard macOS split, and
-    /// `primaryAction:` also gives press-and-hold for free — the context menu is
-    /// there because press-and-hold is not something anyone discovers.
-    ///
-    /// While the tab has an agent this is a LOCKED indicator: `AgentResolution`
-    /// takes the loop straight from the agent's capabilities and ignores whatever
-    /// the chat says, so a live toggle here would be a control that changes
-    /// nothing. It shows what the agent decided and points at the editor.
     private var agentToggle: some View {
         Group {
             if let owner = toolbarToggles.toolsLockedBy {
@@ -1027,8 +2195,8 @@ struct ChatDetailView: View {
     }
 
     /// Flip the tool loop for this chat. Shared by the wrench click and the
-    /// pre-send intent nudge, so the approval re-arm and the thinking auto-off
-    /// can't apply on one path and not the other.
+    /// pre-send intent nudge, so the approval re-arm can't apply on one path
+    /// and not the other.
     private func setToolsEnabled(_ on: Bool) {
         // The agent decides this one — the disc offers no primary action while
         // locked, but the pre-send nudge calls in here too.
@@ -1044,9 +2212,6 @@ struct ChatDetailView: View {
         // "Always allow this session" decays here — for THIS tab only; other
         // tabs keep their decision.
         if !on { toolAllowList.rearm(sessionId) }
-        // Thinking + tool-calling loops degrade quality on most local models —
-        // auto-off when entering Agent mode.
-        if on { enableThinking = false }
     }
 
     // MARK: Per-chat tool switches
@@ -1059,7 +2224,13 @@ struct ChatDetailView: View {
 
     /// What the tab's agent permits at all; everything when there's no agent.
     private var agentAllowedTools: Set<AgentToolKind> {
-        activeAgent.map { $0.capabilities.resolvedTools() } ?? Set(AgentToolKind.allCases)
+        let fromAgent = activeAgent.map { $0.capabilities.resolvedTools() } ?? Set(AgentToolKind.allCases)
+        // The on-device model's 4k window cannot hold the rest of the tool
+        // definitions; `AgentResolution` clamps the turn, this keeps the menu
+        // from offering what the clamp would drop.
+        return appState.useAppleModel
+            ? fromAgent.intersection(AppleFoundationChat.allowedTools)
+            : fromAgent
     }
 
     private var disabledToolSet: Set<AgentToolKind> {
@@ -1085,17 +2256,22 @@ struct ChatDetailView: View {
     /// turn the loop off.
     @ViewBuilder
     private var toolMenuContent: some View {
+        if appState.useAppleModel {
+            Text("\(AppleFoundationChat.displayName): browse and search only — its \(AppleFoundationChat.contextTokens)-token window has no room for the rest.")
+        }
         ForEach(AgentToolGroup.allCases, id: \.self) { group in
-            Section(group.title) {
-                ForEach(group.tools, id: \.self) { tool in
+            let tools = group.tools.filter { !appState.useAppleModel || AppleFoundationChat.allowedTools.contains($0) }
+            if !tools.isEmpty {
+            Section(L10n.text(group.title)) {
+                ForEach(tools, id: \.self) { tool in
                     let allowed = agentAllowedTools.contains(tool)
                     Button {
                         setTool(tool, enabled: !isToolEnabled(tool))
                     } label: {
                         if isToolEnabled(tool) {
-                            Label(tool.displayName, systemImage: "checkmark")
+                            Label(L10n.text(tool.displayName), systemImage: "checkmark")
                         } else if allowed {
-                            Text(tool.displayName)
+                            Text(L10n.text(tool.displayName))
                         } else {
                             // The agent forbids it — say so rather than showing
                             // an off switch the user can't turn on.
@@ -1104,6 +2280,7 @@ struct ChatDetailView: View {
                     }
                     .disabled(!allowed || isExternalBridgeSession)
                 }
+            }
             }
         }
 
@@ -1114,7 +2291,7 @@ struct ChatDetailView: View {
             }
         }
         .disabled(isExternalBridgeSession)
-        Text(session?.workingDirectory ?? "No workspace set")
+        Text(L10n.text(session?.workingDirectory ?? "No workspace set"))
     }
 
     /// Flip MCP for this chat — the Telegram bridge writes the shared config it
@@ -1168,49 +2345,188 @@ struct ChatDetailView: View {
         (session?.messages.isEmpty ?? true) && composerState != .generatingHere
     }
 
+    /// Which reply Cmd+R / the footer's Regenerate button targets — the
+    /// last assistant message, so the button only ever shows on that one.
+    private var lastAssistantMessageId: UUID? {
+        session?.messages.last { $0.role == .assistant }?.id
+    }
+
+    private static let wordmark: NSImage? = {
+        let image = BundledAsset.image("mlx-serve-wordmark.png")
+        image?.isTemplate = true
+        return image
+    }()
+
+    /// The wordmark, anchored just under the toolbar on an empty plain chat:
+    /// a TEMPLATE image (alpha only), tinted with the label colour so it reads
+    /// in both modes — the source art is white on black and would vanish in
+    /// light mode.
+    @ViewBuilder
+    private var wordmarkHeader: some View {
+        if activeAgent == nil, let mark = Self.wordmark {
+            Image(nsImage: mark)
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 240)
+                .foregroundStyle(.primary)
+                .padding(.top, 24)
+                .accessibilityLabel("MLX-Serve")
+        }
+    }
+
+    /// Greeting + discovery chips, one fixed-height block. The vertical slack
+    /// lives OUTSIDE this view (two sibling Spacers in the body) — a Spacer
+    /// nested in here shares space unevenly with the body's own trailing one,
+    /// which is what pinned the whole group to the bottom of the window.
     private var emptyState: some View {
-        VStack(spacing: 10) {
-            Spacer()
-            Text("How can I help you today?")
-                .font(.system(size: 26, weight: .semibold, design: .rounded))
-            if server.status != .running {
-                Text("Start the server to begin.")
+        VStack(spacing: 8) {
+            // Plain SF Pro, one solid colour. It was `design: .rounded` under a
+            // top-to-bottom LinearGradient — a different typeface from the rest
+            // of the app, wearing a fade that reads as a rendering artefact at
+            // this size rather than as depth.
+            // The agent's NAME, not the word "Agent" with the name as its
+            // caption — the name is the thing, the category isn't (same
+            // inversion the sidebar rows had). Under it, what the agent is
+            // FOR, which is what tells you what to ask it.
+            Text(ChatGreeting.heading(agentName: activeAgent?.name))
+                .font(.system(size: 30, weight: .semibold))
+                .foregroundStyle(.primary)
+            if let subtitle = ChatGreeting.subtitle(agentBrief: activeAgent?.brief,
+                                                    serverRunning: canAnswer) {
+                Text(L10n.text(subtitle))
                     .font(.callout)
                     .foregroundStyle(.secondary)
-            } else if let agent = activeAgent {
-                Text("Talking to \(agent.name)")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            // Discovery chips: the features that otherwise live only in the
+            // menu-bar tray (media generation, Model Browser, Tasks, the CLI
+            // launcher). Under the greeting, gone once the conversation starts
+            // — and absent entirely on an agent thread, where they advertise
+            // the app to somebody who has already picked who to talk to.
+            if ChatGreeting.showsDiscoveryChips(hasAgent: activeAgent != nil,
+                                                isExternalBridge: session?.isExternalBridge == true) {
+                // A media chip navigates to the Create pane, exactly like the
+                // Tools menu — the composer never becomes a generator.
+                EmptyStateChipRow()
+                    .padding(.top, 18)
             }
         }
+        // Same column as the transcript and the composer below it, so the
+        // greeting sits over the field rather than spanning the window.
+        .frame(maxWidth: contentWidth)
         .frame(maxWidth: .infinity)
+        .padding(.horizontal, ChatMetrics.gutter)
+        .padding(.bottom, 22)
     }
 
     var body: some View {
         VStack(spacing: 0) {
             if isEmptyConversation {
+                wordmarkHeader
+                // Two SIBLING spacers (this one + the trailing one below the
+                // composer) split the slack evenly, so greeting + chips +
+                // composer sit as one group in the middle of the window.
+                Spacer(minLength: 0)
                 emptyState
             } else {
             // Messages
-            ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(spacing: 12) {
-                        ForEach(ChatRowBuilder.rows(from: session?.messages ?? [])) { row in
+                    // Not lazy: a lazy stack ESTIMATES its height from the rows
+                    // it has built, and every scroll decision below aims at
+                    // that number (story: docs/gotchas/app.md).
+                    VStack(spacing: ChatMetrics.transcriptSpacing) {
+                        if firstVisibleRow > 0 {
+                            showEarlierButton
+                        }
+                        ForEach(rows[firstVisibleRow...]) { row in
                             switch row {
                             case .message(let m):
                                 MessageBubble(
                                     message: m,
                                     sources: sourcesFor(m),
                                     onIncreaseContext: {
-                                        AppActivation.openWindow(id: "settings", using: openWindow)
+                                        let path = appState.selectedModelPath
+                                        let has = ModelSettingsFile.load().override(for: path)?.hasSettings ?? false
+                                        switch ContextIncreaseTarget.resolve(hasOverride: has) {
+                                        case .modelSettings:
+                                            modelSettings = ModelSettingsRequest(path: path, title: ModelDisplayName.pretty((path as NSString).lastPathComponent))
+                                        case .appSettings:
+                                            appState.showSettings()
+                                        }
                                     },
-                                    onDelete: {
-                                        appState.deleteMessage(in: sessionId, messageId: m.id)
-                                    })
+                                    // Your message goes alone. A reply takes
+                                    // the model's turn above it with it, and
+                                    // only where the transcript can be cut.
+                                    onDelete: m.role == .user
+                                        ? { deleteKeepingPlace { appState.deleteMessage(in: sessionId, messageId: m.id) } }
+                                        : ChatTurn.footerDeletes(m, isLast: m.id == session?.messages.last?.id)
+                                            ? { deleteTurn(endingAt: m.id) }
+                                            : nil,
+                                    // Both roles are editable, and they mean
+                                    // different things. Editing YOUR message
+                                    // is a re-ask: the turns after it answered
+                                    // something you no longer said, so they go
+                                    // and it resubmits. Editing the MODEL's is
+                                    // putting words in its mouth — that turn
+                                    // already happened, and the point is to
+                                    // steer what comes next (Continue, or the
+                                    // following turn), so nothing is dropped
+                                    // and nothing re-runs.
+                                    onEdit: session?.isExternalBridge == true ? nil : { newText in
+                                        if m.role == .user {
+                                            editAndResend(messageId: m.id, newText: newText)
+                                        } else {
+                                            appState.editAssistantMessage(in: sessionId,
+                                                                          messageId: m.id,
+                                                                          newText: newText)
+                                        }
+                                    },
+                                    onRegenerate: (m.role == .assistant && m.id == lastAssistantMessageId)
+                                        ? { regenerateLastResponse() }
+                                        : nil,
+                                    // Only the last message: a continuation
+                                    // streams into the END of the transcript,
+                                    // so offering it on an earlier reply would
+                                    // append the text to a different bubble.
+                                    onContinue: (m.id == session?.messages.last?.id && canContinue)
+                                        ? { continueReply() }
+                                        : nil,
+                                    onSelectRevision: { index in
+                                        appState.selectRevision(in: sessionId,
+                                                                messageId: m.id,
+                                                                index: index)
+                                    },
+                                    // Branch here. Offered on both roles and at
+                                    // any depth — unlike Continue and
+                                    // Regenerate, which act on the END of the
+                                    // transcript, a fork is a statement about
+                                    // this message. A task run or a bridge
+                                    // mirror can be branched INTO an ordinary
+                                    // chat, so no read-only gate: nothing about
+                                    // the source is changed.
+                                    onFork: ChatFork.isForkable(session?.messages ?? [], at: m.id)
+                                        ? { appState.forkSession(sessionId, from: m.id) }
+                                        : nil,
+                                    onWillResize: { applyScroll(.rowWillResize) },
+                                    onDidResize: { applyScroll(.rowDidResize) },
+                                    foldStore: foldStore)
                                 .id(m.id)
-                            case .toolCall(let call, let results):
-                                ToolCallRow(call: call, results: results).id(call.id)
+                            case .toolCall(let call, let results, let calls, let owned):
+                                ToolCallRow(call: call, results: results, calls: calls,
+                                            ownedHandles: owned,
+                                            sessionId: sessionId).id(call.id)
                             }
+                        }
+                        // A property of the transcript's END, not of a row: the
+                        // turn stopped on something that carries no footer.
+                        if let last = session?.messages.last,
+                           ChatTurn.needsEndFooter(session?.messages ?? [],
+                                                   turnInFlight: composerState == .generatingHere) {
+                            TurnEndFooter(
+                                endedAt: last.timestamp,
+                                onRegenerate: canRegenerate ? { regenerateLastResponse() } : nil,
+                                onDelete: { deleteTurn(endingAt: last.id) })
                         }
                         // Live media generation, under the tool-call row that
                         // started it. These block chat decode on the one GPU for
@@ -1224,21 +2540,15 @@ struct ChatDetailView: View {
                             MediaProgressCard(progress: progress)
                                 .id("mediaProgress")
                         }
-                        // Bottom anchor — its position relative to the scroll viewport
-                        // tells us whether the user has scrolled to the bottom.
-                        Color.clear.frame(height: 1).id("bottom")
-                            .background(
-                                GeometryReader { geo in
-                                    Color.clear.preference(
-                                        key: ContentBottomKey.self,
-                                        value: geo.frame(in: .named("chatScroll")).maxY
-                                    )
-                                }
-                            )
                     }
-                    .padding(ChatMetrics.gutter)
+                    // The reading measure. The window is free to be as wide as
+                    // the user wants; the prose is not (`ChatMetrics`).
+                    .frame(maxWidth: contentWidth)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, ChatMetrics.gutter)
+                    .padding(.vertical, 20)
                 }
-                .coordinateSpace(name: "chatScroll")
+                .sheet(item: $modelSettings) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
                 // Transcript text used to run straight into the floating model
                 // picker. The toolbar band's own full-width background stays
                 // hidden (the cluster carries its own material — that's what
@@ -1247,37 +2557,56 @@ struct ChatDetailView: View {
                 // drawn by the scroll view itself so nothing new can intercept
                 // a click.
                 .scrollEdgeEffectStyle(.soft, for: .top)
-                .background(
-                    GeometryReader { scrollFrame in
-                        Color.clear.preference(
-                            key: ScrollViewHeightKey.self,
-                            value: scrollFrame.size.height
-                        )
+                // A chat opens at its newest line by LAYOUT, with the real
+                // heights in hand, not by a jump aimed at an estimate of them.
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                // The transcript is moved from exactly one place — `applyScroll`
+                // — and only ever by a decision `ChatScrollState` made.
+                .scrollPosition($scrollPosition)
+                // While following, the scroll view keeps its own bottom edge
+                // glued as the content grows, so a streamed token costs NOTHING:
+                .defaultScrollAnchor(scrollModel.isPinnedToBottom ? .bottom : nil,
+                                     for: .sizeChanges)
+                // The scroll view's OWN geometry says how far the end sits below
+                // the fold. This replaces a preference key published by a 1pt
+                // anchor view, which raced the layout it was measuring and could
+                // not see the viewport at all without a second preference key.
+                .onScrollGeometryChange(for: CGFloat.self) {
+                    ChatScrollState.distanceFromBottom($0)
+                } action: { _, distance in
+                    applyScroll(.geometryChanged(distanceFromBottom: distance))
+                }
+                // The two numbers a fold's correction is made of.
+                .onScrollGeometryChange(for: CGPoint.self) {
+                    CGPoint(x: $0.contentOffset.y, y: $0.contentSize.height)
+                } action: { _, g in
+                    applyScroll(.contentGeometry(offsetY: g.x, contentHeight: g.y))
+                }
+                // Who is moving it. The predecessor was an app-global NSEvent
+                // scroll-wheel monitor: it fired for every other window in the
+                // app, disengaged on a single upward notch (including the
+                // rubber-band settle after flinging TO the bottom, which is why
+                // auto-follow so often refused to come back), and was blind to
+                // scroller drags, keyboard scrolling and window resizes.
+                .onScrollPhaseChange { _, phase in
+                    applyScroll(.driverChanged(ChatScrollDriver(phase)))
+                }
+                .overlay(alignment: .bottom) {
+                    // The old affordance was a 4pt accent strip with hit-testing
+                    // off: it reported the state and offered no way out of it.
+                    Group {
+                        if !scrollModel.isPinnedToBottom {
+                            jumpToLatestButton
+                                .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                        }
                     }
-                )
-                .onPreferenceChange(ScrollViewHeightKey.self) { scrollViewHeight = $0 }
-                .onPreferenceChange(ContentBottomKey.self) { bottom in
-                    contentBottom = bottom
-                    guard scrollViewHeight > 0 else { return }
-                    // Re-engage auto-scroll when content bottom is near viewport bottom
-                    if bottom - scrollViewHeight < 60 { isNearBottom = true }
+                    .animation(.easeInOut(duration: 0.18), value: scrollModel.isPinnedToBottom)
                 }
-                .onChange(of: session?.messages.count) { _, _ in
-                    if isNearBottom { scrollToBottom(proxy) }
-                }
-                .onChange(of: session?.messages.last?.content) { _, _ in
-                    if isNearBottom { scrollToBottom(proxy) }
-                }
-                .overlay(alignment: .trailing) {
-                    // Right-edge strip: accent tint when auto-scroll is on, fades out when off.
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(Color.accentColor.opacity(isNearBottom ? 0.4 : 0))
-                        .frame(width: 4)
-                        .padding(.vertical, 4)
-                        .animation(.easeInOut(duration: 0.3), value: isNearBottom)
-                        .allowsHitTesting(false)
-                }
-            }
+                // A new conversation is a new scroll view, laid out from its
+                // initial anchor instead of inheriting an offset measured in
+                // the transcript it replaces. A metrics change rebuilds every
+                // row anyway (they read `ChatMetrics` at build time).
+                .id("transcript-\(sessionId)-\(interfaceTextSize)-\(interfaceCompact)-\(interfaceChatColumn)")
             // The divider belongs to the transcript — against the empty
             // state's greeting it would draw a line across mid-window.
             Divider()
@@ -1301,9 +2630,9 @@ struct ChatDetailView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
               } else {
-                // Pending attachment thumbnails (images + PDFs + audio)
-                if !pendingImages.isEmpty || !pendingPDFs.isEmpty || !pendingAudio.isEmpty {
-                    AttachmentPreviewRow(images: $pendingImages, pdfs: $pendingPDFs, audio: $pendingAudio)
+                // Pending attachment thumbnails (images + PDFs + videos + audio)
+                if !pendingImages.isEmpty || !pendingPDFs.isEmpty || !pendingVideos.isEmpty || !pendingAudio.isEmpty {
+                    AttachmentPreviewRow(images: $pendingImages, pdfs: $pendingPDFs, videos: $pendingVideos, audio: $pendingAudio)
                 }
 
                 // Attached document folder (mini RAG) — indexing progress / ready chip
@@ -1330,11 +2659,6 @@ struct ChatDetailView: View {
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the
                 // same border, so they read as belonging to it.
-                //
-                // They used to sit BESIDE the input, which cost the field ~200pt
-                // of width (most of a line) on every message, and that cost grew
-                // with each new control. Stacked, the field is as wide as the
-                // transcript it answers.
                 VStack(alignment: .leading, spacing: 6) {
                     composerField
                     composerControls
@@ -1346,20 +2670,54 @@ struct ChatDetailView: View {
                     RoundedRectangle(cornerRadius: 18)
                         .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
                 )
+                // "/" skill menu — FLOATS over the transcript rather than
+                // sitting in the bar: as a sibling it grew the composer and
+                // shoved the conversation up on every keystroke. An overlay
+                // past the clip, its own bottom guide pinned to the
+                // container's top, so it needs no height to position itself.
+                // Not an NSPopover — that takes first responder, and the menu
+                // has to stay open while you keep typing.
+                .overlay(alignment: .topLeading) {
+                    if !slashMatches.isEmpty {
+                        SlashSkillMenu(matches: slashMatches,
+                                       selection: min(slashSelection, max(0, slashMatches.count - 1)),
+                                       onPick: { pickSlashSkill($0) })
+                            .alignmentGuide(.top) { $0[.bottom] + 8 }
+                            .shadow(color: .black.opacity(0.28), radius: 14, y: 4)
+                    }
+                }
                 // Hover cards for the row's bare glyphs. Drawn HERE, past the
                 // clip: an overlay on the control itself is cut off at the
                 // container's rounded edge and lands over the text field.
                 .composerTipOverlay()
               }   // end else (non-Telegram composer)
             }
+            .frame(maxWidth: contentWidth)
+            .frame(maxWidth: .infinity)
             .padding(.horizontal, ChatMetrics.gutter)
-            .padding(.vertical, 8)
-            // Balances the greeting's leading spacer so the greeting and the
-            // composer center as ONE group. Without it the pair sits at the
-            // bottom of an otherwise blank window.
-            if isEmptyConversation { Spacer() }
+            .padding(.vertical, 10)
+            // Once the transcript exists, the composer is the window's bottom
+            // BAR and reads as one: a material band under a full-width divider
+            // (the divider belongs to the transcript, above). In the empty
+            // state it is a floating field under the greeting, so no band —
+            // a bar across the middle of a blank window is a seam.
+            .background(isEmptyConversation ? AnyShapeStyle(.clear) : AnyShapeStyle(.bar))
+            // The top spacer's sibling — see the empty-state branch above.
+            if isEmptyConversation { Spacer(minLength: 0) }
         }
-        .onDrop(of: [.image, .pdf, .audio], isTargeted: nil) { providers in
+        // Cmd+R — regenerate the last reply. A zero-size hidden button rather
+        // than a window-level `.commands` entry: it needs THIS tab's session
+        // and toolbar state, and disabling it here (rather than graying out a
+        // menu item elsewhere) is what keeps it from firing mid-stream or on
+        // an empty chat.
+        .background(
+            Button(action: regenerateLastResponse) { EmptyView() }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(!canRegenerate)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+        )
+        .onDrop(of: [.image, .pdf, .audio, .movie], isTargeted: nil) { providers in
             for provider in providers {
                 if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
                     provider.loadFileRepresentation(forTypeIdentifier: UTType.pdf.identifier) { url, _ in
@@ -1387,58 +2745,88 @@ struct ChatDetailView: View {
                             }
                         }
                     }
-                } else {
-                    provider.loadObject(ofClass: NSImage.self) { image, _ in
-                        if let image = image as? NSImage {
-                            DispatchQueue.main.async { pendingImages.append(image) }
+                } else if videoSupported, provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
+                    // Decode inside the closure — the temp URL is only valid here.
+                    provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
+                        guard let url = url else { return }
+                        let name = url.lastPathComponent
+                        let frames = VideoPreprocessor.extractFrames(url: url)
+                        DispatchQueue.main.async {
+                            if let frames, !frames.isEmpty {
+                                pendingVideos.append(ChatVideo(name: name, frames: frames))
+                            } else {
+                                showVideoError(name)
+                            }
+                        }
+                    }
+                } else if let imageType = provider.registeredTypeIdentifiers.first(where: {
+                    UTType($0)?.conforms(to: .image) == true
+                }) {
+                    // The image's OWN bytes, asked for by the type the provider
+                    // actually REGISTERED — a Finder drag of a PNG registers
+                    // `public.png`, not `public.image`, so a request for the
+                    // umbrella type fails. `loadItem` hands back the file URL
+                    // (Finder) or the data, and either way the encoding survives:
+                    // `loadObject(ofClass: NSImage.self)` decodes to an NSImage
+                    // and throws the bytes away, so a dropped PNG used to be
+                    // stored as a re-encoded JPEG.
+                    //
+                    // The name comes from the URL when there is one and from
+                    // `suggestedName` otherwise (`droppedName`); an extension
+                    // neither supplies comes from the bytes themselves
+                    // (`AttachmentStore.payload`).
+                    //
+                    // The fallback is for a provider that only offers the decoded
+                    // object. It is not what makes a browser drag work: a drag
+                    // out of a page registers `public.jpeg` with NO loader block
+                    // behind it (measured, Brave), so nothing loads by any route
+                    // and the drop does nothing — as it did before this change.
+                    let suggested = provider.suggestedName
+                    provider.loadItem(forTypeIdentifier: imageType) { item, _ in
+                        let url = item as? URL
+                        let bytes: Data? = (item as? Data) ?? url.flatMap { try? Data(contentsOf: $0) }
+                        if let bytes, let image = NSImage(data: bytes) {
+                            let name = AttachmentStore.droppedName(url: url, suggested: suggested)
+                            DispatchQueue.main.async {
+                                pendingImages.append(PendingImage(image: image, original: bytes, filename: name))
+                            }
+                            return
+                        }
+                        provider.loadObject(ofClass: NSImage.self) { image, _ in
+                            guard let image = image as? NSImage else { return }
+                            DispatchQueue.main.async {
+                                pendingImages.append(PendingImage(image: image))
+                            }
                         }
                     }
                 }
             }
             return true
         }
-        // ONE toolbar item — see `floatingToolbar` for why a real ToolbarItem is
-        // the only clickable resident of that band, and why its width stays
-        // bounded (the » eviction gotcha).
-        .toolbar {
-            if #available(macOS 26.0, *) {
-                // Liquid Glass gives every toolbar item its own capsule
-                // background + border; hide it so the controls float bare on
-                // the content, matching the sidebar's seamless look.
-                //
-                // The model picker rides its OWN item at the LEADING edge, not
-                // the trailing cluster: that cluster is at its width budget and
-                // a model name is runtime-variable, which is exactly what
-                // re-triggers » eviction. Its label is width-capped for the
-                // same reason (`ChatModelPill.maxNameWidth`).
-                ToolbarItem(placement: .navigation) {
-                    floatingToolbar
-                }
-                .sharedBackgroundVisibility(.hidden)
-            } else {
-                ToolbarItem(placement: .navigation) {
-                    floatingToolbar
-                }
-            }
-        }
-        // The window's own toolbar material, full width. This was hidden for a
-        // while — the floating cluster carries its own material, so the band
-        // read as a divider above a mostly empty bar. But hiding it left the
-        // transcript running to the window's top edge with nothing between the
-        // two: text clipped mid-line under the model picker (live 2026-07-30),
-        // and `scrollEdgeEffectStyle` had no bar to attach to, so it drew
-        // nothing. The system material IS the 100%-width surface here — the
-        // hand-drawn strip that predated it is what must not come back.
-        .toolbarBackground(.visible, for: .windowToolbar)
+        // No toolbar: everything that lived in it has a better home. The model
+        // picker, the mode discs and the server control are in the COMPOSER row
+        // (they configure the message, or report the thing you discover by
+        // typing); Settings is a sidebar destination and still ⌘, from the menu
+        // bar. What was left was an empty band across the top of the window,
+        // so its MATERIAL is hidden — by `standardSplitView`, which hosts every
+        // mode of this window, not here (on this view it covered only
+        // conversation mode and the chrome flipped as you switched panes).
+        //
+        // What the material was FOR: it frosted content scrolling under the
+        // floating toolbar cluster, and `scrollEdgeEffectStyle` needs a bar to
+        // attach to (text clipped mid-line under the model picker, live
+        // 2026-07-30). Both were about the CLUSTER, and the cluster is gone —
+        // nothing floats over the transcript any more. What still passes under
+        // something is the sidebar's pinned destinations, so that block carries
+        // its own backdrop rather than relying on an effect with nothing to
+        // attach to.
+        //
+        // Hiding the bar ITSELF (`.toolbar(.hidden)`) is the thing that must
+        // not come back: the traffic lights and the sidebar-collapse button are
+        // its residents, and it took them with it (live 2026-08-09).
         .sheet(isPresented: $showMCPMarketplace) {
             MCPMarketplaceView()
                 .environmentObject(mcpManager)
-        }
-        .alert("Enable thinking with Tools on?", isPresented: $showThinkingInAgentConfirm) {
-            Button("Cancel", role: .cancel) { }
-            Button("Enable anyway") { enableThinking = true }
-        } message: {
-            Text("Thinking is not recommended with Tools on — most local models tool-call more reliably without it. Do you still want to enable it?")
         }
         // Typed-turn approvals only. Voice turns approve through the
         // controller's own `pendingApproval`, rendered inline next to the orb
@@ -1453,20 +2841,7 @@ struct ChatDetailView: View {
             inputFocused = true
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
-            scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-                if event.scrollingDeltaY > 0 {
-                    // Scrolling up — disengage auto-scroll
-                    isNearBottom = false
-                } else if event.scrollingDeltaY < -1 {
-                    // Scrolling down — re-engage if content bottom is near viewport bottom.
-                    // The preference handler catches this when content changes, but during
-                    // generation pauses the user needs scroll events to re-engage.
-                    if scrollViewHeight > 0 && contentBottom - scrollViewHeight < 80 {
-                        isNearBottom = true
-                    }
-                }
-                return event
-            }
+            applyScroll(.transcriptShown)
             // Cmd+V into the focused chat input: if the clipboard holds an image,
             // PDF, or folder, attach it (same as the attach button / drag-drop)
             // and swallow the paste; plain text still pastes into the field.
@@ -1482,11 +2857,7 @@ struct ChatDetailView: View {
             // Generation lives on the app-level engine now — closing the chat
             // window must NOT cancel an in-flight turn (the voice assistant may
             // be driving it with no window open). Only tear down this view's
-            // scroll monitor.
-            if let monitor = scrollMonitor {
-                NSEvent.removeMonitor(monitor)
-                scrollMonitor = nil
-            }
+            // paste monitor.
             if let monitor = pasteMonitor {
                 NSEvent.removeMonitor(monitor)
                 pasteMonitor = nil
@@ -1506,6 +2877,11 @@ struct ChatDetailView: View {
                 pendingIntentPrompt = nil
                 proceedSend()
             }
+            // The nudge exists to recommend this one, so it is what Return
+            // takes. "Send Anyway" stays a deliberate click — it also
+            // suppresses the suggestion for the rest of the chat, which is
+            // not something to hand to a reflex.
+            .keyboardShortcut(.defaultAction)
             Button("Send Anyway") {
                 intentSuppress.suppress(prompt, for: sessionId)
                 pendingIntentPrompt = nil
@@ -1530,6 +2906,11 @@ struct ChatDetailView: View {
                   let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
             appState.chatSessions[idx].enableThinking = newValue
         }
+        .onChange(of: reasoningEffort) { _, newValue in
+            guard !isExternalBridgeSession,
+                  let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+            appState.chatSessions[idx].reasoningEffort = newValue
+        }
         .onChange(of: mcpMode) { _, newValue in
             guard !isExternalBridgeSession,
                   let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
@@ -1538,6 +2919,26 @@ struct ChatDetailView: View {
         .onChange(of: composerState) { _, state in
             if state == .idle { inputFocused = true }
         }
+        // The keyboard arriving in the composer collapses the sidebar selection
+        // to this chat. Keyed on the focus MIRROR rather than on the click, so
+        // it covers every way the field ends up holding the keyboard — and the
+        // rule is what keeps ⌘⌫ from raising a delete dialog mid-message with
+        // several chats still lit behind the field.
+        .onChange(of: inputFocused) { _, focused in
+            guard focused,
+                  let collapsed = SidebarMultiSelect.focusingComposer(
+                      in: sessionId, selection: appState.sidebarSelection)
+            else { return }
+            appState.sidebarSelection = collapsed
+        }
+        .onChange(of: session?.messages, initial: true) { _, msgs in
+            rows = ChatRowBuilder.rows(from: msgs ?? [])
+            if windowSession != sessionId {
+                cutTranscriptWindow()
+            } else {
+                firstVisibleRow = TranscriptWindow.clamp(first: firstVisibleRow, total: rows.count)
+            }
+        }
         .onChange(of: sessionId) { _, _ in
             // The view is reused across tabs, so reload the toolbar toggles from
             // the newly-visible session. The allow-list is NOT reset here — it's
@@ -1545,28 +2946,81 @@ struct ChatDetailView: View {
             // switches (a session re-arms only when its Agent toggle goes off).
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
+            // Scroll state is per-view, and the view is reused across tabs — so
+            // without this, leaving one chat scrolled up opened the next one
+            // unpinned at whatever offset the previous conversation's content
+            // happened to leave behind.
+            applyScroll(.transcriptShown)
+            // The binding outlives the scroll view too: a point a fold set in
+            // the old conversation would be what the new one attaches to,
+            // instead of its initial anchor.
+            scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
+            // Rebuilt here as well so the cut does not depend on whether the
+            // messages observer ran first (it runs only when the messages
+            // differ, which a fork's do not).
+            rows = ChatRowBuilder.rows(from: session?.messages ?? [])
+            cutTranscriptWindow()
+            // A history walk belongs to ONE conversation. Stale indexes are
+            // harmless (ComposerHistory reads a mismatched draft as no walk),
+            // but the first ↑ in the newly-visible tab has to mean "the last
+            // thing I said HERE".
+            composerWalk = .idle
+            // Unfolding a long turn belongs to the visit, not to the message:
+            // nothing about it is written to disk, so carrying it across
+            // conversations would remember it until the next launch and no
+            // further, which the reader can rely on in neither direction.
+            foldStore.clear()
         }
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.width
+        } action: { columnWidth = $0 }
     }
 
     /// The input field. No background or border of its own — the composer
     /// container draws those around both rows. NSTextView-backed so a big paste
     /// stays smooth and the mouse wheel scrolls once it grows past the cap.
+    private var composerPlaceholder: String { "Ask me anything…" }
+
     private var composerField: some View {
         GrowingTextEditor(text: $inputText,
                           isFocused: $inputFocused,
                           measuredHeight: $composerHeight,
                           isIdle: composerState == .idle,
-                          onSend: { sendMessage() })
+                          onSend: { sendMessage() },
+                          // Escape stops the reply being written. Handled here
+                          // rather than as a hidden `.cancelAction` button so
+                          // the edit bubble and the approval sheet keep the key
+                          // while they are up (ComposerKey.onEscape).
+                          onCancel: {
+                              switch ComposerKey.onEscape(isGenerating: composerState == .generatingHere) {
+                              case .stop: stopGeneration(); return true
+                              case .pass: return false
+                              }
+                          },
+                          onArrow: { direction, caretAtStart, caretAtEnd in
+                              recallHistory(direction, caretAtStart: caretAtStart, caretAtEnd: caretAtEnd)
+                          },
+                          onKeyCommand: { handleSlashKey($0) })
             .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
-            .padding(.horizontal, 5)
-            .disabled(server.status != .running)
+            .padding(.horizontal, ComposerTextMetrics.fieldHorizontalPadding)
+            .disabled(!canAnswer)
+            // The placeholder stands in for the first character you type, so it
+            // has to sit exactly where that character lands — which is three
+            // insets in, not one (`ComposerTextMetrics`). It was a literal 9
+            // against a real 14, so the caret overlapped its own placeholder.
+            // Escape closes the menu for the text as it stands; the next
+            // keystroke is a new query, so it opens again.
+            .onChange(of: inputText) { _, _ in
+                if slashDismissed { slashDismissed = false }
+                slashSelection = 0
+            }
             .overlay(alignment: .topLeading) {
                 if inputText.isEmpty {
-                    Text("Ask me anything…")
+                    Text(L10n.text(composerPlaceholder))
                         .font(.body)
                         .foregroundStyle(.secondary)
-                        .padding(.leading, 9)
-                        .padding(.top, 8)
+                        .padding(.leading, ComposerTextMetrics.placeholderLeading)
+                        .padding(.top, ComposerTextMetrics.placeholderTop)
                         .allowsHitTesting(false)
                 }
             }
@@ -1594,6 +3048,18 @@ struct ChatDetailView: View {
         agentToggle
         mcpToggle
 
+        // The model answering, right of the discs and left of the gauge. It
+        // belongs to the MESSAGE — which model writes the reply — the same
+        // reason Think/Tools/MCP moved down here, and it has room for the
+        // download affordances the toolbar never did.
+        ChatModelPill(compact: true)
+        // The recovery goes where the problem is DISCOVERED: the pill's dot
+        // going grey is the only thing that says the server is down, so the fix
+        // sits next to it. Transient by construction (`ChatServerStartControl`
+        // resolves to `.hidden` the moment it is up), which is what earns it a
+        // slot in a row that is already at its width budget.
+        serverStartControl
+
         Spacer(minLength: 8)
 
         // Context gauge, immediately left of Send — the control the
@@ -1602,6 +3068,7 @@ struct ChatDetailView: View {
         if showsContextPill {
             ContextPill(stats: contextStats,
                         modelName: server.chatModelInfo?.name,
+                        decodeSpeed: lastDecodeSpeed,
                         isLive: composerState == .generatingHere)
                 .frame(height: ChatMetrics.composerControlSize)
         }
@@ -1614,7 +3081,7 @@ struct ChatDetailView: View {
 
         Button {
             if composerState == .generatingHere {
-                chatEngine.stop(sessionId: sessionId)
+                stopGeneration()
             } else {
                 sendMessage()
             }
@@ -1628,10 +3095,10 @@ struct ChatDetailView: View {
         // Stop is always tappable for the owning chat. Otherwise: Send,
         // disabled when the server is down or when this chat has nothing to
         // send. Another chat's turn blocks nothing — the engine is multi-turn.
-        .disabled(server.status != .running
+        .disabled(!canAnswer
                   || (composerState == .idle
                       && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                      && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty))
+                      && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingVideos.isEmpty && pendingAudio.isEmpty))
         }
     }
 
@@ -1646,7 +3113,7 @@ struct ChatDetailView: View {
 
     /// Pick a folder of mixed documents to index in-memory for this session.
     private func pickDocumentFolder() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -1662,11 +3129,6 @@ struct ChatDetailView: View {
     /// every entry point behaves identically. Embeds on the local server's GPU;
     /// auto-downloads the default encoder model (35 MB, one-time) when none is
     /// available. Server down → lexical-only retrieval. Must run on the main actor.
-    ///
-    /// The pick is persisted (path on the session, security-scoped bookmark in
-    /// defaults) so the index can be rebuilt after a relaunch — under the App
-    /// Sandbox the panel's grant dies with the process; the bookmark is what
-    /// makes the folder reachable again. See `restoreAttachedFolderIfNeeded`.
     private func attachDocumentFolder(_ url: URL) {
         SecurityScopedBookmark.store(url, name: SecurityScopedBookmark.attachedFolderName(sessionId))
         if let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) {
@@ -1717,8 +3179,14 @@ struct ChatDetailView: View {
         }
         if handled { return true }
         // Raw image data (screenshots, copy-image-from-a-browser) — no file URL.
+        //
+        // Take the pasteboard's PNG when it has one, so a copied PNG is stored
+        // byte for byte. What it usually has is TIFF, which is UNCOMPRESSED: a
+        // 3000x2000 screenshot is ~24 MB of it, so those bytes are deliberately
+        // NOT kept and `AttachmentStore` encodes the image to PNG instead.
         if let image = NSImage(pasteboard: pb) {
-            pendingImages.append(image)
+            let png = pb.data(forType: .png)
+            pendingImages.append(PendingImage(image: image, original: png))
             return true
         }
         return false
@@ -1729,7 +3197,7 @@ struct ChatDetailView: View {
     private func attachFileURL(_ url: URL) -> Bool {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return false }
-        switch PasteFileKind.classify(ext: url.pathExtension, isDirectory: isDir.boolValue, audioSupported: audioSupported) {
+        switch PasteFileKind.classify(ext: url.pathExtension, isDirectory: isDir.boolValue, audioSupported: audioSupported, videoSupported: videoSupported) {
         case .folder:
             attachDocumentFolder(url)
         case .pdf:
@@ -1740,9 +3208,13 @@ struct ChatDetailView: View {
             }
         case .audio:
             addAudioAttachment(url)
+        case .video:
+            addVideoAttachment(url)
         case .image:
-            guard let image = NSImage(contentsOf: url) else { return false }
-            pendingImages.append(image)
+            guard let bytes = try? Data(contentsOf: url),
+                  let image = NSImage(data: bytes) else { return false }
+            pendingImages.append(PendingImage(image: image, original: bytes,
+                                              filename: url.lastPathComponent))
         case .unhandled:
             return false
         }
@@ -1752,9 +3224,12 @@ struct ChatDetailView: View {
     // MARK: - Image Helpers
 
     private func pickAttachment() {
-        let panel = NSOpenPanel()
-        // Only offer audio on models that can use it.
-        panel.allowedContentTypes = audioSupported ? [.image, .pdf, .audio] : [.image, .pdf]
+        let panel = OpenPanel.make()
+        // Only offer audio/video on models that can use them.
+        var types: [UTType] = [.image, .pdf]
+        if videoSupported { types.append(.movie) }
+        if audioSupported { types.append(.audio) }
+        panel.allowedContentTypes = types
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         AppActivation.beginPanel(panel) { response in
@@ -1768,8 +3243,12 @@ struct ChatDetailView: View {
                     }
                 } else if let utType = UTType(filenameExtension: url.pathExtension), utType.conforms(to: .audio) {
                     addAudioAttachment(url)
-                } else if let image = NSImage(contentsOf: url) {
-                    pendingImages.append(image)
+                } else if videoSupported, let utType = UTType(filenameExtension: url.pathExtension), utType.conforms(to: .movie) {
+                    addVideoAttachment(url)
+                } else if let bytes = try? Data(contentsOf: url),
+                          let image = NSImage(data: bytes) {
+                    pendingImages.append(PendingImage(image: image, original: bytes,
+                                                      filename: url.lastPathComponent))
                 }
             }
         }
@@ -1799,10 +3278,35 @@ struct ChatDetailView: View {
         alert.runModal()
     }
 
+    /// Extract frames from a video file (off the main thread — AVFoundation
+    /// decode can be slow) and add it as a pending attachment.
+    private func addVideoAttachment(_ url: URL) {
+        let name = url.lastPathComponent
+        DispatchQueue.global(qos: .userInitiated).async {
+            let frames = VideoPreprocessor.extractFrames(url: url)
+            DispatchQueue.main.async {
+                if let frames, !frames.isEmpty {
+                    pendingVideos.append(ChatVideo(name: name, frames: frames))
+                } else {
+                    showVideoError(name)
+                }
+            }
+        }
+    }
+
+    private func showVideoError(_ name: String) {
+        let alert = NSAlert()
+        alert.messageText = "Couldn't read video"
+        alert.informativeText = "\(name) couldn't be decoded."
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+
     /// Convert pending audio clips to a ChatAudio array, clearing the list.
+    /// Written on SEND like the pictures (`AudioClipFile.stored`).
     private func consumePendingAudio() -> [ChatAudio]? {
         guard !pendingAudio.isEmpty else { return nil }
-        let clips = pendingAudio
+        let clips = pendingAudio.map { AudioClipFile.stored($0) }
         pendingAudio = []
         return clips
     }
@@ -1812,13 +3316,27 @@ struct ChatDetailView: View {
     /// actually does something.
     private var audioSupported: Bool { server.chatModelInfo?.supportsAudio ?? false }
 
+    /// Whether the active model understands video (Qwen3-VL-family checkpoints
+    /// declaring `video_token_id`). Gates the video-attach option so it only
+    /// appears where the server can actually read it.
+    private var videoSupported: Bool { server.chatModelInfo?.supportsVideo ?? false }
+
+    /// Convert pending videos to a ChatVideo array, clearing the list.
+    private func consumePendingVideos() -> [ChatVideo]? {
+        guard !pendingVideos.isEmpty else { return nil }
+        let videos = pendingVideos
+        pendingVideos = []
+        return videos
+    }
+
     /// Mic tap handler: start recording (after a permission check), or stop and
     /// turn the captured PCM into a pending audio attachment.
     private func toggleRecording() {
         if recorder.isRecording {
             if let pcm = recorder.stop(), pcm.count >= 4 {
-                let secs = Double(pcm.count / 4) / AudioRecorder.targetSampleRate
-                pendingAudio.append(ChatAudio(name: String(format: "Recording · %.0fs", secs.rounded()), pcm: pcm))
+                // The chips print the duration themselves; a name carrying it too read
+                // "Recording · 4s · 3.8s" and would land in the filename.
+                pendingAudio.append(ChatAudio(name: "Recording", pcm: pcm))
             }
             return
         }
@@ -1869,22 +3387,24 @@ struct ChatDetailView: View {
         return combined
     }
 
-    /// Convert NSImage to JPEG data suitable for API transport.
-    private static func nsImageToJPEG(_ image: NSImage) -> Data? {
-        guard let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) else {
-            return nil
-        }
-        return jpeg
-    }
-
-    /// Convert pending NSImages to ChatImage array, clearing the pending list.
+    /// Write the pending attachments out and hand back the messages' images,
+    /// clearing the pending list.
+    ///
+    /// Written on SEND, not on attach: the preview row lets an attachment be
+    /// removed again, and a file per abandoned pick is how a folder fills up
+    /// with things no conversation names.
+    ///
+    /// A failed write is not fatal to the turn. The `ChatImage` keeps its bytes,
+    /// so the model still sees the picture and the transcript still draws it —
+    /// only the next launch finds no file, and says so.
     private func consumePendingImages() -> [ChatImage]? {
         guard !pendingImages.isEmpty else { return nil }
-        let chatImages = pendingImages.compactMap { img -> ChatImage? in
-            guard let data = Self.nsImageToJPEG(img) else { return nil }
-            return ChatImage(data: data)
+        let chatImages = pendingImages.compactMap { pending -> ChatImage? in
+            var image = ChatImage(data: Data())
+            guard let payload = AttachmentStore.payload(for: pending, id: image.id) else { return nil }
+            image.data = payload.data
+            image.path = AttachmentStore.write(payload.data, named: payload.name)
+            return image
         }
         pendingImages = []
         return chatImages.isEmpty ? nil : chatImages
@@ -1892,10 +3412,133 @@ struct ChatDetailView: View {
 
     // MARK: - Helpers
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        withAnimation(.easeOut(duration: 0.15)) {
-            proxy.scrollTo("bottom", anchor: .bottom)
+    /// Route one event through the decision core and carry out whatever it asks
+    /// for. The ONLY place in this view that moves the transcript.
+    private func applyScroll(_ event: ChatScrollEvent) {
+        switch scrollModel.apply(event) {
+        case .none:
+            break
+        case .toBottom(let animated):
+            if case .geometryChanged = event {
+                // `onScrollGeometryChange` delivers its action INSIDE the
+                // window's layout flush, and `scrollPosition` is @State —
+                // writing it there re-enters layout while AppKit is mid-flush.
+                // Under a streaming re-layout storm (code block re-highlights,
+                // then markdown re-measures) that loop is the #136 beachball,
+                // and the write that lands at the wrong point in the flush is
+                // the uncaught NSException crash (live crash log 2026-08-09:
+                // StoredLocationBase.beginUpdate → setNeedsUpdateConstraints →
+                // _crashOnException). One runloop turn later is outside the
+                // flush, and coalesces the storm to one correction per turn.
+                DispatchQueue.main.async { performScroll(animated: animated) }
+            } else {
+                // Button taps and sends run from event handling, not layout —
+                // they stay synchronous so the jump lands with the click.
+                performScroll(animated: animated)
+            }
+        case .toOffset(let y):
+            // From a geometry callback, so out of the layout flush (#136).
+            DispatchQueue.main.async {
+                var instant = Transaction()
+                instant.disablesAnimations = true
+                withTransaction(instant) { scrollPosition.scrollTo(y: y) }
+            }
         }
+    }
+
+    private func performScroll(animated: Bool) {
+        if animated {
+            // A discrete jump the user asked for (their own message, the
+            // button) — the movement is the feedback that it landed.
+            withAnimation(.easeOut(duration: 0.2)) {
+                scrollPosition.scrollTo(edge: .bottom)
+            }
+        } else {
+            // Following the stream is a direct offset set, explicitly
+            // unanimated: this used to run a 0.15s `withAnimation` per
+            // STREAMED TOKEN, so dozens of animations a second each started
+            // over the top of the one still running. That is the stutter,
+            // and it got worse the longer the transcript grew.
+            var instant = Transaction()
+            instant.disablesAnimations = true
+            withTransaction(instant) {
+                scrollPosition.scrollTo(edge: .bottom)
+            }
+        }
+    }
+
+    /// Above the first laid-out row of a long conversation.
+    private var showEarlierButton: some View {
+        Button {
+            revealEarlierRows()
+        } label: {
+            Group {
+                if isRevealingEarlier {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Text("Show earlier messages")
+                }
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .frame(height: 22)
+            .padding(.horizontal, 12)
+            .background(Color.secondary.opacity(0.15), in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .padding(.bottom, 4)
+    }
+
+    /// A delete shortens the transcript at or above the control that asked for
+    /// it, so it rides the resize bracket a fold uses.
+    private func deleteKeepingPlace(_ change: @escaping () -> Void) {
+        applyScroll(.rowWillResize)
+        change()
+        DispatchQueue.main.async { DispatchQueue.main.async { applyScroll(.rowDidResize) } }
+    }
+
+    private func deleteTurn(endingAt id: UUID) {
+        deleteKeepingPlace { appState.deleteTurn(in: sessionId, endingAt: id) }
+    }
+
+    private func cutTranscriptWindow() {
+        windowSession = sessionId
+        firstVisibleRow = TranscriptWindow.firstRow(total: rows.count)
+    }
+
+    /// The rows appear ABOVE what the reader is looking at, so the transcript
+    /// holds their place through it (the same bracket a fold uses), and the
+    /// button answers the click before the layout that makes it slow starts.
+    private func revealEarlierRows() {
+        isRevealingEarlier = true
+        applyScroll(.rowWillResize)
+        DispatchQueue.main.async {
+            firstVisibleRow = 0
+            DispatchQueue.main.async {
+                DispatchQueue.main.async {
+                    applyScroll(.rowDidResize)
+                    isRevealingEarlier = false
+                }
+            }
+        }
+    }
+
+    /// Shown only while auto-follow is off — its absence is how the transcript
+    /// says it is already following.
+    private var jumpToLatestButton: some View {
+        Button { applyScroll(.jumpTapped) } label: {
+            Image(systemName: "arrow.down")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: 28, height: 28)
+                .background(.regularMaterial, in: Circle())
+                .overlay(Circle().strokeBorder(.separator, lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+        .help("Jump to the latest message")
+        .padding(.bottom, 12)
     }
 
 
@@ -1906,7 +3549,8 @@ struct ChatDetailView: View {
         if let last = messages.last(where: { $0.promptTokens != nil && $0.promptTokens! > 0 }) {
             let ctxLen = AgentEngine.effectiveContextLength(
                 appContextSize: appState.contextSize,
-                modelContextLength: server.chatModelInfo?.contextLength
+                modelContextLength: server.chatModelInfo?.contextLength,
+                apple: appState.useAppleModel
             )
             return (promptTokens: last.promptTokens!, completionTokens: last.completionTokens ?? 0, contextLength: ctxLen)
         }
@@ -1942,8 +3586,14 @@ struct ChatDetailView: View {
             liveTokens: composerState == .generatingHere ? chatEngine.liveCompletionTokens(for: sessionId) : 0,
             contextLength: usage?.contextLength
                 ?? AgentEngine.effectiveContextLength(appContextSize: appState.contextSize,
-                                                      modelContextLength: server.chatModelInfo?.contextLength),
+                                                      modelContextLength: server.chatModelInfo?.contextLength,
+                                                      apple: appState.useAppleModel),
             overflow: lastOverflowNotice)
+    }
+
+    /// Decode speed of the most recent reply that was actually timed.
+    private var lastDecodeSpeed: Double? {
+        session?.messages.last { ($0.tokensPerSecond ?? 0) > 0 }?.tokensPerSecond
     }
 
     /// Hidden until there's something true to report — a pill reading 0.0%
@@ -2030,11 +3680,15 @@ struct ChatDetailView: View {
         // confirm first (unless this chat already declined that suggestion). The
         // dialog's buttons call proceedSend(); nothing is consumed until then.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if composerState != .generatingHere, server.status == .running, !trimmed.isEmpty,
+        if composerState != .generatingHere, canAnswer, !trimmed.isEmpty,
            let prompt = detectIntentPrompt(for: trimmed) {
             pendingIntentPrompt = prompt
             return
         }
+        // Sending ends any history walk: the composer is about to empty for a
+        // different reason, and a live walk would make the next ↑ resume from
+        // wherever the last one left off rather than from what was just sent.
+        composerWalk = .idle
         proceedSend()
     }
 
@@ -2047,57 +3701,60 @@ struct ChatDetailView: View {
         return out
     }
 
-    /// Decide whether to nudge before sending. MCP takes priority over Agent
-    /// because a named server is the more specific signal; both are gated on the
-    /// matching mode being off and the suggestion not already declined this chat.
-    ///
-    /// A mode the tab's agent decides is never nudged about: accepting would
-    /// change nothing and the message would send exactly as it was.
+    /// Decide whether to nudge before sending. The RULE is pure
+    /// (`ComposerIntent.nudge` — MCP over Agent, never a mode that is on, locked
+    /// by the tab's agent, or already declined here, and nothing at all when the
+    /// user has set tools to opt-in); this only gathers what it reads.
     private func detectIntentPrompt(for text: String) -> IntentPrompt? {
         let toggles = toolbarToggles
-        let servers = enabledMCPServerNames()
-        if !mcpMode, toggles.mcpLockedBy == nil, !servers.isEmpty,
-           !intentSuppress.isSuppressed(.mcp, for: sessionId),
-           ComposerIntent.wantsMCP(text, serverNames: servers) {
-            return .mcp
-        }
-        if !isAgentMode, toggles.toolsLockedBy == nil,
-           !intentSuppress.isSuppressed(.agent, for: sessionId),
-           ComposerIntent.wantsAgent(text) {
-            return .agent
-        }
-        return nil
+        return ComposerIntent.nudge(
+            for: text,
+            onlyToolsWhenAsked: appState.serverOptions.toolsOnlyWhenAsked,
+            toolsOn: isAgentMode, toolsLocked: toggles.toolsLockedBy != nil,
+            mcpOn: mcpMode, mcpLocked: toggles.mcpLockedBy != nil,
+            enabledServers: enabledMCPServerNames(),
+            suppressed: intentSuppress, sessionId: sessionId)
     }
 
-    /// Enable the mode the nudge suggested, mirroring the toolbar toggles'
-    /// side effects (turning Agent on clears Thinking).
+    /// Enable the mode the nudge suggested.
     private func enableForPrompt(_ prompt: IntentPrompt) {
         switch prompt {
         case .agent:
             isAgentMode = true
-            enableThinking = false
         case .mcp:
             mcpMode = true
         }
     }
 
     private func proceedSend() {
-        isNearBottom = true // snap to bottom on send
-
         var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachedImages = consumePendingImages()
+        let attachedVideos = consumePendingVideos()
         let attachedAudio = consumePendingAudio()
         let pdfText = consumePendingPDFsAsText()
-        guard !text.isEmpty || attachedImages != nil || attachedAudio != nil || !pdfText.isEmpty,
-              composerState != .generatingHere, server.status == .running else { return }
+        guard !text.isEmpty || attachedImages != nil || attachedVideos != nil || attachedAudio != nil || !pdfText.isEmpty,
+              composerState != .generatingHere, canAnswer else { return }
         inputText = ""
         if !pdfText.isEmpty {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
         }
 
-        // The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
-        // any) overrides what it declared. One builder, so no field is read from
-        // a global here — see ChatTurnEngine.TurnConfig.
+        chatEngine.runTurn(sessionId: sessionId, userText: text,
+                           images: attachedImages, audio: attachedAudio,
+                           config: buildTurnConfig(),
+                           approval: { await requestToolApproval($0) })
+        // Your own message always wins: sending from halfway up the history used
+        // to leave you exactly there, because auto-follow was off and nothing
+        // else scrolled.
+        applyScroll(.userSentMessage)
+    }
+
+    /// The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
+    /// any) overrides what it declared. One builder, so no field is read from
+    /// a global here — see ChatTurnEngine.TurnConfig. Shared by send, Cmd+R
+    /// regenerate, and edit-and-resend so all three run under identical
+    /// settings.
+    private func buildTurnConfig() -> ChatTurnEngine.TurnConfig {
         let resolved = appState.resolvedAgentSettings(
             agentId: session?.agentId,
             toolsEnabled: isAgentMode,
@@ -2105,13 +3762,111 @@ struct ChatDetailView: View {
             thinkingEnabled: enableThinking,
             autoApprove: false,
             workingDirectory: session?.workingDirectory,
-            disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []))
-        let config = ChatTurnEngine.TurnConfig.from(
+            disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []),
+            reasoningEffort: reasoningEffort)
+        return ChatTurnEngine.TurnConfig.from(
             resolved, documentIndex: appState.documentIndexes[sessionId])
-        chatEngine.runTurn(sessionId: sessionId, userText: text,
-                           images: attachedImages, audio: attachedAudio,
-                           config: config,
+    }
+
+    /// Whether this chat can answer at all. Apple's on-device model needs no
+    /// server, so "the server is down" is not the same question as "nothing
+    /// can answer" — every composer gate asks THIS, or the composer locks on a
+    /// model that was ready to reply.
+    private var canAnswer: Bool {
+        ChatTurnEngine.canRunTurn(serverRunning: server.status == .running,
+                                  apple: appState.useAppleModel)
+    }
+
+    /// Cmd+R — regenerate the last reply. Mirrors the footer's Regenerate
+    /// button; both funnel through `ChatTurnEngine.regenerate`, which drops
+    /// the last user turn and resubmits it fresh.
+    private var canRegenerate: Bool {
+        canAnswer && composerState != .generatingHere
+            && session?.isExternalBridge != true
+            && (session?.messages.contains { $0.role == .user } ?? false)
+    }
+
+    /// Whether the reply at the end of this transcript can be finished off.
+    private var canContinue: Bool {
+        ContinueReply.isEligible(session?.messages ?? [],
+                                 serverRunning: server.status == .running,
+                                 busy: composerState != .idle,
+                                 engine: server.chatModelInfo?.engine)
+    }
+
+    /// Hand the last reply back to the model to finish. Same turn config as a
+    /// send, so the continuation runs under the settings that produced it.
+    private func continueReply() {
+        guard canContinue else { return }
+        chatEngine.continueReply(sessionId: sessionId, config: buildTurnConfig())
+        // The text lands at the END of a reply already on screen, so follow it
+        // down the same way a fresh send does.
+        applyScroll(.userSentMessage)
+    }
+
+    /// ↑ / ↓ in the composer: bring back an earlier message of your own.
+    ///
+    /// The rule is `ComposerHistory`, which decides from the draft, the caret
+    /// position and where the walk currently sits — everything here does is
+    /// feed it this chat's history and write the answer back. Returning false
+    /// hands the key to AppKit, which is what makes the arrows still move the
+    /// caret inside a draft.
+    private func recallHistory(_ direction: ComposerHistory.Direction,
+                               caretAtStart: Bool, caretAtEnd: Bool) -> Bool {
+        let entries = ComposerHistory.entries(session?.messages ?? [])
+        let action = direction == .up
+            ? ComposerHistory.up(draft: inputText, caretAtStart: caretAtStart,
+                                 walk: composerWalk, entries: entries)
+            : ComposerHistory.down(draft: inputText, caretAtEnd: caretAtEnd,
+                                   walk: composerWalk, entries: entries)
+        switch action {
+        case .pass:
+            return false
+        case .recall(let text, let walk):
+            inputText = text
+            composerWalk = walk
+            return true
+        }
+    }
+
+    /// Stop this chat's turn. The ONE call both the composer's stop disc and
+    /// Escape make — per-session, because other tabs may be generating and
+    /// neither control may reach across.
+    private func stopGeneration() {
+        chatEngine.stop(sessionId: sessionId)
+    }
+
+    private func regenerateLastResponse() {
+        guard canRegenerate else { return }
+        chatEngine.regenerate(sessionId: sessionId, config: buildTurnConfig(),
+                               approval: { await requestToolApproval($0) })
+        // Same rule as a fresh send: the reply you just asked for is the thing
+        // to be looking at, wherever in the history the request came from.
+        applyScroll(.userSentMessage)
+    }
+
+    /// Edit a past user message in place, then resend it: everything from
+    /// that message onward (its old reply, any tool chain) is dropped and the
+    /// edited text runs as a brand-new turn — the standard "edit and resend"
+    /// behaviour rather than silently rewriting history the model already
+    /// answered.
+    private func editAndResend(messageId: UUID, newText: String) {
+        let trimmed = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let msgs = session?.messages,
+              let idx = msgs.firstIndex(where: { $0.id == messageId })
+        else { return }
+        let images = msgs[idx].images
+        let videos = msgs[idx].videos
+        let audio = msgs[idx].audio
+        appState.truncateMessages(in: sessionId, keepingFirst: idx)
+        chatEngine.runTurn(sessionId: sessionId, userText: trimmed,
+                           images: images, videos: videos, audio: audio,
+                           config: buildTurnConfig(),
                            approval: { await requestToolApproval($0) })
+        // An edit is started from wherever that message sits, which is by
+        // definition not the bottom — follow the resend down to it.
+        applyScroll(.userSentMessage)
     }
 
     /// Ask the user to approve a single tool call. Returns true on Allow /
@@ -2141,12 +3896,6 @@ struct ChatDetailView: View {
 // MARK: - Context Monitor
 
 /// What the chat considers "occupied context".
-///
-/// This was a full-width bar above the composer; it is now the composer's
-/// `ContextPill`, which shows the same reading in one control's width and puts
-/// the breakdown in a popover. Only the summing rule stayed here — the bar's
-/// clamped ratio and colour bands moved to `ContextWindowStats`, which needs an
-/// UNCLAMPED figure so it can display 100.3%.
 enum ContextMonitor {
     /// Total context occupied right now: the last completed turn (prompt + its
     /// reply) plus the in-flight reply's running count. Pure → ContextMonitorTests.
@@ -2205,7 +3954,7 @@ struct GeneratingIndicator: View {
                     .foregroundStyle(memColor)
                 Text("·")
                     .foregroundStyle(.tertiary)
-                Text(whimsy)
+                Text(L10n.text(whimsy))
                     .foregroundStyle(.secondary)
                     .transition(.opacity)
                 Text("·")
@@ -2288,6 +4037,26 @@ struct GeneratingIndicator: View {
 
 // MARK: - Message Bubble
 
+/// Attaches double-click-to-edit, or attaches NOTHING at all.
+///
+/// A `nil` action must leave the view untouched rather than install a gesture
+/// that does nothing: this one is `highPriorityGesture`, so merely EXISTING is
+/// enough to beat `textSelection`'s own double-click-to-select-word. A
+/// no-op-inside-the-closure version therefore reads as "double-click stopped
+/// selecting words" on exactly the messages nobody can edit.
+private struct DoubleClickToEdit: ViewModifier {
+    let action: (() -> Void)?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let action {
+            content.highPriorityGesture(TapGesture(count: 2).onEnded { _ in action() })
+        } else {
+            content
+        }
+    }
+}
+
 struct MessageBubble: View {
     let message: ChatMessage
     /// Pages a web search backed this reply with. Empty for every reply that
@@ -2302,8 +4071,51 @@ struct MessageBubble: View {
     /// a task run's transcript is a record, so it has no delete affordance
     /// rather than one that silently does nothing.
     var onDelete: (() -> Void)?
+    /// Edit this (user) message's text and resend it, dropping everything
+    /// that followed. nil for assistant messages and read-only surfaces —
+    /// same reasoning as `onDelete`.
+    var onEdit: ((String) -> Void)?
+    /// Regenerate this reply. Only ever set on the LAST assistant message —
+    /// the caller decides that, so the bubble itself doesn't need to know its
+    /// position in the transcript.
+    var onRegenerate: (() -> Void)?
+    /// Hand this reply back to the model to finish. Present only on the last
+    /// message, and only when it is continuable (`ContinueReply.isEligible`).
+    var onContinue: (() -> Void)?
+    /// Show a different generated version of this reply.
+    var onSelectRevision: ((Int) -> Void)?
+    /// Branch the conversation here: everything up to this message becomes a
+    /// new chat and this one is left alone. nil when there would be nothing to
+    /// fork (`ChatFork.isForkable`) or on a read-only surface.
+    var onFork: (() -> Void)?
+    /// Bracket a change that makes this row shorter (a fold, a thinking block
+    /// closing, an edit field replacing the bubble), so the transcript can
+    /// hold the reader's place through it. nil where there is no scroll view.
+    var onWillResize: (() -> Void)?
+    var onDidResize: (() -> Void)?
+    /// Survives a transcript rebuild; see `FoldStore`.
+    var foldStore: FoldStore?
+    /// Hover over the whole row reveals the user turn's action row; the
+    /// buttons themselves start invisible.
+    @State private var isHovered = false
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
+    /// Unfolding a long turn is an act of reading, and it belongs to the row
+    /// for the same reason the accordion above does: writing it into the
+    /// transcript's own state re-evaluates every row in the conversation, and
+    /// a fold has to feel like a click, not like a page load.
+    @State private var longTurnExpanded = false
+    /// Between the click and the layout it asks for. Laying out a long `Text`
+    /// takes this thread for up to hundreds of milliseconds, so the control
+    /// answers the click before that starts.
+    @State private var isFolding = false
+    @State private var isEditing = false
+    @State private var editDraft = ""
+    /// The edit field is the composer's field (`GrowingTextEditor`), so it
+    /// needs the composer's two bindings: where the caret is, and how tall the
+    /// text has grown.
+    @State private var editFocused = false
+    @State private var editHeight: CGFloat = 0
 
     var body: some View {
         // A failure notice is not model output: it renders as its own card
@@ -2315,31 +4127,51 @@ struct MessageBubble: View {
         }
     }
 
-    /// Reasoning accordion. The WHOLE header toggles, not just the chevron:
-    /// macOS only hit-tests the disclosure triangle on a DisclosureGroup's
-    /// label, so the "Thinking" text was a dead click target — same fix as the
-    /// Agents editor's Advanced row (the label holds no buttons of its own, so
-    /// a tap gesture here can't swallow child clicks).
+    private var isThinkingNow: Bool {
+        message.isStreaming && message.content.isEmpty
+    }
+
+    /// Hand-built, not a `DisclosureGroup`: that pins its chevron to the
+    /// leading edge and hit-tests only the chevron.
     @ViewBuilder
     private var thinkingBlock: some View {
         if let reasoning = message.reasoningContent, !reasoning.isEmpty {
-            DisclosureGroup(isExpanded: $thinkingExpanded) {
-                Text(reasoning)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } label: {
-                Label("Thinking", systemImage: "brain")
+            VStack(alignment: .leading, spacing: 8) {
+                Button {
+                    if thinkingExpanded {
+                        resize { thinkingExpanded = false }
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded = true }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "brain")
+                            .symbolEffect(.pulse, isActive: isThinkingNow)
+                        Text(L10n.text(ThinkingDuration.label(seconds: isThinkingNow ? nil : message.thinkingSeconds)))
+                        Spacer(minLength: 8)
+                        Image(systemName: "chevron.right")
+                            .rotationEffect(.degrees(thinkingExpanded ? 90 : 0))
+                    }
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.secondary)
                     .contentShape(Rectangle())
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded.toggle() }
-                    }
+                }
+                .buttonStyle(.plain)
+
+                if thinkingExpanded {
+                    Text(L10n.text(reasoning))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
-            .padding(8)
-            .background(.quaternary.opacity(0.5))
+            // Collapsed = one line of type at the column edge, no container.
+            .padding(.horizontal, thinkingExpanded ? ChatMetrics.bubblePaddingH : 0)
+            .padding(.vertical, thinkingExpanded ? ChatMetrics.bubblePaddingV : 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(thinkingExpanded ? AnyShapeStyle(.quaternary.opacity(0.5))
+                                         : AnyShapeStyle(Color.clear))
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
     }
@@ -2349,24 +4181,47 @@ struct MessageBubble: View {
             if message.role == .user { Spacer(minLength: 60) }
 
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
-                // Reasoning (collapsible)
                 thinkingBlock
 
                 // Attached images. Double-click opens the full image in Preview.
-                if let images = message.images, !images.isEmpty {
-                    HStack(spacing: 4) {
+                //
+                // A message carrying an image REF draws from its file instead
+                // (ChatMediaAttachmentView). Generated images stopped shipping
+                // bytes, but a history written before that still has both, and
+                // drawing both would show the same picture twice. The ref wins:
+                // it is the original the generator wrote, not a re-encode.
+                if let images = message.images, !images.isEmpty,
+                   message.media?.contains(where: { $0.kind == .image }) != true {
+                    AttachmentFlowLayout(spacing: ChatMetrics.attachmentSpacing) {
                         ForEach(images) { img in
-                            if let nsImage = NSImage(data: img.data) {
+                            // No bytes: the file under `attachments/` is gone,
+                            // or this message predates attachments on disk and
+                            // its base64 is no longer read. Say so rather than
+                            // leave a hole where a picture was.
+                            if img.data.isEmpty {
+                                Label("attachment no longer on disk", systemImage: "questionmark.folder")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 8)
+                                    .background(.quaternary.opacity(0.4))
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                            } else if let nsImage = NSImage(data: img.data) {
+                                // `.fill`: the rounded corners clip the frame,
+                                // so a letterboxed picture keeps square corners.
                                 Image(nsImage: nsImage)
                                     .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                                    .frame(maxWidth: 400, maxHeight: 300)
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: ChatImagePreview.displayWidth(for: nsImage),
+                                           height: ChatMetrics.attachmentHeight)
                                     .clipShape(RoundedRectangle(cornerRadius: 10))
                                     .onTapGesture(count: 2) { ChatImagePreview.openInPreview(img) }
                                     .help("Double-click to open in Preview")
                             }
                         }
                     }
+                    // The whole column, not the bubble's reading measure.
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                 }
 
                 // Generated tracks / clips, attached by path (see ChatMediaRef).
@@ -2378,26 +4233,40 @@ struct MessageBubble: View {
                     }
                 }
 
-                // Attached audio clips
+                // Attached audio clips. A clip whose file is gone says so, the
+                // way a picture does: it was not sent, and a silent chip would
+                // claim otherwise.
                 if let clips = message.audio, !clips.isEmpty {
                     ForEach(clips) { clip in
-                        Label(String(format: "%@ · %.1fs", clip.name, clip.durationSeconds), systemImage: "waveform")
-                            .font(.caption.weight(.medium))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(Color.purple.opacity(0.18))
-                            .clipShape(Capsule())
+                        if clip.pcm.isEmpty {
+                            Label("\(clip.name) · file no longer on disk", systemImage: "questionmark.folder")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                                .background(.quaternary.opacity(0.4))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                        } else {
+                            Label(String(format: "%@ · %.1fs", clip.name, clip.durationSeconds), systemImage: "waveform")
+                                .font(.caption.weight(.medium))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Color.purple.opacity(0.18))
+                                .clipShape(Capsule())
+                        }
                     }
                 }
 
                 // Content.
-                //
-                // Only the USER gets a bubble. An assistant reply is the page's
-                // main content — long, formatted, full of code blocks and
-                // tables — and boxing it wastes the column's width and fights
-                // every block that wants the full measure. A tool-call summary
-                // keeps its card so it still reads as machinery, not prose.
-                if !message.content.isEmpty || message.isStreaming {
+                if isEditing, onEdit != nil {
+                    editingContent
+                } else if !message.content.isEmpty || message.isStreaming {
+                    // Only the USER gets a bubble (`isBare` below). An assistant
+                    // reply is the page's main content — long, formatted, full
+                    // of code blocks and tables — and boxing it wastes the
+                    // column's width and fights every block that wants the full
+                    // measure. A tool-call summary keeps its card so it still
+                    // reads as machinery, not prose.
                     VStack(alignment: .leading, spacing: 4) {
                         if message.isAgentSummary {
                             Label("Tool Call", systemImage: "wrench.and.screwdriver")
@@ -2408,19 +4277,89 @@ struct MessageBubble: View {
                             MarkdownText(message.content.isEmpty && message.isStreaming ? " " : message.content)
                                 .textSelection(.enabled)
                         } else {
+                            // The user's own turn is plain text (no markdown
+                            // render), so it needs the transcript size stated —
+                            // otherwise your message and the reply to it are
+                            // two different sizes in the same column.
                             Text(message.content)
+                                .font(.system(size: ChatMetrics.transcriptFontSize))
+                                // Same leading as the reply's renderer, or the
+                                // two roles read at two densities.
+                                .lineSpacing(ChatMetrics.userLineSpacing)
                                 .textSelection(.enabled)
+                                .lineLimit(isFolded ? LongUserTurn.collapsedLineLimit : nil)
+                                // A folded `Text` reports the width of the
+                                // lines it shows, so a bubble that hugged it
+                                // would change width on unfold and re-lay the
+                                // whole turn out at the new one. A turn this
+                                // long is a full-width block either way.
+                                .frame(maxWidth: foldsLongTurn ? .infinity : nil, alignment: .leading)
+                                .overlay(alignment: .bottom) { foldFade }
+                            if foldsLongTurn {
+                                Group {
+                                    if isFolding {
+                                        // The spinner ignores `tint`; it draws
+                                        // white in the dark scheme.
+                                        ProgressView()
+                                            .controlSize(.mini)
+                                            .colorScheme(.dark)
+                                    } else {
+                                        Button(L10n.text(isFolded ? "Show more" : "Show less")) { toggleLongTurn() }
+                                            .buttonStyle(.plain)
+                                            .font(.caption.weight(.medium))
+                                            .foregroundStyle(.white.opacity(0.8))
+                                    }
+                                }
+                                .padding(.top, ChatMetrics.foldToggleTopPadding)
+                            }
                         }
                         if message.isStreaming {
                             GeneratingIndicator()
                         }
                     }
+                    // `.highPriorityGesture`, not `.onTapGesture` — the `Text`
+                    // above has `.textSelection(.enabled)`, which installs its
+                    // OWN double-click-to-select-word handling. A plain
+                    // `.onTapGesture(count: 2)` sits behind that in the
+                    // gesture hierarchy and never sees the second click, so
+                    // double-click silently did nothing. `highPriorityGesture`
+                    // makes this the one that wins.
+                    //
+                    // Which is exactly why the `onEdit` test is on the MODIFIER
+                    // and not inside the closure: a message with no edit action
+                    // (every assistant reply, every read-only surface) would
+                    // otherwise still install a winning gesture that beats
+                    // text selection and then does nothing — killing
+                    // double-click-to-select-a-word on the replies, which is
+                    // most of what anyone selects.
+                    // …and why the model's replies are excluded even though they
+                    // ARE editable now: the gesture wins over text selection,
+                    // and an assistant reply is prose people select words in.
+                    // Its edit is reached from the context menu instead.
+                    .modifier(DoubleClickToEdit(
+                        action: (onEdit == nil || message.role != .user) ? nil : { startEditing() }))
                     .padding(.horizontal, isBare ? 0 : ChatMetrics.bubblePaddingH)
                     .padding(.vertical, isBare ? 0 : ChatMetrics.bubblePaddingV)
                     .background(bubbleBackground)
                     .foregroundStyle(message.role == .user ? .white : .primary)
                     .clipShape(RoundedRectangle(cornerRadius: isBare ? 0 : ChatMetrics.bubbleCornerRadius))
-                    .frame(maxWidth: .infinity, alignment: isBare ? .leading : .trailing)
+                    // Cap on the bubble, not the text: a frame on the text
+                    // stretches a one-line question across the width.
+                    .frame(maxWidth: message.role == .user ? ChatMetrics.userBubbleMaxWidth : .infinity,
+                           alignment: isBare ? .leading : .trailing)
+                }
+
+                // A cut reply's notice: DATA on the message, drawn as a footnote
+                // under the bubble — never appended into content, which rides
+                // back to the model as history.
+                if let notice = message.truncationNotice, !message.isStreaming {
+                    Text(L10n.text(notice.text))
+                        .font(.callout)
+                        .italic()
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .padding(.leading, isBare ? 0 : ChatMetrics.statsIndent)
+                        .padding(.top, 2)
                 }
 
                 // Where the answer came from, above the footer — the provenance
@@ -2431,16 +4370,118 @@ struct MessageBubble: View {
                 }
 
                 if showsFooter { footer }
+                if showsUserActions { userActions }
             }
-
-            if message.role == .assistant { Spacer(minLength: 60) }
+            // Turn gap keyed on the footer, not the role: an assistant turn is
+            // several rows (thinking-only message, tool card, reply).
+            .padding(.bottom, message.role == .user
+                     ? ChatMetrics.userBubbleBottomPadding
+                     : (showsFooter ? ChatMetrics.assistantTurnBottomPadding : 0))
+            .frame(maxWidth: .infinity,
+                   alignment: message.role == .user ? .trailing : .leading)
         }
+        .onAppear { longTurnExpanded = foldStore?.isExpanded(message.id) ?? false }
+        // Hover must cover the transparent action row too, or it vanishes as
+        // the pointer approaches it.
+        .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
         .contextMenu {
-            Button("Copy Message") { copyMessage() }
+            if !message.content.isEmpty {
+                Button("Copy Message") { copyMessage() }
+            }
+            if onEdit != nil, !message.content.isEmpty {
+                // Named for what it DOES: editing your own message re-asks the
+                // question, editing the model's rewrites what it said.
+                Button(message.role == .user ? "Edit & Resend" : "Edit Reply") { startEditing() }
+            }
+            if onRegenerate != nil {
+                Button("Regenerate") { onRegenerate?() }
+            }
+            if let onFork {
+                // Between the two destructive answers and Delete: a fork keeps
+                // BOTH branches, so it belongs next to the ones that don't.
+                Divider()
+                Button("Branch Chat From Here", action: onFork)
+            }
             if onDelete != nil {
-                Button("Delete Message", role: .destructive) { onDelete?() }
+                // A reply takes the model's whole turn with it (`ChatTurn`).
+                Button(message.role == .user ? "Delete Message" : "Delete Turn", role: .destructive) { onDelete?() }
             }
         }
+    }
+
+    /// Replaces the static bubble while editing: a growing multi-line field
+    /// pre-filled with the message's current text, Cancel / Save beneath it.
+    /// Save hands the new text to `onEdit`, which drops this message and
+    /// everything after it and resubmits — same shape as a fresh send.
+    ///
+    /// It is the COMPOSER's field, not a `TextEditor`. Editing a message is a
+    /// send, so it answers the keyboard like one: Return submits, Shift+Return
+    /// breaks the line — `ComposerKey.onReturn` decides for both, and
+    /// `editCanSubmit` is the same gate that dims Save, so the key and the
+    /// button can never disagree about whether this draft can go.
+    private var editingContent: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            GrowingTextEditor(text: $editDraft,
+                              isFocused: $editFocused,
+                              measuredHeight: $editHeight,
+                              maxLines: 12,
+                              isIdle: ComposerKey.editCanSubmit(editDraft),
+                              onSend: { commitEdit() },
+                              // Belt and braces: the Cancel button's key
+                              // equivalent claims Escape first while this is up.
+                              onCancel: { cancelEdit(); return true })
+                .frame(height: max(ChatMetrics.composerMinHeight, editHeight))
+                .padding(8)
+                .background(Color(nsColor: .controlBackgroundColor)) // Distinct surface fill
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.accentColor.opacity(0.6), lineWidth: 1.5) // Glowing outline
+                )
+                .shadow(color: Color.black.opacity(0.25), radius: 6, x: 0, y: 3) // Depth
+
+            HStack(spacing: 8) {
+                Button("Cancel") { cancelEdit() }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .keyboardShortcut(.cancelAction)
+
+                Button("Save") { commitEdit() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!ComposerKey.editCanSubmit(editDraft))
+            }
+            .font(.caption)
+        }
+        .padding(4)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    private func startEditing() {
+        editDraft = message.content
+        // The field is capped in height where the bubble was not, so on a long
+        // turn it would otherwise open above the top of the window.
+        resize(animated: false) {
+            isEditing = true
+            // Put the caret in the field the edit just opened — otherwise
+            // Return is typed at whatever still holds focus (the composer
+            // below), which sends a NEW message instead of the edit.
+            editFocused = true
+        }
+    }
+
+    private func cancelEdit() {
+        isEditing = false
+        editFocused = false
+        editDraft = ""
+    }
+
+    private func commitEdit() {
+        guard ComposerKey.editCanSubmit(editDraft) else { return }
+        let text = editDraft
+        isEditing = false
+        editFocused = false
+        onEdit?(text)
     }
 
     // MARK: - Bubble vs bare
@@ -2449,6 +4490,77 @@ struct MessageBubble: View {
     /// bubble.
     private var isBare: Bool { message.role == .assistant && !message.isAgentSummary }
 
+    // MARK: - Folding a long user turn
+
+    private var userTurnCharsPerLine: Int {
+        LongUserTurn.charsPerLine(
+            textWidth: ChatMetrics.userBubbleMaxWidth - 2 * ChatMetrics.bubblePaddingH,
+            fontSize: ChatMetrics.transcriptFontSize)
+    }
+
+    private var foldsLongTurn: Bool {
+        guard message.role == .user, !message.isStreaming else { return false }
+        return LongUserTurn.isCollapsible(message.content, charsPerLine: userTurnCharsPerLine)
+    }
+
+    private var isFolded: Bool { foldsLongTurn && !longTurnExpanded }
+
+    /// Fades the last two kept lines into the bubble instead of ending them on
+    /// an ellipsis, so a folded turn reads as continuing rather than as a
+    /// sentence that stops.
+    ///
+    /// An overlay in the bubble's own colour, not a `mask`: a mask renders what
+    /// it covers into an offscreen layer, and an unfolded turn is a layer
+    /// thousands of points tall — which is hundreds of milliseconds per fold.
+    @ViewBuilder
+    private var foldFade: some View {
+        if isFolded {
+            // Stops short of covering the last line: a line faded to nothing
+            // reads as the end of the message, one still faintly there reads as
+            // more of it below.
+            LinearGradient(colors: [bubbleBackground.opacity(0), bubbleBackground.opacity(0.85)],
+                           startPoint: .top, endPoint: .bottom)
+                .frame(height: (ChatMetrics.transcriptFontSize + ChatMetrics.userLineSpacing) * 2)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private func toggleLongTurn() {
+        let expanding = !longTurnExpanded
+        foldStore?.set(message.id, expanded: expanding)
+        isFolding = true
+        // One turn later, so the indicator is drawn before the layout that
+        // makes this click slow takes the thread.
+        DispatchQueue.main.async {
+            if expanding {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    longTurnExpanded = true
+                } completion: {
+                    isFolding = false
+                }
+            } else {
+                resize({ longTurnExpanded = false }, done: { isFolding = false })
+            }
+        }
+    }
+
+    /// Brackets a change that makes this row shorter. The end is reported one
+    /// turn after the change has landed, so the geometry of its last frame is
+    /// seen inside the bracket.
+    private func resize(animated: Bool = true, _ change: @escaping () -> Void,
+                        done: (() -> Void)? = nil) {
+        onWillResize?()
+        let finish = { onDidResize?(); done?() }
+        if animated {
+            withAnimation(.easeInOut(duration: 0.15)) { change() } completion: {
+                DispatchQueue.main.async(execute: finish)
+            }
+        } else {
+            change()
+            DispatchQueue.main.async { DispatchQueue.main.async(execute: finish) }
+        }
+    }
+
     private var bubbleBackground: Color {
         if isBare { return .clear }
         return message.role == .user ? Color.accentColor : Color(.controlBackgroundColor)
@@ -2456,61 +4568,123 @@ struct MessageBubble: View {
 
     // MARK: - Footer (timestamp · actions · stats)
 
-    private var showsFooter: Bool {
-        message.role == .assistant && !message.isStreaming
-            && !message.isAgentSummary && !message.content.isEmpty
-    }
+    /// One predicate with the transcript's end footer, which is its negation.
+    private var showsFooter: Bool { ChatTurn.hasOwnFooter(message) }
 
-    /// Timestamp and token stats on the left, actions pinned to the right.
-    ///
-    /// The actions are ALWAYS visible. Fading them in on hover meant they moved
-    /// under the pointer as the row re-rendered mid-stream and were awkward to
-    /// hit; two small tertiary glyphs cost nothing to leave on. They sit at the
-    /// trailing edge — past the stats, against the reply's right edge — so the
-    /// eye finds them in the same place on every message instead of at a spot
-    /// that shifts with the length of the stats text.
+    /// Left-aligned strip under a reply: time, actions, speed. Always visible,
+    /// unlike the user turn's row: Regenerate and Continue have no other home.
     private var footer: some View {
-        HStack(spacing: 8) {
-            Text(message.timestamp.formatted(date: .abbreviated, time: .shortened))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+        HStack(spacing: 6) {
+            StatPill(text: message.timestamp.formatted(date: .omitted, time: .shortened),
+                     expanded: message.timestamp.formatted(date: .numeric, time: .shortened))
 
-            if let tps = message.tokensPerSecond, tps > 0 {
-                Label("\(Int(tps)) tokens/sec", systemImage: "gauge.with.needle")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+            // Which version of this reply you are reading. Left of the actions
+            // because it is a statement about the text above it, not another
+            // thing to do to it — and it only exists once there is a choice.
+            if MessageRevisions.isPagerVisible(message.revisions) {
+                HStack(spacing: 1) {
+                    footerButton("chevron.left", help: "Previous version of this reply") {
+                        onSelectRevision?(MessageRevisions.step(index: message.activeRevision,
+                                                                by: -1,
+                                                                count: message.revisions.count))
+                    }
+                    .disabled(!MessageRevisions.canGoBack(index: message.activeRevision))
+                    Text(
+                                                MessageRevisions.label(index: message.activeRevision,
+                                                count: message.revisions.count)
+)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                    footerButton("chevron.right", help: "Next version of this reply") {
+                        onSelectRevision?(MessageRevisions.step(index: message.activeRevision,
+                                                                by: 1,
+                                                                count: message.revisions.count))
+                    }
+                    .disabled(!MessageRevisions.canGoForward(index: message.activeRevision,
+                                                             count: message.revisions.count))
+                }
             }
-            if let completion = message.completionTokens {
-                Text("(\(completion) tokens)")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-
-            Spacer(minLength: 8)
 
             HStack(spacing: 2) {
-                footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
+                // A generated picture has a footer and no text to copy or edit.
+                if !message.content.isEmpty {
+                    footerButton("square.on.square", help: "Copy this reply") { copyMessage() }
+                }
+                // The model's replies are editable but have no double-click
+                // route into it (that gesture belongs to selecting a word), so
+                // without this the only way in is a context menu nobody thinks
+                // to open on a paragraph.
+                if onEdit != nil, message.role == .assistant, !message.content.isEmpty {
+                    footerButton("pencil", help: "Edit this reply — then Continue to carry on from it") {
+                        startEditing()
+                    }
+                }
+                // Continue sits BEFORE regenerate: they are the two answers to
+                // "this reply isn't what I need", and the non-destructive one
+                // goes first — regenerate throws the reply away.
+                if let onContinue {
+                    footerButton("text.append",
+                                 help: message.truncationNotice != nil
+                                     ? "Finish this reply — it was cut short"
+                                     : "Keep writing from where this left off",
+                                 action: onContinue)
+                }
+                if let onRegenerate {
+                    footerButton("arrow.clockwise", help: "Regenerate this reply (⌘R)",
+                                 action: onRegenerate)
+                }
                 if let onDelete {
-                    footerButton("trash", help: "Delete this message from the conversation",
+                    footerButton("trash", help: "Delete this turn from the conversation",
                                  action: onDelete)
                 }
             }
+
+            if let tps = message.tokensPerSecond, tps > 0 {
+                StatPill(text: "\(Int(tps)) tok/sec",
+                         expanded: message.completionTokens.map {
+                             "\(Int(tps)) tok/sec (\($0) tokens)"
+                         } ?? "\(Int(tps)) tok/sec")
+            }
+
+            Spacer(minLength: 0)
         }
         .padding(.leading, isBare ? 0 : ChatMetrics.statsIndent)
-        .padding(.top, 2)
+        .padding(.top, ChatMetrics.compactMode ? 2 : 8)
     }
 
-    private func footerButton(_ icon: String, help: String,
-                              action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .frame(width: 20, height: 18)
-                .contentShape(Rectangle())
+    /// Not drawn at all in compact: an invisible row still holds its height.
+    /// The context menu keeps the same actions.
+    private var showsUserActions: Bool {
+        message.role == .user && !message.isStreaming && !ChatMetrics.compactMode
+    }
+
+    private var userActions: some View {
+        HStack(spacing: 2) {
+            footerButton("square.on.square", help: "Copy this message") { copyMessage() }
+            if onEdit != nil {
+                footerButton("pencil", help: "Edit this message and send it again") { startEditing() }
+            }
+            if let onFork {
+                // Flipped: this branches back from a message above you.
+                footerButton("arrow.trianglehead.branch",
+                             help: "Start a new chat from this message",
+                             flipped: true, action: onFork)
+            }
+            if let onDelete {
+                footerButton("trash", help: "Delete this message from the conversation",
+                             action: onDelete)
+            }
         }
-        .buttonStyle(.plain)
-        .help(help)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.top, 2)
+        .opacity(isHovered ? 1 : 0)
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
+        .allowsHitTesting(isHovered)
+    }
+
+    private func footerButton(_ icon: String, help: String, flipped: Bool = false,
+                              action: @escaping () -> Void) -> some View {
+        FooterIconButton(icon: icon, help: help, flipped: flipped, action: action)
     }
 
     private func copyMessage() {
@@ -2519,17 +4693,115 @@ struct MessageBubble: View {
     }
 }
 
+/// One glyph of a footer's action row.
+private struct FooterIconButton: View {
+    let icon: String
+    let help: String
+    var flipped = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .scaleEffect(y: flipped ? -1 : 1)
+                .foregroundStyle(.secondary)
+                .frame(width: 20, height: 18)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(L10n.text(help))
+    }
+}
+
+/// The footer of a turn that ended without a reply to hang one on: cut while
+/// thinking, stopped after a tool result, an error card. Time of the last
+/// thing that happened, and the two ways out — try again, or take the turn
+/// away. It is what the transcript draws after its last row.
+private struct TurnEndFooter: View {
+    let endedAt: Date
+    var onRegenerate: (() -> Void)?
+    let onDelete: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            StatPill(text: endedAt.formatted(date: .omitted, time: .shortened),
+                     expanded: endedAt.formatted(date: .numeric, time: .shortened))
+            HStack(spacing: 2) {
+                if let onRegenerate {
+                    FooterIconButton(icon: "arrow.clockwise", help: "Regenerate this reply (⌘R)",
+                                     action: onRegenerate)
+                }
+                FooterIconButton(icon: "trash", help: "Delete this turn from the conversation",
+                                 action: onDelete)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.top, ChatMetrics.compactMode ? 2 : 8)
+    }
+}
+
+/// Short at rest, full value floating over the pointer on hover. Floating
+/// rather than growing in place, so the buttons beside it never move.
+private struct StatPill: View {
+    let text: String
+    let expanded: String
+
+    @State private var pointer: CGPoint?
+
+    var body: some View {
+        label(text)
+            // Continuous, not `onHover`: the position is the point of it.
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location): pointer = location
+                case .ended: pointer = nil
+                }
+            }
+            .overlay(alignment: .topLeading) {
+                if let pointer {
+                    label(expanded)
+                        .background(Color(nsColor: .textBackgroundColor), in: Capsule())
+                        .shadow(color: .black.opacity(0.18), radius: 3, y: 1)
+                        .fixedSize()
+                        // Above the pointer and slightly left of it, so the
+                        // cursor never sits on top of the text it revealed.
+                        .offset(x: pointer.x - 10, y: -24)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
+            // Later siblings draw over earlier ones, so without this the
+            // buttons paint on top of the pill that just opened.
+            .zIndex(pointer == nil ? 0 : 1)
+    }
+
+    private func label(_ string: String) -> some View {
+        Text(L10n.text(string))
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.secondary.opacity(0.1), in: Capsule())
+    }
+}
+
 // MARK: - Tool-call grouping (collapse call + result into one collapsible row)
 
 /// A renderable transcript row: a normal message, or a tool call paired with its
 /// result(s) so they show as a single collapsible row instead of two bubbles.
-enum ChatRow: Identifiable {
+enum ChatRow: Identifiable, Equatable {
     case message(ChatMessage)
-    case toolCall(call: ChatMessage, results: [ChatMessage])
+    /// `calls`: the structured record from the assistant message that made the
+    /// call (one message before the summary); empty on older histories.
+    /// `ownedHandles`: background handles this row may still speak for.
+    case toolCall(call: ChatMessage, results: [ChatMessage], calls: [SerializedToolCall],
+                  ownedHandles: [String])
     var id: UUID {
         switch self {
         case .message(let m): return m.id
-        case .toolCall(let c, _): return c.id
+        case .toolCall(let c, _, _, _): return c.id
         }
     }
 }
@@ -2555,12 +4827,14 @@ struct ChatModeToggles: Equatable {
     static func resolve(isExternalBridge: Bool,
                         telegramThinking: Bool, telegramAgent: Bool, telegramMCP: Bool,
                         inAppThinking: Bool, inAppAgent: Bool, inAppMCP: Bool,
-                        agentLock: AgentModeLock? = nil) -> ChatModeToggles {
+                        agentLock: AgentModeLock? = nil,
+                        /// Chat is answered by Apple's on-device model.
+                        apple: Bool = false) -> ChatModeToggles {
         let base = isExternalBridge
             ? ChatModeToggles(thinking: telegramThinking, agent: telegramAgent, mcp: telegramMCP)
             : ChatModeToggles(thinking: inAppThinking, agent: inAppAgent, mcp: inAppMCP)
-        guard let lock = agentLock else { return base }
-        return ChatModeToggles(
+        guard let lock = agentLock else { return applyingApple(base, apple: apple) }
+        return applyingApple(ChatModeToggles(
             // Thinking is the one an agent may leave unset, and `AgentResolution`
             // falls back to the surface's own value there — so locking it anyway
             // would take away a control nobody is deciding for you.
@@ -2569,17 +4843,25 @@ struct ChatModeToggles: Equatable {
             mcp: lock.mcp,
             thinkingLockedBy: lock.thinking == nil ? nil : lock.name,
             toolsLockedBy: lock.name,
-            mcpLockedBy: lock.name)
+            mcpLockedBy: lock.name), apple: apple)
+    }
+
+    /// The on-device model has no thinking mode at all, and its 4k window has
+    /// no room for MCP's tool definitions — so both read locked, with it named
+    /// as the owner. The tool LOOP still switches; the tool SET is clamped in
+    /// `AgentResolution`, which is where capabilities are decided.
+    private static func applyingApple(_ t: ChatModeToggles, apple: Bool) -> ChatModeToggles {
+        guard apple else { return t }
+        var out = t
+        out.thinking = false
+        out.thinkingLockedBy = AppleFoundationChat.displayName
+        out.mcp = false
+        out.mcpLockedBy = AppleFoundationChat.displayName
+        return out
     }
 }
 
 /// What the chat's agent decided about Think / Tools / MCP.
-///
-/// `AgentResolution` takes Tools and MCP straight from the agent's capabilities
-/// and ignores the chat's own toggles — so without this the discs showed one
-/// thing and the turn ran another (every agent defaults `web: true`, which forces
-/// the tool loop on while the wrench renders OFF). Built from the SAME resolution
-/// the turn uses (`ChatDetailView.agentModeLock`), so the two can't drift.
 struct AgentModeLock: Equatable {
     var name: String
     /// nil = the agent left thinking unset; the chat's own toggle stands.
@@ -2607,15 +4889,22 @@ enum ChatRowBuilder {
         let visible = messages.filter { $0.toolCallId == nil }
         var rows: [ChatRow] = []
         var i = 0
+        var pendingCalls: [SerializedToolCall] = []
+        // Handle names are reused across launches: the last announcer owns it.
+        let owned = ProcessCardControls.handleOwnership(
+            visible.map { ($0.id, $0.processHandles ?? []) })
         while i < visible.count {
             let m = visible[i]
+            if let calls = m.toolCalls, !calls.isEmpty { pendingCalls = calls }
             if isCallSummary(m) {
                 var results: [ChatMessage] = []
                 var j = i + 1
                 while j < visible.count, isResultSummary(visible[j]) {
                     results.append(visible[j]); j += 1
                 }
-                rows.append(.toolCall(call: m, results: results))
+                rows.append(.toolCall(call: m, results: results, calls: pendingCalls,
+                                      ownedHandles: owned[m.id] ?? []))
+                pendingCalls = []
                 i = j
             } else {
                 rows.append(.message(m))
@@ -2631,45 +4920,92 @@ enum ChatRowBuilder {
 private struct ToolCallRow: View {
     let call: ChatMessage
     let results: [ChatMessage]
+    /// See `ChatRow.toolCall`.
+    var calls: [SerializedToolCall] = []
+    var ownedHandles: [String] = []
+    /// A handle is only an identity inside one chat
+    /// (`ProcessRegistry.isAlive(handle:sessionId:)`).
+    var sessionId: UUID?
     @State private var expanded = false
-    @State private var hovering = false
     @EnvironmentObject var processRegistry: ProcessRegistry
 
-    /// Live background-process handles this card started — drives the kill X.
-    /// Independent of `call.isStreaming` so the X stays after the tool returns,
-    /// and it vanishes once the registry flips the process dead.
-    private var killableHandles: [String] {
-        ProcessCardControls.killable(handles: call.processHandles, isAlive: processRegistry.isAlive)
+    private var isRunning: Bool { call.isStreaming }
+
+    private var title: String {
+        ToolCallDisplay.title(calls: calls, summary: call.content)
     }
 
-    /// At least one background process from this card is still alive — drives the
-    /// green "running" border. Goes false the moment the registry flips the last
-    /// one dead (e.g. you click its X), so border + kill X disappear together.
-    private var isRunningBackground: Bool { !killableHandles.isEmpty }
+    /// Flat across the round; only the header's headline (first call) reads it.
+    private var argumentRows: [ToolCallDisplay.Argument] {
+        calls.flatMap { ToolCallDisplay.arguments(fromJSON: $0.arguments) }
+    }
 
-    var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                headerRow
-                if expanded { expandedResults }
+    /// One call with its arguments and result. Results pair with calls by
+    /// index: the engine runs them in order and result messages carry no id.
+    private struct CallGroup: Identifiable {
+        let id: String
+        let name: String
+        /// Shown as part of the name (`browse:click`).
+        let variant: String?
+        let arguments: [ToolCallDisplay.Argument]
+        let result: String?
+        /// Read out of the result text, the only place the association exists.
+        let handle: String?
+    }
+
+    private var groups: [CallGroup] {
+        let bodies = results.map { ToolCallDisplay.resultBody($0.content) }
+        // Older history without structured calls: one group per result.
+        guard !calls.isEmpty else {
+            return bodies.enumerated().map { i, body in
+                CallGroup(id: "legacy-\(i)", name: title, variant: nil, arguments: [], result: body,
+                          handle: ToolCallDisplay.backgroundHandle(inResult: body))
             }
-            .padding(.horizontal, ChatMetrics.bubblePaddingH)
-            .padding(.vertical, ChatMetrics.bubblePaddingV)
-            .background(Color(.controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius))
-            .overlay(
-                RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius)
-                    .strokeBorder(Color.green.opacity(isRunningBackground ? 0.7 : 0), lineWidth: 1.5)
-            )
-            .animation(.easeInOut(duration: 0.2), value: isRunningBackground)
-            // Recede a settled tool call so the assistant's prose carries the
-            // conversation; full opacity while it's running, hovered, or expanded.
-            .opacity(call.isStreaming || hovering || expanded ? 1.0 : 0.35)
-            .animation(.easeInOut(duration: 0.15), value: hovering)
-            .onHover { hovering = $0 }
-
-            Spacer(minLength: 60)
         }
+        return calls.enumerated().map { i, call in
+            let body = i < bodies.count ? bodies[i] : nil
+            let args = ToolCallDisplay.arguments(fromJSON: call.arguments)
+            return CallGroup(
+                id: call.id.isEmpty ? "call-\(i)" : call.id,
+                name: call.name,
+                variant: ToolCallDisplay.variant(toolName: call.name, arguments: args),
+                arguments: args,
+                result: body,
+                handle: body.flatMap { ToolCallDisplay.backgroundHandle(inResult: $0) })
+        }
+    }
+
+    /// Handles no call claimed keep their button in the header.
+    private var unclaimedHandles: [String] {
+        ProcessCardControls.split(live: killableHandles,
+                                  claimedBy: groups.map(\.handle)).unclaimed
+    }
+
+    /// Handles whose pill sits beside their call inside the panel.
+    private var claimedHandles: [String] {
+        ProcessCardControls.split(live: killableHandles,
+                                  claimedBy: groups.map(\.handle)).claimed
+    }
+
+    /// Live handles this card owns. Independent of `call.isStreaming`, so the
+    /// stop button outlives the tool result and vanishes when the process dies.
+    private var killableHandles: [String] {
+        ProcessCardControls.killable(handles: ownedHandles) {
+            processRegistry.isAlive(handle: $0, sessionId: sessionId)
+        }
+    }
+
+    /// Built like `thinkingBlock`, for the same reasons.
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            headerRow
+            if expanded { expandedBody }
+        }
+        .padding(.horizontal, expanded ? ChatMetrics.bubblePaddingH : 0)
+        .padding(.vertical, expanded ? ChatMetrics.bubblePaddingV : 0)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(expanded ? AnyShapeStyle(.quaternary.opacity(0.5)) : AnyShapeStyle(Color.clear))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     // Broken out into separately type-checked pieces — a single deeply nested
@@ -2677,78 +5013,245 @@ private struct ToolCallRow: View {
     // SwiftUI type-checker into pathological (effectively non-terminating)
     // compile times.
     @ViewBuilder private var headerRow: some View {
-        HStack(alignment: .top, spacing: 6) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
-            } label: {
-                headerLabel
-            }
-            .buttonStyle(.plain)
-            .disabled(results.isEmpty)
-
-            ProcessKillButtons(handles: killableHandles) { processRegistry.kill(handle: $0) }
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+        } label: {
+            headerLabel
         }
+        .buttonStyle(.plain)
     }
 
     @ViewBuilder private var headerLabel: some View {
-        HStack(alignment: .top, spacing: 6) {
+        HStack(spacing: 6) {
             Image(systemName: "wrench.and.screwdriver")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text(Self.stripBold(call.content))
-                .font(.caption.monospaced())
-                .multilineTextAlignment(.leading)
-                .foregroundStyle(.primary)
-            Spacer(minLength: 6)
-            if call.isStreaming {
-                GeneratingIndicator()
-            } else if !results.isEmpty {
-                Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                .symbolEffect(.pulse, isActive: isRunning)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(Color.accentColor.opacity(0.7))
+            if calls.count > 1 {
+                multiToolTitle
+            } else {
+                singleToolTitle
             }
+            Spacer(minLength: 8)
+            ForEach(headerHandles, id: \.self) { handle in
+                ProcessPill(handle: handle) { processRegistry.kill(handle: $0) }
+            }
+            // Several calls: one stop button here could not say which process
+            // it stops, so the shut card only says that something is running.
+            if !expanded, groups.count > 1, !claimedHandles.isEmpty {
+                RunningIndicator()
+            }
+            Image(systemName: "chevron.right")
+                .rotationEffect(.degrees(expanded ? 90 : 0))
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(Color.accentColor.opacity(0.7))
         }
         .contentShape(Rectangle())
     }
 
-    @ViewBuilder private var expandedResults: some View {
-        ForEach(results) { r in
-            Text(Self.stripBold(r.content))
+    /// One call: every live handle. Several: only the unclaimed ones; the rest
+    /// sit beside their call inside the panel.
+    private var headerHandles: [String] {
+        groups.count > 1 ? unclaimedHandles : killableHandles
+    }
+
+    /// The one place a tool's name is drawn, so `server__tool` reads as a path
+    /// everywhere. `variant` is the behaviour-choosing argument (`browse:click`).
+    @ViewBuilder private func toolLabel(name: String, variant: String?) -> some View {
+        Text(L10n.text(ToolCallDisplay.displayName(name)))
+            .font(.caption.monospaced())
+            .foregroundStyle(Color.accentColor.opacity(0.7))
+        if let variant {
+            Text(":" + variant)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.leading, -4)
+        }
+    }
+
+    @ViewBuilder private var singleToolTitle: some View {
+        toolLabel(name: title,
+                  variant: calls.first.map {
+                      ToolCallDisplay.variant(toolName: $0.name, arguments: argumentRows)
+                  } ?? nil)
+        if let headline {
+            Text("· " + headline)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                // Keep a path's filename.
+                .truncationMode(.middle)
+        }
+        if let resultHeadline {
+            Text("· " + resultHeadline)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .layoutPriority(1)
+        }
+    }
+
+    /// Names only, no arguments (one query in the header would look like the
+    /// only one); past three the tail becomes a count.
+    @ViewBuilder private var multiToolTitle: some View {
+        let shown = groups.count > 3 ? Array(groups.prefix(2)) : groups
+        let hidden = groups.count - shown.count
+
+        ForEach(Array(shown.enumerated()), id: \.offset) { index, group in
+            if index > 0 { middot }
+            toolLabel(name: group.name, variant: group.variant)
+        }
+        if hidden > 0 {
+            middot
+            Text("+\(hidden) other tool\(hidden == 1 ? "" : "s")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private var middot: some View {
+        Text("·")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    private var headline: String? {
+        guard let name = calls.first?.name else { return nil }
+        return ToolCallDisplay.headline(toolName: name, arguments: argumentRows)
+    }
+
+    private var resultHeadline: String? {
+        guard let name = calls.first?.name, let first = results.first else { return nil }
+        return ToolCallDisplay.resultHeadline(toolName: name,
+                                              result: ToolCallDisplay.resultBody(first.content))
+    }
+
+    @ViewBuilder private var expandedBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
+                if groups.count > 1 {
+                    HStack(spacing: 0) {
+                        toolLabel(name: group.name, variant: group.variant)
+                        Spacer(minLength: 8)
+                        if let handle = group.handle, killableHandles.contains(handle) {
+                            ProcessPill(handle: handle) { processRegistry.kill(handle: $0) }
+                        }
+                    }
+                    .padding(.top, index == 0 ? 0 : 4)
+                }
+                callGrid(group)
+            }
+        }
+    }
+
+    @ViewBuilder private func callGrid(_ group: CallGroup) -> some View {
+        Grid(alignment: .topLeading, horizontalSpacing: 10, verticalSpacing: 6) {
+            ForEach(group.arguments) { arg in
+                gridRow(name: arg.name, value: arg.value)
+            }
+
+            if let result = group.result {
+                if !group.arguments.isEmpty {
+                    GridRow { Divider().gridCellColumns(2) }
+                }
+                GridRow {
+                    Text("result")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .gridColumnAlignment(.leading)
+                        .fixedSize(horizontal: true, vertical: false)
+                    Text(L10n.text(result))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func gridRow(name: String, value: String) -> some View {
+        GridRow {
+            Text(name)
                 .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .gridColumnAlignment(.leading)
+                .fixedSize(horizontal: true, vertical: false)
+            Text(value)
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
+}
 
-    /// The summary strings use `**name**` markdown bold; the compact mono header
-    /// and body render as plain text, so strip the `**` markers.
-    static func stripBold(_ s: String) -> String {
-        s.replacingOccurrences(of: "**", with: "")
+/// "running" badge without a button; the stop control is `StopProcessButton`.
+private struct RunningIndicator: View {
+    @Environment(\.colorScheme) private var scheme
+    @State private var pulsing = false
+
+    private var ink: Color {
+        scheme == .dark ? Color(red: 0.44, green: 0.82, blue: 0.50)
+                        : Color(red: 0.05, green: 0.42, blue: 0.16)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            // By hand: `.symbolEffect(.scale)` has nothing to move on
+            // `circle.fill`.
+            Image(systemName: "circle.fill")
+                .font(.system(size: 7))
+                .foregroundStyle(ink)
+                .scaleEffect(pulsing ? 0.55 : 1)
+                .opacity(pulsing ? 0.45 : 1)
+                .animation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true),
+                           value: pulsing)
+                .onAppear { pulsing = true }
+                .accessibilityHidden(true)
+
+            Text("running")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(ink)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Color.green.opacity(0.2), in: Capsule())
     }
 }
 
-/// Per-handle red kill X for a tool-call card's live background processes. Its
-/// own type (not an inline ForEach in ToolCallRow.body) so the SwiftUI
-/// type-checker handles it as an isolated, trivial unit.
-private struct ProcessKillButtons: View {
-    let handles: [String]
+private struct StopProcessButton: View {
+    let handle: String
     let onKill: (String) -> Void
 
     var body: some View {
-        ForEach(handles, id: \.self) { handle in
-            Button {
-                onKill(handle)
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.title2)
-                    .foregroundStyle(.red)
-                    .symbolRenderingMode(.hierarchical)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Stop background process \(handle)")
+        Button { onKill(handle) } label: {
+            // Sized off the pill beside it.
+            Image(systemName: "xmark.circle.fill")
+                .resizable()
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, .red)
+                .aspectRatio(contentMode: .fit)
+                .frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .help("Stop background process \(handle)")
+        .accessibilityLabel("Stop background process \(handle)")
+    }
+}
+
+private struct ProcessPill: View {
+    let handle: String
+    let onKill: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 5) {
+            RunningIndicator()
+            StopProcessButton(handle: handle, onKill: onKill)
+        }
+        .fixedSize(horizontal: true, vertical: false)
     }
 }
 
@@ -2763,6 +5266,7 @@ private struct ProcessKillButtons: View {
 // each Block becomes a styled fragment of the assembled NSAttributedString.
 struct MarkdownText: View {
     let source: String
+    @Environment(\.colorScheme) private var colorScheme
 
     /// Tags emitted by models (thinking, planning, etc.) — rendered as XML blocks.
     /// Standard HTML tags (head, div, meta, etc.) are NOT included — they render as text.
@@ -2783,16 +5287,31 @@ struct MarkdownText: View {
         self.source = source
     }
 
+    private var latexTheme: LaTeXTheme {
+        colorScheme == .dark ? .dark : .light
+    }
+
     var body: some View {
-        // Fenced code renders as its own view (gutter, colors, copy button);
-        // everything between fences stays in ONE text view per run so
-        // drag-selection still crosses paragraphs, lists and tables. See
-        // `MarkdownSegmenter` for why the split is at fences, not at blocks.
-        VStack(alignment: .leading, spacing: 10) {
+        // Fenced code renders as its own view (colors, copy button);
+        // everything between fences — including tables, rendered as an
+        // `NSTextTable` inside the shared attributed string — stays in ONE
+        // text view per run so drag-selection still crosses paragraphs,
+        // lists, and tables. See `MarkdownSegmenter` for why the split is at
+        // fences, not at blocks.
+        VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(MarkdownSegmenter.segments(source).enumerated()), id: \.offset) { _, segment in
                 switch segment {
                 case .prose(let text):
-                    SelectableMarkdownNSText(attributed: Self.attributedString(for: text))
+                    ForEach(Array(Self.latexBlocks(in: text).enumerated()), id: \.offset) { _, block in
+                        switch block {
+                        case .prose(let prose):
+                            SelectableMarkdownNSText(
+                                attributed: Self.attributedString(for: prose, theme: latexTheme)
+                            )
+                        case .display(let latex, let raw):
+                            DisplayLaTeXView(latex: latex, raw: raw, theme: latexTheme)
+                        }
+                    }
                 case .code(let language, let code):
                     CodeBlockView(language: language, code: code)
                 }
@@ -2807,21 +5326,141 @@ struct MarkdownText: View {
         }
     }
 
-    enum TableAlignment { case left, right, center }
+    private enum LaTeXBlock {
+        case prose(String)
+        case display(latex: String, raw: String)
+    }
+
+    /// Display formulas own a horizontally scrollable view. Text and inline
+    /// formulas remain one prose run so NSTextView can preserve native
+    /// selection across paragraphs, lists, and inline equations.
+    private static func latexBlocks(in source: String) -> [LaTeXBlock] {
+        var blocks: [LaTeXBlock] = []
+        var prose = ""
+
+        func flushProse() {
+            guard !prose.isEmpty else { return }
+            blocks.append(.prose(prose))
+            prose = ""
+        }
+
+        for segment in LaTeXSegmenter.segments(source) {
+            switch segment {
+            case .text(let text):
+                prose += text
+            case .inline(_, let raw):
+                prose += raw
+            case .display(let latex, let raw):
+                flushProse()
+                blocks.append(.display(latex: latex, raw: raw))
+            }
+        }
+        flushProse()
+        if blocks.isEmpty { blocks.append(.prose(source)) }
+        return blocks
+    }
 
     fileprivate enum Block {
         case paragraph(String)
         case heading(Int, String)              // level, text
         case code(String, String)              // language, content
-        case listItem(String)
+        case listItem(String, String, Int)     // marker (`•`, `1.`, `☐`), text, depth
+        case thematicBreak                     // `---` between sections
+        case quote(String)                     // `>` lines, already merged
         case xmlBlock(String)                  // raw XML/tag content
         case table([String], [[String]], [TableAlignment])  // headers, rows, alignments
+    }
+
+    /// Anchored: at most nine digits (CommonMark) then `.` or `)` and a space.
+    fileprivate static func listItem(in line: String) -> (marker: String, text: String, indent: Int)? {
+        let indent = leadingIndent(of: line)
+        let body = line.drop { $0 == " " || $0 == "\t" }
+        if body.hasPrefix("- ") || body.hasPrefix("* ") {
+            let text = String(body.dropFirst(2))
+            if let box = taskBox(in: text) { return (box.marker, box.text, indent) }
+            return ("•", text, indent)
+        }
+        guard let match = body.range(of: "^[0-9]{1,9}[.)] ", options: .regularExpression) else {
+            return nil
+        }
+        return (String(body[match]).trimmingCharacters(in: .whitespaces),
+                String(body[match.upperBound...]), indent)
+    }
+
+    /// Spaces before the first mark on the line; a tab counts as four.
+    fileprivate static func leadingIndent(of line: String) -> Int {
+        var n = 0
+        for c in line {
+            if c == " " { n += 1 } else if c == "\t" { n += 4 } else { break }
+        }
+        return n
+    }
+
+    /// A break INSIDE a paragraph. TextKit starts a new paragraph at every
+    /// `\n`, and a new paragraph takes the first-line indent (the margin) and a
+    /// paragraph's worth of air — so an item's own second line would leave the
+    /// list it belongs to.
+    fileprivate static let softBreak = "\u{2028}"
+
+    /// A checklist's boxes, which read at the weight of the text rather than a
+    /// bullet's: they are the item's state, not its punctuation.
+    fileprivate static let taskBoxes: Set<String> = ["\u{25A1}", "\u{2611}"]
+
+    /// `[ ]` or `[x]` right after the marker is a checkbox, not text.
+    private static func taskBox(in text: String) -> (marker: String, text: String)? {
+        guard text.count >= 4, text.hasPrefix("["), text.dropFirst(2).hasPrefix("] ") else { return nil }
+        switch text[text.index(text.startIndex, offsetBy: 1)] {
+        case " ": return ("\u{25A1}", String(text.dropFirst(4)))
+        case "x", "X": return ("\u{2611}", String(text.dropFirst(4)))
+        default: return nil
+        }
+    }
+
+    /// Three or more of one mark, alone on the line.
+    fileprivate static func isThematicBreak(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard let mark = trimmed.first, mark == "-" || mark == "*" || mark == "_" else { return false }
+        guard trimmed.allSatisfy({ $0 == mark || $0 == " " }) else { return false }
+        return trimmed.filter { $0 == mark }.count >= 3
+    }
+
+    /// A list's depth comes from the STEPS it takes, not from a count of
+    /// spaces: models write two or four for the same one level, and a list
+    /// that starts indented is still at its own top.
+    fileprivate struct ListDepth {
+        /// Past this an outline is deeper than the column can show, so further
+        /// levels share an indent rather than walking off the right edge. The
+        /// stack still tracks the real structure, so coming back out lands
+        /// where it should.
+        static let maxLevel = 5
+
+        private var stops: [Int] = []
+
+        mutating func level(forIndent indent: Int) -> Int {
+            while let last = stops.last, indent < last { stops.removeLast() }
+            if let last = stops.last {
+                if indent > last { stops.append(indent) }
+            } else {
+                stops.append(indent)
+            }
+            return min(stops.count - 1, Self.maxLevel)
+        }
+
+        mutating func reset() { stops.removeAll() }
+    }
+
+    /// `>` alone is a blank line inside a quote and keeps the block open.
+    fileprivate static func quoteBody(in line: String) -> String? {
+        if line.hasPrefix("> ") { return String(line.dropFirst(2)) }
+        if line == ">" { return "" }
+        return nil
     }
 
     fileprivate static func parseBlocks(source: String) -> [Block] {
         var blocks: [Block] = []
         let lines = source.components(separatedBy: "\n")
         var i = 0
+        var depth = ListDepth()
 
         while i < lines.count {
             let line = lines[i]
@@ -2892,17 +5531,6 @@ struct MarkdownText: View {
                 continue
             }
 
-            // Markdown table: a `|`-leading row immediately followed by a separator
-            // row (`|---|---|`, optionally with `:` for alignment). We accept the
-            // looser "must have at least one `|`" form too — many models drop the
-            // leading pipe — but require the separator line to confirm intent so
-            // we don't misinterpret a stray pipe as a table header.
-            if let table = Self.tryParseTable(lines: lines, start: i) {
-                blocks.append(.table(table.headers, table.rows, table.alignments))
-                i = table.end
-                continue
-            }
-
             // Heading
             if line.hasPrefix("#") {
                 let level = line.prefix(while: { $0 == "#" }).count
@@ -2916,19 +5544,61 @@ struct MarkdownText: View {
                 }
             }
 
-            // List item
-            if line.starts(with: "- ") || line.starts(with: "* ") ||
-               (line.count >= 3 && line.first?.isNumber == true && line.contains(". ")) {
-                let text: String
-                if line.starts(with: "- ") || line.starts(with: "* ") {
-                    text = String(line.dropFirst(2))
-                } else if let dotIdx = line.firstIndex(of: "."), line[line.index(after: dotIdx)] == " " {
-                    text = String(line[line.index(dotIdx, offsetBy: 2)...])
-                } else {
-                    text = line
+            // Table (GFM pipe table, or the whitespace-aligned pseudo-table
+            // smaller models emit without GFM syntax) — checked before
+            // list-item/paragraph so a `- ` inside a cell or numbered header
+            // doesn't get misread as a list marker.
+            if let table = MarkdownTable.parse(lines: lines, start: i) {
+                blocks.append(.table(table.headers, table.rows, table.alignments))
+                i = table.end
+                continue
+            }
+
+            // Consecutive `>` lines are one quote (models mark every line).
+            if quoteBody(in: line) != nil {
+                var quoted: [String] = []
+                while i < lines.count, let body = quoteBody(in: lines[i]) {
+                    quoted.append(body)
+                    i += 1
                 }
-                blocks.append(.listItem(text))
+                blocks.append(.quote(quoted.joined(separator: "\n")))
+                continue
+            }
+
+            // A rule, before the list check: `- - -` is a break, not an item.
+            if isThematicBreak(line) {
+                blocks.append(.thematicBreak)
                 i += 1
+                continue
+            }
+
+            // List item, with the lines indented under it: a second line, or a
+            // second paragraph, belongs to the item rather than to the margin.
+            if let item = listItem(in: line) {
+                // Any other block ended the list, so its depth starts again.
+                if case .some(.listItem) = blocks.last {} else { depth.reset() }
+                var text = item.text
+                i += 1
+                while i < lines.count {
+                    // One blank line may sit inside an item, before its second
+                    // paragraph; two end it.
+                    let blank = lines[i].trimmingCharacters(in: .whitespaces).isEmpty
+                    let at = blank ? i + 1 : i
+                    guard at < lines.count else { break }
+                    let next = lines[at]
+                    let trimmed = next.trimmingCharacters(in: .whitespaces)
+                    guard !trimmed.isEmpty,
+                          leadingIndent(of: next) > item.indent,
+                          listItem(in: next) == nil,
+                          !isThematicBreak(next),
+                          quoteBody(in: trimmed) == nil,
+                          !trimmed.hasPrefix("```"), !trimmed.hasPrefix("#"),
+                          !trimmed.hasPrefix("|"), !trimmed.hasPrefix("<")
+                    else { break }
+                    text += (blank ? softBreak + softBreak : softBreak) + trimmed
+                    i = at + 1
+                }
+                blocks.append(.listItem(item.marker, text, depth.level(forIndent: item.indent)))
                 continue
             }
 
@@ -2943,9 +5613,12 @@ struct MarkdownText: View {
             i += 1
             while i < lines.count {
                 let next = lines[i]
+                // A paragraph ends where any block begins: models skip the
+                // blank line before a list.
                 if next.trimmingCharacters(in: .whitespaces).isEmpty ||
                    next.hasPrefix("#") || next.hasPrefix("```") ||
-                   next.starts(with: "- ") || next.starts(with: "* ") ||
+                   listItem(in: next) != nil ||
+                   quoteBody(in: next) != nil ||
                    next.hasPrefix("<") ||
                    next.trimmingCharacters(in: .whitespaces).hasPrefix("|") {
                     break
@@ -2959,179 +5632,94 @@ struct MarkdownText: View {
         return blocks
     }
 
-    // MARK: Table parsing
-
-    private struct ParsedTable {
-        let headers: [String]
-        let rows: [[String]]
-        let alignments: [TableAlignment]
-        let end: Int  // index of the line *after* the table
-    }
-
-    /// Detect a GFM-style markdown table starting at `lines[start]`. Requires a
-    /// header row, a separator row of dashes (with optional colons for alignment),
-    /// and zero-or-more data rows. Returns nil if any structural check fails so
-    /// the caller falls through to paragraph handling.
-    private static func tryParseTable(lines: [String], start: Int) -> ParsedTable? {
-        guard start + 1 < lines.count else { return nil }
-        let headerLine = lines[start].trimmingCharacters(in: .whitespaces)
-        let sepLine = lines[start + 1].trimmingCharacters(in: .whitespaces)
-        // First try the strict GFM form (pipes + dashed separator).
-        if headerLine.contains("|"), isTableSeparator(sepLine) {
-            let headers = parseTableRow(headerLine)
-            let alignments = parseTableAlignments(sepLine)
-            guard !headers.isEmpty else { return nil }
-            var rows: [[String]] = []
-            var i = start + 2
-            while i < lines.count {
-                let r = lines[i].trimmingCharacters(in: .whitespaces)
-                guard r.contains("|") else { break }
-                if isTableSeparator(r) { break }
-                rows.append(parseTableRow(r))
-                i += 1
-            }
-            return ParsedTable(headers: headers, rows: rows, alignments: alignments, end: i)
-        }
-        // Fallback: ASCII pseudo-table — many smaller models emit
-        //   Header1   Header2   Header3
-        //   ---------------------------
-        //   value1    value2    value3
-        // i.e. multi-space column separators + a single row of dashes. Detect
-        // it by looking for a header line with at least two 2+-space gaps,
-        // followed by a row that's mostly dashes, followed by data rows that
-        // also have multi-space gaps. We split each row on `\s{2,}` to recover
-        // cells.
-        return tryParseAsciiPseudoTable(lines: lines, start: start)
-    }
-
-    /// Recognise the whitespace-aligned "table" shape smaller models emit when
-    /// asked for tabular data without using GFM pipe syntax. We require a
-    /// dashed-rule line within the next two lines and at least 3 columns in the
-    /// header so we don't false-positive a paragraph that happens to contain a
-    /// double space.
-    private static func tryParseAsciiPseudoTable(lines: [String], start: Int) -> ParsedTable? {
-        let header = lines[start]
-        let headerCells = splitOnDoubleSpace(header)
-        guard headerCells.count >= 2 else { return nil }
-        // Find the separator line — typically immediately next, sometimes after
-        // a blank line. Don't search far so paragraphs don't accidentally match.
-        var sepIdx = start + 1
-        while sepIdx < min(start + 3, lines.count) {
-            let candidate = lines[sepIdx].trimmingCharacters(in: .whitespaces)
-            if isAsciiRule(candidate) { break }
-            if !candidate.isEmpty { return nil }
-            sepIdx += 1
-        }
-        guard sepIdx < lines.count else { return nil }
-        guard isAsciiRule(lines[sepIdx].trimmingCharacters(in: .whitespaces)) else { return nil }
-        // Collect data rows: non-blank, with at least one 2+-space gap, and not
-        // another rule line.
-        var rows: [[String]] = []
-        var i = sepIdx + 1
-        while i < lines.count {
-            let raw = lines[i]
-            let t = raw.trimmingCharacters(in: .whitespaces)
-            if t.isEmpty { i += 1; break }
-            if isAsciiRule(t) { i += 1; break }
-            let cells = splitOnDoubleSpace(raw)
-            // Tolerate single-cell continuation lines (model wrapping a long
-            // cell to the next line) by appending to the previous row's last
-            // cell rather than starting a new row.
-            if cells.count == 1, !rows.isEmpty {
-                rows[rows.count - 1][rows[rows.count - 1].count - 1] += " " + cells[0]
-            } else {
-                rows.append(cells)
-            }
-            i += 1
-        }
-        guard !rows.isEmpty else { return nil }
-        // All-left alignment (we have no `:---:` markers in this format).
-        let alignments = [TableAlignment](repeating: .left, count: headerCells.count)
-        return ParsedTable(headers: headerCells, rows: rows, alignments: alignments, end: i)
-    }
-
-    /// Split on runs of two-or-more whitespace. Trims each cell. Drops the
-    /// empty leading element if the line was indented.
-    private static func splitOnDoubleSpace(_ line: String) -> [String] {
-        let parts = line.components(separatedBy: "  ")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        return parts
-    }
-
-    /// True if the (already-trimmed) line consists entirely of dashes / box-
-    /// drawing chars / spaces and is at least 3 chars long. Catches the
-    /// "----------" rule under header rows in pseudo-tables.
-    private static func isAsciiRule(_ line: String) -> Bool {
-        guard line.count >= 3 else { return false }
-        let allowed: Set<Character> = ["-", "─", "=", " ", "|"]
-        let allAllowed = line.allSatisfy { allowed.contains($0) }
-        let hasDash = line.contains("-") || line.contains("─") || line.contains("=")
-        return allAllowed && hasDash
-    }
-
-    private static func parseTableRow(_ line: String) -> [String] {
-        var t = line.trimmingCharacters(in: .whitespaces)
-        if t.hasPrefix("|") { t.removeFirst() }
-        if t.hasSuffix("|") { t.removeLast() }
-        return t.split(separator: "|", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-    }
-
-    private static func isTableSeparator(_ line: String) -> Bool {
-        let cells = parseTableRow(line)
-        guard !cells.isEmpty else { return false }
-        return cells.allSatisfy { cell in
-            let c = cell.replacingOccurrences(of: " ", with: "")
-            return c.range(of: "^:?-{3,}:?$", options: .regularExpression) != nil
-        }
-    }
-
-    private static func parseTableAlignments(_ line: String) -> [TableAlignment] {
-        return parseTableRow(line).map { cell in
-            let c = cell.replacingOccurrences(of: " ", with: "")
-            let leftColon = c.hasPrefix(":")
-            let rightColon = c.hasSuffix(":")
-            if leftColon && rightColon { return .center }
-            if rightColon { return .right }
-            return .left
-        }
-    }
-
     // MARK: NSAttributedString assembly
+
+    /// Rendered prose runs, keyed by source + appearance because inline math
+    /// attachments are rasterized in the resolved label color.
+    private static let renderCache: NSCache<NSString, NSAttributedString> = {
+        let c = NSCache<NSString, NSAttributedString>()
+        c.countLimit = 256
+        return c
+    }()
 
     /// Build the NSAttributedString fed to NSTextView. Public-static so the
     /// rendering path can be exercised by tests later if needed.
     static func attributedString(for source: String) -> NSAttributedString {
+        attributedString(for: source, theme: .light)
+    }
+
+    static func attributedString(for source: String, theme: LaTeXTheme) -> NSAttributedString {
+        // Everything baked into the string (fonts, leading) rides the key.
+        let key = """
+        \(theme.rawValue)\u{0}\(ChatMetrics.transcriptFontSize)\u{0}\
+        \(ChatMetrics.compactMode)\u{0}\(source)
+        """ as NSString
+        if let hit = renderCache.object(forKey: key) { return hit }
+        let built = buildAttributedString(for: source, theme: theme)
+        renderCache.setObject(built, forKey: key)
+        return built
+    }
+
+    private static func buildAttributedString(
+        for source: String,
+        theme: LaTeXTheme
+    ) -> NSAttributedString {
         let result = NSMutableAttributedString()
         let blocks = parseBlocks(source: source)
+
+        func isItem(_ index: Int) -> Bool {
+            guard index >= 0, index < blocks.count else { return false }
+            if case .listItem = blocks[index] { return true }
+            return false
+        }
+
         for (idx, block) in blocks.enumerated() {
-            if idx > 0 { result.append(blockSpacer()) }
+            // Items are their own blocks and carry their own newline; the
+            // spacer only opens and closes the list.
+            if idx > 0, !(isItem(idx) && isItem(idx - 1)) { result.append(blockSpacer()) }
             switch block {
             case .paragraph(let text):
-                result.append(renderInline(text))
+                // Leading + a real gap after each paragraph (single-newline
+                // "**Label.** text" runs the models love are paragraphs too).
+                let p = NSMutableParagraphStyle()
+                p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
+                p.paragraphSpacing = 8
+                let para = NSMutableAttributedString(attributedString: renderInline(text, theme: theme))
+                para.addAttribute(.paragraphStyle, value: p,
+                                  range: NSRange(location: 0, length: para.length))
+                result.append(para)
 
             case .heading(let level, let text):
-                let size: CGFloat = level == 1 ? 18 : level == 2 ? 16 : 14
+                // Scaled from the body size, so raising the reading size
+                // raises the headings with it instead of flattening them.
+                let base = ChatMetrics.transcriptFontSize
+                let size: CGFloat = level == 1 ? base + 5 : level == 2 ? base + 3 : base + 1
                 let p = NSMutableParagraphStyle()
-                p.paragraphSpacingBefore = 4
+                p.paragraphSpacingBefore = 10
                 p.paragraphSpacing = 2
-                let attrs: [NSAttributedString.Key: Any] = [
+                p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
+                let heading = NSMutableAttributedString(
+                    attributedString: renderInline(text, theme: theme, fontSize: size)
+                )
+                let full = NSRange(location: 0, length: heading.length)
+                heading.addAttributes([
                     .font: NSFont.systemFont(ofSize: size, weight: .bold),
-                    .foregroundColor: NSColor.labelColor,
                     .paragraphStyle: p,
-                ]
-                result.append(NSAttributedString(string: text, attributes: attrs))
+                ], range: full)
+                result.append(heading)
 
             case .code(_, let content):
                 let p = NSMutableParagraphStyle()
                 p.paragraphSpacingBefore = 4
                 p.paragraphSpacing = 4
+                // Its own gutter, so the tinted block stands off the text.
                 p.firstLineHeadIndent = 8
                 p.headIndent = 8
                 p.tailIndent = -8
+                // Less air than prose — a listing wants rows.
+                p.lineHeightMultiple = ChatMetrics.codeLineHeightMultiple
                 let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+                    .font: NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .regular),
                     .backgroundColor: NSColor.textBackgroundColor.blended(withFraction: 0.85, of: .black) ?? NSColor.darkGray,
                     .foregroundColor: NSColor(white: 0.92, alpha: 1.0),
                     .paragraphStyle: p,
@@ -3140,19 +5728,83 @@ struct MarkdownText: View {
                 linkifyBareUrls(code)
                 result.append(code)
 
-            case .listItem(let text):
-                let bullet = NSAttributedString(string: "• ", attributes: [
-                    .font: NSFont.systemFont(ofSize: 13),
-                    .foregroundColor: NSColor.secondaryLabelColor,
+            case .listItem(let marker, let text, let level):
+                let bullet = NSAttributedString(string: marker + " ", attributes: [
+                    .font: NSFont.systemFont(ofSize: ChatMetrics.transcriptFontSize),
+                    .foregroundColor: taskBoxes.contains(marker)
+                        ? NSColor.labelColor : NSColor.secondaryLabelColor,
                 ])
                 let p = NSMutableParagraphStyle()
-                p.headIndent = 14
-                let inline = renderInline(text)
+                // One step per level; the hanging indent hangs off the marker's
+                // own width, so wrapped lines and the item's own second line
+                // line up under its text.
+                let step = CGFloat(level) * ChatMetrics.listIndentStep
+                p.firstLineHeadIndent = step
+                p.headIndent = step + bullet.size().width.rounded(.up)
+                p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
+                // Tight between items, a paragraph's worth after the last.
+                p.paragraphSpacing = isItem(idx + 1) ? 4 : 8
+                let inline = renderInline(text, theme: theme)
                 let combined = NSMutableAttributedString()
                 combined.append(bullet)
                 combined.append(inline)
+                // No block spacer between items, so the item ends itself.
+                if isItem(idx + 1) { combined.append(NSAttributedString(string: "\n")) }
                 combined.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: combined.length))
                 result.append(combined)
+
+            case .thematicBreak:
+                // A rule is a bordered block for the same reason the quote bar
+                // is one: an attributed string has no "line across here".
+                let table = NSTextTable()
+                table.numberOfColumns = 1
+                let cell = NSTextTableBlock(table: table, startingRow: 0, rowSpan: 1,
+                                            startingColumn: 0, columnSpan: 1)
+                cell.setContentWidth(100, type: .percentageValueType)
+                cell.setWidth(1, type: .absoluteValueType, for: .border, edge: .minY)
+                cell.setBorderColor(NSColor.separatorColor, for: .minY)
+                cell.setWidth(8, type: .absoluteValueType, for: .margin, edge: .minY)
+                cell.setWidth(8, type: .absoluteValueType, for: .margin, edge: .maxY)
+                let p = NSMutableParagraphStyle()
+                p.textBlocks = [cell]
+                // The cell needs something to hold; at 1pt the rule is the
+                // only thing with height.
+                result.append(NSAttributedString(string: "\u{00A0}", attributes: [
+                    .font: NSFont.systemFont(ofSize: 1),
+                    .paragraphStyle: p,
+                ]))
+
+            case .table(let headers, let rows, let alignments):
+                result.append(renderTable(headers: headers, rows: rows, alignments: alignments, theme: theme))
+
+            case .quote(let text):
+                // The bar is a one-cell `NSTextTable` with a leading border:
+                // an attributed string has no "rule beside this paragraph".
+                let table = NSTextTable()
+                table.numberOfColumns = 1
+                let cell = NSTextTableBlock(table: table, startingRow: 0, rowSpan: 1,
+                                            startingColumn: 0, columnSpan: 1)
+                cell.setContentWidth(100, type: .percentageValueType)
+                cell.setWidth(3, type: .absoluteValueType, for: .border, edge: .minX)
+                cell.setBorderColor(NSColor.separatorColor, for: .minX)
+                // A text block ignores paragraph spacing: air is the cell's
+                // margin. Vertical padding is lopsided because the extra
+                // leading sits above the letters.
+                cell.setWidth(10, type: .absoluteValueType, for: .padding, edge: .minX)
+                cell.setWidth(0, type: .absoluteValueType, for: .padding, edge: .minY)
+                cell.setWidth(8, type: .absoluteValueType, for: .padding, edge: .maxY)
+                cell.setWidth(6, type: .absoluteValueType, for: .margin, edge: .minY)
+                cell.setWidth(6, type: .absoluteValueType, for: .margin, edge: .maxY)
+
+                let p = NSMutableParagraphStyle()
+                p.textBlocks = [cell]
+                p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
+                p.paragraphSpacing = 4
+                let quoted = NSMutableAttributedString(attributedString: renderInline(text, theme: theme))
+                let range = NSRange(location: 0, length: quoted.length)
+                quoted.addAttribute(.paragraphStyle, value: p, range: range)
+                quoted.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor, range: range)
+                result.append(quoted)
 
             case .xmlBlock(let content):
                 let p = NSMutableParagraphStyle()
@@ -3166,9 +5818,121 @@ struct MarkdownText: View {
                 ]
                 result.append(NSAttributedString(string: content, attributes: attrs))
 
-            case .table(let headers, let rows, let alignments):
-                result.append(renderTable(headers: headers, rows: rows, alignments: alignments))
             }
+        }
+        return result
+    }
+
+    /// Render a table as an `NSTextTable` run appended directly into the
+    /// message's continuous attributed string, so drag-selection and copy
+    /// span prose and table cells together like every other block instead of
+    /// stopping at the table's edge. `NSTextTable` has no "tight to content"
+    /// sizing mode — every column is a percentage of the available width —
+    /// so columns are weighted by content length
+    /// reading column.
+    ///
+    /// Cell content is rendered through `renderCell`, memoized by cell text
+    /// - a table's earlier rows/cells don't change once streamed, only the
+    /// actively-growing last cell does, so this amortizes the per-cell
+    /// markdown/LaTeX-segmentation cost to near zero after the first full
+    /// render instead of repeating it for every unchanged cell on every
+    /// token.
+    private static let cellRenderCache: NSCache<NSString, NSAttributedString> = {
+        let c = NSCache<NSString, NSAttributedString>()
+        c.countLimit = 2048
+        return c
+    }()
+
+    private static func renderCell(_ text: String, theme: LaTeXTheme, bold: Bool) -> NSAttributedString {
+        let key = "\(theme.rawValue)\u{0}\(bold)\u{0}\(text)" as NSString
+        if let hit = cellRenderCache.object(forKey: key) { return hit }
+        let rendered = renderInline(text, theme: theme, weight: bold ? .semibold : .regular)
+        cellRenderCache.setObject(rendered, forKey: key)
+        return rendered
+    }
+
+    private static func renderTable(
+        headers: [String],
+        rows: [[String]],
+        alignments: [TableAlignment],
+        theme: LaTeXTheme
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let cols = headers.count
+        guard cols > 0 else { return result }
+
+        let table = NSTextTable()
+        table.numberOfColumns = cols
+        let fractions = MarkdownTable.columnFractions(headers: headers, rows: rows)
+        let dividerColor = NSColor.separatorColor
+        // A tint of the page toward the ink: thinning a label colour only
+        // darkens, in both appearances.
+        let headerFill = NSColor.textBackgroundColor
+            .blended(withFraction: 0.05, of: .labelColor) ?? .quaternaryLabelColor
+
+        func textAlignment(_ column: Int) -> NSTextAlignment {
+            guard column < alignments.count else { return .left }
+            switch alignments[column] {
+            case .left: return .left
+            case .right: return .right
+            case .center: return .center
+            }
+        }
+
+        // `NSTextTable` has no frame of its own: the outline is the edge cells'
+        // borders. Only `.maxY` between rows, or a neighbour's `.minY` doubles
+        // the line.
+        let outlineWeight: CGFloat = 1
+        let rowRuleWeight: CGFloat = 0.5
+        let lastRow = rows.count   // header is row 0
+
+        func appendRow(_ cells: [String], rowIndex: Int, bold: Bool) {
+            for column in 0..<cols {
+                let text = column < cells.count ? cells[column] : ""
+                let block = NSTextTableBlock(
+                    table: table, startingRow: rowIndex, rowSpan: 1,
+                    startingColumn: column, columnSpan: 1
+                )
+                block.setContentWidth(Double(fractions[column]) * 100, type: .percentageValueType)
+                block.setWidth(6, type: .absoluteValueType, for: .padding)
+
+                if rowIndex == 0 {
+                    block.backgroundColor = headerFill
+                    block.setBorderColor(dividerColor, for: .minY)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .minY)
+                    // A text table ignores the previous paragraph's spacing:
+                    // air above is a margin on the first row.
+                    block.setWidth(10, type: .absoluteValueType, for: .margin, edge: .minY)
+                }
+                if rowIndex == lastRow {
+                    block.setWidth(10, type: .absoluteValueType, for: .margin, edge: .maxY)
+                }
+                block.setBorderColor(dividerColor, for: .maxY)
+                block.setWidth(rowIndex == lastRow || rowIndex == 0 ? outlineWeight : rowRuleWeight,
+                               type: .absoluteValueType, for: .border, edge: .maxY)
+
+                // No rules between columns.
+                if column == 0 {
+                    block.setBorderColor(dividerColor, for: .minX)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .minX)
+                }
+                if column == cols - 1 {
+                    block.setBorderColor(dividerColor, for: .maxX)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .maxX)
+                }
+                let pStyle = NSMutableParagraphStyle()
+                pStyle.textBlocks = [block]
+                pStyle.alignment = textAlignment(column)
+                let cell = NSMutableAttributedString(attributedString: renderCell(text, theme: theme, bold: bold))
+                cell.append(NSAttributedString(string: "\n"))
+                cell.addAttribute(.paragraphStyle, value: pStyle, range: NSRange(location: 0, length: cell.length))
+                result.append(cell)
+            }
+        }
+
+        appendRow(headers, rowIndex: 0, bold: true)
+        for (index, row) in rows.enumerated() {
+            appendRow(row, rowIndex: index + 1, bold: false)
         }
         return result
     }
@@ -3177,7 +5941,7 @@ struct MarkdownText: View {
     /// paragraph spacing so tall blocks don't collapse.
     private static func blockSpacer() -> NSAttributedString {
         let p = NSMutableParagraphStyle()
-        p.paragraphSpacing = 6
+        p.paragraphSpacing = 8
         return NSAttributedString(string: "\n", attributes: [
             .font: NSFont.systemFont(ofSize: 6),
             .paragraphStyle: p,
@@ -3192,17 +5956,100 @@ struct MarkdownText: View {
     /// can leave `**bold**` and link spans with a baked-in `NSColor` that
     /// doesn't adapt, so we overwrite missing-or-static colors with
     /// `.labelColor` (links keep their dynamic `linkColor`).
-    private static func renderInline(_ text: String) -> NSAttributedString {
-        let bodyFont = NSFont.systemFont(ofSize: 13)
-        let result: NSMutableAttributedString
+    private struct InlineMathReplacement {
+        let marker: String
+        let latex: String
+        let raw: String
+    }
+    static func renderInline(
+        _ text: String,
+        theme: LaTeXTheme,
+        weight: NSFont.Weight = .regular,
+        fontSize: CGFloat = ChatMetrics.transcriptFontSize
+    ) -> NSAttributedString {
+        let bodyFont = NSFont.systemFont(ofSize: fontSize, weight: weight)
+        let prepared = inlineMathPlaceholders(in: text)
+        var result = markdownAttributedString(prepared.source)
+
+        let located = prepared.replacements.compactMap { replacement -> (InlineMathReplacement, NSRange)? in
+            let range = (result.string as NSString).range(of: replacement.marker)
+            return range.location == NSNotFound ? nil : (replacement, range)
+        }
+        // Foundation should preserve private-use marker scalars. If a future
+        // parser version does not, keep every source byte visible instead of
+        // silently dropping an equation.
+        if located.count != prepared.replacements.count {
+            result = markdownAttributedString(text)
+            applyInlineTypography(to: result, bodyFont: bodyFont)
+            linkifyBareUrls(result)
+            return result
+        }
+
+        applyInlineTypography(to: result, bodyFont: bodyFont)
+        for (replacement, range) in located.reversed() {
+            let inherited = result.attributes(at: range.location, effectiveRange: nil)
+            let rendered = InlineLaTeXRenderer.attributedAttachment(
+                latex: replacement.latex,
+                raw: replacement.raw,
+                theme: theme,
+                fontSize: fontSize
+            )
+            let inserted: NSMutableAttributedString
+            if let rendered {
+                inserted = NSMutableAttributedString(attributedString: rendered)
+            } else {
+                inserted = NSMutableAttributedString(string: replacement.raw)
+            }
+            inserted.addAttributes(
+                inherited,
+                range: NSRange(location: 0, length: inserted.length)
+            )
+            result.replaceCharacters(in: range, with: inserted)
+        }
+        linkifyBareUrls(result)
+        return result
+    }
+
+    private static func inlineMathPlaceholders(
+        in text: String
+    ) -> (source: String, replacements: [InlineMathReplacement]) {
+        var source = ""
+        var replacements: [InlineMathReplacement] = []
+
+        for segment in LaTeXSegmenter.segments(text) {
+            switch segment {
+            case .text(let value):
+                source += value
+            case .display(_, let raw):
+                // Display equations are split into their own SwiftUI view by
+                // latexBlocks(in:). Direct renderer callers keep them literal.
+                source += raw
+            case .inline(let latex, let raw):
+                var marker = "\u{E000}mlxlatex\(replacements.count)\u{E001}"
+                while text.contains(marker) || source.contains(marker) {
+                    marker += "x"
+                }
+                source += marker
+                replacements.append(InlineMathReplacement(marker: marker, latex: latex, raw: raw))
+            }
+        }
+        return (source, replacements)
+    }
+
+    private static func markdownAttributedString(_ text: String) -> NSMutableAttributedString {
         if let attr = try? AttributedString(
             markdown: text,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         ) {
-            result = NSMutableAttributedString(attr)
-        } else {
-            result = NSMutableAttributedString(string: text)
+            return NSMutableAttributedString(attr)
         }
+        return NSMutableAttributedString(string: text)
+    }
+
+    private static func applyInlineTypography(
+        to result: NSMutableAttributedString,
+        bodyFont: NSFont
+    ) {
         let full = NSRange(location: 0, length: result.length)
         // Default font for any character that didn't pick up an explicit font
         // from the markdown parser.
@@ -3233,8 +6080,48 @@ struct MarkdownText: View {
             }
             result.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
         }
-        linkifyBareUrls(result)
-        return result
+        // `~~struck~~` arrives as an intent, like bold and inline code do.
+        result.enumerateAttribute(.inlinePresentationIntent, in: full, options: []) { value, range, _ in
+            guard isStruckThrough(value) else { return }
+            result.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+        }
+        tintInlineCode(result, bodyFont: bodyFont)
+    }
+
+    /// The intent crosses the `AttributedString` bridge as an `NSNumber`.
+    private static func isStruckThrough(_ value: Any?) -> Bool {
+        if let intent = value as? InlinePresentationIntent { return intent.contains(.strikethrough) }
+        if let number = value as? NSNumber {
+            return InlinePresentationIntent(rawValue: number.uintValue).contains(.strikethrough)
+        }
+        return false
+    }
+
+    /// Inline code is found by `inlinePresentationIntent`, never by the font:
+    /// `NSFont.monospacedSystemFont` does not advertise the `.monoSpace` trait.
+    private static func tintInlineCode(_ result: NSMutableAttributedString, bodyFont: NSFont) {
+        let full = NSRange(location: 0, length: result.length)
+        let mono = NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize,
+                                               weight: .regular)
+        result.enumerateAttributes(in: full, options: []) { attrs, range, _ in
+            guard isInlineCode(attrs[.inlinePresentationIntent]),
+                  // A fenced block sets its own ground and its own colours.
+                  attrs[.backgroundColor] == nil
+            else { return }
+            // A marker, not `.backgroundColor` (that paints the whole line
+            // fragment): `IntrinsicTextView` draws the ground itself.
+            result.addAttributes([.font: mono, .inlineCodeGround: true], range: range)
+        }
+    }
+
+    /// The intent crosses the `AttributedString` bridge as an `NSNumber` of the
+    /// option set's raw value, not as the Swift type.
+    private static func isInlineCode(_ value: Any?) -> Bool {
+        if let intent = value as? InlinePresentationIntent { return intent.contains(.code) }
+        if let number = value as? NSNumber {
+            return InlinePresentationIntent(rawValue: number.uintValue).contains(.code)
+        }
+        return false
     }
 
     /// Shared detector — creating an NSDataDetector is not free and renderInline
@@ -3272,75 +6159,48 @@ struct MarkdownText: View {
         }
     }
 
-    /// Render a markdown table as monospaced columns padded to the widest cell
-    /// per column. Header row gets a bold font; a horizontal rule separates the
-    /// header from the data rows. Looks great in a chat bubble and stays
-    /// selectable as part of the surrounding text.
-    private static func renderTable(
-        headers: [String],
-        rows: [[String]],
-        alignments: [TableAlignment]
-    ) -> NSAttributedString {
-        let cols = headers.count
-        var widths = [Int](repeating: 0, count: cols)
-        let allRows = [headers] + rows
-        for row in allRows {
-            for (j, cell) in row.prefix(cols).enumerated() {
-                widths[j] = max(widths[j], cell.count)
+}
+
+/// A complete display equation is its own horizontally scrollable surface.
+/// SwaTex's MathView performs all parsing/layout/drawing; malformed model
+/// output falls back to the exact delimiters and TeX the model streamed.
+fileprivate struct DisplayLaTeXView: View {
+    let latex: String
+    let raw: String
+    let theme: LaTeXTheme
+
+    private var fontSize: CGFloat { ChatMetrics.transcriptFontSize + 4 }
+
+    var body: some View {
+        if DisplayLaTeXRenderer.canRender(latex, theme: theme, fontSize: fontSize) {
+            ScrollView(.horizontal) {
+                MathView(latex)
+                    .font(size: fontSize)
+                    .mathColor(SwiftUI.Color.primary)
+                    .padding(.vertical, 2)
             }
-        }
-        // Pad cells with at least 1 space so columns don't visually merge.
-        for j in 0..<cols { widths[j] = max(widths[j], 1) }
-
-        func pad(_ cell: String, width: Int, align: TableAlignment) -> String {
-            let gap = width - cell.count
-            if gap <= 0 { return cell }
-            switch align {
-            case .left:   return cell + String(repeating: " ", count: gap)
-            case .right:  return String(repeating: " ", count: gap) + cell
-            case .center:
-                let l = gap / 2
-                return String(repeating: " ", count: l) + cell + String(repeating: " ", count: gap - l)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contextMenu {
+                Button("Copy Equation") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(raw, forType: .string)
+                }
             }
+        } else {
+            SelectableMarkdownNSText(attributed: NSAttributedString(
+                string: raw,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: ChatMetrics.transcriptFontSize),
+                    .foregroundColor: NSColor.labelColor,
+                ]
+            ))
         }
-
-        func formatRow(_ cells: [String]) -> String {
-            var padded = cells
-            while padded.count < cols { padded.append("") }
-            return padded.prefix(cols).enumerated().map { idx, cell in
-                let a = idx < alignments.count ? alignments[idx] : .left
-                return pad(cell, width: widths[idx], align: a)
-            }.joined(separator: "  ")
-        }
-
-        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let monoBold = NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
-        let result = NSMutableAttributedString()
-
-        // Header row (bold) + horizontal rule using box-drawing chars. Explicit
-        // `.foregroundColor: .labelColor` so the table flips light/dark with
-        // the system mode — without it some macOS versions render the cells
-        // in the captured static color from the AttributedString bridge.
-        let headerLine = formatRow(headers) + "\n"
-        result.append(NSAttributedString(string: headerLine, attributes: [
-            .font: monoBold,
-            .foregroundColor: NSColor.labelColor,
-        ]))
-        let rule = widths.map { String(repeating: "─", count: $0) }.joined(separator: "  ") + "\n"
-        result.append(NSAttributedString(string: rule, attributes: [
-            .font: mono,
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]))
-        // Data rows.
-        for (idx, row) in rows.enumerated() {
-            let line = formatRow(row) + (idx == rows.count - 1 ? "" : "\n")
-            result.append(NSAttributedString(string: line, attributes: [
-                .font: mono,
-                .foregroundColor: NSColor.labelColor,
-            ]))
-        }
-        return result
     }
+}
+
+extension NSAttributedString.Key {
+    /// Marks an inline code span; `IntrinsicTextView` draws the ground.
+    static let inlineCodeGround = NSAttributedString.Key("MLXInlineCodeGround")
 }
 
 // MARK: - SelectableMarkdownNSText (NSTextView wrapper)
@@ -3388,17 +6248,100 @@ fileprivate struct SelectableMarkdownNSText: NSViewRepresentable {
     }
 }
 
+/// Where an inline-code span's ground is drawn: one rect per line the span
+/// occupies, each ending at that line's last visible glyph.
+///
+/// Not `enumerateEnclosingRects`, which is SELECTION geometry: a span that
+/// continues on the next line takes its first fragment all the way to the
+/// container's trailing edge, and the tint ran to the right margin.
+enum InlineCodeGround {
+    static func rects(forGlyphRange glyphs: NSRange,
+                      layoutManager: NSLayoutManager,
+                      in container: NSTextContainer) -> [NSRect] {
+        guard glyphs.length > 0, let text = layoutManager.textStorage?.string as NSString? else { return [] }
+        var rects: [NSRect] = []
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphs) { _, _, _, lineGlyphs, _ in
+            let onThisLine = NSIntersectionRange(lineGlyphs, glyphs)
+            guard onThisLine.length > 0 else { return }
+            // The space a line breaks at belongs to the line, and tinting
+            // it is what reaches the margin.
+            var chars = layoutManager.characterRange(forGlyphRange: onThisLine, actualGlyphRange: nil)
+            while chars.length > 0,
+                  let last = text.substring(with: NSRange(location: chars.upperBound - 1, length: 1)).unicodeScalars.first,
+                  CharacterSet.whitespacesAndNewlines.contains(last) {
+                chars.length -= 1
+            }
+            guard chars.length > 0 else { return }
+            let visible = layoutManager.glyphRange(forCharacterRange: chars, actualCharacterRange: nil)
+            guard visible.length > 0 else { return }
+            rects.append(layoutManager.boundingRect(forGlyphRange: visible, in: container))
+        }
+        return rects
+    }
+}
+
 /// NSTextView that reports its laid-out height as its intrinsic content size,
 /// so embedding it in SwiftUI's layout system "just works" — no manual height
 /// binding required.
 fileprivate final class IntrinsicTextView: NSTextView {
+    /// Answering costs a full `ensureLayout` of the run, and auto-layout asks
+    /// several times per pass — so the answer is cached until something that can
+    /// actually change it happens.
+    private var cachedHeight: CGFloat?
+
     override var intrinsicContentSize: NSSize {
+        if let cachedHeight { return NSSize(width: NSView.noIntrinsicMetric, height: cachedHeight) }
         guard let lm = layoutManager, let tc = textContainer else {
             return super.intrinsicContentSize
         }
         lm.ensureLayout(for: tc)
-        let used = lm.usedRect(for: tc)
-        return NSSize(width: NSView.noIntrinsicMetric, height: ceil(used.height))
+        let height = ceil(lm.usedRect(for: tc).height)
+        cachedHeight = height
+        return NSSize(width: NSView.noIntrinsicMetric, height: height)
+    }
+
+    override func invalidateIntrinsicContentSize() {
+        cachedHeight = nil
+        super.invalidateIntrinsicContentSize()
+    }
+
+    /// Inline-code grounds go under the glyphs, at the font's own band rather
+    /// than the line fragment a `.backgroundColor` attribute would fill.
+    override func draw(_ dirtyRect: NSRect) {
+        drawInlineCodeGrounds()
+        super.draw(dirtyRect)
+    }
+
+    private func drawInlineCodeGrounds() {
+        guard let layoutManager, let textContainer, let textStorage else { return }
+        let origin = textContainerOrigin
+        // Same tint as a table header.
+        let fill = NSColor.textBackgroundColor
+            .blended(withFraction: 0.05, of: .labelColor) ?? .quaternaryLabelColor
+        fill.setFill()
+
+        textStorage.enumerateAttribute(.inlineCodeGround,
+                                       in: NSRange(location: 0, length: textStorage.length),
+                                       options: []) { value, range, _ in
+            guard value != nil else { return }
+            let font = textStorage.attribute(.font, at: range.location,
+                                             effectiveRange: nil) as? NSFont
+            let band = ((font?.ascender ?? 10) - (font?.descender ?? -3)) + 2
+            let glyphs = layoutManager.glyphRange(forCharacterRange: range,
+                                                  actualCharacterRange: nil)
+            for rect in InlineCodeGround.rects(forGlyphRange: glyphs,
+                                               layoutManager: layoutManager,
+                                               in: textContainer) {
+                var box = rect.offsetBy(dx: origin.x, dy: origin.y)
+                if box.height > band {
+                    box = box.insetBy(dx: 0, dy: (box.height - band) / 2)
+                }
+                // Flipped view: extra height grows downward.
+                box = box.insetBy(dx: -4, dy: 0)
+                box.size.height += 4
+                NSBezierPath(roundedRect: box, xRadius: 3, yRadius: 3).fill()
+            }
+        }
     }
 
     override func didChangeText() {
@@ -3406,10 +6349,40 @@ fileprivate final class IntrinsicTextView: NSTextView {
         invalidateIntrinsicContentSize()
     }
 
+    override func copy(_ sender: Any?) {
+        let range = selectedRange()
+        guard range.length > 0, let textStorage else {
+            super.copy(sender)
+            return
+        }
+
+        var containsLaTeX = false
+        textStorage.enumerateAttribute(.mlxLaTeXSource, in: range) { value, _, stop in
+            if value != nil {
+                containsLaTeX = true
+                stop.pointee = true
+            }
+        }
+        guard containsLaTeX else {
+            super.copy(sender)
+            return
+        }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(
+            LaTeXCopyText.string(from: textStorage, range: range),
+            forType: .string
+        )
+    }
+
     override func setFrameSize(_ newSize: NSSize) {
+        // This view WRAPS, so only a width change can alter its height.
+        // Invalidating on any frame change fed the height we ourselves just
+        // reported straight back in as a fresh invalidation — layout, invalidate,
+        // layout again, several times per frame.
+        let widthChanged = abs(newSize.width - frame.width) > 0.5
         super.setFrameSize(newSize)
-        // Width changes (parent re-flow) require a layout-driven height re-check.
-        invalidateIntrinsicContentSize()
+        if widthChanged { invalidateIntrinsicContentSize() }
     }
 }
 
@@ -3442,10 +6415,39 @@ enum ComposerLayout {
 /// idle, and is otherwise swallowed (never a stray newline mid-generation).
 enum ComposerReturnAction: Equatable { case send, newline, ignore }
 
+/// What an Escape keypress does in the composer. `.pass` hands the key back to
+/// AppKit rather than swallowing it — with no turn to stop, Escape still has
+/// its platform meaning here.
+enum ComposerEscapeAction: Equatable { case stop, pass }
+
+/// A key the composer offers to the "/" menu before handling it itself.
+enum ComposerKeyCommand { case up, down, accept, cancel }
+
 enum ComposerKey {
     static func onReturn(shift: Bool, isIdle: Bool) -> ComposerReturnAction {
         if shift { return .newline }
         return isIdle ? .send : .ignore
+    }
+
+    /// Escape stops the reply being written, and does nothing otherwise.
+    ///
+    /// This runs from `cancelOperation(_:)` — the RESPONDER CHAIN — not from a
+    /// `.keyboardShortcut(.cancelAction)`. Key equivalents are offered the
+    /// keystroke first, so the edit bubble's Cancel and the tool-approval
+    /// sheet's Deny keep Escape whenever they are on screen, and the composer
+    /// only sees it when neither is. That ordering is the whole reason this
+    /// is not a hidden button like ⌘R regenerate.
+    static func onEscape(isGenerating: Bool) -> ComposerEscapeAction {
+        isGenerating ? .stop : .pass
+    }
+
+    /// Whether an in-place message edit is submittable — the ONE gate the Save
+    /// button and the Return key both read. A resubmit drops the old reply and
+    /// everything after it, so a blanked draft must not be able to spend that:
+    /// the edit field feeds this to `onReturn`'s `isIdle`, which turns a bare
+    /// Return on nothing into `.ignore` rather than a send.
+    static func editCanSubmit(_ draft: String) -> Bool {
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 
@@ -3463,8 +6465,24 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var maxLines: Int = 15
     var isIdle: Bool
     var onSend: () -> Void
+    /// Escape, from the responder chain. Defaults to nothing so a field that
+    /// has no use for the key leaves it to AppKit.
+    var onCancel: () -> Bool = { false }
+    /// ↑ / ↓, with WHERE THE CARET IS — the composer recalls earlier messages,
+    /// but only from the edge of the text, so the keys keep moving the caret
+    /// inside a multi-line draft (`ComposerHistory`). Returning false hands the
+    /// key back to AppKit. Defaults to nothing: the in-place message editor has
+    /// no history to walk.
+    var onArrow: (ComposerHistory.Direction, _ caretAtStart: Bool, _ caretAtEnd: Bool) -> Bool = { _, _, _ in false }
+    /// Keys the "/" menu wants first. Returns true when it consumed one — the
+    /// editor's own Return handling, Escape and arrow recall only run when
+    /// nothing above claimed the key.
+    var onKeyCommand: (ComposerKeyCommand) -> Bool = { _ in false }
 
-    let inset = NSSize(width: 7, height: 8)
+    /// Read from the SAME constants the placeholder overlay reads — the two
+    /// are related only by arithmetic nobody's type system checks.
+    let inset = NSSize(width: ComposerTextMetrics.containerInsetWidth,
+                       height: ComposerTextMetrics.containerInsetHeight)
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -3491,7 +6509,7 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         tv.isVerticallyResizable = true
         tv.isHorizontallyResizable = false
         tv.textContainer?.widthTracksTextView = true
-        tv.textContainer?.lineFragmentPadding = 2
+        tv.textContainer?.lineFragmentPadding = ComposerTextMetrics.lineFragmentPadding
         tv.autoresizingMask = [.width]
         tv.string = text
         tv.onBecomeFocus = { [weak c = context.coordinator] in c?.setFocus(true) }
@@ -3510,19 +6528,41 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         // in-progress edit at the same value.
         if tv.string != text {
             tv.string = text
+            // Caret to the END of whatever was just put in the field. Setting
+            // `string` collapses the selection to the front, which after a
+            // history recall means typing lands BEFORE the recalled message and
+            // ↓ (which arms at the end) can never walk back out of it.
+            tv.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
             context.coordinator.recomputeHeight()
         }
         let enabled = context.environment.isEnabled
         if tv.isEditable != enabled { tv.isEditable = enabled }
-        // Drive AppKit first-responder from the SwiftUI focus mirror.
-        if isFocused, tv.window != nil, tv.window?.firstResponder !== tv {
-            DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+        // Drive AppKit first-responder from the SwiftUI focus mirror — on the
+        // EDGE of a request, never on its level.
+        //
+        // This ran on every update while `isFocused` was true, which made the
+        // field impossible to leave: `onResignFocus` publishes the cleared flag
+        // ASYNCHRONOUSLY, so any update in between saw a still-true flag and a
+        // text view that no longer had the keyboard, and handed it straight
+        // back. `isFocused` is set true on appear and again whenever a turn goes
+        // idle, and nothing ever cleared it, so the composer held the keyboard
+        // for the life of the window — and ⌘⌫ read "the user is typing" forever
+        // (live 2026-08-12).
+        if isFocused != context.coordinator.appliedFocus {
+            context.coordinator.appliedFocus = isFocused
+            if isFocused, tv.window != nil, tv.window?.firstResponder !== tv {
+                DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+            }
         }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: GrowingTextEditor
         weak var textView: ComposerTextView?
+        /// The last focus REQUEST this view acted on, so `updateNSView` can
+        /// tell "focus me" from "you are still notionally focused" — see the
+        /// note there.
+        var appliedFocus = false
         init(_ parent: GrowingTextEditor) { self.parent = parent }
 
         func textDidChange(_ notification: Notification) {
@@ -3532,7 +6572,51 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            // The "/" skill menu gets FIRST REFUSAL on every key it navigates
+            // with, and only a menu that is actually open claims one. When it
+            // declines, the composer's own bindings below run unchanged — so
+            // Escape still stops a reply and ↑/↓ still walk history whenever
+            // the menu is closed. Order matters both ways: an open menu that
+            // let Escape through would stop the generation instead of closing
+            // itself, and arrows reaching history would scroll the transcript
+            // out from under the highlighted row.
+            switch commandSelector {
+            case #selector(NSResponder.moveUp(_:)):
+                if parent.onKeyCommand(.up) { return true }
+            case #selector(NSResponder.moveDown(_:)):
+                if parent.onKeyCommand(.down) { return true }
+            case #selector(NSResponder.insertTab(_:)):
+                if parent.onKeyCommand(.accept) { return true }
+            case #selector(NSResponder.cancelOperation(_:)):
+                if parent.onKeyCommand(.cancel) { return true }
+            default:
+                break
+            }
+            // Escape. Reached only when no `.cancelAction` key equivalent is on
+            // screen to claim it first — see ComposerKey.onEscape.
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                return parent.onCancel()
+            }
+            // ↑ / ↓ recall earlier messages, but the caret position is what
+            // decides — a draft is regularly several lines tall, and swallowing
+            // the arrows inside one would make it uneditable. The rule needs
+            // both edges, so both are measured here rather than inferred: the
+            // caret is at the start and the end simultaneously in an empty
+            // field, which is the state the walk arms from.
+            if commandSelector == #selector(NSResponder.moveUp(_:))
+                || commandSelector == #selector(NSResponder.moveDown(_:)) {
+                let selection = textView.selectedRange()
+                let length = (textView.string as NSString).length
+                let collapsed = selection.length == 0
+                return parent.onArrow(
+                    commandSelector == #selector(NSResponder.moveUp(_:)) ? .up : .down,
+                    collapsed && selection.location == 0,
+                    collapsed && selection.location == length)
+            }
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
+            // Return picks the highlighted command when the menu is open —
+            // it must not send a half-typed "/mus".
+            if parent.onKeyCommand(.accept) { return true }
             let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
             switch ComposerKey.onReturn(shift: shift, isIdle: parent.isIdle) {
             case .newline:
@@ -3588,4 +6672,3 @@ fileprivate final class ComposerTextView: NSTextView {
         return ok
     }
 }
-

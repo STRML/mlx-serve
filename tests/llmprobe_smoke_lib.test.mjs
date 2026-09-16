@@ -47,12 +47,21 @@ test("familyKey folds _text siblings onto the base arch and splits MoE out", () 
     familyKey(model("a", "gemma4", { meta: { architecture: "gemma4", is_moe: true } })),
     "gemma4-moe",
   );
+  // Ling is the same shape: `bailing_hybrid` carries no _moe suffix, so only
+  // is_moe puts it in the MoE bucket — and the MoE bucket is what defaults its
+  // MTP and drafter cells OFF.
+  assert.equal(
+    familyKey(model("a", "bailing_hybrid", { meta: { architecture: "bailing_hybrid", is_moe: true } })),
+    "bailing_hybrid-moe",
+  );
 });
 
 // ── what we probe ──────────────────────────────────────────────────────────
 
 test("isProbeable takes MLX chat models only — no gguf, ds4, encoders or media", () => {
   assert.ok(isProbeable(model("ok", "gemma4")));
+
+  assert.ok(isProbeable(model("ling", "bailing_hybrid")));
 
   // Engine-served GGUF (llama.cpp / ds4) — out of scope by request.
   assert.ok(!isProbeable(model("g", "gguf")));
@@ -189,11 +198,9 @@ test("planCells: the KV-quant cells are a crash check on one model, at its real 
 
   const cells = planCells({ id: "m", family: "gemma4" }, { kvCheck: true });
   const kv4 = cells.find((c) => c.id === "kv4");
-  const turbo = cells.find((c) => c.id === "kv-turbo4");
   // No --no-pld/--no-mtp: the point is "does the server survive the config a
   // user actually runs", so speculation stays at its defaults.
   assert.deepEqual(kv4.flags, ["--kv-quant", "4"]);
-  assert.deepEqual(turbo.flags, ["--kv-quant", "turbo4"]);
 });
 
 // ── engagement: perf alone cannot prove a spec path ran ─────────────────────
@@ -254,13 +261,13 @@ test("buildSummary flags a cell whose conformance regressed against its own base
     },
     {
       family: "gemma4",
-      cell: "kv-turbo4",
+      cell: "kv4",
       result: { conformance: { passed: 37, total: 40 }, bench: { decodeTokPerSec: { median: 55 } } },
     },
   ];
   const s = buildSummary(rows);
   assert.equal(s.regressions.length, 1);
-  assert.match(s.regressions[0], /gemma4.*kv-turbo4.*40 → 37/);
+  assert.match(s.regressions[0], /gemma4.*kv4.*40 → 37/);
 });
 
 test("buildSummary names the fastest cell per family — the birds-eye answer", () => {

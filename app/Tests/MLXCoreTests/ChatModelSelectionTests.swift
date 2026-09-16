@@ -41,6 +41,7 @@ final class ChatModelSelectionTests: XCTestCase {
             switch ChatModelSelection.action(for: tag) {
             case .selectLan(let id): XCTAssertEqual(id, lan)
             case .selectLocal(let p): XCTAssertEqual(p, path)
+            case .selectApple: XCTFail("no apple tag was built")
             }
         }
     }
@@ -50,6 +51,110 @@ final class ChatModelSelectionTests: XCTestCase {
         // "lan" or a path with "lan:" inside it must still load locally.
         XCTAssertEqual(ChatModelSelection.action(for: "/Users/me/lan/models"),
                        .selectLocal("/Users/me/lan/models"))
+    }
+
+    // MARK: - What the pill SHOWS
+    //
+    // The pill names the model answering this conversation and says whether it
+    // is ready. Two things it got wrong: a Hugging Face cache model is stored
+    // under `models--<org>--<repo>/snapshots/<commit>/`, so the server's id for
+    // it is the COMMIT HASH (registry ids are the dir basename) and the pill
+    // rendered a hex string where the tray — which reads our own scan — showed
+    // the repo id; and a hot switch keeps answering on the OLD model until the
+    // new one is resident, so a big model loaded for a minute with the pill
+    // still naming the previous one and a green dot beside it.
+
+    private func local(_ path: String, _ name: String) -> LocalModel {
+        LocalModel(id: name, name: name, path: path, sizeFormatted: "4 GB",
+                   modelType: "qwen3", source: .mlxServe, kind: .base)
+    }
+
+    private var hfCacheModel: LocalModel {
+        local("/Users/me/.cache/huggingface/hub/models--mlx-community--Qwen3.5-4B-MLX-4bit/snapshots/9f0ea3c1d2",
+              "mlx-community/Qwen3.5-4B-MLX-4bit")
+    }
+
+    func testAnHfCacheModelShowsItsRepoIdNotTheCommitHash() {
+        let m = hfCacheModel
+        let state = ChatModelSelection.pillState(lanChatModelId: nil,
+                                                 residentName: "9f0ea3c1d2",
+                                                 loadingPath: nil,
+                                                 selectedPath: m.path,
+                                                 models: [m])
+        XCTAssertEqual(state.name, "mlx-community/Qwen3.5-4B-MLX-4bit")
+        XCTAssertFalse(state.isLoading)
+    }
+
+    func testAResidentModelWeDidNotPickKeepsTheServersOwnName() {
+        // Another surface (a gen pane, a task) can leave a different model
+        // resident. We have no local label for it, and borrowing the selected
+        // model's label would name the wrong model — the server's id is honest.
+        let m = hfCacheModel
+        let state = ChatModelSelection.pillState(lanChatModelId: nil,
+                                                 residentName: "some/other-model",
+                                                 loadingPath: nil,
+                                                 selectedPath: m.path,
+                                                 models: [m])
+        XCTAssertEqual(state.name, "some/other-model")
+    }
+
+    func testASwitchInFlightNamesTheModelBeingLoadedAndSaysItIsLoading() {
+        // The server answers on the old model for the whole load, so
+        // `residentName` is the PREVIOUS one here — the pill must show what
+        // the user just picked, with the spinner.
+        let old = local("/models/mlx-community/gemma", "mlx-community/gemma-4-12b")
+        let new = local("/models/ddalcu/qwen38", "ddalcu/Qwen3.8-27B-MLX-Serve-4bit")
+        let state = ChatModelSelection.pillState(lanChatModelId: nil,
+                                                 residentName: old.name,
+                                                 loadingPath: new.path,
+                                                 selectedPath: new.path,
+                                                 models: [old, new])
+        XCTAssertEqual(state.name, "ddalcu/Qwen3.8-27B-MLX-Serve-4bit")
+        XCTAssertTrue(state.isLoading)
+    }
+
+    func testALoadOfAPathWeHaveNoLabelForNamesThatPathNotTheOldModel() {
+        // A load can be in flight for a path outside the pickable list (the
+        // model turned non-pickable mid-session, a custom dir). Naming the
+        // still-resident PREVIOUS model beside the spinner says the wrong
+        // model is loading — the path's own basename is the honest fallback.
+        let old = local("/models/mlx-community/gemma", "mlx-community/gemma-4-12b")
+        let state = ChatModelSelection.pillState(lanChatModelId: nil,
+                                                 residentName: old.name,
+                                                 loadingPath: "/models/custom/my-model",
+                                                 selectedPath: "/models/custom/my-model",
+                                                 models: [old])
+        XCTAssertEqual(state.name, "my-model")
+        XCTAssertTrue(state.isLoading)
+    }
+
+    func testALanPickIsNeverShownAsLoading() {
+        // A LAN model loads nothing here; a stale in-flight path must not make
+        // a conversation that is already answering look busy.
+        let m = hfCacheModel
+        let state = ChatModelSelection.pillState(lanChatModelId: "qwen@studio",
+                                                 residentName: nil,
+                                                 loadingPath: m.path,
+                                                 selectedPath: m.path,
+                                                 models: [m])
+        XCTAssertEqual(state.name, "qwen@studio")
+        XCTAssertFalse(state.isLoading)
+    }
+
+    func testNothingSelectedAsksForAModel() {
+        let state = ChatModelSelection.pillState(lanChatModelId: nil, residentName: nil,
+                                                 loadingPath: nil, selectedPath: "", models: [])
+        XCTAssertEqual(state.name, ChatModelSelection.noModelPlaceholder)
+        XCTAssertFalse(state.isLoading)
+    }
+
+    func testASelectedButNotYetResidentModelStillReadsAsItself() {
+        // Server down, or the model picked before the first start: the pill
+        // names the pick rather than falling through to "Select a model".
+        let m = hfCacheModel
+        let state = ChatModelSelection.pillState(lanChatModelId: nil, residentName: nil,
+                                                 loadingPath: nil, selectedPath: m.path, models: [m])
+        XCTAssertEqual(state.name, "mlx-community/Qwen3.5-4B-MLX-4bit")
     }
 
     // MARK: - Header name
@@ -139,5 +244,173 @@ final class ChatServerStartControlTests: XCTestCase {
         XCTAssertTrue(ChatServerStartControl.start.isEnabled)
         XCTAssertFalse(ChatServerStartControl.hidden.isEnabled)
         XCTAssertFalse(ChatServerStartControl.starting.isEnabled)
+    }
+}
+
+/// A media generator lives in the SAME registry as chat models — the image /
+/// video / audio panes load one through `prepareGenModel`, and the server sorts
+/// its default first, so `modelInfo` (`allModels.first`) can be a model that
+/// cannot answer a single chat request.
+///
+/// Live 2026-08-05: with a media model loaded the chat window's pill named it,
+/// dotted GREEN ("loaded and ready to answer") and every chat surface reading
+/// `chatModelId` would have sent the turn to it. The picker's LIST was already
+/// chat-only — the resolution underneath it was not.
+final class ChatModelResolutionTests: XCTestCase {
+
+    private func info(_ id: String, _ caps: [String], loaded: Bool = true) -> ModelInfo {
+        APIClient.parseModelInfo(["id": id, "capabilities": caps, "loaded": loaded])
+    }
+
+    @MainActor
+    func testALoadedMediaModelIsNeverTheChatModel() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let video = info("ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit", ["video"])
+        let chat = info("mlx-community/LFM2.5-2.6B-8bit", ["chat"])
+
+        mgr.allModels = [video, chat]
+        mgr.modelInfo = video   // the gen flow loaded it; the server sorts it first
+
+        XCTAssertEqual(mgr.chatModelInfo?.name, chat.name)
+        XCTAssertEqual(mgr.chatModelId, chat.name, "a chat turn must not be addressed to a video model")
+    }
+
+    /// Nothing that can chat ⇒ NOTHING. Naming the generator would earn a
+    /// "does not support this media modality" 400, and the pill's dot keys on
+    /// nil to stay amber instead of claiming ready.
+    @MainActor
+    func testAMediaOnlyServerHasNoChatModel() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let image = info("ddalcu/Krea-2-Turbo-MLX-Serve-mixed-4-8", ["image"])
+        mgr.allModels = [image]
+        mgr.modelInfo = image
+
+        XCTAssertNil(mgr.chatModelInfo)
+        XCTAssertNil(mgr.chatModelId)
+    }
+
+    /// An UNLOADED chat stub is not "the model answering" — it is a model you
+    /// could load. Reporting it would turn the pill's dot green on a server
+    /// holding nothing but a generator.
+    @MainActor
+    func testAnUnloadedChatStubDoesNotStandInForAResidentOne() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        mgr.allModels = [info("ddalcu/Krea-2-Turbo-MLX-Serve-mixed-4-8", ["image"]),
+                         info("mlx-community/LFM2.5-2.6B-8bit", ["chat"], loaded: false)]
+        mgr.modelInfo = mgr.allModels[0]
+
+        XCTAssertNil(mgr.chatModelInfo)
+    }
+
+    /// A headless server sorts no default first: its first row is an unloaded stub.
+    @MainActor
+    func testAHeadlessServersFirstRowIsNotResident() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        mgr.allModels = [info("ddalcu/Qwen3.8-27B-MLX-Serve-4bit", ["chat"], loaded: false)]
+        mgr.modelInfo = mgr.allModels[0]
+
+        XCTAssertNil(mgr.chatModelInfo)
+    }
+
+    /// An embedding model is in the registry too (folder indexing loads one)
+    /// and is just as unable to hold a conversation.
+    @MainActor
+    func testAnEmbeddingModelIsNotAChatModelEither() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let embed = info("mlx-community/bge-small-en-v1.5-8bit", ["embeddings"])
+        mgr.allModels = [embed]
+        mgr.modelInfo = embed
+
+        XCTAssertNil(mgr.chatModelId)
+    }
+
+    /// Unchanged where it already worked: a chat model that also takes images
+    /// and audio advertises those as INPUTS and is still the chat model, and a
+    /// LAN pick still wins over everything local.
+    @MainActor
+    func testAMultimodalChatModelAndALanPickAreUnaffected() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let gemma = info("mlx-community/gemma-4-e4b-it-4bit", ["chat", "vision", "audio"])
+        mgr.allModels = [gemma]
+        mgr.modelInfo = gemma
+        XCTAssertEqual(mgr.chatModelId, gemma.name)
+
+        // A LAN selection wins even before discovery lands it in `allModels`.
+        mgr.lanChatModelId = "big@studio"
+        XCTAssertEqual(mgr.chatModelId, "big@studio")
+    }
+
+    /// Pre-Phase-G / GGUF entries report no capabilities at all and still chat
+    /// (the same tolerance `slotKind` and `lanAdvertises` already carry).
+    @MainActor
+    func testAnEntryWithNoCapabilitiesStillCounts() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let old = info("some/gguf-model", [])
+        mgr.allModels = [old]
+        mgr.modelInfo = old
+        XCTAssertEqual(mgr.chatModelId, old.name)
+    }
+}
+
+/// Class guard for the same bug one hop out: every surface that hands a MODEL
+/// to something which will chat — the CLI launcher's generated agent configs,
+/// the setup instructions, the headless test harness — must resolve it through
+/// `chatModelId`/`chatModelInfo`, never `modelInfo` (which is whatever the
+/// server loaded last, media generators included). A config baked with a video
+/// model's id sends the CLI's first turn to a model that 400s.
+final class ChatSurfaceModelSourceTests: XCTestCase {
+
+    private static var sourcesRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()    // MLXCoreTests
+            .deletingLastPathComponent()    // Tests
+            .deletingLastPathComponent()    // app
+            .appendingPathComponent("Sources/MLXServe")
+    }
+
+    func testNoChatSurfaceBakesTheRawLoadedModelId() throws {
+        let fm = FileManager.default
+        let walker = try XCTUnwrap(fm.enumerator(at: Self.sourcesRoot, includingPropertiesForKeys: nil))
+        var offenders: [String] = []
+        for case let url as URL in walker where url.pathExtension == "swift" {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+                // The launcher's own parameter list is where the id is CONSUMED;
+                // only the call sites that supply one are being audited.
+                guard line.contains("servedModelId:"), line.contains("modelInfo?.name") else { continue }
+                offenders.append("\(url.lastPathComponent): \(line.trimmingCharacters(in: .whitespaces))")
+            }
+        }
+        XCTAssertTrue(offenders.isEmpty,
+                      "route through server.chatModelId — a media model would be handed to a chat CLI: \(offenders)")
+    }
+
+    // MARK: - Apple Intelligence
+
+    /// The on-device model is neither a path nor a peer, so it rides its own
+    /// tag — a local folder literally named "apple" must still load locally.
+    func testAppleTagRoundTrips() {
+        XCTAssertEqual(ChatModelSelection.tag(localPath: "/m", lanChatModelId: nil, apple: true),
+                       ChatModelSelection.appleTag)
+        XCTAssertEqual(ChatModelSelection.action(for: ChatModelSelection.appleTag), .selectApple)
+        XCTAssertEqual(ChatModelSelection.action(for: "apple"), .selectLocal("apple"))
+    }
+
+    /// It wins the pill the way a LAN pick does: the local selection is still
+    /// set underneath, and naming it would name a model that isn't answering.
+    func testApplePillNamesItselfAndNeverLoads() {
+        let state = ChatModelSelection.pillState(lanChatModelId: nil, apple: true,
+                                                 residentName: "some-resident",
+                                                 loadingPath: "/loading",
+                                                 selectedPath: "/m", models: [])
+        XCTAssertEqual(state.name, AppleFoundationChat.displayName)
+        XCTAssertFalse(state.isLoading)
     }
 }

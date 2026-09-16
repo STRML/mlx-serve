@@ -58,7 +58,9 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(d.llamaCacheEntries, 4)        // server.zig llama_cache_entries
         XCTAssertEqual(d.skipMemPreflight, false)     // scheduler.zig skip_mem_preflight
         XCTAssertEqual(d.ssdStreaming, false)         // main.zig ds4_ssd_streaming
-        XCTAssertEqual(d.enableMetrics, false)        // main.zig metrics_enabled
+        // Deliberate divergence from main.zig's metrics_enabled=false: the tray
+        // reads /metrics.json for its throughput rows.
+        XCTAssertEqual(d.enableMetrics, true)
         XCTAssertEqual(d.apiKey, "")                  // server.zig g_api_key (null = open)
         XCTAssertEqual(d.enablePrefixCacheDisk, false) // server.zig prefix_cache_disk_bytes (0 = off)
 
@@ -77,8 +79,9 @@ final class ServerOptionsTests: XCTestCase {
         // The SSD tier is always emitted so it can't be silently on via a
         // server default; a fresh (toggle-off) launch emits `off`.
         XCTAssertTrue(contains(args, flag: "--prefix-cache-disk", value: "off"))
-        // --metrics + --api-key are emit-only-when-set and absent by default.
-        XCTAssertFalse(args.contains("--metrics"))
+        // --metrics is ON by default here (the tray reads /metrics.json);
+        // --api-key is emit-only-when-set.
+        XCTAssertTrue(args.contains("--metrics"))
         XCTAssertFalse(args.contains("--api-key"))
     }
 
@@ -184,15 +187,14 @@ final class ServerOptionsTests: XCTestCase {
 
     // MARK: - Observability (--metrics)
 
-    func testMetricsFlagOmittedByDefault() {
-        let opts = ServerOptions()
-        XCTAssertFalse(opts.toCLIArgs().contains("--metrics"))
+    func testMetricsFlagEmittedByDefault() {
+        XCTAssertTrue(ServerOptions().toCLIArgs().contains("--metrics"))
     }
 
-    func testMetricsFlagEmittedWhenEnabled() {
+    func testMetricsFlagOmittedWhenDisabled() {
         var opts = ServerOptions()
-        opts.enableMetrics = true
-        XCTAssertTrue(opts.toCLIArgs().contains("--metrics"))
+        opts.enableMetrics = false
+        XCTAssertFalse(opts.toCLIArgs().contains("--metrics"))
     }
 
     func testMetricsHasNoAdminKeyFlag() {
@@ -232,7 +234,7 @@ final class ServerOptionsTests: XCTestCase {
     func testEnableMetricsChangeTriggersRestart() {
         let a = ServerOptions()
         var b = ServerOptions()
-        b.enableMetrics = true
+        b.enableMetrics = false
         XCTAssertFalse(a.serverLaunchEquals(b),
                       "Toggling --metrics must trigger a server restart")
     }
@@ -451,6 +453,9 @@ final class ServerOptionsTests: XCTestCase {
         b = ServerOptions()
         b.tokenizeCacheEntries = 0
         XCTAssertFalse(a.serverLaunchEquals(b))
+        b = ServerOptions()
+        b.idleEvictSecs = 900
+        XCTAssertFalse(a.serverLaunchEquals(b))
         // Sanity: untouched defaults are equal.
         a = ServerOptions(); b = ServerOptions()
         XCTAssertTrue(a.serverLaunchEquals(b))
@@ -614,6 +619,7 @@ extension ServerOptionsTests {
         o.llamaKvQuant = .q8
         o.llamaCacheEntries = 2   // off the default (4) so the round-trip moves it
         o.tokenizeCacheEntries = 16
+        o.idleEvictSecs = 1800
         o.defaultMaxTokens = 8192
         o.defaultTemperature = 0.42
         o.defaultTopP = 0.5
@@ -627,6 +633,7 @@ extension ServerOptionsTests {
         o.telegram = .init(enabled: true, botToken: "1:abc", agentMode: true,
                            useMCP: true, enableThinking: true, allowedChatIds: [7, 8])
         o.sandbox = .init(enabled: true, network: false)
+        o.toolsOnlyWhenAsked = true
 
         XCTAssertNotEqual(o, ServerOptions(), "sanity: every field moved off its default")
         let decoded = try JSONDecoder().decode(ServerOptions.self, from: try JSONEncoder().encode(o))
@@ -1086,5 +1093,65 @@ extension ServerOptionsTests {
         XCTAssertEqual(explicitOff.decodeAttnQuantChoice, false)
         let empty = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
         XCTAssertNil(empty.decodeAttnQuantChoice)
+    }
+
+    /// The registry's residency cap was reachable only from a hand-launched
+    /// server: the app emitted no `--max-resident-mem` and has no extra-args
+    /// passthrough, so every GUI launch ran the auto cap (80% of the wired
+    /// limit) and a model the auto cap refuses was unloadable at any setting.
+    /// `--skip-mem-preflight` does not help — the registry gate runs first.
+    func testMaxResidentMemIsEmittedWhenSetAndOmittedOtherwise() {
+        var opts = ServerOptions()
+        XCTAssertEqual(opts.maxResidentMemGB, 0)  // 0 = Auto (the server's own cap)
+        XCTAssertFalse(opts.toCLIArgs().contains("--max-resident-mem"))
+
+        opts.maxResidentMemGB = 48
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--max-resident-mem", value: "48GB"))
+    }
+
+    /// The slider's snap points. `main.zig` EXITS on a value it cannot parse,
+    /// which is why this is a number picked off a ladder rather than typed
+    /// text — there is no unparseable value to guard against. The ladder must
+    /// always offer Auto, and must not offer a cap the machine cannot back.
+    func testResidentMemPresetsAlwaysOfferAutoAndNeverExceedRAM() {
+        for gb in [8, 16, 36, 48, 64, 128, 512] {
+            let presets = ServerOptions.residentMemPresets(physicalMemoryBytes: UInt64(gb) * Self.GiB)
+            XCTAssertEqual(presets.first, 0, "\(gb) GB Mac: Auto must be reachable")
+            XCTAssertEqual(presets, presets.sorted(), "\(gb) GB Mac: snap points must ascend")
+            XCTAssertFalse(presets.contains { $0 > gb },
+                           "\(gb) GB Mac: offers a cap above physical RAM \(presets)")
+            XCTAssertGreaterThan(presets.count, 1, "\(gb) GB Mac: Auto is the only choice")
+        }
+        // Unknown RAM must still produce a usable ladder, not just [Auto].
+        XCTAssertGreaterThan(ServerOptions.residentMemPresets(physicalMemoryBytes: 0).count, 1)
+    }
+
+    /// Bar: the flag reaches the server when set, and 0 emits nothing (0 is
+    /// the server's own default).
+    func testIdleEvictSecsIsEmittedWhenSetAndOmittedOtherwise() {
+        var opts = ServerOptions()
+        XCTAssertEqual(opts.idleEvictSecs, 0)
+        XCTAssertFalse(opts.toCLIArgs().contains("--idle-evict-secs"))
+
+        opts.idleEvictSecs = 900
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--idle-evict-secs", value: "900"))
+    }
+
+    /// Bar: Off is reachable, the ladder ascends, and the readout is time.
+    func testIdleEvictLadderOffersOffAndReadsAsTime() {
+        let presets = ServerOptions.idleEvictPresets
+        XCTAssertEqual(presets.first, 0, "Off must be reachable")
+        XCTAssertEqual(presets, presets.sorted(), "snap points must ascend")
+        XCTAssertEqual(Set(presets).count, presets.count, "duplicate snap points")
+        XCTAssertGreaterThan(presets.count, 1, "Off is the only choice")
+        for secs in presets.dropFirst() {
+            XCTAssertEqual(secs % 60, 0, "\(secs)s is not a whole number of minutes")
+            if secs >= 3600 { XCTAssertEqual(secs % 3600, 0, "\(secs)s is not a whole number of hours") }
+        }
+        XCTAssertEqual(ServerOptions.idleEvictLabel(0), "Off")
+        XCTAssertEqual(ServerOptions.idleEvictLabel(300), "5 min")
+        XCTAssertEqual(ServerOptions.idleEvictLabel(1800), "30 min")
+        XCTAssertEqual(ServerOptions.idleEvictLabel(3600), "1 hr")
+        XCTAssertEqual(ServerOptions.idleEvictLabel(7200), "2 hr")
     }
 }

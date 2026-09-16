@@ -21,24 +21,21 @@ struct MLXCoreEntryPoint {
 
 struct MLXCoreApp: App {
     private static let menuBarIcon: NSImage = {
-        // Try Bundle.main (works in .app bundles) then SPM bundle (works in dev builds)
-        let candidates: [URL?] = [
-            Bundle.main.resourceURL?.appendingPathComponent("tray.png"),
-            Bundle.main.bundleURL.appendingPathComponent("MLXCore_MLXCore.bundle/Resources/tray.png"),
-        ]
-        for case let url? in candidates {
-            if let img = NSImage(contentsOf: url) {
-                img.size = NSSize(width: 18, height: 18)
-                img.isTemplate = true
-                return img
-            }
+        guard let img = BundledAsset.image("tray.png") else {
+            return NSImage(systemSymbolName: "brain.head.profile", accessibilityDescription: "MLX Core")!
         }
-        return NSImage(systemSymbolName: "brain.head.profile", accessibilityDescription: "MLX Core")!
+        img.size = NSSize(width: 18, height: 18)
+        img.isTemplate = true
+        return img
     }()
 
     @NSApplicationDelegateAdaptor(MLXCoreAppDelegate.self) private var appDelegate
+    /// The View ▸ Interface menu writes the same keys the Settings rows do.
+    @AppStorage(InterfacePrefKey.chatColumn) private var chatColumnRaw = ChatColumnWidth.wide.rawValue
+    @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
     @StateObject private var appState = AppState()
     @StateObject private var hfSearch = HFSearchService()
+    @ObservedObject private var browser = BrowserManager.shared
     @Environment(\.openWindow) private var openWindow
 
     private func menuBarIcon(for status: ServerStatus) -> NSImage {
@@ -85,17 +82,22 @@ struct MLXCoreApp: App {
     var body: some Scene {
         MenuBarExtra {
             StatusMenuView(
-                openChat: { openAndFocus("chat") },
-                openModelBrowser: { openAndFocus("modelBrowser") },
-                openImageGen: { openAndFocus("imageGen") },
-                openVideoGen: { openAndFocus("videoGen") },
-                openAudioGen: { openAndFocus("audioGen") },
-                openModel3DGen: { openAndFocus("model3dGen") },
-                openSettings: { openAndFocus("settings") },
+                openChat: { appState.showChat() },
+                openModelBrowser: { appState.showModels() },
+                openImageGen: { appState.showCreate(.image) },
+                openVideoGen: { appState.showCreate(.video) },
+                openAudioGen: { appState.showCreate(.audio) },
+                openModel3DGen: { appState.showCreate(.model3d) },
+                openSettings: { appState.showSettings() },
                 openServerLog: { openAndFocus("serverLog") },
-                openTasks: { openAndFocus("tasks") },
+                openModelSettings: {
+                    let path = appState.selectedModelPath
+                    appState.modelSettingsRequest = ModelSettingsRequest(
+                        path: path, title: ModelDisplayName.pretty((path as NSString).lastPathComponent))
+                    openAndFocus("modelSettings")
+                },
+                openTasks: { appState.showTasks() },
                 openAgents: { openAndFocus("agents") },
-                openSandboxTerminal: { openAndFocus("sandboxTerminal") },
                 openBenchmarks: { openAndFocus("benchmarks") }
             )
                 .environmentObject(appState)
@@ -111,24 +113,48 @@ struct MLXCoreApp: App {
                 // A tapped task notification deep-links here; open the Tasks window
                 // (the label is always present, so this fires even with no window open).
                 .onChange(of: appState.pendingTaskDeepLink) { _, taskId in
-                    if taskId != nil { openAndFocus("tasks") }
+                    // A tapped task notification: the Tasks pane is part of the
+                    // chat window now, so this brings that window up on it and
+                    // TaskListPane consumes the id in .onAppear/.onChange.
+                    if taskId != nil { appState.showTasks() }
                 }
                 // Quick launcher "Open in chat" (⌘↩): same always-present bridge —
                 // the launcher panel can't reach SwiftUI's openWindow itself.
                 .onChange(of: appState.pendingChatOpenTick) { _, _ in
                     openAndFocus("chat")
                 }
-                // Welcome window's "Browse Models" nudge: same bridge — it's a
-                // bare NSHostingView outside the Scene graph.
-                .onChange(of: appState.pendingModelBrowserOpenTick) { _, _ in
-                    openAndFocus("modelBrowser")
+                // A tool handler has no SwiftUI environment: browse{show} bumps
+                // this on the manager and the scene opens the window.
+                .onChange(of: browser.showRequestTick) { _, _ in
+                    openAndFocus("browser")
                 }
+
         }
         .menuBarExtraStyle(.window)
 
         Window("MLX Core", id: "chat") {
             ChatView()
                 .environmentObject(appState)
+                // The Model Browser is a MODE of this window now
+                // (`ChatWorkspace`), so everything its panes read has to be
+                // injected HERE — there is no second window to inject it into,
+                // and SwiftUI reports a missing one as a render-time trap, not
+                // a compile error (live crash 2026-08-08 on `downloads`).
+                // Pinned by `testTheChatWindowInjectsEveryObjectTheBrowserPaneReads`.
+                .environmentObject(hfSearch)
+                .environmentObject(appState.downloads)
+                // The four media generators are PAGES of this window now
+                // (`ChatWorkspace.create`), not windows of their own.
+                .environmentObject(appState.imageGen)
+                .environmentObject(appState.videoGen)
+                .environmentObject(appState.audioGen)
+                .environmentObject(appState.musicGen)
+                .environmentObject(appState.model3dGen)
+                // Settings, Tasks and Agents render here as modes too, so their
+                // objects ride this scene (`ChatWorkspace`).
+                .environmentObject(appState.taskScheduler)
+                .environmentObject(appState.terminals)
+                .environmentObject(appState.agents)
                 .environmentObject(appState.server)
                 .environmentObject(appState.toolExecutor)
                 .environmentObject(appState.agentMemory)
@@ -136,82 +162,38 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.chatEngine)
                 .environmentObject(appState.voice)
                 .environmentObject(appState.processRegistry)
-                .frame(minWidth: 700, minHeight: 500)
+                // 1070: this window hosts Models/Settings/Create panes and the
+                // composer row carries the model pill now — smaller floors
+                // clipped them.
+                .frame(minWidth: 1070, minHeight: 500)
+                // The intro screen, as a DIALOG over the chat window rather
+                // than a floating window of its own. The injections below are
+                // NOT redundant: a sheet does not inherit the environment of
+                // the view it hangs on (`SheetEnvironmentAuditTests`).
+                .sheet(isPresented: $appState.showWelcome) {
+                    WelcomeView(onDismiss: { appState.showWelcome = false },
+                                hasChatModels: appState.welcomeHasChatModels,
+                                onOpenModelBrowser: { appState.showModels() },
+                                onOpenChat: { appState.pendingChatOpenTick += 1 })
+                        .environmentObject(appState)
+                        .environmentObject(appState.downloads)
+                        .environmentObject(appState.server)
+                }
                 .onDisappear {
                     Task { await appState.mcpManager.stopAll() }
                 }
+                .appAppearance()
         }
-        .defaultSize(width: 900, height: 650)
+        // Roomier than the old 900x650: this window is three things now
+        // (transcript, model browser, media generators) and the two it gained
+        // were 960pt-wide windows in their own right.
+        .defaultSize(width: 1160, height: 780)
 
         Window("Browser", id: "browser") {
             BrowserView()
+                .appAppearance()
         }
         .defaultSize(width: 1024, height: 768)
-
-        Window("Model Browser", id: "modelBrowser") {
-            ModelBrowserView()
-                .environmentObject(hfSearch)
-                .environmentObject(appState)
-                .environmentObject(appState.downloads)
-                // Lets model rows tell "selected" from "actually loaded" — the
-                // In-use badge reads `server.status`.
-                .environmentObject(appState.server)
-                // Floor derived from sidebar + detail minimums — a smaller
-                // literal here caps the window's reported minimum and lets
-                // the Discover table clip off the right edge.
-                .frame(minWidth: ModelBrowserMetrics.minWindowWidth, minHeight: 400)
-        }
-        .defaultSize(width: ModelBrowserMetrics.defaultWindowWidth,
-                     height: ModelBrowserMetrics.defaultWindowHeight)
-
-        Window("Image Generation", id: "imageGen") {
-            ImageGenView()
-                .environmentObject(appState.imageGen)
-                .environmentObject(appState.server)
-                .environmentObject(appState.downloads)
-                .environmentObject(appState)
-        }
-        .defaultSize(width: 960, height: 700)
-
-        Window("Video Generation", id: "videoGen") {
-            VideoGenView()
-                .environmentObject(appState.videoGen)
-                .environmentObject(appState.server)
-                .environmentObject(appState.downloads)
-                .environmentObject(appState)
-        }
-        .defaultSize(width: 960, height: 700)
-
-        Window("Audio Generation", id: "audioGen") {
-            AudioGenView()
-                .environmentObject(appState.audioGen)
-                .environmentObject(appState.musicGen)
-                .environmentObject(appState.server)
-                .environmentObject(appState.downloads)
-                .environmentObject(appState)
-        }
-        .defaultSize(width: 900, height: 660)
-
-        Window("3D Generation", id: "model3dGen") {
-            Model3DGenView()
-                .environmentObject(appState.model3dGen)
-                .environmentObject(appState.server)
-                .environmentObject(appState.downloads)
-                .environmentObject(appState)
-        }
-        .defaultSize(width: 960, height: 700)
-
-        Window("Settings", id: "settings") {
-            SettingsView()
-                .environmentObject(appState)
-                .environmentObject(appState.server)
-                .environmentObject(appState.downloads)
-                // Wider since the category sidebar landed: it takes ~200pt, and
-                // the form's rows (label + explainer + control) were already
-                // tight at the old 720 minimum.
-                .frame(minWidth: 900, minHeight: 560)
-        }
-        .defaultSize(width: 1020, height: 700)
 
         // Dedicated terminal-style window for the server's live stderr.
         // The inline log on the tray popover is still there for a glance;
@@ -220,6 +202,7 @@ struct MLXCoreApp: App {
         Window("Server Log", id: "serverLog") {
             ServerLogWindowView()
                 .environmentObject(appState.server)
+                .appAppearance()
         }
         .defaultSize(width: 900, height: 560)
 
@@ -231,19 +214,38 @@ struct MLXCoreApp: App {
             BenchmarkView()
                 .environmentObject(appState)
                 .environmentObject(appState.server)
+                .appAppearance()
         }
         .defaultSize(width: 1040, height: 680)
 
-        // The Sandbox window: an embedded terminal for agent CLI sessions
-        // (pi / hermes / shell over ssh) inside the guest, plus the Activity
-        // transcript of everything running in it. Title tracks the live
-        // session via .navigationTitle ("pi — MLX Sandbox").
-        Window("MLX Sandbox", id: "sandboxTerminal") {
-            SandboxTerminalView()
-                .environmentObject(appState)
-                .environmentObject(appState.server)
+        // Per-model settings for the tray's selected model. A window, not a
+        // sheet: the MenuBarExtra popover cannot host one.
+        Window("Model Settings", id: "modelSettings") {
+            if let request = appState.modelSettingsRequest {
+                ModelSettingsSheet(request: request)
+                    .environmentObject(appState)
+                    .environmentObject(appState.server)
+                    .appAppearance()
+            }
         }
-        .defaultSize(width: 780, height: 560)
+        .windowResizability(.contentSize)
+
+        // A sandbox terminal moved out of the chat window ("Move Tab to New
+        // Window", 2026-09-02). One window per session id; the session itself
+        // stays in `appState.terminals` — the window only hosts its view, so
+        // closing the window puts the terminal back in the sidebar's detail
+        // column and ends nothing.
+        WindowGroup("Terminal", id: "terminalWindow", for: UUID.self) { $sessionId in
+            if let sessionId {
+                TerminalWindowView(sessionId: sessionId)
+                    .environmentObject(appState)
+                    .environmentObject(appState.server)
+                    .environmentObject(appState.terminals)
+                    .frame(minWidth: 560, minHeight: 360)
+                    .appAppearance()
+            }
+        }
+        .defaultSize(width: 900, height: 600)
 
         // Agents (personas): who you're talking to, and the settings that
         // conversation runs under. Configuration only — chatting with an agent
@@ -254,19 +256,28 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.agents)
                 .environmentObject(appState.server)
                 .frame(minWidth: 760, minHeight: 520)
+                .appAppearance()
         }
         .defaultSize(width: 900, height: 640)
 
-        // Scheduled / on-demand agent tasks — the unattended "claw" surface.
-        Window("Tasks", id: "tasks") {
-            TasksView()
-                .environmentObject(appState)
-                .environmentObject(appState.server)
-                .environmentObject(appState.taskScheduler)
-                .frame(minWidth: 720, minHeight: 480)
-        }
-        .defaultSize(width: 900, height: 620)
         .commands {
+            CommandGroup(replacing: .newItem) {
+                    Button("New Chat") {
+                        openAndFocus("chat")
+                        _ = appState.newChatSession()
+                    }
+                    .keyboardShortcut("n", modifiers: [.command])
+
+                    // ⌘⌫, Finder's own "move to trash". A MENU command rather
+                    // than a key handler on the sidebar: `.onDeleteCommand`
+                    // there only fires while that view is first responder, and
+                    // a ScrollView of plain Buttons never is — see the note in
+                    // `ChatSidebar.conversationsSidebar`. It also makes the
+                    // shortcut discoverable, which a bare key never was.
+                    Button("Delete Chat") { appState.requestChatDeletionFromMenu() }
+                        .keyboardShortcut(.delete, modifiers: [.command])
+                        .disabled(appState.chatDeletionTarget == nil)
+                }
             CommandMenu("Agent") {
                 Button("Agents…") { openAndFocus("agents") }
                     .keyboardShortcut("a", modifiers: [.command, .shift])
@@ -280,7 +291,7 @@ struct MLXCoreApp: App {
                 Button("Benchmarks…") { openAndFocus("benchmarks") }
                     .keyboardShortcut("k", modifiers: [.command, .shift])
 
-                Button("Settings…") { openAndFocus("settings") }
+                Button("Settings…") { appState.showSettings() }
                     .keyboardShortcut(",", modifiers: [.command])
 
                 Button("Edit System Prompt") {
@@ -314,6 +325,85 @@ struct MLXCoreApp: App {
                 Button("Open MLX Serve Folder") {
                     let path = NSString(string: "~/.mlx-serve").expandingTildeInPath
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                }
+            }
+
+            // Menu-bar twin of the chat's empty-state discovery chips
+            // (ChatEmptyState): every feature that otherwise lives only in
+            // the tray popover, reachable from the menu bar and Help-menu
+            // search. The media section iterates the SAME catalog as the
+            // chips so the two lists cannot drift.
+            // View ▸ Interface: the same `@AppStorage` keys the Settings rows
+            // write. `CommandGroup`, not `CommandMenu("View")`, which would
+            // build a second View menu beside the system one.
+            CommandGroup(after: .sidebar) {
+                Menu {
+                    ForEach(ChatColumnWidth.allCases) { width in
+                        Toggle(isOn: Binding(
+                            get: { chatColumnRaw == width.rawValue },
+                            set: { if $0 { chatColumnRaw = width.rawValue } }
+                        )) {
+                            Text("\(width.label) chat column")
+                        }
+                        .keyboardShortcut(width.menuShortcut, modifiers: [.command, .option])
+                    }
+
+                    Divider()
+
+                    // Never a bare Control combo: menu key equivalents run
+                    // before keyDown, so ⌃C would be stolen from the embedded
+                    // terminal.
+                    Toggle("Compact mode", isOn: $compactMode)
+                        .keyboardShortcut("c", modifiers: [.command, .option])
+                } label: {
+                    Label("Interface", systemImage: "paintbrush")
+                }
+            }
+
+            CommandMenu("Tools") {
+                // ⌘L: the model switcher, over the same rows the composer's
+                // pill offers. A menu key equivalent so it works from every
+                // window, and it goes through AppState's door — which raises
+                // the picker AND brings the chat window forward.
+                Button("Switch Model…") { appState.showModelPalette() }
+                    .keyboardShortcut("l", modifiers: [.command])
+
+                Button("Browse Models…") { appState.showModels() }
+                    .keyboardShortcut("m", modifiers: [.command, .shift])
+
+                Button("Scheduled Tasks…") { appState.showTasks() }
+                    .keyboardShortcut("t", modifiers: [.command, .shift])
+
+                Divider()
+
+                // The four generators are PAGES of the chat window now
+                // (`.create(...)` actions, windowId nil) — dispatch through the
+                // one door, `AppState.showCreate`.
+                ForEach(ChatEmptyState.mediaItems) { item in
+                    if case .create(let experiment) = item.action {
+                        Button("\(item.title)…") { appState.showCreate(experiment) }
+                    }
+                }
+
+                Divider()
+
+                // DMG builds only — the MAS build can't detect or launch
+                // other apps' CLIs (same gate as the tray's Code button).
+                if BuildFeatures.current.cliLauncher {
+                    Button("Launch Claude Code…") {
+                        launchClaudeCodeWithPicker(
+                            baseURL: appState.server.baseURL,
+                            serverContextLength: appState.server.chatModelInfo?.contextLength)
+                    }
+                }
+
+                // No .keyboardShortcut here: ⌃Space is registered as a GLOBAL
+                // Carbon hotkey (QuickLauncherController); a menu key
+                // equivalent on the same combo would race it while the app is
+                // frontmost, so the combo rides the title instead.
+                Button("Quick Launcher (\(QuickLauncherHotKey.display))") {
+                    if !appState.quickLauncherEnabled { appState.quickLauncherEnabled = true }
+                    appState.quickLauncher.show()
                 }
             }
         }

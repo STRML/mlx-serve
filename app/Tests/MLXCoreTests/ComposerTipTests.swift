@@ -8,6 +8,7 @@ final class ComposerTipTests: XCTestCase {
 
     private var all: [ComposerTip] {
         [.attachments(audioSupported: true), .attachments(audioSupported: false),
+         .attachments(audioSupported: true, videoSupported: true), .attachments(audioSupported: false, videoSupported: true),
          .thinking(isOn: true), .thinking(isOn: false),
          .tools(isOn: true, workspace: "/tmp/w"), .tools(isOn: false, workspace: nil),
          .mcp(isOn: true), .mcp(isOn: false)]
@@ -61,6 +62,15 @@ final class ComposerTipTests: XCTestCase {
         }
     }
 
+    /// Same rule for the brain disc since its right-click grew the
+    /// reasoning-effort picker.
+    func testThinkingTipNamesTheRightClickMenu() {
+        for tip in [ComposerTip.thinking(isOn: true), .thinking(isOn: false)] {
+            XCTAssertTrue(tip.body.lowercased().contains("right-click"),
+                          "the effort picker is undiscoverable unless the card names it: \(tip.body)")
+        }
+    }
+
     /// The workspace is what every file and shell call resolves against, and it
     /// is otherwise two clicks away inside the menu.
     func testToolsTipNamesTheWorkspaceOrSaysItIsUnset() {
@@ -75,6 +85,15 @@ final class ComposerTipTests: XCTestCase {
     func testAttachmentTipMentionsAudioOnlyWhenTheModelCanHearIt() {
         XCTAssertTrue(ComposerTip.attachments(audioSupported: true).body.lowercased().contains("audio"))
         XCTAssertFalse(ComposerTip.attachments(audioSupported: false).body.lowercased().contains("audio"))
+    }
+
+    /// Same dead-control class as audio, for video (Qwen3-VL-family only).
+    func testAttachmentTipMentionsVideoOnlyWhenTheModelCanSeeIt() {
+        XCTAssertTrue(ComposerTip.attachments(audioSupported: false, videoSupported: true).body.lowercased().contains("video"))
+        XCTAssertFalse(ComposerTip.attachments(audioSupported: false, videoSupported: false).body.lowercased().contains("video"))
+        // Both together — neither offer crowds out the other.
+        let both = ComposerTip.attachments(audioSupported: true, videoSupported: true).body.lowercased()
+        XCTAssertTrue(both.contains("audio") && both.contains("video"))
     }
 
     /// A card that appears the instant the pointer crosses a disc flashes five

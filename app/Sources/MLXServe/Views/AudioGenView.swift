@@ -12,26 +12,51 @@ struct AudioGenView: View {
         case music = "Music"
     }
 
-    @State private var tab: Tab = .voice
+    /// The left menu's "Audio & Music" row must reopen on the tab you left it
+    /// on. `ChatView.createPane` UNMOUNTS this view on navigation, so plain
+    /// `@State` reset to Voice on every visit, not only across launches.
+    /// The stored raw values are a persistence contract — renaming the display
+    /// text would silently send everyone back to Voice.
+    @AppStorage("audioGenTab") private var tab: Tab = .voice
 
     var body: some View {
         VStack(spacing: 0) {
             Picker("", selection: $tab) {
                 ForEach(Tab.allCases, id: \.self) { t in
-                    Text(t.rawValue).tag(t)
+                    Text(L10n.text(t.rawValue)).tag(t)
                 }
             }
             .pickerStyle(.segmented)
+            .controlSize(.large)
             .labelsHidden()
-            .frame(width: 240)
+            .frame(width: 280)
             .padding(.top, 10)
-            .padding(.bottom, 2)
+            .padding(.bottom, 14)
 
             switch tab {
             case .voice: VoiceGenView()
             case .music: MusicGenView()
             }
         }
+    }
+}
+
+/// The style prompt a track was made from, read back out of the `<track>.txt`
+/// sidecar the gen services write beside every WAV.
+///
+/// A history row carries a path and nothing else, so without this a track sent
+/// to chat arrives captioned "Generated audio" — true, and useless in a
+/// transcript you keep. Best-effort by design: an older track, a hand-copied
+/// file or a missing sidecar just falls back to that.
+enum AudioSidecar {
+    static func prompt(forTrack path: String) -> String {
+        let txt = (path as NSString).deletingPathExtension + ".txt"
+        guard let body = try? String(contentsOfFile: txt, encoding: .utf8) else { return "" }
+        guard let range = body.range(of: "# Style prompt\n") else { return "" }
+        let rest = body[range.upperBound...]
+        // The sidecar's sections are separated by a blank line.
+        let end = rest.range(of: "\n\n")?.lowerBound ?? rest.endIndex
+        return String(rest[..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -50,7 +75,7 @@ struct AudioHistoryShelf: View {
         Group {
             if !paths.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(L10n.text(title)).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     ScrollView {
                         VStack(spacing: 2) {
                             ForEach(paths, id: \.self) { path in
@@ -108,7 +133,11 @@ struct AudioHistoryShelf: View {
 struct VoiceGenView: View {
     @EnvironmentObject var service: AudioGenService
     @EnvironmentObject var server: ServerManager
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
+    /// For "Send to Chat" — the hand-off opens a new conversation and switches
+    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
+    @EnvironmentObject var appState: AppState
 
     @StateObject private var recorder = AudioRecorder()
 
@@ -123,6 +152,9 @@ struct VoiceGenView: View {
     @State private var showAdvanced: Bool = false
 
     @State private var refError: String? = nil
+    /// True while a drag carrying a file hovers the reference-voice section —
+    /// drives its dashed-border highlight (see `MediaDropTarget`).
+    @State private var isDropTargeted: Bool = false
     /// Dictation into the text editor: the voice-mode recognizer emits one
     /// finalized utterance per silence gap; each is appended via `Dictation`.
     /// Created lazily on first use — never at launch (audio-graph TCC rule).
@@ -133,7 +165,10 @@ struct VoiceGenView: View {
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: AudioGenRequest? = nil
-    @StateObject private var clipPlayer = AudioClipPlayer()
+    // The app-wide singleton, not a per-view instance — see the matching note
+    // in MusicGenView: a private player left playing when this view unmounts
+    // on tab navigation is a leaked NSSound nothing can stop.
+    @ObservedObject private var clipPlayer = AudioClipPlayer.shared
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
@@ -141,8 +176,9 @@ struct VoiceGenView: View {
     @State private var didHydrate: Bool = false
 
     var body: some View {
+        // No window-sized floor — see ImageGenView: pages shrink their
+        // preview side, they don't overflow the detail column.
         readyView
-        .frame(minWidth: 820, minHeight: 600)
         .onAppear {
             if !didHydrate {
                 hydrating = true
@@ -154,11 +190,12 @@ struct VoiceGenView: View {
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
         }
-        .onDisappear { stopDictation() }
+        .onDisappear {
+            stopDictation()
+            stopPlayback()
+        }
         .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: speed) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: temperature) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: stickySnapshot) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
             // A new generation stops whatever is still playing.
             if case .running = phase { stopPlayback() }
@@ -200,7 +237,8 @@ struct VoiceGenView: View {
                 outputFolderLink
             }
             .padding(16)
-            .frame(minWidth: 420)
+            // The preview gives way in a small window.
+            .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
@@ -209,7 +247,7 @@ struct VoiceGenView: View {
                 pendingRequest = nil
             }
         } message: {
-            Text(ramWarningMessage)
+            Text(L10n.text(ramWarningMessage))
         }
     }
 
@@ -225,7 +263,7 @@ struct VoiceGenView: View {
                         .foregroundStyle(dictating ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
                 }
                 .buttonStyle(.borderless)
-                .help(dictating ? "Stop dictation" : "Dictate the text to speak")
+                .help(L10n.text(dictating ? "Stop dictation" : "Dictate the text to speak"))
             }
             TextEditor(text: $text)
                 .font(.body)
@@ -234,7 +272,7 @@ struct VoiceGenView: View {
                     RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                 )
             if dictating {
-                Text(dictationPartial.isEmpty ? "Listening…" : dictationPartial)
+                Text(L10n.text(dictationPartial.isEmpty ? "Listening…" : dictationPartial))
                     .font(.caption2).foregroundStyle(.secondary)
                     .lineLimit(2)
             }
@@ -286,25 +324,25 @@ struct VoiceGenView: View {
         dictating = false
     }
 
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: LanPick.selection(
-                model: $model, lanModel: $lanModel,
-                resolve: { id in AudioModelPreset.all.first { $0.id == id } },
-                persist: persist)
-            ) {
-                ForEach(AudioModelPreset.all) { preset in
-                    Text(preset.name).tag(preset.id)
-                }
-                LanModelPickerRows(capability: "audio")
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            Text("~\(model.approxRAMGB) GB RAM • zero-shot voice cloning")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        MediaModelChooser.pane(
+            all: AudioModelPreset.all,
+            onThisMac: CustomMediaModels.audioPresets(from: server.allModels),
+            // "speech", not "audio": see ModelInfo.lanAdvertises — a peer's
+            // music model advertises "audio" too.
+            capability: "speech",
+            selected: $model, lanModel: $lanModel,
+            capabilityOf: { $0.capabilityLabel },
+            resolveCustom: { [models = server.allModels] in
+                CustomMediaModels.audioPreset(for: $0, from: models)
+            },
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
     }
 
     private var referenceSection: some View {
@@ -312,7 +350,7 @@ struct VoiceGenView: View {
             HStack {
                 Text("Reference voice").font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("~\(model.recommendedRefSeconds)s recommended")
+                Text(L10n.format("~%llds recommended", Int64(model.recommendedRefSeconds)))
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -322,8 +360,13 @@ struct VoiceGenView: View {
                     Text(url.lastPathComponent)
                         .font(.caption).lineLimit(1).truncationMode(.middle)
                     Spacer()
-                    Button { playReference(url) } label: { Image(systemName: "play.circle") }
-                        .buttonStyle(.borderless).help("Preview reference")
+                    if clipPlayer.playingPath == url.path {
+                        Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
+                            .buttonStyle(.borderless).help("Stop preview")
+                    } else {
+                        Button { playReference(url) } label: { Image(systemName: "play.circle") }
+                            .buttonStyle(.borderless).help("Preview reference")
+                    }
                     Button { clearReference() } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear reference")
                 }
@@ -363,13 +406,20 @@ struct VoiceGenView: View {
                         .font(.caption)
                 }
             } else {
-                Text("Pick or record ~\(model.recommendedRefSeconds) seconds of the voice to clone. Without a reference, the model's default voice is used.")
+                Text(L10n.format("Pick, record or drag in ~%lld seconds of the voice to clone. Without a reference, the model's default voice is used.",
+                                 Int64(model.recommendedRefSeconds)))
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
             if let err = refError {
                 Text(err).font(.caption2).foregroundStyle(.orange)
             }
+        }
+        // One clip slot, so a drop replaces what's there. Routed through
+        // `acceptReference` so a dropped file is transcoded exactly like a
+        // picked one — see `MediaDropTarget`.
+        .mediaDrop(.audio, isTargeted: $isDropTargeted) { urls in
+            if let url = urls.first { acceptReference(url) }
         }
     }
 
@@ -409,7 +459,7 @@ struct VoiceGenView: View {
     private var actionRow: some View {
         VStack(spacing: 8) {
             if lanModel == nil && !downloads.bundleReady(model.bundle) {
-                BundleDownloadBar(bundle: model.bundle)
+                BundleDownloadBar(bundle: model.bundle, showsStartButton: false)
             }
             HStack {
                 if service.isRunning {
@@ -508,12 +558,21 @@ struct VoiceGenView: View {
 
     private func chooseReferenceFile() {
         refError = nil
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
+        acceptReference(url)
+    }
+
+    /// The one way a FILE becomes the reference clip, whether it was picked or
+    /// dropped: a dropped file gets the same 24 kHz mono transcode, and a
+    /// transcode failure the same visible reason rather than a file that
+    /// silently doesn't attach.
+    private func acceptReference(_ url: URL) {
+        refError = nil
         do {
             refAudioURL = try AudioReference.normalizedReferenceWav(fromFile: url)
         } catch {
@@ -560,21 +619,32 @@ struct VoiceGenView: View {
 
     private func hydrate() {
         let s = AudioGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         speed = s.speed
         temperature = s.temperature
         keepResident = s.keepResident
+        text = s.text
+        refText = s.refText
+        // The clip is a temp transcode; only restore it while it still exists.
+        refAudioURL = s.refAudioPath.flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
     }
 
-    private func persist() {
+    /// Every sticky field (knobs AND the typed draft) as one `Equatable`
+    /// blob, so a single `onChange` persists all of it.
+    private var stickySnapshot: AudioGenSettings {
         var s = AudioGenSettings()
         s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.speed = speed
         s.temperature = temperature
         s.keepResident = keepResident
-        s.save()
+        s.text = text
+        s.refText = refText
+        s.refAudioPath = refAudioURL?.path
+        return s
     }
+
+    private func persist() { stickySnapshot.save() }
 
     // MARK: - Generate
 
@@ -603,10 +673,6 @@ struct VoiceGenView: View {
     }
 
     private func showLogWindow() {
-        let logText = service.log.joined(separator: "\n")
-        let alert = NSAlert()
-        alert.messageText = "Audio generation log"
-        alert.informativeText = logText.isEmpty ? "(no output)" : logText
-        alert.runModal()
+        AppActivation.openWindow(id: "serverLog", using: openWindow)
     }
 }

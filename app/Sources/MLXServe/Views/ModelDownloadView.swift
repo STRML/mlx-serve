@@ -30,9 +30,9 @@ struct ModelDownloadRow: View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(option.displayName)
+                    Text(L10n.text(option.displayName))
                         .font(.caption.weight(.medium))
-                    Text(option.sizeEstimate)
+                    Text(L10n.text(option.sizeEstimate))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -45,7 +45,7 @@ struct ModelDownloadRow: View {
                 } else if let state, state.status == .downloading {
                     HStack(spacing: 6) {
                         VStack(alignment: .trailing, spacing: 1) {
-                            ProgressView(value: state.fileProgress)
+                            ProgressView(value: state.progress)
                                 .frame(width: 60)
                             Text("\(state.percentFormatted) \(state.speedFormatted)")
                                 .font(.system(size: 8).monospacedDigit())
@@ -66,13 +66,13 @@ struct ModelDownloadRow: View {
                         .foregroundStyle(.green)
                         .font(.caption)
                 } else if let state, state.status == .failed {
-                    Button(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Retry") {
+                    Button(L10n.text(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Retry")) {
                         startDownload()
                     }
                     .font(.caption)
                     .controlSize(.mini)
                 } else {
-                    Button(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Download") {
+                    Button(L10n.text(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Download")) {
                         startDownload()
                     }
                     .font(.caption)

@@ -29,8 +29,8 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 # Legacy flat layout fallback (pre-two-level model dirs).
-if [ ! -d "$MODEL" ] && [ -d "$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit" ]; then
-    MODEL="$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit"
+if [ ! -d "$MODEL" ] && [ -d "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit" ]; then
+    MODEL="$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit"
 fi
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_prefix_cache_disk: $MODEL not found."
@@ -208,7 +208,7 @@ echo "== 6. hybrid SSM arch (Qwen 3.5 GatedDeltaNet) persists + restores SSM sta
 # Qwen3.5-0.8B; SKIPs cleanly otherwise (the attention sections above cover the
 # non-hybrid path either way).
 HYBRID_MODEL="$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"
-[ -d "$HYBRID_MODEL" ] || HYBRID_MODEL="$HOME/.mlx-serve/models/Qwen3.5-0.8B-MLX-4bit"
+[ -d "$HYBRID_MODEL" ] || HYBRID_MODEL="$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"
 if [ ! -d "$HYBRID_MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} hybrid section: Qwen3.5-0.8B-MLX-4bit not found."
 else
@@ -223,6 +223,12 @@ else
     HCOLD_MS="${HOUT1%%|*}"
     HCONTENT1="${HOUT1#*|}"
     echo "  cold total=${HCOLD_MS}ms content='${HCONTENT1:0:60}'"
+    # A hybrid restore is not bit-identical to cold (checkpoint replay, ~0.05
+    # nats) and this prompt sits on a near-tie, so the bar is the RAM restore:
+    # the SSD tier must reproduce it byte for byte.
+    HOUTW=$(fire_long)
+    HCONTENTW="${HOUTW#*|}"
+    [ "$HCONTENT1" = "$HCONTENTW" ] || echo "  note: RAM-warm output differs from cold (hybrid restore class): '${HCONTENTW:0:60}'"
     sleep 1
     if grep -q '\[disk-cache\] persisted' "$LOGFILE"; then
         # A hybrid persist reports SSM checkpoints in the count.
@@ -245,10 +251,10 @@ else
         echo -e "${RED}FAIL${NC} hybrid: no '[disk-cache] restored … (ssm@…)' line after restart"
         tail -30 "$LOGFILE"; FAIL=1
     fi
-    if [ "$HCONTENT1" = "$HCONTENT2" ]; then
-        echo -e "${GREEN}PASS${NC} hybrid output byte-identical across restart restore"
+    if [ "$HCONTENTW" = "$HCONTENT2" ]; then
+        echo -e "${GREEN}PASS${NC} hybrid SSD restore matches the RAM restore byte for byte"
     else
-        echo -e "${RED}FAIL${NC} hybrid output diverged: '$HCONTENT1' vs '$HCONTENT2'"
+        echo -e "${RED}FAIL${NC} hybrid SSD restore diverged from the RAM restore: '$HCONTENTW' vs '$HCONTENT2'"
         FAIL=1
     fi
     HSPEEDUP_OK=$(python3 -c "print(1 if $HRESTART_MS * 2 <= $HCOLD_MS else 0)")

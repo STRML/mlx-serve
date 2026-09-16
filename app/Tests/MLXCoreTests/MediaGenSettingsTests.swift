@@ -16,16 +16,15 @@ final class MediaGenSettingsTests: XCTestCase {
         s.resolutionId = "1216x832"
         s.steps = 33
         s.seed = 7
-        s.safeMode = false
         s.keepResident = true
         let decoded = try JSONDecoder().decode(ImageGenSettings.self, from: try JSONEncoder().encode(s))
         XCTAssertEqual(decoded, s)
     }
 
-    /// Settings saved by an older build still carry `guidance` and
-    /// `negativePrompt` — both retired once it was clear no image backend ever
-    /// read them. The tolerant decoder must ignore the leftovers rather than
-    /// throwing, or every existing user's image settings reset on upgrade.
+    /// Settings saved by an older build still carry `guidance`, `negativePrompt`
+    /// and `safeMode` — all retired. The tolerant decoder must ignore the
+    /// leftovers rather than throwing, or every existing user's image settings
+    /// reset on upgrade.
     func testImageSettingsIgnoresRetiredKeysFromOlderBuilds() throws {
         let legacy = Data("""
         {"modelId":"mflux/flux2-klein-4b-q4","quality":"Quality","resolutionId":"1216x832",
@@ -36,7 +35,6 @@ final class MediaGenSettingsTests: XCTestCase {
         XCTAssertEqual(s.steps, 33)
         XCTAssertEqual(s.seed, 7)
         XCTAssertEqual(s.resolutionId, "1216x832")
-        XCTAssertFalse(s.safeMode)
         XCTAssertTrue(s.keepResident)
         XCTAssertEqual(s.strength, 0.4)
         XCTAssertFalse(s.editMode)
@@ -64,8 +62,26 @@ final class MediaGenSettingsTests: XCTestCase {
         s.stgScale = 1.0
         s.seed = 99
         s.keepResident = true
+        // REGRESSION: the tolerant decoder listed every field EXCEPT
+        // bestQuality, so H3's "Max quality" toggle silently reset to off on
+        // every app relaunch (saved, then dropped on load).
+        s.bestQuality = true
         let decoded = try JSONDecoder().decode(VideoGenSettings.self, from: try JSONEncoder().encode(s))
         XCTAssertEqual(decoded, s)
+    }
+
+    /// A persisted LAN pick ("lan:<model>@<peer>") whose base id matches a
+    /// local preset resolves to THAT preset, not the LTX fallback — the pane
+    /// gates ladders, resolutions and request fields on `resolvedModel`, so
+    /// falling back to LTX sent a remote H3 off-canvas sizes and frame counts
+    /// below its trained floor (the cross-pollution class).
+    func testVideoResolvesLanModelToItsMatchingPreset() {
+        var s = VideoGenSettings()
+        s.modelId = "lan:" + VideoModelPreset.minimaxH3.id + "@studio"
+        XCTAssertEqual(s.resolvedModel.id, VideoModelPreset.minimaxH3.id)
+        // An unknown remote model keeps today's LTX fallback.
+        s.modelId = "lan:someone/custom-video@studio"
+        XCTAssertEqual(s.resolvedModel.id, VideoModelPreset.ltx23Q4.id)
     }
 
     // MARK: - Reconstruct preset / resolution by id
@@ -126,7 +142,11 @@ final class MediaGenSettingsTests: XCTestCase {
         s.resolutionId = "1x1"
         XCTAssertEqual(s.resolvedModel.id, VideoModelPreset.ltx23Q4.id)
         let m = s.resolvedModel
-        XCTAssertEqual(s.resolvedResolution(for: m).id, m.defaultResolution.id)
+        // With nothing saved the canvas is sized for THIS Mac, not a static
+        // default — but it is always a rung the picker offers.
+        let r = s.resolvedResolution(for: m)
+        XCTAssertEqual(r.id, m.recommendedResolution(totalGB: RAMChecker.totalGB).id)
+        XCTAssertTrue(m.resolutions.contains(r))
     }
 
     // MARK: - Migration-safe decode: a missing key defaults, never throws
@@ -135,11 +155,9 @@ final class MediaGenSettingsTests: XCTestCase {
         var obj = try JSONSerialization.jsonObject(
             with: try JSONEncoder().encode(ImageGenSettings())) as! [String: Any]
         obj.removeValue(forKey: "steps")
-        obj.removeValue(forKey: "safeMode")
         let decoded = try JSONDecoder().decode(
             ImageGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
         XCTAssertEqual(decoded.steps, ImageGenSettings().steps)
-        XCTAssertEqual(decoded.safeMode, ImageGenSettings().safeMode)
     }
 
     func testAudioMigrationSafeDecodeDropsKey() throws {
@@ -214,5 +232,31 @@ final class MediaGenSettingsTests: XCTestCase {
             Model3DGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
         XCTAssertEqual(decoded.resolution, Model3DGenSettings().resolution)
         XCTAssertEqual(decoded.turntable, Model3DGenSettings().turntable)
+    }
+
+    // MARK: - Resizable prompt editor
+
+    /// A dragged height is persisted, so a value from a different window size —
+    /// or a garbage one — must never leave the editor unusable or off-screen.
+    func testPromptEditorHeightIsClampedBothWays() {
+        XCTAssertEqual(PromptEditorHeight.clamp(4000), PromptEditorHeight.maxHeight)
+        XCTAssertEqual(PromptEditorHeight.clamp(0), PromptEditorHeight.minHeight)
+        XCTAssertEqual(PromptEditorHeight.clamp(-50), PromptEditorHeight.minHeight)
+        XCTAssertEqual(PromptEditorHeight.clamp(.nan), PromptEditorHeight.defaultHeight)
+        XCTAssertEqual(PromptEditorHeight.clamp(240), 240)
+    }
+
+    func testVideoSettingsClampAStalePromptHeightOnDecode() throws {
+        var obj = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(VideoGenSettings())) as! [String: Any]
+        obj["promptHeight"] = 9999.0
+        let decoded = try JSONDecoder().decode(
+            VideoGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(decoded.promptHeight, PromptEditorHeight.maxHeight)
+        // Absent key = an older build's blob → the default, not zero.
+        obj.removeValue(forKey: "promptHeight")
+        let old = try JSONDecoder().decode(
+            VideoGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(old.promptHeight, PromptEditorHeight.defaultHeight)
     }
 }

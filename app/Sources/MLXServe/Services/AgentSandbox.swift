@@ -1017,14 +1017,22 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// and pin the guest. The caller MUST balance with `endCliSession(_:)`
     /// when the terminal exits. Throws `SandboxError` with an actionable
     /// message on every distinct failure — never a hung terminal.
+    ///
+    /// `workingDirectory` is the host folder the session starts in: the
+    /// Settings default lands at `/workspace`, anything else is hot-mounted at
+    /// `/projects/<slug>` (no VM reboot, so terminals on different folders
+    /// coexist). nil = `/workspace`.
     func startCliSession(agent: SandboxAgentSpec?, model: String?, serverPort: UInt16,
                          budget: AgentBudget.Budget, apiKey: String?,
-                         entries: [AgentModelEntry] = []) async throws -> CliSession {
+                         entries: [AgentModelEntry] = [],
+                         workingDirectory: String? = nil) async throws -> CliSession {
         let image = { lock.lock(); defer { lock.unlock() }; return baseImage }()
         return try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    let (g, _) = try self.ensureBooted(image: image, workingDirectory: nil)
+                    let (g, root) = try self.ensureBooted(image: image, workingDirectory: nil)
+                    let cwd = self.resolveAndMountProject(guest: g, hostPath: workingDirectory,
+                                                          defaultRoot: root).path
                     let (port, rootfs): (UInt16?, String?) = {
                         self.bootLock.lock(); defer { self.bootLock.unlock() }
                         return (self.currentSshPort, self.rootfsPath)
@@ -1040,7 +1048,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                         throw SandboxError(message: Self.staleImageMessage(image: image))
                     }
 
-                    var remoteCommand: String?
+                    let remoteCommand: String
                     if let agent {
                         guard let model, !model.isEmpty else {
                             throw SandboxError(message: "no model is loaded — start the server before opening a \(agent.displayName) session")
@@ -1048,8 +1056,11 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                         let bootstrap = try SandboxAgentRegistry.materialize(
                             spec: agent, model: model, serverPort: serverPort,
                             budget: budget, apiKey: apiKey, entries: entries,
-                            rootfsDir: rootfsDir)
+                            rootfsDir: rootfsDir, cwd: cwd)
                         remoteCommand = "sh \(bootstrap)"
+                    } else {
+                        // The image's shell is bash (agent-shell-mlxserve Dockerfile).
+                        remoteCommand = "cd \(VzGuest.shellQuote(cwd)) 2>/dev/null; exec bash -l"
                     }
 
                     // The mirror listens once the first net snapshot delivers
@@ -1203,8 +1214,11 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             }
         }
         // The rootfs is demand-paged over virtiofs (not RAM-resident like the old
-        // initramfs boot), so guest RAM is pure workload headroom.
-        let ramGB = ProcessInfo.processInfo.environment["SANDBOX_RAM_GB"].flatMap { UInt64($0) } ?? 1
+        // initramfs boot), so guest RAM is pure workload headroom — a CAP, not a
+        // reservation (VZ commits pages lazily). 1 GB OOM-killed hermes's
+        // browser-deps `npm install` at ~850 MB RSS (issue #150 follow-up), and
+        // an agent that compiles or runs headless Chromium needs real headroom.
+        let ramGB = ProcessInfo.processInfo.environment["SANDBOX_RAM_GB"].flatMap { UInt64($0) } ?? 4
         cfg.ramBytes = ramGB * 1024 * 1024 * 1024
 
         // Guest monitor consumer: every snapshot carries /proc/meminfo (tray RAM
@@ -1279,16 +1293,32 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
 
     // MARK: Provisioning
 
-    /// contain's prebuilt minimal guest kernel (6.6, virtio-pci + virtiofs +
-    /// virtio-console + virtio-vsock, ~37 MB raw / ~12 MB gz). Same asset the
-    /// contain CLI fetches; pinned by tag, bumped only when the kernel is rebuilt.
+    /// Our prebuilt minimal guest kernel (6.6, virtio-pci + virtiofs +
+    /// virtio-console + virtio-vsock, ~37 MB raw / ~12 MB gz), built by
+    /// `containers/guest-kernel/build.sh` and published as a release asset on
+    /// THIS repo; pinned by tag, bumped only when the kernel is rebuilt.
+    /// (`kernels-v2`/`v3` came from the contain repo and stay published there.)
     ///
     /// `kernels-v3` added `CONFIG_VSOCKETS` + `CONFIG_VIRTIO_VSOCKETS`, which the
     /// guest agent needs. A `kernels-v2` cache still boots — it just falls back
     /// to the legacy console shell (see `chooseTransport`).
-    static let kernelTag = "kernels-v3"
+    ///
+    /// `kernels-v4` (6.6.151) makes the guest a normally writable Linux:
+    /// - fuse patch so no virtiofs inode ever lacks owner-read (issue #150):
+    ///   Apple's host-side server runs unprivileged, making any owner-read-less
+    ///   file a black hole the guest can't create, stat, open, or unlink —
+    ///   which broke `apt-get install` (dpkg's mode-000 .dpkg-new staging) and
+    ///   hermes's Node extraction (GNU tar's mode-000 dangling-symlink
+    ///   placeholders). Creates, mkdir and chmod are clamped; see
+    ///   `containers/guest-kernel/patches/`.
+    /// - ≥6.6.69 is load-bearing on M4 for the stable SVE-hwcap filter: older
+    ///   kernels advertised sve2 the CPU can't execute outside streaming mode
+    ///   (M4 has SME, no real SVE), and capability probes SIGILL'd — hermes
+    ///   died on launch importing python-cryptography (OpenSSL's armcap
+    ///   probe); Go binaries are the same class.
+    static let kernelTag = "kernels-v4"
     static let kernelURL = URL(string:
-        "https://github.com/ddalcu/contain/releases/download/\(kernelTag)/kernel-contain-arm64.gz")!
+        "https://github.com/ddalcu/mlx-serve/releases/download/\(kernelTag)/kernel-arm64.gz")!
 
     /// Cache filename. Tag-versioned rather than sniffed, so bumping the kernel
     /// invalidates every old cache by construction instead of by remembering to

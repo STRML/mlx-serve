@@ -14,17 +14,32 @@ final class CLILauncher: ObservableObject {
     /// Keep rescanning off the initial launch path until we actually have a result.
     @Published private(set) var hasScanned = false
 
-    private static let candidates: [LauncherCLI] = [
+    private nonisolated static let candidates: [LauncherCLI] = [
         .claudeCode,
         .pi,
+        .omp,
         .opencode,
+        .opencode2,
+        .codex,
+        .hermes,
+        .aider,
     ]
+
+    /// Stable id list — pinned against the MAS instructions panel's tabs
+    /// (same CLIs, same order) by `CLISetupInstructionsTests`.
+    nonisolated static var candidateIds: [String] { candidates.map(\.id) }
+
+    /// What the "On this Mac" section shows: the detected CLIs plus the plain
+    /// shell, which has nothing to detect.
+    nonisolated static func offered(detected: [LauncherCLI]) -> [LauncherCLI] {
+        detected + [.shell]
+    }
 
     init() {
         Task { await refresh() }
     }
 
-    /// Re-scan PATH. Cheap — three `which` calls in a single shell invocation.
+    /// Re-scan PATH. Cheap — one `command -v` sweep in a single shell invocation.
     func refresh() async {
         // The App Store build cannot detect or launch other apps (App Review
         // 2.5.2) — it has no host shell to scan PATH with, either. Stay empty.
@@ -33,7 +48,7 @@ final class CLILauncher: ObservableObject {
             return
         }
         let found = await Self.detectInstalled()
-        self.available = found
+        self.available = Self.offered(detected: found)
         self.hasScanned = true
     }
 
@@ -83,45 +98,40 @@ final class CLILauncher: ObservableObject {
         }
 
         var result: [LauncherCLI] = []
+        let home = NSHomeDirectory()
         for cli in candidates {
-            guard let path = resolvedByName[cli.binaryName],
-                  FileManager.default.isExecutableFile(atPath: path) else { continue }
+            var path = resolvedByName[cli.binaryName]
+            if path == nil || !FileManager.default.isExecutableFile(atPath: path!) {
+                // Not on PATH — a desktop app may bundle it (codex inside
+                // ChatGPT.app/Codex.app).
+                path = cli.fallbackPaths
+                    .map { $0.replacingOccurrences(of: "$HOME", with: home) }
+                    .first { FileManager.default.isExecutableFile(atPath: $0) }
+            }
+            guard let resolved = path,
+                  FileManager.default.isExecutableFile(atPath: resolved) else { continue }
             var updated = cli
-            updated.resolvedPath = path
+            updated.resolvedPath = resolved
             result.append(updated)
         }
         return result
     }
 
-    /// Launch a CLI with a folder picker for its working directory.
-    func launchWithPicker(_ cli: LauncherCLI, baseURL: String, servedModelId: String,
-                          budget: AgentBudget.Budget, entries: [AgentModelEntry]) {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.canCreateDirectories = true // show the "New Folder" button
-        panel.prompt = "Open"
-        panel.message = "Select or create a working directory"
-        let defaultWS = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
-        try? FileManager.default.createDirectory(atPath: defaultWS, withIntermediateDirectories: true)
-        panel.directoryURL = URL(fileURLWithPath: defaultWS)
-        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
-        launch(cli, baseURL: baseURL, servedModelId: servedModelId,
-               budget: budget, entries: entries, workingDirectory: url.path)
-    }
-
     /// Write a shell script that sets the right env vars / config for the given
-    /// CLI, then hand it to Terminal.app via NSWorkspace.
-    func launch(_ cli: LauncherCLI, baseURL: String, servedModelId: String,
-                budget: AgentBudget.Budget, entries: [AgentModelEntry],
-                workingDirectory: String?) {
+    /// CLI and return the command an embedded terminal spawns to run it: a
+    /// login+interactive zsh (rc files are where PATH lives — the same shell
+    /// detection used), so the CLI resolves exactly as `command -v` saw it.
+    /// Until 2026-09-02 this was handed to Terminal.app as a `.command` file;
+    /// now it runs in a terminal row of the chat window like the sandbox ones.
+    static func launchCommand(_ cli: LauncherCLI, baseURL: String, servedModelId: String,
+                              budget: AgentBudget.Budget, entries: [AgentModelEntry],
+                              workingDirectory: String?) -> (executable: String, args: [String]) {
         // pi and opencode both need their config files written before launch.
         // The budget travels with them: neither CLI reads `/v1/models` on its
         // own (pi's live list rides the extension we write), so the numbers
         // baked here ARE the contexts they believe the models have. `entries`
         // is the full chat-capable registry — the in-agent /model switch list.
-        cli.prepareConfig?(baseURL, servedModelId, budget)
+        cli.prepareConfig?(baseURL, servedModelId, budget, entries)
 
         let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
         let script = cli.scriptBody(baseURL, servedModelId, cdLine, budget, entries)
@@ -131,7 +141,20 @@ final class CLILauncher: ObservableObject {
         let path = NSTemporaryDirectory() + filename
         try? fullScript.write(toFile: path, atomically: true, encoding: String.Encoding.utf8)
         try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        return ("/bin/zsh", ["-l", "-i", path])
+    }
+}
+
+/// Small-window alert before an agent launches: the agent takes the whole
+/// screen, so a line in its terminal is never seen.
+func warnIfSmallContext(agentId: String, context: Int) {
+    guard let text = AgentBudget.contextWarning(agentId: agentId, context: context) else { return }
+    MainActor.assumeIsolated {
+        let alert = NSAlert()
+        alert.messageText = "Small context window"
+        alert.informativeText = text
+        alert.alertStyle = .warning
+        alert.runModal()
     }
 }
 
@@ -144,8 +167,18 @@ struct LauncherCLI: Identifiable, Equatable {
     let useClaudeIcon: Bool
     /// Optional side-effect invoked before the terminal script runs (e.g. write
     /// pi's `models.json` into its dedicated `~/.mlx-serve/pi/` config dir).
+    /// `entries` = the chat-capable registry snapshot, for configs that bake
+    /// the full model list (aider's metadata file).
     let prepareConfig: (@Sendable (_ baseURL: String, _ servedModelId: String,
-                                  _ budget: AgentBudget.Budget) -> Void)?
+                                  _ budget: AgentBudget.Budget,
+                                  _ entries: [AgentModelEntry]) -> Void)?
+    /// Absolute paths probed when the binary is NOT on PATH — for CLIs a
+    /// desktop app bundles (codex inside ChatGPT.app/Codex.app). `~` is not
+    /// expanded here; entries may start with `$HOME`, expanded at probe time.
+    var fallbackPaths: [String] = []
+    /// A row that talks to mlx-serve refuses to start while the server is
+    /// down; the plain shell does not.
+    var requiresServer: Bool = true
     /// Shell body that sets env vars and execs the CLI. Does NOT include the
     /// shebang. `entries` = the chat-capable registry snapshot (opencode bakes
     /// it into its inline config; pi/Claude Code ignore it — pi's list is
@@ -191,12 +224,16 @@ extension LauncherCLI {
         // the user already configured. Same isolation move as OPENCODE_CONFIG,
         // and the same dir the MAS instructions panel tells the user to create
         // (CLISetupInstructionsTests pins the two against each other).
-        prepareConfig: { baseURL, model, budget in
+        prepareConfig: { baseURL, model, budget, _ in
             let dir = NSString(string: "~/.mlx-serve/pi").expandingTildeInPath
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             let config = AgentConfigs.piModelsJSON(baseURL: baseURL, model: model, budget: budget)
             let path = (dir as NSString).appendingPathComponent("models.json")
             try? config.write(toFile: path, atomically: true, encoding: .utf8)
+            let settingsPath = (dir as NSString).appendingPathComponent("settings.json")
+            let existing = (try? String(contentsOfFile: settingsPath, encoding: .utf8)) ?? "{}"
+            try? AgentConfigs.piSettingsJSON(existing: existing, context: budget.context)
+                .write(toFile: settingsPath, atomically: true, encoding: .utf8)
             // Global context file — pi injects it into every session's system
             // prompt (same builder the sandbox registry materializes in-guest).
             try? AgentConfigs.piAgentsMD(budget: budget)
@@ -217,6 +254,122 @@ extension LauncherCLI {
             export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
             \(cdLine)
             pi --provider mlx --model \(model)
+            """
+        }
+    )
+
+    /// oh-my-pi (https://github.com/can1357/oh-my-pi) — pi fork with its own
+    /// config tree: models.yml (YAML) under the agent dir. Dedicated dir,
+    /// never the user's real ~/.omp/agent — the same non-clobber move as pi.
+    /// The dir env var is still pi's spelling (PI_CODING_AGENT_DIR; measured
+    /// on omp v17 — the OMP_ rename reached only its help text), so the
+    /// script exports both spellings.
+    static let omp = LauncherCLI(
+        id: "omp",
+        displayName: "oh-my-pi",
+        binaryName: "omp",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, entries in
+            let dir = NSString(string: "~/.mlx-serve/omp").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.ompModelsYML(baseURL: baseURL, defaultModel: model, entries: entries)
+                .write(toFile: (dir as NSString).appendingPathComponent("models.yml"),
+                       atomically: true, encoding: .utf8)
+        },
+        scriptBody: { _, model, cdLine, _, _ in
+            """
+            export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
+            export OMP_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
+            \(cdLine)
+            omp --model mlx/\(model)
+            """
+        }
+    )
+
+    /// codex (https://github.com/openai/codex) — Responses-wire only; config
+    /// rides a dedicated CODEX_HOME (the dir must exist before codex runs).
+    /// The script resolves the binary itself (PATH, then the desktop app's
+    /// bundled CLI) so a ChatGPT.app-only install still launches.
+    static let codex = LauncherCLI(
+        id: "codex",
+        displayName: "Codex",
+        binaryName: "codex",
+        iconSystemName: "chevron.left.forwardslash.chevron.right",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, _ in
+            let dir = NSString(string: "~/.mlx-serve/codex").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.codexConfigTOML(baseURL: baseURL, model: model, budget: budget)
+                .write(toFile: (dir as NSString).appendingPathComponent("config.toml"),
+                       atomically: true, encoding: .utf8)
+        },
+        fallbackPaths: [
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "$HOME/Applications/ChatGPT.app/Contents/Resources/codex",
+            "$HOME/Applications/Codex.app/Contents/Resources/codex",
+        ],
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            export CODEX_HOME="$HOME/.mlx-serve/codex"
+            \(AgentConfigs.codexBinResolver)
+            \(cdLine)
+            "$CODEX_BIN"
+            """
+        }
+    )
+
+    /// hermes (Nous Research) — whole config tree rides HERMES_HOME
+    /// (hermes_constants.py), so the sandbox's config.yaml + .env pair lands
+    /// in a dedicated host dir instead of the user's real ~/.hermes.
+    static let hermes = LauncherCLI(
+        id: "hermes",
+        displayName: "hermes",
+        binaryName: "hermes",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, _ in
+            let dir = NSString(string: "~/.mlx-serve/hermes").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.hermesConfigYAML(baseURL: baseURL, apiKey: "mlx-serve",
+                                               model: model, budget: budget, entries: [])
+                .write(toFile: (dir as NSString).appendingPathComponent("config.yaml"),
+                       atomically: true, encoding: .utf8)
+            try? AgentConfigs.hermesEnvFile(baseURL: baseURL)
+                .write(toFile: (dir as NSString).appendingPathComponent(".env"),
+                       atomically: true, encoding: .utf8)
+        },
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            export HERMES_HOME="$HOME/.mlx-serve/hermes"
+            \(cdLine)
+            hermes
+            """
+        }
+    )
+
+    /// aider (https://aider.chat) — pure env vars plus a litellm metadata
+    /// file carrying the real per-model context windows.
+    static let aider = LauncherCLI(
+        id: "aider",
+        displayName: "aider",
+        binaryName: "aider",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, entries in
+            let dir = NSString(string: "~/.mlx-serve/aider").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.aiderModelMetadataJSON(model: model, budget: budget, entries: entries)
+                .write(toFile: (dir as NSString).appendingPathComponent("model-metadata.json"),
+                       atomically: true, encoding: .utf8)
+        },
+        scriptBody: { baseURL, model, cdLine, _, _ in
+            """
+            export OPENAI_API_BASE='\(baseURL)/v1'
+            export OPENAI_API_KEY=mlx-serve
+            \(cdLine)
+            aider --model openai/\(model) --weak-model openai/\(model) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
             """
         }
     )
@@ -249,14 +402,70 @@ extension LauncherCLI {
             """
         }
     )
+
+    static let opencode2 = LauncherCLI(
+        id: "opencode2",
+        displayName: "OpenCode 2",
+        binaryName: "opencode2",
+        iconSystemName: "chevron.left.forwardslash.chevron.right",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, _, _, _ in
+            let pluginDest = NSString(string: "~/.mlx-serve/opencode2/opencode/plugins/mlx-serve").expandingTildeInPath
+            AgentConfigs.copyOpencode2Plugin(to: pluginDest)
+            let cliDir = NSString(string: "~/.mlx-serve/opencode2/opencode").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: cliDir, withIntermediateDirectories: true)
+            let userCli: String
+            if let xdg = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"], !xdg.isEmpty {
+                userCli = (xdg as NSString).appendingPathComponent("opencode/cli.json")
+            } else {
+                userCli = NSString(string: "~/.config/opencode/cli.json").expandingTildeInPath
+            }
+            let existing = (try? String(contentsOfFile: userCli, encoding: .utf8)) ?? "{}"
+            let json = AgentConfigs.opencode2CliJSON(existing: existing, baseURL: baseURL)
+            try? json.write(toFile: (cliDir as NSString).appendingPathComponent("cli.json"),
+                            atomically: true, encoding: .utf8)
+        },
+        scriptBody: { baseURL, model, cdLine, budget, entries in
+            var list = entries
+            if !list.contains(where: { $0.id == model }) {
+                list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+            }
+            return """
+            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true, compaction: true))'
+            export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
+            \(cdLine)
+            if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
+            opencode2 --standalone
+            """
+        }
+    )
+
+    /// A plain login shell in the terminal pane. No config, no server: the
+    /// script only cds and hands the row an INTERACTIVE zsh — without the
+    /// exec the script would end and the row would close on open.
+    static let shell = LauncherCLI(
+        id: "shell",
+        displayName: "Shell",
+        binaryName: "zsh",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: nil,
+        requiresServer: false,
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            \(cdLine)
+            exec /bin/zsh -i
+            """
+        }
+    )
 }
 
 // MARK: - UI
 
 /// Launcher button for the menu bar: one `Menu` with the detected host CLIs
 /// (launched in Terminal.app against the local server) plus the sandboxed
-/// agents (pi/hermes INSIDE the guest VM — routed to the Sandbox window via
-/// `openSandboxAgent`). The sandbox rows are always present, so the button no
+/// agents (pi/hermes INSIDE the guest VM — a terminal row of the chat window,
+/// via `openSandboxAgent`). The sandbox rows are always present, so the button no
 /// longer hides when no host CLI is installed — running an agent needs
 /// nothing on the host anymore.
 @MainActor
@@ -272,63 +481,91 @@ struct CLILauncherButton: View {
     /// subset becomes each CLI's in-agent /model switch list.
     let models: [ModelInfo]
     let isEnabled: Bool
-    /// Tray → Sandbox window hand-off (agent id): the tray can't drive the
-    /// window's state directly, so this posts the launch request and opens
-    /// the window; the window focuses a running session or starts one.
-    let openSandboxAgent: (String) -> Void
-
-    private var budget: AgentBudget.Budget { AgentBudget.forServerContext(serverContextLength) }
-    private var entries: [AgentModelEntry] { AgentModelEntry.chatEntries(from: models) }
+    /// Start a sandbox terminal for an agent id (nil = plain shell) — every
+    /// surface routes to `AppState.startTerminal(agentId:)`.
+    let openSandboxAgent: (String?) -> Void
+    /// Start a host CLI in a terminal row — `AppState.startTerminal(hostCLI:)`.
+    let openHostCLI: (LauncherCLI) -> Void
 
     @StateObject private var detector = CLILauncher()
+    @State private var hovering = false
 
     var body: some View {
         Group {
-            if !detector.hasScanned {
-                // Still scanning — reserve the space with a placeholder so the
-                // footer doesn't reflow when scan finishes a moment later.
-                Color.clear.frame(width: 0, height: 0)
+            if !isEnabled || !detector.hasScanned {
+                // A disabled Menu with a plain button style draws no label, so
+                // the tile vanished with the server; show the gray face instead.
+                TrayTileFace(icon: "terminal", title: "Code", isEnabled: false)
+                    .help(isEnabled ? "Scanning for coding agents…" : "Start the server to launch a coding agent")
             } else {
                 Menu {
-                    if !detector.available.isEmpty {
-                        Section("On this Mac") {
-                            ForEach(detector.available) { cli in
-                                Button {
-                                    detector.launchWithPicker(cli, baseURL: baseURL, servedModelId: servedModelId,
-                                                              budget: budget, entries: entries)
-                                } label: {
-                                    Label(cli.displayName, systemImage: cli.iconSystemName ?? "terminal")
-                                }
-                            }
-                        }
-                    }
-                    Section("In the sandbox") {
-                        ForEach(SandboxAgentRegistry.all) { spec in
-                            Button {
-                                openSandboxAgent(spec.id)
-                            } label: {
-                                Label("\(spec.displayName) in Sandbox", systemImage: "shippingbox")
-                            }
-                        }
-                    }
+                    CLILauncherMenuItems(detector: detector, baseURL: baseURL,
+                                         servedModelId: servedModelId,
+                                         serverContextLength: serverContextLength,
+                                         models: models,
+                                         openSandboxAgent: openSandboxAgent,
+                                         openHostCLI: openHostCLI)
                 } label: {
-                    HStack(spacing: TrayFooterMetrics.iconSpacing) {
-                        Image(systemName: "terminal")
-                        Text("Code")
-                    }
-                    .frame(maxWidth: .infinity)
+                    // The tray tile's own face (`TrayTileFace`), so the Code
+                    // menu matches its Chat / Tasks / Quit siblings and the
+                    // Media Generation row above them.
+                    TrayTileFace(icon: "terminal", title: "Code",
+                                 hovering: hovering, isEnabled: isEnabled)
                 }
-                // Standard bordered-button chrome so the menu is visually
-                // identical to its sibling Chat/Tasks buttons — the previous
-                // hand-rolled stroke + material background rendered as an
-                // odd-one-out outlined pill in the tray footer.
+                // `.button` (not `.borderlessButton`, which throws the custom
+                // label away and draws a plain menu title) + a plain button so
+                // the tile face IS the control.
                 .menuStyle(.button)
-                .buttonStyle(.bordered)
+                .buttonStyle(.plain)
                 .menuIndicator(.hidden)
-                .disabled(!isEnabled)
+                .frame(maxWidth: .infinity)
+                .onHover { hovering = $0 }
                 .help("Launch a coding agent — on this Mac (\(detector.available.isEmpty ? "none detected" : detector.available.map(\.displayName).joined(separator: ", "))) or inside the sandbox (pi, hermes)")
             }
         }
         .task { await detector.refresh() }
+    }
+}
+
+/// The launcher dropdown's BODY — the detected host CLIs plus the sandboxed
+/// agents. Shared by the tray's Code button and the chat empty state's Code
+/// Launcher chip: one list, so the two surfaces cannot drift (a CLI the tray
+/// gains that the chip never offers is the silent-hole class).
+@MainActor
+struct CLILauncherMenuItems: View {
+    @ObservedObject var detector: CLILauncher
+    let baseURL: String
+    let servedModelId: String
+    let serverContextLength: Int?
+    let models: [ModelInfo]
+    let openSandboxAgent: (String?) -> Void
+    let openHostCLI: (LauncherCLI) -> Void
+
+    var body: some View {
+        if !detector.available.isEmpty {
+            Section("On this Mac") {
+                ForEach(detector.available) { cli in
+                    Button {
+                        openHostCLI(cli)
+                    } label: {
+                        Label(L10n.text(cli.displayName), systemImage: cli.iconSystemName ?? "terminal")
+                    }
+                }
+            }
+        }
+        Section("In the sandbox") {
+            ForEach(SandboxAgentRegistry.all) { spec in
+                Button {
+                    openSandboxAgent(spec.id)
+                } label: {
+                    Label("\(spec.displayName) in Sandbox", systemImage: "shippingbox")
+                }
+            }
+            Button {
+                openSandboxAgent(nil)
+            } label: {
+                Label("Shell in Sandbox", systemImage: "terminal")
+            }
+        }
     }
 }

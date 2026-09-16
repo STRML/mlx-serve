@@ -1,6 +1,6 @@
 cask "mlx-core" do
-  version "26.7.12"
-  sha256 "313883392f29a9dfac5ef789c06c0010694e9e1194d81c90abc1947f244745ef"
+  version "26.9.2"
+  sha256 "4fa51eed22cfafe058ba20e9b50353cb1316ba44041382e1d20eb71d2a34680e"
 
   url "https://github.com/ddalcu/mlx-serve/releases/download/v#{version}/MLXCore.dmg"
   name "MLX Core"

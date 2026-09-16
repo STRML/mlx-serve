@@ -19,12 +19,14 @@ const flux = @import("flux.zig");
 const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
 const lora_mod = @import("lora.zig");
-const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
+const music3 = @import("music3.zig");
 const kokoro = @import("kokoro.zig");
 const ltx = @import("ltx_video.zig");
+const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
+const minimax_h3 = @import("minimax_h3.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
 const glb_mod = @import("glb.zig");
@@ -79,14 +81,31 @@ pub const Modality = enum {
 /// (stub) config's `model_type`, so it must accept the markers from
 /// `Modality.modelType` AND the raw config strings discovery peeks
 /// ("flux2-klein-4b", "qwen3_tts", "AudioVideo").
+/// Every media `model_type` this server serves. The ONE list the two
+/// duplicated predicates below are checked against.
+///
+/// `model_discovery.isMediaModelType` cannot call `modalityFromType` — that
+/// module stays filesystem-only so it never pulls in mlx — so the duplication
+/// is deliberate and documented. What was missing was a guard: `minimax_h3`
+/// was registered here and NOT there, so discovery rejected the model with
+/// "unsupported model_type" while the engine that serves it was ready and
+/// waiting. The test at the bottom of this file pins them together.
+pub const media_model_types = [_][]const u8{
+    "flux2",     "krea",       "mage_flow",      "mageflow",
+    "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
+    "hunyuan3d", "minimax_h3", "minimax_music3",
+};
+
 pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
+    if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
     if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
+    if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     return null;
 }
@@ -115,6 +134,7 @@ pub const GenRoute = enum {
 /// `AudioEngine.load` re-peek performs).
 pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
     if (std.mem.eql(u8, model_type, "acestep")) return .music;
+    if (std.mem.eql(u8, model_type, "minimax_music3")) return .music3;
     if (std.mem.eql(u8, model_type, "kokoro")) return .kokoro;
     return .tts;
 }
@@ -124,7 +144,18 @@ pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
 /// clones from `ref_audio` and has no voice list, Kokoro has 54 named blendable
 /// voices and no cloning. The handler refuses the wrong control rather than
 /// ignoring it.
-pub const AudioBackendKind = enum { tts, music, kokoro };
+pub const AudioBackendKind = enum {
+    tts,
+    music,
+    music3,
+    kokoro,
+
+    /// Music-generation backends serve /v1/audio/music-generations and
+    /// advertise "music" beside "audio"; the TTS arms never do.
+    pub fn servesMusic(self: AudioBackendKind) bool {
+        return self == .music or self == .music3;
+    }
+};
 
 /// Peek `model_dir/config.json` for its `model_type` string (owned dupe, caller
 /// frees) or null on any read/parse error. Cheap — used both to route to a media
@@ -195,18 +226,52 @@ fn isMageFlowRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// for a regular LM/embedding arch. The video (LTX "AudioVideo") branch
 /// additionally requires `connector.safetensors` so a generic "AudioVideo"
 /// config without the LTX bundle isn't misrouted.
+/// A file that must be present for `model_type` to be accepted as that media
+/// backend, or null when the `model_type` alone is sufficient.
+///
+/// This is keyed on the TYPE, not the modality. It used to be
+/// `if (modality == .video) require connector.safetensors` — a marker that
+/// belongs to LTX only. The moment a second video backend existed, that guard
+/// rejected it, `detectModality` returned null, and the loader fell through to
+/// the MLX TEXT path: it globbed all four of MiniMax-H3's safetensors into one
+/// weight map and died on `model.norm.weight`. A per-MODALITY guard cannot
+/// survive a modality growing a second backend.
+pub fn requiredMarkerFor(model_type: []const u8) ?[]const u8 {
+    // The table lives in model_discovery (fs-only, so discovery and
+    // register-by-path apply the SAME completeness rule) — this module can
+    // import that one, just not the other way around.
+    return discovery.requiredMediaMarker(model_type);
+}
+
 pub fn detectModality(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?Modality {
     const mt = peekModelType(io, allocator, model_dir) orelse return null;
     defer allocator.free(mt);
     const modality = modalityFromType(mt) orelse return null;
-    if (modality == .video) {
-        // Require the connector — distinguishes the LTX bundle from any other
-        // "AudioVideo" config and ensures the text path can load.
-        const conn_path = std.fmt.allocPrintSentinel(allocator, "{s}/connector.safetensors", .{model_dir}, 0) catch return null;
-        defer allocator.free(conn_path);
-        if (!fileExists(io, conn_path)) return null;
+    if (requiredMarkerFor(mt)) |marker| {
+        const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return null;
+        defer allocator.free(p);
+        if (!fileExists(io, p)) {
+            log.warn("[gen] {s} at {s} is missing {s}; not treating it as a media model\n", .{ mt, model_dir, marker });
+            return null;
+        }
     }
     return modality;
+}
+
+/// True when `model_dir` declares a media `model_type` whose required marker
+/// is missing — an incomplete pack (an in-flight or interrupted download, or
+/// a stray fragment). The load path refuses these BY NAME: falling through to
+/// the text loader globs whatever safetensors ARE present and dies on the
+/// first missing weight (`unreachable` in ReleaseFast — live 2026-08-08, a
+/// turbo-lora fragment killed the server on a plain Generate).
+pub fn incompleteMediaDir(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const mt = peekModelType(io, allocator, model_dir) orelse return false;
+    defer allocator.free(mt);
+    if (modalityFromType(mt) == null) return false;
+    const marker = requiredMarkerFor(mt) orelse return false;
+    const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return false;
+    defer allocator.free(p);
+    return !fileExists(io, p);
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -295,20 +360,22 @@ const FluxImpl = struct {
         self.allocator.free(self.model_dir);
     }
 
-    /// Tokenize the prompt (Qwen3 chat template) and run the FLUX pipeline →
-    /// image [1,3,H,W] f32 in [0,1] (owned mlx array; caller frees).
-    fn generateImage(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {
-        // mflux Qwen3 chat template (enable_thinking=False adds an empty <think> block).
-        const templated = try std.fmt.allocPrint(allocator, "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", .{prompt});
+    /// Tokenize text with the mflux Qwen3 chat template (enable_thinking=False
+    /// adds an empty <think> block), padded/truncated to the fixed
+    /// `FLUX_SEQ_LEN` the DiT's text-position ids are built for. Shared by
+    /// the prompt and (CFG) negative-prompt encodes so both land on the same
+    /// shape.
+    fn tokenizeFixed(self: *FluxImpl, allocator: std.mem.Allocator, text: []const u8) !struct { ids: []i32, mask: []i32 } {
+        const templated = try std.fmt.allocPrint(allocator, "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", .{text});
         defer allocator.free(templated);
 
         const enc = try self.tok.encode(allocator, templated);
         defer allocator.free(enc);
 
-        var ids = try allocator.alloc(i32, FLUX_SEQ_LEN);
-        defer allocator.free(ids);
-        var mask = try allocator.alloc(i32, FLUX_SEQ_LEN);
-        defer allocator.free(mask);
+        const ids = try allocator.alloc(i32, FLUX_SEQ_LEN);
+        errdefer allocator.free(ids);
+        const mask = try allocator.alloc(i32, FLUX_SEQ_LEN);
+        errdefer allocator.free(mask);
         const real = @min(enc.len, FLUX_SEQ_LEN);
         for (0..FLUX_SEQ_LEN) |i| {
             if (i < real) {
@@ -319,7 +386,18 @@ const FluxImpl = struct {
                 mask[i] = 0;
             }
         }
-        var fopts = flux.GenOpts{ .cond_gain = opts.cond_gain, .cond_weights = opts.cond_weights };
+        return .{ .ids = ids, .mask = mask };
+    }
+
+    /// Run the FLUX pipeline → image [1,3,H,W] f32 in [0,1] (owned mlx array;
+    /// caller frees).
+    fn generateImage(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {
+        const pos = try self.tokenizeFixed(allocator, prompt);
+        defer allocator.free(pos.ids);
+        defer allocator.free(pos.mask);
+        const ids = pos.ids;
+        const mask = pos.mask;
+        var fopts = flux.GenOpts{ .cond_gain = opts.cond_gain, .cond_weights = opts.cond_weights, .guidance_scale = opts.guidance_scale };
         var init_lat: ?mlx.mlx_array = null;
         defer if (init_lat) |l| {
             _ = mlx.mlx_array_free(l);
@@ -353,6 +431,15 @@ const FluxImpl = struct {
         if (self.te == null) {
             self.te = try flux.loadTextEncoder(self.io, self.allocator, self.s, self.model_dir);
         }
+        // Classifier-free guidance (base klein): encode the negative prompt
+        // (default "" — unconditional) at the SAME fixed length, so the
+        // denoise loop's cond/uncond forwards share img_ids/txt_ids.
+        if (opts.guidance_scale != 1.0) {
+            const neg = try self.tokenizeFixed(allocator, opts.negative_prompt);
+            defer allocator.free(neg.ids);
+            defer allocator.free(neg.mask);
+            fopts.neg_enc = try flux.encodePrompt(&self.te.?, neg.ids, neg.mask, fopts);
+        }
         const cond = try flux.encodePrompt(&self.te.?, ids, mask, fopts);
         if (self.low_mem) {
             self.te.?.deinit();
@@ -385,6 +472,24 @@ const ImageBackend = union(enum) {
 /// bounds attention memory; the official sampler tops out around 10.
 pub const MAX_EDIT_IMAGES = 4;
 
+/// Ceiling on one video response's raw RGB volume. The whole `frames.rgb`
+/// buffer is base64'd into ONE JSON body and the app decodes it in memory;
+/// past this the client drops the socket and a finished render dies as
+/// `WriteFailed` (#283: 5 chained windows = 701f at 1056x864 = 1.9 GB).
+/// Twin of the app's `VideoModelPreset.maxFramePayloadBytes`; refuse at
+/// admission, by name, before any denoise step.
+pub const MAX_VIDEO_RGB_BYTES: u64 = 768 * 1024 * 1024;
+
+pub fn videoRgbTransportReason(delivered_frames: u32, width: u32, height: u32) ?[]const u8 {
+    const bytes: u64 = @as(u64, delivered_frames) * @as(u64, width) * @as(u64, height) * 3;
+    if (bytes <= MAX_VIDEO_RGB_BYTES) return null;
+    const S = struct {
+        var buf: [192]u8 = undefined;
+    };
+    return std.fmt.bufPrint(&S.buf, "{d} frames at {d}x{d} is {d} MB of raw RGB; one response carries at most {d} MB — fewer frames or windows, or a smaller canvas", .{ delivered_frames, width, height, bytes / (1024 * 1024), MAX_VIDEO_RGB_BYTES / (1024 * 1024) }) catch "video too large for one response";
+}
+
+
 /// Per-request image-generation options shared by both backends.
 pub const ImageGenOpts = struct {
     /// img2img source pixels [1,3,H,W] f32 [0,1], pre-resized to the target
@@ -410,6 +515,12 @@ pub const ImageGenOpts = struct {
     /// (FLUX: 3 taps, Krea: 12 taps).
     cond_gain: f32 = 1.0,
     cond_weights: ?[]const f32 = null,
+    /// Classifier-free guidance — the undistilled "base" klein checkpoints,
+    /// gated by `ImageEngine.supportsGuidance()`. 1.0 (default) skips the
+    /// unconditional forward entirely; distilled klein has guidance baked
+    /// into the weights and is never asked to run it.
+    guidance_scale: f32 = 1.0,
+    negative_prompt: []const u8 = "",
 };
 
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
@@ -417,11 +528,9 @@ pub const ImageGenOpts = struct {
 pub const ImageEngine = struct {
     allocator: std.mem.Allocator,
     backend: ImageBackend,
-    // Runtime LoRA state: the File owns the adapter arrays the attached Refs
-    // point at, so it must live until the next detach (clearLora).
-    lora_file: ?lora_mod.File = null,
-    lora_path: ?[]u8 = null,
-    lora_scale: f32 = 1.0,
+    // Runtime LoRA state: the Stack owns the adapter arrays the attached
+    // Refs point at, so it must live until the next detach (clearLora).
+    lora_stack: ?lora_mod.Stack = null,
     lora_matched: u32 = 0,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*ImageEngine {
@@ -498,33 +607,58 @@ pub const ImageEngine = struct {
         return self.backend == .mage_flow;
     }
 
-    /// Reconcile the engine's attached LoRA with the request: `path == null`
-    /// detaches; a new path (or scale) loads + attaches; the same path+scale is
-    /// a no-op reuse. Returns the number of matched DiT modules.
-    pub fn setLora(self: *ImageEngine, path: ?[]const u8, scale: f32) !u32 {
-        if (path) |p| {
-            if (self.lora_path) |cur| {
-                if (std.mem.eql(u8, cur, p) and scale == self.lora_scale) return self.lora_matched;
-            }
+    /// True when real classifier-free guidance (`guidance_scale`/`negative_prompt`)
+    /// is wired — FLUX only. Distilled klein still accepts the fields (1.0
+    /// is a no-op, matching mflux's basic guider); Krea/Mage-Flow have no
+    /// negative-encode path.
+    pub fn supportsGuidance(self: *const ImageEngine) bool {
+        return self.backend == .flux;
+    }
+
+    /// Reconcile the engine's attached LoRA stack with the request: an empty
+    /// `paths` detaches; the same paths+scales (same order) is a no-op
+    /// reuse; anything else clears and re-attaches every adapter. Mirrors
+    /// mflux's `lora_paths`/`lora_scales`: adapters are summed at forward
+    /// time (`lora.deltaSum`), not merged into the base weight. Returns the
+    /// total number of (module, adapter) attachments across the stack.
+    pub fn setLoras(self: *ImageEngine, paths: []const []const u8, scales: []const f32) !u32 {
+        if (paths.len == 0) {
             self.clearLora();
-            var lf = try lora_mod.loadFile(self.allocator, p);
-            const matched = switch (self.backend) {
-                .flux => |*f| flux.attachLora(&f.dit, &lf, scale),
-                .krea => |k| krea.attachLora(&k.dit, &lf, scale),
-                .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
-            };
-            if (matched == 0) {
-                lf.deinit();
-                return error.LoraNoMatch;
-            }
-            self.lora_file = lf;
-            self.lora_path = try self.allocator.dupe(u8, p);
-            self.lora_scale = scale;
-            self.lora_matched = matched;
-            return matched;
+            return 0;
+        }
+        if (paths.len > lora_mod.MAX_LORAS) return error.TooManyLoras;
+        if (self.lora_stack) |*st| {
+            if (st.matches(paths, scales)) return self.lora_matched;
         }
         self.clearLora();
-        return 0;
+        var stack: lora_mod.Stack = .{ .allocator = self.allocator };
+        errdefer stack.deinit();
+        for (paths, scales) |p, sc| {
+            const dup_p = try self.allocator.dupe(u8, p);
+            errdefer self.allocator.free(dup_p);
+            const arch: lora_mod.Arch = switch (self.backend) {
+                .flux => .flux2,
+                .krea => .krea2,
+                .mage_flow => .generic,
+            };
+            const lf = try lora_mod.loadFile(self.allocator, p, arch);
+            stack.files[stack.count] = lf;
+            stack.paths[stack.count] = dup_p;
+            stack.scales[stack.count] = sc;
+            stack.count += 1;
+        }
+        const matched = switch (self.backend) {
+            .flux => |*f| flux.attachLora(&f.dit, &stack),
+            .krea => |k| krea.attachLora(&k.dit, &stack),
+            .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
+        };
+        if (matched == 0) {
+            stack.deinit();
+            return error.LoraNoMatch;
+        }
+        self.lora_stack = stack;
+        self.lora_matched = matched;
+        return matched;
     }
 
     fn clearLora(self: *ImageEngine) void {
@@ -533,10 +667,8 @@ pub const ImageEngine = struct {
             .krea => |k| krea.detachLora(&k.dit),
             .mage_flow => {}, // no LoRA attached
         }
-        if (self.lora_file) |*lf| lf.deinit();
-        self.lora_file = null;
-        if (self.lora_path) |p| self.allocator.free(p);
-        self.lora_path = null;
+        if (self.lora_stack) |*st| st.deinit();
+        self.lora_stack = null;
         self.lora_matched = 0;
     }
 
@@ -621,82 +753,12 @@ fn clampKreaDim(v: u32) u32 {
     return std.math.clamp(rounded, 256, 2048);
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// NSFW content filter (Krea 2 Community License §4.2). A single shared classifier
-// (Falconsai ViT, src/nsfw.zig) is lazy-loaded once from ~/.mlx-serve/models and
-// applied to EVERY generated image (FLUX + Krea). On by default; `--no-safety`
-// or per-request `"safety": false` disables it. FAILS OPEN: if the classifier
-// isn't downloaded/loadable, image gen proceeds unfiltered (with a warning).
-// Loaded + run on the inference thread (the sole mlx caller) — gen is serial
-// there, so the lazy-init singleton needs no lock.
-// ════════════════════════════════════════════════════════════════════════
-
-const NSFW_REPO_DIR = "Falconsai/nsfw_image_detection";
-var g_nsfw: ?nsfw.Classifier = null;
-var g_nsfw_tried: bool = false;
-
-/// Locate the auto-downloaded classifier dir under ~/.mlx-serve/models (must
-/// contain model.safetensors), or null (→ fail open).
-fn resolveNsfwDir(allocator: std.mem.Allocator, io: std.Io) ?[]u8 {
-    const home = std.mem.span(std.c.getenv("HOME") orelse return null);
-    const dir = std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models/{s}", .{ home, NSFW_REPO_DIR }) catch return null;
-    const marker = std.fmt.allocPrint(allocator, "{s}/model.safetensors", .{dir}) catch {
-        allocator.free(dir);
-        return null;
-    };
-    defer allocator.free(marker);
-    if (std.Io.Dir.openFileAbsolute(io, marker, .{})) |f| {
-        f.close(io);
-        return dir; // caller owns
-    } else |_| {
-        allocator.free(dir);
-        return null;
-    }
-}
-
-/// Lazy-load the shared classifier (once). Returns null on the fail-open path
-/// (model missing or load error) — logged once.
-fn ensureNsfwClassifier(io: std.Io, allocator: std.mem.Allocator) ?*nsfw.Classifier {
-    if (g_nsfw_tried) return if (g_nsfw) |*c| c else null;
-    g_nsfw_tried = true;
-    const dir = resolveNsfwDir(allocator, io) orelse {
-        log.warn("[image] content filter ON but classifier not found at ~/.mlx-serve/models/{s} — failing OPEN (images NOT filtered). Download it to enable.\n", .{NSFW_REPO_DIR});
-        return null;
-    };
-    defer allocator.free(dir);
-    g_nsfw = nsfw.load(io, allocator, dir) catch |err| {
-        log.warn("[image] NSFW classifier load failed ({s}) — failing OPEN (images NOT filtered)\n", .{@errorName(err)});
-        g_nsfw = null;
-        return null;
-    };
-    log.info("[image] NSFW content filter ready (Falconsai ViT)\n", .{});
-    return if (g_nsfw) |*c| c else null;
-}
-
-/// P(nsfw) threshold above which a generated image is blocked. Default 0.5;
-/// operators can tune via `MLX_SERVE_NSFW_THRESHOLD` (stricter = lower).
-fn nsfwThreshold() f32 {
-    if (std.c.getenv("MLX_SERVE_NSFW_THRESHOLD")) |v| {
-        return std.fmt.parseFloat(f32, std.mem.span(v)) catch nsfw.NSFW_THRESHOLD;
-    }
-    return nsfw.NSFW_THRESHOLD;
-}
-
-/// True if the request explicitly opts out of the content filter via
-/// `"safety": false`.
-fn bodyDisablesSafety(body: []const u8) bool {
-    const pat = "\"safety\"";
-    const ki = std.mem.indexOf(u8, body, pat) orelse return false;
-    var i = ki + pat.len;
-    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
-    return std.mem.startsWith(u8, body[i..], "false");
-}
-
 /// The audio modality hosts MULTIPLE architectures (the `ImageBackend`
 /// convention): Qwen3-TTS speech synthesis and ACE-Step music generation.
 pub const AudioBackend = union(enum) {
     tts: tts.Synthesizer,
     music: *acestep.Engine,
+    music3: *music3.Engine,
     kokoro: *kokoro.Engine,
 };
 
@@ -718,6 +780,11 @@ pub const AudioEngine = struct {
             log.info("[audio] ACE-Step music engine ready\n", .{});
             return self;
         }
+        if (mt != null and audioBackendKindForType(mt.?) == .music3) {
+            self.backend = .{ .music3 = try music3.Engine.load(io, allocator, model_dir) };
+            log.info("[audio] MiniMax Music 3 engine ready\n", .{});
+            return self;
+        }
         if (mt != null and audioBackendKindForType(mt.?) == .kokoro) {
             const ks = mlx.mlx_default_gpu_stream_new();
             self.backend = .{ .kokoro = try kokoro.Engine.load(io, allocator, model_dir, ks) };
@@ -734,6 +801,7 @@ pub const AudioEngine = struct {
         switch (self.backend) {
             .tts => |*synth| synth.deinit(),
             .music => |e| e.deinit(),
+            .music3 => |e| e.deinit(),
             .kokoro => |e| e.deinit(),
         }
         self.allocator.destroy(self);
@@ -819,7 +887,14 @@ fn dirHasConfig(dir: []const u8) bool {
     return true;
 }
 
-const LTX_PAD_LEN: usize = 256; // gemma left-pad length
+// The reference's `TOKENIZER_MAX_LENGTH` (ltx_core/text_encoders/gemma/
+// gemma_assets.py), for 2.3 and 2.5 alike. `LTXGemmaTokenizer` DEFAULTS to 256,
+// but no caller uses that default — `build_gemma_tokenizer` passes 1024, and the
+// encoder's own docstring says "the tokenizer pads every prompt to max_length
+// (1024)". We shipped 256 from the 2.3 port onwards, which left the connector
+// tiling its 128 learnable registers over 2 slots instead of 8 and gave the DiT
+// a quarter of the text rows it was trained to cross-attend to.
+const LTX_PAD_LEN: usize = 1024; // gemma left-pad length
 const LTX_PAD_ID: i32 = 0; // gemma <pad>
 const LTX_GEMMA_BOS: i32 = 2; // <bos>
 
@@ -828,7 +903,7 @@ const LTX_GEMMA_BOS: i32 = 2; // <bos>
 // scrambled subtitle-like captions into the frame; these terms steer CFG away
 // from that. The audio tail (lip sync, muted/distorted voice, background
 // noise, dialogue terms) is load-bearing for speech when audio CFG runs; if
-// the whole thing ever exceeds LTX_PAD_LEN (~229 tokens today, 256 budget),
+// the whole thing ever exceeds LTX_PAD_LEN (~229 tokens today, 1024 budget),
 // ltxPadWithBos left-truncates and keeps that tail.
 const LTX_NEGATIVE_PROMPT =
     "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, " ++
@@ -866,7 +941,129 @@ pub const TransformerVariant = enum {
 /// stream; the forward graph runs on the GPU stream. The 11 GB transformer slot
 /// holds ONE variant at a time; `ensureTransformer` swaps it (deinit + reload)
 /// so dev + distilled are never resident together.
+/// The `.video` modality slot, one arm per backend — the same shape
+/// `ImageEngine` uses for flux|krea|mage_flow. Adding a backend is one arm plus
+/// an impl file; every call site holds `*VideoEngine` and dispatches here.
 pub const VideoEngine = struct {
+    allocator: std.mem.Allocator,
+    backend: union(enum) {
+        ltx: *LtxVideoEngine,
+        h3: *H3VideoEngine,
+    },
+
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*VideoEngine {
+        const self = try allocator.create(VideoEngine);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .backend = undefined };
+        if (peekModelType(io, allocator, model_dir)) |mt| {
+            defer allocator.free(mt);
+            if (std.mem.eql(u8, mt, "minimax_h3")) {
+                self.backend = .{ .h3 = try H3VideoEngine.load(io, allocator, model_dir) };
+                return self;
+            }
+        }
+        self.backend = .{ .ltx = try LtxVideoEngine.load(io, allocator, model_dir) };
+        return self;
+    }
+
+    pub fn deinit(self: *VideoEngine) void {
+        switch (self.backend) {
+            .ltx => |e| e.deinit(),
+            .h3 => |e| e.deinit(),
+        }
+        self.allocator.destroy(self);
+    }
+
+    /// LoRA is an LTX-only capability; H3 ships no adapter format, so this is a
+    /// NAMED refusal rather than a silent no-op that reports a match count of 0.
+    pub fn setLora(self: *VideoEngine, path: ?[]const u8, scale: f32) !u32 {
+        return switch (self.backend) {
+            .ltx => |e| e.setLora(path, scale),
+            .h3 => if (path == null) 0 else error.LoraUnsupported,
+        };
+    }
+};
+
+/// `h3ConfigDeclaresRef2va` over a model dir's own `config.json`.
+fn h3DirDeclaresRef2va(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return false;
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    return h3ConfigDeclaresRef2va(allocator, content);
+}
+
+/// True when a MiniMax-H3 `config.json` declares the `ref2va` task. The two
+/// partitions share the text encoder, both VAEs and every geometry number, so
+/// nothing about the files themselves tells them apart — only the converter's
+/// declared task list does, and an FL2VA pack handed references would generate
+/// while silently ignoring them.
+fn h3ConfigDeclaresRef2va(allocator: std.mem.Allocator, config_json: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const tasks = parsed.value.object.get("tasks") orelse return false;
+    if (tasks != .array) return false;
+    for (tasks.array.items) |t| {
+        if (t == .string and std.mem.eql(u8, t.string, "ref2va")) return true;
+    }
+    return false;
+}
+
+/// MiniMax-H3 video+audio. Holds only paths: `minimax_h3.generate` stages the
+/// text encoder and the DiT sequentially because they cannot both be resident,
+/// so there is nothing useful to keep loaded between requests.
+pub const H3VideoEngine = struct {
+    allocator: std.mem.Allocator,
+    model_dir: []u8,
+    /// Whether this pack is the REF2VA partition (read from its config's task
+    /// list at load — the file layout is identical either way).
+    supports_refs: bool = false,
+
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*H3VideoEngine {
+        const self = try allocator.create(H3VideoEngine);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .model_dir = try allocator.dupe(u8, model_dir),
+            .supports_refs = h3DirDeclaresRef2va(io, allocator, model_dir),
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *H3VideoEngine) void {
+        self.allocator.free(self.model_dir);
+        self.allocator.destroy(self);
+    }
+
+    pub fn paths(self: *const H3VideoEngine, a: std.mem.Allocator) !minimax_h3.GenPaths {
+        return .{
+            .tokenizer_dir = self.model_dir,
+            .text_encoder = try std.fmt.allocPrint(a, "{s}/text_encoder.safetensors", .{self.model_dir}),
+            .dit = try std.fmt.allocPrint(a, "{s}/transformer.safetensors", .{self.model_dir}),
+            .vae = try std.fmt.allocPrint(a, "{s}/video_vae.safetensors", .{self.model_dir}),
+            .audio_vae = try std.fmt.allocPrint(a, "{s}/audio_vae.safetensors", .{self.model_dir}),
+            .turbo_lora = try std.fmt.allocPrint(a, "{s}/turbo_lora.safetensors", .{self.model_dir}),
+        };
+    }
+
+    /// Whether the pack ships the Turbo LoRA. Probed per request, not cached
+    /// at engine load: the 744 MB file can land in the folder while the
+    /// server is up, and a stale "no" would 400 a capability that exists.
+    pub fn hasTurboLora(self: *const H3VideoEngine, io: std.Io, a: std.mem.Allocator) bool {
+        const p = std.fs.path.join(a, &.{ self.model_dir, "turbo_lora.safetensors" }) catch return false;
+        defer a.free(p);
+        const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return false;
+        return st.size > 0;
+    }
+};
+
+pub const LtxVideoEngine = struct {
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
     transformer: ltx.Component,
@@ -876,33 +1073,39 @@ pub const VideoEngine = struct {
     audio: ?ltx.Component = null, // audio VAE + vocoder; null → video has no sound
     vae_encoder: ?ltx.Component = null, // image VAE encoder; null → image-to-video + two-stage disabled
     upsampler: ?ltx.Component = null, // spatial x2 latent upsampler; lazy-loaded for two-stage
+    // LTX's own DiffVAE decoder — what their published clips are decoded with.
+    // Lazy like the upsampler: the 4-bit pack does not ship it, and a request
+    // that never asks for it must not pay 0.83 GB.
+    diffusion_decoder: ?ltx.Component = null,
     tok: tok_mod.Tokenizer,
     gemma_dir: []u8,
     model_dir: []u8,
-    // Runtime LoRA state (mirrors ImageEngine): the File owns the adapter
+    /// Which LTX release this pack is, read from its own config.json at load.
+    /// It decides the text encoder (2.5 ships its own, in-pack) and the two
+    /// DiT-side differences; the geometry is shared.
+    ltx_cfg: ltx.LtxConfig = .{},
+    // Runtime LoRA state (mirrors ImageEngine): the Stack owns the adapter
     // arrays the transformer Component's `lora` pointer reads through, so it
     // must live until the next detach (clearLora).
-    lora_file: ?lora_mod.File = null,
-    lora_path: ?[]u8 = null,
-    lora_scale: f32 = 1.0,
+    lora_stack: ?lora_mod.Stack = null,
     lora_matched: u32 = 0,
 
-    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*VideoEngine {
-        const self = try allocator.create(VideoEngine);
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*LtxVideoEngine {
+        const self = try allocator.create(LtxVideoEngine);
         errdefer allocator.destroy(self);
         self.* = undefined;
         self.allocator = allocator;
         self.audio = null;
         self.vae_encoder = null;
         self.upsampler = null;
-        self.lora_file = null;
-        self.lora_path = null;
-        self.lora_scale = 1.0;
+        self.diffusion_decoder = null;
+        self.lora_stack = null;
         self.lora_matched = 0;
 
-        self.gemma_dir = try resolveGemmaDir(io, allocator);
+        self.ltx_cfg = ltx.loadLtxConfig(io, allocator, model_dir);
+        self.gemma_dir = try resolveGemmaDir(io, allocator, model_dir, self.ltx_cfg.version);
         errdefer allocator.free(self.gemma_dir);
-        log.info("[video] gemma text encoder: {s}\n", .{self.gemma_dir});
+        log.info("[video] LTX {s} — gemma text encoder: {s}\n", .{ @tagName(self.ltx_cfg.version), self.gemma_dir });
         self.model_dir = try allocator.dupe(u8, model_dir);
         errdefer allocator.free(self.model_dir);
 
@@ -945,7 +1148,7 @@ pub const VideoEngine = struct {
         return self;
     }
 
-    fn hasVariant(self: *VideoEngine, io: std.Io, variant: TransformerVariant) bool {
+    fn hasVariant(self: *LtxVideoEngine, io: std.Io, variant: TransformerVariant) bool {
         var buf: [1024]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ self.model_dir, variant.fileName() }, 0) catch return false;
         return fileExists(io, p);
@@ -954,7 +1157,7 @@ pub const VideoEngine = struct {
     /// Swap the transformer slot to `want` (no-op when already loaded). The old
     /// component is freed BEFORE the new one loads so dev + distilled (11 GB
     /// each) never coexist.
-    pub fn ensureTransformer(self: *VideoEngine, want: TransformerVariant) !void {
+    pub fn ensureTransformer(self: *LtxVideoEngine, want: TransformerVariant) !void {
         if (self.transformer_variant == want) return;
         log.info("[video] swapping transformer: {s} -> {s}\n", .{ @tagName(self.transformer_variant), @tagName(want) });
         self.transformer.deinit();
@@ -966,49 +1169,56 @@ pub const VideoEngine = struct {
         self.applyLora();
     }
 
-    /// Reconcile the attached LoRA with the request (mirrors ImageEngine):
-    /// `path == null` detaches; the same path+scale is a no-op reuse; a new
-    /// path/scale loads + installs on the transformer Component. Returns the
-    /// number of adapter modules present in the DiT.
-    pub fn setLora(self: *VideoEngine, path: ?[]const u8, scale: f32) !u32 {
-        if (path) |p| {
-            if (self.lora_path) |cur| {
-                if (std.mem.eql(u8, cur, p) and scale == self.lora_scale) return self.lora_matched;
-            }
+    /// Reconcile the attached LoRA stack with the request (mirrors
+    /// `ImageEngine.setLoras`): empty `paths` detaches; the same
+    /// paths+scales is a no-op reuse; anything else loads + installs every
+    /// adapter on the transformer Component. Returns the total number of
+    /// (module, adapter) attachments present in the DiT.
+    pub fn setLoras(self: *LtxVideoEngine, paths: []const []const u8, scales: []const f32) !u32 {
+        if (paths.len == 0) {
             self.clearLora();
-            var lf = try lora_mod.loadFile(self.allocator, p);
-            const matched = ltx.countLoraMatches(&self.transformer, &lf);
-            if (matched == 0) {
-                lf.deinit();
-                return error.LoraNoMatch;
-            }
-            self.lora_file = lf;
-            self.lora_path = try self.allocator.dupe(u8, p);
-            self.lora_scale = scale;
-            self.lora_matched = matched;
-            self.applyLora();
-            return matched;
+            return 0;
+        }
+        if (paths.len > lora_mod.MAX_LORAS) return error.TooManyLoras;
+        if (self.lora_stack) |*st| {
+            if (st.matches(paths, scales)) return self.lora_matched;
         }
         self.clearLora();
-        return 0;
+        var stack: lora_mod.Stack = .{ .allocator = self.allocator };
+        errdefer stack.deinit();
+        for (paths, scales) |p, sc| {
+            const dup_p = try self.allocator.dupe(u8, p);
+            errdefer self.allocator.free(dup_p);
+            const lf = try lora_mod.loadFile(self.allocator, p, .flux2);
+            stack.files[stack.count] = lf;
+            stack.paths[stack.count] = dup_p;
+            stack.scales[stack.count] = sc;
+            stack.count += 1;
+        }
+        const matched = ltx.countLoraMatches(&self.transformer, &stack);
+        if (matched == 0) {
+            stack.deinit();
+            return error.LoraNoMatch;
+        }
+        self.lora_stack = stack;
+        self.lora_matched = matched;
+        self.applyLora();
+        return matched;
     }
 
-    fn clearLora(self: *VideoEngine) void {
+    fn clearLora(self: *LtxVideoEngine) void {
         self.transformer.lora = null;
-        if (self.lora_file) |*lf| lf.deinit();
-        self.lora_file = null;
-        if (self.lora_path) |p| self.allocator.free(p);
-        self.lora_path = null;
+        if (self.lora_stack) |*st| st.deinit();
+        self.lora_stack = null;
         self.lora_matched = 0;
     }
 
-    fn applyLora(self: *VideoEngine) void {
-        self.transformer.lora = if (self.lora_file) |*lf| lf else null;
-        self.transformer.lora_scale = self.lora_scale;
+    fn applyLora(self: *LtxVideoEngine) void {
+        self.transformer.lora = if (self.lora_stack) |*st| st else null;
     }
 
     /// Lazily load the spatial-x2 upsampler for the two-stage boundary.
-    pub fn ensureUpsampler(self: *VideoEngine, io: std.Io) !*const ltx.Component {
+    pub fn ensureUpsampler(self: *LtxVideoEngine, io: std.Io) !*const ltx.Component {
         if (self.upsampler) |*u| return u;
         var buf: [1024]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}.safetensors", .{ self.model_dir, ltx.UPSAMPLER_PREFIX }, 0) catch return error.MissingUpsampler;
@@ -1022,7 +1232,20 @@ pub const VideoEngine = struct {
         return &self.upsampler.?;
     }
 
-    pub fn deinit(self: *VideoEngine) void {
+    /// Lazily load the DiffVAE decoder. Absent → `error.MissingDiffusionDecoder`,
+    /// which the handler turns into a NAMED 400; a silent fall back to the conv
+    /// decoder would answer a different question than the one asked.
+    pub fn ensureDiffusionDecoder(self: *LtxVideoEngine, io: std.Io) !*const ltx.Component {
+        if (self.diffusion_decoder) |*d| return d;
+        var buf: [1024]u8 = undefined;
+        const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ self.model_dir, diffvae_fwd.FILE_NAME }, 0) catch return error.MissingDiffusionDecoder;
+        if (!fileExists(io, p)) return error.MissingDiffusionDecoder;
+        const cpu_s = mlx.mlx_default_cpu_stream_new();
+        self.diffusion_decoder = try diffvae_fwd.load(self.allocator, p, cpu_s);
+        return &self.diffusion_decoder.?;
+    }
+
+    pub fn deinit(self: *LtxVideoEngine) void {
         self.clearLora();
         self.transformer.deinit();
         self.connector.deinit();
@@ -1030,6 +1253,7 @@ pub const VideoEngine = struct {
         if (self.audio) |*a| a.deinit();
         if (self.vae_encoder) |*e| e.deinit();
         if (self.upsampler) |*u| u.deinit();
+        if (self.diffusion_decoder) |*d| d.deinit();
         self.tok.deinit();
         self.allocator.free(self.gemma_dir);
         self.allocator.free(self.model_dir);
@@ -1195,6 +1419,10 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
     var prompt: ?[]const u8 = null;
     var model: ?[]const u8 = null;
     var size: ?[]const u8 = null;
+    var lora_paths: ?[]const u8 = null;
+    var lora_scales: ?[]const u8 = null;
+    var lora_path: ?[]const u8 = null;
+    var lora_scale: ?[]const u8 = null;
 
     while (it.next()) |part| {
         // `image`, `image[]` and `image[0]` are all in the wild.
@@ -1221,6 +1449,14 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
             if (part.data.len != 0 and !std.mem.eql(u8, part.data, "png")) return error.OutputFormatUnsupported;
         } else if (std.mem.eql(u8, part.name, "stream")) {
             if (std.mem.eql(u8, part.data, "true")) return error.StreamUnsupported;
+        } else if (std.mem.eql(u8, part.name, "lora_paths")) {
+            if (part.data.len != 0) lora_paths = part.data;
+        } else if (std.mem.eql(u8, part.name, "lora_scales")) {
+            if (part.data.len != 0) lora_scales = part.data;
+        } else if (std.mem.eql(u8, part.name, "lora_path")) {
+            if (part.data.len != 0) lora_path = part.data;
+        } else if (std.mem.eql(u8, part.name, "lora_scale")) {
+            if (part.data.len != 0) lora_scale = part.data;
         }
         // background / quality / input_fidelity / output_compression / user /
         // partial_images: accepted and ignored — they don't change what we'd
@@ -1244,6 +1480,25 @@ pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, cont
     if (size) |sz| {
         try out.appendSlice(allocator, ",\"size\":");
         try chat_mod.appendJsonString(allocator, &out, sz);
+    }
+    // LoRA fields ride through to `parseLoraFields` (issue #268: they were
+    // silently dropped). The array forms are JSON text and pass as-is — a
+    // malformed array is that parser's named 400, not ours.
+    if (lora_paths) |v| {
+        try out.appendSlice(allocator, ",\"lora_paths\":");
+        try out.appendSlice(allocator, v);
+    }
+    if (lora_scales) |v| {
+        try out.appendSlice(allocator, ",\"lora_scales\":");
+        try out.appendSlice(allocator, v);
+    }
+    if (lora_path) |v| {
+        try out.appendSlice(allocator, ",\"lora_path\":");
+        try chat_mod.appendJsonString(allocator, &out, v);
+    }
+    if (lora_scale) |v| {
+        try out.appendSlice(allocator, ",\"lora_scale\":");
+        try out.appendSlice(allocator, v);
     }
     try out.appendSlice(allocator, ",\"image\":\"");
     try appendBase64(allocator, &out, images[0]);
@@ -1331,6 +1586,26 @@ fn imageNativeSize(encoded: []const u8) ?struct { w: u32, h: u32 } {
 /// source window matching the target's aspect ratio — the image is never
 /// stretched; mismatched aspects lose edges to a center crop instead of
 /// distorting the subject. Returns null on decode failure.
+/// [1,3,H,W] in [0,1] (decodeImageToBCHW's cover output) -> [1,3,1,H,W] in
+/// [-1,1] f32 — the shape/range MiniMax-H3's keyframe encoder consumes.
+fn unitToPm1BCFHW(bchw: mlx.mlx_array, target_h: u32, target_w: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const two = mlx.mlx_array_new_float(2.0);
+    defer _ = mlx.mlx_array_free(two);
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    try mlx.check(mlx.mlx_multiply(&scaled, bchw, two, s));
+    var pm1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pm1);
+    try mlx.check(mlx.mlx_subtract(&pm1, scaled, one, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const shape5 = [_]c_int{ 1, 3, 1, @intCast(target_h), @intCast(target_w) };
+    try mlx.check(mlx.mlx_reshape(&out, pm1, &shape5, 5, s));
+    return out;
+}
+
 fn decodeImageToBCHW(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32) ?mlx.mlx_array {
     var w: c_int = 0;
     var h: c_int = 0;
@@ -1448,13 +1723,26 @@ const LTX_GEMMA_REPO_DIR = "mlx-community/gemma-3-12b-it-4bit";
 /// owns downloads. `$LTX_GEMMA_DIR` stays as an explicit override (tests /
 /// custom installs). A candidate is accepted only if it has a `config.json`,
 /// so a partial download never gets handed back.
-fn resolveGemmaDir(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+fn resolveGemmaDir(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, version: ltx.LtxVersion) ![]u8 {
     if (std.c.getenv("LTX_GEMMA_DIR")) |env| {
         const e = std.mem.span(env);
         // A relative override would feed openFileAbsolute's assert downstream
         // (ReleaseFast UB) — ignore it loudly instead.
         if (e.len > 0 and std.fs.path.isAbsolute(e)) return allocator.dupe(u8, e);
         if (e.len > 0) log.warn("[video] ignoring non-absolute LTX_GEMMA_DIR: {s}\n", .{e});
+    }
+    // 2.5 ships a FINE-TUNED encoder inside the pack, so the pack is
+    // self-contained and there is no shared repo to fall back to: a 2.5 pack
+    // whose subdir is missing is incomplete, not a 2.3 pack.
+    if (version.textEncoderSubdir()) |sub| {
+        const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, sub });
+        errdefer allocator.free(dir);
+        const cfg = try std.fmt.allocPrintSentinel(allocator, "{s}/config.json", .{dir}, 0);
+        defer allocator.free(cfg);
+        if (fileExists(io, cfg)) return dir;
+        allocator.free(dir);
+        log.err("[video] LTX 2.5 pack is missing its text encoder ({s}/{s})\n", .{ model_dir, sub });
+        return error.NoGemmaDir;
     }
     const home = std.mem.span(std.c.getenv("HOME") orelse return error.NoGemmaDir);
     if (!std.fs.path.isAbsolute(home)) return error.NoGemmaDir;
@@ -1512,7 +1800,7 @@ fn ltxPadWithBos(allocator: std.mem.Allocator, enc: []const u32, bos: i32, pad_l
 // ════════════════════════════════════════════════════════════════════════
 
 /// POST /v1/images/generations — base64 PNG (or SSE progress + complete).
-pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *ImageEngine) !void {
+pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *ImageEngine) !void {
     const prompt_raw = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
     const prompt = try jsonUnescape(allocator, prompt_raw);
     defer allocator.free(prompt);
@@ -1621,6 +1909,28 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
                 return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
             edit_imgs_n = 1;
             log.info("[image] edit: reference {d}x{d} -> {d}x{d} (in-context conditioning)\n", .{ nat.w, nat.h, rd.w, rd.h });
+            // Output grid (independent of the reference's own conditioning grid
+            // above — the reference rides at its own `rd` grid in every attention
+            // step and is never resized onto the output canvas, unlike the
+            // byte-based backend above). NO size in the request = "Match
+            // source": the reference's own resolution IS the output target,
+            // same contract the byte-based backend already honors above. An
+            // EXPLICIT size is honored LITERALLY — the reference's aspect ratio
+            // has no architectural claim on the output grid here, so reshaping
+            // a requested 512x512 into the reference's aspect (as the
+            // byte-based backend must) just produced the wrong resolution.
+            // Without the no-size branch, `width`/`height` stay at the
+            // 1024x1024 default from earlier and every edit comes back square
+            // regardless of what the client asked to match.
+            const fit = if (size_given)
+                fitWithinCap(width, height, engine.maxDim())
+            else
+                resolveEditTargetSize(nat.w, nat.h, nat.w, nat.h, engine.maxDim());
+            const nz = engine.normalizeSize(fit.w, fit.h);
+            if (nz.w != width or nz.h != height)
+                log.info("[image] edit: target {d}x{d} -> {d}x{d} (primary reference is {d}x{d}, size {s})\n", .{ width, height, nz.w, nz.h, nat.w, nat.h, if (size_given) "requested" else "matched to source" });
+            width = nz.w;
+            height = nz.h;
         } else {
             // Variation shares the output's latent grid — cover + center-crop
             // to the output dims (never stretched).
@@ -1682,27 +1992,61 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         log.info("[image] rebalance: gain={d:.2} weights={d}\n", .{ cond_gain, wl.len });
     }
 
-    // Style LoRA: absolute path to a .safetensors adapter (+ optional scale).
-    // No `lora_path` in the request detaches whatever was attached before.
-    if (extractJsonString(body, "lora_path")) |lp_raw| {
-        const lp = try jsonUnescape(allocator, lp_raw);
-        defer allocator.free(lp);
-        const lscale: f32 = @floatCast(extractJsonFloat(body, "lora_scale") orelse 1.0);
-        const matched = engine.setLora(lp, lscale) catch |err| switch (err) {
-            error.LoraNoMatch => return sendError(conn, 400, "LoRA has no modules matching this model's DiT — wrong LoRA for this architecture?"),
-            error.BadLoraPath => return sendError(conn, 400, "'lora_path' must be an absolute path to a .safetensors file"),
+    // Classifier-free guidance (base klein, undistilled): 'guidance_scale'
+    // != 1.0 runs a second, unconditional forward per step against
+    // 'negative_prompt' (default "" — empty-string unconditioning, the
+    // standard CFG convention). 1.0 is a no-op, so distilled klein can
+    // accept both fields harmlessly; only an ACTUALLY-requested CFG run
+    // needs the capability.
+    var guidance_scale: f32 = 1.0;
+    if (extractJsonFloat(body, "guidance_scale")) |g| {
+        if (!(g >= 0.0 and g <= 20.0)) return sendError(conn, 400, "'guidance_scale' must be in [0,20]");
+        guidance_scale = @floatCast(g);
+    }
+    var negative_prompt: []const u8 = "";
+    var negative_prompt_owned: ?[]u8 = null;
+    defer if (negative_prompt_owned) |np| allocator.free(np);
+    if (extractJsonString(body, "negative_prompt")) |raw_neg| {
+        negative_prompt_owned = try jsonUnescape(allocator, raw_neg);
+        negative_prompt = negative_prompt_owned.?;
+    }
+    if (guidance_scale != 1.0 and !engine.supportsGuidance())
+        return sendError(conn, 400, "'guidance_scale' requires a FLUX.2 model");
+
+    // Style LoRA(s): one or more absolute paths to .safetensors adapters,
+    // each with an optional scale — mirrors mflux's `--lora-paths`/
+    // `--lora-scales`. Accepts the array form (`lora_paths`/`lora_scales`)
+    // or the original single-adapter form (`lora_path`/`lora_scale`) for
+    // backward compatibility. No LoRA fields in the request detaches
+    // whatever was attached before.
+    {
+        var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
+        var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
+        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+            error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
+            error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
+            error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
             error.OutOfMemory => return err,
-            else => return sendError(conn, 400, "failed to load the LoRA file"),
         };
-        log.info("[image] lora: matched {d} modules from {s} (scale {d:.2})\n", .{ matched, lp, lscale });
-    } else {
-        _ = engine.setLora(null, 1.0) catch {};
+        defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
+
+        var lora_paths: [lora_mod.MAX_LORAS][]const u8 = undefined;
+        for (lora_path_bufs[0..lora_n], 0..) |p, i| lora_paths[i] = p;
+        const matched = engine.setLoras(lora_paths[0..lora_n], lora_scales[0..lora_n]) catch |err| switch (err) {
+            error.LoraNoMatch => return sendError(conn, 400, "LoRA(s) have no modules matching this model's DiT — wrong LoRA for this architecture?"),
+            error.BadLoraPath => return sendError(conn, 400, "'lora_path'/'lora_paths' must be absolute path(s) to .safetensors file(s)"),
+            error.TooManyLoras => return sendError(conn, 400, "too many LoRA adapters requested"),
+            error.OutOfMemory => return err,
+            else => return sendError(conn, 400, "failed to load a LoRA file"),
+        };
+        if (lora_n > 0)
+            log.info("[image] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, lora_n });
     }
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[image] generating {d}x{d} steps={d} stream={}: {d} chars\n", .{ width, height, steps, want_stream, prompt.len });
-    var sctx = sse.StreamCtx{ .conn = conn };
-    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     const gen_opts = ImageGenOpts{
@@ -1712,8 +2056,16 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         .edit_image_bytes = edit_byte_bufs[0..edit_byte_n],
         .cond_gain = cond_gain,
         .cond_weights = cond_weights,
+        .guidance_scale = guidance_scale,
+        .negative_prompt = negative_prompt,
     };
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
+        // Client hung up mid-generation — there is nobody to answer, and
+        // saying "generation failed" would be a lie about a job we stopped.
+        if (err == error.Cancelled) {
+            log.info("[image] generation cancelled — client disconnected\n", .{});
+            return;
+        }
         log.err("[image] generation failed: {}\n", .{err});
         if (want_stream) {
             sse.sendError(conn, "generation failed");
@@ -1722,26 +2074,6 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         return sendError(conn, 500, "generation failed");
     };
     defer _ = mlx.mlx_array_free(img);
-
-    // Content filter (Krea license §4.2; on by default, `--no-safety` /
-    // `"safety":false` to disable). Run the NSFW classifier on the generated
-    // pixels; if flagged, refuse. Fail OPEN if the classifier is unavailable.
-    if (server_mod.image_safety_filter and !bodyDisablesSafety(body)) {
-        if (ensureNsfwClassifier(io, allocator)) |clf| {
-            const p_nsfw = clf.classify(img) catch |err| blk: {
-                log.warn("[image] classifier error ({s}) — failing OPEN\n", .{@errorName(err)});
-                break :blk @as(f32, 0);
-            };
-            if (p_nsfw > nsfwThreshold()) {
-                log.warn("[image] output blocked by content filter (P(nsfw)={d:.3})\n", .{p_nsfw});
-                if (want_stream) {
-                    sse.sendError(conn, "generated image blocked by the content filter");
-                    return;
-                }
-                return sendError(conn, 400, "generated image blocked by the content filter (set \"safety\":false or run with --no-safety to override)");
-            }
-        }
-    }
 
     const png_bytes = try engine.toPng(allocator, img);
     defer allocator.free(png_bytes);
@@ -1768,7 +2100,7 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
 pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
     const synth = switch (engine.backend) {
         .tts => |*t| t,
-        .music => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
+        .music, .music3 => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
         .kokoro => |k| return handleKokoroSpeech(allocator, conn, body, k),
     };
     // Pre-warm (docs/qwentts-cache.md): `{"warm_only":true,"ref_audio":...}`
@@ -1830,8 +2162,8 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[audio] synthesizing {d} chars stream={} clone={}\n", .{ text.len, want_stream, ref_samples != null });
-    var sctx = sse.StreamCtx{ .conn = conn };
-    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     const wav = synth.synthesizeWav(text, 2048, prog, ref_samples) catch |err| {
@@ -1936,18 +2268,38 @@ fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     return sendBytes(conn, allocator, "audio/wav", out);
 }
 
-/// `POST /v1/audio/music-generations` — ACE-Step text2music.
+/// `instrumental: true` beside words to sing is contradictory. Letting either
+/// side quietly win is the failure mode — a sticky checkbox silently discards a
+/// verse the user typed, or the checkbox does nothing — so the pair is a NAMED
+/// 400 (the `/v1/images/edits` rule: everything we cannot honor is named).
+/// Whitespace-only lyrics count as ABSENT so an app that keeps a blank lyrics
+/// editor mounted beside the checkbox is fine. Both backends read this ONE
+/// predicate, so the rule cannot drift between them.
+pub fn instrumentalConflicts(instrumental: bool, lyrics: []const u8) bool {
+    return instrumental and std.mem.trim(u8, lyrics, " \t\r\n").len != 0;
+}
+
+/// `POST /v1/audio/music-generations` — ACE-Step text2music / cover / complete.
 /// `{"model", "prompt" (style/genre/mood, REQUIRED), "lyrics" ("" →
-/// "[Instrumental]"), "vocal_language" ("en"), "bpm", "keyscale",
+/// "[Instrumental]"), "instrumental" (bool, the explicit spelling of empty
+/// lyrics; a 400 if real lyrics ride along), "vocal_language" ("en"), "bpm", "keyscale",
 /// "timesignature", "duration_seconds" (default 60, valid 10–600), "seed",
-/// "stream"}`. Response mirrors `/v1/audio/speech`: raw `audio/wav` bytes
+/// "ref_audio" (base64 WAV, style/timbre), "task" ("text2music" | "cover" |
+/// "complete"), "src_audio" (base64 WAV 10–600 s, the cover/complete source;
+/// its length becomes the track length), "cover_strength" (0–1, default 1),
+/// "cover_noise_strength" (0–1, default 0), "track_classes" (complete: array
+/// from the TRACK_NAMES vocabulary), "stream"}`. Response mirrors `/v1/audio/speech`: raw `audio/wav` bytes
 /// non-stream; SSE `progress` per stage/step + a base64 `complete` event when
 /// streaming. Targeting a TTS voice model here is an explicit 400.
 pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
-    const music = switch (engine.backend) {
-        .music => |m| m,
+    switch (engine.backend) {
+        .music => |m| return handleMusicAcestep(allocator, conn, body, m),
+        .music3 => |m| return handleMusic3(allocator, conn, body, m),
         .tts, .kokoro => return sendError(conn, 400, "loaded audio model is a TTS voice; POST /v1/audio/speech"),
-    };
+    }
+}
+
+fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, music: *acestep.Engine) !void {
     const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (style/genre/mood description)");
     const prompt = try jsonUnescape(allocator, raw_prompt);
     defer allocator.free(prompt);
@@ -1965,6 +2317,10 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         allocator.free(language);
         language = try jsonUnescape(allocator, raw);
     }
+    const instrumental = sse.bodyWantsTrue(body, "instrumental");
+    if (instrumentalConflicts(instrumental, lyrics))
+        return sendError(conn, 400, "'instrumental' is true but 'lyrics' is non-empty — send one or the other");
+    const cond_lyrics = acestep.resolveLyrics(instrumental, lyrics);
     const keyscale = extractJsonString(body, "keyscale") orelse "";
     const timesignature = extractJsonString(body, "timesignature") orelse "";
     var bpm: ?u32 = null;
@@ -1977,21 +2333,117 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         return sendError(conn, 400, "'duration_seconds' must be in [10,600]");
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
 
+    // `task`: text2music (default) | cover | complete (vocal-to-BGM). The task
+    // is the DiT's context stream + the instruction line; cover/complete read
+    // a full-length `src_audio`, whose latent decides the track length.
+    var task: acestep.Task = .text2music;
+    if (extractJsonString(body, "task")) |raw| {
+        task = std.meta.stringToEnum(acestep.Task, raw) orelse return sendError(conn, 400, "'task' must be one of text2music, cover, complete");
+    }
+    const cover_strength: f32 = @floatCast(extractJsonFloat(body, "cover_strength") orelse 1.0);
+    const cover_noise_strength: f32 = @floatCast(extractJsonFloat(body, "cover_noise_strength") orelse 0.0);
+    if (cover_strength < 0.0 or cover_strength > 1.0 or cover_noise_strength < 0.0 or cover_noise_strength > 1.0)
+        return sendError(conn, 400, "'cover_strength' and 'cover_noise_strength' must be in [0,1]");
+    if (task != .cover and (extractJsonFloat(body, "cover_strength") != null or extractJsonFloat(body, "cover_noise_strength") != null))
+        return sendError(conn, 400, "'cover_strength' / 'cover_noise_strength' only apply to task \"cover\"");
+    var track_classes: []u8 = try allocator.dupe(u8, "");
+    defer allocator.free(track_classes);
+    if (iterJsonStringArray(body, "track_classes")) |it0| {
+        if (task != .complete) return sendError(conn, 400, "'track_classes' only applies to task \"complete\"");
+        var it = it0;
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(allocator);
+        while (it.next()) |n| try names.append(allocator, n);
+        if (it.bad) return sendError(conn, 400, "'track_classes' must be an array of strings");
+        allocator.free(track_classes);
+        track_classes = acestep.joinTrackClasses(allocator, names.items) catch
+            return sendError(conn, 400, "'track_classes' entries must be from: woodwinds, brass, fx, synth, strings, percussion, keyboard, guitar, bass, drums, backing_vocals, vocals");
+    }
+    if (task == .cover and !music.fsqAvailable())
+        return sendError(conn, 400, "task \"cover\" needs fsq.safetensors beside model.safetensors (this pack predates cover mode — re-download it, or fetch fsq.safetensors from the HF mirror into the model folder)");
+
+    // `src_audio`: the cover / complete SOURCE as a base64 WAV, full length
+    // (10–600 s, NOT windowed like ref_audio). Named 400s, never a silent
+    // text2music downgrade.
+    var src_audio: ?mlx.mlx_array = null;
+    defer if (src_audio) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    if (extractJsonString(body, "src_audio")) |raw_src| {
+        const b64 = try jsonUnescape(allocator, raw_src);
+        defer allocator.free(b64);
+        if (b64.len > 0) {
+            if (task == .text2music) return sendError(conn, 400, "'src_audio' needs task \"cover\" or \"complete\" (text2music takes 'ref_audio' for style)");
+            const wav_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "src_audio: invalid base64");
+            defer allocator.free(wav_bytes);
+            const dec = wav_mod.decode(allocator, wav_bytes) catch return sendError(conn, 400, "src_audio: expected a PCM16/PCM24/float32 WAV");
+            defer allocator.free(dec.pcm);
+            const secs = (dec.pcm.len / dec.channels) / dec.sample_rate;
+            if (secs < acestep.MIN_DURATION_S) return sendError(conn, 400, "src_audio: clip too short (needs at least 10 s)");
+            if (secs > acestep.MAX_DURATION_S) return sendError(conn, 400, "src_audio: clip longer than 600 s");
+            const stereo = try wav_mod.toStereoInterleaved(allocator, dec.pcm, dec.channels);
+            defer allocator.free(stereo);
+            const at48k = try wav_mod.resampleLinear(allocator, stereo, 2, dec.sample_rate, music.cfg.sample_rate);
+            defer allocator.free(at48k);
+            const n: c_int = @intCast(at48k.len / 2);
+            src_audio = mlx.mlx_array_new_data(at48k.ptr, &[_]c_int{ 1, n, 2 }, 3, .float32);
+            log.info("[music] source audio: {d}s {d} Hz {d}ch clip for task {s}\n", .{ secs, dec.sample_rate, dec.channels, @tagName(task) });
+        }
+    }
+    if (task != .text2music and src_audio == null)
+        return sendError(conn, 400, "task \"cover\" / \"complete\" needs 'src_audio' (base64 WAV of the source track)");
+
+    // `ref_audio` (#259): a base64 WAV whose style/timbre the track should
+    // follow. Fills the condition encoder's timbre slot (VAE latent mean of a
+    // 30 s window, `acestep.referenceWindow`) instead of the silence latent.
+    // NOT graceful (the a2vid rule): the user asked for THIS clip, so a silent
+    // text2music downgrade is a wrong result — named 400s instead.
+    var ref_audio: ?mlx.mlx_array = null;
+    defer if (ref_audio) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    if (extractJsonString(body, "ref_audio")) |raw_ref| {
+        const b64 = try jsonUnescape(allocator, raw_ref);
+        defer allocator.free(b64);
+        if (b64.len > 0) {
+            const wav_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "ref_audio: invalid base64");
+            defer allocator.free(wav_bytes);
+            const dec = wav_mod.decode(allocator, wav_bytes) catch return sendError(conn, 400, "ref_audio: expected a PCM16/PCM24/float32 WAV");
+            defer allocator.free(dec.pcm);
+            if (dec.pcm.len / dec.channels < dec.sample_rate) return sendError(conn, 400, "ref_audio: clip too short (needs at least 1 s)");
+            const stereo = try wav_mod.toStereoInterleaved(allocator, dec.pcm, dec.channels);
+            defer allocator.free(stereo);
+            const at48k = try wav_mod.resampleLinear(allocator, stereo, 2, dec.sample_rate, music.cfg.sample_rate);
+            defer allocator.free(at48k);
+            const window = try acestep.referenceWindow(allocator, at48k, music.cfg.sample_rate);
+            defer allocator.free(window);
+            const n: c_int = @intCast(window.len / 2);
+            ref_audio = mlx.mlx_array_new_data(window.ptr, &[_]c_int{ 1, n, 2 }, 3, .float32);
+            log.info("[music] reference audio: {d:.1}s {d} Hz {d}ch clip -> 30 s timbre window\n", .{ @as(f32, @floatFromInt(dec.pcm.len / dec.channels)) / @as(f32, @floatFromInt(dec.sample_rate)), dec.sample_rate, dec.channels });
+        }
+    }
+
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[music] generating {d}s seed={d} lyrics={d}ch stream={}\n", .{ duration, seed, lyrics.len, want_stream });
-    var sctx = sse.StreamCtx{ .conn = conn };
-    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    log.info("[music] generating {d}s task={s} seed={d} lyrics={d}ch instrumental={} ref_audio={} src_audio={} stream={}\n", .{ duration, @tagName(task), seed, cond_lyrics.len, instrumental, ref_audio != null, src_audio != null, want_stream });
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     const req = acestep.MusicRequest{
         .caption = prompt,
-        .lyrics = lyrics,
+        .lyrics = cond_lyrics,
         .language = language,
         .bpm = bpm,
         .keyscale = keyscale,
         .timesignature = timesignature,
         .duration_s = duration,
         .seed = seed,
+        .ref_audio = ref_audio,
+        .task = task,
+        .src_audio = src_audio,
+        .cover_strength = cover_strength,
+        .cover_noise_strength = cover_noise_strength,
+        .track_classes = track_classes,
     };
     const wav = music.generateWav(allocator, req, prog) catch |err| {
         log.err("[music] generation failed: {}\n", .{err});
@@ -2003,6 +2455,145 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     };
     defer allocator.free(wav);
     log.info("[music] -> {d} WAV bytes\n", .{wav.len});
+    if (want_stream) {
+        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
+        const b64 = try allocator.alloc(u8, b64_len);
+        defer allocator.free(b64);
+        _ = std.base64.standard.Encoder.encode(b64, wav);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
+        try out.appendSlice(allocator, b64);
+        try out.appendSlice(allocator, "\"}\n\n");
+        try conn.writeAll(out.items);
+        return;
+    }
+    return sendBytes(conn, allocator, "audio/wav", wav);
+}
+
+/// `POST /v1/audio/music-generations` — MiniMax Music 3 text2music.
+/// `{"model", "prompt" (style/genre/mood caption, REQUIRED), "lyrics"
+/// (REQUIRED unless `instrumental` — the model is lyric-conditioned; structure
+/// tags like `[verse]` each on their own line), "instrumental" (bool; sends the
+/// `[Instrumental]` section tag from MiniMax's own model card as the whole
+/// lyric block — the open weights have no `is_instrumental` parameter, so text
+/// is the only lever, and the tag is the same one ACE-Step uses),
+/// "bpm" (30-300) and "keyscale" — no request field exists for these on this
+/// engine, so they are folded into the caption as MiniMax's own
+/// `BPM: 96. Key: C major.` (`music3.captionWithFacts`), skipped when the
+/// prompt already says them; "duration_seconds" (default 60, valid 1-360, an
+/// UPPER bound — the model may stop earlier), "steps" (flow-match steps,
+/// default 30, valid 4-100), "seed", "stream"}`. ACE-Step's
+/// bpm/keyscale/timesignature/vocal_language have NO equivalent here and are
+/// named 400s rather than silent ignores. Response mirrors the ACE-Step
+/// handler: raw `audio/wav` non-stream, SSE progress + base64 complete when
+/// streaming.
+fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3: *music3.Engine) !void {
+    // `timesignature` and `vocal_language` stay named 400s: MiniMax's card
+    // documents neither, and inventing caption text for an undocumented knob is
+    // worse than saying we cannot honor it. `bpm` and `keyscale` USED to be
+    // refused here too — wrongly. Global Metadata on that same card lists BPM,
+    // key and scale, and its example caption reads
+    // "Genre: acoustic pop. BPM: 96. Key: C major.", so they are supported;
+    // they are just caption TEXT here rather than conditioning fields.
+    for ([_][]const u8{ "timesignature", "vocal_language" }) |field| {
+        const present = extractJsonString(body, field) != null or extractJsonInt(body, field) != null;
+        if (present) {
+            var msg: [160]u8 = undefined;
+            const m = std.fmt.bufPrint(&msg, "'{s}' is an ACE-Step field; MiniMax Music 3 has no documented equivalent (put it in 'prompt' yourself)", .{field}) catch "unsupported field";
+            return sendError(conn, 400, m);
+        }
+    }
+    const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (style/genre/mood description)");
+    const prompt = try jsonUnescape(allocator, raw_prompt);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+    const instrumental = sse.bodyWantsTrue(body, "instrumental");
+    var lyrics: []u8 = try allocator.dupe(u8, "");
+    defer allocator.free(lyrics);
+    if (extractJsonString(body, "lyrics")) |raw| {
+        allocator.free(lyrics);
+        lyrics = try jsonUnescape(allocator, raw);
+    }
+    if (instrumentalConflicts(instrumental, lyrics))
+        return sendError(conn, 400, "'instrumental' is true but 'lyrics' is non-empty — send one or the other");
+    if (extractJsonString(body, "ref_audio")) |raw| if (raw.len > 0)
+        return sendError(conn, 400, "'ref_audio' is not supported by this model (MiniMax Music 3 takes no reference audio) — it is an ACE-Step field");
+    if (extractJsonString(body, "src_audio")) |raw| if (raw.len > 0)
+        return sendError(conn, 400, "'src_audio' is not supported by this model (MiniMax Music 3 has no cover / complete mode) — it is an ACE-Step field");
+    if (extractJsonString(body, "task")) |raw| if (!std.mem.eql(u8, raw, "text2music"))
+        return sendError(conn, 400, "'task' is not supported by this model (MiniMax Music 3 is text2music only) — cover / complete are ACE-Step tasks");
+    if (!instrumental and std.mem.trim(u8, lyrics, " \t\r\n").len == 0)
+        return sendError(conn, 400, "missing 'lyrics' (MiniMax Music 3 is lyric-conditioned; structure tags like [verse] go on their own lines, or send \"instrumental\": true)");
+    const cond_lyrics = music3.resolveLyrics(instrumental, lyrics);
+
+    // Tempo and key ride the CAPTION on this engine (see captionWithFacts), as
+    // does the no-vocals intent — the lyric tag alone leaves vocal TEXTURE in
+    // (measured 2026-08-18), and MiniMax's api marks `prompt` required for an
+    // instrumental track while making `lyrics` optional. Built BEFORE the
+    // 5000-token pre-check below so every added clause is COUNTED, never
+    // smuggled past the cap.
+    var bpm: ?u32 = null;
+    if (extractJsonInt(body, "bpm")) |b| {
+        if (b < 30 or b > 300) return sendError(conn, 400, "'bpm' must be in [30,300]");
+        bpm = @intCast(b);
+    }
+    const keyscale = extractJsonString(body, "keyscale") orelse "";
+    const caption = try music3.captionWithFacts(
+        allocator,
+        prompt,
+        bpm,
+        keyscale,
+        instrumental and music3.instrumentalCaptionEnabled(),
+    );
+    defer allocator.free(caption);
+    const caption_grew = caption.len != prompt.len;
+
+    const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 60);
+    if (duration < music3.MIN_DURATION_S or duration > music3.MAX_DURATION_S)
+        return sendError(conn, 400, "'duration_seconds' must be in [1,360]");
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse music3.DEFAULT_STEPS);
+    if (steps < 4 or steps > 100) return sendError(conn, 400, "'steps' must be in [4,100]");
+    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
+
+    // Pre-validate the prompt budget BEFORE any SSE bytes go out, so the cap
+    // is a clean named 400 instead of a mid-stream error.
+    {
+        const toks = m3.tokenizePrompt(allocator, caption, cond_lyrics) catch |err| switch (err) {
+            error.PromptTooLong => return sendError(conn, 400, "assembled prompt exceeds 5000 tokens"),
+            else => return err,
+        };
+        allocator.free(toks.ids);
+        allocator.free(toks.uncond);
+    }
+
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[music3] generating {d}s steps={d} seed={d} lyrics={d}ch instrumental={} caption_facts={} stream={}\n", .{ duration, steps, seed, cond_lyrics.len, instrumental, caption_grew, want_stream });
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const req = music3.MusicRequest{
+        .caption = caption,
+        .lyrics = cond_lyrics,
+        .duration_s = duration,
+        .seed = seed,
+        .steps = steps,
+    };
+    const wav = m3.generateWav(allocator, req, prog) catch |err| {
+        if (err == error.Cancelled) {
+            log.info("[music3] generation cancelled by client\n", .{});
+            return;
+        }
+        log.err("[music3] generation failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "music generation failed");
+            return;
+        }
+        return sendError(conn, 500, "music generation failed");
+    };
+    defer allocator.free(wav);
+    log.info("[music3] -> {d} WAV bytes\n", .{wav.len});
     if (want_stream) {
         const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
         const b64 = try allocator.alloc(u8, b64_len);
@@ -2106,10 +2697,58 @@ pub fn videoGuiderDefaults(pipeline: VideoPipeline, cfg_video: ?f32, cfg_audio: 
     }
 }
 
+/// H3 result -> the SAME wire shape the LTX path emits (base64 rgb8 frames plus
+/// interleaved pcm_s16le), so the Swift client's existing decode and
+/// AVAssetWriter mux need no new branch.
+fn sendH3Video(allocator: std.mem.Allocator, conn: *Conn, res: *const minimax_h3.GenResult, want_stream: bool) !void {
+    const s = mlx.gpuStream();
+    const audio_mod = @import("minimax_h3_audio.zig");
+
+    // [1,3,F,H,W] in [-1,1] -> [F,H,W,3] u8
+    const rgb = try minimax_h3.pixelsToRgb8(allocator, res, s);
+    defer allocator.free(rgb);
+    log.info("[video] -> {d}f {d}x{d} ({d} rgb bytes)\n", .{ res.frame_count, res.height, res.width, rgb.len });
+
+    const b64_len = std.base64.standard.Encoder.calcSize(rgb.len);
+    const b64 = try allocator.alloc(u8, b64_len);
+    defer allocator.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, rgb);
+
+    var audio_b64: ?[]u8 = null;
+    defer if (audio_b64) |a| allocator.free(a);
+    if (res.audio) |wave| {
+        const pcm = try minimax_h3.audioToPcm16(allocator, wave, s);
+        defer allocator.free(pcm);
+        const al = std.base64.standard.Encoder.calcSize(pcm.len);
+        const ab = try allocator.alloc(u8, al);
+        _ = std.base64.standard.Encoder.encode(ab, pcm);
+        audio_b64 = ab;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    const prefix = if (want_stream) "data: {\"type\":\"complete\"," else "{\"created\":0,";
+    const head = try std.fmt.allocPrint(allocator, "{s}\"frames\":{d},\"height\":{d},\"width\":{d},\"fps\":24,\"format\":\"rgb8\",\"data\":\"", .{ prefix, res.frame_count, res.height, res.width });
+    defer allocator.free(head);
+    try out.appendSlice(allocator, head);
+    try out.appendSlice(allocator, b64);
+    try out.appendSlice(allocator, "\"");
+    if (audio_b64) |ab| {
+        const ah = try std.fmt.allocPrint(allocator, ",\"audio_sample_rate\":{d},\"audio_channels\":2,\"audio_format\":\"pcm_s16le\",\"audio_data\":\"", .{audio_mod.SAMPLE_RATE});
+        defer allocator.free(ah);
+        try out.appendSlice(allocator, ah);
+        try out.appendSlice(allocator, ab);
+        try out.appendSlice(allocator, "\"");
+    }
+    try out.appendSlice(allocator, if (want_stream) "}\n\n" else "}");
+    if (want_stream) return conn.writeAll(out.items);
+    return sendBytesJson(conn, allocator, out.items);
+}
+
 /// Stage-2 transformer provider for the two-stage boundary: swaps the engine's
 /// transformer slot from dev to distilled (freeing dev first).
 const Stage2Swap = struct {
-    engine: *VideoEngine,
+    engine: *LtxVideoEngine,
 
     fn swap(ctx: *anyopaque) anyerror!*const ltx.Component {
         const self: *Stage2Swap = @ptrCast(@alignCast(ctx));
@@ -2119,6 +2758,530 @@ const Stage2Swap = struct {
 };
 
 pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *VideoEngine) !void {
+    return switch (engine.backend) {
+        .ltx => |e| handleVideoLtx(io, allocator, conn, body, e),
+        .h3 => |e| handleVideoH3(io, allocator, conn, body, e),
+    };
+}
+
+/// SSE sink for a video request. Preview JPEGs are opt-in and require stream.
+fn videoStreamCtx(conn: *Conn, allocator: std.mem.Allocator, body: []const u8, want_stream: bool) sse.StreamCtx {
+    const pr = sse.parsePreview(body);
+    return .{
+        .conn = conn,
+        .stream = want_stream,
+        .allocator = allocator,
+        .preview = want_stream and pr.enabled,
+        .preview_frames = pr.frames,
+        .preview_max_side = pr.max_side,
+    };
+}
+
+/// Base64-decode a JSON string value (unescaping `\/` first — Swift clients
+/// escape every slash) into an owned buffer.
+fn jsonB64Alloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const unescaped = try jsonUnescape(allocator, raw);
+    defer allocator.free(unescaped);
+    return base64DecodeAlloc(allocator, unescaped);
+}
+
+/// One reference's bytes, before `resolveRefs` has decided its canvas. Images
+/// and video frames stay ENCODED — the canvas is not known yet and the server
+/// resizes by decoding AT a size, so there is nothing useful to decode into.
+const PendingRefs = struct {
+    allocator: std.mem.Allocator,
+    images: std.ArrayList([]u8) = .empty,
+    /// Per reference video: its encoded frames, then its 32 kHz stereo
+    /// soundtrack (interleaved) if it carries one.
+    video_frames: std.ArrayList(std.ArrayList([]u8)) = .empty,
+    video_audio: std.ArrayList(?[]f32) = .empty,
+    audios: std.ArrayList([]f32) = .empty,
+
+    fn deinit(self: *PendingRefs) void {
+        const a = self.allocator;
+        for (self.images.items) |b| a.free(b);
+        self.images.deinit(a);
+        for (self.video_frames.items) |*fr| {
+            for (fr.items) |b| a.free(b);
+            fr.deinit(a);
+        }
+        self.video_frames.deinit(a);
+        for (self.video_audio.items) |p| if (p) |x| a.free(x);
+        self.video_audio.deinit(a);
+        for (self.audios.items) |p| a.free(p);
+        self.audios.deinit(a);
+    }
+};
+
+/// Decode a base64 WAV to 32 kHz STEREO interleaved f32 — the audio VAE's rate.
+/// The VAE is not sensitive to sub-sample resample accuracy, so the linear
+/// resampler the a2vid conditioning path already uses is enough here too.
+fn refWavTo32kStereo(allocator: std.mem.Allocator, raw_b64: []const u8) ![]f32 {
+    const wav_bytes = try jsonB64Alloc(allocator, raw_b64);
+    defer allocator.free(wav_bytes);
+    const dec = try wav_mod.decode(allocator, wav_bytes);
+    defer allocator.free(dec.pcm);
+    const stereo = try wav_mod.toStereoInterleaved(allocator, dec.pcm, dec.channels);
+    defer allocator.free(stereo);
+    return wav_mod.resampleLinear(allocator, stereo, 2, dec.sample_rate, minimax_h3.audio_mod.SAMPLE_RATE);
+}
+
+/// `[2, L]` f32 in [-1, 1] from interleaved stereo — the audio encoder's shape
+/// (the stereo channels ride the BATCH axis; the encoder itself is mono).
+fn stereoInterleavedToArray(allocator: std.mem.Allocator, pcm: []const f32) !mlx.mlx_array {
+    const frames = pcm.len / 2;
+    const planar = try allocator.alloc(f32, frames * 2);
+    defer allocator.free(planar);
+    for (0..frames) |i| {
+        planar[i] = pcm[i * 2];
+        planar[frames + i] = pcm[i * 2 + 1];
+    }
+    const shp = [_]c_int{ 2, @intCast(frames) };
+    return mlx.mlx_array_new_data(planar.ptr, &shp, 2, mlx.mlx_dtype.float32);
+}
+
+/// Parse and decode the ref2va reference fields into `out` (caller owns every
+/// entry). Returns null on success, or the NAMED 400 message to send — a
+/// reference the server cannot use must never be silently dropped, because the
+/// generation then succeeds while ignoring what the user asked it to follow.
+///
+/// `err_buf` backs the messages that name an index; the rest are literals.
+fn parseH3Refs(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    gen_w: u32,
+    gen_h: u32,
+    gen_frames: u32,
+    out: *std.ArrayList(minimax_h3.RefMedia),
+    err_buf: []u8,
+) !?[]const u8 {
+    const mode: minimax_h3.RefImageSizing = blk: {
+        const raw = extractJsonString(body, "ref_image_size") orelse break :blk .match;
+        if (std.mem.eql(u8, raw, "match")) break :blk .match;
+        if (std.mem.eql(u8, raw, "max")) break :blk .max;
+        return "'ref_image_size' must be \"match\" or \"max\"";
+    };
+
+    var pend = PendingRefs{ .allocator = allocator };
+    defer pend.deinit();
+
+    if (iterJsonStringArray(body, "ref_images")) |it0| {
+        var it = it0;
+        while (it.next()) |b64| {
+            const bytes = jsonB64Alloc(allocator, b64) catch
+                return std.fmt.bufPrint(err_buf, "'ref_images'[{d}] is not valid base64", .{pend.images.items.len}) catch
+                    "a 'ref_images' entry is not valid base64";
+            try pend.images.append(allocator, bytes);
+        }
+        if (it.bad) return "'ref_images' must be an array of base64 PNG/JPEG strings";
+    }
+
+    if (iterJsonObjectArray(body, "ref_videos")) |it0| {
+        var it = it0;
+        while (it.next()) |obj| {
+            const vi = pend.video_frames.items.len;
+            // Handed to `pend` EMPTY and filled through its own slot: every
+            // rejection below is a named 400, i.e. a NORMAL return, so an
+            // errdefer would not fire and the frames decoded so far would leak.
+            try pend.video_frames.append(allocator, .empty);
+            const frames = &pend.video_frames.items[vi];
+            var fit = iterJsonStringArray(obj, "frames") orelse
+                return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}] needs a 'frames' array of base64 PNG/JPEG strings", .{vi}) catch
+                    "a 'ref_videos' entry needs a 'frames' array";
+            while (fit.next()) |b64| {
+                const bytes = jsonB64Alloc(allocator, b64) catch
+                    return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}].frames[{d}] is not valid base64", .{ vi, frames.items.len }) catch
+                        "a 'ref_videos' frame is not valid base64";
+                try frames.append(allocator, bytes);
+            }
+            if (fit.bad)
+                return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}].frames must be an array of base64 PNG/JPEG strings", .{vi}) catch
+                    "a 'ref_videos' frames array is malformed";
+            // The soundtrack is a FIELD on its own video object, so a missing
+            // one cannot shift the pairing the way a parallel array's hole did.
+            var track: ?[]f32 = null;
+            if (extractJsonString(obj, "audio")) |raw| {
+                if (raw.len > 0) {
+                    track = refWavTo32kStereo(allocator, raw) catch
+                        return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}].audio must be a PCM16/PCM24/float32 WAV", .{vi}) catch
+                            "a 'ref_videos' soundtrack could not be decoded";
+                }
+            }
+            try pend.video_audio.append(allocator, track);
+        }
+        if (it.bad) return "'ref_videos' must be an array of {\"frames\":[…],\"audio\":\"…\"} objects";
+    }
+
+    if (iterJsonStringArray(body, "ref_audios")) |it0| {
+        var it = it0;
+        while (it.next()) |b64| {
+            const pcm = refWavTo32kStereo(allocator, b64) catch
+                return std.fmt.bufPrint(err_buf, "'ref_audios'[{d}] must be a PCM16/PCM24/float32 WAV", .{pend.audios.items.len}) catch
+                    "a 'ref_audios' entry could not be decoded";
+            try pend.audios.append(allocator, pcm);
+        }
+        if (it.bad) return "'ref_audios' must be an array of base64 WAV strings";
+    }
+
+    const n_total = pend.images.items.len + pend.video_frames.items.len + pend.audios.items.len;
+    if (n_total == 0) return null;
+
+    // Source dimensions, which is all `resolveRefs` sizes from. A reference
+    // whose pixels cannot even be measured is a 400 here rather than a decode
+    // failure three steps later with no field name attached to it.
+    var inputs_i = try allocator.alloc(minimax_h3.RefInput, pend.images.items.len);
+    defer allocator.free(inputs_i);
+    for (pend.images.items, 0..) |bytes, i| {
+        const sz = imageNativeSize(bytes) orelse
+            return std.fmt.bufPrint(err_buf, "could not decode 'ref_images'[{d}] (PNG/JPEG expected)", .{i}) catch
+                "a 'ref_images' entry could not be decoded (PNG/JPEG expected)";
+        inputs_i[i] = .{ .kind = .image, .w = sz.w, .h = sz.h };
+    }
+    var inputs_v = try allocator.alloc(minimax_h3.RefInput, pend.video_frames.items.len);
+    defer allocator.free(inputs_v);
+    for (pend.video_frames.items, 0..) |fr, i| {
+        if (fr.items.len == 0)
+            return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}] has no frames", .{i}) catch "a 'ref_videos' entry has no frames";
+        const sz = imageNativeSize(fr.items[0]) orelse
+            return std.fmt.bufPrint(err_buf, "could not decode 'ref_videos'[{d}].frames[0] (PNG/JPEG expected)", .{i}) catch
+                "a 'ref_videos' frame could not be decoded (PNG/JPEG expected)";
+        // The reference node truncates a reference longer than the generation
+        // before snapping it to the ladder; a clip the output cannot span
+        // costs sampling rows for footage the model can never reach.
+        const supplied: u32 = @intCast(fr.items.len);
+        inputs_v[i] = .{
+            .kind = .video,
+            .w = sz.w,
+            .h = sz.h,
+            .frames = @min(supplied, gen_frames),
+            .audio_samples = 0,
+            .soundtrack_samples = if (pend.video_audio.items[i]) |p| @intCast(p.len / 2) else null,
+        };
+    }
+    var inputs_a = try allocator.alloc(minimax_h3.RefInput, pend.audios.items.len);
+    defer allocator.free(inputs_a);
+    for (pend.audios.items, 0..) |pcm, i| {
+        inputs_a[i] = .{ .kind = .audio, .audio_samples = @intCast(pcm.len / 2) };
+    }
+
+    var res = switch (try minimax_h3.resolveRefs(allocator, inputs_i, inputs_v, inputs_a, gen_w, gen_h, mode)) {
+        .ok => |r| r,
+        .reject => |why| return why.message(),
+    };
+    defer res.deinit();
+
+    // Decode at the canvases the resolver picked — the VAE canvas for the DiT
+    // payload, and the Qwen canvas for the vision tower. Two decodes rather
+    // than one resize, because the server has no image resampler.
+    for (res.refs) |r| {
+        // Appended EMPTY first and filled through the caller's own slot: a
+        // named-400 return is a NORMAL return, so an errdefer would not fire
+        // and a second decode failing would strand the first array. The
+        // caller's deinit loop owns every partially-filled entry.
+        try out.append(allocator, .{ .ref = r });
+        const media = &out.items[out.items.len - 1];
+        switch (r.kind) {
+            .image => {
+                const bytes = pend.images.items[r.src_index];
+                const vfit = minimax_h3.h3v.fitCanvas(r.canvas.h, r.canvas.w);
+                const bad = std.fmt.bufPrint(err_buf, "could not decode 'ref_images'[{d}] (PNG/JPEG expected)", .{r.src_index}) catch
+                    "a 'ref_images' entry could not be decoded (PNG/JPEG expected)";
+                media.pixels = decodeImageToBCFHW(allocator, bytes, r.canvas.h, r.canvas.w, mlx.gpuStream()) orelse return bad;
+                media.vision = decodeImageToBCFHW(allocator, bytes, vfit.h, vfit.w, mlx.gpuStream()) orelse return bad;
+            },
+            .video => {
+                const fr = pend.video_frames.items[r.src_index].items;
+                const vfit = minimax_h3.h3v.fitCanvas(r.canvas.h, r.canvas.w);
+                const bad = std.fmt.bufPrint(err_buf, "could not decode a 'ref_videos'[{d}] frame (PNG/JPEG expected)", .{r.src_index}) catch
+                    "a 'ref_videos' frame could not be decoded (PNG/JPEG expected)";
+                media.pixels = try decodeRefVideoFrames(allocator, fr[0..r.frames], r.canvas.h, r.canvas.w, 1, 2) orelse return bad;
+                media.vision = try decodeRefVideoFrames(allocator, fr[0..r.frames], vfit.h, vfit.w, minimax_h3.qwenFrameStride(), 0) orelse return bad;
+                if (pend.video_audio.items[r.src_index]) |pcm|
+                    media.waveform = try stereoInterleavedToArray(allocator, pcm);
+            },
+            .audio => media.waveform = try stereoInterleavedToArray(allocator, pend.audios.items[r.src_index]),
+        }
+    }
+    return null;
+}
+
+/// Decode every `stride`-th encoded frame at `th`x`tw` and stack them.
+/// `cat_axis` 2 gives the VAE's `[1,3,T,H,W]`; 0 gives the vision tower's
+/// `[n,3,H,W]`. Null when any frame fails to decode.
+fn decodeRefVideoFrames(
+    allocator: std.mem.Allocator,
+    frames: []const []u8,
+    th: u32,
+    tw: u32,
+    stride: u32,
+    cat_axis: c_int,
+) !?mlx.mlx_array {
+    var parts: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (parts.items) |p| _ = mlx.mlx_array_free(p);
+        parts.deinit(allocator);
+    }
+    var i: usize = 0;
+    while (i < frames.len) : (i += stride) {
+        const bcfhw = decodeImageToBCFHW(allocator, frames[i], th, tw, mlx.gpuStream()) orelse return null;
+        if (cat_axis == 2) {
+            try parts.append(allocator, bcfhw);
+        } else {
+            // [1,3,1,H,W] -> [1,3,H,W] so the stack lands on the frame axis.
+            defer _ = mlx.mlx_array_free(bcfhw);
+            var four = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(four);
+            const shp4 = [_]c_int{ 1, 3, @intCast(th), @intCast(tw) };
+            try mlx.check(mlx.mlx_reshape(&four, bcfhw, &shp4, 4, mlx.gpuStream()));
+            try parts.append(allocator, four);
+        }
+    }
+    if (parts.items.len == 0) return null;
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (parts.items) |p| _ = mlx.mlx_vector_array_append_value(vec, p);
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_concatenate_axis(&o, vec, cat_axis, mlx.gpuStream()));
+    return o;
+}
+
+/// MiniMax-H3 text-to-audio-video.
+///
+/// The request surface is deliberately NARROWER than LTX's: H3 has no CFG
+/// scale and no pipeline mode, and its frame counts live on a 17k+5 ladder
+/// rather than 8N+1. Anything the client sends that this backend cannot honor
+/// is a NAMED 400 — a silently ignored field is the class the app's preset
+/// rules exist to prevent. LoRAs it DOES take: `lora_paths`/`lora_scales`
+/// (or the legacy singular pair), stacking with the engine-owned Turbo
+/// distillation adapter that `"turbo": true` attaches.
+fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *H3VideoEngine) !void {
+    const prompt_raw = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
+    const prompt = try jsonUnescape(allocator, prompt_raw);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+
+    // `cfg_scale` / `stg_scale` / `pipeline` are NOT rejected: the app sends
+    // them unconditionally for every video backend, so 400-ing on their
+    // PRESENCE made every H3 request fail. Hiding a control is not the same
+    // as not sending the field. They are ignored, which is honest here — H3
+    // is CFG-distilled and single-pipeline, so there is no setting they could
+    // have selected that we silently dropped.
+
+    // Style LoRA(s), through the SAME parser the image and LTX handlers use —
+    // one grammar for `lora_paths`/`lora_scales` (and the legacy singular
+    // pair) across every backend that takes adapters. They stack with Turbo:
+    // the engine sums every attached delta on each linear.
+    var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
+    var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
+    const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+        error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
+        error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
+        error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
+        error.OutOfMemory => return err,
+    };
+    defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
+    var lora_paths: [lora_mod.MAX_LORAS][]const u8 = undefined;
+    for (lora_path_bufs[0..lora_n], 0..) |p, i| lora_paths[i] = p;
+    // Paths are proven HERE, not inside the engine: H3 loads its DiT per
+    // request, so `loadFile`'s own check is reached minutes into a generation
+    // — long after the handler could answer 400. Same rule either way
+    // (`lora.validatePath`), so the two cannot disagree.
+    for (lora_paths[0..lora_n]) |p| {
+        lora_mod.validatePath(p) catch
+            return sendError(conn, 400, "'lora_paths' must be absolute paths to readable .safetensors files");
+    }
+
+    // Turbo: the 4-step distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora).
+    // Steps default to 4, which is also the floor: on the ema_ckpt850 weights
+    // the mirrors now ship, 4 steps is already sharp — the 6-8 default came
+    // from ckpt500, which needed the extra steps to firm up. 30 stays the
+    // non-turbo default.
+    const turbo = sse.bodyWantsTrue(body, "turbo");
+    if (turbo and !engine.hasTurboLora(io, allocator))
+        return sendError(conn, 400, "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
+
+    const width: u32 = @intCast(extractJsonInt(body, "width") orelse 256);
+    const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse (if (turbo) @as(u64, 4) else 30));
+    const seed: u64 = @intCast(extractJsonInt(body, "seed") orelse 0);
+    const requested_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 56);
+
+    if (width % 32 != 0 or height % 32 != 0)
+        return sendError(conn, 400, "width and height must be multiples of 32");
+    if (turbo and steps < 4)
+        return sendError(conn, 400, "turbo needs at least 4 steps (the distillation's own floor, and its default)");
+
+    // Chained windows: N back-to-back `num_frames`-frame windows, each
+    // conditioned on its predecessor's last decoded frame through the fl2va
+    // path. `num_frames` is PER WINDOW; the response reports the delivered
+    // (joined) count. Needs the FL2VA pack — a reference has no keyframe row
+    // to chain through — so the REF2VA partition is refused by name.
+    const chain_windows: u32 = @intCast(extractJsonInt(body, "chain_windows") orelse 1);
+    if (chain_windows < 1 or chain_windows > 6)
+        return sendError(conn, 400, "chain_windows must be 1-6");
+    if (chain_windows > 1 and engine.supports_refs)
+        return sendError(conn, 400, "chained windows ride FL2VA keyframe conditioning — the REF2VA pack cannot serve them; load an FL2VA checkpoint");
+
+    // Snap to the model's own ladder and SAY SO: silently generating a
+    // different length than asked is how a client's audio mux drifts.
+    const shape = minimax_h3.temporalShape(requested_frames);
+    if (videoRgbTransportReason(minimax_h3.chainDeliveredFrames(chain_windows, shape.frame_count), width, height)) |reason|
+        return sendError(conn, 400, reason);
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    const preview_req = sse.parsePreview(body);
+    log.info("[video] minimax-h3 {d}x{d} {d}f/window (requested {d}, snapped to the 17k+5 ladder) steps={d} turbo={} loras={d} chain={d} stream={} preview={}\n", .{ width, height, shape.frame_count, requested_frames, steps, turbo, lora_n, chain_windows, want_stream, preview_req.enabled });
+
+    // fl2va keyframes. NOT graceful (the a2vid rule: the user asked for THIS
+    // frame): an undecodable image is a named 400, never a silent t2va. The
+    // reference's resize policy per anchor: first = plain STRETCH to the
+    // canvas (the geometry anchor), last = aspect-preserving center-COVER.
+    var keyframes_buf: [2]minimax_h3.Keyframe = undefined;
+    var n_kf: usize = 0;
+    defer for (keyframes_buf[0..n_kf]) |kf| {
+        _ = mlx.mlx_array_free(kf.pixels);
+        if (kf.vision) |v| _ = mlx.mlx_array_free(v);
+    };
+    // The keyframe also enters the Qwen conditioning as a `<Picture i>` block,
+    // which has its OWN canvas rule (multiple of 32 above a 3136-pixel floor).
+    // On every servable target the two agree and the VAE copy is reused; below
+    // the floor they diverge, so decode a second copy at the vision canvas
+    // rather than patchify pixels whose grid says something else.
+    const vfit = minimax_h3.h3v.fitCanvas(height, width);
+    const vision_differs = vfit.h != height or vfit.w != width;
+    inline for (.{ .{ "first_frame_image", minimax_h3.KeyframeAnchor.first }, .{ "last_frame_image", minimax_h3.KeyframeAnchor.last } }) |spec| {
+        if (extractJsonString(body, spec[0])) |raw_img| {
+            const b64 = try jsonUnescape(allocator, raw_img);
+            defer allocator.free(b64);
+            if (b64.len > 0) {
+                const img_bytes = base64DecodeAlloc(allocator, b64) catch
+                    return sendError(conn, 400, "keyframe image is not valid base64");
+                defer allocator.free(img_bytes);
+                const decodeAt = struct {
+                    fn f(a: std.mem.Allocator, bytes: []const u8, anchor: minimax_h3.KeyframeAnchor, th: u32, tw: u32) ?mlx.mlx_array {
+                        return switch (anchor) {
+                            // first = geometry anchor, plain STRETCH;
+                            // last = follower, aspect-preserving center-COVER.
+                            .first => decodeImageToBCFHW(a, bytes, th, tw, mlx.gpuStream()),
+                            .last => blk: {
+                                const bchw = decodeImageToBCHW(a, bytes, th, tw) orelse break :blk null;
+                                defer _ = mlx.mlx_array_free(bchw);
+                                break :blk unitToPm1BCFHW(bchw, th, tw, mlx.gpuStream()) catch null;
+                            },
+                        };
+                    }
+                }.f;
+                const arr = decodeAt(allocator, img_bytes, spec[1], height, width);
+                if (arr == null) return sendError(conn, 400, "keyframe image could not be decoded (PNG/JPEG expected)");
+                const vis: ?mlx.mlx_array = if (!vision_differs) null else blk: {
+                    const v = decodeAt(allocator, img_bytes, spec[1], vfit.h, vfit.w);
+                    if (v == null) {
+                        _ = mlx.mlx_array_free(arr.?);
+                        return sendError(conn, 400, "keyframe image could not be decoded (PNG/JPEG expected)");
+                    }
+                    break :blk v;
+                };
+                keyframes_buf[n_kf] = .{ .anchor = spec[1], .pixels = arr.?, .vision = vis };
+                n_kf += 1;
+                log.info("[video] minimax-h3 {s} keyframe conditioning engaged ({d}x{d}, vision block {d}x{d})\n", .{ @tagName(spec[1]), width, height, vfit.w, vfit.h });
+            }
+        }
+    }
+
+    // ── ref2va references ──
+    // Refused on an FL2VA pack rather than ignored: both partitions ship the
+    // same files and the same geometry, so nothing downstream would notice, and
+    // the generation would come back looking like the model ignored the user.
+    var refs: std.ArrayList(minimax_h3.RefMedia) = .empty;
+    defer {
+        for (refs.items) |*m| m.deinit();
+        refs.deinit(allocator);
+    }
+    const has_ref_fields = std.mem.indexOf(u8, body, "\"ref_images\"") != null or
+        std.mem.indexOf(u8, body, "\"ref_videos\"") != null or
+        std.mem.indexOf(u8, body, "\"ref_audios\"") != null;
+    if (has_ref_fields and !engine.supports_refs)
+        return sendError(conn, 400, "this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
+    if (has_ref_fields) {
+        var err_buf: [256]u8 = undefined;
+        if (try parseH3Refs(allocator, body, width, height, shape.frame_count, &refs, &err_buf)) |msg|
+            return sendError(conn, 400, msg);
+        for (refs.items) |m| {
+            log.info("[video] minimax-h3 reference {s} #{d}: {d}x{d} {d}f, latent {d}x{d}x{d}, audio_t {d}\n", .{
+                @tagName(m.ref.kind), m.ref.ordinal,  m.ref.canvas.w, m.ref.canvas.h,
+                m.ref.frames,         m.ref.latent_t, m.ref.latent_h, m.ref.latent_w,
+                m.ref.audio_t,
+            });
+        }
+    }
+
+    // Generations here run for MINUTES, so a silent socket is indistinguishable
+    // from a wedged server; the client drives its meter off these events. The
+    // progress sink is handed over on BOTH paths — a non-streaming request
+    // emits nothing but still gets the disconnect probe, or a client that gives
+    // up (or times out: a 1344x768 clip outlasts most default timeouts) leaves
+    // the GPU running to the end with every queued request behind it.
+    var sctx = videoStreamCtx(conn, allocator, body, want_stream);
+    const prog: ?sse.Progress = sctx.progress();
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const paths = try engine.paths(allocator);
+    defer {
+        allocator.free(paths.text_encoder);
+        allocator.free(paths.dit);
+        allocator.free(paths.vae);
+        if (paths.audio_vae) |p| allocator.free(p);
+        if (paths.turbo_lora) |p| allocator.free(p);
+    }
+
+    var res = minimax_h3.generate(allocator, io, paths, .{
+        .prompt = prompt,
+        .width = width,
+        .height = height,
+        .frames = requested_frames,
+        .steps = steps,
+        .seed = seed,
+        .fast = sse.bodyBool(body, "fast"),
+        .turbo = turbo,
+        .lora_paths = lora_paths[0..lora_n],
+        .lora_scales = lora_scales[0..lora_n],
+        .chain_windows = chain_windows,
+        .keyframes = keyframes_buf[0..n_kf],
+        .refs = refs.items,
+    }, prog, mlx.gpuStream()) catch |e| {
+        // Client hung up mid-generation — there is nobody to answer, and
+        // saying "generation failed" would be a lie about a job we stopped.
+        if (e == error.Cancelled) {
+            log.info("[video] generation cancelled — client disconnected\n", .{});
+            return;
+        }
+        // The LoRA failures are the user's to fix and each has a distinct
+        // remedy, so they are named 400s rather than one opaque 500 — the
+        // whole reason a wrong-architecture adapter is worth detecting at all.
+        const named: ?[]const u8 = switch (e) {
+            error.LoraNoMatch => "a LoRA has no modules matching MiniMax-H3's DiT — wrong architecture for this adapter?",
+            error.BadLoraPath => "'lora_paths' must be absolute paths to .safetensors files",
+            error.TooManyLoras => "too many LoRA adapters (max 8, and turbo takes one of the slots)",
+            error.TurboLoraIncomplete => "turbo_lora.safetensors is incomplete — re-download minimax_h3_turbo_4step_ckpt500.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora",
+            else => null,
+        };
+        if (named) |msg| {
+            log.err("[video] minimax-h3 lora: {any}\n", .{e});
+            if (want_stream) return sse.sendError(conn, msg);
+            return sendError(conn, 400, msg);
+        }
+        log.err("[video] minimax-h3 generation failed: {any}\n", .{e});
+        // Mid-stream the headers are already out, so an error must be an SSE
+        // event, not a status line the client will never parse.
+        if (want_stream) return sse.sendError(conn, "MiniMax-H3 generation failed");
+        return sendError(conn, 500, "MiniMax-H3 generation failed");
+    };
+    defer res.deinit();
+
+    try sendH3Video(allocator, conn, &res, want_stream);
+}
+
+fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *LtxVideoEngine) !void {
     const prompt_raw = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
     const prompt = try jsonUnescape(allocator, prompt_raw);
     defer allocator.free(prompt);
@@ -2127,6 +3290,8 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     const num_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 9);
     const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
     const width: u32 = @intCast(extractJsonInt(body, "width") orelse 384);
+    if (videoRgbTransportReason(num_frames, width, height)) |reason|
+        return sendError(conn, 400, reason);
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
     const frame_rate: f32 = 24.0;
 
@@ -2139,7 +3304,8 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     const stage2_steps: u32 = @intCast(extractJsonInt(body, "stage2_steps") orelse 0);
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[video] generating {s} {d}f {d}x{d} steps={d} cfg={d:.1}/{d:.1} stg={d:.1} stream={}: {d} chars\n", .{ @tagName(pipeline), num_frames, height, width, steps, guiders.vp.cfg, guiders.ap.cfg, guiders.vp.stg, want_stream, prompt.len });
+    const preview_req = sse.parsePreview(body);
+    log.info("[video] generating {s} {d}f {d}x{d} steps={d} cfg={d:.1}/{d:.1} stg={d:.1} stream={} preview={}: {d} chars\n", .{ @tagName(pipeline), num_frames, height, width, steps, guiders.vp.cfg, guiders.ap.cfg, guiders.vp.stg, want_stream, preview_req.enabled, prompt.len });
 
     // Two-stage prerequisites: even half-res grid, the VAE encoder (latent
     // statistics), the upsampler, and BOTH transformer variants on disk.
@@ -2157,22 +3323,34 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
             return sendError(conn, 400, "two-stage pipelines require spatial_upscaler_x2_v1_1.safetensors — download it into the model dir");
     }
 
-    // Style LoRA: absolute path to a .safetensors adapter (+ optional scale),
-    // applied to the DiT at runtime. No `lora_path` in the request detaches
-    // whatever was attached before (same contract as handleImage).
-    if (extractJsonString(body, "lora_path")) |lp_raw| {
-        const lp = try jsonUnescape(allocator, lp_raw);
-        defer allocator.free(lp);
-        const lscale: f32 = @floatCast(extractJsonFloat(body, "lora_scale") orelse 1.0);
-        const matched = engine.setLora(lp, lscale) catch |err| switch (err) {
-            error.LoraNoMatch => return sendError(conn, 400, "LoRA has no modules matching this model's DiT — wrong LoRA for this architecture?"),
-            error.BadLoraPath => return sendError(conn, 400, "'lora_path' must be an absolute path to a .safetensors file"),
+    // Style LoRA(s): one or more absolute paths to .safetensors adapters,
+    // each with an optional scale, applied to the DiT at runtime. Accepts
+    // the array form (`lora_paths`/`lora_scales`) or the original
+    // single-adapter form (`lora_path`/`lora_scale`) — same contract as
+    // handleImage. No LoRA fields in the request detaches whatever was
+    // attached before.
+    {
+        var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
+        var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
+        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+            error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
+            error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
+            error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
             error.OutOfMemory => return err,
-            else => return sendError(conn, 400, "failed to load the LoRA file"),
         };
-        log.info("[video] lora: matched {d} modules from {s} (scale {d:.2})\n", .{ matched, lp, lscale });
-    } else {
-        _ = engine.setLora(null, 1.0) catch {};
+        defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
+
+        var lora_paths: [lora_mod.MAX_LORAS][]const u8 = undefined;
+        for (lora_path_bufs[0..lora_n], 0..) |p, i| lora_paths[i] = p;
+        const matched = engine.setLoras(lora_paths[0..lora_n], lora_scales[0..lora_n]) catch |err| switch (err) {
+            error.LoraNoMatch => return sendError(conn, 400, "LoRA(s) have no modules matching this model's DiT — wrong LoRA for this architecture?"),
+            error.BadLoraPath => return sendError(conn, 400, "'lora_path'/'lora_paths' must be absolute path(s) to .safetensors file(s)"),
+            error.TooManyLoras => return sendError(conn, 400, "too many LoRA adapters requested"),
+            error.OutOfMemory => return err,
+            else => return sendError(conn, 400, "failed to load a LoRA file"),
+        };
+        if (lora_n > 0)
+            log.info("[video] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, lora_n });
     }
 
     // ── audio-to-video: `audio` is a base64 WAV (PCM16/24/f32, any rate,
@@ -2262,8 +3440,58 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         }
     }
 
-    var sctx = sse.StreamCtx{ .conn = conn };
-    const prog: ?ltx.Progress = if (want_stream) sctx.progress() else null;
+    // Last-frame anchor (#260): `last_frame_image` pins the LAST latent frame
+    // the same way. NOT graceful — the user asked for this ending, so a silent
+    // text-to-video downgrade is a wrong result: named 400s instead. The
+    // two-stage half-grid pair mirrors the first-frame one.
+    var last_img: ?mlx.mlx_array = null;
+    defer if (last_img) |c| {
+        _ = mlx.mlx_array_free(c);
+    };
+    var last_img_half: ?mlx.mlx_array = null;
+    defer if (last_img_half) |c| {
+        _ = mlx.mlx_array_free(c);
+    };
+    if (extractJsonString(body, "last_frame_image")) |raw_img| {
+        const b64 = try jsonUnescape(allocator, raw_img);
+        defer allocator.free(b64);
+        if (b64.len > 0) {
+            const ve = if (engine.vae_encoder) |*e| e else return sendError(conn, 400, "last frame conditioning needs vae_encoder.safetensors — download it into the model dir");
+            const img_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "last_frame_image: invalid base64");
+            defer allocator.free(img_bytes);
+            if (num_frames < 9) return sendError(conn, 400, "last_frame_image needs at least 9 frames (one latent frame cannot hold an anchor and still generate)");
+            const enc_h = (height / 32) * 32;
+            const enc_w = (width / 32) * 32;
+            last_img = decodeImageToBCFHW(allocator, img_bytes, enc_h, enc_w, engine.s) orelse return sendError(conn, 400, "last_frame_image: expected a PNG/JPEG image");
+            if (pipeline != .one_stage) {
+                const half_h = ((height / 2) / 32) * 32;
+                const half_w = ((width / 2) / 32) * 32;
+                last_img_half = decodeImageToBCFHW(allocator, img_bytes, half_h, half_w, engine.s) orelse return sendError(conn, 400, "last_frame_image: expected a PNG/JPEG image");
+            }
+            enc_ptr = ve;
+            log.info("[video] last frame anchor {d}x{d}\n", .{ enc_h, enc_w });
+        }
+    }
+
+    // `decoder`: which VAE turns the final latent into pixels. Default is the
+    // conv `vae_decoder` we have always shipped; `diffusion` is LTX's own
+    // DiffVAE, which their published clips are decoded with and which only the
+    // 8-bit pack ships. An absent file is a NAMED 400, never a silent downgrade.
+    var vae_choice = ltx.VaeChoice{ .conv = &engine.vae, .seed = seed +% 0x5DEC0DE };
+    if (extractJsonString(body, "decoder")) |raw_dec| {
+        const dec = try jsonUnescape(allocator, raw_dec);
+        defer allocator.free(dec);
+        if (std.mem.eql(u8, dec, "diffusion")) {
+            vae_choice.diffusion = engine.ensureDiffusionDecoder(io) catch
+                return sendError(conn, 400, "'decoder':\"diffusion\" requires vae_diffusion_decoder.safetensors — the 8-bit LTX-2.5 pack ships it, the 4-bit pack does not");
+            log.info("[video] decoder: diffusion (DiffVAE)\n", .{});
+        } else if (!std.mem.eql(u8, dec, "conv") and dec.len > 0) {
+            return sendError(conn, 400, "'decoder' must be \"conv\" or \"diffusion\"");
+        }
+    }
+
+    var sctx = videoStreamCtx(conn, allocator, body, want_stream);
+    const prog: ?ltx.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     var frames = switch (pipeline) {
@@ -2271,7 +3499,7 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
             // Run the schedule the loaded variant was trained for; the request
             // never forces a swap here (dev-only bundles keep working).
             const distilled = engine.transformer_variant == .distilled;
-            break :blk ltx.generateVideoFrames(io, allocator, .{}, &engine.transformer, &engine.connector, &engine.vae, enc_ptr, cond_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, distilled, seed, guiders.vp, guiders.ap, prog, engine.s);
+            break :blk ltx.generateVideoFrames(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, enc_ptr, cond_img, last_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, distilled, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
         .two_stage, .two_stage_hq => blk: {
             engine.ensureTransformer(.dev) catch |err| break :blk err;
@@ -2284,7 +3512,7 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
                 .swap_ctx = @ptrCast(&swapper),
                 .swap = Stage2Swap.swap,
             };
-            break :blk ltx.generateVideoFramesTwoStage(io, allocator, .{}, &engine.transformer, &engine.connector, &engine.vae, &engine.vae_encoder.?, cond_img_half, cond_img, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
+            break :blk ltx.generateVideoFramesTwoStage(io, allocator, engine.ltx_cfg, &engine.transformer, &engine.connector, vae_choice, &engine.vae_encoder.?, cond_img_half, cond_img, last_img_half, last_img, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
     } catch |err| {
         if (err == error.Cancelled) {
@@ -2292,6 +3520,13 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
             // denoise loop aborted; nothing to write, the socket is dead.
             log.info("[video] generation cancelled — client disconnected\n", .{});
             return;
+        }
+        if (err == error.KeyframeCanvasTooShort) {
+            if (want_stream) {
+                conn.writeAll("data: {\"type\":\"error\",\"message\":\"keyframes need at least 9 frames\"}\n\n") catch {};
+                return;
+            }
+            return sendError(conn, 400, "keyframes need at least 9 frames (one latent frame cannot hold an anchor and still generate)");
         }
         log.err("[video] generation failed: {}\n", .{err});
         if (want_stream) {
@@ -2430,8 +3665,8 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[mesh] generating steps={d} res={d} guidance={d:.1} seed={d} texture={} stream={} from {d}x{d} image\n", .{ steps, res, guidance, seed, want_texture, want_stream, img.w, img.h });
-    var sctx = sse.StreamCtx{ .conn = conn };
-    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     const opts = hy3d.MeshOpts{ .steps = steps, .guidance = guidance, .seed = seed, .octree_resolution = res };
@@ -2570,26 +3805,214 @@ pub fn freeStubCpuState(allocator: std.mem.Allocator, s: *StubCpuState) void {
 /// transformer/, vae/, text_encoder/; LTX keeps them top-level). Returns 0 on
 /// any read failure (treated as "unknown" → the registry skips the byte cap).
 pub fn estimateResidentBytes(io: std.Io, model_dir: []const u8) u64 {
+    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
+    return sumSafetensorsIn(io, dir);
+}
+
+fn sumSafetensorsIn(io: std.Io, dir: std.Io.Dir) u64 {
+    // Symlinked weights count (statFile follows) — an HF hub-cache snapshot
+    // is ALL symlinks into ../../blobs; skipping them billed a pack at 0.
     var total: u64 = 0;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".safetensors")) {
+        if ((entry.kind == .file or entry.kind == .sym_link) and std.mem.endsWith(u8, entry.name, ".safetensors")) {
             const st = dir.statFile(io, entry.name, .{}) catch continue;
+            if (st.kind != .file) continue;
             total += @intCast(st.size);
         } else if (entry.kind == .directory) {
             var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
             defer sub.close(io);
             var sit = sub.iterate();
             while (sit.next(io) catch null) |se| {
-                if (se.kind != .file or !std.mem.endsWith(u8, se.name, ".safetensors")) continue;
+                if (se.kind != .file and se.kind != .sym_link) continue;
+                if (!std.mem.endsWith(u8, se.name, ".safetensors")) continue;
                 const st = sub.statFile(io, se.name, .{}) catch continue;
+                if (st.kind != .file) continue;
                 total += @intCast(st.size);
             }
         }
     }
     return total;
+}
+
+/// Peak resident bytes for a backend whose parts do NOT all coexist.
+/// `resident` is what the engine holds for its whole lifetime; `stages` are
+/// DISJOINT — each is loaded, used and released before the next runs, so only
+/// the biggest is ever on top of `resident`. A stage that GENERATES carries its
+/// own transients inside its number, because they are not uniform across stages
+/// (a text-encoder pass over a few hundred rows allocates nothing like a
+/// 124-frame denoise).
+///
+/// Sum-of-directory is what a backend gets when it declares no plan, and it is
+/// the RIGHT answer for the resident-engine backends (krea, mage_flow,
+/// hunyuan3d, acestep, tts all hold text-encoder + DiT + VAE on one struct for
+/// the engine's lifetime). It goes wrong in BOTH directions the moment a
+/// backend loads something it later frees, or reads weights from outside its
+/// own directory — see `ltxPeakBytes` for one backend doing each.
+pub fn stagedPeakBytes(resident: u64, stages: []const u64) u64 {
+    var biggest: u64 = 0;
+    for (stages) |st| biggest = @max(biggest, st);
+    return resident + biggest;
+}
+
+/// LTX's plan. Its engine is RESIDENT (transformer + connector + VAEs + audio
+/// stay on `LtxVideoEngine` for its lifetime), with two corrections the
+/// directory sum cannot make:
+///
+///   `spare_transformer` — packs ship `transformer-dev` AND
+///   `transformer-distilled` (~10.5 GiB each) and `ensureTransformer` frees one
+///   BEFORE loading the other, precisely so they never coexist. The sum bills a
+///   phantom.
+///
+///   `text_encoder` — the Gemma encoder is a SEPARATE shared repo, loaded by
+///   `ltx_video.gemmaCapture` per generation and freed when it returns. Being
+///   outside the model dir, the sum bills 7.5 GiB at zero, and it is resident
+///   on top of the whole engine while it runs.
+///
+/// No activation term: nothing has been measured for this backend, and
+/// inventing one would newly refuse loads that work today.
+pub fn ltxPeakBytes(dir_sum: u64, spare_transformer: u64, text_encoder: u64) u64 {
+    return stagedPeakBytes(dir_sum -| spare_transformer, &.{text_encoder});
+}
+
+/// Percent of `transformer.safetensors` still resident once `precomputeAdaln`
+/// has tabled and FREED the 13B modulation weights (~39% of the DiT's
+/// parameters, so the share barely moves with quant width). Measured 0.615 on
+/// the 8-bit pack (32.83 → 20.19 GiB) and 0.623 on the 4-bit (17.41 → 10.84);
+/// billed at 0.65 so a pack whose AdaLN share is smaller than ours still fails
+/// safe.
+pub const H3_DIT_RESIDENT_PCT: u64 = 65;
+
+/// Transients the two GENERATING stages carry on top of their weights: the
+/// packed [text|cond|audio|video] sequence's activations while sampling, and
+/// the VAE decode's frame buffers. Measured 4.0-5.0 GiB at 768x448 / 124f
+/// (process peak minus self-reported DiT residency, both packs); billed at 6.
+/// It scales with pixels x frames, which a per-MODEL load gate cannot see —
+/// bounding a specific request is not something this estimator can do, and
+/// the old formula's incidental margin was the same order.
+///
+/// The TEXT-ENCODER stage gets none of it: that is one forward over a few
+/// hundred prompt rows, so a shared "+ activations" on the max of all three
+/// stages bills the biggest stage for transients it never allocates — which
+/// is what refused the 8-bit pack on every Mac under ~96 GB.
+pub const H3_ACTIVATION_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
+/// MiniMax Music 3's non-weight working set at the request caps: batch-2 KV
+/// cache for 36 layers at 9000 frames + 5000 prompt tokens (~4.1 GB), the
+/// bf16 frame-hidden buffer (~0.6 GB), and DiT/vocoder window transients.
+pub const MUSIC3_GEN_BUFFER_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
+/// The DiT term of the H3 bill. `precompute` mirrors
+/// MINIMAX_H3_ADALN_PRECOMPUTE: with it off the modulation weights are never
+/// freed and the whole file stays resident, so the shed size would under-bill
+/// by ~12 GiB into an uncatchable Metal OOM.
+pub fn h3DitResidentBytes(dit_file: u64, precompute: bool) u64 {
+    if (!precompute) return dit_file;
+    return dit_file * H3_DIT_RESIDENT_PCT / 100;
+}
+
+/// MiniMax-H3's staged residency plan, as a bill. `minimax_h3.generate` runs
+/// three DISJOINT stages: the text encoder is loaded, run and FREED before the
+/// DiT loads (`Model.load` is scoped), and the DiT is released before the VAEs
+/// load — so the peak is the BIGGEST stage, never a sum. The two VAEs are one
+/// stage: the video decoder is still resident when the audio one loads.
+/// `dit_resident` is post-AdaLN-precompute (`h3DitResidentBytes`), which the
+/// file size overstates by ~39%.
+pub fn h3PeakBytes(te: u64, dit_resident: u64, video_vae: u64, audio_vae: u64) u64 {
+    const vaes = video_vae + audio_vae;
+    const generating = @max(dit_resident, vaes);
+    if (te == 0 and generating == 0) return 0; // unknown dir → never block
+    return stagedPeakBytes(0, &.{ te, generating + H3_ACTIVATION_BYTES });
+}
+
+/// Per-backend generation-peak estimate for the media load preflight. A
+/// backend with a STAGED residency plan declares it here; every other type
+/// keeps the sum-of-safetensors default — over-billing fails safe (a refused
+/// load names its numbers), under-billing kills the process mid-request.
+pub fn estimatePeakResidentBytesIn(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 {
+    const sz = struct {
+        fn f(io_: std.Io, d: std.Io.Dir, name: []const u8) u64 {
+            const st = d.statFile(io_, name, .{}) catch return 0;
+            return @intCast(st.size);
+        }
+    }.f;
+    if (std.mem.eql(u8, model_type, "minimax_h3")) {
+        // The Turbo LoRA (when the pack ships one) is resident ALONGSIDE the
+        // DiT and precompute does not free it, so it rides the DiT term at
+        // full size — billed whenever present, since the gate estimate is
+        // per-model, not per-request.
+        const dit = h3DitResidentBytes(
+            sz(io, dir, "transformer.safetensors"),
+            minimax_h3.adalnPrecomputeOn(),
+        ) + sz(io, dir, "turbo_lora.safetensors");
+        return h3PeakBytes(
+            sz(io, dir, "text_encoder.safetensors"),
+            dit,
+            sz(io, dir, "video_vae.safetensors"),
+            sz(io, dir, "audio_vae.safetensors"),
+        );
+    }
+    if (std.mem.eql(u8, model_type, "minimax_music3")) {
+        // The whole engine is resident for its lifetime (no staging), so the
+        // sum is the right weight bill — plus the AR stage's working set the
+        // directory cannot see: the batch-2 KV cache (~4.1 GB at the 9000-frame
+        // + 5000-token caps), the frame-hidden buffer (~0.6 GB bf16), and the
+        // DiT/vocoder window transients.
+        const sum = sumSafetensorsIn(io, dir);
+        if (sum == 0) return 0; // unknown dir -> never block
+        return sum + MUSIC3_GEN_BUFFER_BYTES;
+    }
+    if (std.mem.eql(u8, model_type, "AudioVideo")) {
+        // Both variants ship; only one is ever loaded. Subtract the smaller so
+        // an asymmetric future pack still bills its larger one.
+        const spare = @min(
+            sz(io, dir, "transformer-dev.safetensors"),
+            sz(io, dir, "transformer-distilled.safetensors"),
+        );
+        return ltxPeakBytes(sumSafetensorsIn(io, dir), spare, 0);
+    }
+    return sumSafetensorsIn(io, dir);
+}
+
+/// Sum of the `.safetensors` under an absolute path, or 0 if it is not
+/// readable — 0 means "unknown", which every caller treats as "do not block".
+fn sumSafetensorsAt(io: std.Io, path: []const u8) u64 {
+    if (path.len == 0 or path[0] != '/') return 0; // openDirAbsolute UB class
+    var d = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    return sumSafetensorsIn(io, d);
+}
+
+/// LTX's text encoder, resolved the way `resolveGemmaDir` does but without an
+/// allocator (this runs inside the load gate). Absent → 0.
+fn ltxTextEncoderBytes(io: std.Io) u64 {
+    var buf: [1024]u8 = undefined;
+    if (std.c.getenv("LTX_GEMMA_DIR")) |env| {
+        const e = std.mem.span(env);
+        if (std.fs.path.isAbsolute(e)) return sumSafetensorsAt(io, e);
+    }
+    const home = std.mem.span(std.c.getenv("HOME") orelse return 0);
+    for ([_][]const u8{ LTX_GEMMA_REPO_DIR, "gemma-3-12b-it-4bit" }) |rel| {
+        const p = std.fmt.bufPrint(&buf, "{s}/.mlx-serve/models/{s}", .{ home, rel }) catch continue;
+        const n = sumSafetensorsAt(io, p);
+        if (n > 0) return n;
+    }
+    return 0;
+}
+
+pub fn estimatePeakResidentBytes(io: std.Io, model_dir: []const u8, model_type: []const u8) u64 {
+    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    const in_dir = estimatePeakResidentBytesIn(io, dir, model_type);
+    // LTX reads its text encoder from a DIFFERENT repo, so it is a stage the
+    // model dir cannot see. Every other backend's weights are all in its own
+    // directory; if that stops being true, it belongs here beside this one.
+    if (in_dir > 0 and std.mem.eql(u8, model_type, "AudioVideo"))
+        return stagedPeakBytes(in_dir, &.{ltxTextEncoderBytes(io)});
+    return in_dir;
 }
 
 // ── HTTP response helpers (self-contained; mirror the old *_server.zig) ──
@@ -2621,6 +4044,10 @@ fn sendBytes(conn: *Conn, allocator: std.mem.Allocator, content_type: []const u8
 }
 
 fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
+    // A refusal that logs nothing is invisible the moment a client drops the
+    // body (live 2026-08-06: the app's stream path showed a bare "HTTP 400"
+    // while the log showed a clean load→unload and nothing else).
+    log.warn("[gen] {d}: {s}\n", .{ code, msg });
     // Escape at the SINK: several of these messages quote a field value
     // (`mode:"edit"`), which went onto the wire as raw quotes inside a JSON
     // string — an unparseable body. See `sse.jsonEscapeMessage`.
@@ -2720,9 +4147,12 @@ fn img2imgStartStep(steps: u32, strength: f32) u32 {
 
 /// Extract the `cond_weights` request field: either a JSON number array
 /// (`[1, 0.5, …]`) or a comma/space-separated string (`"1 0.5 …"`).
-fn extractCondWeights(body: []const u8, buf: []f32) ?[]f32 {
+/// Parse a JSON key's value as either a bracketed number array
+/// (`"key": [0.8, 1.0]`) or a quoted comma/space-separated string of numbers
+/// (`"key": "0.8 1.0"`). Shared by `cond_weights` and `lora_scales`.
+fn extractFloatArrayField(body: []const u8, key: []const u8, buf: []f32) ?[]f32 {
     var key_pat_buf: [64]u8 = undefined;
-    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{"cond_weights"}) catch return null;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
     const ki = std.mem.indexOf(u8, body, key_pat) orelse return null;
     var i = ki + key_pat.len;
     while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
@@ -2736,6 +4166,65 @@ fn extractCondWeights(body: []const u8, buf: []f32) ?[]f32 {
         return parseFloatList(body[i + 1 .. end], buf);
     }
     return null;
+}
+
+fn extractCondWeights(body: []const u8, buf: []f32) ?[]f32 {
+    return extractFloatArrayField(body, "cond_weights", buf);
+}
+
+/// Per-adapter scales for `lora_scales` (multi-LoRA counterpart of the
+/// single `lora_scale` float field).
+fn extractLoraScales(body: []const u8, buf: []f32) ?[]f32 {
+    return extractFloatArrayField(body, "lora_scales", buf);
+}
+
+const LoraFieldsError = error{ TooManyLoraPaths, BadLoraPathsJson, BadLoraScalesJson, OutOfMemory };
+
+/// Parse the LoRA fields common to image and video requests: the array form
+/// (`lora_paths` + optional `lora_scales`) or the original single-adapter
+/// form (`lora_path` + optional `lora_scale`), which is kept exactly
+/// backward-compatible. Writes up to `lora_mod.MAX_LORAS` unescaped,
+/// allocator-owned path strings into `path_bufs` (caller frees them) and
+/// their resolved scales into `scale_buf`. Returns 0 with both buffers
+/// untouched when neither field is present — the "detach whatever was
+/// attached" case. Missing `lora_scales` entries default to 1.0, matching
+/// mflux's `resolve_scales`.
+fn parseLoraFields(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    path_bufs: *[lora_mod.MAX_LORAS][]u8,
+    scale_buf: *[lora_mod.MAX_LORAS]f32,
+) LoraFieldsError!usize {
+    var n: usize = 0;
+    errdefer for (path_bufs[0..n]) |p| allocator.free(p);
+
+    if (std.mem.indexOf(u8, body, "\"lora_paths\"") != null) {
+        var it = iterJsonStringArray(body, "lora_paths") orelse return error.BadLoraPathsJson;
+        while (it.next()) |raw| {
+            if (n >= lora_mod.MAX_LORAS) return error.TooManyLoraPaths;
+            path_bufs[n] = try jsonUnescape(allocator, raw);
+            n += 1;
+        }
+        if (it.bad) return error.BadLoraPathsJson;
+    } else if (extractJsonString(body, "lora_path")) |lp_raw| {
+        path_bufs[0] = try jsonUnescape(allocator, lp_raw);
+        n = 1;
+    }
+    if (n == 0) return 0;
+
+    if (std.mem.indexOf(u8, body, "\"lora_scales\"") != null) {
+        var sbuf: [lora_mod.MAX_LORAS]f32 = undefined;
+        const sl = extractLoraScales(body, &sbuf) orelse return error.BadLoraScalesJson;
+        const m = @min(sl.len, n);
+        @memcpy(scale_buf[0..m], sl[0..m]);
+        for (scale_buf[m..n]) |*sc| sc.* = 1.0;
+    } else if (n == 1) {
+        // Legacy single-adapter form: honor 'lora_scale' exactly as before.
+        scale_buf[0] = @floatCast(extractJsonFloat(body, "lora_scale") orelse 1.0);
+    } else {
+        for (scale_buf[0..n]) |*sc| sc.* = 1.0;
+    }
+    return n;
 }
 
 /// Iterate the string elements of a JSON array field (`"key": ["a", "b"]`).
@@ -2780,6 +4269,75 @@ const JsonStringArrayIter = struct {
         return null;
     }
 };
+
+/// Walks an array of JSON OBJECTS, handing back each element's raw `{…}` slice
+/// so the caller can read its fields with the same scanners it uses on a whole
+/// body. Brace-balanced and string-aware, which is what keeps one element's
+/// fields from leaking into the next one's.
+const JsonObjectArrayIter = struct {
+    rest: []const u8,
+    bad: bool = false,
+
+    fn next(self: *JsonObjectArrayIter) ?[]const u8 {
+        var i: usize = 0;
+        while (i < self.rest.len) : (i += 1) {
+            switch (self.rest[i]) {
+                '{' => break,
+                ']' => return null,
+                ',', ' ', '\t', '\n', '\r' => continue,
+                else => {
+                    self.bad = true;
+                    return null;
+                },
+            }
+        }
+        if (i >= self.rest.len) {
+            self.bad = true; // ran out before the closing ']'
+            return null;
+        }
+        const start = i;
+        var depth: usize = 0;
+        var in_str = false;
+        while (i < self.rest.len) : (i += 1) {
+            const c = self.rest[i];
+            if (in_str) {
+                if (c == '\\') {
+                    i += 1;
+                } else if (c == '"') {
+                    in_str = false;
+                }
+                continue;
+            }
+            switch (c) {
+                '"' => in_str = true,
+                '{', '[' => depth += 1,
+                '}', ']' => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        const v = self.rest[start .. i + 1];
+                        self.rest = self.rest[i + 1 ..];
+                        return v;
+                    }
+                },
+                else => {},
+            }
+        }
+        self.bad = true; // unterminated object
+        return null;
+    }
+};
+
+/// Position an iterator at the first element of the `key` JSON object array.
+/// Null when the key is absent or its value is not an array.
+fn iterJsonObjectArray(body: []const u8, key: []const u8) ?JsonObjectArrayIter {
+    var key_pat_buf: [64]u8 = undefined;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
+    const ki = std.mem.indexOf(u8, body, key_pat) orelse return null;
+    var i = ki + key_pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
+    if (i >= body.len or body[i] != '[') return null;
+    return .{ .rest = body[i + 1 ..] };
+}
 
 /// Position an iterator at the first element of the `key` JSON string array.
 /// Null when the key is absent or its value is not an array.
@@ -2872,6 +4430,7 @@ test "modalityFromType classifies the media archs + markers (incl. krea + hunyua
     try testing.expectEqual(Modality.image, modalityFromType("krea").?);
     try testing.expectEqual(Modality.audio, modalityFromType("qwen3_tts").?);
     try testing.expectEqual(Modality.audio, modalityFromType("acestep").?);
+    try testing.expectEqual(Modality.audio, modalityFromType("minimax_music3").?);
     try testing.expectEqual(Modality.video, modalityFromType("AudioVideo").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d_2_1").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d").?);
@@ -2981,6 +4540,18 @@ test "openaiEditFormToJson: OpenAI multipart becomes our edit request" {
     const j3 = try openaiEditFormToJson(a, auto, CT);
     defer a.free(j3);
     try testing.expect(std.mem.indexOf(u8, j3, "\"size\"") == null);
+
+    // LoRA fields reach the edit body (issue #268: they were rebuilt away).
+    const lora = "--X\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\np\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"lora_paths\"\r\n\r\n[\"/l/a.safetensors\"]\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"lora_scales\"\r\n\r\n[0.8]\r\n" ++
+        "--X\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\nAAA\r\n--X--\r\n";
+    const j4 = try openaiEditFormToJson(a, lora, CT);
+    defer a.free(j4);
+    var p4 = try std.json.parseFromSlice(std.json.Value, a, j4, .{});
+    defer p4.deinit();
+    try testing.expectEqualStrings("/l/a.safetensors", p4.value.object.get("lora_paths").?.array.items[0].string);
+    try testing.expectEqual(@as(f64, 0.8), p4.value.object.get("lora_scales").?.array.items[0].float);
 }
 
 test "openaiEditFormToJson: everything we can't honor is an explicit error" {
@@ -3107,15 +4678,34 @@ test "GenRoute: speech + music share the audio modality slot" {
 
 test "audioBackendKindForType routes acestep to music, everything else to tts" {
     try testing.expect(audioBackendKindForType("acestep") == .music);
+    try testing.expect(audioBackendKindForType("minimax_music3") == .music3);
     try testing.expect(audioBackendKindForType("qwen3_tts") == .tts);
     try testing.expect(audioBackendKindForType("gemma4") == .tts);
+    // Both music engines serve /v1/audio/music-generations and advertise the
+    // "music" capability; TTS backends never do.
+    try testing.expect(AudioBackendKind.music.servesMusic());
+    try testing.expect(AudioBackendKind.music3.servesMusic());
+    try testing.expect(!AudioBackendKind.tts.servesMusic());
+    try testing.expect(!AudioBackendKind.kokoro.servesMusic());
 }
 
-test "bodyDisablesSafety detects per-request opt-out" {
-    try testing.expect(bodyDisablesSafety("{\"prompt\":\"x\",\"safety\":false}"));
-    try testing.expect(bodyDisablesSafety("{\"safety\": false }"));
-    try testing.expect(!bodyDisablesSafety("{\"prompt\":\"x\",\"safety\":true}"));
-    try testing.expect(!bodyDisablesSafety("{\"prompt\":\"x\"}"));
+test "estimatePeakResidentBytes: minimax_music3 bills the sum plus its AR working set" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const b100: [100]u8 = @splat('x');
+    const b40: [40]u8 = @splat('x');
+    for ([_][]const u8{ "language_model.safetensors", "rvq_depth_decoder.safetensors", "transformer.safetensors", "condition_encoder.safetensors" }) |name|
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = &b100 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "vocoder.safetensors", .data = &b40 });
+    // The whole engine is resident for its lifetime (no staging), so the sum
+    // is right — but the AR stage's KV cache + frame-hidden buffer are real
+    // resident bytes no directory sum can see.
+    try std.testing.expectEqual(@as(u64, 440) + MUSIC3_GEN_BUFFER_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_music3"));
+    // An unreadable/empty dir stays 0 = "unknown, never block".
+    var empty = std.testing.tmpDir(.{ .iterate = true });
+    defer empty.cleanup();
+    try std.testing.expectEqual(@as(u64, 0), estimatePeakResidentBytesIn(io, empty.dir, "minimax_music3"));
 }
 
 test "parseSize parses WxH and rejects garbage" {
@@ -3288,6 +4878,19 @@ test "a2vidMuxSampleCount trims to video duration and never exceeds the clip" {
     // Degenerate inputs
     try testing.expectEqual(@as(usize, 0), a2vidMuxSampleCount(100, 0, 48000, 97, 24.0));
     try testing.expectEqual(@as(usize, 0), a2vidMuxSampleCount(100, 2, 48000, 97, 0.0));
+}
+
+// The connector fills the padded region by TILING its 128 learnable registers
+// (`ltx_video.connectorTransform`: `num_tiles = T / num_reg`, integer division).
+// A pad length that is not a whole number of tiles silently drops the remainder
+// — the text embeddings come out short and nothing errors. 1024 is also the
+// reference's own `TOKENIZER_MAX_LENGTH`; 256 was ours, and it gave the DiT a
+// quarter of the text rows the connector was trained against.
+test "LTX pad length is the reference's 1024 and a whole number of register tiles" {
+    try std.testing.expectEqual(@as(usize, 1024), LTX_PAD_LEN);
+    const registers: usize = 128; // connector.*.learnable_registers rows
+    try std.testing.expectEqual(@as(usize, 0), LTX_PAD_LEN % registers);
+    try std.testing.expectEqual(@as(usize, 8), LTX_PAD_LEN / registers);
 }
 
 test "LTX negative prompt keeps the reference audio negatives (speech guidance)" {
@@ -3465,6 +5068,147 @@ test "iterJsonStringArray walks ref_images entries" {
     try testing.expect(b.bad);
 }
 
+test "a named-400 on a reference set frees everything decoded before it" {
+    // Every rejection here is a NORMAL return carrying a message, not a Zig
+    // error, so `errdefer` does NOT fire — anything already decoded has to be
+    // owned by something the caller frees. The test allocator is the assertion:
+    // pre-fix each of these stranded the entries decoded before the bad one.
+    const a = testing.allocator;
+    var buf: [256]u8 = undefined;
+    const cases = [_]struct { body: []const u8, needle: []const u8 }{
+        // A valid entry, then an un-decodable base64 one.
+        .{ .body = "{\"ref_images\":[\"QUJD\",\"!!!!\"]}", .needle = "'ref_images'[1]" },
+        .{ .body = "{\"ref_videos\":[{\"frames\":[\"QUJD\",\"QUJD\",\"!!!!\"]}]}", .needle = "frames[2]" },
+        .{ .body = "{\"ref_audios\":[\"!!!!\"]}", .needle = "'ref_audios'[0]" },
+        // A whole video's frames decoded, then the SOUNDTRACK is unusable.
+        .{ .body = "{\"ref_videos\":[{\"frames\":[\"QUJD\"],\"audio\":\"QUJD\"}]}", .needle = "'ref_videos'[0].audio" },
+        // Malformed containers, and a sizing mode that is not one of the two.
+        .{ .body = "{\"ref_videos\":[{\"frames\":[\"QUJD\",1]}]}", .needle = "'ref_videos'[0].frames" },
+        .{ .body = "{\"ref_images\":[\"QUJD\"],\"ref_image_size\":\"huge\"}", .needle = "ref_image_size" },
+        // Decodable base64 that is not an image: the entry is NAMED, and the
+        // bytes already staged for it are freed.
+        .{ .body = "{\"ref_images\":[\"QUJDRA==\"]}", .needle = "could not decode 'ref_images'[0]" },
+    };
+    for (cases) |c| {
+        var out: std.ArrayList(minimax_h3.RefMedia) = .empty;
+        defer {
+            for (out.items) |*m| m.deinit();
+            out.deinit(a);
+        }
+        const msg = (try parseH3Refs(a, c.body, 864, 480, 124, &out, &buf)) orelse {
+            std.debug.print("expected a rejection for {s}\n", .{c.body});
+            return error.ExpectedRejection;
+        };
+        try testing.expect(std.mem.indexOf(u8, msg, c.needle) != null);
+    }
+    // No reference fields at all is not a rejection — the feature is simply off.
+    var none: std.ArrayList(minimax_h3.RefMedia) = .empty;
+    defer none.deinit(a);
+    try testing.expect((try parseH3Refs(a, "{\"prompt\":\"x\"}", 864, 480, 124, &none, &buf)) == null);
+    try testing.expectEqual(@as(usize, 0), none.items.len);
+}
+
+test "reference audio arrives as 32 kHz stereo in the encoder's planar shape" {
+    const a = testing.allocator;
+    // The audio VAE is MONO and takes the stereo channels on the BATCH axis, so
+    // interleaved -> [2, L] is a de-interleave, not a reshape. A reshape here
+    // runs, produces the right shape, and encodes a channel-swapped chirp.
+    var inter = [_]f32{ 0.0, 0.5, 0.1, 0.6, 0.2, 0.7 };
+    const arr = try stereoInterleavedToArray(a, &inter);
+    defer _ = mlx.mlx_array_free(arr);
+    const shp = mlx.getShape(arr);
+    try testing.expectEqual(@as(c_int, 2), shp[0]);
+    try testing.expectEqual(@as(c_int, 3), shp[1]);
+    try mlx.check(mlx.mlx_array_eval(arr));
+    const d = mlx.mlx_array_data_float32(arr).?;
+    const want = [_]f32{ 0.0, 0.1, 0.2, 0.5, 0.6, 0.7 };
+    for (want, 0..) |v, i| try testing.expectApproxEqAbs(v, d[i], 1e-6);
+
+    // A 16 kHz mono clip must come back at the VAE's 32 kHz, in stereo — the
+    // rate is what the latent-frame count is computed from, so a clip left at
+    // its own rate silently halves the reference's length.
+    var mono: [1600]f32 = undefined;
+    for (&mono, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 100)) / 100.0;
+    const wav_bytes = try wav_mod.encodePcm16(a, &mono, 16000, 1);
+    defer a.free(wav_bytes);
+    const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(wav_bytes.len));
+    defer a.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, wav_bytes);
+    const pcm = try refWavTo32kStereo(a, b64);
+    defer a.free(pcm);
+    try testing.expectEqual(@as(usize, 3200 * 2), pcm.len);
+    // Duplicated, not summed: both channels carry the mono signal.
+    try testing.expectApproxEqAbs(pcm[0], pcm[1], 1e-6);
+    try testing.expectApproxEqAbs(pcm[200], pcm[201], 1e-6);
+}
+
+test "h3ConfigDeclaresRef2va reads the pack's own task list" {
+    const a = testing.allocator;
+    // The converter writes the partition's task list; ref2va and fl2va share
+    // every geometry number, so the DiT file is the ONLY thing that differs and
+    // this is the only way to tell an FL2VA pack from a REF2VA one.
+    try testing.expect(h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"ref2va\"]}"));
+    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"fl2va\"]}"));
+    // Absent / malformed / wrong-typed → NOT ref2va. A pack that cannot say it
+    // supports references must not be handed them: it would generate happily
+    // and ignore every one of them.
+    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\"}"));
+    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"tasks\":\"ref2va\"}"));
+    try testing.expect(!h3ConfigDeclaresRef2va(a, "not json"));
+    // A substring match on the whole file would pass on the README-ish text a
+    // config can legally carry; only the task LIST counts.
+    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"note\":\"ref2va\",\"tasks\":[\"t2va\",\"fl2va\"]}"));
+}
+
+test "iterJsonObjectArray walks ref_videos entries" {
+    // A reference video is an OBJECT — `{"frames":[…],"audio":"…"}` — so the
+    // soundtrack is a field on the video it belongs to. The original shape was
+    // a parallel `ref_video_audios` array, where a null hole silently
+    // mis-pairs a soundtrack with the wrong clip.
+    const body =
+        "{\"ref_videos\":[ {\"frames\":[\"QQ==\",\"Qg==\"],\"audio\":\"Ug==\"} , {\"frames\":[\"Qw==\"]} ],\"seed\":3}";
+    var it = iterJsonObjectArray(body, "ref_videos").?;
+    const o1 = it.next().?;
+    var f1 = iterJsonStringArray(o1, "frames").?;
+    try testing.expectEqualStrings("QQ==", f1.next().?);
+    try testing.expectEqualStrings("Qg==", f1.next().?);
+    try testing.expect(f1.next() == null);
+    try testing.expectEqualStrings("Ug==", extractJsonString(o1, "audio").?);
+    const o2 = it.next().?;
+    // The second object must NOT see the first one's audio — an unbalanced
+    // scan that overruns is exactly how a soundtrack lands on the wrong clip.
+    try testing.expect(extractJsonString(o2, "audio") == null);
+    var f2 = iterJsonStringArray(o2, "frames").?;
+    try testing.expectEqualStrings("Qw==", f2.next().?);
+    try testing.expect(it.next() == null);
+    try testing.expect(!it.bad);
+
+    // A brace inside a quoted string does not close the object.
+    var q = iterJsonObjectArray("{\"ref_videos\":[{\"audio\":\"a}b\",\"frames\":[\"QQ==\"]}]}", "ref_videos").?;
+    const qo = q.next().?;
+    try testing.expectEqualStrings("a}b", extractJsonString(qo, "audio").?);
+    try testing.expect(q.next() == null);
+    try testing.expect(!q.bad);
+
+    // Empty array: no entries, not malformed.
+    var e = iterJsonObjectArray("{\"ref_videos\":[]}", "ref_videos").?;
+    try testing.expect(e.next() == null);
+    try testing.expect(!e.bad);
+
+    // Absent key / non-array value → null (feature off, not a 400).
+    try testing.expect(iterJsonObjectArray("{\"seed\":1}", "ref_videos") == null);
+    try testing.expect(iterJsonObjectArray("{\"ref_videos\":\"x\"}", "ref_videos") == null);
+
+    // A non-object element and an unterminated array flag bad, so the handler
+    // 400s by name instead of generating while ignoring what was asked for.
+    var b = iterJsonObjectArray("{\"ref_videos\":[\"QQ==\"]}", "ref_videos").?;
+    try testing.expect(b.next() == null);
+    try testing.expect(b.bad);
+    var u = iterJsonObjectArray("{\"ref_videos\":[{\"frames\":[", "ref_videos").?;
+    try testing.expect(u.next() == null);
+    try testing.expect(u.bad);
+}
+
 test "extractCondWeights accepts a JSON array or a separated string" {
     var buf: [16]f32 = undefined;
     const a = extractCondWeights("{\"cond_weights\":[1, 2.5, -3]}", &buf).?;
@@ -3521,4 +5265,244 @@ test "paint stage dir resolves from the combined single-repo layout (subdir firs
     const bare = try mkModelDir(allocator, tmp.dir, root, "bare/shape-only");
     defer allocator.free(bare);
     try testing.expect(findPaintDir(allocator, bare) == null);
+}
+
+test "media model types: discovery and modality dispatch agree" {
+    // CLASS GUARD. `model_discovery.isMediaModelType` and `modalityFromType`
+    // are documented duplication (discovery must not import mlx), and they
+    // silently drifted: `minimax_h3` was added to the dispatcher but not to
+    // discovery, so `/v1/load-model` answered
+    //   400 "Model at that path has an unsupported model_type"
+    // for a model the server could actually serve. Neither side is wrong on
+    // its own — only their DISAGREEMENT is — so the check is bidirectional.
+    for (media_model_types) |mt| {
+        try std.testing.expect(discovery.isMediaModelType(mt));
+        try std.testing.expect(modalityFromType(mt) != null);
+    }
+    // And a non-media type must be rejected by BOTH, or a chat model would be
+    // routed to a media engine.
+    for ([_][]const u8{ "gemma4", "qwen3", "llama", "deepseek_v4", "bert" }) |mt| {
+        try std.testing.expect(!discovery.isMediaModelType(mt));
+        try std.testing.expect(modalityFromType(mt) == null);
+    }
+}
+
+test "stagedPeakBytes: disjoint stages never sum, and resident always carries" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // The whole point: stages are loaded and freed in turn, so only the
+    // biggest is ever on top of what the engine holds for its lifetime.
+    try std.testing.expectEqual(12 * GB, stagedPeakBytes(4 * GB, &.{ 8 * GB, 3 * GB, 1 * GB }));
+    try std.testing.expectEqual(4 * GB, stagedPeakBytes(4 * GB, &.{}));
+    try std.testing.expectEqual(8 * GB, stagedPeakBytes(0, &.{ 8 * GB, 3 * GB }));
+    // Nothing known → 0, which the preflight reads as "unknown, never block".
+    try std.testing.expectEqual(@as(u64, 0), stagedPeakBytes(0, &.{ 0, 0 }));
+}
+
+test "LTX bills ONE transformer variant, plus the text encoder its dir cannot see" {
+    const MB: u64 = 1024 * 1024;
+    // Real dgrauet/ltx-2.3-mlx-q4 sizes. Both transformer variants ship at
+    // 10.54 GiB and `ensureTransformer` frees one BEFORE loading the other, so
+    // the sum bills a phantom. The Gemma text encoder is a SEPARATE repo
+    // (mlx-community/gemma-3-12b-it-4bit, 7.5 GiB) loaded per generation on top
+    // of the resident engine, so the dir sum bills it at zero.
+    const dir_sum: u64 = 30_318 * MB; // all eight files
+    const variant: u64 = 10_793 * MB;
+    const gemma: u64 = 7_680 * MB;
+
+    const peak = ltxPeakBytes(dir_sum, variant, gemma);
+    try std.testing.expectEqual(dir_sum - variant + gemma, peak);
+    // Strictly below the sum-of-dir bill it replaces on a two-variant pack…
+    try std.testing.expect(peak < dir_sum + dir_sum / 10);
+    // …but a one-variant pack must go UP, not down: the text encoder is real
+    // and was billed at nothing. Under-billing is the uncatchable-OOM side.
+    try std.testing.expect(ltxPeakBytes(dir_sum - variant, 0, gemma) > dir_sum - variant);
+    // A missing/unfound encoder dir contributes nothing rather than guessing.
+    try std.testing.expectEqual(dir_sum - variant, ltxPeakBytes(dir_sum, variant, 0));
+
+    // LTX 2.5 ships its text encoder INSIDE the pack, and `sumSafetensorsIn`
+    // recurses one level — so `dir_sum` already carries it. It is resident
+    // only while the engine is (loaded per generation, freed on return), so
+    // the peak is still sum-minus-spare and the encoder must NOT also ride in
+    // as a stage: that bills 6.8 GiB twice and refuses loads that fit.
+    const te_in_pack: u64 = 6_800 * MB;
+    const sum_25: u64 = dir_sum + te_in_pack;
+    try std.testing.expectEqual(sum_25 - variant, ltxPeakBytes(sum_25, variant, 0));
+    try std.testing.expect(ltxPeakBytes(sum_25, variant, te_in_pack) > sum_25 - variant);
+}
+
+test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint ones" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const act = H3_ACTIVATION_BYTES;
+    // Three disjoint stages: the TE is freed before the DiT loads, the DiT is
+    // freed before the VAEs load. Billing any two together refuses a Mac that
+    // would work — the VAEs used to be added to the DiT term.
+    try std.testing.expectEqual(35 * GB + act, h3PeakBytes(28 * GB, 35 * GB, 5 * GB, 1 * GB));
+    // The two VAEs DO coexist (the video decoder is still resident when the
+    // audio one loads), so they are one stage.
+    try std.testing.expectEqual(9 * GB + act, h3PeakBytes(4 * GB, 3 * GB, 5 * GB, 4 * GB));
+    // The TE stage carries no generation transients — one forward over a few
+    // hundred prompt rows. Adding them to it is what refused the 8-bit pack.
+    try std.testing.expectEqual(48 * GB, h3PeakBytes(48 * GB, 35 * GB, 5 * GB, 1 * GB));
+    // All-unknown must stay 0: the preflight treats 0 as "unknown, never block".
+    try std.testing.expectEqual(@as(u64, 0), h3PeakBytes(0, 0, 0, 0));
+
+    // The real 8-bit pack on a 48 GB Mac (auto cap 29.95 GiB): 26.28 TE,
+    // 32.83 DiT + 0.73 turbo, 4.85 + 0.56 VAEs. Measured process peak 26 GB.
+    const MB: u64 = 1024 * 1024;
+    const real = h3PeakBytes(
+        26_910 * MB,
+        h3DitResidentBytes(33_618 * MB, true) + 747 * MB,
+        4_966 * MB,
+        573 * MB,
+    );
+    try std.testing.expect(real < 29 * GB); // fits the 48 GB Mac's auto cap
+    try std.testing.expect(real > 24 * GB); // and stays above the measured peak
+}
+
+test "h3 DiT term sheds the AdaLN weights precompute frees — unless it is off" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // Measured: the 8-bit pack's 32.83 GiB transformer.safetensors settles at
+    // 20.19 GiB resident once precomputeAdaln frees the 13B modulation
+    // weights, so the file size over-bills the DiT by ~12 GiB.
+    const eight_bit: u64 = 32 * GB;
+    try std.testing.expect(h3DitResidentBytes(eight_bit, true) < eight_bit);
+    try std.testing.expect(h3DitResidentBytes(eight_bit, true) >= 20 * GB);
+    // MINIMAX_H3_ADALN_PRECOMPUTE=0 never frees them, so the whole file stays
+    // resident and billing the shed size would be an uncatchable OOM.
+    try std.testing.expectEqual(eight_bit, h3DitResidentBytes(eight_bit, false));
+}
+
+test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const b300: [300]u8 = @splat('x');
+    const b500: [500]u8 = @splat('x');
+    const b120: [120]u8 = @splat('x');
+    const b30: [30]u8 = @splat('x');
+    const b1000: [1000]u8 = @splat('x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "text_encoder.safetensors", .data = &b300 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "transformer.safetensors", .data = &b500 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "video_vae.safetensors", .data = &b120 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "audio_vae.safetensors", .data = &b30 });
+    // A file H3's residency plan never loads: billed by the default sum,
+    // never by the staged estimate.
+    try tmp.dir.writeFile(io, .{ .sub_path = "extra.safetensors", .data = &b1000 });
+
+    // LTX (`AudioVideo`): the dir sum MINUS the transformer variant that never
+    // coexists with the other. Its text encoder lives in a different repo, so
+    // it is added by the outer `estimatePeakResidentBytes`, not here.
+    try tmp.dir.writeFile(io, .{ .sub_path = "transformer-dev.safetensors", .data = &b500 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "transformer-distilled.safetensors", .data = &b500 });
+    try std.testing.expectEqual(@as(u64, 2450), estimatePeakResidentBytesIn(io, tmp.dir, "AudioVideo"));
+    tmp.dir.deleteFile(io, "transformer-dev.safetensors") catch {};
+    tmp.dir.deleteFile(io, "transformer-distilled.safetensors") catch {};
+
+    // H3: max(TE 300, DiT 500*65% + activations, VAEs 120+30 + activations).
+    try std.testing.expectEqual(325 + H3_ACTIVATION_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+
+    // A pack shipping the Turbo LoRA bills it on the DiT term (it is resident
+    // ALONGSIDE the DiT and precompute does not free it), whenever present —
+    // the gate estimate is per-model, not per-request.
+    const b80: [80]u8 = @splat('x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "turbo_lora.safetensors", .data = &b80 });
+    try std.testing.expectEqual(405 + H3_ACTIVATION_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    tmp.dir.deleteFile(io, "turbo_lora.safetensors") catch {};
+    // Any other media type: the plain sum over the dir (the safe default —
+    // a backend without a declared residency plan must not under-bill).
+    try std.testing.expectEqual(@as(u64, 1950), estimatePeakResidentBytesIn(io, tmp.dir, "flux2"));
+}
+
+test "media markers are per-TYPE, not per-modality" {
+    // REGRESSION. `detectModality` guarded the whole `.video` modality on
+    // LTX's `connector.safetensors`. MiniMax-H3 has no such file, so detection
+    // returned null and the loader fell through to the MLX TEXT path — it
+    // globbed all four H3 safetensors into one weight map and failed on
+    // `model.norm.weight`, a Qwen tensor H3 does not have.
+    //
+    // The invariant: a marker belongs to a BACKEND. Requiring one backend's
+    // file from every model in its modality breaks the next backend added.
+    try std.testing.expectEqualStrings("connector.safetensors", requiredMarkerFor("AudioVideo").?);
+    try std.testing.expectEqualStrings("transformer.safetensors", requiredMarkerFor("minimax_h3").?);
+    // Music3: the converter writes the vocoder LAST, so its presence is the
+    // completeness marker for the whole five-file pack.
+    try std.testing.expectEqualStrings("vocoder.safetensors", requiredMarkerFor("minimax_music3").?);
+    // H3 must NOT be gated on LTX's file.
+    try std.testing.expect(!std.mem.eql(u8, requiredMarkerFor("minimax_h3").?, "connector.safetensors"));
+
+    // Every media type either declares its own marker or needs none; none may
+    // inherit another backend's.
+    for (media_model_types) |mt| {
+        if (requiredMarkerFor(mt)) |m| {
+            try std.testing.expect(m.len > 0);
+            if (!std.mem.eql(u8, mt, "AudioVideo"))
+                try std.testing.expect(!std.mem.eql(u8, m, "connector.safetensors"));
+        }
+    }
+    // A non-media type never carries one.
+    try std.testing.expect(requiredMarkerFor("gemma4") == null);
+}
+
+test "incompleteMediaDir: marker-missing media dir is refused, complete and non-media are not" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try tmp.dir.createDirPath(io, "fragment");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fragment/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.createDirPath(io, "complete");
+    try tmp.dir.writeFile(io, .{ .sub_path = "complete/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "complete/transformer.safetensors", .data = "x" });
+    try tmp.dir.createDirPath(io, "chat");
+    try tmp.dir.writeFile(io, .{ .sub_path = "chat/config.json", .data = "{\"model_type\":\"gemma4\"}" });
+
+    const frag = try std.fs.path.join(allocator, &.{ root, "fragment" });
+    defer allocator.free(frag);
+    const comp = try std.fs.path.join(allocator, &.{ root, "complete" });
+    defer allocator.free(comp);
+    const chat_dir = try std.fs.path.join(allocator, &.{ root, "chat" });
+    defer allocator.free(chat_dir);
+
+    try testing.expect(incompleteMediaDir(io, allocator, frag));
+    try testing.expect(!incompleteMediaDir(io, allocator, comp));
+    try testing.expect(!incompleteMediaDir(io, allocator, chat_dir));
+    // The refused dir is exactly the one detectModality declines.
+    try testing.expect(detectModality(io, allocator, frag) == null);
+    try testing.expectEqual(Modality.video, detectModality(io, allocator, comp).?);
+}
+
+test "instrumental is a request-level rule: the flag and real lyrics are a conflict, not a race" {
+    // `instrumental: true` beside words to sing is contradictory, and letting
+    // either side quietly win is the failure mode — a user who typed a verse
+    // and left a sticky checkbox set gets a wordless track with no explanation,
+    // or a checkbox that does nothing. Both backends read the ONE predicate, so
+    // the rule cannot drift between them.
+    try testing.expect(instrumentalConflicts(true, "[verse]\nhello"));
+    try testing.expect(instrumentalConflicts(true, "la la la"));
+    // Whitespace-only is ABSENT, not a conflict: an app that keeps a blank
+    // lyrics editor mounted beside the checkbox must not 400.
+    try testing.expect(!instrumentalConflicts(true, ""));
+    try testing.expect(!instrumentalConflicts(true, "  \n\t\r "));
+    // The flag off never conflicts, whatever the lyrics say.
+    try testing.expect(!instrumentalConflicts(false, "[verse]\nhello"));
+    try testing.expect(!instrumentalConflicts(false, ""));
+}
+
+test "instrumental is parsed off the body only when spelled true" {
+    try testing.expect(sse.bodyWantsTrue("{\"instrumental\":true}", "instrumental"));
+    try testing.expect(sse.bodyWantsTrue("{\"instrumental\": true}", "instrumental"));
+    try testing.expect(!sse.bodyWantsTrue("{\"instrumental\":false}", "instrumental"));
+    try testing.expect(!sse.bodyWantsTrue("{\"prompt\":\"x\"}", "instrumental"));
+}
+
+test "videoRgbTransportReason: chained windows are billed into the response cap (#283)" {
+    // 141f/window x 5 windows at 1056x864 = 701 frames = 1.9 GB raw: refused by name.
+    try std.testing.expect(videoRgbTransportReason(minimax_h3.chainDeliveredFrames(5, 141), 1056, 864) != null);
+    // One window of the same shape fits.
+    try std.testing.expect(videoRgbTransportReason(141, 1056, 864) == null);
 }

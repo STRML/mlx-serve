@@ -170,8 +170,8 @@ struct BenchmarkView: View {
                 }
                 Divider().padding(.vertical, 9)
                 BenchRow("Model") {
-                    Text(server.modelInfo?.name ?? "None loaded")
-                        .foregroundStyle(server.modelInfo == nil ? .secondary : .primary)
+                    Text(server.residentChatModel?.name ?? "No chat model loaded")
+                        .foregroundStyle(server.residentChatModel == nil ? .secondary : .primary)
                         .lineLimit(1).truncationMode(.middle)
                 }
                 Divider().padding(.vertical, 9)
@@ -255,10 +255,10 @@ struct BenchmarkView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(isRunning || server.status != .running || server.modelInfo == nil)
+            .disabled(isRunning || server.status != .running || server.residentChatModel == nil)
 
-            if server.modelInfo == nil {
-                Text("Load a model from the menu bar to run a benchmark.")
+            if server.residentChatModel == nil {
+                Text("Load a chat model from the menu bar to run a benchmark.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -560,7 +560,7 @@ struct BenchmarkView: View {
     }
 
     private func runBenchmark() async {
-        guard let model = server.modelInfo?.name else { return }
+        guard let model = server.residentChatModel?.name else { return }
         isRunning = true
         runError = nil
         submitState = .idle

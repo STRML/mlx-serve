@@ -61,11 +61,47 @@ def group_of(name):
     return "top"
 
 
+def converter_cmd(converter, src, out, groups=None, imatrix=None):
+    cmd = [sys.executable, converter, "--src", src, "--out", out]
+    if imatrix is not None:
+        cmd += ["--imatrix", imatrix]
+    if groups is not None:
+        cmd += ["--groups", groups]
+    return cmd
+
+
+def self_test():
+    ok = True
+
+    def check(cond, name):
+        nonlocal ok
+        print(("PASS" if cond else "FAIL") + f"  {name}")
+        ok = ok and cond
+
+    # Without --imatrix the driver must not inject the flag: the converter's
+    # own default applies (and a converter-side default change is one place).
+    c = converter_cmd("conv.py", "/s", "/o", groups="layer.3")
+    check("--imatrix" not in c, "no --imatrix flag when none requested")
+    check(c[-2:] == ["--groups", "layer.3"], "group pass carries --groups")
+    # With one, BOTH the per-group and the finalize invocations must carry it —
+    # the finalize pass re-runs the converter and would otherwise stamp the
+    # mirror's `calibration` field from the wrong .dat.
+    c = converter_cmd("conv.py", "/s", "/o", groups="mtp", imatrix="/im.dat")
+    check(c[c.index("--imatrix") + 1] == "/im.dat", "group pass carries --imatrix")
+    f = converter_cmd("conv.py", "/s", "/o", imatrix="/im.dat")
+    check("--groups" not in f, "finalize pass has no --groups")
+    check(f[f.index("--imatrix") + 1] == "/im.dat", "finalize pass carries --imatrix")
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--converter", default=os.path.join(os.path.dirname(__file__), "convert_dsv4_weights.py"))
+    ap.add_argument("--imatrix", default=None,
+                    help="imatrix .dat passed through to the converter on every "
+                         "invocation (default: the converter's own default)")
     args = ap.parse_args()
     src = os.path.expanduser(args.src)
     out = os.path.expanduser(args.out)
@@ -107,7 +143,7 @@ def main():
                 f"Free space (e.g. remove the superseded preview mirror) and re-run — this is resumable.")
             return 1
         log(f"{g}: converting ({fg:.1f} GiB free)")
-        r = subprocess.run([sys.executable, args.converter, "--src", src, "--out", out, "--groups", g])
+        r = subprocess.run(converter_cmd(args.converter, src, out, groups=g, imatrix=args.imatrix))
         if r.returncode != 0:
             log(f"ABORT: converter failed on {g}")
             return r.returncode
@@ -125,7 +161,7 @@ def main():
     # per-path `quantization` dict, and the tokenizer/template files. Without
     # it the mirror is a pile of shards no loader can open.
     log("finalizing: index + config + tokenizer")
-    r = subprocess.run([sys.executable, args.converter, "--src", src, "--out", out])
+    r = subprocess.run(converter_cmd(args.converter, src, out, imatrix=args.imatrix))
     if r.returncode != 0:
         log("ABORT: finalize pass failed")
         return r.returncode
@@ -140,4 +176,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(self_test())
     sys.exit(main())

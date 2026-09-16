@@ -207,6 +207,13 @@ fn writeToSink(bytes: []const u8) void {
 /// Flip it locally (see the file-sink test) when a test must assert on logging.
 var stderr_enabled: bool = !builtin.is_test;
 
+/// Env-gated live-test harnesses (generation runs driven through the test
+/// binary) opt back into stderr logging: the phase/step lines ARE the
+/// harness's observable output, and a profile run without them is blind.
+pub fn enableStderr() void {
+    stderr_enabled = true;
+}
+
 /// Format once, fan out to stderr and (when open) the file.
 fn emit(comptime fmt: []const u8, args: anytype) void {
     if (stderr_enabled) std.debug.print(fmt, args);
@@ -248,6 +255,16 @@ pub fn debug(comptime fmt: []const u8, args: anytype) void {
     if (@intFromEnum(current_level) >= @intFromEnum(Level.debug)) {
         emit(fmt, args);
     }
+}
+
+/// Would a line at `level` be written? Ask first when the arguments are costly to build.
+pub fn enabled(level: Level) bool {
+    return @intFromEnum(current_level) >= @intFromEnum(level);
+}
+
+/// `info`/`debug`/`warn` with the level chosen at runtime.
+pub fn atLevel(level: Level, comptime fmt: []const u8, args: anytype) void {
+    if (enabled(level)) emit(fmt, args);
 }
 
 // ── Tests ──
@@ -399,3 +416,32 @@ fn readFileForTest(path: [*:0]const u8, buf: []u8) usize {
     const n = std.c.read(fd, buf.ptr, buf.len);
     return if (n > 0) @intCast(n) else 0;
 }
+
+test "enabled/atLevel: the level check a caller can ask BEFORE building its arguments" {
+    const original = current_level;
+    defer current_level = original;
+    const original_stderr = stderr_enabled;
+    stderr_enabled = false; // this test drives atLevel for real
+    defer stderr_enabled = original_stderr;
+
+    current_level = .info;
+    try testing.expect(enabled(.err));
+    try testing.expect(enabled(.warn));
+    try testing.expect(enabled(.info));
+    try testing.expect(!enabled(.debug));
+
+    current_level = .warn;
+    try testing.expect(enabled(.warn));
+    try testing.expect(!enabled(.info));
+    try testing.expect(!enabled(.debug));
+
+    current_level = .debug;
+    inline for (.{ Level.err, Level.warn, Level.info, Level.debug }) |lv| {
+        try testing.expect(enabled(lv));
+    }
+
+    current_level = .info;
+    atLevel(.debug, "suppressed {d}\n", .{1});
+    atLevel(.info, "written {d}\n", .{2});
+}
+

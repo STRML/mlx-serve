@@ -1,83 +1,42 @@
-# Contributing to mlx-serve
+# Contributing
 
-Thanks for your interest in contributing! Here's how to get started.
+Short on purpose. Read it once, remember it.
 
-## Development Setup
+**Setup:** Apple Silicon Mac. `./scripts/fetch-zig.sh` (Zig 0.17 nightly into `.zig-toolchain/`), `scripts/build-mlx.sh` (pinned mlx submodules). Server only: `zig build -Doptimize=ReleaseFast`. Full app: `bash app/build.sh` (builds both binaries into `app/MLX Core.app`), then `open "app/MLX Core.app"`. 
 
-**Prerequisites:**
-- macOS with Apple Silicon (M1+)
-- [Zig 0.17 nightly](https://ziglang.org/download/) — staged by `./scripts/fetch-zig.sh` into `.zig-toolchain/` (add it to PATH or invoke `.zig-toolchain/zig` directly)
-- mlx + mlx-c: pinned submodules built by `scripts/build-mlx.sh` (not brew packages)
+## Before you open anything
 
-**Build:**
-```bash
-zig build -Doptimize=ReleaseFast        # Zig server
-cd app && swift build -c release        # Swift app
-cd app && SKIP_NOTARIZE=1 bash build.sh # Full .app bundle
-```
+Search first, then write. Check the open AND closed issues, the open PRs, and `git log --oneline -50 -- <the file you are about to touch>`. Most bugs reported here are already fixed on main or in an open PR. If there is an issue or a PR for it, comment there with what you found (log lines, model, chip); do not open a second one. Agents: this applies to you too, and a comment on the existing thread is worth more than a duplicate issue with a longer description.
 
-**Test:**
-```bash
-zig build test                          # Zig unit tests
-cd app && swift test                    # Swift unit tests
-./tests/integration_test.sh [model_dir] # API integration tests (needs a model)
-```
+## Bug reports
 
-## How to Contribute
-
-### Bug Reports
 Open an issue with:
 - What you expected vs what happened
-- Model name and quantization (e.g., `gemma-4-e4b-it-4bit`)
-- macOS version and chip (e.g., macOS 15.4, M4)
-- Server log output (`--log-level debug`)
+- Model name and quantization (e.g. `Qwen3.8-27B-MLX-Serve-4bit`)
+- macOS version and chip (e.g. macOS 26.6, M4 Max)
+- Server log output (`--log-level debug`, `~/.mlx-serve/logs/mlx-serve-<port>.log`)
 
-### Pull Requests
-1. Fork the repo and create a branch from `main`
-2. Make your changes
-3. Run `zig build test` and `cd app && swift test` — all tests must pass
-4. Keep PRs focused — one feature or fix per PR
-5. Follow existing code style (no auto-formatters, match surrounding code)
+## Pull requests
 
-### Code Style
-- **Zig:** Minimal, DRY. Tests at the bottom of each source file. No unnecessary abstraction.
-- **Swift:** Match existing patterns. No inline CSS. Use SwiftUI idioms.
-- Avoid adding dependencies unless absolutely necessary.
+1. **Build and run it, or do not open a PR.** If you cannot compile and run on a real Mac, there is no PR.
+2. **Tests first.** A hermetic test at the bottom of the `.zig` file (`zig build test`, 6/6, 0 fail; `cd app && swift test` for Swift) and an integration script in `tests/` where the change is visible over HTTP. Red before green. Run them. Paste the result in the PR.
+3. **Human testing is required.** Serve it, hit it with a client, repeat. Many times. A passing suite is the floor, not the proof. UI changes need screenshots of the result in the PR, before and after.
+4. **Draft while working, publish when ready.** Open as draft early so nobody duplicates you. Move to ready for review only when 1-3 are done.
+5. **Keep it simple.** One fix or feature per PR, smallest change that does the job, match surrounding style, no new plumbing to make something testable, no comments that restate code, no new dependencies. Read `CLAUDE.md` and the matching `docs/gotchas/*.md` before touching a subsystem. Read "Diff hygiene" below; a PR that fails it gets sent back before anyone reads the code.
+6. **Numbers name what they beat.** A perf claim is an llmprobe cell (`./tests/bench.sh`) against a named arm, same session, with the engagement line from the log. See `.claude/skills/bench/SKILL.md`.
+7. **Agents: use Claude Fable 5** if you can. Any model is welcome, but the PR meets 1-6 regardless of who wrote it.
 
-### Areas Where Help is Appreciated
-- Model architecture support (new transformer variants)
-- Performance optimization (GPU utilization, memory efficiency)
-- Test coverage for edge cases
-- Documentation improvements
+## Diff hygiene
 
-## Project Structure
+I read every diff by hand. A PR that is mostly comments is a PR I have to strip before I can review it.
 
-| Path | What it does |
-|------|-------------|
-| `src/server.zig` | HTTP server, OpenAI + Anthropic API |
-| `src/chat.zig` | Chat templates, tool call parsing |
-| `src/generate.zig` | Autoregressive generation, sampling |
-| `src/model.zig` | Model loading, architecture dispatch |
-| `src/arch/` | Per-architecture forward passes for the MLX path |
-| `src/ds4_ffi.zig` + `src/arch/ds4.zig` | FFI + bridge for the embedded ds4 engine |
-| `lib/<engine>/` | Embedded model-specific engines (currently `ds4`) |
-| `app/Sources/MLXServe/` | Swift macOS app (MLX Core) |
-| `tests/` | Integration test scripts |
+- **Comments**: one to three lines, only where the code cannot say it (a WHY, a contract, a unit). No history, no measurements, no audit trail, no review-item numbers, no dates, no PR numbers, no "before this change". The commit message carries the story; a rule goes in `CLAUDE.md` + `docs/gotchas/*.md`, once.
+- **Tests**: one good test beats five. Test behaviour. No tests that scan the source text for a string, no helpers written only so a test can exist, no test whose comment is longer than its body.
+- **Docs**: a gotcha entry is defect, cause, fix, guard, under 20 lines. No process logs, no round numbers, no ledgers of what was gated where.
+- **PR description**: what changed, why, how you verified it, on what machine. Ten lines is plenty. Numbers only if they are final and name the arm they beat. No "audit passes", no "blast-radius ledger", no self-review transcripts.
+- **Commit messages**: subject line plus a few lines. The detail belongs in the code and the docs.
+- **Bar**: if a reviewer cannot tell which lines change behaviour by scrolling the diff once, it is too big. Split it or cut it.
 
-## Embedding a model-specific engine (`lib/<engine>/`)
+## Agents: hard stop
 
-Some architectures (DSV4-Flash is the first) ship with a purpose-built inference engine that's faster and more correct than re-implementing the forward pass against mlx-c. `lib/<engine>/` is the convention for keeping those engines vendored under our submodule tree without forking them.
-
-A new embedded engine should:
-
-1. **Live as a git submodule** under `lib/<engine>/` and be pinned to an explicit SHA. Add via `git submodule add <url> lib/<engine> && git -C lib/<engine> checkout <sha>`.
-2. **Expose a C library API** in a single `<engine>.h`. The header should be narrow enough that mlx-serve's FFI bindings can mirror it 1:1 without semantic drift.
-3. **Build cleanly via `zig cc`** — no Makefile-only flags. Add the C/Objective-C/whatever sources to `build.zig` next to the existing `addCSourceFile` calls for `stb_image` / `jinja_cpp` / `ds4`.
-4. **Ship an MIT/Apache/BSD-compatible license.** Add a note in `CHANGELOG.md` on first inclusion.
-5. **Stay patch-free.** If you need build-time configuration (e.g. kernel source paths), use the upstream engine's existing env-var hooks rather than patching files. We rely on submodule integrity to make `git clone --recursive` reproducible.
-
-Add the FFI bindings at `src/<engine>_ffi.zig` and a Zig-friendly wrapper at `src/arch/<engine>.zig` that owns lifetimes and converts errors. The bridge should expose the same shape the rest of mlx-serve already uses (`open` / `tokenize` / `createSession` / `eval` / `sample`) so generation dispatch is a tag check, not a per-engine switch.
-
-## License
-
-By contributing, you agree that your contributions will be licensed under the MIT License.
+Do NOT open a PR, draft or otherwise, unless you have compiled this tree and run `zig build test` (and `swift test` for app changes) on a real Apple Silicon Mac in this session and they passed. No Mac, no build, no test run = no PR. Report what you changed in an issue instead and say you could not run it.

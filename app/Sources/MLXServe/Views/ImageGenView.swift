@@ -5,16 +5,14 @@ import UniformTypeIdentifiers
 /// Image generation window — native FLUX.2, Krea-2-Turbo and Mage-Flow (no
 /// Python). The model picker lists every `ImageModelPreset`; the server
 /// auto-routes to the right image backend by the model's `model_type`.
-///
-/// UI layering: a Quality picker drives steps (hidden where the schedule is
-/// distillation-fixed), a Resolution picker pins to model-trained buckets, and
-/// Advanced lets the user override individual fields. Every control in Advanced
-/// is gated on a preset capability flag — the pane shows nothing this backend
-/// would ignore or reject.
 struct ImageGenView: View {
     @EnvironmentObject var service: ImageGenService
     @EnvironmentObject var server: ServerManager
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
+    /// For "Send to Chat" — the hand-off opens a new conversation and switches
+    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
+    @EnvironmentObject var appState: AppState
 
     @State private var prompt: String = ""
     @State private var showAdvanced: Bool = false
@@ -23,6 +21,10 @@ struct ImageGenView: View {
     @State private var lanModel: String? = nil
     @State private var quality: QualityPreset = .good
     @State private var resolution: ResolutionOption = ImageModelPreset.flux2Klein4B_Q4.defaultResolution
+    // Held as text, not Int: a size field has to be allowed to be empty or
+    // half-typed while the user edits it, which a numeric binding fights.
+    @State private var customWidthText: String = "1024"
+    @State private var customHeightText: String = "1024"
     @State private var steps: Int = 8
     @State private var seed: Int = -1
     @State private var showRAMWarning: Bool = false
@@ -31,9 +33,6 @@ struct ImageGenView: View {
     /// Keep the model resident after generating (default off → unload to free
     /// GPU memory). On → the next generation reuses it instantly.
     @State private var keepResident: Bool = false
-    /// Apply the NSFW content filter (on by default). Off → sends safety:false so
-    /// the server skips it. (The license expects filtering in deployments.)
-    @State private var safeMode: Bool = true
     /// Image-to-image source (transient — not persisted, like video's first frame).
     @State private var initImageURL: URL? = nil
     /// Extra in-context references for edit mode (FLUX.2 multi-reference):
@@ -49,8 +48,15 @@ struct ImageGenView: View {
     @State private var condGain: Double = 1.0
     /// Conditioning rebalance (Advanced): per-tapped-layer weights as typed.
     @State private var condWeightsText: String = ""
-    /// Style LoRA (Advanced): .safetensors adapter path ("" = none).
-    @State private var loraPath: String = ""
+    /// Classifier-free guidance (Advanced, `model.supportsGuidance` only):
+    /// how strongly to follow the prompt over the unconditional pathway.
+    @State private var guidanceScale: Double = 1.0
+    /// What to steer away from (Advanced, CFG only). Transient like the main
+    /// prompt — not persisted.
+    @State private var negativePrompt: String = ""
+    /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
+    /// Several can attach at once — their effects sum, so order doesn't matter.
+    @State private var loras: [LoraAdapter] = []
     /// True while `hydrate()` seeds `@State` from saved settings. Hydrating
     /// `model`/`quality` fires their `.onChange` (applyModelDefaults /
     /// applyQualityDefaults) which would clobber the just-restored
@@ -58,10 +64,15 @@ struct ImageGenView: View {
     @State private var hydrating: Bool = false
     /// Hydrate exactly once per window lifetime (the first `.onAppear`).
     @State private var didHydrate: Bool = false
+    /// True while a drag carrying a file is hovering the source-image section
+    /// — drives that section's dashed-border highlight and the well's fill.
+    @State private var isDropTargeted: Bool = false
 
     var body: some View {
+        // No window-sized floor: this is a PAGE of the chat window now, and a
+        // root minimum wider than the detail column overflows it and clips
+        // both edges. Small windows shrink the preview side instead.
         readyView
-        .frame(minWidth: 880, minHeight: 640)
         .onAppear {
             if !didHydrate {
                 hydrating = true
@@ -74,14 +85,14 @@ struct ImageGenView: View {
             // Freshen the network-model list so LAN entries are current in
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
-            downloads.ensureNsfwClassifier() // best-effort: provision the shared content filter
         }
         // Persist every other sticky field on change (model/quality persist in
         // their sections after applying preset defaults).
         .onChange(of: resolution) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: customWidthText) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: customHeightText) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: safeMode) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
     }
 
@@ -106,7 +117,9 @@ struct ImageGenView: View {
                 outputFolderLink
             }
             .padding(16)
-            .frame(minWidth: 460)
+            // The preview is what gives way in a small window — the generated
+            // image scales to fit; the controls column keeps its form floor.
+            .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
@@ -115,7 +128,7 @@ struct ImageGenView: View {
                 pendingRequest = nil
             }
         } message: {
-            Text(ramWarningMessage)
+            Text(L10n.text(ramWarningMessage))
         }
     }
 
@@ -133,7 +146,7 @@ struct ImageGenView: View {
                     ForEach(model.promptExamples(editing: isEditing), id: \.name) { group in
                         Menu(group.name) {
                             ForEach(group.examples, id: \.title) { ex in
-                                Button(ex.title) { prompt = ex.body; persist() }
+                                Button(L10n.text(ex.title)) { prompt = ex.body; persist() }
                             }
                         }
                     }
@@ -153,74 +166,48 @@ struct ImageGenView: View {
 
     private var sourceImageSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Source image (optional)").font(.subheadline.weight(.semibold))
-            if let url = initImageURL {
-                HStack(spacing: 8) {
-                    if let img = NSImage(contentsOf: url) {
-                        Image(nsImage: img)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 40, height: 40)
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }
-                    Text(url.lastPathComponent)
-                        .font(.caption)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    Button {
-                        initImageURL = nil
-                        refImageURLs = []
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .help("Remove the source image (back to text-to-image)")
-                }
-                .padding(6)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
-                // The mode switch only makes sense where BOTH modes exist. A
-                // model with instruction editing but no VAE-encoder variation
-                // path (Mage-Flow-Edit) would otherwise offer "Variation" and
-                // get a 400 back.
-                if model.supportsReferenceEdit && model.supportsImg2Img {
+            HStack(spacing: 8) {
+                Text("Source image (optional)").font(.subheadline.weight(.semibold))
+                Spacer(minLength: 8)
+                // The mode switch belongs to the SECTION, not to the source
+                // row: sitting between the source and the references it split
+                // a list of identical rows in half and read as a property of
+                // the picture above it. In the header it sits beside the name
+                // of the thing it modifies, and the pictures below are one
+                // uninterrupted list. It only appears where BOTH modes exist —
+                // a model with instruction editing but no VAE-encoder
+                // variation path (Mage-Flow-Edit) would otherwise offer
+                // "Variation" and get a 400 back — and only once there is a
+                // source for it to apply to.
+                if initImageURL != nil && model.supportsReferenceEdit && model.supportsImg2Img {
                     Picker("", selection: $editMode) {
                         Text("Edit").tag(true)
                         Text("Variation").tag(false)
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
+                    .controlSize(.small)
+                    .fixedSize()
                     .onChange(of: editMode) { _, _ in guard !hydrating else { return }; persist() }
                 }
+            }
+            if let url = initImageURL {
+                // The source is picture 1 and the references follow it, which
+                // is the numbering the prompt refers to — so they are one
+                // list, drawn by one row.
+                imageRow(url, number: numberedImageRows ? 1 : nil,
+                         help: "Remove the source image (back to text-to-image)") {
+                    initImageURL = nil
+                    refImageURLs = []
+                }
                 if effectiveEditMode {
-                    ForEach(refImageURLs, id: \.self) { ref in
-                        HStack(spacing: 8) {
-                            if let img = NSImage(contentsOf: ref) {
-                                Image(nsImage: img)
-                                    .resizable()
-                                    .scaledToFill()
-                                    .frame(width: 40, height: 40)
-                                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                            }
-                            Text(ref.lastPathComponent)
-                                .font(.caption)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer()
-                            Button {
-                                refImageURLs.removeAll { $0 == ref }
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                            }
-                            .buttonStyle(.borderless)
-                            .foregroundStyle(.secondary)
-                            .help("Remove this reference image")
+                    ForEach(Array(refImageURLs.enumerated()), id: \.element) { i, ref in
+                        imageRow(ref, number: numberedImageRows ? i + 2 : nil,
+                                 help: "Remove this reference image") {
+                            refImageURLs.removeAll { $0 == ref }
                         }
-                        .padding(6)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
                     }
-                    if refImageURLs.count < 3 {
+                    if refImageURLs.count < maxRefImages {
                         Button {
                             chooseRefImage()
                         } label: {
@@ -254,17 +241,69 @@ struct ImageGenView: View {
                     }
                 }
             } else {
-                Button {
-                    chooseSourceImage()
-                } label: {
-                    Label(sourceImageButtonLabel, systemImage: "photo.badge.plus")
-                        .font(.caption)
-                }
-                Text(sourceImageHint)
+                MediaDropWell(title: sourceImageButtonLabel,
+                              systemImage: "photo.badge.plus",
+                              isTargeted: isDropTargeted) { chooseSourceImage() }
+                Text(L10n.text(sourceImageHint))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
         }
+        // Drops land on the source-image section rather than the whole window,
+        // and because the section GROWS once a source is set, the target grows
+        // to cover the thumbnail and reference rows — which is exactly where a
+        // later drop is aimed. `ImageDropPlacement` decides which slot it
+        // lands in, and states the ROOM it has for one — so a pane with
+        // nothing left to fill bounces the file instead of swallowing it.
+        .mediaDrop(.image,
+                   limit: ImageDropPlacement.room(source: initImageURL,
+                                                  editing: effectiveEditMode,
+                                                  refs: refImageURLs.count,
+                                                  refLimit: maxRefImages),
+                   isTargeted: $isDropTargeted) { placeDroppedImages($0) }
+    }
+
+    /// One attached picture. The source and every reference draw the SAME row
+    /// — they are one numbered list to the model, so they read as one list
+    /// here, and a row that differs only in what its ✕ does has no business
+    /// being written twice.
+    private func imageRow(_ url: URL, number: Int?, help: String,
+                          remove: @escaping () -> Void) -> some View {
+        HStack(spacing: 8) {
+            if let number {
+                Text("\(number)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 10, alignment: .trailing)
+            }
+            if let img = NSImage(contentsOf: url) {
+                Image(nsImage: img)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 40, height: 40)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            }
+            Text(url.lastPathComponent)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            Button(action: remove) {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help(help)
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// The numbers are the prompt's own vocabulary ("the face from image 2"),
+    /// so they appear exactly when there is more than one picture to tell
+    /// apart. A lone "1" beside the only image on screen is decoration.
+    private var numberedImageRows: Bool {
+        effectiveEditMode && !refImageURLs.isEmpty
     }
 
     /// What a source image is FOR on this model — instruction editing, a
@@ -284,26 +323,23 @@ struct ImageGenView: View {
         }
     }
 
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: LanPick.selection(
-                model: $model, lanModel: $lanModel,
-                resolve: { id in ImageModelPreset.all.first { $0.id == id } },
-                persist: persist)
-            ) {
-                ForEach(ImageModelPreset.all) { preset in
-                    Text(preset.name).tag(preset.id)
-                }
-                LanModelPickerRows(capability: "image")
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
-            Text(lanModel.map { "Runs on \(LanPick.peer(of: $0)) over your network — nothing to download." } ?? "~\(model.approxRAMGB) GB RAM")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        MediaModelChooser.pane(
+            all: ImageModelPreset.all,
+            onThisMac: CustomMediaModels.imagePresets(from: server.allModels),
+            capability: "image",
+            selected: $model, lanModel: $lanModel,
+            capabilityOf: { $0.capabilityLabel },
+            resolveCustom: { [models = server.allModels] in
+                CustomMediaModels.imagePreset(for: $0, from: models)
+            },
+            bundleOf: { $0.bundle },
+            downloads: downloads,
+            onDownloadFinished: { appState.refreshModels() },
+            persist: persist)
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
     }
 
     @ViewBuilder
@@ -322,13 +358,13 @@ struct ImageGenView: View {
                 Text("Quality").font(.subheadline.weight(.semibold))
                 Picker("", selection: $quality) {
                     ForEach(QualityPreset.allCases) { q in
-                        Text(q.label).tag(q)
+                        Text(L10n.text(q.label)).tag(q)
                     }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .onChange(of: quality) { _, _ in guard !hydrating else { return }; applyQualityDefaults(); persist() }
-                Text(qualityHint)
+                Text(L10n.text(qualityHint))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -339,7 +375,7 @@ struct ImageGenView: View {
     /// front. CFG is deliberately absent: no image backend reads a guidance
     /// field, so quoting one would be inventing a knob.
     private var qualityHint: String {
-        "\(model.settings(quality).steps) steps"
+        L10n.format("%lld steps", Int64(model.settings(quality).steps))
     }
 
     private var resolutionSection: some View {
@@ -347,7 +383,7 @@ struct ImageGenView: View {
             Text("Resolution").font(.subheadline.weight(.semibold))
             Picker("", selection: $resolution) {
                 ForEach(model.resolutionOptions(editMode: isEditing)) { r in
-                    Text(r.label).tag(r)
+                    Text(L10n.text(r.label)).tag(r)
                 }
             }
             .labelsHidden()
@@ -363,7 +399,61 @@ struct ImageGenView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+            if resolution.isCustom { customResolutionFields }
         }
+    }
+
+    /// Width/height for the Custom… row, with the one line of feedback the
+    /// grid produced. The server rewrites anything off-grid regardless, so the
+    /// point of this is to say so BEFORE the request rather than leave the user
+    /// reading an unexpected size off a finished image.
+    @ViewBuilder
+    private var customResolutionFields: some View {
+        let verdict = customResolutionVerdict
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                labelledSizeField("Width", text: $customWidthText)
+                Text("×").foregroundStyle(.secondary)
+                labelledSizeField("Height", text: $customHeightText)
+            }
+            if let hint = verdict.hint {
+                Label(L10n.text(hint), systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
+                    .font(.caption2)
+                    // A correction is information; a refusal is the reason
+                    // Generate is disabled, so only that one is coloured.
+                    .foregroundStyle(verdict.isValid ? Color.secondary : Color.orange)
+            }
+        }
+    }
+
+    private func labelledSizeField(_ title: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(L10n.text(title)).font(.caption2).foregroundStyle(.secondary)
+            TextField("", text: text)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 80)
+        }
+    }
+
+    /// Only gates while Custom is actually selected — a stale unparseable value
+    /// left in the fields must not disable Generate for a fixed bucket.
+    private var customSizeValid: Bool {
+        !resolution.isCustom || customResolutionVerdict.isValid
+    }
+
+    /// What the selected model's grid makes of the typed size. Non-numeric or
+    /// empty text reads as 0, which the grid already refuses by name.
+    private var customResolutionVerdict: CustomResolution {
+        model.resolutionGrid.resolve(width: Int(customWidthText) ?? 0,
+                                     height: Int(customHeightText) ?? 0)
+    }
+
+    /// The size the request should carry: the grid's corrected numbers while
+    /// Custom is selected, the picked bucket otherwise. Generate is gated on
+    /// the same verdict, so the `?? ` fallback is never the one that ships.
+    private var effectiveSize: (width: Int, height: Int) {
+        guard resolution.isCustom else { return (resolution.width, resolution.height) }
+        return customResolutionVerdict.size ?? (resolution.width, resolution.height)
     }
 
     private var advancedToggle: some View {
@@ -390,26 +480,45 @@ struct ImageGenView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
             }
-            // No CFG field and no negative prompt: NO image backend reads either
-            // one (`handleImage` parses neither, and the app never sent
-            // guidance), so both were pure decoration on every model, not just
-            // the distilled ones. Steps stay overridable even where the schedule
-            // is fixed — it's the Advanced panel, and the hint says the cost.
+            // Steps stay overridable even where the schedule is fixed — it's
+            // the Advanced panel, and the hint says the cost.
             HStack {
                 numberField("Steps", value: $steps, step: 1)
-                numberField("Seed (-1 = random)", value: $seed, step: 1)
+                // -1 is the random sentinel and renders as an EMPTY box, so the
+                // placeholder explains it instead of a literal -1 that reads as
+                // a broken value.
+                SeedField(label: "Seed", placeholder: "random", range: -1...Int.max, value: $seed,
+                          help: "Same seed + same settings reproduces the image. Paste one to rerun someone else's; leave it empty for a new one each time.")
             }
             if model.stepsAreFixed {
                 Text("This model is distilled for \(model.fixedSteps) steps; other values cost time without adding detail.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+
+            // Real CFG — the undistilled base checkpoint only. Every other
+            // preset has guidance baked into its weights, so the field would
+            // be pure decoration there and stays hidden.
+            if model.supportsGuidance {
+                Divider()
+                Text("Classifier-free guidance").font(.caption.weight(.semibold))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Guidance scale").font(.caption)
+                    Stepper(value: $guidanceScale, in: 1...20, step: 0.5) {
+                        Text(String(format: "%.1f", guidanceScale))
+                    }
+                    .onChange(of: guidanceScale) { _, _ in guard !hydrating else { return }; persist() }
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Negative prompt").font(.caption)
+                    TextField("", text: $negativePrompt, prompt: Text("what to steer away from (optional)"))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                }
+            }
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
-            Toggle("Safe mode (NSFW content filter)", isOn: $safeMode)
-                .font(.caption)
-                .help("On (default): generated images are screened by an on-device NSFW classifier and explicit results are blocked. Off: no filtering — you are responsible for the output.")
 
             // Rebalance scales the TAPPED text-encoder layers. A backend that
             // conditions on a single final hidden state has none to tap
@@ -447,39 +556,60 @@ struct ImageGenView: View {
             // LoRA attaches to the DiT; a backend without that path answers 400.
             if model.supportsLoRA {
             Divider()
-            Text("Style LoRA").font(.caption.weight(.semibold))
-            if loraPath.isEmpty {
+            HStack {
+                Text("Style LoRAs").font(.caption.weight(.semibold))
+                Spacer()
+                Button {
+                    chooseLora()
+                } label: {
+                    Image(systemName: "plus.circle")
+                }
+                .buttonStyle(.borderless)
+                .disabled(loras.count >= maxLoras)
+                .help(loras.count >= maxLoras ? "Maximum \(maxLoras) LoRAs" : "Add another LoRA")
+            }
+            if loras.isEmpty {
                 Button {
                     chooseLora()
                 } label: {
                     Label("Choose .safetensors…", systemImage: "paintpalette")
                         .font(.caption)
                 }
-                Text("Apply a LoRA adapter to the image model for a custom style.")
+                Text("Apply one or more LoRA adapters to the image model for a custom style. Several can stack at once.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else {
-                HStack(spacing: 8) {
-                    Image(systemName: "paintpalette")
+                ForEach(Array(loras.enumerated()), id: \.element.id) { index, lora in
+                    HStack(spacing: 8) {
+                        Image(systemName: "paintpalette")
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(URL(fileURLWithPath: lora.path).lastPathComponent)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(lora.path)
+                            Stepper(value: $loras[index].scale, in: 0...2, step: 0.05) {
+                                Text("scale \(String(format: "%.2f", lora.scale))")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .onChange(of: loras[index].scale) { _, _ in guard !hydrating else { return }; persist() }
+                        }
+                        Spacer()
+                        Button {
+                            loras.remove(at: index)
+                            persist()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.borderless)
                         .foregroundStyle(.secondary)
-                    Text(URL(fileURLWithPath: loraPath).lastPathComponent)
-                        .font(.caption)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .help(loraPath)
-                    Spacer()
-                    Button {
-                        loraPath = ""
-                        persist()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
+                        .help("Remove this LoRA")
                     }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .help("Remove the LoRA")
+                    .padding(6)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
                 }
-                .padding(6)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
             }
             } // model.supportsLoRA
         }
@@ -515,7 +645,7 @@ struct ImageGenView: View {
     }
 
     private func chooseSourceImage() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -526,33 +656,52 @@ struct ImageGenView: View {
     }
 
     private func chooseRefImage() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        if AppActivation.runModal(panel) == .OK, let url = panel.url, refImageURLs.count < 3 {
+        if AppActivation.runModal(panel) == .OK, let url = panel.url, refImageURLs.count < maxRefImages {
             refImageURLs.append(url)
         }
     }
 
+    /// Max simultaneously-attached LoRAs — mirrors the server's `lora.MAX_LORAS`.
+    private let maxLoras = 8
+    /// Reference images an edit takes beside the source.
+    private let maxRefImages = 3
+
+    /// Routing lives in `ImageDropPlacement` — one drop can carry several
+    /// files, so this is the whole placement (source, then references) applied
+    /// at once rather than a per-file decision.
+    private func placeDroppedImages(_ urls: [URL]) {
+        let placed = ImageDropPlacement.place(
+            urls, source: initImageURL, editing: effectiveEditMode,
+            refs: refImageURLs, refLimit: maxRefImages)
+        initImageURL = placed.source
+        refImageURLs = placed.refs
+    }
+
     private func chooseLora() {
-        let panel = NSOpenPanel()
+        guard loras.count < maxLoras else { return }
+        let panel = OpenPanel.make()
         if let st = UTType(filenameExtension: "safetensors") {
             panel.allowedContentTypes = [st]
         }
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        if AppActivation.runModal(panel) == .OK, let url = panel.url {
-            loraPath = url.path
+        panel.allowsMultipleSelection = true
+        if AppActivation.runModal(panel) == .OK {
+            for url in panel.urls.prefix(maxLoras - loras.count) {
+                loras.append(LoraAdapter(path: url.path))
+            }
             persist()
         }
     }
 
     private func numberField(_ label: String, value: Binding<Int>, step: Int) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption)
+            Text(L10n.text(label)).font(.caption)
             Stepper(value: value, step: step) {
                 Text(String(value.wrappedValue))
             }
@@ -561,8 +710,11 @@ struct ImageGenView: View {
 
     private var actionRow: some View {
         VStack(spacing: 8) {
+            // Progress only — the Download BUTTON lives on the model row above
+            // (`MediaModelChooser`). Two buttons stacked here, one to fetch and
+            // one to run, was the pane's most confusing moment.
             if lanModel == nil && !downloads.bundleReady(model.bundle) {
-                BundleDownloadBar(bundle: model.bundle)
+                BundleDownloadBar(bundle: model.bundle, showsStartButton: false)
             }
             HStack {
                 if service.isRunning {
@@ -582,7 +734,7 @@ struct ImageGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)) || !condWeightsValid)
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)) || !condWeightsValid || !customSizeValid)
                 }
             }
         }
@@ -638,6 +790,15 @@ struct ImageGenView: View {
                 } label: { Image(systemName: "folder") }
                 .buttonStyle(.borderless)
                 .help("Reveal in Finder")
+                // The one bridge from the workshop to a conversation. It opens
+                // a NEW chat and switches to it — see
+                // `AppState.sendGeneratedMediaToNewChat`.
+                Button {
+                    appState.sendGeneratedMediaToNewChat(
+                        path: path, prompt: prompt, kind: .image)
+                } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
+                .buttonStyle(.borderless)
+                .help("Send to Chat — opens a new conversation with this attached")
             }
         }
         .padding(8)
@@ -665,23 +826,23 @@ struct ImageGenView: View {
     /// writes trigger doesn't reapply preset defaults over them.
     private func hydrate() {
         let s = ImageGenSettings.load()
-        model = s.resolvedModel
+        model = s.resolvedModel(models: server.allModels)
         lanModel = LanPick.lanId(s.modelId)
         quality = s.quality
         resolution = s.resolvedResolution(for: model)
         steps = s.steps
         seed = s.seed
-        safeMode = s.safeMode
         keepResident = s.keepResident
         strength = s.strength
         editMode = s.editMode
         condGain = s.condGain
         condWeightsText = s.condWeightsText
-        loraPath = s.loraPath
-        // The LoRA file may have moved since last session — drop a stale path.
-        if !loraPath.isEmpty && !FileManager.default.fileExists(atPath: loraPath) {
-            loraPath = ""
-        }
+        guidanceScale = s.guidanceScale
+        loras = s.loras
+        customWidthText = String(s.customWidth)
+        customHeightText = String(s.customHeight)
+        // A LoRA file may have moved since last session — drop stale entries.
+        loras.removeAll { !FileManager.default.fileExists(atPath: $0.path) }
     }
 
     /// Capture the current controls as the new last-used settings.
@@ -690,15 +851,20 @@ struct ImageGenView: View {
         s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.quality = quality
         s.resolutionId = resolution.id
+        // Persist what the fields HOLD, not the corrected value: rewriting the
+        // user's own number under them mid-edit is the thing a hint exists to
+        // avoid. Unparseable text keeps the previous saved size.
+        s.customWidth = Int(customWidthText) ?? ImageGenSettings().customWidth
+        s.customHeight = Int(customHeightText) ?? ImageGenSettings().customHeight
         s.steps = steps
         s.seed = seed
-        s.safeMode = safeMode
         s.keepResident = keepResident
         s.strength = strength
         s.editMode = editMode
         s.condGain = condGain
         s.condWeightsText = condWeightsText
-        s.loraPath = loraPath
+        s.guidanceScale = guidanceScale
+        s.loras = loras
         s.save()
     }
 
@@ -726,19 +892,20 @@ struct ImageGenView: View {
             model: model,
             prompt: prompt,
             seed: seed,
-            width: resolution.width,
-            height: resolution.height,
+            width: effectiveSize.width,
+            height: effectiveSize.height,
             steps: steps,
             keepResident: keepResident,
             lanModelId: lanModel,
-            safeMode: safeMode,
             initImagePath: initImageURL?.path,
             strength: strength,
             editMode: effectiveEditMode,
             refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
             condGain: condGain,
             condWeightsText: condWeightsText,
-            loraPath: loraPath.isEmpty ? nil : loraPath
+            loras: loras,
+            guidanceScale: model.supportsGuidance ? guidanceScale : 1.0,
+            negativePrompt: model.supportsGuidance ? negativePrompt : ""
         )
         persist()  // final capture — the agent's generate_image reuses these
 
@@ -755,10 +922,6 @@ struct ImageGenView: View {
     }
 
     private func showLogWindow() {
-        let text = service.log.joined(separator: "\n")
-        let alert = NSAlert()
-        alert.messageText = "Image generation log"
-        alert.informativeText = text.isEmpty ? "(no output)" : text
-        alert.runModal()
+        AppActivation.openWindow(id: "serverLog", using: openWindow)
     }
 }

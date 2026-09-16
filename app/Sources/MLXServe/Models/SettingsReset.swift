@@ -29,10 +29,16 @@ enum SettingsReset {
     /// sections with nothing of their own to reset.
     static func fields(for category: SettingsCategory) -> [SettingsFieldReset] {
         switch category {
-        // Model Folders' extra scan path lives on `DownloadManager.customRoot`,
-        // not in ServerOptions; Updates holds no settings. Neither offers a
-        // Reset button (`isResettable`), rather than a button that does nothing.
-        case .modelFolders, .updates:
+        // Model Folders' two paths live in `ModelRoots` (UserDefaults), not in
+        // ServerOptions, and each row carries its own Clear/Reset button beside
+        // the path it clears; Updates holds no settings, and About is links
+        // only. None offers a section Reset button (`isResettable`), rather
+        // than a button that does nothing. Interface is the same shape:
+        // `@AppStorage`-backed display prefs, not a `ServerOptions` field —
+        // each of its rows (appearance/accent/text size/compact/shortcut)
+        // carries its own control default or Reset (the shortcut row's).
+        // Providers live in providers.json, edited row by row in their own pane.
+        case .modelFolders, .updates, .about, .interface, .providers:
             return []
 
         case .server:
@@ -50,6 +56,9 @@ enum SettingsReset {
                 f("apiKey") { $0.apiKey = $1.apiKey },
                 f("toolAutocorrect") { $0.toolAutocorrect = $1.toolAutocorrect },
                 f("skipMemPreflight") { $0.skipMemPreflight = $1.skipMemPreflight },
+                f("maxResidentMemGB") { $0.maxResidentMemGB = $1.maxResidentMemGB },
+                f("maxResidentModels") { $0.maxResidentModels = $1.maxResidentModels },
+                f("idleEvictSecs") { $0.idleEvictSecs = $1.idleEvictSecs },
             ]
 
         case .lanSharing:
@@ -71,7 +80,7 @@ enum SettingsReset {
                 f("draftBlockSize") { $0.draftBlockSize = $1.draftBlockSize },
                 f("enableMTP") { $0.enableMTP = $1.enableMTP },
                 f("mtpDepth") { $0.mtpDepth = $1.mtpDepth },
-                f("forceMTPOnMoE") { $0.forceMTPOnMoE = $1.forceMTPOnMoE },
+                f("mtpOnMoE") { $0.mtpOnMoE = $1.mtpOnMoE },
                 f("enableDSpark") { $0.enableDSpark = $1.enableDSpark },
             ]
 
@@ -86,6 +95,14 @@ enum SettingsReset {
                 f("prefixCacheMem") { $0.prefixCacheMem = $1.prefixCacheMem },
                 f("enablePrefixCacheDisk") { $0.enablePrefixCacheDisk = $1.enablePrefixCacheDisk },
                 f("prefixCacheDisk") { $0.prefixCacheDisk = $1.prefixCacheDisk },
+            ]
+
+        case .neuralEngine:
+            return [
+                f("anePrefill") { $0.anePrefill = $1.anePrefill },
+                f("aneImage") { $0.aneImage = $1.aneImage },
+                f("aneVideo") { $0.aneVideo = $1.aneVideo },
+                f("aneAudio") { $0.aneAudio = $1.aneAudio },
             ]
 
         case .ggufPerformance:
@@ -130,6 +147,9 @@ enum SettingsReset {
         case .sandbox:
             return [
                 f("sandbox") { $0.sandbox = $1.sandbox },
+                // Agent behavior rather than sandboxing, but this is the pane
+                // that holds it — and every field needs exactly one owner.
+                f("toolsOnlyWhenAsked") { $0.toolsOnlyWhenAsked = $1.toolsOnlyWhenAsked },
             ]
 
         case .messaging:

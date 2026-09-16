@@ -42,6 +42,7 @@ pub const OpenOptions = struct {
     mtp_path: ?[]const u8 = null,
     mtp_draft_tokens: c_int = 0,
     mtp_margin: f32 = 0,
+    dspark: bool = false,
     ssd_streaming: bool = false,
     ssd_streaming_cold: bool = false,
     ssd_streaming_cache_experts: u32 = 0,

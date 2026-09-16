@@ -13,6 +13,9 @@ struct ContextPill: View {
     /// nothing without knowing whose window it is (and LAN chats can be talking
     /// to another Mac's model entirely).
     let modelName: String?
+    /// Decode speed of the last timed reply, from the SERVER's own `timings`
+    /// (see `ContextWindowStats.speedText`). nil until a reply has been timed.
+    let decodeSpeed: Double?
     /// True while this chat is streaming: the figure is moving, so it's marked
     /// live rather than reading as a settled total.
     let isLive: Bool
@@ -31,7 +34,7 @@ struct ContextPill: View {
     var body: some View {
         Button { showDetail.toggle() } label: {
             HStack(spacing: 5) {
-                Text(stats.percentText)
+                Text(L10n.text(stats.percentText))
                     .font(.caption.monospacedDigit().weight(.medium))
                     .foregroundStyle(stats.pressure == .comfortable ? Color.secondary : tint)
                 ring
@@ -43,9 +46,13 @@ struct ContextPill: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help("Context window — \(stats.percentText) of \(ContextWindowStats.compact(stats.contextLength)) tokens used. Click for the breakdown.")
+        .help(L10n.format(
+            "Context window — %@ of %@ tokens used. Click for the breakdown.",
+            stats.percentText,
+            ContextWindowStats.compact(stats.contextLength)
+        ))
         .popover(isPresented: $showDetail, arrowEdge: .top) {
-            ContextWindowDetail(stats: stats, modelName: modelName)
+            ContextWindowDetail(stats: stats, modelName: modelName, decodeSpeed: decodeSpeed)
         }
     }
 
@@ -70,6 +77,7 @@ struct ContextPill: View {
 struct ContextWindowDetail: View {
     let stats: ContextWindowStats
     let modelName: String?
+    let decodeSpeed: Double?
 
     private var tint: Color {
         switch stats.pressure {
@@ -90,7 +98,7 @@ struct ContextWindowDetail: View {
                     Text("Context window")
                         .font(.callout.weight(.semibold))
                     if let modelName, !modelName.isEmpty {
-                        Text(modelName)
+                        Text(L10n.text(modelName))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -105,7 +113,7 @@ struct ContextWindowDetail: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(stats.percentText)
+                    Text(L10n.text(stats.percentText))
                         .font(.system(size: 26, weight: .semibold, design: .rounded))
                         .foregroundStyle(tint)
                     Spacer()
@@ -139,8 +147,33 @@ struct ContextWindowDetail: View {
                 row(icon: "ruler", label: "Remaining", value: stats.remainingTokens)
             }
             .padding(12)
+
+            // Its OWN section, below the divider: everything above counts
+            // TOKENS IN THE WINDOW, and a throughput figure in that group would
+            // read as one more thing filling the context. Absent until a reply
+            // has been timed, rather than a placeholder dash.
+            if let speed = ContextWindowStats.speedText(decodeSpeed) {
+                Divider()
+                textRow(icon: "gauge.with.needle", label: "Decode speed", value: speed)
+                    .padding(12)
+            }
         }
         .frame(width: 280)
+    }
+
+    /// Same layout as `row`, for a figure that is already formatted.
+    private func textRow(icon: String, label: String, value: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .frame(width: 14)
+            Text(L10n.text(label))
+                .font(.callout)
+            Spacer()
+            Text(value)
+                .font(.system(size: 12, design: .monospaced))
+        }
     }
 
     private func row(icon: String, label: String, value: Int, emphasized: Bool = false) -> some View {
@@ -149,7 +182,7 @@ struct ContextWindowDetail: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .frame(width: 14)
-            Text(label)
+            Text(L10n.text(label))
                 .font(.callout)
             Spacer()
             // Exact figures here — the pill rounds, this is where you check.

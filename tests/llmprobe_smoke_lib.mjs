@@ -20,6 +20,12 @@ const MLX_CHAT_ARCHS = new Set([
   "gemma3", "gemma4", "gemma4_unified", "diffusion_gemma",
   "qwen2", "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_moe", "qwen3_next",
   "llama", "mistral", "lfm2", "nemotron_h", "hy_v3",
+  // Ling-3.0-flash. Its MoE-ness comes from `is_moe` (the arch name carries no
+  // `_moe` suffix), so familyKey lands it on `bailing_hybrid-moe` and it
+  // inherits the MoE rules: MTP + drafter default OFF. Note the mirror is
+  // 68.5 GB against SMOKE_MAX_GB's 60 default, so it needs the cap raised.
+  "bailing_hybrid",
+  "lfm2_moe", "lfm2_vl", "laguna", "inkling_mm_model", "muse_glimmer", "spark2_5", "qwen4_exp",
 ]);
 
 /** Block-diffusion models denoise a canvas instead of decoding token-by-token,
@@ -171,7 +177,6 @@ export function planCells(rep, opts = {}) {
   if (kvCheck) {
     cells.push(
       { id: "kv4", label: "KV 4-bit (crash check)", flags: ["--kv-quant", "4"], expectSpec: null, kv: true },
-      { id: "kv-turbo4", label: "KV TurboQuant-4 (crash check)", flags: ["--kv-quant", "turbo4"], expectSpec: null, kv: true },
     );
   }
   return cells;

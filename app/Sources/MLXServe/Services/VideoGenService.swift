@@ -30,6 +30,7 @@ final class VideoGenService: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .idle
+    @Published private(set) var livePreview: NSImage? = nil
     @Published private(set) var recent: [String] = []
     @Published private(set) var log: [String] = []
     @Published private(set) var residency: Residency? = nil
@@ -44,6 +45,15 @@ final class VideoGenService: ObservableObject {
     private func setPhase(_ p: Phase, for gen: Int) {
         guard gen == generationSeq else { return }
         phase = p
+        switch p {
+        case .running: break
+        default: livePreview = nil
+        }
+    }
+
+    private func setLivePreview(_ img: NSImage?, for gen: Int) {
+        guard gen == generationSeq else { return }
+        livePreview = img
     }
 
     /// A cancelled URLSession request surfaces as URLError.cancelled, not
@@ -79,6 +89,7 @@ final class VideoGenService: ObservableObject {
         task?.cancel()
         generationSeq += 1
         let gen = generationSeq
+        livePreview = nil
         phase = .running(step: 0, total: 3, message: "Loading model…")
         log = []
 
@@ -88,6 +99,7 @@ final class VideoGenService: ObservableObject {
         let steps = request.steps
         let keep = request.keepResident
         let firstFramePath = request.firstFrameImagePath
+        let lastFramePath = request.lastFrameImagePath
         let audioPath = request.audioPath
 
         task = Task {
@@ -105,6 +117,14 @@ final class VideoGenService: ObservableObject {
                         (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
                     }
                 }.value
+                // The last-frame anchor reads the same way. Both keyframes are
+                // ordinary image files; the server owns the per-anchor resize
+                // policy (first stretches, last center-covers).
+                let lastFrameB64: String? = await Task.detached(priority: .userInitiated) {
+                    lastFramePath.flatMap { path in
+                        (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
+                    }
+                }.value
                 // Audio-to-video: transcode the clip to a PCM16 WAV off-main
                 // (AVFoundation decode of an mp3/m4a can take a moment). A
                 // failed transcode is a hard error — the user asked for THIS
@@ -117,6 +137,18 @@ final class VideoGenService: ObservableObject {
                     setPhase(.failed("Couldn't read the audio clip. Pick a WAV, MP3, M4A, or AAC file."), for: gen)
                     return
                 }
+                // ref2va: reading 9 images and pulling frames out of 3 clips is
+                // seconds of work, so it goes off-main like the two above. A
+                // reference that cannot be read is a hard error — generating
+                // while dropping one silently is exactly what the server's
+                // named 400s exist to prevent.
+                let refPayloads: VideoRefPayloads? = await Task.detached(priority: .userInitiated) {
+                    Self.refPayloads(for: request)
+                }.value
+                guard let refs = refPayloads else {
+                    setPhase(.failed("Couldn't read one of the reference files. Images must be PNG or JPEG, clips a QuickTime/MP4 movie of at least 5 frames, and audio a WAV, MP3, M4A or AAC file."), for: gen)
+                    return
+                }
                 let (port, modelId, unloadId) = try await server.prepareGenModel(
                     lanModelId: request.lanModelId, repo: request.model.repo)
                 loadedId = unloadId
@@ -127,10 +159,27 @@ final class VideoGenService: ObservableObject {
                 if Task.isCancelled { setPhase(.cancelled, for: gen); return }
                 let body = Self.requestBody(model: modelId, prompt: prompt,
                                             request: request, firstFrameB64: firstFrameB64,
-                                            audioB64: audioB64)
+                                            lastFrameB64: lastFrameB64,
+                                            audioB64: audioB64, refs: refs)
                 // SSE: the server pushes `progress` events per denoise step, then a
                 // `complete` event with the frames. Drive a determinate bar from them.
                 var decoded: DecodedFrames? = nil
+                // Live ETA from the run's own cadence — the only estimate that
+                // knows what this machine is doing right now. A three-hour job
+                // with a bar and no number is indistinguishable from a hang.
+                var clock = H3StepClock()
+                // Floor + tail for the live number (H3 only; LTX keeps the
+                // plain lap mean — its laps are near-uniform and it has no
+                // pre-run model to floor against). `fast` is effectiveFast:
+                // turbo forces the server recipe off, never !bestQuality alone.
+                let pricing: (perStep: Double, tail: Double) =
+                    request.model.backend == .minimaxH3
+                    ? H3TimeEstimate.livePricing(model: request.model,
+                                                 width: request.width, height: request.height,
+                                                 frames: request.numFrames, steps: steps,
+                                                 fast: !request.bestQuality && !request.turbo)
+                    : (0, 0)
+                let startedAt = ProcessInfo.processInfo.systemUptime
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/video/generations", json: body) {
                     switch ev["type"] as? String {
@@ -138,7 +187,17 @@ final class VideoGenService: ObservableObject {
                         let step = ev["step"] as? Int ?? 0
                         let total = ev["total"] as? Int ?? steps
                         let stage = ev["stage"] as? String ?? "Generating"
-                        setPhase(.running(step: step, total: max(total, 1), message: "\(stage)…"), for: gen)
+                        clock.observe(step: step)
+                        var message = "\(stage)…"
+                        if let eta = clock.eta(totalSteps: max(total, 1),
+                                               floorPerStep: pricing.perStep, tail: pricing.tail),
+                           eta > 0 {
+                            message += " \(H3TimeEstimate.duration(eta)) left"
+                        }
+                        if let data = MediaSSE.previewJPEG(ev), let img = NSImage(data: data) {
+                            setLivePreview(img, for: gen)
+                        }
+                        setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
                     case "complete":
                         decoded = Self.decodeFrames(ev)
                     case "error":
@@ -155,8 +214,19 @@ final class VideoGenService: ObservableObject {
                     return
                 }
                 if Task.isCancelled { setPhase(.cancelled, for: gen); return }
+                // Calibrate this Mac against the anchor model, so the next
+                // estimate is measured rather than extrapolated. Recorded from
+                // the SAMPLING span only — the encode below is ours, not the
+                // model's, and the estimate does not include it.
+                H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
+                                      frames: request.numFrames, steps: steps, fast: !request.bestQuality,
+                                      measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
                 setPhase(.running(step: steps, total: steps, message: "Encoding mp4…"), for: gen)
                 let outFps = frames.fps > 0 ? frames.fps : fps
+                let settings = Self.settingsText(
+                    request, modelId: modelId,
+                    outputWidth: frames.width, outputHeight: frames.height,
+                    outputFrames: frames.frames, outputFps: outFps)
                 try await Task.detached(priority: .userInitiated) {
                     try VideoGenService.writeMP4(
                         rgb: frames.rgb, frames: frames.frames,
@@ -164,6 +234,9 @@ final class VideoGenService: ObservableObject {
                         fps: outFps, to: URL(fileURLWithPath: outputPath),
                         audioPCM: frames.audioPCM, audioSampleRate: frames.audioSampleRate,
                         audioChannels: frames.audioChannels)
+                    // The mp4 is the primary artifact. Match audio/music generation:
+                    // a sidecar failure must not discard a successfully encoded clip.
+                    try? VideoGenService.writeSettingsSidecar(settings, forVideo: outputPath)
                 }.value
                 setPhase(.completed(path: outputPath), for: gen)
                 insertRecent(outputPath)
@@ -234,6 +307,10 @@ final class VideoGenService: ObservableObject {
             }
             report(steps, steps, "Encoding mp4")
             let outFps = frames.fps > 0 ? frames.fps : request.fps
+            let settings = Self.settingsText(
+                request, modelId: modelId,
+                outputWidth: frames.width, outputHeight: frames.height,
+                outputFrames: frames.frames, outputFps: outFps)
             try await Task.detached(priority: .userInitiated) {
                 try VideoGenService.writeMP4(
                     rgb: frames.rgb, frames: frames.frames,
@@ -241,6 +318,7 @@ final class VideoGenService: ObservableObject {
                     fps: outFps, to: URL(fileURLWithPath: outputPath),
                     audioPCM: frames.audioPCM, audioSampleRate: frames.audioSampleRate,
                     audioChannels: frames.audioChannels)
+                try? VideoGenService.writeSettingsSidecar(settings, forVideo: outputPath)
             }.value
             await releaseIfNeeded()
             return outputPath
@@ -254,7 +332,10 @@ final class VideoGenService: ObservableObject {
         task?.cancel()
         task = nil
         // Instant feedback; the cancelled task's own catch re-confirms it.
-        if isRunning { phase = .cancelled }
+        if isRunning {
+            phase = .cancelled
+            livePreview = nil
+        }
     }
 
     // MARK: - Residency (model loaded? GPU memory?)
@@ -310,7 +391,9 @@ final class VideoGenService: ObservableObject {
     /// tests pin every field here so the UI model can't drift from the wire.
     nonisolated static func requestBody(model: String, prompt: String,
                                         request: VideoGenRequest, firstFrameB64: String?,
-                                        audioB64: String? = nil) -> [String: Any] {
+                                        lastFrameB64: String? = nil,
+                                        audioB64: String? = nil,
+                                        refs: VideoRefPayloads = .init()) -> [String: Any] {
         var pipeline: String
         switch request.mode {
         case .oneStage:   pipeline = "one_stage"
@@ -332,19 +415,212 @@ final class VideoGenService: ObservableObject {
             "model": model, "prompt": prompt, "num_frames": request.numFrames,
             "height": request.height, "width": request.width, "steps": request.steps,
             "seed": request.seed,
-            "pipeline": pipeline,
         ]
-        if !dropGuidance {
+        // Send only what the BACKEND declares it can honor. Hiding a control is
+        // not the same as not sending its field: `pipeline` used to go out
+        // unconditionally, which meant every MiniMax-H3 request carried a field
+        // that backend has no concept of. Gating the request against the same
+        // capabilities the pane gates its controls on keeps the two honest.
+        if request.model.supportsPipelineModes {
+            body["pipeline"] = pipeline
+        }
+        if request.model.supportsCFG, !dropGuidance {
             body["cfg_scale"] = request.cfgScale
             body["stg_scale"] = request.stgScale
+            // The audio guider only exists on the a2vid path, so the scale
+            // rides the clip rather than the preset: without one it would set
+            // a knob on a guider that never runs. It drops with the rest of
+            // the guidance on an upgraded one-stage request, because the whole
+            // point of that drop is to let the server's reference two-stage
+            // defaults (3.0 video / 7.0 audio) apply as a SET.
+            if hasAudio { body["cfg_audio_scale"] = request.cfgAudioScale }
+        }
+        // Stage-2 refine steps. Two-stage only — one-stage has no refine pass,
+        // so the field would be a no-op the server still parses. 0 is Auto and
+        // stays absent, keeping "absent = the server's default" true.
+        if request.model.supportsPipelineModes, pipeline != "one_stage", request.stage2Steps > 0 {
+            body["stage2_steps"] = request.stage2Steps
         }
         if let firstFrameB64 { body["first_frame_image"] = firstFrameB64 }
-        if hasAudio, let audioB64 { body["audio"] = audioB64 }
-        if let lora = request.loraPath, !lora.isEmpty {
-            body["lora_path"] = lora
-            if request.loraScale != 1.0 { body["lora_scale"] = request.loraScale }
+        // The other half of fl2va. Capability-gated like every field above: a
+        // preset switch leaves the picked file in state, and LTX's handler has
+        // no `last_frame_image` to ignore it with.
+        if request.model.supportsLastFrame, let lastFrameB64 {
+            body["last_frame_image"] = lastFrameB64
         }
+        // The fast recipe is the SERVER's default — the app only speaks up to
+        // opt OUT, and only on a backend that has the recipe at all.
+        if request.model.supportsFastRecipe, request.bestQuality { body["fast"] = false }
+        // The conv decoder is the server's default, so the app only speaks up
+        // to ask for the DiffVAE — and only on a pack that ships it.
+        if request.model.supportsDiffusionDecoder, request.diffusionDecoder {
+            body["decoder"] = "diffusion"
+        }
+        // Turbo + chained windows: capability-gated like every H3 field above,
+        // and emitted only when engaged — the server's defaults are the
+        // absent-field behavior.
+        if request.model.supportsTurbo, request.turbo { body["turbo"] = true }
+        if request.model.supportsChainedWindows, request.chainWindows > 1 {
+            body["chain_windows"] = request.chainWindows
+        }
+        if request.model.supportsAudioInput, hasAudio, let audioB64 { body["audio"] = audioB64 }
+        // Stacked style LoRAs (adapters sum, so several can attach at once —
+        // see ImageGenService.requestJson for the same pattern). Capability-
+        // gated like every other field: a preset switch leaves the rows in
+        // state, and a backend without LoRA support must not see the arrays.
+        let loras = request.loras.filter { !$0.path.isEmpty }
+        if request.model.supportsLoRA, !loras.isEmpty {
+            body["lora_paths"] = loras.map(\.path)
+            body["lora_scales"] = loras.map(\.scale)
+        }
+        // ref2va. Gated on the pack's own capability for the same reason as
+        // `pipeline` above: an FL2VA checkpoint handed references 400s, and a
+        // preset switch leaves the picked files in the request state.
+        if request.model.supportsReferences {
+            if !refs.images.isEmpty { body["ref_images"] = refs.images }
+            if !refs.videos.isEmpty {
+                body["ref_videos"] = refs.videos.map { v -> [String: Any] in
+                    var o: [String: Any] = ["frames": v.frames]
+                    // Omitted rather than null: the soundtrack is a field on
+                    // the clip it belongs to, and "absent" is the only way to
+                    // say a clip is silent.
+                    if let a = v.audio, !a.isEmpty { o["audio"] = a }
+                    return o
+                }
+            }
+            if !refs.audios.isEmpty { body["ref_audios"] = refs.audios }
+            // `match` is the server's default; only an opt-out is stated.
+            if request.refImageSize != .match { body["ref_image_size"] = request.refImageSize.rawValue }
+        }
+        // Per-step latent previews on the SSE stream (issue #208), opt-in from
+        // the pane's own toggle. Absent = off, so a client that never asks
+        // pays nothing; asking costs an x0 solve plus a host copy of the
+        // previewed frames on every step.
+        if request.livePreview {
+            body["preview"] = true
+            body["preview_frames"] = 1
+            body["preview_max_side"] = 256
+        }
+
         return body
+    }
+
+    // MARK: - Settings sidecar
+
+    /// Human-readable `<clip>.txt` companion for a generated video. This is
+    /// deliberately built from paths/settings, never from the wire body: the
+    /// latter contains multi-megabyte base64 images, PCM audio, and video frames.
+    /// Optional fields are capability-gated exactly like `requestBody`, so a
+    /// stale control value left behind by a preset switch is not documented as
+    /// something the selected backend actually used.
+    nonisolated static func settingsText(_ request: VideoGenRequest, modelId: String,
+                                         outputWidth: Int? = nil, outputHeight: Int? = nil,
+                                         outputFrames: Int? = nil, outputFps: Int? = nil) -> String {
+        var lines: [String] = [
+            "model: \(modelId)",
+            "preset: \(request.model.name)",
+            "seed: \(request.seed)",
+            "width: \(request.width)",
+            "height: \(request.height)",
+            "frames: \(request.numFrames)",
+            "fps: \(request.fps)",
+            "steps: \(request.steps)",
+        ]
+
+        if let outputWidth, let outputHeight,
+           outputWidth != request.width || outputHeight != request.height {
+            lines.append("output_width: \(outputWidth)")
+            lines.append("output_height: \(outputHeight)")
+        }
+        if let outputFrames, outputFrames != request.numFrames {
+            lines.append("output_frames: \(outputFrames)")
+        }
+        if let outputFps, outputFps != request.fps {
+            lines.append("output_fps: \(outputFps)")
+        }
+
+        let hasAudio = request.model.supportsAudioInput &&
+            request.audioPath?.isEmpty == false
+        let upgradedForAudio = hasAudio && request.mode == .oneStage
+        if request.model.supportsPipelineModes {
+            let pipeline: String
+            if upgradedForAudio {
+                pipeline = "two_stage"
+            } else {
+                switch request.mode {
+                case .oneStage:   pipeline = "one_stage"
+                case .twoStage:   pipeline = "two_stage"
+                case .twoStageHQ: pipeline = "two_stage_hq"
+                }
+            }
+            lines.append("pipeline: \(pipeline)")
+        }
+        // A one-stage audio request intentionally drops its one-stage guidance
+        // values and lets the server use two-stage defaults.
+        if request.model.supportsCFG, !upgradedForAudio {
+            lines.append("cfg_scale: \(String(format: "%.2f", request.cfgScale))")
+            lines.append("stg_scale: \(String(format: "%.2f", request.stgScale))")
+        }
+        if request.model.supportsFastRecipe {
+            lines.append("fast_recipe: \(!request.bestQuality && !request.turbo)")
+        }
+        if request.model.supportsDiffusionDecoder {
+            lines.append("decoder: \(request.diffusionDecoder ? "diffusion" : "convolution")")
+        }
+        if request.model.supportsTurbo {
+            lines.append("turbo: \(request.turbo)")
+        }
+        if request.model.supportsChainedWindows {
+            lines.append("chain_windows: \(max(request.chainWindows, 1))")
+        }
+
+        func basename(_ path: String) -> String {
+            (path as NSString).lastPathComponent
+        }
+        if let path = request.firstFrameImagePath, !path.isEmpty {
+            lines.append("first_frame: \(basename(path))")
+        }
+        if let path = request.lastFrameImagePath, !path.isEmpty {
+            lines.append("last_frame: \(basename(path))")
+        }
+        if hasAudio, let path = request.audioPath {
+            lines.append("input_audio: \(basename(path))")
+        }
+
+        if request.model.supportsLoRA {
+            for (index, lora) in request.loras.filter({ !$0.path.isEmpty }).enumerated() {
+                lines.append("lora_\(index + 1)_file: \(basename(lora.path))")
+                lines.append("lora_\(index + 1)_scale: \(String(format: "%.2f", lora.scale))")
+            }
+        }
+        if request.model.supportsReferences {
+            for (index, path) in request.refImagePaths.filter({ !$0.isEmpty }).enumerated() {
+                lines.append("reference_image_\(index + 1): \(basename(path))")
+            }
+            for (index, path) in request.refVideoPaths.filter({ !$0.isEmpty }).enumerated() {
+                lines.append("reference_video_\(index + 1): \(basename(path))")
+            }
+            for (index, path) in request.refAudioPaths.filter({ !$0.isEmpty }).enumerated() {
+                lines.append("reference_audio_\(index + 1): \(basename(path))")
+            }
+            lines.append("reference_image_size: \(request.refImageSize.rawValue)")
+        }
+
+        var out = lines.joined(separator: "\n")
+        out += "\n\n# Prompt\n" + request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        return out + "\n"
+    }
+
+    /// `<clip>.mp4` → `<clip>.txt` companion path.
+    nonisolated static func sidecarPath(forVideo videoPath: String) -> String {
+        (videoPath as NSString).deletingPathExtension + ".txt"
+    }
+
+    /// Kept separate from mp4 encoding so tests can pin actual filesystem
+    /// behavior without synthesizing video frames through AVFoundation.
+    nonisolated static func writeSettingsSidecar(_ text: String, forVideo videoPath: String) throws {
+        try text.write(to: URL(fileURLWithPath: sidecarPath(forVideo: videoPath)),
+                       atomically: true, encoding: .utf8)
     }
 
     /// Longest clip shipped to the server. LTX's frame ladder tops out around
@@ -404,6 +680,91 @@ final class VideoGenService: ObservableObject {
         return wav.base64EncodedString()
     }
 
+    // MARK: - ref2va reference payloads
+
+    /// Longest edge a reference frame is shipped at. The server normalizes a
+    /// reference video to a 768 short edge anyway, so sending phone-native
+    /// frames is pure payload — a 124-frame clip at 4K is hundreds of MB of
+    /// base64 against a 64 MB request cap.
+    nonisolated static let refFrameMaxEdge: CGFloat = 1024
+
+    /// How many frames of a reference clip to actually ship. H3's ladder is
+    /// 17k+5 and the SERVER snaps DOWN, so anything past the snapped count is
+    /// extracted, encoded, uploaded and discarded. 0 means the clip is too
+    /// short to condition on (the server's own 5-frame floor).
+    nonisolated static func refVideoFrameCount(available: Int, cap: Int) -> Int {
+        var n = min(available, cap)
+        while n >= 5, n % 17 != 5 { n -= 1 }
+        return n < 5 ? 0 : n
+    }
+
+    /// Presentation timestamps for `count` frames at H3's fixed 24 fps.
+    nonisolated static func refFrameTimes(count: Int, fps: Int) -> [Double] {
+        guard count > 0, fps > 0 else { return [] }
+        return (0..<count).map { Double($0) / Double(fps) }
+    }
+
+    /// Read an image file straight through as base64 — the server decodes
+    /// PNG/JPEG and resizes to the canvas it picked, so re-encoding here would
+    /// only lose detail the `max` sizing mode exists to keep.
+    nonisolated static func imageFileToBase64(path: String) -> String? {
+        (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
+    }
+
+    /// Pull a reference clip apart into base64 JPEG frames at 24 fps plus its
+    /// soundtrack. JPEG, not PNG: a reference is conditioning, not a pixel-exact
+    /// input, and PNG frames blow through the request cap.
+    nonisolated static func videoFileToRefPayload(path: String, maxFrames: Int) -> VideoRefPayloads.Video? {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        let seconds = CMTimeGetSeconds(asset.duration)
+        guard seconds.isFinite, seconds > 0 else { return nil }
+        let fps = 24
+        let available = Int(seconds * Double(fps))
+        let count = refVideoFrameCount(available: available, cap: maxFrames)
+        guard count > 0 else { return nil }
+
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = .zero
+        gen.maximumSize = CGSize(width: refFrameMaxEdge, height: refFrameMaxEdge)
+
+        var frames: [String] = []
+        frames.reserveCapacity(count)
+        for t in refFrameTimes(count: count, fps: fps) {
+            let time = CMTime(seconds: t, preferredTimescale: CMTimeScale(fps * 1000))
+            guard let cg = try? gen.copyCGImage(at: time, actualTime: nil) else { return nil }
+            let rep = NSBitmapImageRep(cgImage: cg)
+            guard let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.9])
+            else { return nil }
+            frames.append(jpeg.base64EncodedString())
+        }
+        // A silent clip is a legitimate reference: its motion and framing still
+        // condition the generation, so a missing track is not a failure.
+        return .init(frames: frames, audio: audioFileToWavBase64(path: path))
+    }
+
+    /// Resolve a request's reference PATHS into wire payloads. Returns nil when
+    /// something the user picked could not be read — the caller surfaces that
+    /// rather than generating while quietly dropping a reference.
+    nonisolated static func refPayloads(for request: VideoGenRequest) -> VideoRefPayloads? {
+        guard request.model.supportsReferences else { return VideoRefPayloads() }
+        var out = VideoRefPayloads()
+        for p in request.refImagePaths {
+            guard let b64 = imageFileToBase64(path: p) else { return nil }
+            out.images.append(b64)
+        }
+        for p in request.refVideoPaths {
+            guard let v = videoFileToRefPayload(path: p, maxFrames: request.numFrames) else { return nil }
+            out.videos.append(v)
+        }
+        for p in request.refAudioPaths {
+            guard let b64 = audioFileToWavBase64(path: p) else { return nil }
+            out.audios.append(b64)
+        }
+        return out
+    }
+
     // MARK: - Decode + mux (pure / nonisolated so they're testable + off-main)
 
     struct DecodedFrames: Equatable {
@@ -456,7 +817,7 @@ final class VideoGenService: ObservableObject {
         return out
     }
 
-    enum MuxError: Error { case writerInit, noPool, finishFailed(String), audioBuffer }
+    enum MuxError: Error { case writerInit, noPool, frameBuffer(Int), frameAppend(Int, String), finishFailed(String), audioBuffer }
 
     /// Mux raw RGB frames (+ optional stereo PCM) → h264/aac mp4 via AVAssetWriter.
     nonisolated static func writeMP4(rgb: Data, frames: Int, width: Int, height: Int, fps: Int, to url: URL,
@@ -515,13 +876,22 @@ final class VideoGenService: ObservableObject {
         guard let pool = adaptor.pixelBufferPool else { throw MuxError.noPool }
 
         let ts: Int32 = 600
+        // Every frame is appended or the mux FAILS. A dropped frame (pool
+        // exhausted, encoder refused the buffer) used to `continue` and the
+        // writer still finished "successfully" — issue #170's 28 KB black mp4
+        // after an hours-long H3 render. Pool misses fall back to a standalone
+        // buffer; a refused append throws with the writer's own error.
+        var muxFailure: MuxError? = nil
         rgb.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             let src = raw.bindMemory(to: UInt8.self).baseAddress!
             for f in 0..<frames {
                 while !input.isReadyForMoreMediaData { usleep(500) }
                 var pbOut: CVPixelBuffer?
                 CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pbOut)
-                guard let pb = pbOut else { continue }
+                if pbOut == nil {
+                    CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pbOut)
+                }
+                guard let pb = pbOut else { muxFailure = .frameBuffer(f); return }
                 CVPixelBufferLockBaseAddress(pb, [])
                 if let base = CVPixelBufferGetBaseAddress(pb) {
                     let dst = base.assumingMemoryBound(to: UInt8.self)
@@ -540,10 +910,19 @@ final class VideoGenService: ObservableObject {
                 }
                 CVPixelBufferUnlockBaseAddress(pb, [])
                 let pts = CMTime(value: Int64(f) * Int64(ts) / Int64(max(fps, 1)), timescale: ts)
-                adaptor.append(pb, withPresentationTime: pts)
+                if !adaptor.append(pb, withPresentationTime: pts) {
+                    muxFailure = .frameAppend(f, String(describing: writer.error))
+                    return
+                }
             }
         }
         input.markAsFinished()
+        if let failure = muxFailure {
+            audioInput?.markAsFinished()
+            writer.cancelWriting()
+            try? FileManager.default.removeItem(at: url)
+            throw failure
+        }
 
         let sem = DispatchSemaphore(value: 0)
         writer.finishWriting { sem.signal() }

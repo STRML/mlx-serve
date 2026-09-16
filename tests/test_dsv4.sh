@@ -8,7 +8,9 @@
 #
 # Pins the live serving surface end-to-end: greedy raw-completion prefix (the
 # python-oracle ground truth), chat on both thinking arms, DSML tool calling
-# (call → result → answer), and streaming delta cleanliness. Booted WITH
+# (call → result → answer), streaming delta cleanliness, and single-flight
+# admission (a concurrent request must queue, never clobber the module-owned
+# dec_state). Booted WITH
 # --pld --mtp to prove the scheduler's dsv4 spec hard-off guards hold (the
 # app always passes both flags). Complements the hermetic layers: the
 # DSV4_MINI fixture/decode-equivalence gates, the template render test, and
@@ -40,13 +42,19 @@ LOG=$(mktemp /tmp/dsv4_test_serve.XXXXXX)
 # quality regression rather than a diff.
 ENCODING_DIR="${DSV4_ENCODING_DIR:-$HOME/.mlx-serve/staging/DeepSeek-V4-Flash-0731/encoding}"
 if [ -f "$ENCODING_DIR/encoding_dsv4.py" ]; then
-    echo "[0/6] template A/B vs the release encoder"
+    echo "[0/7] template A/B vs the release encoder"
     python3 "$(dirname "$0")/dsv4_template_ab.py" --encoding "$ENCODING_DIR" | tail -1
 else
-    echo "[0/6] SKIP template A/B (no encoding_dsv4.py at $ENCODING_DIR)"
+    echo "[0/7] SKIP template A/B (no encoding_dsv4.py at $ENCODING_DIR)"
 fi
 
-"$BIN" --model "$MODEL" --serve --port "$PORT" --pld --mtp > "$LOG" 2>&1 &
+# DSV4_TEST_SKIP_PREFLIGHT=1: the ~102 GB mirror is a deliberately tight fit
+# on a 128 GB box — a browser plus normal daemons already sink the preflight's
+# margin. The override is how the mirror is actually served day-to-day; the
+# default stays strict so a clean CI box still exercises the guard.
+EXTRA_FLAGS=()
+[ "${DSV4_TEST_SKIP_PREFLIGHT:-0}" = "1" ] && EXTRA_FLAGS+=(--skip-mem-preflight)
+"$BIN" --model "$MODEL" --serve --port "$PORT" --pld --mtp ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} > "$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -63,14 +71,14 @@ curl -s -m 3 "http://127.0.0.1:$PORT/health" | grep -q '"ok"' || { echo "FAIL: n
 
 pass=0; fail=0
 check() { # name, got, expected-substring
-    if echo "$2" | grep -qF "$3"; then
+    if grep -qF "$3" <<< "$2"; then
         echo "PASS: $1"; pass=$((pass+1))
     else
         echo "FAIL: $1"; echo "  got:      $2"; echo "  expected: $3"; fail=$((fail+1))
     fi
 }
 refuse() { # name, got, forbidden-substring
-    if echo "$2" | grep -qF "$3"; then
+    if grep -qF "$3" <<< "$2"; then
         echo "FAIL: $1 (leaked '$3')"; echo "  got: $2"; fail=$((fail+1))
     else
         echo "PASS: $1"; pass=$((pass+1))
@@ -83,10 +91,15 @@ RAW=$(curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: a
     | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['text'])")
 check "raw greedy prefix" "$RAW" " Paris."
 
-# [2] Chat, thinking OFF (chat mode): correct arithmetic, clean content.
+# [2] Chat, thinking OFF (chat mode): correct content, no think leak. The
+# probe is a FACTUAL cell, not arithmetic — no-CoT mental multiplication is a
+# knife-edge that flips between quant recipes (the imatrix gs128 mirror gets
+# 17*23 wrong thinking-off while beating the minmax mirror on the
+# char-precision class; both answer this correctly). This cell pins the
+# ENGINE's thinking-off arm, not the checkpoint's arithmetic.
 OFF=$(curl -s -m 600 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
-    -d '{"model":"mlx-serve","messages":[{"role":"user","content":"What is 17 * 23? Answer with just the number."}],"max_tokens":32,"temperature":0}')
-check "thinking-off content" "$OFF" '391'
+    -d '{"model":"mlx-serve","messages":[{"role":"user","content":"What is the capital of Australia? Answer with just the city name."}],"max_tokens":32,"temperature":0}')
+check "thinking-off content" "$OFF" 'Canberra'
 refuse "thinking-off no think leak" "$OFF" '</think>'
 
 # [3] Chat, thinking ON: reasoning split out, content clean.
@@ -119,6 +132,38 @@ RT=$(curl -s -m 600 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Typ
 # checkpoint's phrasing. '9:14' matches both spellings.
 check "tool round-trip answer" "$RT" '9:14'
 refuse "tool round-trip no DSML leak" "$RT" 'DSML｜tool_calls>'
+
+# [7] Single-flight admission: dsv4's decode state is MODULE-OWNED (one
+# `dec_state` per loaded model, not per slot), so a second concurrent
+# request must QUEUE, never interleave (live 2026-08-02: an app chat mid-pi
+# -session reset pi's state at cache.step==0 — the app's answer leaked into
+# pi's stream, every word doubled, then degenerate). All greedy, same boot:
+# a solo baseline, then the SAME request with a short marker chat fired
+# mid-generation. The long output must be BYTE-equal to solo and free of
+# the marker content; the marker must still be answered (queued, not lost).
+SF_BODY='{"model":"mlx-serve","prompt":"List the first 12 prime numbers, one per line, then explain briefly why 1 is not prime.","max_tokens":128,"temperature":0}'
+SOLO=$(curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
+    -d "$SF_BODY" | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['text'])")
+CONC_FILE=$(mktemp /tmp/dsv4_sf_conc.XXXXXX)
+curl -s -m 600 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
+    -d "$SF_BODY" > "$CONC_FILE" &
+CONC_PID=$!
+sleep 1
+MARKER=$(curl -s -m 600 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model":"mlx-serve","messages":[{"role":"user","content":"Reply with exactly: Kangaroo"}],"max_tokens":16,"temperature":0}')
+wait "$CONC_PID" || true
+CONC=$(python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['text'])" < "$CONC_FILE" 2>/dev/null || echo "<unparseable>")
+rm -f "$CONC_FILE"
+if [ "$CONC" = "$SOLO" ] && [ -n "$SOLO" ]; then
+    echo "PASS: single-flight long output byte-equal to solo"; pass=$((pass+1))
+else
+    echo "FAIL: single-flight long output diverged from solo"
+    echo "  solo: $(echo "$SOLO" | head -c 300)"
+    echo "  conc: $(echo "$CONC" | head -c 300)"
+    fail=$((fail+1))
+fi
+check "single-flight marker answered after queueing" "$MARKER" 'Kangaroo'
+refuse "single-flight no cross-request leak" "$CONC" 'Kangaroo'
 
 echo
 echo "dsv4: $pass passed, $fail failed"

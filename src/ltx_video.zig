@@ -34,13 +34,53 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
+const transformer_mod = @import("transformer.zig");
 const lora_mod = @import("lora.zig");
+const diffvae = @import("ltx_diffvae.zig");
+const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 
 const S = mlx.mlx_stream;
 
 // ── Config (from config.json) ──
 
+/// Which LTX release a pack is. 2.5 keeps 2.3's DiT key template minus the 96
+/// video-FF biases and plus one `keyframes_abs_pos_embedding`, and swaps the
+/// text encoder from a shared Gemma-3-12B to a Lightricks-tuned Gemma-4-12B
+/// shipped INSIDE the pack. Everything else — connector geometry, both VAEs,
+/// the vocoder, both upscalers — is unchanged.
+pub const LtxVersion = enum {
+    v23,
+    v25,
+
+    /// `model_version` is "<major>.<minor>.<patch>"; anything we don't
+    /// recognize reads as 2.3, which is what every pack that predates the
+    /// field is.
+    pub fn fromString(v: []const u8) LtxVersion {
+        return if (std.mem.startsWith(u8, v, "2.5")) .v25 else .v23;
+    }
+
+    /// The text encoder a pack of this version brings. 2.5 ships its own
+    /// fine-tuned encoder in a subdirectory (so a pack is self-contained);
+    /// 2.3 points at the shared `mlx-community/gemma-3-12b-it-4bit` download.
+    pub fn textEncoderSubdir(self: LtxVersion) ?[]const u8 {
+        return switch (self) {
+            .v23 => null,
+            .v25 => "gemma4-12b-ltx-v1",
+        };
+    }
+};
+
 pub const LtxConfig = struct {
+    version: LtxVersion = .v23,
+    /// 2.5 sets `ff_bias: false` — the VIDEO feed-forward ships no biases.
+    /// `dQLin` already treats `.bias` as optional, so this is documentation
+    /// for the loader rather than a branch; the AUDIO feed-forward keeps its.
+    ff_bias: bool = true,
+    audio_ff_bias: bool = true,
+    /// 2.5's one new DiT tensor: a learned `[1, video_dim]` row added to the
+    /// tokens of conditioning KEYFRAMES so the model can tell a frame it was
+    /// handed from one it is generating. No keyframe ⇒ never applied.
+    keyframes_abs_pos: bool = false,
     num_heads: u32 = 32,
     head_dim: u32 = 128,
     in_channels: u32 = 128,
@@ -73,6 +113,46 @@ pub const LtxConfig = struct {
     }
 };
 
+/// Parse the fields of `config.json` that DIFFER across LTX releases. The
+/// geometry (48 blocks, 32x128 video / 32x64 audio, connector shape) is
+/// identical in 2.3 and 2.5 and stays as struct defaults — a pack that
+/// disagreed about those would need a new loader, not a new number.
+pub fn parseLtxConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !LtxConfig {
+    var cfg = LtxConfig{};
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return cfg;
+    defer parsed.deinit();
+    if (parsed.value != .object) return cfg;
+    const root = parsed.value.object;
+    if (root.get("model_version")) |v| {
+        if (v == .string) cfg.version = LtxVersion.fromString(v.string);
+    }
+    if (root.get("ff_bias")) |v| {
+        if (v == .bool) cfg.ff_bias = v.bool;
+    }
+    if (root.get("audio_ff_bias")) |v| {
+        if (v == .bool) cfg.audio_ff_bias = v.bool;
+    }
+    if (root.get("use_keyframes_abs_pos_embedding")) |v| {
+        if (v == .bool) cfg.keyframes_abs_pos = v.bool;
+    }
+    return cfg;
+}
+
+/// Read `<model_dir>/config.json` into an `LtxConfig`. A pack with no readable
+/// config is 2.3 by default — that is what every pack shipped before the field
+/// existed, and refusing to load one would retire working installs.
+pub fn loadLtxConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) LtxConfig {
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return .{};
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return .{};
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return .{};
+    defer allocator.free(bytes);
+    return parseLtxConfig(allocator, bytes) catch .{};
+}
+
 // ── Single-component weight loader ──
 //
 // The LTX checkpoint stores each sub-model as a separate `*.safetensors` file in
@@ -84,11 +164,12 @@ pub const LtxConfig = struct {
 pub const Component = struct {
     map: std.StringHashMap(mlx.mlx_array),
     allocator: std.mem.Allocator,
-    // Runtime LoRA (non-owning; gen.VideoEngine owns the File and re-installs
-    // the pointer after every transformer swap). Checked by dQLin only — the
-    // DiT projections are the modules video LoRAs target.
-    lora: ?*const lora_mod.File = null,
-    lora_scale: f32 = 1.0,
+    // Runtime LoRA (non-owning; gen.VideoEngine owns the Stack and
+    // re-installs the pointer after every transformer swap). Checked by
+    // dQLin only — the DiT projections are the modules video LoRAs target.
+    // A Stack may hold several simultaneously-attached adapters; their
+    // deltas are summed (lora.deltaSum), never merged.
+    lora: ?*const lora_mod.Stack = null,
 
     pub fn deinit(self: *Component) void {
         var it = self.map.iterator();
@@ -165,6 +246,65 @@ pub fn conv3d(input: mlx.mlx_array, weight: mlx.mlx_array, stride: [3]c_int, pad
     return out;
 }
 
+/// Output elements one conv3d call may produce (frames x H x W x max(C,O)).
+/// MLX >= 0.32.2 runs a temporal-pad-0, stride-1, N=1 3D conv as kD per-tap
+/// 2D convs, keeps every tap's FULL output alive until the op completes and
+/// budgets the Winograd working set against the whole GPU, blind to what is
+/// already resident. Over a full-resolution 193-frame VAE tensor that was a
+/// Metal command-buffer OOM at "Decoding video" (#321). 64M elements bounds
+/// the per-call transient to a few hundred MB at the decoder's widest stage.
+pub const CONV3D_CHUNK_ELEMS: u64 = 64 << 20;
+
+/// Output frames per conv3d call under `CONV3D_CHUNK_ELEMS`; never 0.
+pub fn conv3dChunkFrames(h: u64, w: u64, c: u64, o: u64, budget: u64) u32 {
+    const per_frame = h * w * @max(c, o);
+    if (per_frame == 0) return 1;
+    return @intCast(@max(1, @min(budget / per_frame, std.math.maxInt(c_int))));
+}
+
+var conv3d_chunk_logged = false;
+
+/// `conv3d(x, w, stride 1, pad 0)` over depth windows of `max_frames` output
+/// frames (input overlap `k - 1`), each evaluated before the next so the
+/// transient is one window's. Exact: an output frame reads only its `k`
+/// input frames. Whole-depth when it already fits.
+pub fn conv3dDepthChunked(x: mlx.mlx_array, weight: mlx.mlx_array, k: u32, max_frames: u32, s: S) !mlx.mlx_array {
+    const D: c_int = mlx.getShape(x)[1];
+    const kk: c_int = @intCast(k);
+    const od: c_int = D - kk + 1;
+    const step: c_int = @intCast(max_frames);
+    if (od <= step) return conv3d(x, weight, .{ 1, 1, 1 }, .{ 0, 0, 0 }, s);
+    if (!conv3d_chunk_logged) {
+        conv3d_chunk_logged = true;
+        log.info("[ltx] conv3d depth-chunked: {d} output frames in windows of {d}\n", .{ od, step });
+    }
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var start: c_int = 0;
+    while (start < od) : (start += step) {
+        const n = @min(step, od - start);
+        const win = try sliceAxis1(x, start, start + n + kk - 1, s);
+        defer _ = mlx.mlx_array_free(win);
+        var wc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wc);
+        try mlx.check(mlx.mlx_contiguous(&wc, win, false, s));
+        const part = try conv3d(wc, weight, .{ 1, 1, 1 }, .{ 0, 0, 0 }, s);
+        defer _ = mlx.mlx_array_free(part);
+        _ = mlx.mlx_array_eval(part); // bound the transient to this window
+        _ = mlx.mlx_vector_array_append_value(vec, part);
+    }
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+    return out;
+}
+
+/// Frames per call for `decoderConv3d` on padded input `t` and weight `w`.
+fn decoderChunkFrames(t: mlx.mlx_array, weight: mlx.mlx_array) u32 {
+    const ts = mlx.getShape(t);
+    const ws = mlx.getShape(weight);
+    return conv3dChunkFrames(@intCast(ts[2]), @intCast(ts[3]), @intCast(ts[4]), @intCast(ws[0]), CONV3D_CHUNK_ELEMS);
+}
+
 /// Slice frames `[start, stop)` along the depth axis (axis 1) of an NDHWC array.
 fn sliceAxis1(x: mlx.mlx_array, start: c_int, stop: c_int, s: S) !mlx.mlx_array {
     const sh = mlx.getShape(x);
@@ -225,7 +365,7 @@ pub fn decoderConv3d(x: mlx.mlx_array, weight: mlx.mlx_array, bias: ?mlx.mlx_arr
     try mlx.check(mlx.mlx_contiguous(&tc, t, false, s));
     _ = mlx.mlx_array_free(t);
 
-    const out = try conv3d(tc, weight, .{ 1, 1, 1 }, .{ 0, 0, 0 }, s);
+    const out = try conv3dDepthChunked(tc, weight, k, decoderChunkFrames(tc, weight), s);
     if (bias) |b| {
         var wb = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_add(&wb, out, b, s));
@@ -370,6 +510,26 @@ fn unpatchifySpatial(x: mlx.mlx_array, ps: u32, s: S) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(t);
     return reshapeTo(t, &[_]c_int{ B, F, H * psc, W * psc, C }, s);
 }
+
+/// Which decoder turns the final latent into pixels. The conv `vae_decoder` is
+/// the default; `.diffusion` is LTX's own DiffVAE (`vae_diffusion_decoder`),
+/// which their published clips are decoded with. The two travel as ONE value so
+/// a second decode call site cannot pick up half of them (`server.PldDefaults`
+/// pattern) — and the seed rides along because the DiffVAE denoises from noise.
+pub const VaeChoice = struct {
+    conv: *const Component,
+    diffusion: ?*const Component = null,
+    seed: u64 = 0,
+
+    /// `[1,128,F,H,W]` latent → `[1,3,F',H',W']` pixels in [-1,1]; both arms
+    /// return the same shape and range, so callers are decoder-agnostic.
+    pub fn decode(self: VaeChoice, alloc: std.mem.Allocator, latent_bcfhw: mlx.mlx_array, s: S) !mlx.mlx_array {
+        if (self.diffusion) |d| {
+            return diffvae_fwd.decode(alloc, d, diffvae.production, latent_bcfhw, .{ .seed = self.seed }, s);
+        }
+        return vaeDecode(self.conv, latent_bcfhw, s);
+    }
+};
 
 const ResStageSpec = struct { up_idx: u32, num_blocks: u32 };
 const UpSpec = struct { up_idx: u32, sf: u32, tf: u32 };
@@ -1169,7 +1329,7 @@ pub fn connectorTransform(comp: *const Component, allocator: std.mem.Allocator, 
         defer _ = mlx.mlx_array_free(krp);
         var attn = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn);
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qrp, krp, vh, scale, "", null_arr, null_arr, s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qrp, krp, vh, scale, "", null_arr, null_arr, false, s));
         { // per-head gate: 2*sigmoid(to_gate_logits(normed)) [1,T,heads] → [1,heads,T,1]
             const gl = try linBias(comp, allocator, normed, "{s}.transformer_1d_blocks.{d}.attn1.to_gate_logits", .{ prefix, blk }, s);
             defer _ = mlx.mlx_array_free(gl);
@@ -1251,6 +1411,23 @@ const GemmaCfg = struct {
     theta_global: f32 = 1000000.0,
 };
 
+/// (bits, group_size) of an affine-quantized weight, SOLVED from the packed
+/// geometry — never assumed. The pack's width is a property of the pack: the
+/// 4-bit and 8-bit LTX packs are the same layout at different widths, and a
+/// hardcoded 4 meant the engine could only ever load one of them (an 8-bit
+/// pack died at the first matmul with a shapes-incompatible MLX error, which
+/// reads like a corrupt file rather than an engine that never asked).
+/// `in_dim` is the contraction size — the last axis of the activation.
+fn quantGeom(w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: u32) !transformer_mod.QuantParams {
+    return transformer_mod.affineParamsFromGeometry(w, sc, in_dim) orelse error.UnsupportedQuantGeometry;
+}
+
+/// Contraction size of `x` (its last axis).
+fn lastDim(x: mlx.mlx_array) u32 {
+    const sh = mlx.getShape(x);
+    return if (sh.len == 0) 0 else @intCast(sh[sh.len - 1]);
+}
+
 fn gGet(w: *const model_mod.Weights, key: []const u8) !mlx.mlx_array {
     return w.get(key) orelse {
         log.err("[ltx-gemma] MISSING WEIGHT: {s}\n", .{key});
@@ -1258,7 +1435,7 @@ fn gGet(w: *const model_mod.Weights, key: []const u8) !mlx.mlx_array {
     };
 }
 
-/// q4 linear: y = x @ dequant(<base>.weight).T  (affine g64 b4).
+/// Affine-quantized linear; (bits, group_size) solved per weight.
 fn gQLin(w: *const model_mod.Weights, a: std.mem.Allocator, x: mlx.mlx_array, base: []const u8, s: S) !mlx.mlx_array {
     const wk = try std.fmt.allocPrint(a, "{s}.weight", .{base});
     defer a.free(wk);
@@ -1269,8 +1446,9 @@ fn gQLin(w: *const model_mod.Weights, a: std.mem.Allocator, x: mlx.mlx_array, ba
     const wq = try gGet(w, wk);
     const sc = try gGet(w, sk);
     const bi = try gGet(w, bk);
+    const qp = try quantGeom(wq, sc, lastDim(x));
     var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_quantized_matmul(&o, x, wq, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    try mlx.check(mlx.mlx_quantized_matmul(&o, x, wq, sc, bi, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", s));
     return o;
 }
 
@@ -1351,7 +1529,7 @@ fn gLayer(w: *const model_mod.Weights, a: std.mem.Allocator, idx: u32, h: mlx.ml
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
     const null_arr = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, cfg.qk_scale, "array", mask, null_arr, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, cfg.qk_scale, "array", mask, null_arr, false, s));
 
     const at = try gTranspose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
     defer _ = mlx.mlx_array_free(at);
@@ -1390,11 +1568,116 @@ fn fmtKey(a: std.mem.Allocator, prefix: []const u8, suffix: []const u8) ![]u8 {
     return std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, suffix });
 }
 
+/// The LTX text-encoder mask: causal AND blind to the left padding, `[1,1,T,T]`
+/// bf16. Both terms are the reference's FINITE -1e9, never -inf — a padding
+/// query row can see nothing but padding, and an all -inf row softmaxes to NaN
+/// which then rides into the connector on rows it has not replaced yet.
+fn causalPadMask(allocator: std.mem.Allocator, ids: []const i32, pad_id: i32, s: S) !mlx.mlx_array {
+    const tn: usize = ids.len;
+    const T: c_int = @intCast(tn);
+    const mbuf = try allocator.alloc(f32, tn * tn);
+    defer allocator.free(mbuf);
+    const neg: f32 = -1e9;
+    for (0..tn) |i| {
+        for (0..tn) |j| {
+            var m: f32 = if (j <= i) 0.0 else neg;
+            if (ids[j] == pad_id) m += neg;
+            mbuf[i * tn + j] = m;
+        }
+    }
+    const mshape = [_]c_int{ 1, 1, T, T };
+    const mask_f32 = mlx.mlx_array_new_data(mbuf.ptr, &mshape, 4, .float32);
+    defer _ = mlx.mlx_array_free(mask_f32);
+    var mask = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&mask, mask_f32, .bfloat16, s));
+    return mask;
+}
+
+/// LTX 2.5's text encoder: 49 hidden states out of the Lightricks-tuned
+/// Gemma-4-12B the pack ships in `gemma4-12b-ltx-v1/`.
+///
+/// That checkpoint is the SAME `gemma4_unified` decoder mlx-serve already
+/// serves as a chat model — dual head dims on the full-attention layers (512
+/// vs 256), one global KV head, K aliased to V there, partial proportional
+/// RoPE, a per-layer `layer_scalar` — so this runs the real `Transformer` and
+/// taps its residual stream through `capture_layers` instead of hand-rolling
+/// that arithmetic a second time. `gemmaCapture` (2.3, Gemma-3) stays as it
+/// is; the two encoders share only the mask and the sqrt(hidden) embedding
+/// scale.
+///
+/// The prompt is LEFT-PADDED, which the standard forward has no notion of, so
+/// the mask rides in on `ForwardCtx.prefill_mask_add`. ONE forward, no
+/// chunking: the term is sized to the whole prompt.
+///
+/// Caller owns the returned states and the slice.
+pub fn gemmaCapture4(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) ![]mlx.mlx_array {
+    var config = try model_mod.parseConfig(io, allocator, gemma_dir);
+    var weights = try model_mod.loadWeights(io, allocator, gemma_dir);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try transformer_mod.Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+
+    const n_layers = config.num_hidden_layers;
+    var states = try allocator.alloc(mlx.mlx_array, n_layers + 1);
+    var done: usize = 0;
+    errdefer {
+        for (states[0..done]) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(states);
+    }
+
+    const cap_ids = try allocator.alloc(u32, n_layers);
+    defer allocator.free(cap_ids);
+    for (cap_ids, 0..) |*c, i| c.* = @intCast(i);
+
+    const id_shape = [_]c_int{ 1, @intCast(ids.len) };
+    const ids_arr = mlx.mlx_array_new_data(ids.ptr, &id_shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids_arr);
+
+    // states[0] is the embedding output AFTER Gemma's sqrt(hidden) scale —
+    // what `output_hidden_states` returns as hidden_states[0], and what the
+    // connector's 49-state aggregate projection was trained against.
+    states[0] = try xfm.embedding(ids_arr);
+    done = 1;
+
+    const mask = try causalPadMask(allocator, ids, pad_id, s);
+    defer _ = mlx.mlx_array_free(mask);
+
+    for (states[1..]) |*st| st.* = mlx.mlx_array_new();
+    var cl = transformer_mod.CaptureLayers{ .ids = cap_ids, .out = states[1..] };
+    done = states.len;
+    {
+        var ctx = xfm.defaultCtx();
+        ctx.capture_layers = &cl;
+        ctx.prefill_mask_add = mask;
+        // Only the residual stream is wanted, so the 262K-vocab projection
+        // over all 256 prompt rows is pure waste.
+        ctx.skip_lm_head = true;
+        const out = try xfm.forwardWith(&ctx, ids_arr);
+        _ = mlx.mlx_array_free(out);
+    }
+
+    // `capture_layers` is honored by the STANDARD forward only. A checkpoint
+    // that routed elsewhere would leave these empty and the connector would
+    // project 48 blank states into a plausible-looking, meaningless prompt —
+    // so say so instead.
+    for (states) |st| {
+        if (st.ctx == null) return error.GemmaCaptureUnavailable;
+    }
+
+    // The captures are refcount-shared with a LAZY graph whose leaves are the
+    // Transformer's weights, and `xfm.deinit()` runs on the way out — so
+    // realize them here or the frees below pull the inputs out from under it.
+    for (states) |st| _ = mlx.mlx_array_eval(st);
+    return states;
+}
+
 fn addArr(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_add(&o, x, y, s));
     return o;
 }
+
 fn mulArr(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_multiply(&o, x, y, s));
@@ -1471,7 +1754,9 @@ pub fn gemmaCapture(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const
     var deq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(deq);
     const null_gs = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_dequantize(&deq, rw, rs, rb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", null_gs, .{ .value = .bfloat16, .has_value = true }, s));
+    // The embedding table's contraction axis is the hidden width.
+    const eqp = try quantGeom(emb_w, emb_s, cfg.hidden);
+    try mlx.check(mlx.mlx_dequantize(&deq, rw, rs, rb, mlx.mlx_optional_int.some(@intCast(eqp.group_size)), mlx.mlx_optional_int.some(@intCast(eqp.bits)), "affine", null_gs, .{ .value = .bfloat16, .has_value = true }, s));
     const hd: c_int = @intCast(cfg.hidden);
     const emb3 = try gReshape(deq, &[_]c_int{ 1, T, hd }, s);
     defer _ = mlx.mlx_array_free(emb3);
@@ -1483,23 +1768,8 @@ pub fn gemmaCapture(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const
     done = 1;
 
     // ── Combined causal + left-pad mask [1,1,T,T] bf16 ──
-    const tn: usize = ids.len;
-    const mbuf = try allocator.alloc(f32, tn * tn);
-    defer allocator.free(mbuf);
-    const neg: f32 = -1e9;
-    for (0..tn) |i| {
-        for (0..tn) |j| {
-            var m: f32 = if (j <= i) 0.0 else neg;
-            if (ids[j] == pad_id) m += neg;
-            mbuf[i * tn + j] = m;
-        }
-    }
-    const mshape = [_]c_int{ 1, 1, T, T };
-    const mask_f32 = mlx.mlx_array_new_data(mbuf.ptr, &mshape, 4, .float32);
-    defer _ = mlx.mlx_array_free(mask_f32);
-    var mask = mlx.mlx_array_new();
+    const mask = try causalPadMask(allocator, ids, pad_id, s);
     defer _ = mlx.mlx_array_free(mask);
-    try mlx.check(mlx.mlx_astype(&mask, mask_f32, .bfloat16, s));
 
     // ── 48 decoder layers ──
     var li: u32 = 0;
@@ -1522,7 +1792,10 @@ pub fn gemmaCapture(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const
 
 /// get_timestep_embedding(t_scaled, dim): sinusoidal, flip_sin_to_cos=True
 /// (cos first), downscale_freq_shift=0, max_period=10000. Returns [1, dim].
-fn ditTimestepSinusoid(t_scaled: f32, dim: u32, s: S) !mlx.mlx_array {
+/// `get_timestep_embedding(t, dim, flip_sin_to_cos=True, downscale_freq_shift=0)`
+/// — `[cos, sin]` concatenated. Shared with the DiffVAE decoder, whose
+/// `t_embedder` is the same PixArt combined-timestep block at 256 wide.
+pub fn timestepSinusoid(t_scaled: f32, dim: u32, s: S) !mlx.mlx_array {
     const half: c_int = @intCast(dim / 2);
     var ar = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ar);
@@ -1559,7 +1832,7 @@ fn ditTimestepSinusoid(t_scaled: f32, dim: u32, s: S) !mlx.mlx_array {
     return out;
 }
 
-/// Per-token sinusoidal timestep embedding `[N, dim]` — `ditTimestepSinusoid`
+/// Per-token sinusoidal timestep embedding `[N, dim]` — `timestepSinusoid`
 /// applied row-wise to each `t_scaled[n]` (= the reference `get_timestep_embedding`
 /// on a flat `(N,)` vector). Used for I2V per-token AdaLN: clean tokens get
 /// t_scaled=0, generated tokens get t_scaled=sigma*1000.
@@ -1627,7 +1900,8 @@ fn ditAdaLNSingle(comp: *const Component, alloc: std.mem.Allocator, t_sin: mlx.m
 // `.bias`; adaLN scale_shift tables F32. Reference: transformer.py / attention.py.
 // ════════════════════════════════════════════════════════════════════════
 
-/// q4 linear over a Component: y = x @ dequant(<base>.weight).T + <base>.bias.
+/// Affine-quantized linear over a Component ((bits, gs) solved per weight):
+/// y = x @ dequant(<base>.weight).T + <base>.bias.
 /// Mirrors `gQLin` (affine g64 b4) but reads from a Component and adds the
 /// quantized Linear's separate bf16 `.bias` (present on every DiT projection).
 /// When a LoRA is installed on the Component, adds scale·(x@Aᵀ)@Bᵀ unfused
@@ -1644,15 +1918,20 @@ fn dQLin(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, bas
     const wq = comp.get(wk) orelse return error.MissingDitWeight;
     const sc = comp.get(sk) orelse return error.MissingDitWeight;
     const bi = comp.get(bk) orelse return error.MissingDitWeight;
+    const qp = try quantGeom(wq, sc, lastDim(x));
     var mm = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_quantized_matmul(&mm, x, wq, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
-    if (loraRefFor(comp, base)) |ref| {
-        const d = try lora_mod.delta(x, ref, s);
-        defer _ = mlx.mlx_array_free(d);
-        var summed = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&summed, mm, d, s));
-        _ = mlx.mlx_array_free(mm);
-        mm = summed;
+    try mlx.check(mlx.mlx_quantized_matmul(&mm, x, wq, sc, bi, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", s));
+    if (comp.lora != null) {
+        var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
+        const refs = loraRefsFor(comp, base, &rbuf);
+        if (refs.len > 0) {
+            const d = try lora_mod.deltaSum(x, refs, s);
+            defer _ = mlx.mlx_array_free(d);
+            var summed = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&summed, mm, d, s));
+            _ = mlx.mlx_array_free(mm);
+            mm = summed;
+        }
     }
     if (comp.get(lbk)) |lb| {
         var out = mlx.mlx_array_new();
@@ -1663,20 +1942,28 @@ fn dQLin(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, bas
     return mm;
 }
 
-/// LoRA adapter for a dQLin base key, or null. Adapter modules are keyed with
-/// wrapper prefixes stripped (`lora.parseKey` drops `transformer.` /
-/// `diffusion_model.`), so drop our `transformer.` prefix before matching;
-/// diffusers FF naming (`ff.net.0.proj` / `ff.net.2`) is accepted as an alias
-/// for this checkpoint's `ff.proj_in` / `ff.proj_out`.
-fn loraRefFor(comp: *const Component, base: []const u8) ?lora_mod.Ref {
-    const lf = comp.lora orelse return null;
+/// LoRA adapters for a dQLin base key, across every file in the attached
+/// Stack. Adapter modules are keyed with wrapper prefixes stripped
+/// (`lora.parseKey` drops `transformer.` / `diffusion_model.`), so drop our
+/// `transformer.` prefix before matching; diffusers FF naming
+/// (`ff.net.0.proj` / `ff.net.2`) is accepted as an alias for this
+/// checkpoint's `ff.proj_in` / `ff.proj_out`. Each file in the stack is
+/// tried under the primary name first, falling back to the FF alias for
+/// that same file — a file that doesn't have either is simply skipped, not
+/// an error (some LoRAs only retrain a subset of projections).
+fn loraRefsFor(comp: *const Component, base: []const u8, out: *[lora_mod.MAX_LORAS]lora_mod.Ref) []lora_mod.Ref {
+    const stack = comp.lora orelse return out[0..0];
     var mod = base;
     if (std.mem.startsWith(u8, mod, "transformer.")) mod = mod["transformer.".len..];
-    const e = lf.find(mod) orelse blk: {
-        var buf: [512]u8 = undefined;
-        break :blk lf.find(ffAlias(&buf, mod) orelse return null) orelse return null;
-    };
-    return .{ .at = e.at, .bt = e.bt, .scale = e.scale * comp.lora_scale };
+    var abuf: [512]u8 = undefined;
+    const alias = ffAlias(&abuf, mod);
+    var n: usize = 0;
+    for (stack.files[0..stack.count], stack.scales[0..stack.count]) |*f, user_scale| {
+        const e = f.find(mod) orelse (if (alias) |al| f.find(al) else null) orelse continue;
+        out[n] = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
+        n += 1;
+    }
+    return out[0..n];
 }
 
 /// Map between our FF projection names and diffusers' (both directions):
@@ -1695,12 +1982,15 @@ fn ffAlias(buf: []u8, mod: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Count adapter entries in `lf` that target a projection present in this
-/// component — setLora uses it to reject wrong-architecture LoRA files.
-pub fn countLoraMatches(comp: *const Component, lf: *const lora_mod.File) u32 {
+/// Count adapter entries across every file in `stack` that target a
+/// projection present in this component — setLoras uses it to reject a
+/// stack where NOTHING matched (wrong architecture for every adapter).
+pub fn countLoraMatches(comp: *const Component, stack: *const lora_mod.Stack) u32 {
     var n: u32 = 0;
-    for (lf.entries) |*e| {
-        if (loraModulePresent(comp, e.module)) n += 1;
+    for (stack.files[0..stack.count]) |*f| {
+        for (f.entries) |*e| {
+            if (loraModulePresent(comp, e.module)) n += 1;
+        }
     }
     return n;
 }
@@ -1986,7 +2276,7 @@ fn ditAttention(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_arr
     const null_arr = mlx.mlx_array{ .ctx = null };
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qh, kh, vh, scale, "", null_arr, null_arr, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qh, kh, vh, scale, "", null_arr, null_arr, false, s));
     if (skip_to_values) {
         // STG perturbation (full skip at B=1): replace the attention output with
         // the value projection — reference `out*mask + v*(1-mask)` with mask=0,
@@ -2435,11 +2725,16 @@ pub fn ditForward(
     var vh = try linBias(comp, alloc, video_latent, "{s}", .{"transformer.patchify_proj"}, s);
     var ah = try linBias(comp, alloc, audio_latent, "{s}", .{"transformer.audio_patchify_proj"}, s);
 
+    // LTX 2.5's `keyframes_abs_pos_embedding` marks GENERATED keyframe slots
+    // only; given-content tokens (first/last image guidance) are never marked
+    // (reference `extend_keyframes_mask(marked=False)`). This engine builds no
+    // generated slots, so the parameter is never added.
+
     // ── timestep embeddings → adaLN param sets ──
     // Audio / prompt / AV-gate AdaLN ALWAYS use the scalar sigma sinusoids.
-    const t_sin = try ditTimestepSinusoid(sigma * cfg.timestep_scale, 256, s); // sigma*1000
+    const t_sin = try timestepSinusoid(sigma * cfg.timestep_scale, 256, s); // sigma*1000
     defer _ = mlx.mlx_array_free(t_sin);
-    const t_sin_gate = try ditTimestepSinusoid(sigma * 1.0, 256, s); // av_ca gate scale (×1)
+    const t_sin_gate = try timestepSinusoid(sigma * 1.0, 256, s); // av_ca gate scale (×1)
     defer _ = mlx.mlx_array_free(t_sin_gate);
 
     // Video AdaLN (9-param self/ff/text-ca + 4-param AV-cross-video): scalar from
@@ -2470,7 +2765,7 @@ pub fn ditForward(
         _ = mlx.mlx_array_free(t_sin_a);
     };
     if (audio_sigma) |asig| {
-        t_sin_a = try ditTimestepSinusoid(asig * cfg.timestep_scale, 256, s);
+        t_sin_a = try timestepSinusoid(asig * cfg.timestep_scale, 256, s);
         t_sin_a_owned = true;
     }
     const a_ada = try ditAdaLNSingle(comp, alloc, t_sin_a, "transformer.audio_adaln_single", s);
@@ -2775,7 +3070,82 @@ pub const ProgressWindow = struct {
     label: []const u8 = "Generating",
     base: u32 = 0,
     total: u32 = 0, // 0 → use the sampler's own step count
+    /// Latent volume for opt-in per-step JPEG (#208). Zero F → no preview.
+    preview_f: u32 = 0,
+    preview_h: u32 = 0,
+    preview_w: u32 = 0,
+    preview_first_frame: bool = false,
 };
+
+fn copyArrayF32(alloc: std.mem.Allocator, x: mlx.mlx_array, s: S) ![]f32 {
+    const f = try asF32(x, s);
+    defer _ = mlx.mlx_array_free(f);
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, f, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    const n: usize = mlx.mlx_array_size(c);
+    const raw = mlx.mlx_array_data_float32(c) orelse return error.NoData;
+    return alloc.dupe(f32, raw[0..n]);
+}
+
+/// Predicted clean video x0 (already unguided/guided) → Latent2RGB JPEG.
+/// Failures fall back to a preview-less progress event.
+fn tryEmitLtxPreview(
+    p: Progress,
+    alloc: std.mem.Allocator,
+    win: ProgressWindow,
+    step: u32,
+    total: u32,
+    x0_tokens: mlx.mlx_array,
+    s: S,
+) void {
+    if (!p.wantsPreview() or win.preview_f == 0 or win.preview_h == 0 or win.preview_w == 0) {
+        p.emit(win.label, step, total);
+        return;
+    }
+    const frame = renderLtxPreview(alloc, p.preview_opts, win, x0_tokens, s) catch {
+        p.emit(win.label, step, total);
+        return;
+    };
+    defer alloc.free(frame.jpeg);
+    p.emitPreview(win.label, step, total, frame);
+}
+
+/// Only the frames the strip shows cross to the host: a 480p 121-frame clip is
+/// F=31 latent frames, so the whole [1,128,F,H,W] volume is ~25 MB of f32 per
+/// step and one frame is 0.8 MB. The temporal pick therefore happens on the GPU
+/// (gather on the token grid's F axis), and `jpegFromLatent` sees a clip that is
+/// already exactly the wanted frames in order.
+fn renderLtxPreview(
+    alloc: std.mem.Allocator,
+    opts: @import("preview.zig").Opts,
+    win: ProgressWindow,
+    x0_tokens: mlx.mlx_array,
+    s: S,
+) !@import("preview.zig").Encoded {
+    const preview_mod = @import("preview.zig");
+    const shp = mlx.getShape(x0_tokens);
+    if (shp.len < 3) return error.BadLatentShape;
+    const nv: u32 = @intCast(shp[1]);
+    if (nv != win.preview_f * win.preview_h * win.preview_w) return error.BadLatentShape;
+
+    var idx_buf: [preview_mod.Opts.max_frames]u32 = undefined;
+    const idx = preview_mod.temporalIndices(&idx_buf, win.preview_f, opts.normalize().frames, win.preview_first_frame);
+    const n: u32 = @intCast(idx.len);
+
+    const vol = try unpatchifyVideoFrames(x0_tokens, win.preview_f, win.preview_h, win.preview_w, idx, s);
+    defer _ = mlx.mlx_array_free(vol);
+    const cpu = try copyArrayF32(alloc, vol, s);
+    defer alloc.free(cpu);
+    // The gather already applied the temporal pick, so the sub-clip's own
+    // frames are 0..n-1 in order.
+    return preview_mod.jpegFromLatent(alloc, preview_mod.ltx_av, cpu, n, win.preview_h, win.preview_w, .{
+        .enabled = true,
+        .frames = n,
+        .max_side = opts.max_side,
+    }, false);
+}
 
 /// One guided x0 prediction for both modalities (reference guided_denoise_loop
 /// steps 1-5): conditional forward, plus the unconditional / STG-perturbed /
@@ -2938,7 +3308,7 @@ pub fn ditSampleCfg(
         _ = mlx.mlx_array_eval(vx);
         _ = mlx.mlx_array_eval(ax);
         if (progress) |p| {
-            p.emit(win.label, win.base + @as(u32, @intCast(i + 1)), total);
+            tryEmitLtxPreview(p, alloc, win, win.base + @as(u32, @intCast(i + 1)), total, x0.v, s);
             // Client hung up (progress write failed) → stop burning GPU on a
             // video nobody will receive; the queued next request unblocks.
             if (p.cancelled()) {
@@ -3319,7 +3689,8 @@ pub fn ditSampleRes2s(
         _ = mlx.mlx_array_eval(vx);
         _ = mlx.mlx_array_eval(ax);
         if (progress) |p| {
-            p.emit(win.label, win.base + @as(u32, @intCast(step + 1)), total);
+            // d2.v is the second-stage x0 prediction (the later, refined one).
+            tryEmitLtxPreview(p, alloc, win, win.base + @as(u32, @intCast(step + 1)), total, d2.v, s);
             // vx/ax are released by the function's errdefers.
             if (p.cancelled()) return error.Cancelled;
         }
@@ -3626,6 +3997,36 @@ pub fn unpatchifyVideo(tokens: mlx.mlx_array, F: u32, H: u32, W: u32, s: S) !mlx
     return out;
 }
 
+/// `unpatchifyVideo` for a SUBSET of the temporal axis: `[1,C,n,H,W]` holding
+/// frames `want` in the order given. The gather runs before the transpose so the
+/// materialized result is n frames wide, not F.
+pub fn unpatchifyVideoFrames(tokens: mlx.mlx_array, F: u32, H: u32, W: u32, want: []const u32, s: S) !mlx.mlx_array {
+    if (want.len == 0) return error.BadLatentShape;
+    const C: c_int = mlx.getShape(tokens)[2];
+    var r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(r);
+    try mlx.check(mlx.mlx_reshape(&r, tokens, &[_]c_int{ 1, @intCast(F), @intCast(H), @intCast(W), C }, 5, s));
+
+    var idx_i32: [8]i32 = undefined;
+    if (want.len > idx_i32.len) return error.BadLatentShape;
+    for (want, 0..) |v, i| {
+        if (v >= F) return error.BadLatentShape;
+        idx_i32[i] = @intCast(v);
+    }
+    const idx = mlx.mlx_array_new_data(&idx_i32, &[_]c_int{@intCast(want.len)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(idx);
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    try mlx.check(mlx.mlx_take_axis(&g, r, idx, 1, s)); // [1,n,H,W,C]
+
+    var t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t);
+    try mlx.check(mlx.mlx_transpose_axes(&t, g, &[_]c_int{ 0, 4, 1, 2, 3 }, 5, s)); // [1,C,n,H,W]
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&out, t, false, s));
+    return out;
+}
+
 /// Convert decoded pixels [1,3,F,H,W] (≈[-1,1]) to RGB uint8 frames laid out as
 /// [F, H, W, 3] (row-major). Matches the reference clip→(x+1)*127.5→uint8→HWC.
 /// Returns a freshly-allocated `[]u8` of length F*H*W*3 (caller frees).
@@ -3753,8 +4154,14 @@ pub const TextEmbeds = struct {
 /// Full text-conditioning path: gemmaCapture (49 states) → connectorProject →
 /// connectorTransform (per modality). `ids` is the left-padded token sequence;
 /// pads are replaced by learnable registers inside connectorTransform.
-pub fn encodeTextLtx(connector: *const Component, io: std.Io, alloc: std.mem.Allocator, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) !TextEmbeds {
-    const states = try gemmaCapture(io, alloc, gemma_dir, ids, pad_id, s);
+pub fn encodeTextLtx(connector: *const Component, io: std.Io, alloc: std.mem.Allocator, version: LtxVersion, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) !TextEmbeds {
+    // The connector's aggregate projection is trained against ONE encoder's
+    // 49-state stack, so the version picks the encoder — never a probe of
+    // what happens to be in `gemma_dir`.
+    const states = switch (version) {
+        .v23 => try gemmaCapture(io, alloc, gemma_dir, ids, pad_id, s),
+        .v25 => try gemmaCapture4(io, alloc, gemma_dir, ids, pad_id, s),
+    };
     defer {
         for (states) |st| _ = mlx.mlx_array_free(st);
         alloc.free(states);
@@ -3822,9 +4229,10 @@ pub fn oneStageSigmas(alloc: std.mem.Allocator, distilled: bool, num_steps: u32,
 /// text embeds → seed noise → guided Euler sampler → VAE decode → RGB uint8
 /// frames. `connector`/`transformer` are connector.safetensors / a transformer
 /// variant; `vae` is vae_decoder.safetensors. For I2V, pass `vae_encoder` (the
-/// encoder Component) and `cond_image` (`[1,3,1,height,width]` BCFHW, bf16,
-/// [-1,1]) — the image is VAE-encoded and pinned as the clean first latent
-/// frame; both null → pure t2v (byte-unchanged). The negative prompt is only
+/// encoder Component) and `cond_image` / `last_image` (`[1,3,1,height,width]`
+/// BCFHW, bf16, [-1,1]) — each image is VAE-encoded and pinned as the clean
+/// first / last latent frame (`buildKeyframeCond`); all null → pure t2v
+/// (byte-unchanged). The negative prompt is only
 /// encoded (a full Gemma-3-12B pass) when a guider actually needs the
 /// unconditional forward. Caller frees the result.
 pub fn generateVideoFrames(
@@ -3833,9 +4241,10 @@ pub fn generateVideoFrames(
     cfg: LtxConfig,
     transformer: *const Component,
     connector: *const Component,
-    vae: *const Component,
+    vae: VaeChoice,
     vae_encoder: ?*const Component,
     cond_image: ?mlx.mlx_array,
+    last_image: ?mlx.mlx_array,
     gemma_dir: []const u8,
     pos_ids: []const i32,
     neg_ids: []const i32,
@@ -3862,14 +4271,14 @@ pub fn generateVideoFrames(
 
     // ── text embeds (positive; negative only when CFG needs it) ──
     if (progress) |p| p.emit("Encoding prompt", 0, num_steps);
-    var pos = try encodeTextLtx(connector, io, alloc, gemma_dir, pos_ids, pad_id, s);
+    var pos = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, pos_ids, pad_id, s);
     defer pos.deinit();
     _ = mlx.mlx_array_eval(pos.video);
     _ = mlx.mlx_array_eval(pos.audio);
     var neg: ?TextEmbeds = null;
     defer if (neg) |*n| n.deinit();
     if (vp.needsUncond() or ap.needsUncond()) {
-        neg = try encodeTextLtx(connector, io, alloc, gemma_dir, neg_ids, pad_id, s);
+        neg = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, neg_ids, pad_id, s);
         _ = mlx.mlx_array_eval(neg.?.video);
         _ = mlx.mlx_array_eval(neg.?.audio);
     }
@@ -3894,59 +4303,34 @@ pub fn generateVideoFrames(
     const noise_a = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, seed + 1, s);
     defer _ = mlx.mlx_array_free(noise_a);
 
-    // ── I2V first-frame conditioning (optional) ──────────────────────────────
-    // Encode the reference image → clean tokens for latent frame 0. Replace the
-    // first H*W noise tokens with them, build the clean latent + denoise mask.
-    // Reference: combined_image_conditionings + VideoConditionByLatentIndex.
+    // ── keyframe conditioning (optional) ────────────────────────────────────
+    // Encode the anchor image(s) → clean tokens for latent frame 0 / F-1,
+    // spliced over the noise, plus the clean latent + denoise mask.
+    // Reference: VideoConditionByLatentIndex.
     const HW = H * W;
-    var init_owned: ?mlx.mlx_array = null;
-    defer if (init_owned) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    var clean_v: ?mlx.mlx_array = null;
-    defer if (clean_v) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    var cond_mask: ?[]f32 = null;
-    defer if (cond_mask) |b| alloc.free(b);
-    if (vae_encoder) |venc| if (cond_image) |img| if (HW < Nv) {
+    var kf: ?KeyframeCond = null;
+    defer if (kf) |*c| c.deinit(alloc);
+    if (vae_encoder) |venc| if (cond_image != null or last_image != null) {
         if (progress) |p| p.emit("Encoding image", 0, num_steps);
-        const ref_lat = try vaeEncode(venc, img, s); // [1,128,1,H,W]
-        defer _ = mlx.mlx_array_free(ref_lat);
-        // patchify: [1,128,1,H,W] → [1,1,H,W,128] → [1,H*W,128].
-        const tr = try transposeTo(ref_lat, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
-        defer _ = mlx.mlx_array_free(tr);
-        var trc = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(trc);
-        try mlx.check(mlx.mlx_contiguous(&trc, tr, false, s));
-        var ref_tokens = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ref_tokens);
-        try mlx.check(mlx.mlx_reshape(&ref_tokens, trc, &[_]c_int{ 1, @intCast(HW), 128 }, 3, s));
-
-        // init latent = [ref_tokens, noise[HW:]].
-        const rest = try sliceTokens(noise_v, HW, Nv, s);
-        defer _ = mlx.mlx_array_free(rest);
-        init_owned = try concatTokens(ref_tokens, rest, s);
-
-        // clean latent = [ref_tokens, zeros] (the zero region is masked out anyway).
-        const zv = mlx.mlx_array_new_float(0.0);
-        defer _ = mlx.mlx_array_free(zv);
-        var zeros = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(zeros);
-        try mlx.check(mlx.mlx_full(&zeros, &[_]c_int{ 1, @intCast(Nv - HW), 128 }, 3, zv, .bfloat16, s));
-        clean_v = try concatTokens(ref_tokens, zeros, s);
-
-        // denoise mask: 0 for the conditioned first frame, 1 for generated tokens.
-        const m = try alloc.alloc(f32, Nv);
-        for (0..Nv) |n| m[n] = if (n < HW) 0.0 else 1.0;
-        cond_mask = m;
-        log.info("[ltx] I2V: conditioned first frame ({d} tokens of {d})\n", .{ HW, Nv });
+        kf = try buildKeyframeCond(alloc, venc, cond_image, last_image, noise_v, vpos, H, W, F, num_frames, frame_rate, s);
+        log.info("[ltx] keyframe conditioning: first={} last={} ({d} of {d} tokens)\n", .{ cond_image != null, last_image != null, HW * (@as(u32, @intFromBool(cond_image != null)) + @intFromBool(last_image != null)), Nv });
     };
-    const sampler_v = init_owned orelse noise_v;
+    const clean_v: ?mlx.mlx_array = if (kf) |c| c.clean else null;
+    const cond_mask: ?[]const f32 = if (kf) |c| c.mask else null;
+    const sampler_v = if (kf) |c| c.init_latent else noise_v;
+    const sampler_vpos = if (kf) |c| c.positions else vpos;
 
     // ── denoise ──
     const total_steps: u32 = @intCast(sigmas.len - 1);
-    const final = try ditSampleCfg(transformer, alloc, cfg, sampler_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos, apos, sigmas, vp, ap, cond_mask, clean_v, null, progress, .{ .label = "Generating", .base = 0, .total = total_steps }, s);
+    const final = try ditSampleCfg(transformer, alloc, cfg, sampler_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, sampler_vpos, apos, sigmas, vp, ap, cond_mask, clean_v, null, progress, .{
+        .label = "Generating",
+        .base = 0,
+        .total = total_steps,
+        .preview_f = F,
+        .preview_h = H,
+        .preview_w = W,
+        .preview_first_frame = cond_image != null,
+    }, s);
     defer _ = mlx.mlx_array_free(final.v);
     // final.a (audio latent [1, Na, 128]) is transferred to the caller below for
     // optional audio decode; if anything fails before then, free it.
@@ -3957,9 +4341,13 @@ pub fn generateVideoFrames(
 
     // ── decode video → frames ──
     if (progress) |p| p.emit("Decoding video", total_steps, total_steps);
-    const latent = try unpatchifyVideo(final.v, F, H, W, s);
+    const canvas_v = if (kf) |c| try c.trim(final.v, s) else final.v;
+    defer if (kf != null) {
+        _ = mlx.mlx_array_free(canvas_v);
+    };
+    const latent = try unpatchifyVideo(canvas_v, F, H, W, s);
     defer _ = mlx.mlx_array_free(latent);
-    const pixels = try vaeDecode(vae, latent, s);
+    const pixels = try vae.decode(alloc, latent, s);
     defer _ = mlx.mlx_array_free(pixels);
     const psh = mlx.getShape(pixels); // [1,3,F_px,H_px,W_px]
     const rgb = try framesToU8(pixels, alloc, s);
@@ -3978,43 +4366,163 @@ pub fn generateVideoFrames(
 //            from stage 1 and renoised likewise.
 // ════════════════════════════════════════════════════════════════════════
 
-/// First-frame conditioning state for one stage (built from an encoded image).
-const I2VCond = struct {
-    init_latent: mlx.mlx_array, // [1,Nv,C]: [ref tokens, rest of `base`]
-    clean: mlx.mlx_array, // [1,Nv,C]: [ref tokens, zeros]
-    mask: []f32, // 0 for the first HW tokens, 1 elsewhere
+/// Keyframe conditioning state for one stage (built from the encoded anchor images).
+const KeyframeCond = struct {
+    init_latent: mlx.mlx_array, // [1,N,C]: `base` with frame 0 replaced, last-anchor tokens appended
+    clean: mlx.mlx_array, // [1,N,C]: anchor tokens, zeros elsewhere
+    mask: []f32, // 0 on the anchor tokens, 1 elsewhere
+    positions: []f32, // video positions for all N tokens
+    canvas_tokens: u32, // Nv: tokens that survive into the decoder (appended ones are trimmed)
 
-    fn deinit(self: *I2VCond, alloc: std.mem.Allocator) void {
+    fn deinit(self: *KeyframeCond, alloc: std.mem.Allocator) void {
         _ = mlx.mlx_array_free(self.init_latent);
         _ = mlx.mlx_array_free(self.clean);
         alloc.free(self.mask);
+        alloc.free(self.positions);
+    }
+
+    /// Drop the appended conditioning tokens from a sampled stream.
+    fn trim(self: KeyframeCond, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        return sliceTokens(x, 0, self.canvas_tokens, s);
     }
 };
 
-/// VAE-encode `img` and pin it as latent frame 0 over `base` (the noise / noisy
-/// tokens for the rest of the canvas). Mirrors VideoConditionByLatentIndex.
-fn buildI2VCond(alloc: std.mem.Allocator, venc: *const Component, img: mlx.mlx_array, base: mlx.mlx_array, HW: u32, Nv: u32, s: S) !I2VCond {
-    const ref_lat = try vaeEncode(venc, img, s); // [1,128,1,H,W]
-    defer _ = mlx.mlx_array_free(ref_lat);
-    const ref_tokens = try patchifyVideo(ref_lat, s); // [1,HW,128]
-    defer _ = mlx.mlx_array_free(ref_tokens);
+/// Denoise mask over the video token stream: 0 on conditioned tokens, 1
+/// elsewhere. A first anchor REPLACES latent frame 0 (tokens `[0, HW)`,
+/// `VideoConditionByLatentIndex`); a last anchor is APPENDED as `HW` extra
+/// tokens after the `F_lat*HW` canvas (`VideoConditionByKeyframeIndex`) —
+/// a standalone-frame latent dropped into slot `F_lat-1` decodes as eight
+/// pixel frames of noise on the causal VAE (#260). This is the ONE place
+/// keyframe token ranges are computed; strength 1.
+pub fn keyframeMask(alloc: std.mem.Allocator, HW: u32, F_lat: u32, has_first: bool, has_last: bool) ![]f32 {
+    if (F_lat < 2 and (has_first or has_last)) return error.KeyframeCanvasTooShort;
+    const Nv = F_lat * HW;
+    const n = Nv + if (has_last) HW else 0;
+    const mask = try alloc.alloc(f32, n);
+    @memset(mask, 1.0);
+    if (has_first) @memset(mask[0..HW], 0.0);
+    if (has_last) @memset(mask[Nv..n], 0.0);
+    return mask;
+}
 
-    const rest = try sliceTokens(base, HW, Nv, s);
-    defer _ = mlx.mlx_array_free(rest);
-    const init_latent = try concatTokens(ref_tokens, rest, s);
-    errdefer _ = mlx.mlx_array_free(init_latent);
+/// `base` video positions plus `H*W` appended keyframe positions: frame-0's
+/// spatial grid at pixel frame `num_frames-1`, ONE frame wide (reference
+/// `get_pixel_coords(causal_fix=False)` + `frame_idx`, end narrowed to
+/// start+1 for a single-pixel-frame latent, midpoint / fps).
+pub fn keyframePositions(alloc: std.mem.Allocator, base: []const f32, H: u32, W: u32, num_frames: u32, frame_rate: f32) ![]f32 {
+    const HW = H * W;
+    const out = try alloc.alloc(f32, base.len + HW * 3);
+    @memcpy(out[0..base.len], base);
+    const t = (@as(f32, @floatFromInt(num_frames - 1)) + 0.5) / frame_rate;
+    for (0..HW) |i| {
+        const src = base[i * 3 ..][0..3];
+        const dst = out[base.len + i * 3 ..][0..3];
+        dst[0] = t;
+        dst[1] = src[1];
+        dst[2] = src[2];
+    }
+    return out;
+}
+
+/// VAE-encode the present anchors: the first is pinned clean over `base`'s
+/// latent frame 0, the last rides appended clean tokens (see `keyframeMask`).
+/// `positions` is the sampler's video position table for the whole stream.
+fn buildKeyframeCond(alloc: std.mem.Allocator, venc: *const Component, first: ?mlx.mlx_array, last: ?mlx.mlx_array, base: mlx.mlx_array, vpos: []const f32, H: u32, W: u32, F_lat: u32, num_frames: u32, frame_rate: f32, s: S) !KeyframeCond {
+    const HW = H * W;
+    const mask = try keyframeMask(alloc, HW, F_lat, first != null, last != null);
+    errdefer alloc.free(mask);
+    const positions = if (last != null) try keyframePositions(alloc, vpos, H, W, num_frames, frame_rate) else try alloc.dupe(f32, vpos);
+    errdefer alloc.free(positions);
+    const Nv = F_lat * HW;
 
     const zv = mlx.mlx_array_new_float(0.0);
     defer _ = mlx.mlx_array_free(zv);
     var zeros = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(zeros);
-    try mlx.check(mlx.mlx_full(&zeros, &[_]c_int{ 1, @intCast(Nv - HW), 128 }, 3, zv, .bfloat16, s));
-    const clean = try concatTokens(ref_tokens, zeros, s);
+    try mlx.check(mlx.mlx_full(&zeros, &[_]c_int{ 1, @intCast(Nv), 128 }, 3, zv, .bfloat16, s));
+
+    var init_latent = try sliceTokens(base, 0, Nv, s);
+    errdefer _ = mlx.mlx_array_free(init_latent);
+    var clean = try sliceTokens(zeros, 0, Nv, s);
     errdefer _ = mlx.mlx_array_free(clean);
 
-    const mask = try alloc.alloc(f32, Nv);
-    for (0..Nv) |n| mask[n] = if (n < HW) 0.0 else 1.0;
-    return .{ .init_latent = init_latent, .clean = clean, .mask = mask };
+    if (first) |img| {
+        const tokens = try encodeAnchorTokens(venc, img, s);
+        defer _ = mlx.mlx_array_free(tokens);
+        const ni = try spliceTokens(init_latent, tokens, 0, Nv, s);
+        _ = mlx.mlx_array_free(init_latent);
+        init_latent = ni;
+        const nc = try spliceTokens(clean, tokens, 0, Nv, s);
+        _ = mlx.mlx_array_free(clean);
+        clean = nc;
+    }
+    if (last) |img| {
+        const tokens = try encodeAnchorTokens(venc, img, s);
+        defer _ = mlx.mlx_array_free(tokens);
+        // Strength 1 ⇒ x_t == clean for these tokens from the first forward on.
+        const ni = try concatTokens(init_latent, tokens, s);
+        _ = mlx.mlx_array_free(init_latent);
+        init_latent = ni;
+        const nc = try concatTokens(clean, tokens, s);
+        _ = mlx.mlx_array_free(clean);
+        clean = nc;
+    }
+    return .{ .init_latent = init_latent, .clean = clean, .mask = mask, .positions = positions, .canvas_tokens = Nv };
+}
+
+/// One anchor image → `[1,HW,128]` clean latent tokens.
+fn encodeAnchorTokens(venc: *const Component, img: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const ref_lat = try vaeEncode(venc, img, s); // [1,128,1,H,W]
+    defer _ = mlx.mlx_array_free(ref_lat);
+    return patchifyVideo(ref_lat, s); // [1,HW,128]
+}
+
+/// `x` with tokens `[start, start+len(ins))` replaced by `ins`.
+fn spliceTokens(x: mlx.mlx_array, ins: mlx.mlx_array, start: u32, Nv: u32, s: S) !mlx.mlx_array {
+    const n: u32 = @intCast(mlx.getShape(ins)[1]);
+    const head_base = try sliceTokens(x, 0, start, s);
+    defer _ = mlx.mlx_array_free(head_base);
+    const head = try concatTokens(head_base, ins, s);
+    defer _ = mlx.mlx_array_free(head);
+    const tail = try sliceTokens(x, start + n, Nv, s);
+    defer _ = mlx.mlx_array_free(tail);
+    return concatTokens(head, tail, s);
+}
+
+test "ltx keyframeMask: first replaces latent frame 0, last is APPENDED" {
+    const a = testing.allocator;
+    const HW: u32 = 4;
+    const m_first = try keyframeMask(a, HW, 3, true, false);
+    defer a.free(m_first);
+    try testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 }, m_first);
+    // A last anchor never touches latent slot F_lat-1 (a standalone-frame
+    // latent there decodes as 8 pixel frames of noise, #260): it rides HW
+    // appended tokens after the canvas, VideoConditionByKeyframeIndex.
+    const m_last = try keyframeMask(a, HW, 3, false, true);
+    defer a.free(m_last);
+    try testing.expectEqualSlices(f32, &[_]f32{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }, m_last);
+    const m_both = try keyframeMask(a, HW, 3, true, true);
+    defer a.free(m_both);
+    try testing.expectEqualSlices(f32, &[_]f32{ 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0 }, m_both);
+    const m_none = try keyframeMask(a, HW, 1, false, false);
+    defer a.free(m_none);
+    try testing.expectEqualSlices(f32, &[_]f32{ 1, 1, 1, 1 }, m_none);
+    try testing.expectError(error.KeyframeCanvasTooShort, keyframeMask(a, HW, 1, true, true));
+    try testing.expectError(error.KeyframeCanvasTooShort, keyframeMask(a, HW, 1, false, true));
+}
+
+test "ltx keyframePositions: appended tokens sit at pixel frame num_frames-1, one frame wide" {
+    const a = testing.allocator;
+    const base = try computeVideoPositions(a, 2, 1, 2, 24.0);
+    defer a.free(base);
+    const pos = try keyframePositions(a, base, 1, 2, 9, 24.0);
+    defer a.free(pos);
+    try testing.expectEqual(@as(usize, (2 * 2 + 2) * 3), pos.len);
+    try testing.expectEqualSlices(f32, base, pos[0..base.len]);
+    // get_pixel_coords without causal_fix, +frame_idx, end narrowed to
+    // start+1 (num_pixel_frames=1), midpoint / fps; spatial = frame-0 grid.
+    const t: f32 = (8.0 + 0.5) / 24.0;
+    try testing.expectEqualSlices(f32, &[_]f32{ t, 16, 16, t, 16, 48 }, pos[base.len..]);
 }
 
 /// `noise*sigma + clean*(1-sigma)` (flow-matching renoise), bf16 out.
@@ -4048,18 +4556,21 @@ pub const TwoStageOpts = struct {
 
 /// Two-stage text/image-to-video. `transformer` is the DEV variant (stage 1
 /// requires real CFG); `vae_encoder` is REQUIRED (latent statistics for the
-/// upsampler boundary, plus I2V). `cond_image_half`/`cond_image_full` are the
-/// first-frame pixels prepared at the stage-1 / stage-2 grids (both null → t2v).
+/// upsampler boundary, plus keyframes). `cond_image_half`/`cond_image_full` are
+/// the first-frame pixels prepared at the stage-1 / stage-2 grids, `last_image_*`
+/// the last-frame pair (all null → t2v).
 pub fn generateVideoFramesTwoStage(
     io: std.Io,
     alloc: std.mem.Allocator,
     cfg: LtxConfig,
     transformer: *const Component,
     connector: *const Component,
-    vae: *const Component,
+    vae: VaeChoice,
     vae_encoder: *const Component,
     cond_image_half: ?mlx.mlx_array,
     cond_image_full: ?mlx.mlx_array,
+    last_image_half: ?mlx.mlx_array,
+    last_image_full: ?mlx.mlx_array,
     // a2vid: encoded clean audio tokens [1,Na,128] (encodeAudioCond). Stage 1
     // FREEZES them (audio timestep 0, x0 pinned) so the video is generated
     // against the real soundtrack; stage 2 renoises + jointly refines exactly
@@ -4098,14 +4609,14 @@ pub fn generateVideoFramesTwoStage(
 
     // ── text embeds (positive + negative — stage 1 always runs CFG) ──
     if (progress) |p| p.emit("Encoding prompt", 0, total);
-    var pos = try encodeTextLtx(connector, io, alloc, gemma_dir, pos_ids, pad_id, s);
+    var pos = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, pos_ids, pad_id, s);
     defer pos.deinit();
     _ = mlx.mlx_array_eval(pos.video);
     _ = mlx.mlx_array_eval(pos.audio);
     var neg: ?TextEmbeds = null;
     defer if (neg) |*n| n.deinit();
     if (vp.needsUncond() or ap.needsUncond()) {
-        neg = try encodeTextLtx(connector, io, alloc, gemma_dir, neg_ids, pad_id, s);
+        neg = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, neg_ids, pad_id, s);
         _ = mlx.mlx_array_eval(neg.?.video);
         _ = mlx.mlx_array_eval(neg.?.audio);
     }
@@ -4135,20 +4646,29 @@ pub fn generateVideoFramesTwoStage(
     // defaults). Structural, not caller-optional.
     const ap1: GuiderParams = if (audio_cond != null) .{} else ap;
 
-    var cond1: ?I2VCond = null;
+    var cond1: ?KeyframeCond = null;
     defer if (cond1) |*c| c.deinit(alloc);
-    if (cond_image_half) |img| if (H1 * W1 < Nv1) {
+    if (cond_image_half != null or last_image_half != null) {
         if (progress) |p| p.emit("Encoding image", 0, total);
-        cond1 = try buildI2VCond(alloc, vae_encoder, img, noise_v1, H1 * W1, Nv1, s);
-        log.info("[ltx] two-stage I2V: conditioned first frame ({d} of {d} tokens)\n", .{ H1 * W1, Nv1 });
-    };
+        cond1 = try buildKeyframeCond(alloc, vae_encoder, cond_image_half, last_image_half, noise_v1, vpos1, H1, W1, F, num_frames, frame_rate, s);
+        log.info("[ltx] keyframe conditioning (stage 1): first={} last={} ({d} of {d} tokens)\n", .{ cond_image_half != null, last_image_half != null, H1 * W1 * (@as(u32, @intFromBool(cond_image_half != null)) + @intFromBool(last_image_half != null)), Nv1 });
+    }
 
     const stage1_v = if (cond1) |c| c.init_latent else noise_v1;
-    const win1 = ProgressWindow{ .label = "Stage 1", .base = 0, .total = total };
+    const stage1_vpos = if (cond1) |c| c.positions else vpos1;
+    const win1 = ProgressWindow{
+        .label = "Stage 1",
+        .base = 0,
+        .total = total,
+        .preview_f = F,
+        .preview_h = H1,
+        .preview_w = W1,
+        .preview_first_frame = cond_image_half != null,
+    };
     const out1 = if (opts.hq)
-        try ditSampleRes2s(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos1, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, seed, progress, win1, s)
+        try ditSampleRes2s(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, stage1_vpos, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, seed, progress, win1, s)
     else
-        try ditSampleCfg(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos1, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, progress, win1, s);
+        try ditSampleCfg(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, stage1_vpos, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, progress, win1, s);
     var audio1: ?mlx.mlx_array = out1.a;
     defer if (audio1) |a| {
         _ = mlx.mlx_array_free(a);
@@ -4157,8 +4677,10 @@ pub fn generateVideoFramesTwoStage(
     // ── boundary: unpatchify → denormalize → x2 upsample → renormalize ──
     if (progress) |p| p.emit("Upscaling", opts.stage1_steps, total);
     const video_tokens2 = blk: {
-        const half = try unpatchifyVideo(out1.v, F, H1, W1, s);
-        _ = mlx.mlx_array_free(out1.v);
+        const canvas1 = if (cond1) |c| try c.trim(out1.v, s) else out1.v;
+        if (cond1 != null) _ = mlx.mlx_array_free(out1.v);
+        const half = try unpatchifyVideo(canvas1, F, H1, W1, s);
+        _ = mlx.mlx_array_free(canvas1);
         defer _ = mlx.mlx_array_free(half);
         const denorm = try latentDenormalize(vae_encoder, half, s);
         defer _ = mlx.mlx_array_free(denorm);
@@ -4186,11 +4708,15 @@ pub fn generateVideoFramesTwoStage(
     const noisy_v2 = try lerpToSigma(video_tokens2, noise_v2, start_sigma, s);
     defer _ = mlx.mlx_array_free(noisy_v2);
 
-    var cond2: ?I2VCond = null;
+    const vpos2 = try computeVideoPositions(alloc, F, H2, W2, frame_rate);
+    defer alloc.free(vpos2);
+
+    var cond2: ?KeyframeCond = null;
     defer if (cond2) |*c| c.deinit(alloc);
-    if (cond_image_full) |img| if (H2 * W2 < Nv2) {
-        cond2 = try buildI2VCond(alloc, vae_encoder, img, noisy_v2, H2 * W2, Nv2, s);
-    };
+    if (cond_image_full != null or last_image_full != null) {
+        cond2 = try buildKeyframeCond(alloc, vae_encoder, cond_image_full, last_image_full, noisy_v2, vpos2, H2, W2, F, num_frames, frame_rate, s);
+        log.info("[ltx] keyframe conditioning (stage 2): first={} last={} ({d} of {d} tokens)\n", .{ cond_image_full != null, last_image_full != null, H2 * W2 * (@as(u32, @intFromBool(cond_image_full != null)) + @intFromBool(last_image_full != null)), Nv2 });
+    }
 
     // audio: carry stage-1 latent, renoised to the stage-2 start sigma.
     const noise_a2 = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, seed +% 2 +% 0x9E3779B97F4A7C15, s);
@@ -4198,11 +4724,17 @@ pub fn generateVideoFramesTwoStage(
     const noisy_a2 = try lerpToSigma(audio1.?, noise_a2, start_sigma, s);
     defer _ = mlx.mlx_array_free(noisy_a2);
 
-    const vpos2 = try computeVideoPositions(alloc, F, H2, W2, frame_rate);
-    defer alloc.free(vpos2);
-
     const stage2_v = if (cond2) |c| c.init_latent else noisy_v2;
-    const out2 = try ditSampleCfg(dit2, alloc, cfg, stage2_v, noisy_a2, pos.video, pos.audio, null, null, vpos2, apos, sigmas2, .{}, .{}, if (cond2) |c| c.mask else null, if (cond2) |c| c.clean else null, null, progress, .{ .label = "Stage 2", .base = opts.stage1_steps, .total = total }, s);
+    const stage2_vpos = if (cond2) |c| c.positions else vpos2;
+    const out2 = try ditSampleCfg(dit2, alloc, cfg, stage2_v, noisy_a2, pos.video, pos.audio, null, null, stage2_vpos, apos, sigmas2, .{}, .{}, if (cond2) |c| c.mask else null, if (cond2) |c| c.clean else null, null, progress, .{
+        .label = "Stage 2",
+        .base = opts.stage1_steps,
+        .total = total,
+        .preview_f = F,
+        .preview_h = H2,
+        .preview_w = W2,
+        .preview_first_frame = cond_image_full != null,
+    }, s);
     defer _ = mlx.mlx_array_free(out2.v);
     // stage-2 audio replaces stage-1 as the decoded track.
     _ = mlx.mlx_array_free(audio1.?);
@@ -4214,9 +4746,13 @@ pub fn generateVideoFramesTwoStage(
 
     // ── decode ──
     if (progress) |p| p.emit("Decoding video", total, total);
-    const latent = try unpatchifyVideo(out2.v, F, H2, W2, s);
+    const canvas2 = if (cond2) |c| try c.trim(out2.v, s) else out2.v;
+    defer if (cond2 != null) {
+        _ = mlx.mlx_array_free(canvas2);
+    };
+    const latent = try unpatchifyVideo(canvas2, F, H2, W2, s);
     defer _ = mlx.mlx_array_free(latent);
-    const pixels = try vaeDecode(vae, latent, s);
+    const pixels = try vae.decode(alloc, latent, s);
     defer _ = mlx.mlx_array_free(pixels);
     const psh = mlx.getShape(pixels); // [1,3,F_px,H_px,W_px]
     const rgb = try framesToU8(pixels, alloc, s);
@@ -4229,11 +4765,72 @@ pub fn generateVideoFramesTwoStage(
 
 const testing = std.testing;
 
+test "the LTX quant helpers solve their width instead of assuming 4-bit" {
+    // The 4-bit and 8-bit packs are the SAME layout at different widths, so a
+    // hardcoded `bits` is an engine that can only load the pack it was written
+    // against — the 8-bit text encoder died at its first matmul with an MLX
+    // "shapes ... incompatible" error, which reads like a corrupt download.
+    // Every quantized read in this file resolves (bits, gs) from geometry.
+    const src = @embedFile("ltx_video.zig");
+    var it = std.mem.splitScalar(u8, src, '\n');
+    var checked: usize = 0;
+    while (it.next()) |line| {
+        // `mlx.check(` keeps the scan on real CALL SITES — this test's own
+        // search literals name the same functions.
+        if (std.mem.indexOf(u8, line, "mlx.check(") == null) continue;
+        const is_quant_call = std.mem.indexOf(u8, line, "mlx_quantized_matmul(") != null or
+            std.mem.indexOf(u8, line, "mlx_dequantize(") != null;
+        if (!is_quant_call) continue;
+        checked += 1;
+        try std.testing.expect(std.mem.indexOf(u8, line, "some(4)") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "some(8)") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "qp.bits") != null or
+            std.mem.indexOf(u8, line, "eqp.bits") != null);
+    }
+    // Three today (gQLin, dQLin, the embedding table). A zero here means the
+    // scan stopped matching the call and is guarding nothing.
+    try std.testing.expect(checked >= 3);
+}
+
 test "LtxConfig derived dims" {
     const c = LtxConfig{};
     try testing.expectEqual(@as(u32, 4096), c.videoDim());
     try testing.expectEqual(@as(u32, 2048), c.audioDim());
     try testing.expectEqual(@as(u32, 188160), c.gemma_layers * c.gemma_hidden);
+}
+
+// The 2.3 and 2.5 config.json files are byte-identical apart from these four
+// fields, so they ARE the version discriminator — and a pack that predates
+// `model_version` must keep reading as 2.3 rather than failing to load.
+test "parseLtxConfig reads the 2.5 version and its FF-bias / keyframe flags" {
+    const a = testing.allocator;
+
+    const c23 = try parseLtxConfig(a,
+        \\{"model_version":"2.3.0","is_v2":true,"model_type":"AudioVideo","num_layers":48}
+    );
+    try testing.expectEqual(LtxVersion.v23, c23.version);
+    try testing.expect(c23.ff_bias);
+    try testing.expect(c23.audio_ff_bias);
+    try testing.expect(!c23.keyframes_abs_pos);
+    try testing.expectEqual(@as(?[]const u8, null), c23.version.textEncoderSubdir());
+
+    const c25 = try parseLtxConfig(a,
+        \\{"model_version":"2.5.0","is_v2":true,"model_type":"AudioVideo",
+        \\ "use_keyframes_abs_pos_embedding":true,"ff_bias":false,"audio_ff_bias":true}
+    );
+    try testing.expectEqual(LtxVersion.v25, c25.version);
+    try testing.expect(!c25.ff_bias);
+    try testing.expect(c25.audio_ff_bias);
+    try testing.expect(c25.keyframes_abs_pos);
+    try testing.expectEqualStrings("gemma4-12b-ltx-v1", c25.version.textEncoderSubdir().?);
+
+    // Geometry is shared — a version bump must not silently move it.
+    try testing.expectEqual(c23.videoDim(), c25.videoDim());
+    try testing.expectEqual(c23.num_layers, c25.num_layers);
+
+    // No `model_version` at all (pre-2.3.0 packs) reads as 2.3, not an error.
+    const legacy = try parseLtxConfig(a, "{\"model_type\":\"AudioVideo\"}");
+    try testing.expectEqual(LtxVersion.v23, legacy.version);
 }
 
 test "ltxNeedsCfg: both scales 1.0 skips the negative forward" {
@@ -4284,6 +4881,43 @@ test "ltx loader: connector + vae_decoder key map" {
         try testing.expectEqual(@as(c_int, 1024), sh[0]);
         try testing.expectEqual(@as(c_int, 128), sh[4]);
     }
+}
+
+test "ltx conv3dDepthChunked is exact against the whole-depth conv3d" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 7));
+    // C % 16 == 0, N == 1, kD == 3, temporal pad 0: the shape MLX >= 0.32.2
+    // decomposes into per-tap 2D convs (#321).
+    const xs = [_]c_int{ 1, 11, 8, 8, 16 };
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_random_normal(&x, &xs, xs.len, .float32, 0.0, 1.0, key, s));
+    const ws = [_]c_int{ 32, 3, 3, 3, 16 };
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_random_normal(&w, &ws, ws.len, .float32, 0.0, 1.0, key, s));
+
+    const whole = try conv3d(x, w, .{ 1, 1, 1 }, .{ 0, 0, 0 }, s);
+    defer _ = mlx.mlx_array_free(whole);
+    // 9 output frames in windows of 4 → 4 + 4 + 1.
+    const chunked = try conv3dDepthChunked(x, w, 3, 4, s);
+    defer _ = mlx.mlx_array_free(chunked);
+    try testing.expectEqualSlices(c_int, mlx.getShape(whole), mlx.getShape(chunked));
+    var diff = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(diff);
+    try mlx.check(mlx.mlx_subtract(&diff, whole, chunked, s));
+    var ad = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ad);
+    try mlx.check(mlx.mlx_abs(&ad, diff, s));
+    var mx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mx);
+    try mlx.check(mlx.mlx_max(&mx, ad, false, s));
+    var v: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&v, mx));
+    try testing.expectEqual(@as(f32, 0), v);
 }
 
 // Stage-5 keystone: validate decoderConv3d (the VAE's causal=False Conv3dBlock)
@@ -4469,6 +5103,120 @@ test "ltx VAE encoder reproduces reference VideoEncoder" {
     const corr = corrF32(mlx.mlx_array_data_float32(outf).?, ref, 0);
     std.debug.print("[ltx-enc] n={d} corr={d:.6}\n", .{ n, corr });
     try testing.expect(corr > 0.998);
+}
+
+// The PERCEPTUAL bar for the denoise preview (issue #208 review). preview.zig's
+// fixture oracle proves our projection is ComfyUI's; it cannot prove ComfyUI's
+// projection looks like the video. So: encode a real image with the real VAE,
+// decode it back, box-average the decode down to the latent grid and correlate
+// against the preview of the same latent. The golden-angle hue wheel this used
+// to ship is the control arm — the H3 twin lives in minimax_h3_vae.zig.
+// This needs vae_encoder + vae_decoder and NOTHING else — 1.45 GB of a pack
+// whose full form is 40 GB. So it takes its own var and only falls back to the
+// full-pack one: pointing LTX_TEST_MODEL at a VAE-only dir would fail the seven
+// live tests that legitimately demand a connector, a transformer and fixtures.
+//   LTX_VAE_DIR (preferred) or LTX_TEST_MODEL
+test "ltx preview: the Latent2RGB preview resembles the decoded frame" {
+    const raw = std.c.getenv("LTX_VAE_DIR") orelse std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest;
+    const dir = std.mem.span(raw);
+    if (dir.len == 0) return error.SkipZigTest;
+    const preview_mod = @import("preview.zig");
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const ep = try std.fmt.allocPrintSentinel(allocator, "{s}/vae_encoder.safetensors", .{dir}, 0);
+    defer allocator.free(ep);
+    const dp = try std.fmt.allocPrintSentinel(allocator, "{s}/vae_decoder.safetensors", .{dir}, 0);
+    defer allocator.free(dp);
+    var enc = loadComponent(allocator, ep, cpu_s) catch return error.SkipZigTest;
+    defer enc.deinit();
+    var dec = loadComponent(allocator, dp, cpu_s) catch return error.SkipZigTest;
+    defer dec.deinit();
+    {
+        var it = enc.map.iterator();
+        while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+        var it2 = dec.map.iterator();
+        while (it2.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+    }
+
+    // 512 px = a 16x16 latent grid at LTX's 32x spatial compression, one
+    // independent colour per cell. Ramps do NOT discriminate here: summing 128
+    // channels at uniform magnitude reproduced a gradient's chroma at 0.79
+    // against the fit's 0.94, so the control arm was passing on content, not on
+    // being right.
+    const px: u32 = 512;
+    const buf = try preview_mod.perceptualTestFrame(allocator, px, 32);
+    defer allocator.free(buf);
+    const pshape = [_]c_int{ 1, 3, 1, @intCast(px), @intCast(px) };
+    const px_f32 = mlx.mlx_array_new_data(buf.ptr, &pshape, 5, .float32);
+    defer _ = mlx.mlx_array_free(px_f32);
+    var pxb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pxb);
+    try mlx.check(mlx.mlx_astype(&pxb, px_f32, .bfloat16, s));
+
+    const lat = try vaeEncode(&enc, pxb, s);
+    defer _ = mlx.mlx_array_free(lat);
+    var latf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(latf);
+    try mlx.check(mlx.mlx_astype(&latf, lat, .float32, s));
+    _ = mlx.mlx_array_eval(latf);
+    const lshp = mlx.getShape(latf);
+    const lc: u32 = @intCast(lshp[1]);
+    const lt: u32 = @intCast(lshp[2]);
+    const lh: u32 = @intCast(lshp[3]);
+    const lw: u32 = @intCast(lshp[4]);
+    try testing.expectEqual(preview_mod.ltx_av.channels(), lc);
+    const lat_host = (mlx.mlx_array_data_float32(latf) orelse return error.NoLatentData)[0 .. @as(usize, lc) * lt * lh * lw];
+
+    const fit = try allocator.alloc(u8, @as(usize, lh) * lw * 3);
+    defer allocator.free(fit);
+    preview_mod.latentSliceToRgb(preview_mod.ltx_av, lat_host, lt, lh, lw, 0, fit);
+    const ctrl_map = preview_mod.goldenAngleControlMap(128);
+    const ctrl = try allocator.alloc(u8, @as(usize, lh) * lw * 3);
+    defer allocator.free(ctrl);
+    preview_mod.latentSliceToRgb(ctrl_map, lat_host, lt, lh, lw, 0, ctrl);
+
+    const out = try vaeDecode(&dec, lat, s);
+    defer _ = mlx.mlx_array_free(out);
+    var outf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(outf);
+    try mlx.check(mlx.mlx_astype(&outf, out, .float32, s));
+    _ = mlx.mlx_array_eval(outf);
+    const oshp = mlx.getShape(outf);
+    const ot: usize = @intCast(oshp[2]);
+    const oh: usize = @intCast(oshp[3]);
+    const ow: usize = @intCast(oshp[4]);
+    const odata = mlx.mlx_array_data_float32(outf) orelse return error.NoPixelData;
+    const decoded = try allocator.alloc(u8, oh * ow * 3);
+    defer allocator.free(decoded);
+    for (0..oh) |y| {
+        for (0..ow) |x| {
+            for (0..3) |c| {
+                const v = (odata[c * ot * oh * ow + y * ow + x] + 1.0) * 0.5 * 255.0;
+                decoded[(y * ow + x) * 3 + c] = @intFromFloat(@min(255.0, @max(0.0, v)));
+            }
+        }
+    }
+    const small = try preview_mod.boxDownsampleRgb(allocator, decoded, @intCast(ow), @intCast(oh), lw, lh);
+    defer allocator.free(small);
+
+    const corr_fit = preview_mod.rgbCorrelation(fit, small);
+    const corr_ctrl = preview_mod.rgbCorrelation(ctrl, small);
+    const chroma_fit = preview_mod.rgbChromaCorrelation(fit, small);
+    const chroma_ctrl = preview_mod.rgbChromaCorrelation(ctrl, small);
+    std.debug.print(
+        "[ltx-preview] latent={d}x{d}x{d} decode={d}x{d}x{d} corr_fit={d:.4} corr_huewheel={d:.4} chroma_fit={d:.4} chroma_huewheel={d:.4}\n",
+        .{ lc, lh, lw, ot, oh, ow, corr_fit, corr_ctrl, chroma_fit, chroma_ctrl },
+    );
+    // Same four-part bar as the H3 twin. Measured 2026-08-30 (LTX-2.5 8-bit VAE
+    // pair, M-series): fit 0.898 / chroma 0.923, control 0.196 / 0.262.
+    try testing.expect(corr_fit > 0.6);
+    try testing.expect(corr_fit > corr_ctrl + 0.3);
+    try testing.expect(chroma_fit > 0.7);
+    try testing.expect(chroma_fit > chroma_ctrl + 0.3);
 }
 
 fn corrOf(a: []const f32, b: []const f32) f64 {
@@ -4731,7 +5479,7 @@ test "ltx DiT adaLN conditioning reproduces AdaLayerNormSingle" {
     const refe = try readF32(io, allocator, ep);
     defer allocator.free(refe);
 
-    const t_sin = try ditTimestepSinusoid(700.0, 256, s);
+    const t_sin = try timestepSinusoid(700.0, 256, s);
     defer _ = mlx.mlx_array_free(t_sin);
     const out = try ditAdaLNSingle(&comp, allocator, t_sin, "transformer.adaln_single", s);
     defer _ = mlx.mlx_array_free(out.params);
@@ -5523,7 +6271,7 @@ test "ltx DiT encodeTextLtx reproduces PromptEncoder" {
     const ids = try readI32(io, allocator, idp);
     defer allocator.free(ids);
 
-    var emb = try encodeTextLtx(&comp, io, allocator, gdir, ids, 0, s);
+    var emb = try encodeTextLtx(&comp, io, allocator, .v23, gdir, ids, 0, s);
     defer emb.deinit();
     var vf = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(vf);

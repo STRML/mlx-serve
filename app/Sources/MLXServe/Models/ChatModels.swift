@@ -1,5 +1,14 @@
 import Foundation
 
+/// How hard the model thinks while the Think toggle is on — the wire's own
+/// `reasoning_effort` values. Picked from the brain disc's right-click menu,
+/// per session like the toggle itself.
+enum ReasoningEffort: String, Codable, CaseIterable, Identifiable, Sendable {
+    case low, medium, high
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
+}
+
 struct ChatSession: Identifiable, Codable {
     let id: UUID
     var title: String
@@ -28,19 +37,18 @@ struct ChatSession: Identifiable, Codable {
     /// across tab switches and relaunches — `mode` already does the same for the
     /// Agent toggle. See PerSessionUIStateTests.
     var enableThinking: Bool
+    /// The brain disc's right-click pick: `reasoning_effort` for this chat's
+    /// turns while thinking is on.
+    var reasoningEffort: ReasoningEffort
     var useMCP: Bool
+    // The composer's create mode (`createMode`) is retired: sessions saved by
+    // builds that had it simply carry a key this decoder no longer asks for.
     /// The agent (persona) this tab is talking to; nil = none, i.e. the app's own
     /// defaults and today's behavior. Per-session like the toggles above — the
     /// detail view is REUSED across tabs, so an app-wide "active agent" would
     /// leak between conversations. Switching applies to subsequent turns only.
     var agentId: UUID?
     /// Tools this chat has switched OFF in the Tools menu, by wire name.
-    ///
-    /// Stored as raw strings rather than `AgentToolKind` so a tool retired in a
-    /// later build leaves an unrecognized name on disk instead of failing the
-    /// whole session's decode — `disabledToolKinds` drops what it can't resolve.
-    /// Subtractive only: it can take away what the agent already allowed, never
-    /// grant what it forbids (see `AgentResolution.resolve`).
     var disabledTools: [String]
 
     init(title: String = "New Chat") {
@@ -55,6 +63,7 @@ struct ChatSession: Identifiable, Codable {
         self.taskRunId = nil
         self.isExternalBridge = false
         self.enableThinking = false
+        self.reasoningEffort = .low
         self.useMCP = false
         self.agentId = nil
         self.disabledTools = []
@@ -69,6 +78,7 @@ struct ChatSession: Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId
         case disabledTools
+        case reasoningEffort
     }
 
     init(from decoder: Decoder) throws {
@@ -84,6 +94,10 @@ struct ChatSession: Identifiable, Codable {
         // Backfill: sessions saved before the per-session Think/MCP toggles
         // existed come back with the keys absent → default both off.
         enableThinking = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) ?? false
+        // Absent (older builds) and unknown (a future build's level) both read
+        // as the default rather than failing the whole session's decode.
+        reasoningEffort = (try c.decodeIfPresent(String.self, forKey: .reasoningEffort))
+            .flatMap(ReasoningEffort.init(rawValue:)) ?? .low
         useMCP = try c.decodeIfPresent(Bool.self, forKey: .useMCP) ?? false
         // Absent (every session saved before agents existed) → no agent → the
         // app defaults, unchanged on upgrade.
@@ -151,30 +165,74 @@ struct SerializedToolCall: Codable, Equatable {
     let arguments: String // JSON string
 }
 
+/// An image on a message.
+///
+/// The bytes are NOT persisted: `CodingKeys` carries `id` and `path` only, and
+/// a decode reads the picture back from the file. Uploads used to ride
+/// `chat-history.json` as base64, which measured 97% of an ordinary
+/// conversation's file.
 struct ChatImage: Identifiable, Codable, Equatable {
     let id: UUID
-    let data: Data  // JPEG bytes
+    /// The file under `~/.mlx-serve/attachments/`, when there is one.
+    ///
+    /// Optional so a history written before attachments moved to disk still
+    /// DECODES: its `data` key is simply unknown here and `path` is absent, so
+    /// the record survives and only its picture is gone. A required field would
+    /// throw instead, and `loadChatHistory`'s `?? []` turns one throw into an
+    /// EMPTY history — the whole file, not one image.
+    ///
+    /// Also nil for bytes that were never meant to outlive the turn: a Telegram
+    /// photo, whose session is never persisted at all, and a `browse`
+    /// screenshot, which no reopened conversation reads or draws.
+    var path: String?
+    /// The picture itself, for this run of the app. Empty when the file is gone.
+    var data: Data
 
-    init(data: Data) {
+    enum CodingKeys: String, CodingKey { case id, path }
+
+    init(data: Data, path: String? = nil) {
         self.id = UUID()
         self.data = data
+        self.path = path
     }
 
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        path = try c.decodeIfPresent(String.self, forKey: .path)
+        data = path.flatMap { FileManager.default.contents(atPath: $0) } ?? Data()
+    }
+
+    /// Sniffed, not assumed: an attachment we encoded ourselves is PNG, and
+    /// labelling PNG bytes as JPEG is the kind of lie that works until it
+    /// doesn't.
     var base64URL: String {
-        "data:image/jpeg;base64,\(data.base64EncodedString())"
+        let b = [UInt8](data.prefix(4))
+        let isPNG = b.count >= 4 && b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47
+        return "data:image/\(isPNG ? "png" : "jpeg");base64,\(data.base64EncodedString())"
+    }
+}
+
+enum ThinkingDuration {
+
+    /// "Thinking" until measured, then "Thinking took 2 minutes 7 seconds".
+    static func label(seconds: Double?) -> String {
+        guard let seconds, seconds >= 1 else { return "Thinking" }
+        let total = Int(seconds.rounded())
+        let minutes = total / 60
+        let remainder = total % 60
+
+        if minutes == 0 { return "Thinking took \(plural(remainder, "second"))" }
+        if remainder == 0 { return "Thinking took \(plural(minutes, "minute"))" }
+        return "Thinking took \(plural(minutes, "minute")) \(plural(remainder, "second"))"
+    }
+
+    private static func plural(_ n: Int, _ unit: String) -> String {
+        "\(n) \(unit)\(n == 1 ? "" : "s")"
     }
 }
 
 /// A generated media file attached to a message BY REFERENCE.
-///
-/// Images ride `ChatMessage.images` as JPEG bytes, which is fine for a picture
-/// but not for the rest: a 30 s track is tens of MB and a 4 s clip more, and
-/// `chat-history.json` would carry every one of them forever. So audio and video
-/// are a path into the same `~/.mlx-serve/generations` tree the tray windows
-/// write to — the file the service already produced, not a second copy.
-///
-/// The file can go away (the user empties that folder), so every renderer treats
-/// a missing path as a normal state rather than assuming it resolves.
 struct ChatMediaRef: Codable, Equatable, Identifiable {
     enum Kind: String, Codable { case image, audio, video }
 
@@ -192,15 +250,34 @@ struct ChatMediaRef: Codable, Equatable, Identifiable {
 /// An audio clip attached to a message. `pcm` holds raw little-endian float32
 /// mono samples at 16 kHz — the format the Gemma 4 12B unified audio embedder
 /// frames into 640-sample tokens. Decoded client-side by `AudioPreprocessor`.
+///
+/// The samples are NOT persisted: like `ChatImage`, the history carries `id`,
+/// `name` and `path`, and a decode reads the clip back from its WAV file
+/// (`AudioClipFile`). A history from before, or a file since gone, decodes
+/// with empty `pcm` rather than throwing, for the same reason as the image.
 struct ChatAudio: Identifiable, Codable, Equatable {
     let id: UUID
     let name: String   // original filename, for the attachment chip
-    let pcm: Data       // float32-LE 16 kHz mono samples
+    /// The WAV under `~/.mlx-serve/attachments/`, when there is one.
+    var path: String?
+    var pcm: Data       // float32-LE 16 kHz mono samples; empty when the file is gone
 
-    init(name: String, pcm: Data) {
+    enum CodingKeys: String, CodingKey { case id, name, path }
+
+    init(name: String, pcm: Data, path: String? = nil) {
         self.id = UUID()
         self.name = name
         self.pcm = pcm
+        self.path = path
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        path = try c.decodeIfPresent(String.self, forKey: .path)
+        pcm = path.flatMap { FileManager.default.contents(atPath: $0) }
+            .flatMap { AudioClipFile.decode(wav: $0) } ?? Data()
     }
 
     /// Number of decoded samples (4 bytes each) and the clip's duration.
@@ -208,7 +285,26 @@ struct ChatAudio: Identifiable, Codable, Equatable {
     var durationSeconds: Double { Double(sampleCount) / 16_000.0 }
 }
 
-struct ChatMessage: Identifiable, Codable {
+/// A video attached to a message. `frames` are JPEG bytes sampled evenly
+/// across the whole clip (`VideoPreprocessor.extractFrames`) — Qwen3-VL-family
+/// models are the only ones that read video input, and the server decodes each
+/// frame the same way it decodes a plain `image_url` (no video codec exists
+/// anywhere in mlx-serve, so frame extraction is the client's job).
+struct ChatVideo: Identifiable, Codable, Equatable {
+    let id: UUID
+    let name: String // original filename, for the attachment chip
+    let frames: [Data] // JPEG bytes, one per sampled frame
+
+    init(name: String, frames: [Data]) {
+        self.id = UUID()
+        self.name = name
+        self.frames = frames
+    }
+
+    var frameCount: Int { frames.count }
+}
+
+struct ChatMessage: Identifiable, Codable, Equatable {
     let id: UUID
     var role: Role
     var content: String
@@ -221,10 +317,14 @@ struct ChatMessage: Identifiable, Codable {
     var promptTokens: Int?
     var completionTokens: Int?
     var tokensPerSecond: Double?
+    /// Seconds from the message's timestamp to the first content delta
+    /// (includes prefill). Absent in older histories.
+    var thinkingSeconds: Double?
     var toolCallId: String?   // For tool response messages
     var toolName: String?     // For tool response messages
     var toolCalls: [SerializedToolCall]? // Tool calls made BY this assistant message
     var images: [ChatImage]?  // Images attached to this message
+    var videos: [ChatVideo]?  // Videos attached to this message
     var audio: [ChatAudio]?   // Audio clips attached to this message
     // Generated media attached BY PATH (see ChatMediaRef) — the tracks and clips
     // the in-chat media tools produce. Absent on every message saved before they
@@ -243,6 +343,17 @@ struct ChatMessage: Identifiable, Codable {
     // prompt overflowed) instead of the old `[Error: …]` text, which read as
     // something the model itself had said.
     var errorNotice: ChatErrorNotice? = nil
+    // Set when the reply was cut (max_tokens / repetition loop). Rendered as a
+    // footnote under the bubble, NEVER appended into `content` — content rides
+    // back to the model as history, and the old in-content banner taught it
+    // the warning text. Absent forever on messages saved before the field.
+    var truncationNotice: TruncationNotice.Notice? = nil
+    /// Every generated version of this reply, oldest first, populated only
+    /// once it has been regenerated at least once. `content` mirrors the
+    /// selected one — the transcript, the history builder and every existing
+    /// reader keep reading `content` and never learn this field exists.
+    var revisions: [MessageRevision] = []
+    var activeRevision: Int = 0
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -263,9 +374,9 @@ struct ChatMessage: Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, role, content, reasoningContent, isStreaming, timestamp
         case agentPlan, toolResults, isAgentSummary
-        case promptTokens, completionTokens, tokensPerSecond
-        case toolCallId, toolName, toolCalls, images, audio, failedRetry, processHandles
-        case errorNotice, media
+        case promptTokens, completionTokens, tokensPerSecond, thinkingSeconds
+        case toolCallId, toolName, toolCalls, images, videos, audio, failedRetry, processHandles
+        case errorNotice, media, truncationNotice, revisions, activeRevision
     }
 
     init(from decoder: Decoder) throws {
@@ -282,15 +393,23 @@ struct ChatMessage: Identifiable, Codable {
         promptTokens = try c.decodeIfPresent(Int.self, forKey: .promptTokens)
         completionTokens = try c.decodeIfPresent(Int.self, forKey: .completionTokens)
         tokensPerSecond = try c.decodeIfPresent(Double.self, forKey: .tokensPerSecond)
+        thinkingSeconds = try c.decodeIfPresent(Double.self, forKey: .thinkingSeconds)
         toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
         toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
         toolCalls = try c.decodeIfPresent([SerializedToolCall].self, forKey: .toolCalls)
         images = try c.decodeIfPresent([ChatImage].self, forKey: .images)
+        videos = try c.decodeIfPresent([ChatVideo].self, forKey: .videos)
         audio = try c.decodeIfPresent([ChatAudio].self, forKey: .audio)
         media = try c.decodeIfPresent([ChatMediaRef].self, forKey: .media)
         failedRetry = try c.decodeIfPresent(Bool.self, forKey: .failedRetry) ?? false
         processHandles = try c.decodeIfPresent([String].self, forKey: .processHandles)
         errorNotice = try c.decodeIfPresent(ChatErrorNotice.self, forKey: .errorNotice)
+        // Tolerant: a cause this build doesn't know must not fail the message.
+        truncationNotice = (try? c.decodeIfPresent(TruncationNotice.Notice.self, forKey: .truncationNotice)) ?? nil
+        // Tolerant, like every other optional here: a session written by an
+        // older build has neither key and decodes as an ordinary reply.
+        revisions = (try? c.decodeIfPresent([MessageRevision].self, forKey: .revisions)) ?? []
+        activeRevision = (try? c.decodeIfPresent(Int.self, forKey: .activeRevision)) ?? 0
     }
 }
 
@@ -330,6 +449,11 @@ struct ModelInfo {
     /// was launched with `--no-vision`. The Telegram bridge reads this to
     /// decide whether to forward an incoming photo or refuse it.
     var supportsVision: Bool = false
+    /// True when the model advertises `video` in `input_modalities` (Qwen3-VL-
+    /// family checkpoints that declare `video_token_id` alongside vision).
+    /// Never true without `supportsVision` also being true — video piggybacks
+    /// the same vision tower. Gates the video-attach option in chat.
+    var supportsVideo: Bool = false
     /// True when the model advertises the `embeddings` capability (encoder-
     /// only BERT entries, loaded or stub). DocumentIndex uses this to pick a
     /// GPU embedder for folder indexing.
@@ -348,6 +472,10 @@ struct ModelInfo {
     /// the server loaded the native multi-token-prediction head. Drives the
     /// "+MTP" speedup badge under the model name in the tray.
     var mtpLoaded: Bool = false
+    /// `meta.mtp_available`: the checkpoint ships an MTP head. nil on older servers.
+    var mtpAvailable: Bool? = nil
+    /// `meta.kv_quant`: "off" | "4" | "8" | … — the width THIS model stores at. Empty on older servers.
+    var kvQuant: String = ""
     /// Plan 05 Phase G — multi-model fields. All optional so older
     /// servers (single-model) still decode without these.
     /// Whether this entry currently holds resident weights.
@@ -376,6 +504,11 @@ struct ModelInfo {
     /// (the server badges remote entries with `lan_peer`; their ids are
     /// `<model>@<peer>` and requests are proxied to that host). nil = local.
     var lanPeer: String? = nil
+    /// Set when this entry is a configured upstream provider (`provider`
+    /// badge, `src/providers.zig`). Routing is identical to a LAN peer — the
+    /// id is `<model>@<name>` and the server proxies — so `lanPeer` is set
+    /// too; this field only decides the picker heading and the label.
+    var provider: String? = nil
 
     /// Whether this LAN-mirrored entry serves `capability` — the tray
     /// empty-state and the "On Your Network" pickers count through this, not
@@ -387,6 +520,15 @@ struct ModelInfo {
     /// modality, so empty counts as chat and nothing else.
     func lanAdvertises(_ capability: String) -> Bool {
         guard lanPeer != nil else { return false }
+        // "audio" is the MODALITY, and the server advertises a music backend
+        // ADDITIVELY as ["audio","music"] on both the ready and stub paths
+        // (src/server.zig) — so a peer running ACE-Step or MiniMax Music 3
+        // matched the Voice pane's "audio" ask and offered itself as a TTS
+        // voice. Speech is audio-and-not-music; the Music pane's own "music"
+        // ask was already exact, because no TTS backend advertises it.
+        if capability == "speech" {
+            return capabilities.contains("audio") && !capabilities.contains("music")
+        }
         if capabilities.contains(capability) { return true }
         return capability == "chat" && capabilities.isEmpty
     }
@@ -430,6 +572,14 @@ struct ModelInfo {
         if drafterLoaded { return "+Drafter" }
         return nil
     }
+
+    /// Whether this entry can answer a chat request at all. A generator
+    /// advertises only its OUTPUT modality ("image" / "video" / "audio") and an
+    /// encoder only "embeddings"; a multimodal chat model advertises "chat"
+    /// alongside its input modalities, so `slotKind` already draws this line —
+    /// including the "no capabilities at all" tolerance for pre-Phase-G servers
+    /// and loaded GGUFs.
+    var servesChat: Bool { slotKind == .chat }
 
     /// Classify a registry entry into a tray slot from its capabilities.
     /// "chat" wins first: a multimodal chat model also advertises "vision"/
@@ -493,6 +643,68 @@ enum ServerEngine: String, CaseIterable {
         case .llama: return "llama.cpp (GGUF)"
         case .dsv4:  return "ds4 (DSV4-Flash)"
         }
+    }
+}
+
+/// The `/props` "batching" object: does the loaded model share one decode
+/// forward across concurrent requests, and why not when it does not.
+struct BatchingInfo: Equatable {
+    var supported: Bool
+    var reason: String
+    var maxGroup: Int
+
+    static func parse(_ json: [String: Any]) -> BatchingInfo? {
+        guard let obj = json["batching"] as? [String: Any],
+              let supported = obj["supported"] as? Bool else { return nil }
+        return BatchingInfo(
+            supported: supported,
+            reason: obj["reason"] as? String ?? "",
+            maxGroup: obj["max_group"] as? Int ?? 0
+        )
+    }
+
+    /// One line for the settings row. Reasons are the server's `BatchVerdict` tags.
+    var label: String {
+        if supported { return "Loaded model batches decode (up to \(maxGroup) requests share one forward)." }
+        switch reason {
+        case "no_model": return "No model loaded."
+        case "embedded_engine": return "Loaded model runs on an embedded GGUF engine: concurrent requests take turns."
+        default: return "Loaded model's architecture does not batch: concurrent requests take turns."
+        }
+    }
+}
+
+/// What the server's measured spec-decode cost model resolved for this load
+/// (`/props` `"spec_cost"`, absent when `MLX_SERVE_SPEC_COST_PROBE=0` or the
+/// probe declined — then the per-silicon tables applied instead).
+///
+/// The Settings picker shows this beside "Automatic" rather than offering a
+/// second "Probe" entry: a user cannot choose between "Automatic" and "Probe"
+/// without benchmarking, but they can read what Automatic landed on.
+struct SpecCostInfo: Equatable {
+    var mtpDepthCap: Int
+    var widths: [Int]
+    var msPerWidth: [Double]
+    var kvMsPerToken: Double
+
+    /// Decode the `spec_cost` object. Pure and testable; nil for a server
+    /// that published none (the tables applied), which reads as "no measured
+    /// width to show".
+    static func parse(_ json: [String: Any]) -> SpecCostInfo? {
+        guard let obj = json["spec_cost"] as? [String: Any],
+              let cap = obj["mtp_depth_cap"] as? Int, cap > 0 else { return nil }
+        return SpecCostInfo(
+            mtpDepthCap: cap,
+            widths: (obj["widths"] as? [Any])?.compactMap { ($0 as? NSNumber)?.intValue } ?? [],
+            msPerWidth: (obj["ms"] as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue } ?? [],
+            kvMsPerToken: (obj["kv_ms_per_token"] as? NSNumber)?.doubleValue ?? 0
+        )
+    }
+
+    /// Label for the picker's automatic entry. Names the width AND that it was
+    /// measured — a bare "Automatic (6)" reads the same as a hardcoded cap.
+    var automaticLabel: String {
+        "Automatic (measured: \(mtpDepthCap) token\(mtpDepthCap == 1 ? "" : "s"))"
     }
 }
 
@@ -619,15 +831,32 @@ enum LocalModelSource: String, Codable, Hashable, CaseIterable {
     /// where `huggingface_hub` / `mlx_lm` download). Read-only in the app — the
     /// cache's blob/ref/symlink structure is managed by `huggingface-cli`.
     case huggingFace
+    /// The canonical model folder of ANOTHER local-inference tool, found by
+    /// `ToolModelRoots.detected()` rather than configured by anyone.
+    ///
+    /// One case per tool, deliberately. A single shared "other tools" bucket
+    /// tells you a folder exists but not whose it is, and the whole point of
+    /// the read-only badge is to send you to the app that owns the file — a
+    /// heading that cannot name that app cannot do it. LM Studio and the
+    /// Hugging Face cache were already per-source for the same reason; adding
+    /// a tool is one case here plus one path in `ToolModelRoots`.
+    case mtplx
+    case osaurus
     case custom
 
     /// Heading for this source's group in a model picker. `allCases` order is
     /// the order pickers render, so it also decides which group comes first.
+    ///
+    /// LM Studio held the generic "Other Discovered Models" back when it was
+    /// the only folder MLX Core did not own. It no longer is, so the generic
+    /// title moved to the generic bucket and LM Studio says its own name.
     var sectionTitle: String {
         switch self {
         case .mlxServe: "MLX-Serve Models"
-        case .lmStudio: "Other Discovered Models"
+        case .lmStudio: "LM Studio Models"
         case .huggingFace: "Hugging Face Cache"
+        case .mtplx: "MTPLX Models"
+        case .osaurus: "Osaurus Models"
         case .custom: "Custom Folder"
         }
     }
@@ -683,6 +912,53 @@ enum ModelEngine: String, Hashable {
     }
 }
 
+/// Why a directory that LOOKS like a model cannot be one.
+///
+/// Discovery used to answer this question by dropping the folder: no
+/// `.safetensors`, no entry. That hid the folder from the only app willing to
+/// tell you it was junk, while the server — which does not run this check —
+/// registered it and would have died on the first load. Worse, the check was
+/// file-EXISTS, so a directory whose entire weight payload is a 48 KB stub
+/// passed it and was offered as a real, selectable model.
+///
+/// A defective folder is LISTED, never picked, and always deletable. It is the
+/// one case where the read-only rule for other tools' trees does not apply:
+/// nobody wants to keep a broken folder, and the app that owns it is not
+/// showing it to you either.
+enum ModelDefect: String, Codable, Hashable, CaseIterable {
+    /// `config.json` present, but the weight bytes beside it could not be a
+    /// checkpoint. Covers both "no `.safetensors` at all" and "a stub file".
+    case missingWeights
+    /// `model.safetensors.index.json` names shards that are not on disk. This
+    /// one is EXACT — the checkpoint lists its own parts, so nothing is
+    /// inferred from size.
+    case missingShards
+    /// A `.partial` / `.incomplete` file is still sitting in the directory.
+    case interruptedDownload
+
+    /// Short badge text for the row.
+    var label: String {
+        switch self {
+        case .missingWeights: "No weights"
+        case .missingShards: "Missing shards"
+        case .interruptedDownload: "Interrupted"
+        }
+    }
+
+    /// What it is and what to do about it. Shown on the row and in the delete
+    /// confirmation — a row you are invited to delete has to justify itself.
+    var explanation: String {
+        switch self {
+        case .missingWeights:
+            return "This folder has a config but no usable model weights, so nothing can load it. It is safe to delete."
+        case .missingShards:
+            return "Some of this checkpoint\u{2019}s weight files are missing, so it cannot load. Re-download it or delete it."
+        case .interruptedDownload:
+            return "A download into this folder was interrupted and never finished. Re-download it or delete it."
+        }
+    }
+}
+
 struct LocalModel: Identifiable, Hashable {
     let id: String
     let name: String
@@ -705,11 +981,22 @@ struct LocalModel: Identifiable, Hashable {
     var numExperts: Int? = nil
     /// Active MoE experts per token (`num_experts_per_tok`).
     var activeExperts: Int? = nil
+    /// The dir ships an MTP head (`DownloadManager.dirHasMtpHead`).
+    var hasMtpHead: Bool = false
     /// The `.gguf` basename this model IS, when it's one quant of a GGUF repo.
     /// A repo folder holds many quants and each is separately loadable, so
     /// discovery emits one `LocalModel` per file and `path` points at the file.
     /// nil for MLX checkpoints, whose `path` is the directory.
     var quantFile: String? = nil
+    /// The quant's menu label as `GgufQuant.groupQuants` resolved it — which is
+    /// the only place that can see the SIBLINGS, and so the only place that can
+    /// tell two builds of one scheme apart. nil ⇒ derive it from the filename.
+    var quantLabel: String? = nil
+
+    /// Non-nil when this directory cannot serve as a model. See `ModelDefect`.
+    /// A defective row is listed so you can see and remove it, and is excluded
+    /// from every picker.
+    var defect: ModelDefect? = nil
 
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType) || isMediaModelType(modelType)
@@ -722,16 +1009,25 @@ struct LocalModel: Identifiable, Hashable {
     /// delete into them (deleting an HF snapshot orphans shared blobs and
     /// dangles `refs/main`; the others simply aren't ours to remove).
     var isDeletable: Bool {
-        source == .mlxServe
+        // Junk in a foreign tree is still junk. The read-only rule exists so we
+        // never remove another app's WORKING model; a folder that cannot load
+        // is not one, and the owning app is not offering to clean it up either.
+        if defect != nil { return true }
+        return source == .mlxServe
     }
 
     /// Non-nil when this model is read-only (not `isDeletable`): the user-facing
     /// reason shown on the badge that replaces the trash. nil for `.mlxServe`.
     var externalReadOnlyReason: String? {
+        // A deletable row must not also claim to be read-only — the badge and
+        // the trash are the same slot, and `isDeletable` already said trash.
+        if defect != nil { return nil }
         switch source {
         case .mlxServe: return nil
         case .lmStudio: return "In LM Studio\u{2019}s models folder \u{2014} manage it in LM Studio. MLX Core loads it read-only."
         case .huggingFace: return "In the Hugging Face cache \u{2014} manage with huggingface-cli. MLX Core loads it read-only."
+        case .mtplx: return "In MTPLX\u{2019}s models folder \u{2014} manage it in MTPLX. MLX Core loads it read-only."
+        case .osaurus: return "In Osaurus\u{2019}s models folder \u{2014} manage it in Osaurus. MLX Core loads it read-only."
         case .custom: return "In a custom models folder you added \u{2014} MLX Core loads it read-only and won\u{2019}t delete it."
         }
     }
@@ -739,14 +1035,15 @@ struct LocalModel: Identifiable, Hashable {
     /// Offerable by chat-model pickers (tray menu, task sheet, auto-select):
     /// a base checkpoint whose architecture serves chat completions. Excludes
     /// drafters, media models (LTX "AudioVideo", FLUX/Krea, Qwen3-TTS,
-    /// Hunyuan3D, AceStep), the Falconsai NSFW classifier ("vit"), and
+    /// Hunyuan3D, AceStep), image classifiers ("vit"), and
     /// embeddings-only "bert" encoders — those live under ~/.mlx-serve/models
     /// as gen-pane / doc-RAG dependencies and load by path, never as the
     /// tray's primary model. The Model Browser's Downloaded tab still lists
     /// them (size + delete) and, since they ARE supported architectures,
     /// no longer flags them "Unsupported".
     var isChatPickable: Bool {
-        kind == .base && isSupportedArchitecture && modelType != "bert" && !isMediaModelType(modelType)
+        guard defect == nil else { return false }
+        return kind == .base && isSupportedArchitecture && modelType != "bert" && !isMediaModelType(modelType)
     }
 
     /// Likely tool/function-calling support (name heuristic, shared with the
@@ -817,7 +1114,7 @@ struct LocalModel: Identifiable, Hashable {
     /// `name` has to stay the repo name because filters and grouping key off it.
     var displayLabel: String {
         guard let quantFile else { return name }
-        return "\(name) · \(DownloadManager.quantLabel(forFilename: quantFile))"
+        return "\(name) · \(quantLabel ?? DownloadManager.quantLabel(forFilename: quantFile))"
     }
 
     /// Display labels shared by more than one model. macOS `.menu` Pickers key
@@ -915,29 +1212,20 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // 31B: 31B dense — fits 36 GB+ Macs (4-bit) or 48 GB+ (8-bit)
     GemmaModelOption(id: "31b-4bit", displayName: "Gemma 4 31B (4-bit)", repoId: "mlx-community/gemma-4-31b-it-4bit", sizeEstimate: "~18.4 GB, needs 36 GB+ RAM"),
     GemmaModelOption(id: "31b-8bit", displayName: "Gemma 4 31B (8-bit)", repoId: "mlx-community/gemma-4-31b-it-8bit", sizeEstimate: "~33.8 GB, needs 48 GB+ RAM"),
-    // Qwen 3.6 27B dense (4-bit) with a native MTP head — fits 24 GB+ Macs. Ships
-    // an mtp/weights.safetensors sidecar; the server auto-loads it for multi-token
-    // speculative decode (~1.1–1.4× decode on agent/code workloads).
-    GemmaModelOption(id: "qwen36-27b-4bit-mtp", displayName: "Qwen 3.6 27B (4-bit, MTP)", repoId: "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", sizeEstimate: "~16.6 GB, needs 24 GB+ RAM"),
+    // Qwen 3.8 27B dense (4-bit), vision + a native MTP head IN the checkpoint —
+    // fits 24 GB+ Macs. The server auto-loads the head for multi-token
+    // speculative decode (26 -> 75 tok/s on code, M4 Max). Supersedes the
+    // Qwen 3.6 27B MTP entry: same geometry, newer weights, images too.
+    GemmaModelOption(id: "qwen38-27b-4bit", displayName: "Qwen 3.8 27B (4-bit, MTP)", repoId: "ddalcu/Qwen3.8-27B-MLX-Serve-4bit", sizeEstimate: "~18.2 GB, needs 24 GB+ RAM"),
     // DeepSeek-V4-Flash on the NATIVE deepseek_v4 MLX arch — 128 GB Macs only.
-    // Our own mixed 2/3/8-bit safetensors mirror, so it takes the plain repo
-    // download path; it replaced the `antirez/deepseek-v4-gguf` IQ2XXS entry
-    // that the embedded ds4 engine served (same model, one engine fewer in the
-    // way, but 118 GB instead of 87 — the 96 GB tier no longer has a DeepSeek
-    // entry here). The id keeps its "dsv4" token: that is what the tray filter
-    // reads.
     GemmaModelOption(
         id: "dsv4-flash-mlx",
-        displayName: "DeepSeek-V4-Flash (MLX native)",
-        repoId: "ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit",
-        sizeEstimate: "~118 GB, needs 128 GB RAM",
+        displayName: "DeepSeek-V4-Flash (iQ-MLX 3.3 bpw)",
+        repoId: "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw",
+        sizeEstimate: "~130 GB, needs 128 GB RAM",
         minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.
-    // The imatrix-calibrated 2-bit build (mlx-community oQ2e): the FULL
-    // 192-expert model with attention/router/shared-expert/embeddings kept at
-    // 8-bit, ~84 GB — so a 128 GB Mac loads it WITH real context headroom
-    // (the older ~110 GB mixed build loaded but left almost none). No MTP head.
     GemmaModelOption(
         id: "hy3-oq2e",
         displayName: "Hunyuan 3 295B-A21B (2-bit)",

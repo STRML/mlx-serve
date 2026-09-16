@@ -8,6 +8,11 @@ import SwiftUI
 /// encoder — all surfaced here as one action.
 struct BundleDownloadBar: View {
     let bundle: MediaBundle
+    /// When false the bar reports progress and failures but offers no START
+    /// button — the Create panes moved that onto the model row itself
+    /// (`MediaModelChooser`), so having one here too put two ways to fetch the
+    /// same model on screen at once, one of them beside Generate.
+    var showsStartButton: Bool = true
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
 
@@ -25,10 +30,16 @@ struct BundleDownloadBar: View {
         }
     }
 
+    @ViewBuilder
     private var notStartedRow: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("This model isn't downloaded yet.")
+            Text(L10n.text(
+                 showsStartButton
+                 ? "This model isn't downloaded yet."
+                 : "This model isn't downloaded yet — use Download above."
+))
                 .font(.caption).foregroundStyle(.secondary)
+            if showsStartButton {
             Button {
                 downloads.startBundle(bundle) { appState.refreshModels() }
             } label: {
@@ -36,8 +47,10 @@ struct BundleDownloadBar: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            }
             if bundle.components.count > 1 {
-                Text("Includes \(bundle.components.count) models (e.g. the text encoder).")
+                Text(L10n.format("Includes %lld models (e.g. the text encoder).",
+                                 Int64(bundle.components.count)))
                     .font(.caption2).foregroundStyle(.tertiary)
             }
         }
@@ -46,7 +59,7 @@ struct BundleDownloadBar: View {
     private func downloadingRow(_ a: (repo: String, index: Int, count: Int, state: DownloadManager.DownloadState)) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                ProgressView(value: a.state.fileProgress).frame(maxWidth: .infinity)
+                ProgressView(value: a.state.progress).frame(maxWidth: .infinity)
                 Text("\(a.state.percentFormatted) \(a.state.speedFormatted)")
                     .font(.system(size: 9).monospacedDigit()).foregroundStyle(.secondary)
                 Button { downloads.cancelBundle(bundle) } label: {
@@ -55,7 +68,9 @@ struct BundleDownloadBar: View {
                 .buttonStyle(.plain)
                 .help("Cancel download")
             }
-            let label = a.count > 1 ? "Downloading model \(a.index)/\(a.count): " : "Downloading: "
+            let label = a.count > 1
+                ? L10n.format("Downloading model %lld/%lld: ", Int64(a.index), Int64(a.count))
+                : L10n.text("Downloading: ")
             Text(label + (a.state.currentFile.isEmpty ? a.state.statusText : a.state.currentFile))
                 .font(.system(size: 9)).foregroundStyle(.secondary)
                 .lineLimit(1).truncationMode(.middle)

@@ -106,7 +106,7 @@ enum VoiceCloneMenuModel {
     @MainActor
     private static func bundleOnDisk(_ preset: AudioModelPreset) -> Bool {
         preset.bundle.components.allSatisfy {
-            DownloadManager.componentReady($0, modelsRoot: ServerManager.modelsRoot)
+            DownloadManager.componentReady($0, roots: ModelRoots.readRoots())
         }
     }
 
@@ -159,7 +159,7 @@ enum VoiceCloneMenuModel {
     /// clip location. Returns (path, displayLabel); nil on user cancel.
     @MainActor
     static func pickAndPersistClip() throws -> (path: String, label: String)? {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false

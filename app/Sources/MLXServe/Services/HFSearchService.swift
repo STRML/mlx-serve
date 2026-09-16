@@ -193,7 +193,9 @@ class HFSearchService: ObservableObject {
         ]
         let q = query.trimmingCharacters(in: .whitespaces)
         if !q.isEmpty { items.append(URLQueryItem(name: "search", value: q)) }
-        for field in ["safetensors", "lastModified", "likes", "downloads", "tags", "pipeline_tag"] {
+        // `config` carries `model_type` — the field the server dispatches on,
+        // and how a media pack (H3, LTX, …) is recognized in search results.
+        for field in ["safetensors", "lastModified", "likes", "downloads", "tags", "pipeline_tag", "config"] {
             items.append(URLQueryItem(name: "expand[]", value: field))
         }
         components.queryItems = items
@@ -206,7 +208,7 @@ class HFSearchService: ObservableObject {
     /// GGUF → min/max range so `HFModel.ramEstimate` can surface "1.7–8.5 GB"
     /// instead of an opaque "Unknown".
     private func fetchFallbackSizes(for models: [HFModel]) async {
-        await withTaskGroup(of: (String, FallbackSize)?.self) { group in
+        await withTaskGroup(of: (String, FallbackSize?, Bool?)?.self) { group in
             for model in models {
                 group.addTask {
                     // `?recursive=true` so a sharded GGUF's nested shards are
@@ -217,13 +219,23 @@ class HFSearchService: ObservableObject {
                           let http = response as? HTTPURLResponse, http.statusCode == 200,
                           let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
                     let entries = Self.treeEntries(from: raw)
-                    guard let fb = Self.parseFallbackSize(files: entries) else { return nil }
-                    return (model.id, fb)
+                    // A media repo's tree also settles whether it's downloadable
+                    // at all: the family bundle's own ready markers, checked
+                    // before any bytes move.
+                    var verified: Bool? = nil
+                    if let arch = model.mediaFamilyModelType,
+                       let bundle = CustomMediaModels.bundle(arch: arch, repoId: model.id) {
+                        verified = Self.mediaStructureSatisfied(
+                            markers: bundle.components[0].readyMarkers, files: entries)
+                    }
+                    return (model.id, Self.parseFallbackSize(files: entries), verified)
                 }
             }
             for await result in group {
-                guard let (id, fb) = result else { continue }
+                guard let (id, fb, verified) = result else { continue }
                 if let idx = fetchedModels.firstIndex(where: { $0.id == id }) {
+                    if let verified { fetchedModels[idx].mediaStructureVerified = verified }
+                    guard let fb else { continue }
                     switch fb {
                     case .safetensorsSum(let bytes), .ggufSingle(let bytes):
                         fetchedModels[idx].fallbackSizeBytes = bytes
@@ -234,6 +246,10 @@ class HFSearchService: ObservableObject {
                         // and any code reading `estimatedSizeBytes` still has
                         // a single number to work with (conservative-high).
                         fetchedModels[idx].fallbackSizeBytes = hi
+                    case .mlxVariants(let variants):
+                        fetchedModels[idx].mlxVariants = variants
+                        // Same conservative-high seed as the GGUF range.
+                        fetchedModels[idx].fallbackSizeBytes = variants.map(\.sizeBytes).max()
                     }
                 }
             }
@@ -251,7 +267,21 @@ class HFSearchService: ObservableObject {
     /// — gating GGUF out here was the bug that re-surfaced "Unknown" in the
     /// Model Browser even after `parseFallbackSize` learned about GGUF.
     nonisolated static func needsFallbackFetch(_ model: HFModel) -> Bool {
-        model.estimatedSizeBytes == 0 && model.isCompatible
+        // A media repo needs the tree regardless of size metadata: the fetch
+        // is what verifies its structure and earns (or denies) the Download
+        // button. Once verified either way, never refetched.
+        if model.isServedMediaRepo { return model.mediaStructureVerified == nil }
+        return model.estimatedSizeBytes == 0 && model.isCompatible
+    }
+
+    /// Marker check against a repo TREE: a marker names a file (exact path)
+    /// or a directory (something must live under it). The markers are the
+    /// family bundle's own `readyMarkers` — the same contract a finished
+    /// download is checked against, applied before any bytes move.
+    nonisolated static func mediaStructureSatisfied(markers: [String], files: [TreeFileEntry]) -> Bool {
+        markers.allSatisfy { m in
+            files.contains { $0.path == m || $0.path.hasPrefix(m + "/") }
+        }
     }
 
     // MARK: - Pure tree-parsing helpers (testable without a network)
@@ -271,6 +301,7 @@ class HFSearchService: ObservableObject {
         case safetensorsSum(Int64)                    // all .safetensors shards summed
         case ggufSingle(Int64)                        // a single non-mmproj .gguf
         case ggufRange(min: Int64, max: Int64)        // smallest + largest non-mmproj .gguf
+        case mlxVariants([MlxVariant])                // one complete model per subfolder
     }
 
     /// Convert the raw `[[String: Any]]` HF tree response into typed entries.
@@ -309,6 +340,12 @@ class HFSearchService: ObservableObject {
     /// more — they're summed into their quant, since the download path now
     /// reassembles a sharded quant.
     nonisolated static func parseFallbackSize(files: [TreeFileEntry]) -> FallbackSize? {
+        // Checked FIRST: a repo shipping one model per subfolder has no single
+        // size, and the plain sum below would report every quant added together
+        // (~20 GB for a 2.6B model) as if it were one download.
+        let variants = MlxVariantScan.variants(files: files)
+        if !variants.isEmpty { return .mlxVariants(variants) }
+
         let safetensorsSum = files
             .filter { $0.path.hasSuffix(".safetensors") }
             .reduce(Int64(0)) { $0 + $1.size }

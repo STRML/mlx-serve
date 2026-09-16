@@ -20,9 +20,12 @@ protocol TurnRunning: AnyObject {
     func runTurn(sessionId: UUID,
                  userText: String,
                  images: [ChatImage]?,
+                 videos: [ChatVideo]?,
                  audio: [ChatAudio]?,
                  config: ChatTurnEngine.TurnConfig,
                  approval: @escaping (APIClient.ToolCall) async -> Bool)
+    // (No default for `videos` here — Swift protocol requirements can't carry
+    // default argument values; every call site names it explicitly.)
     /// Cancel every in-flight turn (the legacy app-wide stop).
     func stop()
     /// Cancel one session's in-flight turn, leaving the others running.
@@ -237,6 +240,16 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         /// plain chat do NOT share one).
         var temperature: Double? = nil
         var maxTokens: Int? = nil
+        /// The rest of the sampling surface; nil = the user's saved default
+        /// (`ServerOptions`). Applied by `requestDefaults(from:)`.
+        var topP: Double? = nil
+        var topK: Int? = nil
+        var repeatPenalty: Double? = nil
+        var presencePenalty: Double? = nil
+        var reasoningBudget: Int? = nil
+        /// The surface's `reasoning_effort` pick, sent only while thinking is
+        /// on (see `reasoningEffortParam`).
+        var reasoningEffort: ReasoningEffort = .low
         /// The agent's own voice for this turn; nil = follow Settings.
         var voice: AgentVoice? = nil
         /// The spoken name this turn answers to (the agent's phrase when it has
@@ -262,9 +275,38 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 autoApprove: r.autoApprove,
                 temperature: r.temperatureOverride,
                 maxTokens: r.maxTokensOverride,
+                topP: r.topPOverride,
+                topK: r.topKOverride,
+                repeatPenalty: r.repeatPenaltyOverride,
+                presencePenalty: r.presencePenaltyOverride,
+                reasoningBudget: r.reasoningBudgetOverride,
+                reasoningEffort: r.reasoningEffort,
                 voice: r.voiceOverride,
                 wakePhrase: r.wakePhrase
             )
+        }
+
+        /// The wire value for `reasoning_effort`, gated on the turn's EFFECTIVE
+        /// thinking state: the server reads the field as a thinking opt-in, so
+        /// sending it with the toggle off would silently turn thinking on.
+        func reasoningEffortParam(thinking: Bool) -> String? {
+            thinking ? reasoningEffort.rawValue : nil
+        }
+
+        /// The per-request defaults for this turn: the user's saved sampling
+        /// with the agent's overrides laid on top. An override REPLACES the
+        /// saved value — including with the canonical "off" (top_k 0, repeat
+        /// 1.0, presence 0.0, budget -1), which clears the global rather than
+        /// leaving it standing, mapped to an omitted field exactly as
+        /// `RequestDefaults.from` maps it.
+        func requestDefaults(from opts: ServerOptions) -> APIClient.RequestDefaults {
+            var d = APIClient.RequestDefaults.from(opts)
+            if let v = topP { d.topP = v }
+            if let v = topK { d.topK = v > 0 ? v : nil }
+            if let v = repeatPenalty { d.repeatPenalty = v != 1.0 ? v : nil }
+            if let v = presencePenalty { d.presencePenalty = v != 0.0 ? v : nil }
+            if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
+            return d
         }
 
         /// The tools to ADVERTISE: none unless the loop is actually running.
@@ -312,6 +354,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// the orphaned streaming bubble.
     private func appendErrorNotice(_ error: Error, to sessionId: UUID) {
         appState.updateLastMessage(in: sessionId, streaming: false)
+        // Before the notice row is appended, so a regeneration's pager lands on
+        // the partial reply and not on our own error card.
+        appState.finishRevisions(in: sessionId)
         var msg = ChatMessage(role: .assistant, content: "")
         msg.isStreaming = false
         msg.failedRetry = true
@@ -379,6 +424,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             mediaProgressSessionId = nil
         }
         appState.updateLastMessage(in: sessionId, streaming: false)
+        appState.finishRevisions(in: sessionId)
         appState.saveChatHistory()
         publishTurnState()
     }
@@ -393,18 +439,32 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             mediaProgress = nil
             mediaProgressSessionId = nil
         }
+        // The ONE exit both paths complete through. A regeneration's held seed
+        // is applied here rather than when the turn started, because on the
+        // agent path the reply it belongs to is the last of several appended
+        // from inside the Task — see AppState.pendingRevisionSeed.
+        appState.finishRevisions(in: sessionId)
+        appState.saveChatHistory()
         publishTurnState()
+    }
+
+    /// Apple's on-device model answers with no mlx-serve process, so the
+    /// server gate does not apply to it.
+    nonisolated static func canRunTurn(serverRunning: Bool, apple: Bool) -> Bool {
+        apple || serverRunning
     }
 
     func runTurn(sessionId: UUID,
                  userText: String,
                  images: [ChatImage]?,
+                 videos: [ChatVideo]? = nil,
                  audio: [ChatAudio]?,
                  config: TurnConfig,
                  approval: @escaping (APIClient.ToolCall) async -> Bool) {
         let text = userText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty || images != nil || audio != nil,
-              server.status == .running else { return }
+        guard !text.isEmpty || images != nil || videos != nil || audio != nil,
+              Self.canRunTurn(serverRunning: server.status == .running,
+                              apple: appState.useAppleModel) else { return }
 
         // A new submission to the SAME session supersedes its in-flight turn.
         // Other sessions' turns are untouched — the engine is multi-turn.
@@ -422,40 +482,104 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
 
         if config.agentMode || config.mcpMode || config.documentIndex != nil {
-            runAgentTurn(sessionId: sessionId, text: text, images: images, audio: audio,
+            runAgentTurn(sessionId: sessionId, text: text, images: images, videos: videos, audio: audio,
                          config: config, token: token, approval: approval)
         } else {
-            runPlainTurn(sessionId: sessionId, text: text, images: images, audio: audio,
+            runPlainTurn(sessionId: sessionId, text: text, images: images, videos: videos, audio: audio,
                          config: config, token: token)
         }
     }
 
+    /// Regenerate the last reply: drop the last user turn (and whatever
+    /// followed it — the old assistant reply, any tool-call chain) and
+    /// resubmit that same user text as a fresh turn. Reuses `runTurn` rather
+    /// than duplicating the plain/agent branching, so a regenerated turn is
+    /// indistinguishable from a freshly sent one.
+    func regenerate(sessionId: UUID, config: TurnConfig,
+                     approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        guard let msgs = session(sessionId)?.messages,
+              let lastUserIdx = msgs.lastIndex(where: { $0.role == .user })
+        else { return }
+        let text = msgs[lastUserIdx].content
+        let images = msgs[lastUserIdx].images
+        let audio = msgs[lastUserIdx].audio
+        // The reply about to be destroyed. `truncateMessages` drops everything
+        // from the last user turn onward, so this is the only moment it can be
+        // captured — and a regeneration that silently threw away a better first
+        // answer is the whole reason the pager exists.
+        let replaced = msgs[(lastUserIdx + 1)...].last { $0.role == .assistant && !$0.content.isEmpty }
+        appState.truncateMessages(in: sessionId, keepingFirst: lastUserIdx)
+        runTurn(sessionId: sessionId, userText: text, images: images, audio: audio,
+                config: config, approval: approval)
+        // AFTER runTurn, which opens with `stop(sessionId:)` — and stop is a
+        // turn exit, so a seed placed before it would be spent immediately.
+        // The seed is HELD from here and applied when this turn ends: the
+        // reply it belongs to does not exist yet, and on the agent path it is
+        // the last of several appended from inside the Task.
+        if let replaced { appState.seedRevisions(in: sessionId, from: replaced) }
+    }
+
+    /// Extend the reply at the end of the transcript instead of answering
+    /// after it — the model is handed its own unfinished text and resumes.
+    ///
+    /// Deliberately NOT routed through `runTurn`: that appends a user message
+    /// and a fresh placeholder, which is exactly what a continuation must not
+    /// do. It also never takes the agent path — a tool loop mid-reply would
+    /// have to splice a call into text the user has already read.
+    func continueReply(sessionId: UUID, config: TurnConfig) {
+        guard ContinueReply.isEligible(session(sessionId)?.messages ?? [],
+                                       serverRunning: server.status == .running,
+                                       busy: composerState(for: sessionId) != .idle,
+                                       engine: server.chatModelInfo?.engine,
+                                       apple: appState.useAppleModel)
+        else { return }
+        stop(sessionId: sessionId)
+        let token = ledger.begin(session: sessionId)
+        // AFTER stop, which is a turn exit and would consume the mark — the
+        // same ordering hazard `regenerate` has with its seed. It tells the
+        // turn exit to EXTEND the version being read rather than file the
+        // continuation as a new one.
+        appState.markContinuing(sessionId)
+        publishTurnState()
+        runPlainTurn(sessionId: sessionId, text: "", images: nil, audio: nil,
+                     config: config, token: token, continuing: true)
+    }
+
     // MARK: - Plain chat
 
+    /// - Parameter continuing: extend the reply already at the end of the
+    ///   transcript instead of answering after it. No user message is added and
+    ///   no placeholder is appended — the trailing assistant message IS the
+    ///   placeholder, and the server is told to treat it as a prefill.
     private func runPlainTurn(sessionId: UUID, text: String,
-                              images: [ChatImage]?, audio: [ChatAudio]?,
-                              config: TurnConfig, token: UUID) {
-        var userMsg = ChatMessage(role: .user, content: text)
-        userMsg.images = images
-        userMsg.audio = audio
-        appState.appendMessage(to: sessionId, message: userMsg)
+                              images: [ChatImage]?, videos: [ChatVideo]? = nil, audio: [ChatAudio]?,
+                              config: TurnConfig, token: UUID,
+                              continuing: Bool = false) {
+        if !continuing {
+            var userMsg = ChatMessage(role: .user, content: text)
+            userMsg.images = images
+            userMsg.videos = videos
+            userMsg.audio = audio
+            appState.appendMessage(to: sessionId, message: userMsg)
+        }
 
         let api = APIClient()
 
         // Build the request from the session (its source of truth). We append
         // the streaming placeholder AFTER this so it never lands in the
-        // request — same pattern the agent loop uses. Image handling: only
-        // the latest user message's images are sent (older turns' images are
-        // stripped for bandwidth).
+        // request — same pattern the agent loop uses. Image/video handling:
+        // only the latest user message's attachments are sent (older turns'
+        // are stripped for bandwidth).
         let sessionMsgs = session(sessionId)?.messages ?? []
         let lastUserIdx = sessionMsgs.lastIndex { $0.role == .user }
         let useServerPreprocess = wantsServerImagePreprocess
         let history: [[String: Any]] = sessionMsgs.enumerated().map { i, msg in
             if i == lastUserIdx, msg.role == .user {
                 let imgs = msg.images ?? []
+                let vids = msg.videos ?? []
                 let clips = msg.audio ?? []
-                if !imgs.isEmpty || !clips.isEmpty {
-                    return ["role": "user", "content": Self.buildMultimodalContent(text: msg.content, images: imgs, audio: clips, serverPreprocess: useServerPreprocess)]
+                if !imgs.isEmpty || !vids.isEmpty || !clips.isEmpty {
+                    return ["role": "user", "content": Self.buildMultimodalContent(text: msg.content, images: imgs, videos: vids, audio: clips, serverPreprocess: useServerPreprocess)]
                 }
             }
             return Self.plainHistoryDict(msg)
@@ -479,6 +603,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 phrase: config.wakePhrase ?? appState.serverOptions.wakePhrase,
                 hasPersona: !persona.isEmpty))
         }
+        // Third explicit ask: a skill the user invoked by NAME (`/music3 …`).
+        // Plain chat builds its own system message, so this is a SECOND
+        // construction site — the agent loop's injection does not cover it
+        // (live: /music3 with Tools off answered from the model's own head).
+        let invokedSkill = AgentPrompt.skillManager.invokedSkill(for: text)
+        if !invokedSkill.isEmpty { plainSystemBits.append(invokedSkill) }
         if !plainSystemBits.isEmpty {
             messagesArray.insert(["role": "system",
                                   "content": plainSystemBits.joined(separator: "\n\n")],
@@ -486,36 +616,57 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
 
         // Streaming placeholder for the UI — appended AFTER the request body is
-        // built so it doesn't show up in the prompt.
-        var assistantMsg = ChatMessage(role: .assistant, content: "")
-        assistantMsg.isStreaming = true
-        appState.appendMessage(to: sessionId, message: assistantMsg)
+        // built so it doesn't show up in the prompt. A continuation has one
+        // already: the reply being extended. Appending a second would stream
+        // the rest of the sentence into a NEW bubble under the one it belongs
+        // to, and `updateLastMessage` (which appends) writes to the last
+        // message either way, so reusing it needs no other change.
+        if continuing {
+            // The notice said the reply was cut. It is being un-cut.
+            appState.clearTruncationNotice(in: sessionId)
+            appState.updateLastMessage(in: sessionId, streaming: true)
+        } else {
+            var assistantMsg = ChatMessage(role: .assistant, content: "")
+            assistantMsg.isStreaming = true
+            appState.appendMessage(to: sessionId, message: assistantMsg)
+        }
 
         tasks[sessionId] = Task { [weak self] in
             await self?.streamPlainResponse(api: api, sessionId: sessionId,
                                             messages: messagesArray, config: config,
-                                            token: token)
+                                            token: token, continuing: continuing)
         }
     }
 
     private func streamPlainResponse(api: APIClient, sessionId: UUID,
                                      messages: [[String: Any]], config: TurnConfig,
-                                     token: UUID) async {
+                                     token: UUID, continuing: Bool = false) async {
         do {
+            let thinking = config.enableThinking || appState.serverOptions.defaultEnableThinking
+            let stream: AsyncThrowingStream<SSEEvent, Error>
+            if appState.useAppleModel {
+                // Apple's on-device model needs no server and no load.
+                stream = AppleFoundationChat.stream(
+                    messages: messages,
+                    temperature: turnTemperature(config, default: appState.serverOptions.defaultTemperature))
+            } else {
             // A media-first server runs headless (no default model) — hot-load
             // the selected chat model once so the request below resolves.
             await server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
             // Pin the request to the active model (server-resolved default if
             // nil) so hot-switch can finish in-flight requests on the old model.
-            let stream = api.streamChat(
+            stream = api.streamChat(
                 port: server.port,
                 messages: messages,
                 maxTokens: turnMaxTokens(config),
                 temperature: turnTemperature(config, default: appState.serverOptions.defaultTemperature),
-                enableThinking: config.enableThinking || appState.serverOptions.defaultEnableThinking,
-                defaults: APIClient.RequestDefaults.from(appState.serverOptions),
-                modelId: server.chatModelId
+                enableThinking: thinking,
+                reasoningEffort: config.reasoningEffortParam(thinking: thinking),
+                defaults: config.requestDefaults(from: appState.serverOptions),
+                modelId: server.chatModelId,
+                continueFinalMessage: continuing
             )
+            }
             var coalescer = StreamCoalescer()
             beginLiveTokenCount(for: sessionId)
             for try await event in stream {
@@ -527,16 +678,23 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     streamDelta(reasoning: text, coalescer: &coalescer, to: sessionId)
                 case .usage(let usage):
                     applyStreamBatch(coalescer.drain(), to: sessionId)
-                    appState.updateLastMessage(in: sessionId, usage: usage)
+                    // A continuation streams into a message that already
+                    // carries a generation's worth of tokens, so the counts
+                    // ADD — the footnote describes the reply, and the reply is
+                    // both halves.
+                    appState.updateLastMessage(in: sessionId, usage: usage,
+                                               addingCompletionTokens: continuing)
                     setLiveTokens(usage.completionTokens, for: sessionId)   // reconcile to the authoritative count
                 case .toolCalls:
                     break
-                case .maxTokensReached:
+                case .truncated(let cause):
                     // Plain chat is a single, always-terminal response — show the
-                    // notice immediately (no agent loop to stack it). Flush any
-                    // buffered text first so the notice lands after it, in order.
+                    // notice immediately (no agent loop to stack it). It rides the
+                    // message as DATA, never content: content is what history
+                    // builders send back, and the old in-content banner taught
+                    // the model its own warning text.
                     applyStreamBatch(coalescer.drain(), to: sessionId)
-                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(maxTokens: turnMaxTokens(config)))
+                    appState.updateLastMessage(in: sessionId, truncation: .init(cause: cause, maxTokens: turnMaxTokens(config)))
                 case .done:
                     break
                 }
@@ -562,11 +720,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     // MARK: - Agent mode (native tool calling)
 
     private func runAgentTurn(sessionId: UUID, text: String,
-                              images: [ChatImage]?, audio: [ChatAudio]?,
+                              images: [ChatImage]?, videos: [ChatVideo]? = nil, audio: [ChatAudio]?,
                               config: TurnConfig, token: UUID,
                               approval: @escaping (APIClient.ToolCall) async -> Bool) {
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.images = images
+        userMsg.videos = videos
         userMsg.audio = audio
         appState.appendMessage(to: sessionId, message: userMsg)
 
@@ -672,7 +831,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             let turnMax = turnMaxTokens(config)
             let contextLength = AgentEngine.effectiveContextLength(
                 appContextSize: appState.contextSize,
-                modelContextLength: server.chatModelInfo?.contextLength
+                modelContextLength: server.chatModelInfo?.contextLength,
+                apple: appState.useAppleModel
             )
             let useServerPreprocess = wantsServerImagePreprocess
             var history = AgentEngine.buildAgentHistory(
@@ -712,6 +872,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // working-dir listing: matched skills (per message), the
                 // working-dir listing (changes as files change), then the
                 // learned recent-dirs/commands snippet (changes per command).
+                // Most-stable volatile item first (it only changes when the
+                // user switches music model), so a per-message skill hit
+                // re-prefills less.
+                if config.advertisedTools.contains(.generateMusic) {
+                    agentVolatileTail += AgentPrompt.musicEngineNote(
+                        MusicGenSettings.load().resolvedModel(models: server.allModels))
+                }
                 agentVolatileTail += skills
                 if let wd = workingDirectory {
                     agentVolatileTail += AgentEngine.workingDirectoryContext(wd)
@@ -726,6 +893,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 systemPrompt = AgentPrompt.docsOnlySystemPrompt(
                     folderName: index?.folderName ?? "documents",
                     fileCount: indexedFileCount(index))
+            }
+            // A skill invoked by NAME (`/music3 …`) works in every mode: the
+            // user asked for it explicitly, so it does not wait for the agent
+            // loop's trigger matching (which also covers it, above).
+            if !config.agentMode {
+                agentVolatileTail += AgentPrompt.skillManager.invokedSkill(for: userMsg)
             }
             // Attached-docs section for the modes whose base prompt doesn't
             // already explain the searchDocuments tool.
@@ -781,33 +954,49 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // Stream model response with tools
             var receivedToolCalls: [APIClient.ToolCall] = []
             var maxTokensHit = false
+            var truncationCause: TruncationNotice.Cause? = nil
             let combinedToolsJSON = Self.combinedToolsJSON(
                 tools: config.advertisedTools,
                 mcpToolsJSON: mcpToolsJSON,
-                docsToolJSON: config.documentIndex != nil ? AgentPrompt.searchDocumentsToolJSON : nil
+                // The docs tool normally rides along with an attached folder;
+                // on-device there is no room for a third definition.
+                docsToolJSON: config.documentIndex != nil && !appState.useAppleModel
+                    ? AgentPrompt.searchDocumentsToolJSON : nil
             )
+            let stream: AsyncThrowingStream<SSEEvent, Error>
+            if appState.useAppleModel {
+                // The on-device model's tool calls come back OUT of its
+                // session as `.toolCalls`, so the loop below — approvals,
+                // repetition guard, logging — is the same one every model runs.
+                stream = AppleFoundationChat.stream(
+                    messages: messages, toolsJSON: combinedToolsJSON,
+                    temperature: turnTemperature(config, default: Self.agentLoopTemperature))
+            } else {
             // Headless (media-first) server → ensure the selected chat model
             // is loaded + promoted before the alias-addressed request.
             await server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
-            let stream = api.streamChat(
+            stream = api.streamChat(
                 port: server.port,
                 messages: messages,
                 maxTokens: turnMaxTokens(config),
                 temperature: turnTemperature(config, default: Self.agentLoopTemperature),
                 enableThinking: config.enableThinking,
+                reasoningEffort: config.reasoningEffortParam(thinking: config.enableThinking),
                 toolsJSON: combinedToolsJSON,
-                defaults: APIClient.RequestDefaults.from(appState.serverOptions),
+                defaults: config.requestDefaults(from: appState.serverOptions),
                 modelId: server.chatModelId
             )
+            }
 
             // No client-side stream watchdog: long generations (large
             // contexts, big batches, slow sampling on big MoE) can legitimately
             // sit silent for minutes between events. The user keeps the Stop
             // button as the manual cancel; URLSession's own resource timeout
             // (set in APIClient) handles a truly broken socket.
-            let streamTask = Task<(tcs: [APIClient.ToolCall], maxHit: Bool), Error> {
+            let streamTask = Task<(tcs: [APIClient.ToolCall], maxHit: Bool, cause: TruncationNotice.Cause?), Error> {
                 var tcs: [APIClient.ToolCall] = []
                 var maxHit = false
+                var cause: TruncationNotice.Cause? = nil
                 var coalescer = StreamCoalescer()
                 self.beginLiveTokenCount(for: sessionId)
                 for try await event in stream {
@@ -823,12 +1012,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                         self.setLiveTokens(usage.completionTokens, for: sessionId)   // reconcile to the authoritative count
                     case .toolCalls(let calls):
                         tcs = calls
-                    case .maxTokensReached:
+                    case .truncated(let c):
                         // Just record it. The notice is surfaced once at the
                         // turn's terminal exit (see below) — appending here, per
                         // iteration, is what stacked duplicate banners on a
                         // multi-step agent turn.
                         maxHit = true
+                        cause = c
                     case .done:
                         break
                     }
@@ -836,7 +1026,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // Flush the trailing batch so the message content is complete
                 // before the post-stream truncation/pad checks read it back.
                 self.applyStreamBatch(coalescer.drain(), to: sessionId)
-                return (tcs, maxHit)
+                return (tcs, maxHit, cause)
             }
             // Wire the user's Stop button through to the inner stream task.
             do {
@@ -847,10 +1037,25 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 }
                 receivedToolCalls = result.tcs
                 maxTokensHit = result.maxHit
+                truncationCause = result.cause
             } catch is CancellationError {
                 throw CancellationError()
             }
             appState.updateLastMessage(in: sessionId, streaming: false)
+
+            // A repetition-loop cut ENDS the turn, ahead of every recovery path
+            // below. The loop's text is already in the transcript — a streamed
+            // delta cannot be retracted, so the server's own trim never reaches
+            // a streaming client — and the next round would send it back as
+            // history for the model to read and resume. That is the error-echo
+            // class with our own transcript as the error, and from the server it
+            // looks like five cuts in a row, each firing sooner than the last
+            // (live 2026-08-05, under pi). Every other "length" cause keeps
+            // its recovery: the reply was fine and simply ran out of room.
+            if TruncationNotice.endsTurn(cause: truncationCause) {
+                appState.updateLastMessage(in: sessionId, truncation: .init(cause: .repetitionLoop, maxTokens: turnMaxTokens(config)))
+                return
+            }
 
             // Truncation recovery: if max_tokens was hit AND tool calls were received,
             // the tool call args are likely truncated (incomplete JSON). Don't execute them —
@@ -955,7 +1160,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // was cut off by the cap, surface the truncation notice exactly
                 // once here — not per iteration in the stream loop above.
                 if TruncationNotice.shouldShow(maxTokensHit: maxTokensHit, turnEnding: true, willRetry: false) {
-                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(maxTokens: turnMaxTokens(config)))
+                    appState.updateLastMessage(in: sessionId, truncation: .init(cause: truncationCause ?? .maxTokens, maxTokens: turnMaxTokens(config)))
                 }
                 return
             }
@@ -1072,16 +1277,23 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 toolMsg.toolName = result.name
 
                 // Inline images. `browse` screenshots attach to the (hidden) tool
-                // message as VISION INPUT for the next turn. `generate_image`
-                // instead surfaces the rendered image to the USER as a separate
-                // visible assistant message (the tool message is hidden, and only
-                // a `.message` bubble renders images — ChatView ~1793); its
-                // model-facing content keeps just the caption/path, never the
-                // multi-KB base64 (which would blow up the context).
-                var pendingInlineImage: ChatImage? = nil
-                // A produced track or clip rides back as a PATH, not bytes — see
-                // ChatMediaRef. Same split-and-hide shape as the image marker:
-                // the model gets the caption, the user gets a player.
+                // message as VISION INPUT for the next turn, and they live only
+                // as long as this run of the app. Nothing reads them from a
+                // reopened conversation: the transcript hides tool messages
+                // (`ChatRows.rows` drops everything with a `toolCallId`) and
+                // the agent loop sends images from the last USER message only.
+                // A file under `attachments/` would be one nobody looks at,
+                // kept until the conversation is deleted.
+                //
+                // A GENERATED image keeps none. The generator already wrote the
+                // original to `~/.mlx-serve/generations`, and the ref below
+                // carries its path, so the transcript draws from that file. The
+                // history used to carry a second, re-encoded JPEG of a picture
+                // already on disk: 424 KB on a 1 MB history where the text was
+                // 29 KB.
+                //
+                // Produced tracks and clips ride a PATH, not bytes, for the same
+                // reason — see ChatMediaRef.
                 var pendingMediaRef: ChatMediaRef? = nil
                 if (result.name == "browse" || result.name == "generate_image")
                     && result.output.contains(AgentMediaInline.jpegDataURIMarker) {
@@ -1091,12 +1303,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                         // A generated image ships BOTH markers, so the caption
                         // comes from the ref split (which stops before the ref
                         // line) rather than the image split (which would keep
-                        // it). The ref is what gives the picture the same
-                        // Reveal-in-Finder button as a track or a clip.
+                        // it). The ref is the whole attachment now: the picture,
+                        // its caption and its Reveal-in-Finder button all come
+                        // from the file it points at, so the inline bytes this
+                        // branch decoded are dropped on the floor.
                         let (caption, ref) = AgentMediaInline.splitMediaRef(
                             result.output, prompt: tc.arguments["prompt"] ?? "")
                         toolMsg.content = caption.isEmpty ? "[image generated]" : caption
-                        pendingInlineImage = chatImage
                         pendingMediaRef = ref
                     } else if let chatImage {
                         toolMsg.images = [chatImage]
@@ -1122,13 +1335,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
                 // Render the generated media inline AFTER the tool-call card, via
                 // a visible assistant `.message` (the only row that displays it).
-                // ONE message even when both are set — a generated image is its
-                // bytes AND its file, and splitting them would put the caption
-                // and its Reveal button in a separate row from the picture.
-                if pendingInlineImage != nil || pendingMediaRef != nil {
+                if let ref = pendingMediaRef {
                     var mediaMsg = ChatMessage(role: .assistant, content: "")
-                    mediaMsg.images = pendingInlineImage.map { [$0] }
-                    mediaMsg.media = pendingMediaRef.map { [$0] }
+                    mediaMsg.media = [ref]
                     appState.appendMessage(to: sessionId, message: mediaMsg)
                 }
             }
@@ -1260,7 +1469,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runImageTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = ImageGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         // A LAN model picked in the Image pane needs no local download — the
         // hosting Mac has the weights.
         let lanId = LanPick.lanId(s.modelId)
@@ -1268,8 +1477,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                             approxGB: "\(model.approxDownloadGB)",
                                             window: "Image", lanId: lanId) { return notice }
         let req = try MediaToolArgs.image(args, model: model,
-                                          saved: s.resolvedResolution(for: model),
-                                          seed: s.seed, safeMode: s.safeMode,
+                                          saved: s.concreteResolution(for: model),
+                                          seed: s.seed,
                                           keepResident: s.keepResident, lanId: lanId)
         let path = try await appState.imageGen.generateForAgent(req, server: appState.server,
                                                                 onProgress: onProgress)
@@ -1291,7 +1500,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runSpeechTool(_ args: [String: String],
                                onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = AudioGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: String(format: "%.1f", model.approxDownloadGB),
@@ -1311,7 +1520,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runMusicTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = MusicGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: String(format: "%.1f", model.approxDownloadGB),
@@ -1327,13 +1536,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func runVideoTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = VideoGenSettings.load()
-        let model = s.resolvedModel
+        let model = s.resolvedModel(models: appState.server.allModels)
         let lanId = LanPick.lanId(s.modelId)
         if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
                                             approxGB: "\(model.approxFirstRunDownloadGB)",
                                             window: "Video", lanId: lanId) { return notice }
         let req = try MediaToolArgs.video(args, model: model,
-                                          saved: s.resolvedResolution(for: model),
+                                          saved: s.concreteResolution(for: model),
                                           keepResident: s.keepResident, lanId: lanId)
         let path = try await appState.videoGen.generateForAgent(req, server: appState.server,
                                                                 onProgress: onProgress)
@@ -1443,8 +1652,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// nothink signature without it, so the model stops thinking from turn 2.
     /// Templates that strip history reasoning (Qwen, Gemma) never read it.
     nonisolated static func plainHistoryDict(_ msg: ChatMessage) -> [String: Any] {
-        var d: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
-        if msg.role == .assistant && msg.content.isEmpty { d.removeValue(forKey: "content") }
+        // `truncationNotice` is a field, so it never rides here by construction;
+        // the strip covers sessions saved when the banner lived IN content.
+        let content = msg.role == .assistant
+            ? TruncationNotice.stripped(from: msg.content) : msg.content
+        var d: [String: Any] = ["role": msg.role.rawValue, "content": content]
+        if msg.role == .assistant && content.isEmpty { d.removeValue(forKey: "content") }
         if msg.role == .assistant, let rc = msg.reasoningContent, !rc.isEmpty {
             d["reasoning_content"] = rc
         }
@@ -1452,20 +1665,20 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     }
 
     /// Build OpenAI-style content blocks for a message with images (and,
-    /// optionally, audio). Delegates to the pure, unit-tested `MultimodalContent`
-    /// builder. Two overloads so the `buildAgentHistory` closure (images only)
-    /// and the plain-chat path (images + audio) can both reference it.
+    /// optionally, video/audio). Delegates to the pure, unit-tested
+    /// `MultimodalContent` builder. Two overloads so the `buildAgentHistory`
+    /// closure (images only — the agent tool-loop doesn't send video/audio
+    /// attachments to the model, same as audio today) and the plain-chat path
+    /// (images + video + audio) can both reference it.
     nonisolated static func buildMultimodalContent(text: String, images: [ChatImage], serverPreprocess: Bool = false) -> Any {
-        MultimodalContent.build(text: text, images: images, audio: [], serverPreprocess: serverPreprocess)
+        MultimodalContent.build(text: text, images: images, videos: [], audio: [], serverPreprocess: serverPreprocess)
     }
 
-    nonisolated static func buildMultimodalContent(text: String, images: [ChatImage], audio: [ChatAudio], serverPreprocess: Bool = false) -> Any {
-        MultimodalContent.build(text: text, images: images, audio: audio, serverPreprocess: serverPreprocess)
+    nonisolated static func buildMultimodalContent(text: String, images: [ChatImage], videos: [ChatVideo] = [], audio: [ChatAudio], serverPreprocess: Bool = false) -> Any {
+        MultimodalContent.build(text: text, images: images, videos: videos, audio: audio, serverPreprocess: serverPreprocess)
     }
 
-    /// Whether the loaded model wants server-side image preprocessing (Qwen3-VL):
-    /// its `x-mlx-pixels` square format is Gemma-only, so Qwen sends raw images.
     var wantsServerImagePreprocess: Bool {
-        (server.chatModelInfo?.architecture ?? "").hasPrefix("qwen")
+        MultimodalContent.wantsServerPreprocess(architecture: server.chatModelInfo?.architecture ?? "")
     }
 }

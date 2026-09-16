@@ -34,6 +34,22 @@ done
 # capabilities advertise "video"
 curl -s "http://127.0.0.1:$PORT/v1/models" | grep -q '"video"' || { echo "FAIL: /v1/models missing video capability"; exit 1; }
 
+# The pack's own config.json decides which text encoder loads, and a 2.5 pack
+# ships one INSIDE itself. Getting this wrong does not crash — the connector
+# would project a stack from the wrong encoder and generate a plausible video
+# for a prompt nobody typed — so assert the resolution rather than the output.
+VERSION=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('model_version','2.3.0'))" "$MODEL/config.json" 2>/dev/null || echo 2.3.0)
+case "$VERSION" in
+  2.5*)
+    grep -q "LTX v25" /tmp/test_video_server.log || { echo "FAIL: 2.5 pack did not load as v25"; grep -i "\[video\]" /tmp/test_video_server.log | head -3; exit 1; }
+    grep -q "gemma text encoder: $MODEL/gemma4-12b-ltx-v1" /tmp/test_video_server.log || { echo "FAIL: 2.5 pack did not resolve its in-pack text encoder"; grep -i "text encoder" /tmp/test_video_server.log | head -3; exit 1; }
+    echo "PASS: LTX 2.5 resolved its own in-pack Gemma-4 text encoder"
+    ;;
+  *)
+    grep -q "LTX v23" /tmp/test_video_server.log || { echo "FAIL: 2.3 pack did not load as v23"; grep -i "\[video\]" /tmp/test_video_server.log | head -3; exit 1; }
+    ;;
+esac
+
 OUT=/tmp/test_video_gen.json
 code=$(curl -s --max-time 600 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
   -d '{"prompt":"a red fox running through a snowy forest","num_frames":9,"height":256,"width":384,"steps":4,"seed":42}' \
@@ -155,8 +171,81 @@ PY
   else
     echo "FAIL: I2V http $code"; head -c 300 "$I2V"; rc=1
   fi
+
+  # ── First + last frame (#260) ─────────────────────────────────────────────
+  # The last anchor is a top-dark/bottom-bright split; the first stays the
+  # left/right one. Frame 0 must show the left/right split, the final frame
+  # the top/bottom one, and the engine must log BOTH anchors engaged.
+  LAST_IMG=/tmp/test_flf_last.png
+  python3 - "$LAST_IMG" <<'PY'
+import sys, struct, zlib
+W, H = 384, 256
+def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+raw = bytearray()
+for y in range(H):
+    raw.append(0)
+    v = 20 if y < H // 2 else 235   # top dark, bottom bright
+    raw += bytes((v, v, v)) * W
+png = b"\x89PNG\r\n\x1a\n"
+png += chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+png += chunk(b"IEND", b"")
+open(sys.argv[1], "wb").write(png)
+PY
+  LB64=$(base64 < "$LAST_IMG" | tr -d '\n')
+  FLF=/tmp/test_video_flf.json
+  python3 -c "import json,sys;json.dump({'prompt':'a red fox running through a snowy forest','num_frames':17,'height':256,'width':384,'steps':4,'seed':7,'first_frame_image':sys.argv[1],'last_frame_image':sys.argv[2]}, open('/tmp/test_flf_req.json','w'))" "$B64" "$LB64"
+  code=$(curl -s --max-time 600 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    --data @/tmp/test_flf_req.json -o "$FLF" -w "%{http_code}")
+  if [ "$code" = "200" ]; then
+    grep -q "\[ltx\] keyframe conditioning: first=true last=true" /tmp/test_video_server.log \
+      || { echo "FAIL: last-frame anchor not engaged (no first=true last=true log line)"; rc=1; }
+    python3 - "$FLF" <<'PY'
+import sys, json, base64
+d = json.load(open(sys.argv[1]))
+F, H, W = d["frames"], d["height"], d["width"]
+assert F == 17, f"expected 17 frames, got {F}"
+raw = base64.b64decode(d["data"])
+fb = H * W * 3
+def gray(px, i): return (px[i] + px[i+1] + px[i+2]) / 3.0
+def halves(frame, axis):
+    a = b = na = nb = 0.0
+    for y in range(H):
+        for x in range(W):
+            g = gray(frame, (y * W + x) * 3)
+            first = (x < W // 2) if axis == "x" else (y < H // 2)
+            if first: a += g; na += 1
+            else: b += g; nb += 1
+    return a / na, b / nb
+l, r = halves(raw[:fb], "x")
+t, b = halves(raw[(F - 1) * fb:F * fb], "y")
+print(f"FLF frame0 left={l:.1f} right={r:.1f}; last top={t:.1f} bottom={b:.1f}")
+assert r - l > 30, f"first frame did not adhere to the first anchor ({l:.1f} vs {r:.1f})"
+assert b - t > 30, f"last frame did not adhere to the last anchor ({t:.1f} vs {b:.1f})"
+print("PASS: first/last frame anchors both reconstruct")
+PY
+    [ $? -eq 0 ] || rc=1
+  else
+    echo "FAIL: FLF http $code"; head -c 300 "$FLF"; rc=1
+  fi
+  # Refusals are named, never a silent text-to-video downgrade.
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d '{"prompt":"x","num_frames":9,"height":256,"width":384,"steps":2,"last_frame_image":"!!notbase64"}' -o /tmp/test_flf_bad.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "last_frame_image" /tmp/test_flf_bad.json \
+    && echo "PASS: bad last_frame_image -> named 400" \
+    || { echo "FAIL: bad last_frame_image http $code"; head -c 200 /tmp/test_flf_bad.json; rc=1; }
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    --data "{\"prompt\":\"x\",\"num_frames\":5,\"height\":256,\"width\":384,\"steps\":2,\"last_frame_image\":\"$LB64\"}" -o /tmp/test_flf_short.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "9 frames" /tmp/test_flf_short.json \
+    && echo "PASS: last frame on a one-latent-frame canvas -> named 400" \
+    || { echo "FAIL: short canvas with last frame http $code"; head -c 200 /tmp/test_flf_short.json; rc=1; }
 else
   echo "no vae_encoder.safetensors in $MODEL -> skipping image-to-video test"
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d '{"prompt":"x","num_frames":9,"height":256,"width":384,"steps":2,"last_frame_image":"AAAA"}' -o /tmp/test_flf_noenc.json -w "%{http_code}")
+  [ "$code" = "400" ] && grep -q "vae_encoder" /tmp/test_flf_noenc.json \
+    && echo "PASS: last_frame_image without encoder -> named 400" \
+    || { echo "FAIL: last_frame_image without encoder http $code"; rc=1; }
 fi
 
 # ── Two-stage pipeline (dev CFG half-res → x2 upsample → distilled refine) ──
@@ -274,6 +363,88 @@ PY
 else
   echo "a2vid prerequisites incomplete in $MODEL -> skipping audio-to-video test"
 fi
+
+# ── DiffVAE decoder (`"decoder":"diffusion"`) ──────────────────────────────
+# LTX's own diffusion decoder, which their published clips are decoded with.
+# Only the 8-bit 2.5 pack ships `vae_diffusion_decoder.safetensors`; a pack
+# without it must answer a NAMED 400, never silently fall back to the conv
+# decoder (the two-stage-prerequisite precedent). ENGAGEMENT is the log line —
+# a 200 alone cannot tell the two decoders apart, and per-frame pixel metrics
+# fork with content, so this asserts the resolution and that the bytes DIFFER.
+DV_OUT=/tmp/test_video_gen_diffvae.json
+DV_REQ='{"prompt":"a red fox running through a snowy forest","num_frames":9,"height":256,"width":384,"steps":4,"seed":42'
+code=$(curl -s --max-time 900 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d "$DV_REQ,\"decoder\":\"diffusion\"}" -o "$DV_OUT" -w "%{http_code}")
+if [ -f "$MODEL/vae_diffusion_decoder.safetensors" ]; then
+  if [ "$code" != "200" ]; then
+    echo "FAIL: decoder=diffusion returned $code"; head -c 300 "$DV_OUT"; rc=1
+  else
+    grep -q "\[video\] decoder: diffusion" /tmp/test_video_server.log \
+      || { echo "FAIL: decoder=diffusion did not engage (no log line)"; rc=1; }
+    grep -q "\[diffvae\] NA kernel engaged" /tmp/test_video_server.log \
+      || { echo "FAIL: the DiffVAE NA kernel never ran"; rc=1; }
+    grep -q "\[diffvae\] decoding " /tmp/test_video_server.log \
+      || { echo "FAIL: no DiffVAE decode line"; rc=1; }
+    python3 - "$OUT" "$DV_OUT" <<'PYEOF' || rc=1
+import base64, json, sys
+conv = json.load(open(sys.argv[1]))
+diff = json.load(open(sys.argv[2]))
+if (conv["frames"], conv["height"], conv["width"]) != (diff["frames"], diff["height"], diff["width"]):
+    print("FAIL: diffusion decode changed the clip geometry"); sys.exit(1)
+a = base64.b64decode(conv["data"]); b = base64.b64decode(diff["data"])
+if len(a) != len(b):
+    print("FAIL: diffusion decode changed the byte count"); sys.exit(1)
+if a == b:
+    print("FAIL: decoder=diffusion produced the conv decoder's bytes"); sys.exit(1)
+
+# STATIC is the failure mode, and it is not a range check: noise spans 0..255
+# happily. The sampler contract (x0, one step, timesteps x1000) is MEASURED —
+# no pack ships a VAE config — and every wrong arm decodes to static, so the
+# guard is the mean absolute difference between horizontally adjacent pixels
+# (tests/lora_noise.py's metric, inlined here without numpy). It is compared
+# RELATIVELY: the absolute value is a property of the canvas and step count
+# (13.9 on a 4-step 9-frame 384x256 render, 2.2 on a 25-frame 8-step one), so
+# the bar is the CONV arm's own number on the same clip. Measured ratios:
+# 1.04-1.09 healthy, 16x on the broken sampler.
+def gradient(buf, w, h, frames):
+    total = 0
+    count = 0
+    row = w * 3
+    for f in range(0, frames, max(1, frames // 4)):
+        base = f * h * row
+        for y in range(0, h, 8):
+            o = base + y * row
+            for x in range(0, w - 1):
+                p = o + x * 3
+                q = p + 3
+                l = (buf[p] + buf[p + 1] + buf[p + 2]) / 3.0
+                r = (buf[q] + buf[q + 1] + buf[q + 2]) / 3.0
+                total += abs(l - r)
+                count += 1
+    return total / max(1, count)
+
+gc = gradient(a, conv["width"], conv["height"], conv["frames"])
+gd = gradient(b, diff["width"], diff["height"], diff["frames"])
+print(f"adjacent-pixel gradient: conv {gc:.2f}  diffusion {gd:.2f}  ratio {gd / max(gc, 1e-6):.2f}")
+if gd > gc * 2.0 + 2.0:
+    print("FAIL: decoder=diffusion decoded to STATIC — check the sampler contract "
+          "(MLX_SERVE_DIFFVAE_OUTPUT/STEPS/TSCALE)"); sys.exit(1)
+print(f"PASS: decoder=diffusion decoded {diff['frames']}f, real picture, differs from conv")
+PYEOF
+  fi
+elif [ "$code" = "400" ]; then
+  grep -q "vae_diffusion_decoder" "$DV_OUT" \
+    && echo "PASS: decoder=diffusion 400s by name when the pack does not ship it" \
+    || { echo "FAIL: 400 body does not name the missing file"; head -c 300 "$DV_OUT"; rc=1; }
+else
+  echo "FAIL: decoder=diffusion returned $code without the decoder file (want 400)"; rc=1
+fi
+
+# An unknown decoder name is a named 400 on every pack.
+code=$(curl -s --max-time 60 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d "$DV_REQ,\"decoder\":\"nope\"}" -o /tmp/test_video_gen_baddec.json -w "%{http_code}")
+[ "$code" = "400" ] && echo "PASS: unknown 'decoder' value 400s" \
+  || { echo "FAIL: unknown 'decoder' returned $code (want 400)"; rc=1; }
 
 # Optional: mux to mp4 if ffmpeg is present (proves a playable clip, with sound
 # when an audio track was decoded above into /tmp/test_video_gen.wav).

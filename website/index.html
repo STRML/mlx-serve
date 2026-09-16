@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>mlx-serve — Run any LLM on your Mac · MLX + GGUF · faster than LM Studio · OpenAI + Anthropic API</title>
-  <meta name="description" content="Native Zig inference server for Apple Silicon. Runs any LLM — MLX and GGUF — faster than LM Studio. OpenAI- and Anthropic-compatible (Claude Code) APIs. No Python. Drop-in alternative to LM Studio, Ollama, and llama.cpp on macOS. Gemma 4, Qwen 3.6, Llama 3, Mistral, DeepSeek V4 Flash — local, MIT-licensed.">
-  <meta name="keywords" content="MLX, MLX server, mlx-serve, Apple Silicon LLM, local LLM Mac, LM Studio alternative, Ollama alternative, Ollama API compatible, Ollama drop-in replacement, llama.cpp Mac, GGUF Apple Silicon, OpenAI compatible local, Anthropic API local, Claude Code local, DeepSeek V4 Flash, Gemma 4, Qwen 3.6, M1 M2 M3 M4 M5 LLM, native MLX inference, local image generation Mac, AI photo editing local, image to video Mac, AI agent sandbox">
+  <meta name="description" content="Native Zig inference server for Apple Silicon. Runs any LLM — MLX and GGUF — faster than LM Studio. OpenAI- and Anthropic-compatible (Claude Code) APIs. No Python. Drop-in alternative to LM Studio, Ollama, and llama.cpp on macOS. Gemma 4, Qwen 3.8, Llama 3, Mistral, DeepSeek V4 Flash — local, MIT-licensed.">
+  <meta name="keywords" content="MLX, MLX server, mlx-serve, Apple Silicon LLM, local LLM Mac, LM Studio alternative, Ollama alternative, Ollama API compatible, Ollama drop-in replacement, llama.cpp Mac, GGUF Apple Silicon, OpenAI compatible local, Anthropic API local, Claude Code local, DeepSeek V4 Flash, Gemma 4, Qwen 3.8, M1 M2 M3 M4 M5 LLM, native MLX inference, local image generation Mac, AI photo editing local, image to video Mac, AI agent sandbox">
   <meta name="author" content="David Dalcu">
   <link rel="canonical" href="https://mlxserve.com/">
   <!-- Open Graph -->
@@ -37,7 +37,7 @@
     "downloadUrl": "https://github.com/ddalcu/mlx-serve/releases/latest",
     "codeRepository": "https://github.com/ddalcu/mlx-serve",
     "license": "https://opensource.org/licenses/MIT",
-    "softwareVersion": "v26.7.12",
+    "softwareVersion": "v26.8.7",
     "author": { "@type": "Person", "name": "David Dalcu" },
     "description": "Native Zig inference server for Apple Silicon that runs any LLM — MLX and GGUF — with OpenAI- and Anthropic-compatible APIs. Faster than LM Studio. No Python. MIT licensed.",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -49,7 +49,7 @@
       "Anthropic Messages API (works with Claude Code)",
       "OpenAI Responses API + WebSocket transport",
       "Speculative decoding (PLD + Gemma 4 drafter)",
-      "KV-cache quantization (4-bit, 8-bit, TurboQuant)",
+      "KV-cache quantization (4-bit, 8-bit)",
       "Continuous batching",
       "Built-in agent mode with MCP tool calling",
       "DeepSeek V4 Flash via embedded ds4 engine",
@@ -77,7 +77,7 @@
         "name": "Is mlx-serve faster than LM Studio?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Yes, where it counts: on the v26.7.12 code matrix (Gemma 4 and Qwen 3.6 families, vs LM Studio 0.4.19) mlx-serve's best configuration decodes at 2.0x geomean over LM Studio's fastest engine per model, and +81% on identical MLX weights. The lead comes from speculative decoding: the Gemma drafter +53% on E4B code, native Qwen MTP +154% on the 35B-A3B, which also decodes +70% raw (153 vs 90 tok/s)."
+          "text": "Yes. On the v26.8.3 matrix (M4 Max, LM Studio 0.4.19+2, identical MLX weight files, both engines on shipping defaults), mlx-serve decodes +26% geomean and prefills +36% geomean across the four models LM Studio also has. The separation is prefill (+117% on Gemma 4 E4B) and speculative decoding: on Qwen 3.6 27B mlx-serve loads the checkpoint's MTP head and LM Studio does not, which is +145% decode on the same file. That's defaults against defaults, the number you actually get out of the box."
         }
       },
       {
@@ -244,6 +244,10 @@
       border-radius: 100px;
       margin-left: 2px;
     }
+
+    /* assets/version.js fills this from the latest GitHub release; until it
+       does (or if the call fails) there is nothing to show, so show nothing. */
+    .nav-ver:empty { display: none; }
 
     .nav-dl {
       font-size: 12.5px; font-weight: 600; color: var(--white) !important;
@@ -1216,7 +1220,7 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.7.12</span>
+      <span class="nav-ver"></span>
     </a>
     <input type="checkbox" id="nav-toggle" class="nav-toggle-input">
     <ul class="nav-links" onclick="if(event.target.closest('a')) document.getElementById('nav-toggle').checked=false">
@@ -1257,22 +1261,22 @@
       <div class="hero-meta-item"><strong>macOS 26+</strong></div>
       <div class="hero-meta-item"><strong>M1 – M5</strong></div>
       <div class="hero-meta-item"><strong>Free &amp; open source</strong></div>
-      <a href="https://github.com/ddalcu/mlx-serve/stargazers" class="hero-meta-item" style="text-decoration:none;color:var(--text-tertiary);" target="_blank" rel="noopener">★ <strong>Star on GitHub</strong></a>
+      <a href="https://github.com/ddalcu/mlx-serve/" class="hero-meta-item" style="text-decoration:none;color:var(--text-tertiary);" target="_blank" rel="noopener">★ <strong>Star on GitHub</strong></a>
     </div>
   </section>
 
   <!-- SCREENSHOT -->
   <section class="screenshot-section">
     <div class="screenshot-wrap">
-      <img src="demo-diffusion.gif" alt="MLX Core app — DiffusionGemma block diffusion running live in the chat interface" loading="lazy">
+      <img src="screenshots/ds4.jpg" alt="MLX Core app — Cat with Deepseek, Use Voice Mode, Generate Media" loading="lazy">
     </div>
   </section>
 
   <!-- MARQUEE -->
   <div class="marquee" aria-hidden="true">
     <div class="marquee-track">
-      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">Live Metrics</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
-      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">Live Metrics</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.8</span><span class="marquee-item">Muse-Glimmer</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">Live Metrics</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.8</span><span class="marquee-item">Muse-Glimmer</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">Live Metrics</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
     </div>
   </div>
 
@@ -1576,7 +1580,7 @@
       <a class="explore-card" href="lm-studio-alternative/" style="--ec:#0071e3;">
         <span class="explore-kicker">Compare</span>
         <h3>Faster than LM Studio</h3>
-        <p>+81% on identical models — keeps your library.</p>
+        <p>+26% on identical models, defaults vs defaults — keeps your library.</p>
         <span class="go">Deep dive →</span>
       </a>
       <a class="explore-card" href="ollama-alternative/" style="--ec:#0d8a45;">
@@ -1602,6 +1606,12 @@
         <h3>The local LLM tier list</h3>
         <p>Community S-tiers, filtered to your Mac's memory.</p>
         <span class="go">Cast your vote →</span>
+      </a>
+      <a class="explore-card" href="benchmarks/" style="--ec:#30d158;">
+        <span class="explore-kicker">Measure</span>
+        <h3>Community benchmarks</h3>
+        <p>Real tok/s by chip, GPU cores and memory, submitted from the app.</p>
+        <span class="go">See the numbers →</span>
       </a>
     </div>
   </section>
@@ -1717,7 +1727,7 @@
       </div>
     </div>
     <p class="spec-note reveal">
-      <b>How fast is native MTP?</b> On Qwen3.6-27B 4-bit (M4 Max, v26.7.12): code completion <b>28 → 78 tok/s (2.8×)</b> with the checkpoint's own MTP head, loaded from a sidecar like <a href="https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve" target="_blank" rel="noopener" style="color:var(--blue)">ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve</a> or straight out of an oMLX oQ checkpoint. In same-checkpoint head-to-heads, mlx-serve out-decodes MTPLX 2.3.0 at <b>all 8 context rungs</b> from 0.5K to 64K (+15–38%) and oMLX's Lightning MTP at all 8 on oMLX's own oQ4e checkpoint (+15–52%). At 64K context it decodes <b>37.4 tok/s where MTPLX does 30.3</b>. <a href="speculative-decoding/" style="color:var(--blue);text-decoration:none;">Speculative decoding, in depth →</a>
+      <b>How fast is native MTP?</b> On Qwen3.6-27B 4-bit (M4 Max, v26.7.12): code completion <b>28 → 78 tok/s (2.8×)</b> with the checkpoint's own MTP head, loaded from a sidecar like <a href="https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve" target="_blank" rel="noopener" style="color:var(--blue)">ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve</a> or straight out of an oMLX oQ checkpoint. In same-checkpoint head-to-heads on shipping defaults (v26.8.3), mlx-serve out-decodes MTPLX 2.5.3 by <b>+10%</b> with <b>+17%</b> prefill and a third of the time to first token (494 ms vs 1528 ms) on its own MTPLX-Optimized build, and oMLX 0.5.2's Lightning MTP at <b>every rung from 0.5K to 16K</b> on oMLX's own oQ4e checkpoint (+25% to +36%). <a href="speculative-decoding/" style="color:var(--blue);text-decoration:none;">Speculative decoding, in depth →</a>
     </p>
   </section>
 
@@ -1999,8 +2009,15 @@
         <div class="model-card">
           <div class="model-logo ml-qwen">Q</div>
           <div class="model-info">
-            <h3>Qwen 3.6</h3>
-            <p>Alibaba · 27B &amp; 35B-A3B · vision · extra-fast MTP builds</p>
+            <h3>Qwen 3.8</h3>
+            <p>Alibaba · 27B · vision · draft head built in, 75 tok/s on code</p>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-logo ml-llama" style="font-size:13px;">MG</div>
+          <div class="model-info">
+            <h3>Muse-Glimmer</h3>
+            <p>Meta · 30B · vision · ~2× faster with its bundled draft companion</p>
           </div>
         </div>
         <div class="model-card">
@@ -2035,14 +2052,14 @@
           <div class="model-logo ml-more">+</div>
           <div class="model-info">
             <h3>And thousands more</h3>
-            <p>Hunyuan 3 · Nemotron-H · LFM2.5 · Qwen 3-Next · Gemma 3 · any GGUF</p>
+            <p>Qwen 3.6 · Ling 3.0 · Hunyuan 3 · Nemotron-H · LFM2.5 (+VL) · Gemma 3 · any GGUF</p>
           </div>
         </div>
       </div>
     </div>
 
     <div class="models-group reveal">
-      <div class="models-group-label">Create — image, video &amp; voice</div>
+      <div class="models-group-label">Create — image, video, music &amp; voice</div>
       <div class="models-grid">
         <a class="model-card" href="image-generation/">
           <div class="model-logo ml-flux" style="font-size:13px;">FX</div>
@@ -2061,8 +2078,22 @@
         <a class="model-card" href="video-generation/">
           <div class="model-logo ml-ltx" style="font-size:11px;">LTX</div>
           <div class="model-info">
-            <h3>LTX-Video 2.3 <span class="model-flag f-vid">Video</span></h3>
-            <p>Lightricks · clips with synced sound · photo &amp; audio input</p>
+            <h3>LTX-Video 2.5 <span class="model-flag f-vid">Video</span></h3>
+            <p>Lightricks · clips with synced sound · photo &amp; audio input · 2.3 too</p>
+          </div>
+        </a>
+        <a class="model-card" href="video-generation/">
+          <div class="model-logo ml-ltx" style="font-size:11px;">H3</div>
+          <div class="model-info">
+            <h3>MiniMax-H3 <span class="model-flag f-vid">Video</span></h3>
+            <p>Hailuo 3.0 · video and its soundtrack denoised together</p>
+          </div>
+        </a>
+        <a class="model-card" href="music-generation/">
+          <div class="model-logo ml-tts" style="font-size:11px;">M3</div>
+          <div class="model-info">
+            <h3>MiniMax Music 3 <span class="model-flag f-voice">Music</span></h3>
+            <p>Sings your lyrics · songs up to 6 minutes · 44.1 kHz</p>
           </div>
         </a>
         <a class="model-card" href="image-generation/">
@@ -2108,7 +2139,7 @@
       </details>
       <details class="faq-item">
         <summary>Is mlx-serve faster than LM Studio?</summary>
-        <p>Yes, where it counts: on the v26.7.12 code matrix (Gemma 4 E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE, vs LM Studio 0.4.19) mlx-serve's best configuration decodes at <b>2.0× geomean over LM Studio's fastest engine per model</b>, and <b>+81%</b> on identical MLX weights. The lead comes from speculative decoding: the Gemma drafter <b>+53%</b> on E4B code, native Qwen MTP <b>+154%</b> on the 35B-A3B, which also decodes +70% raw (153 vs 90 tok/s).</p>
+        <p>Yes. On the v26.8.3 matrix (M4 Max, LM Studio 0.4.19+2, identical MLX weight files, <b>both engines on shipping defaults</b>), mlx-serve decodes <b>+26% geomean</b> and prefills <b>+36% geomean</b> across the four models LM Studio also has. The separation is prefill (<b>+117%</b> on Gemma 4 E4B) and speculative decoding: on Qwen 3.6 27B mlx-serve loads the checkpoint's MTP head and LM Studio does not, which is <b>+145%</b> decode on the same file. That's defaults against defaults, the number you actually get out of the box.</p>
       </details>
       <details class="faq-item">
         <summary>Does mlx-serve replace LM Studio?</summary>
@@ -2176,7 +2207,7 @@
       <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
-      <li><a href="https://github.com/ddalcu/mlx-serve/stargazers" target="_blank" rel="noopener">★ Star</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/" target="_blank" rel="noopener">★ Star</a></li>
     </ul>
     <ul class="footer-dives">
       <li><a href="onboarding/">Getting started</a></li>
@@ -2195,7 +2226,7 @@
       <li><a href="speculative-decoding/">Speculative decoding</a></li>
       <li><a href="local-ai-assistant/">Always-on assistant</a></li>
     </ul>
-    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.7.12</span> · built for Apple Silicon</p>
+    <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
   </footer>
 
   <script>
@@ -2255,6 +2286,7 @@
     }
 
   </script>
+  <script src="assets/version.js"></script>
   <script src="assets/perf-chart.js"></script>
 
 </body>

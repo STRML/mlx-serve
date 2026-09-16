@@ -7,15 +7,19 @@ import XCTest
 /// vanish from the tray, so the surfacing is tested through the real filter.
 final class ModelCatalogTests: XCTestCase {
 
-    func testQwen36MtpIsCuratedAndSurfacesInTray() {
-        let repo = "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve"
+    func testQwen38MtpIsCuratedAndSurfacesInTray() {
+        let repo = "ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
         XCTAssertTrue(
             gemmaModelOptions.contains { $0.repoId == repo },
-            "Qwen 3.6 27B (4-bit, MTP) must be in the curated catalog"
+            "Qwen 3.8 27B (4-bit, MTP) must be in the curated catalog"
         )
         XCTAssertTrue(
             gemmaModelOptionsTrayMenu.contains { $0.repoId == repo },
-            "Qwen 3.6 27B (4-bit, MTP) must surface in the menu-bar tray (id needs the \"4bit\" token)"
+            "Qwen 3.8 27B (4-bit, MTP) must surface in the menu-bar tray (id needs the \"4bit\" token)"
+        )
+        XCTAssertFalse(
+            gemmaModelOptions.contains { $0.repoId == "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve" },
+            "the Qwen 3.6 27B entry is superseded by the 3.8 build"
         )
     }
 
@@ -28,7 +32,7 @@ final class ModelCatalogTests: XCTestCase {
         guard let ds4 = gemmaModelOptions.first(where: { $0.id.contains("dsv4") }) else {
             return XCTFail("DeepSeek-V4-Flash must be in the curated catalog")
         }
-        XCTAssertEqual(ds4.repoId, "ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit")
+        XCTAssertEqual(ds4.repoId, "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw")
         XCTAssertNil(ds4.ggufFilename, "the native MLX mirror fetches the whole safetensors repo")
         XCTAssertEqual(ds4.minHostRamBytes, 128 * (UInt64(1) << 30))
         XCTAssertTrue(gemmaModelOptionsTrayMenu.contains { $0.id == ds4.id },

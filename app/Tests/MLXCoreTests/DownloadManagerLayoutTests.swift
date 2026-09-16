@@ -60,6 +60,29 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertNil(DownloadManager.existingModelDir(rootDir: tempRoot, repoId: "nobody/missing"))
     }
 
+    // MARK: - GGUF sidecar classification (mirror of Zig isGgufSidecarBasename)
+
+    /// The classifier decides which `.gguf` files in a repo folder are
+    /// selectable chat quants — anything not filtered becomes a tray entry
+    /// the server can only fail to load. Must stay in sync with the Zig
+    /// `model_discovery.isGgufSidecarBasename`.
+    func testGgufSidecarClassification() {
+        // mmproj + tokenizer + legacy MTP draft head.
+        XCTAssertTrue(DownloadManager.isGgufSidecar("mmproj-gemma-4-E4B-it-BF16.gguf"))
+        XCTAssertTrue(DownloadManager.isGgufSidecar("qwen3-tts-tokenizer-f16.gguf"))
+        XCTAssertTrue(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"))
+        // DSpark support GGUF (0731's replacement for the MTP sidecar,
+        // upstream `DeepSeek-V4-Flash-DSpark-support.gguf`): its name starts
+        // with "deepseek-v4-flash", so unfiltered it classifies as a
+        // servable chat quant via ggufModelType.
+        XCTAssertTrue(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-DSpark-support.gguf"))
+        // Real chat quants stay servable — including names that merely
+        // contain the letters without the delimited token.
+        XCTAssertFalse(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"))
+        XCTAssertFalse(DownloadManager.isGgufSidecar("DeepSeek-V4-Flash-dsparkle-chat.gguf"))
+        XCTAssertFalse(DownloadManager.isGgufSidecar("gemma-4-E4B-it-Q4_K_M.gguf"))
+    }
+
     // MARK: - File selection (recursive tree, incl. mtp/ sidecar)
 
     /// Regression for the silent MTP-sidecar drop: a model download must pull
@@ -95,6 +118,28 @@ final class DownloadManagerLayoutTests: XCTestCase {
         // Sidecar size is threaded through for the progress/space pre-check.
         let sidecar = DownloadManager.selectNeededFiles(from: entries).first { $0.0 == "mtp/weights.safetensors" }
         XCTAssertEqual(sidecar?.1, 524_000_000)
+    }
+
+    /// A `.bin` sidecar the engine READS is a needed file (qwen4_exp's
+    /// `ngram_table.bin`, mmapped at serve time): the extension allowlist used
+    /// to drop it, so app-downloaded packs crashed on a missing table while
+    /// `mlx-serve pull` (denylist) got it. Torch-format duplicates stay out on
+    /// both sides — same rule, so keep this in sync with `cli.shouldDownload`.
+    func testSelectNeededFilesIncludesBinSidecarSkipsTorchWeights() {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 108_000],
+            ["path": "model-00001-of-00002.safetensors", "type": "file", "size": 5_300_000_000],
+            ["path": "ngram_table.bin", "type": "file", "size": 32_000_000_000],
+            ["path": "pytorch_model-00001-of-00002.bin", "type": "file", "size": 5_300_000_000],
+            ["path": "consolidated.pth", "type": "file", "size": 5_300_000_000],
+            ["path": "flax_model.msgpack", "type": "file", "size": 5_300_000_000],
+        ]
+        let paths = Set(DownloadManager.selectNeededFiles(from: entries).map { $0.0 })
+
+        XCTAssertTrue(paths.contains("ngram_table.bin"), "engine-read .bin sidecar must be downloaded")
+        XCTAssertFalse(paths.contains("pytorch_model-00001-of-00002.bin"), "torch shadow weights must not be pulled")
+        XCTAssertFalse(paths.contains("consolidated.pth"))
+        XCTAssertFalse(paths.contains("flax_model.msgpack"))
     }
 
     /// oMLX OptiQ repos ship the MTP head as `optiq/mtp.safetensors` (a sibling
@@ -169,32 +214,6 @@ final class DownloadManagerLayoutTests: XCTestCase {
         let found = DownloadManager.discoverDrafters(in: [tempRoot, alt])
         XCTAssertEqual(found.count, 1)
         XCTAssertEqual(found.first?.url.path, primary)
-    }
-
-    // MARK: - Internal helper models (hidden from the Model Browser)
-
-    /// Class guard: the NSFW classifier is an app-internal dependency, not a
-    /// model the user chose — it must be in the exclusion set `discoverLocalModels`
-    /// filters against, or it reappears in My Models (as a confusing red
-    /// "Unsupported" row, since its `vit` architecture isn't a chat model).
-    func testInternalHelperReposExcludesTheNsfwClassifier() {
-        XCTAssertTrue(DownloadManager.internalHelperRepos.contains(DownloadManager.nsfwClassifierRepo))
-    }
-
-    /// Regression guard for the exact filter `discoverLocalModels` applies to
-    /// its scan results: the classifier must never survive it, while a real
-    /// downloaded model passes through untouched.
-    func testInternalHelperFilterHidesOnlyTheClassifier() {
-        let classifier = LocalModel(
-            id: "mlxServe:\(DownloadManager.nsfwClassifierRepo)", name: DownloadManager.nsfwClassifierRepo,
-            path: "/tmp/classifier", sizeFormatted: "1 GB", modelType: "vit", source: .mlxServe, kind: .base
-        )
-        let realModel = LocalModel(
-            id: "mlxServe:mlx-community/gemma-4-e4b-it-4bit", name: "mlx-community/gemma-4-e4b-it-4bit",
-            path: "/tmp/gemma", sizeFormatted: "5 GB", modelType: "gemma4", source: .mlxServe, kind: .base
-        )
-        let filtered = [classifier, realModel].filter { !DownloadManager.internalHelperRepos.contains($0.name) }
-        XCTAssertEqual(filtered.map(\.name), [realModel.name])
     }
 
     func testGemmaVariantParsing() {
@@ -623,6 +642,32 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertFalse(DownloadManager.parseConfigMetadata(atPath: cfg).hasVision)
     }
 
+    func testParseConfigMetadataEmptyVisionConfigIsNotAVisionTower() throws {
+        // mlx-community's TEXT-ONLY LFM2.5 packs declare `Lfm2ForCausalLM` and
+        // ship a vestigial EMPTY `vision_config` (verified on
+        // mlx-community/LFM2.5-2.6B-8bit, 2026-08-13). The `_text` suffix guard
+        // cannot see it — the arch is plain "lfm2" — so the Downloaded tab
+        // badged a text-only checkpoint as vision-capable while the server
+        // (which arms its tower on `model_type == "lfm2_vl"`) served it text.
+        // A block with no geometry in it is not a tower.
+        let dir = (tempRoot as NSString).appendingPathComponent("cfg-empty-vision")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let cfg = (dir as NSString).appendingPathComponent("config.json")
+        try #"{"model_type":"lfm2","vision_config":{}}"#
+            .write(toFile: cfg, atomically: true, encoding: .utf8)
+        XCTAssertFalse(DownloadManager.parseConfigMetadata(atPath: cfg).hasVision)
+
+        // …and the real VL pack next to it still reports vision.
+        let vlDir = (tempRoot as NSString).appendingPathComponent("cfg-lfm2-vl")
+        try FileManager.default.createDirectory(atPath: vlDir, withIntermediateDirectories: true)
+        let vlCfg = (vlDir as NSString).appendingPathComponent("config.json")
+        try #"{"model_type":"lfm2_vl","vision_config":{"hidden_size":1152,"num_hidden_layers":27}}"#
+            .write(toFile: vlCfg, atomically: true, encoding: .utf8)
+        let vl = DownloadManager.parseConfigMetadata(atPath: vlCfg)
+        XCTAssertTrue(vl.hasVision)
+        XCTAssertEqual(vl.modelType, "lfm2_vl")
+    }
+
     func testParseConfigMetadataMissingFileDefaults() {
         let meta = DownloadManager.parseConfigMetadata(atPath: "/nope/config.json")
         XCTAssertEqual(meta, DownloadManager.ConfigMetadata())
@@ -800,5 +845,136 @@ final class DownloadManagerLayoutTests: XCTestCase {
         try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
         let cfg = (path as NSString).appendingPathComponent("config.json")
         try "{\"model_type\":\"gemma4_assistant\"}".write(toFile: cfg, atomically: true, encoding: .utf8)
+    }
+}
+
+// MARK: - Hugging Face cache ROOT resolution
+//
+// `huggingface_hub` lets people move the cache with three env vars, in this
+// precedence: `HF_HUB_CACHE`, then `$HF_HOME/hub`, then
+// `$XDG_CACHE_HOME/huggingface/hub`, then `~/.cache/huggingface/hub`. A
+// Finder-launched bundle has NO shell environment, so the value also has to be
+// reachable from the login shell — `LoginShellEnv` is that half.
+
+final class HuggingFaceRootTests: XCTestCase {
+    private var tempRoot: String!
+
+    override func setUpWithError() throws {
+        tempRoot = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("mlx-serve-hfroot-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: tempRoot, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(atPath: tempRoot)
+    }
+
+    private func mkdir(_ path: String) throws -> String {
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        return path
+    }
+
+    private func sub(_ components: String) -> String {
+        (tempRoot as NSString).appendingPathComponent(components)
+    }
+
+    func testHubCacheRootPrecedenceAcrossEnvVars() throws {
+        let explicit = try mkdir(sub("explicit-hub"))
+        let hfHome = try mkdir(sub("hf-home"))
+        let hfHomeHub = try mkdir(sub("hf-home/hub"))
+        let xdg = try mkdir(sub("xdg"))
+        let xdgHub = try mkdir(sub("xdg/huggingface/hub"))
+        let home = try mkdir(sub("home"))
+        let defaultHub = try mkdir(sub("home/.cache/huggingface/hub"))
+
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRootPath(
+                environment: ["HF_HUB_CACHE": explicit, "HF_HOME": hfHome, "XDG_CACHE_HOME": xdg],
+                home: home),
+            explicit, "HF_HUB_CACHE outranks everything")
+
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRootPath(
+                environment: ["HF_HOME": hfHome, "XDG_CACHE_HOME": xdg], home: home),
+            hfHomeHub, "HF_HOME names the cache PARENT — the hub dir is a level down")
+
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRootPath(environment: ["XDG_CACHE_HOME": xdg], home: home),
+            xdgHub, "XDG_CACHE_HOME moves the default cache")
+
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRootPath(environment: [:], home: home),
+            defaultHub)
+    }
+
+    func testConfiguredRootThatIsNotOnDiskDoesNotFallBackToTheDefaultCache() throws {
+        let home = try mkdir(sub("home"))
+        _ = try mkdir(sub("home/.cache/huggingface/hub"))
+        XCTAssertNil(
+            DownloadManager.huggingFaceRootPath(
+                environment: ["HF_HOME": sub("not-mounted")], home: home),
+            "HF_HOME set means the models are elsewhere; serving the default cache would be a lie")
+    }
+
+    func testTildeAndTrailingSlashResolveToOneFolder() throws {
+        let home = try mkdir(sub("home"))
+        let hub = try mkdir(sub("home/.cache/huggingface/hub"))
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRootPath(environment: ["HF_HUB_CACHE": hub + "/"], home: home),
+            hub)
+    }
+
+    // MARK: - Login-shell probe
+
+    func testLoginShellEnvParsesMarkedValuesOutOfRcNoise() {
+        let names = ["HF_HOME", "HF_TOKEN"]
+        let out = """
+        [oh-my-zsh] updating...
+        \(LoginShellEnv.beginMarker("HF_HOME"))/Volumes/G Drive SSD/hf\(LoginShellEnv.endMarker("HF_HOME"))
+        \(LoginShellEnv.beginMarker("HF_TOKEN"))\(LoginShellEnv.endMarker("HF_TOKEN"))
+        """
+        let values = LoginShellEnv.parse(names, fromShellOutput: out)
+        XCTAssertEqual(values["HF_HOME"], "/Volumes/G Drive SSD/hf")
+        XCTAssertNil(values["HF_TOKEN"], "an unset var must not come back as an empty-string override")
+        XCTAssertNil(LoginShellEnv.parse(names, fromShellOutput: "no markers")["HF_HOME"])
+    }
+
+    /// CLASS GUARD. The bug was not "HF_HOME is unread" — it was read, from
+    /// `ProcessInfo.processInfo.environment`, which a Finder-launched bundle
+    /// does not have. Every HF variable must come from the merged accessor so
+    /// the next one added does not repeat it.
+    func testHuggingFaceEnvIsNeverReadStraightFromTheProcessEnvironment() throws {
+        let sources = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe")
+        let fm = FileManager.default
+        let walker = try XCTUnwrap(fm.enumerator(at: sources, includingPropertiesForKeys: nil))
+        var offenders: [String] = []
+        for case let url as URL in walker where url.pathExtension == "swift" {
+            guard url.lastPathComponent != "LoginShellEnv.swift" else { continue }
+            let text = try String(contentsOf: url, encoding: .utf8)
+            for (n, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+                let line = String(rawLine)
+                guard !line.trimmingCharacters(in: .whitespaces).hasPrefix("//"),
+                      line.contains("ProcessInfo.processInfo.environment"),
+                      LoginShellEnv.huggingFaceNames.contains(where: { line.contains("\"\($0)\"") })
+                else { continue }
+                offenders.append("\(url.lastPathComponent):\(n + 1)")
+            }
+        }
+        XCTAssertTrue(offenders.isEmpty, """
+            Hugging Face env read straight from the process environment: \(offenders.joined(separator: ", "))
+            A Finder-launched bundle has no shell environment — use
+            LoginShellEnv.huggingFaceEnvironment() so the login shell's value is seen.
+            """)
+    }
+
+    func testProcessEnvironmentWinsOverTheLoginShell() {
+        let merged = LoginShellEnv.merge(shell: ["HF_HOME": "/from/shell", "HF_TOKEN": "shell"],
+                                         into: ["HF_HOME": "/from/process"])
+        XCTAssertEqual(merged["HF_HOME"], "/from/process",
+                       "a launch that DOES carry the var is authoritative")
+        XCTAssertEqual(merged["HF_TOKEN"], "shell")
     }
 }

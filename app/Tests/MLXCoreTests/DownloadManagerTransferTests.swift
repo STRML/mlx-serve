@@ -1,5 +1,14 @@
+import Combine
 import XCTest
 @testable import MLXCore
+
+/// Collects published progress values from a Combine sink.
+private final class ProgressSamples: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Double] = []
+    func append(_ v: Double) { lock.withLock { storage.append(v) } }
+    var values: [Double] { lock.withLock { storage } }
+}
 
 /// Drives the REAL `DownloadManager.download(repoId:)` loop — tree listing,
 /// per-file retry, resume, commit, cancel — against a stub Hugging Face origin.
@@ -51,6 +60,38 @@ final class DownloadManagerTransferTests: XCTestCase {
         }
         XCTAssertTrue(Self.strays(in: dir).isEmpty, "left behind: \(Self.strays(in: dir))")
         XCTAssertTrue(manager.isReady(repoId))
+    }
+
+    func testTheProgressBarOnlyEverMovesForward() async throws {
+        // Every bar in the app used to render the CURRENT FILE's fraction, so a
+        // repo of N files ran 0→100% N times and people read the resets as a
+        // download that kept restarting. `progress` is the whole transfer, and
+        // the fixture is the shape that exposes the difference: two tiny files
+        // and then a 40 MB one, so per-file progress fills the bar twice before
+        // the real work starts.
+        HuggingFaceStubProtocol.serve(repo: repoId, files: Self.fixtureFiles())
+        let manager = DownloadManager(modelsRoot: tempRoot)
+
+        let samples = ProgressSamples()
+        let repo = repoId
+        let sub = manager.$downloads.sink { d in
+            if let p = d[repo]?.progress { samples.append(p) }
+        }
+        defer { sub.cancel() }
+
+        await manager.download(repoId: repoId)
+        XCTAssertEqual(manager.downloads[repoId]?.status, .completed)
+
+        let values = samples.values
+        XCTAssertGreaterThan(values.count, 3, "no progress was published")
+        XCTAssertEqual(values, values.sorted(),
+                       "progress went backwards — the bar resets: \(values)")
+        // The two small files are ~40 bytes of a 40 MB transfer. Finishing them
+        // must barely move the bar; a per-file fraction would report 100%.
+        let firstMove = try XCTUnwrap(values.first { $0 > 0 })
+        XCTAssertLessThan(firstMove, 0.01,
+                          "finishing the first small file filled the bar (\(firstMove))")
+        XCTAssertEqual(values.last, 1.0)
     }
 
     func testTheBigFileActuallyUsedManyConnections() async throws {
@@ -112,6 +153,59 @@ final class DownloadManagerTransferTests: XCTestCase {
         XCTAssertNil(manager.downloads[repoId], "a cancelled download must not leave a row")
         let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir), "cancel must leave zero footprint")
+    }
+
+    /// The GGUF twin of the test above, and NOT covered by it: a quant download
+    /// unwinds through `finalizeIfCancelledGguf` → `removeGgufQuant`, a
+    /// completely different cleanup path from the whole-repo `wipeDownloadDir`.
+    /// A quant that never committed exists ONLY as `<name>.gguf.partial`, so a
+    /// cleanup keyed on the committed name deletes nothing — and on the repo
+    /// this came from that is tens of GB of an 86 GB file left behind by a
+    /// Cancel that reported success, with no UI able to reach it (the Delete
+    /// submenu lists COMPLETE quants only).
+    func testCancellingAGgufQuantLeavesNoPartialBehind() async throws {
+        let gguf = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-chat-v2.gguf"
+        HuggingFaceStubProtocol.serve(repo: repoId,
+                                      files: [(gguf, Self.pseudoRandom(bytes: 40 << 20))],
+                                      throttle: true)
+        let manager = DownloadManager(modelsRoot: tempRoot)
+
+        let finished = expectation(description: "download settled")
+        manager.startGguf(repoId: repoId,
+                          quant: GgufQuant(filename: gguf, label: "IQ2XXS")) { finished.fulfill() }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        manager.cancel(repoId)
+        await fulfillment(of: [finished], timeout: 30)
+
+        XCTAssertNil(manager.downloads[repoId], "a cancelled download must not leave a row")
+        let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)
+        XCTAssertTrue(Self.strays(in: dir).isEmpty, "left behind: \(Self.strays(in: dir))")
+        XCTAssertFalse(manager.hasPartialDownload(repoId),
+                       "the menu would come back saying Resume over bytes we claimed to delete")
+    }
+
+    /// Same path, sharded quant: the shards live in a subfolder, so the cleanup
+    /// removes the folder — right for committed shards, and it has to hold for a
+    /// folder containing only the first shard's `.partial` too.
+    func testCancellingAShardedGgufQuantLeavesNoPartialBehind() async throws {
+        let shards = ["Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+                      "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf"]
+        HuggingFaceStubProtocol.serve(repo: repoId,
+                                      files: shards.map { ($0, Self.pseudoRandom(bytes: 20 << 20)) },
+                                      throttle: true)
+        let manager = DownloadManager(modelsRoot: tempRoot)
+
+        let finished = expectation(description: "download settled")
+        manager.startGguf(repoId: repoId,
+                          quant: GgufQuant(filename: shards[0], label: "IQ1_M", shards: shards)) { finished.fulfill() }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        manager.cancel(repoId)
+        await fulfillment(of: [finished], timeout: 30)
+
+        XCTAssertNil(manager.downloads[repoId])
+        let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent("Hy3-IQ1_M")),
+                       "the quant subfolder — partials and all — goes with the cancel")
     }
 
     // MARK: - Every entry point uses the same transport

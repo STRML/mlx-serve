@@ -10,12 +10,43 @@ final class CLISetupInstructionsTests: XCTestCase {
                                   budget: budget)
     }
 
-    func testThreeTabsWithStableIdsInLauncherOrder() {
-        XCTAssertEqual(tabs.map(\.id), ["claude", "pi", "opencode"],
+    func testTabsHaveStableIdsInLauncherOrder() {
+        XCTAssertEqual(tabs.map(\.id),
+                       ["claude", "pi", "omp", "opencode", "opencode2", "codex", "hermes", "aider"],
                        "same CLIs, same order as the DMG launcher dropdown")
         for tab in tabs {
             XCTAssertFalse(tab.command.isEmpty, tab.id)
             XCTAssertFalse(tab.installHint.isEmpty, tab.id)
+        }
+    }
+
+    /// The two surfaces must offer the SAME CLIs in the SAME order — a CLI the
+    /// launcher gains that the panel never shows is the silent-hole class.
+    func testPanelAndLauncherOfferTheSameCLIs() {
+        XCTAssertEqual(tabs.map(\.id), CLILauncher.candidateIds)
+    }
+
+    func testPlainShellLauncherNeedsNoServerAndKeepsTheShellAlive() {
+        let shell = LauncherCLI.shell
+        XCTAssertFalse(shell.requiresServer)
+        let script = shell.scriptBody("http://localhost:11234", "m1", "cd '/tmp'", budget, [])
+        XCTAssertTrue(script.contains("cd '/tmp'"), script)
+        // Without an exec the script would run to the end and the row would
+        // close the moment it opened.
+        XCTAssertTrue(script.contains("exec"), script)
+    }
+
+    /// The plain shell rides beside the detected CLIs but is not a candidate:
+    /// there is no binary to probe and no instructions tab for it.
+    func testShellIsOfferedButNotDetected() {
+        XCTAssertFalse(CLILauncher.candidateIds.contains("shell"))
+        XCTAssertEqual(CLILauncher.offered(detected: [.claudeCode]).map(\.id),
+                       ["claude", "shell"])
+    }
+
+    func testEveryOtherLauncherStillRequiresTheServer() {
+        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .codex, .hermes, .aider] {
+            XCTAssertTrue(cli.requiresServer, cli.id)
         }
     }
 
@@ -76,6 +107,60 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertFalse(json.contains("'"), "opencodeJSON must stay single-quote-free")
     }
 
+    func testOpencode2TabUsesDedicatedXdgConfigAndRegistersThePlugin() throws {
+        let tab = try XCTUnwrap(tabs.first { $0.id == "opencode2" })
+        XCTAssertTrue(tab.command.contains(#"export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2""#))
+        XCTAssertTrue(tab.command.contains("opencode2 --standalone"))
+        XCTAssertFalse(tab.command.contains("opencode2 --model"))
+        XCTAssertTrue(tab.command.contains(#""model": "mlx/gemma-4-e4b-it-4bit""#))
+        XCTAssertTrue(tab.command.contains("npm install -g @opencode/cli"))
+        XCTAssertTrue(tab.command.contains("./plugins/mlx-serve"))
+        XCTAssertTrue(tab.command.contains("http://localhost:11234/metrics.json"))
+        XCTAssertFalse(tab.command.contains("~/.config/opencode"), "must never write the user's real opencode config")
+        let json = AgentConfigs.opencodeJSON(
+            baseURL: "http://localhost:11234", defaultModel: "gemma-4-e4b-it-4bit",
+            entries: [AgentModelEntry(id: "gemma-4-e4b-it-4bit", budget: budget, vision: false)],
+            pinModel: true, compaction: true)
+        XCTAssertTrue(tab.command.contains("export OPENCODE_CONFIG_CONTENT='\(json)'"))
+    }
+
+    func testDMGLauncherOpencode2MatchesTheTab() {
+        XCTAssertNotNil(LauncherCLI.opencode2.prepareConfig)
+        let script = LauncherCLI.opencode2.scriptBody("http://localhost:11234",
+                                                     "gemma-4-e4b-it-4bit", "cd '/tmp'", budget, [])
+        XCTAssertTrue(script.contains(#"export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2""#), script)
+        XCTAssertTrue(script.contains("opencode2 --standalone"), script)
+        XCTAssertFalse(script.contains("opencode2 --model"), script)
+        XCTAssertTrue(script.contains(#""model": "mlx/gemma-4-e4b-it-4bit""#), script)
+        XCTAssertTrue(script.contains("npm install -g @opencode/cli"), script)
+        XCTAssertTrue(script.contains("exit 127"), script)
+    }
+
+    func testOpencode2CliJsonMergeKeepsThemeAndReplacesMlxServe() throws {
+        let existing = """
+        {"theme":"nord","plugins":[{"package":"other-plugin","options":{"a":1}},{"package":"./plugins/mlx-serve","options":{"metricsUrl":"http://old:1/metrics.json"}}]}
+        """
+        let json = AgentConfigs.opencode2CliJSON(existing: existing, baseURL: "http://127.0.0.1:11234")
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(obj["theme"] as? String, "nord")
+        let plugins = try XCTUnwrap(obj["plugins"] as? [Any]).compactMap { $0 as? [String: Any] }
+        XCTAssertEqual(plugins.count, 2)
+        let other = plugins.first { ($0["package"] as? String) == "other-plugin" }
+        XCTAssertNotNil(other)
+        XCTAssertEqual((other?["options"] as? [String: Any])?["a"] as? Int, 1)
+        let mlx = plugins.filter { ($0["package"] as? String) == "./plugins/mlx-serve" }
+        XCTAssertEqual(mlx.count, 1)
+        let opts = try XCTUnwrap(mlx[0]["options"] as? [String: Any])
+        XCTAssertEqual(opts["metricsUrl"] as? String, "http://127.0.0.1:11234/metrics.json")
+        XCTAssertNil(opts["metricsToken"])
+
+        let remote = AgentConfigs.opencode2CliJSON(existing: "{}", baseURL: "http://10.0.0.2:11234")
+        let remoteObj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(remote.utf8)) as? [String: Any])
+        let remotePlugins = try XCTUnwrap(remoteObj["plugins"] as? [Any]).compactMap { $0 as? [String: Any] }
+        let remoteOpts = try XCTUnwrap(remotePlugins[0]["options"] as? [String: Any])
+        XCTAssertEqual(remoteOpts["metricsToken"] as? String, "mlx-serve")
+    }
+
     /// The DMG one-click launcher makes the same move: inline env var in the
     /// script, no prepareConfig side-effect writing temp files.
     func testDMGLauncherInlinesTheOpencodeConfigToo() {
@@ -87,6 +172,156 @@ final class CLISetupInstructionsTests: XCTestCase {
             baseURL: "http://localhost:11234", model: "gemma-4-e4b-it-4bit", budget: budget)
         XCTAssertTrue(script.contains("export OPENCODE_CONFIG_CONTENT='\(json)'"), script)
         XCTAssertTrue(script.contains("opencode --model mlx/gemma-4-e4b-it-4bit"))
+    }
+
+    /// omp (oh-my-pi) is a pi fork with its own config tree: models.yml (YAML,
+    /// not models.json) under the agent dir. The env read is still pi's
+    /// PI_CODING_AGENT_DIR spelling (measured on omp v17 — the changelog's
+    /// OMP_ rename reached only its help text), so both spellings are
+    /// exported. Same isolation move as pi — never the user's real ~/.omp.
+    func testOmpTabWritesAnIsolatedConfigDirNeverTheUsersRealOne() throws {
+        let tab = try XCTUnwrap(tabs.first { $0.id == "omp" })
+        XCTAssertTrue(tab.command.contains("mkdir -p ~/.mlx-serve/omp"))
+        XCTAssertTrue(tab.command.contains("cat > ~/.mlx-serve/omp/models.yml <<'EOF'"))
+        XCTAssertTrue(tab.command.contains(#"export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp""#))
+        XCTAssertTrue(tab.command.contains(#"export OMP_CODING_AGENT_DIR="$HOME/.mlx-serve/omp""#))
+        XCTAssertTrue(tab.command.contains(AgentConfigs.ompModelsYML(
+            baseURL: "http://localhost:11234", model: "gemma-4-e4b-it-4bit", budget: budget)))
+        XCTAssertTrue(tab.command.contains("omp --model mlx/gemma-4-e4b-it-4bit"))
+        XCTAssertTrue(tab.command.contains("contextWindow: 90112"))
+        XCTAssertFalse(tab.command.contains("~/.omp"), "must never touch the user's real omp config")
+    }
+
+    func testDMGLauncherUsesTheSameIsolatedOmpConfigDir() {
+        let script = LauncherCLI.omp.scriptBody("http://localhost:11234", "gemma-4-e4b-it-4bit",
+                                                "cd '/tmp'", budget, [])
+        XCTAssertTrue(script.contains(#"export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp""#), script)
+        XCTAssertTrue(script.contains("omp --model mlx/gemma-4-e4b-it-4bit"))
+    }
+
+    /// omp's models.yml is a STATIC chat-capable list — deliberately NOT
+    /// omp's openai-models-list discovery, which would put every media model
+    /// in the coding agent's picker at omp's 128k default context. Each entry
+    /// carries its own budget.
+    func testOmpConfigBakesTheChatEntriesStatically() {
+        let entries = [
+            AgentModelEntry(id: "m1", budget: .init(context: 4096, output: 1024), vision: false),
+            AgentModelEntry(id: "m2", budget: .init(context: 262144, output: 65536), vision: true),
+        ]
+        let yml = AgentConfigs.ompModelsYML(
+            baseURL: "http://localhost:11234", defaultModel: "m1", entries: entries)
+        XCTAssertFalse(yml.contains("discovery"), yml)
+        XCTAssertTrue(yml.contains("baseUrl: http://localhost:11234/v1"), yml)
+        XCTAssertTrue(yml.contains("api: openai-completions"), yml)
+        XCTAssertTrue(yml.contains("contextWindow: 4096"), yml)
+        XCTAssertTrue(yml.contains("contextWindow: 262144"), yml)
+        XCTAssertTrue(yml.contains("maxTokens: 65536"), yml)
+        XCTAssertTrue(yml.contains("input: [text, image]"), yml)
+        XCTAssertTrue(yml.contains("thinkingFormat: qwen"), yml)
+    }
+
+    /// codex only speaks the Responses wire API (WireApi has one variant) and
+    /// honors CODEX_HOME for its whole config tree — dedicated dir, keyless
+    /// provider (no env_key: the loopback server ignores keys).
+    func testCodexTabWritesAnIsolatedCodexHome() throws {
+        let tab = try XCTUnwrap(tabs.first { $0.id == "codex" })
+        XCTAssertTrue(tab.command.contains("mkdir -p ~/.mlx-serve/codex"))
+        XCTAssertTrue(tab.command.contains("cat > ~/.mlx-serve/codex/config.toml <<'EOF'"))
+        XCTAssertTrue(tab.command.contains(#"export CODEX_HOME="$HOME/.mlx-serve/codex""#))
+        XCTAssertTrue(tab.command.contains(AgentConfigs.codexConfigTOML(
+            baseURL: "http://localhost:11234", model: "gemma-4-e4b-it-4bit", budget: budget)))
+        XCTAssertFalse(tab.command.contains("~/.codex"), "must never touch the user's real codex config")
+    }
+
+    /// The ChatGPT desktop app (codex's rebranded app; bundle id
+    /// com.openai.codex, shipped as ChatGPT.app or Codex.app) bundles the
+    /// codex CLI at Contents/Resources/codex — a desktop-app-only user has a
+    /// working binary that is NOT on PATH. Both launch surfaces resolve it
+    /// through the same shell snippet, and refuse with the install hint
+    /// instead of exec'ing an empty string.
+    func testCodexLaunchFallsBackToTheDesktopAppBundledBinary() throws {
+        let tab = try XCTUnwrap(tabs.first { $0.id == "codex" })
+        let script = LauncherCLI.codex.scriptBody("http://localhost:11234", "m1",
+                                                  "", budget, [])
+        for surface in [tab.command, script] {
+            XCTAssertTrue(surface.contains(AgentConfigs.codexBinResolver), surface)
+            XCTAssertTrue(surface.contains("\"$CODEX_BIN\""), surface)
+            XCTAssertFalse(surface.contains("\ncodex\n"), "bare codex would miss the bundled binary")
+        }
+        XCTAssertTrue(AgentConfigs.codexBinResolver.contains("/Applications/ChatGPT.app"))
+        XCTAssertTrue(AgentConfigs.codexBinResolver.contains("/Applications/Codex.app"))
+        XCTAssertTrue(AgentConfigs.codexBinResolver.contains("$HOME/Applications"))
+        XCTAssertTrue(AgentConfigs.codexBinResolver.contains("Contents/Resources/codex"))
+    }
+
+    /// Detection must also SHOW the codex row for a desktop-app-only user:
+    /// the `command -v` sweep can't see inside an app bundle, so codex
+    /// declares the bundle paths as detection fallbacks.
+    func testCodexDetectionProbesTheAppBundles() {
+        XCTAssertEqual(LauncherCLI.codex.fallbackPaths.count, 4)
+        XCTAssertTrue(LauncherCLI.codex.fallbackPaths.contains(
+            "/Applications/ChatGPT.app/Contents/Resources/codex"))
+        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .hermes, .aider] {
+            XCTAssertTrue(cli.fallbackPaths.isEmpty, cli.id)
+        }
+    }
+
+    func testCodexConfigTargetsOurResponsesAPIAndCarriesTheContext() {
+        let toml = AgentConfigs.codexConfigTOML(
+            baseURL: "http://localhost:11234", model: "m1", budget: budget)
+        XCTAssertTrue(toml.contains(#"wire_api = "responses""#), toml)
+        XCTAssertTrue(toml.contains(#"base_url = "http://localhost:11234/v1""#), toml)
+        XCTAssertTrue(toml.contains("model_context_window = \(budget.context)"), toml)
+        XCTAssertTrue(toml.contains(#"model = "m1""#), toml)
+        XCTAssertTrue(toml.contains(#"model_provider = "mlx""#), toml)
+        XCTAssertFalse(toml.contains("env_key"), "keyless — loopback is exempt from --api-key")
+    }
+
+    /// hermes reads its whole tree from HERMES_HOME (hermes_constants.py) —
+    /// the same config.yaml + .env pair the sandbox materializes in-guest,
+    /// relocated to a dedicated dir on the host.
+    func testHermesTabWritesAnIsolatedHermesHome() throws {
+        let tab = try XCTUnwrap(tabs.first { $0.id == "hermes" })
+        XCTAssertTrue(tab.command.contains("mkdir -p ~/.mlx-serve/hermes"))
+        XCTAssertTrue(tab.command.contains(#"export HERMES_HOME="$HOME/.mlx-serve/hermes""#))
+        XCTAssertTrue(tab.command.contains("cat > ~/.mlx-serve/hermes/config.yaml <<'EOF'"))
+        // The .env is the first-run wizard kill switch (OPENAI_BASE_URL set).
+        XCTAssertTrue(tab.command.contains("cat > ~/.mlx-serve/hermes/.env <<'ENVEOF'"))
+        XCTAssertTrue(tab.command.contains("OPENAI_BASE_URL=http://localhost:11234/v1"))
+        XCTAssertFalse(tab.command.contains("~/.hermes"), "must never touch the user's real hermes config")
+    }
+
+    func testDMGLauncherUsesTheSameIsolatedHermesHome() {
+        let script = LauncherCLI.hermes.scriptBody("http://localhost:11234", "gemma-4-e4b-it-4bit",
+                                                   "cd '/tmp'", budget, [])
+        XCTAssertTrue(script.contains(#"export HERMES_HOME="$HOME/.mlx-serve/hermes""#), script)
+    }
+
+    /// aider is pure env vars (OPENAI_API_BASE) plus a litellm metadata file
+    /// that tells it the real context window — without it aider assumes its
+    /// own defaults for unknown openai/<id> models.
+    func testAiderTabExportsEnvAndWritesTheMetadataFile() throws {
+        let tab = try XCTUnwrap(tabs.first { $0.id == "aider" })
+        XCTAssertTrue(tab.command.contains("export OPENAI_API_BASE='http://localhost:11234/v1'"))
+        XCTAssertTrue(tab.command.contains("cat > ~/.mlx-serve/aider/model-metadata.json <<'EOF'"))
+        XCTAssertTrue(tab.command.contains("aider --model openai/gemma-4-e4b-it-4bit"))
+        XCTAssertTrue(tab.command.contains("--model-metadata-file ~/.mlx-serve/aider/model-metadata.json"))
+        XCTAssertTrue(tab.command.contains("\"max_input_tokens\": 90112"))
+    }
+
+    func testAiderMetadataDeclaresEveryChatEntryWithItsOwnBudget() throws {
+        let entries = [
+            AgentModelEntry(id: "m1", budget: .init(context: 4096, output: 1024), vision: false),
+            AgentModelEntry(id: "m2", budget: .init(context: 262144, output: 65536), vision: true),
+        ]
+        let json = AgentConfigs.aiderModelMetadataJSON(
+            model: "m1", budget: .init(context: 4096, output: 1024), entries: entries)
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(json.utf8)) as? [String: [String: Any]])
+        XCTAssertEqual(obj["openai/m1"]?["max_input_tokens"] as? Int, 4096)
+        XCTAssertEqual(obj["openai/m2"]?["max_input_tokens"] as? Int, 262144)
+        XCTAssertEqual(obj["openai/m2"]?["max_output_tokens"] as? Int, 65536)
+        XCTAssertEqual(obj["openai/m1"]?["litellm_provider"] as? String, "openai")
     }
 
     /// A heredoc body containing its own delimiter line would truncate the

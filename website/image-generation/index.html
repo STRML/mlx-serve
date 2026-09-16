@@ -69,7 +69,7 @@
     <a href="../" class="nav-logo">
       <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.7.12</span>
+      <span class="nav-ver"></span>
     </a>
     <input type="checkbox" id="nav-toggle" class="nav-toggle-input">
     <ul class="nav-links" onclick="if(event.target.closest('a')) document.getElementById('nav-toggle').checked=false">
@@ -122,11 +122,6 @@
         <span class="mini-k">Photorealistic</span>
         <h4>Krea-2-Turbo</h4>
         <p>12.9B parameters, one-click ~15 GB download. Photorealism validated at <b>0.9996 end-to-end pixel cosine</b> against the reference implementation.</p>
-      </div>
-      <div class="mini-card reveal">
-        <span class="mini-k">Safety</span>
-        <h4>On-device screening</h4>
-        <p>Every generated image passes a local NSFW classifier — nothing is uploaded anywhere. On by default, with a Safe-mode toggle (and a <code>--no-safety</code> flag).</p>
       </div>
       <div class="mini-card reveal">
         <span class="mini-k">In chat</span>
@@ -229,7 +224,7 @@
       </details>
       <details class="faq-item">
         <summary>Is anything uploaded anywhere?</summary>
-        <p>No. Generation, editing, and the safety classifier all run on-device. Your source photos and outputs never leave the Mac.</p>
+        <p>No. Generation and editing run on-device. Your source photos and outputs never leave the Mac.</p>
       </details>
     </div>
   </section>
@@ -272,6 +267,7 @@
     <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
   </footer>
 
+  <script src="../assets/version.js"></script>
   <script src="../assets/feature.js"></script>
 </body>
 </html>

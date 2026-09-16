@@ -17,9 +17,27 @@ struct FileSelection: Equatable {
     /// LoRAs, upscalers, and alternate transformers. Non-safetensors (json/txt)
     /// follow the normal extension rule.
     var keepSafetensors: Set<String>? = nil
+    /// When set, pull ONLY this immediate subfolder's files and write them at
+    /// the destination ROOT. A multi-variant MLX repo ships one complete model
+    /// per quant subfolder (see `MlxVariant`); each is fetched into its own
+    /// model dir, so the prefix must come off on the way to disk.
+    var subfolder: String? = nil
 
     /// Chat-model default: top-level files + `mtp/`, all needed extensions.
     static let chatDefault = FileSelection()
+
+    /// One quant subfolder of a multi-variant MLX repo.
+    static func mlxVariant(_ folder: String) -> FileSelection {
+        FileSelection(subfolder: folder)
+    }
+
+    /// Where a fetched file lands, relative to the destination dir. Only a
+    /// variant selection rewrites anything — everything else is pass-through,
+    /// so the `mtp/` sidecar keeps its directory.
+    func localPath(forRemote path: String) -> String {
+        guard let subfolder, path.hasPrefix(subfolder + "/") else { return path }
+        return String(path.dropFirst(subfolder.count + 1))
+    }
 }
 
 /// One downloadable piece of a media bundle: a HF repo + how to pull it + how
@@ -53,10 +71,29 @@ struct MediaBundle: Identifiable, Equatable {
     /// TTS model rounding to "~0 GB" would be a lie). Shared by
     /// `BundleDownloadBar` and the Model Browser's Media pane so the two
     /// surfaces can't drift onto different rounding rules.
-    var approxSizeLabel: String {
-        sizeEstimateGB >= 1
-            ? String(format: "~%.0f GB", sizeEstimateGB)
-            : String(format: "~%.1f GB", sizeEstimateGB)
+    ///
+    /// A .5 keeps its decimal, and ties round UP.
+    ///
+    /// `%.0f`/`%.1f` are round-half-to-EVEN, which made the 2.0 GB and 2.5 GB
+    /// Qwen3-TTS presets both print "~2 GB" — two different downloads wearing
+    /// one label — and rendered Kokoro's 0.35 GB as "~0.3 GB". Both errors run
+    /// the same way: a size shown SMALLER than the bytes about to be fetched.
+    /// For a download prompt that is the misleading direction, so ties go up.
+    var approxSizeLabel: String { Self.sizeLabel(forGB: sizeEstimateGB) }
+
+    /// Static so the rounding rule is testable without building a bundle.
+    static func sizeLabel(forGB gb: Double) -> String {
+        if gb < 1 { return String(format: "~%.1f GB", roundUpHalf(gb * 10) / 10) }
+        let rounded = roundUpHalf(gb * 2) / 2
+        return rounded == rounded.rounded()
+            ? String(format: "~%.0f GB", rounded)
+            : String(format: "~%.1f GB", rounded)
+    }
+
+    /// `.rounded(.toNearestOrAwayFromZero)`, spelled out because the whole
+    /// point of this helper is that the DEFAULT tie rule was the bug.
+    private static func roundUpHalf(_ v: Double) -> Double {
+        v.rounded(.toNearestOrAwayFromZero)
     }
 
     static func == (l: MediaBundle, r: MediaBundle) -> Bool { l.id == r.id }
@@ -144,6 +181,48 @@ extension MediaBundle {
     /// SOUND track — the `dgrauet/ltx-2.3-mlx-q4` repo ships both. They're
     /// deliberately NOT ready markers: a checkpoint without them still completes
     /// and plays (silently). The server loads both from the model dir.
+    /// MiniMax-H3: ONE self-contained repo — DiT, text encoder, both VAEs and
+    /// the tokenizer. Upstream splits these across `Comfy-Org` (weights, no
+    /// tokenizer) and `MiniMaxAI` (tokenizer); our converted mirror bundles
+    /// them so there is no second component to keep in sync.
+    ///
+    /// `audio_vae.safetensors` is allowlisted but is NOT a ready marker, the
+    /// same call the LTX bundle makes: without it the server still generates,
+    /// the clip is just silent.
+    static func minimaxH3(repo: String, displayName: String) -> MediaBundle {
+        MediaBundle(
+            id: "minimax-h3:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(keepSafetensors: [
+                        "transformer.safetensors", "text_encoder.safetensors",
+                        "video_vae.safetensors", "audio_vae.safetensors",
+                        // The Turbo distillation adapter (~744 MB): 4-step
+                        // sampling instead of 30. Allowlisted but NOT a ready
+                        // marker, the same call `audio_vae` makes — a pack
+                        // downloaded before it shipped must keep reading as
+                        // complete rather than offering a 69 GB re-download.
+                        // Those installs get it on demand instead, see
+                        // `TurboLoraFetch`.
+                        TurboLoraFetch.fileName,
+                    ]),
+                    readyMarkers: [
+                        "config.json", "transformer.safetensors",
+                        "text_encoder.safetensors", "video_vae.safetensors",
+                        // The tokenizer is a ready marker BECAUSE it ships in
+                        // this repo: without it there is no prompt to encode,
+                        // and upstream does not provide one alongside the
+                        // weights.
+                        "tokenizer.json",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: 70 // 69 + the Turbo adapter
+        )
+    }
+
     static func ltx(repo: String, displayName: String) -> MediaBundle {
         MediaBundle(
             id: "ltx:\(repo)",
@@ -174,6 +253,50 @@ extension MediaBundle {
             // ~18 GB (3 LTX) + ~0.6 GB (VAE encoder) + ~0.37 GB (audio VAE + vocoder)
             // + ~12 GB (distilled transformer + x2 upscaler) + ~8 GB (Gemma-3-12B 4-bit).
             sizeEstimateGB: 39
+        )
+    }
+
+    /// LTX 2.5: same engine files as 2.3, but the text encoder lives INSIDE
+    /// the pack (`gemma4-12b-ltx-v1/`) instead of being the shared Gemma-3
+    /// chat download — so there is no second component, and the fetch has to
+    /// be recursive to reach the encoder's own tokenizer + config.
+    ///
+    /// The safetensors allowlist still applies (by BASENAME), so `model` is on
+    /// it for the encoder's weights; the upscalers ride along like 2.3's. The
+    /// encoder DIRECTORY is a ready marker: without it the server has no text
+    /// path at all, which is a harder failure than 2.3's missing-I2V case.
+    static func ltx25(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "ltx25:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(
+                        recursive: true,
+                        excludeSubstrings: [".cache/"],
+                        keepSafetensors: [
+                            "transformer-distilled.safetensors", "transformer-dev.safetensors",
+                            "connector.safetensors", "vae_decoder.safetensors", "vae_encoder.safetensors",
+                            "audio_vae.safetensors", "vocoder.safetensors",
+                            "spatial_upscaler_x2_v1_1.safetensors", "temporal_upscaler_x2_v1_0.safetensors",
+                            // LTX's own DiffVAE decoder — the 8-bit pack ships
+                            // it, the 4-bit one does not, and the allowlist is
+                            // by basename so a pack without it just has one
+                            // fewer file to fetch.
+                            "vae_diffusion_decoder.safetensors",
+                            // The in-pack Gemma-4 text encoder's weights.
+                            "model.safetensors",
+                        ]
+                    ),
+                    readyMarkers: [
+                        "config.json", "transformer-distilled.safetensors",
+                        "connector.safetensors", "vae_decoder.safetensors",
+                        ltx25TextEncoderDir,
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
         )
     }
 
@@ -237,9 +360,10 @@ extension MediaBundle {
         )
     }
 
-    /// ACE-Step music (text2music): a flat converted dir — `config.json` +
+    /// ACE-Step music: a flat converted dir — `config.json` +
     /// `model.safetensors` (DiT + condition encoder) + `vae.safetensors`
-    /// (Oobleck) + the `text_encoder/` Qwen3-Embedding subdir. Single
+    /// (Oobleck) + `fsq.safetensors` (cover-mode tokenizer; fetched on demand
+    /// into packs that predate it) + the `text_encoder/` Qwen3-Embedding subdir. Single
     /// self-contained repo, no external-component dependencies (the simplest
     /// bundle yet). Local-convert repos share this factory with any future
     /// published one (readiness checks disk presence either way).
@@ -251,12 +375,42 @@ extension MediaBundle {
                 MediaComponent(
                     repo: repo,
                     selection: FileSelection(recursive: true, keepSafetensors: [
-                        "model.safetensors", "vae.safetensors",
+                        "model.safetensors", "vae.safetensors", "fsq.safetensors",
                     ]),
                     readyMarkers: [
                         "config.json", "model.safetensors", "vae.safetensors",
                         "text_encoder/config.json", "text_encoder/model.safetensors",
                         "text_encoder/tokenizer.json",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
+    /// MiniMax Music 3: a flat converted dir — `config.json` + five component
+    /// safetensors (LLM, depth decoder, DiT, condition encoder, vocoder) +
+    /// the `tokenizer/` subdir the engine reads (`music_tokenizer/` rides
+    /// along via the recursive scan). The vocoder is the completeness marker
+    /// (written LAST by the converter — mirrors the server's
+    /// `requiredMediaMarker`).
+    static func music3(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "music3:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, keepSafetensors: [
+                        "language_model.safetensors", "rvq_depth_decoder.safetensors",
+                        "transformer.safetensors", "condition_encoder.safetensors",
+                        "vocoder.safetensors",
+                    ]),
+                    readyMarkers: [
+                        "config.json", "language_model.safetensors",
+                        "rvq_depth_decoder.safetensors", "transformer.safetensors",
+                        "condition_encoder.safetensors", "vocoder.safetensors",
+                        "tokenizer/tokenizer.json",
                     ]
                 ),
             ],
@@ -284,6 +438,12 @@ extension MediaBundle {
         )
     }
 
+    /// The subdirectory LTX 2.5 ships its own text encoder in. Cross-pinned
+    /// with the server's `ltx_video.LtxVersion.textEncoderSubdir` — the server
+    /// resolves the encoder from this exact path, so a rename here silently
+    /// makes every 2.5 pack unloadable.
+    static let ltx25TextEncoderDir = "gemma4-12b-ltx-v1"
+
     /// The Gemma-3-12B text encoder LTX needs — also a standalone chat model.
     /// Standard MLX layout (config + tokenizer + sharded safetensors).
     static let ltxGemmaRepo = "mlx-community/gemma-3-12b-it-4bit"
@@ -303,8 +463,9 @@ extension ImageModelPreset {
             return .krea(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .mageFlowTurbo, .mageFlowEditTurbo:
             return .mageFlow(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
-        case .flux2Klein9B:
-            // The one MLX conversion of klein 9B ships no root config.json.
+        case .flux2Klein9B, .flux2Klein9BBase:
+            // The MLX conversions of klein 9B — distilled and base alike —
+            // ship no root config.json.
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB), hasRootConfig: false)
         default:
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
@@ -325,7 +486,15 @@ extension AudioModelPreset {
 
 extension VideoModelPreset {
     var bundle: MediaBundle {
-        .ltx(repo: repo, displayName: name)
+        switch backend {
+        case .ltx:
+            // A pack carrying its own encoder must NOT also pull the shared
+            // Gemma-3 chat model: 8 GB fetched for a component it never opens.
+            return shipsOwnTextEncoder
+                ? .ltx25(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+                : .ltx(repo: repo, displayName: name)
+        case .minimaxH3: return .minimaxH3(repo: repo, displayName: name)
+        }
     }
 }
 
@@ -337,7 +506,10 @@ extension Model3DModelPreset {
 
 extension MusicModelPreset {
     var bundle: MediaBundle {
-        .music(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        switch family {
+        case .acestep: return .music(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        case .minimaxMusic3: return .music3(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        }
     }
 }
 
@@ -348,19 +520,19 @@ extension MusicModelPreset {
 /// modalities instead of four near-duplicate views. `Model3DModelPreset`
 /// deliberately does NOT conform — the Media tab covers exactly the four
 /// modalities the user asked for; 3D stays its own thing for now.
-protocol MediaModelPreset: Identifiable, Hashable where ID == String {
+/// What every media preset — INCLUDING 3D — can say about its cost. Split out
+/// of `MediaModelPreset` so a Create pane's picker can rank all five catalogues
+/// (`MediaModelPicks`) without dragging 3D into the Model Browser's Media tab,
+/// which is what conforming it to the fuller protocol below would do.
+protocol MediaModelSizing: Identifiable where ID == String {
     var name: String { get }
-    var bundle: MediaBundle { get }
-    /// Plain-English explanation shown under the model in the Media pane —
-    /// the same idea as `RecommendedModelPick.blurb`.
-    var description: String { get }
     /// Peak unified-memory footprint, GB — already the full RAM-needed
     /// figure (not raw weight size), unlike `RecommendedModelPick.sizeGB`,
     /// so `meetsSystemRequirements` below needs no extra overhead multiplier.
     var approxRAMGB: Int { get }
 }
 
-extension MediaModelPreset {
+extension MediaModelSizing {
     /// Whether this Mac's physical RAM covers what the model needs. A soft
     /// signal for the UI (show a warning, never a download/use gate) — same
     /// "warn, don't block" policy as `RecommendedModelPick.meetsSystemRequirements`
@@ -370,7 +542,16 @@ extension MediaModelPreset {
     }
 }
 
+protocol MediaModelPreset: MediaModelSizing, Hashable {
+    var bundle: MediaBundle { get }
+    /// Plain-English explanation shown under the model in the Media pane —
+    /// the same idea as `RecommendedModelPick.blurb`.
+    var description: String { get }
+}
+
 extension ImageModelPreset: MediaModelPreset {}
 extension AudioModelPreset: MediaModelPreset {}
 extension VideoModelPreset: MediaModelPreset {}
 extension MusicModelPreset: MediaModelPreset {}
+// Sizing only — see `MediaModelSizing`: 3D stays out of the Media tab.
+extension Model3DModelPreset: MediaModelSizing {}

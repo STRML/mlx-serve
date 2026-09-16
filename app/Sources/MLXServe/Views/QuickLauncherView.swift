@@ -86,7 +86,7 @@ struct QuickLauncherView: View {
             VStack(alignment: .leading, spacing: 10) {
                 if let question = convo.messages.last(where: { $0.role == .user })?.content,
                    !question.isEmpty {
-                    Text(question)
+                    Text(L10n.text(question))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
@@ -143,18 +143,12 @@ struct QuickLauncherTrayRow: View {
     @EnvironmentObject var appState: AppState
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "bolt.fill")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(appState.quickLauncherEnabled ? Color.accentColor : .secondary)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Quick Launcher")
-                    .font(.subheadline.weight(.medium))
-                Text("\(QuickLauncherHotKey.display) — ask from anywhere")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
+        TrayFeatureRow(
+            icon: "bolt.fill",
+            title: "Quick Launcher",
+            subtitle: "\(QuickLauncherHotKey.display) — ask from anywhere",
+            isOn: appState.quickLauncherEnabled
+        ) {
             Toggle("", isOn: $appState.quickLauncherEnabled)
                 .labelsHidden()
                 .toggleStyle(.switch)

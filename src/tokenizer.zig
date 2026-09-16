@@ -4,7 +4,66 @@ const io_util = @import("io_util.zig");
 
 pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe, wordpiece };
 
+/// An added token flagged `special: true` in tokenizer.json.
+pub const FlaggedSpecial = struct { id: u32, content: []const u8 };
+
+/// The ids a sampler must never draw: added tokens flagged `special: true`,
+/// MINUS the ones that are legitimate output. Legitimacy is DERIVED, never a
+/// hardcoded list (which would break thinking/tool-calling on the next arch):
+///   - EOS/stop ids (`exempt_ids`) stay reachable, and
+///   - any special whose literal text appears in the chat template source
+///     stays reachable — thinking tags, tool markers and role markers all
+///     ride their model's own template.
+/// An empty `template_source` disables suppression entirely (returns no ids):
+/// with no template to consult, "what can this model legitimately emit" has
+/// no honest answer, and fallback-formatted models keep pre-change behavior.
+/// A reserved marker like `<|fim_hole|>` in chat output is always a bug
+/// regardless of what produced it (a collapsed distribution can rank one top-5 at a
+/// degenerate position); the substring rule errs toward exemption, which can
+/// only ever keep a token reachable.
+/// Specials a model legitimately EMITS but that no template ever RENDERS.
+///
+/// `reservedOutputIds` derives legitimacy from presence in the chat template,
+/// which is right for every marker that appears on both sides of the
+/// conversation (role markers, think tags, tool wrappers) — the model emits
+/// what it was shown. An output-only marker breaks that symmetry: it exists
+/// purely in generated text, so the template cannot vouch for it and the
+/// derivation files it as reserved. Masking one does not merely drop it; the
+/// model substitutes whatever it can still draw, and a malformed structure is
+/// worse than a missing token.
+///
+/// Kept to markers that are unambiguous across families, since this is the one
+/// place the derivation is overridden by name.
+fn isOutputOnlySpecial(content: []const u8) bool {
+    // harmony (gpt_oss): declares a tool call's argument content type inside
+    // the header the MODEL writes — `to=functions.x <|constrain|>json`. The
+    // template renders tool calls only when replaying history, and omits it.
+    return std.mem.eql(u8, content, "<|constrain|>");
+}
+
+pub fn reservedOutputIds(
+    allocator: std.mem.Allocator,
+    flagged: []const FlaggedSpecial,
+    template_source: []const u8,
+    exempt_ids: []const u32,
+) ![]u32 {
+    if (template_source.len == 0) return allocator.alloc(u32, 0);
+    var out = std.ArrayList(u32).empty;
+    errdefer out.deinit(allocator);
+    outer: for (flagged) |sp| {
+        for (exempt_ids) |e| {
+            if (sp.id == e) continue :outer;
+        }
+        if (std.mem.indexOf(u8, template_source, sp.content) != null) continue;
+        if (isOutputOnlySpecial(sp.content)) continue;
+        try out.append(allocator, sp.id);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// BPE tokenizer supporting both SentencePiece (Gemma) and byte-level (GPT-2/Qwen3) modes.
+pub const PretokStyle = enum { gpt2, llama3 };
+
 pub const Tokenizer = struct {
     /// Token string -> id
     vocab: std.StringHashMap(u32),
@@ -17,6 +76,20 @@ pub const Tokenizer = struct {
     special_tokens: std.StringHashMap(u32),
     /// Tokenizer type determines encode/decode behavior
     tok_type: TokenizerType,
+    /// Digits per pre-token for the byte-level path: 1 (`\p{N}`, Qwen/GPT-2)
+    /// or 3 (`\p{N}{1,3}`, DeepSeek-V4/Llama-3) — parsed from tokenizer.json.
+    digit_group: u8 = 1,
+    /// Pre-tokenizer grammar: .gpt2 (Qwen/GPT-2-style) or .llama3
+    /// (Muse-Glimmer/Llama-3-style: case-transition word splits, attached
+    /// (?i) contractions, {1,3} digit groups, `/` in the punct tail).
+    /// Parsed from the tokenizer.json Split regex.
+    pretok_style: PretokStyle = .gpt2,
+    /// Decode-only marker aliases (K2-Horizon): the `<ifm|…>` think and tool
+    /// markers decode as the canonical `<think>` / GLM tag spellings every
+    /// downstream parser reads. Encoding keeps the checkpoint's own bytes.
+    marker_aliases: ?std.AutoHashMap(u32, []const u8) = null,
+    /// K2 think opener id -> its own closer id (three pairs, one per effort).
+    marker_closers: ?std.AutoHashMap(u32, u32) = null,
     /// Byte-to-unicode mapping for byte-level BPE (256 entries, index = byte value)
     byte_to_unicode: [256]u21,
     /// Unicode-to-byte reverse mapping
@@ -31,6 +104,14 @@ pub const Tokenizer = struct {
     /// borrowed directly from its arena instead of duped per entry — a 30×
     /// speedup on Gemma-class tokenizers (262k vocab + 514k merges).
     parsed_json: ?std.json.Parsed(std.json.Value) = null,
+
+    /// Added tokens flagged `special: true` in tokenizer.json — the
+    /// candidate set for reserved-output suppression. NOT the same as
+    /// `special_tokens`, which deliberately holds ALL added tokens
+    /// (`special: false` entries like `<think>` are atomic-encode units but
+    /// perfectly legitimate output). Content slices borrow `parsed_json`'s
+    /// arena; the slice itself is owned and freed in deinit.
+    flagged_specials: []const FlaggedSpecial = &.{},
 
     const MergePair = struct {
         left: []const u8,
@@ -50,11 +131,33 @@ pub const Tokenizer = struct {
         }
     };
 
+    /// A decode-capable tokenizer with EMPTY maps, for tests in other modules
+    /// that need to turn ids into text without a checkpoint on disk. The caller
+    /// owns every map and must `deinit` them; nothing here reads tokenizer.json,
+    /// so encode is not meaningfully usable — populate `id_to_token` and decode.
+    pub fn initEmptyForTests(allocator: std.mem.Allocator, tok_type: TokenizerType) Tokenizer {
+        return .{
+            .vocab = std.StringHashMap(u32).init(allocator),
+            .id_to_token = std.AutoHashMap(u32, []const u8).init(allocator),
+            .merge_ranks = std.HashMap(MergePair, u32, MergePairContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .allocator = allocator,
+            .special_tokens = std.StringHashMap(u32).init(allocator),
+            .tok_type = tok_type,
+            .byte_to_unicode = buildBytesToUnicode(),
+            .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+            .bos_id = null,
+            .eos_id = null,
+        };
+    }
+
     pub fn deinit(self: *Tokenizer) void {
         // Map keys/values either point into `parsed_json`'s arena (no
         // per-entry free needed) or were duped explicitly when no parsed
         // JSON is held (e.g., the test-only constructors). Freeing the
         // parsed JSON deinits its arena in one shot.
+        if (self.flagged_specials.len > 0) self.allocator.free(self.flagged_specials);
+        if (self.marker_aliases) |*m| m.deinit();
+        if (self.marker_closers) |*m| m.deinit();
         if (self.parsed_json) |*p| {
             self.vocab.deinit();
             self.id_to_token.deinit();
@@ -200,6 +303,73 @@ pub const Tokenizer = struct {
         return self.special_tokens.get(name);
     }
 
+    /// K2-Horizon spells the think block and the GLM tool tags with an `ifm|`
+    /// prefix, one special token each; three think variants (one per effort)
+    /// all read as `<think>`. Installed when the vocabulary carries the family
+    /// marker; false otherwise.
+    pub fn installMarkerAliases(self: *Tokenizer) bool {
+        const family_marker = "<ifm|think>";
+        if (self.special_tokens.get(family_marker) == null) return false;
+        var map = std.AutoHashMap(u32, []const u8).init(self.allocator);
+        errdefer map.deinit();
+        const pairs = [_][2][]const u8{
+            .{ "<ifm|think>", "<think>" },              .{ "</ifm|think>", "</think>" },
+            .{ "<ifm|think_fast>", "<think>" },         .{ "</ifm|think_fast>", "</think>" },
+            .{ "<ifm|think_faster>", "<think>" },       .{ "</ifm|think_faster>", "</think>" },
+            .{ "<ifm|tool_calls>", "<tool_calls>" },    .{ "</ifm|tool_calls>", "</tool_calls>" },
+            .{ "<ifm|tool_call>", "<tool_call>" },      .{ "</ifm|tool_call>", "</tool_call>" },
+            .{ "<ifm|arg_key>", "<arg_key>" },          .{ "</ifm|arg_key>", "</arg_key>" },
+            .{ "<ifm|arg_value>", "<arg_value>" },      .{ "</ifm|arg_value>", "</arg_value>" },
+        };
+        for (pairs) |pair| {
+            if (self.special_tokens.get(pair[0])) |id| map.put(id, pair[1]) catch return false;
+        }
+        var closers = std.AutoHashMap(u32, u32).init(self.allocator);
+        errdefer closers.deinit();
+        for ([_][2][]const u8{
+            .{ "<ifm|think>", "</ifm|think>" },
+            .{ "<ifm|think_fast>", "</ifm|think_fast>" },
+            .{ "<ifm|think_faster>", "</ifm|think_faster>" },
+        }) |pair| {
+            const open = self.special_tokens.get(pair[0]) orelse continue;
+            const close = self.special_tokens.get(pair[1]) orelse continue;
+            closers.put(open, close) catch return false;
+        }
+        self.marker_aliases = map;
+        self.marker_closers = closers;
+        return true;
+    }
+
+    /// The atomic closer paired with a K2 think opener id; null for every other id.
+    pub fn markerCloserFor(self: *const Tokenizer, opener_id: u32) ?u32 {
+        const m = self.marker_closers orelse return null;
+        return m.get(opener_id);
+    }
+
+    /// Reserved-output ids for this tokenizer: `reservedOutputIds` over the
+    /// `special: true` added tokens recorded at load. See that function for
+    /// the derivation rules.
+    pub fn reservedIds(self: *const Tokenizer, allocator: std.mem.Allocator, template_source: []const u8, exempt_ids: []const u32) ![]u32 {
+        return reservedOutputIds(allocator, self.flagged_specials, template_source, exempt_ids);
+    }
+
+    /// Highest DEFINED id + 1 — the real vocabulary, which is not the config's
+    /// `vocab_size`: checkpoints pad the embedding/lm_head rows out to a
+    /// friendly multiple (qwen4_exp: 248044 base + 33 added = 248077 defined
+    /// against a declared 248320, so 243 rows decode to nothing at all). Those
+    /// rows carry whatever the initializer left and a collapsed distribution
+    /// can rank one top-1; `installSuppressMask` masks them out of sampling.
+    /// 0 when nothing is defined (an `initEmptyForTests` tokenizer) — callers
+    /// treat that as "no padding known", never as "suppress everything".
+    pub fn definedVocabSize(self: *const Tokenizer) usize {
+        var highest: ?u32 = null;
+        var it = self.id_to_token.keyIterator();
+        while (it.next()) |id| {
+            if (highest == null or id.* > highest.?) highest = id.*;
+        }
+        return if (highest) |h| @as(usize, h) + 1 else 0;
+    }
+
     // ── SentencePiece BPE (Gemma-style) ──
 
     fn encodeSentencePiece(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
@@ -263,7 +433,10 @@ pub const Tokenizer = struct {
             for (words.items) |w| allocator.free(w);
             words.deinit(allocator);
         }
-        try gpt2PreTokenize(allocator, text, &words);
+        switch (self.pretok_style) {
+            .gpt2 => try gpt2PreTokenize(allocator, text, self.digit_group, &words),
+            .llama3 => try llama3PreTokenize(allocator, text, &words),
+        }
 
         // For each word: map bytes to unicode chars, then BPE merge, then look up vocab
         var all_ids = std.ArrayList(u32).empty;
@@ -296,6 +469,12 @@ pub const Tokenizer = struct {
         defer token_str.deinit(allocator);
 
         for (ids) |id| {
+            if (self.marker_aliases) |aliases| {
+                if (aliases.get(id)) |alias| {
+                    try token_str.appendSlice(allocator, alias);
+                    continue;
+                }
+            }
             if (self.id_to_token.get(id)) |token| {
                 try token_str.appendSlice(allocator, token);
             }
@@ -569,7 +748,13 @@ pub const Tokenizer = struct {
 ///      causes the model to see a perturbed prior on every subsequent word.
 ///   4. Digits are SINGLE-codepoint pre-tokens (pattern 3 = `\p{N}`, not
 ///      `\p{N}+`). `100` → three separate `1`, `0`, `0` pre-tokens.
-fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std.ArrayList([]const u8)) !void {
+/// `digit_group`: how many consecutive digits form one pre-token. 1 = the
+/// Qwen/GPT-2 `\p{N}` rule; 3 = the DeepSeek-V4/Llama-3 `\p{N}{1,3}` rule
+/// (greedy left-to-right groups). Parsed per model from tokenizer.json —
+/// feeding a {1,3}-trained model per-digit pre-tokens puts every number
+/// off-distribution (the echo-precision slip class: `1o` for `10`, split
+/// digits, o-for-0 near-ties).
+fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: u8, words: *std.ArrayList([]const u8)) !void {
     var i: usize = 0;
     while (i < text.len) {
         const start = i;
@@ -604,10 +789,16 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std.A
             continue;
         }
 
-        // ── Pattern 3: `\p{N}` — exactly ONE digit codepoint ──
+        // ── Pattern 3: `\p{N}` or `\p{N}{1,3}` — up to digit_group digits ──
         if (decodeCodepoint(text, i)) |cp_info| {
             if (isDigit(cp_info.cp)) {
                 i += cp_info.len;
+                var taken: u8 = 1;
+                while (taken < digit_group) : (taken += 1) {
+                    const next = decodeCodepoint(text, i) orelse break;
+                    if (!isDigit(next.cp)) break;
+                    i += next.len;
+                }
                 try words.append(allocator, try allocator.dupe(u8, text[start..i]));
                 continue;
             }
@@ -649,6 +840,151 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std.A
         i += 1;
         try words.append(allocator, try allocator.dupe(u8, text[start..i]));
     }
+}
+
+/// Llama-3-style pre-tokenizer (Muse-Glimmer). Branch order mirrors the
+/// tokenizer.json Split regex exactly:
+///   1. [^\r\n\p{L}\p{N}]?[UPPER]*[LOWER]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+///   2. [^\r\n\p{L}\p{N}]?[UPPER]+[LOWER]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+///   3. \p{N}{1,3}
+///   4.  ?[^\s\p{L}\p{N}]+[\r\n/]*
+///   5. \s*[\r\n]+   6. \s+(?!\S)   7. \s+
+/// UPPER = \p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}, LOWER = \p{Ll}\p{Lm}\p{Lo}\p{M} —
+/// caseless letters and marks belong to BOTH classes. Branches 1+2 collapse
+/// into one deterministic scan (greedy upper-run then greedy lower-run, ≥1
+/// letter total): for disjoint ASCII classes this reproduces the regex's
+/// backtracking exactly, and for the overlap classes every reachable match
+/// END coincides. Known gap: non-ASCII CASED letters (Cyrillic/Greek Lu/Ll)
+/// are treated caseless, so a mid-word case transition there doesn't split —
+/// same text, off-reference boundary; revisit with real Lu/Ll tables if a
+/// checkpoint's traffic warrants it.
+fn llama3PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std.ArrayList([]const u8)) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        const start = i;
+
+        // ── Branches 1+2: optional non-LNN char + cased word + contraction ──
+        if (llama3MatchWord(text, i)) |new_i| {
+            i = new_i;
+            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            continue;
+        }
+
+        // ── Branch 3: `\p{N}{1,3}` ──
+        if (decodeCodepoint(text, i)) |cp_info| {
+            if (isDigit(cp_info.cp)) {
+                i += cp_info.len;
+                var taken: u8 = 1;
+                while (taken < 3) : (taken += 1) {
+                    const next = decodeCodepoint(text, i) orelse break;
+                    if (!isDigit(next.cp)) break;
+                    i += next.len;
+                }
+                try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+                continue;
+            }
+        }
+
+        // ── Branch 4: ` ?[^\s\p{L}\p{N}]+[\r\n/]*` (marks ride with punct,
+        // and `/` joins the newline tail) ──
+        if (llama3MatchPunct(text, i)) |new_i| {
+            i = new_i;
+            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            continue;
+        }
+
+        // ── Branches 5-7: identical whitespace grammar to gpt2 ──
+        if (matchWhitespaceWithNewline(text, i)) |new_i| {
+            i = new_i;
+            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            continue;
+        }
+        if (matchTrailingWhitespace(text, i)) |new_i| {
+            i = new_i;
+            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            continue;
+        }
+        if (i < text.len and isWhitespace(text[i])) {
+            while (i < text.len and isWhitespace(text[i])) i += 1;
+            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            continue;
+        }
+
+        i += 1;
+        try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+    }
+}
+
+/// UPPER class: \p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M} — ASCII exact, non-ASCII
+/// letters/marks caseless (in both classes; see llama3PreTokenize doc).
+fn llama3UpperClass(cp: u21) bool {
+    if (cp < 128) return cp >= 'A' and cp <= 'Z';
+    return isLetterOrMark(cp);
+}
+
+/// LOWER class: \p{Ll}\p{Lm}\p{Lo}\p{M}.
+fn llama3LowerClass(cp: u21) bool {
+    if (cp < 128) return cp >= 'a' and cp <= 'z';
+    return isLetterOrMark(cp);
+}
+
+/// Branches 1+2 of the llama3 grammar. Returns the match end or null.
+fn llama3MatchWord(text: []const u8, start: usize) ?usize {
+    var i = start;
+    const first = decodeCodepoint(text, i) orelse return null;
+    // Optional single char that's NOT \r/\n/letter/digit (space and marks OK).
+    if (!isLetter(first.cp) and !isDigit(first.cp) and first.cp != '\r' and first.cp != '\n') {
+        // Consume it only if letters actually follow (regex optionality).
+        const after = i + first.len;
+        const next = decodeCodepoint(text, after) orelse return null;
+        if (!llama3UpperClass(next.cp) and !llama3LowerClass(next.cp)) return null;
+        i = after;
+    }
+    const word_start = i;
+    // Greedy upper-run, then greedy lower-run; ≥1 letter total.
+    while (decodeCodepoint(text, i)) |c| {
+        if (!llama3UpperClass(c.cp)) break;
+        i += c.len;
+    }
+    while (decodeCodepoint(text, i)) |c| {
+        if (!llama3LowerClass(c.cp)) break;
+        i += c.len;
+    }
+    if (i == word_start) return null;
+    // Optional (?i) contraction suffix.
+    if (i < text.len and text[i] == '\'' and i + 1 < text.len) {
+        const n1 = std.ascii.toLower(text[i + 1]);
+        if (n1 == 's' or n1 == 't' or n1 == 'm' or n1 == 'd') {
+            i += 2;
+        } else if (i + 2 < text.len) {
+            const n2 = std.ascii.toLower(text[i + 2]);
+            if ((n1 == 'r' and n2 == 'e') or (n1 == 'v' and n2 == 'e') or (n1 == 'l' and n2 == 'l')) {
+                i += 3;
+            }
+        }
+    }
+    return i;
+}
+
+/// Branch 4: ` ?[^\s\p{L}\p{N}]+[\r\n/]*`. Unlike the gpt2 pattern, marks
+/// belong to the punct class and `/` joins the trailing run.
+fn llama3MatchPunct(text: []const u8, start: usize) ?usize {
+    if (start >= text.len) return null;
+    var p_start: usize = start;
+    if (text[start] == ' ') p_start = start + 1;
+
+    if (p_start >= text.len) return null;
+    const first_cp = decodeCodepoint(text, p_start) orelse return null;
+    if (isWhitespaceCp(first_cp.cp) or isLetter(first_cp.cp) or isDigit(first_cp.cp)) return null;
+
+    var i: usize = p_start + first_cp.len;
+    while (i < text.len) {
+        const c = decodeCodepoint(text, i) orelse break;
+        if (isWhitespaceCp(c.cp) or isLetter(c.cp) or isDigit(c.cp)) break;
+        i += c.len;
+    }
+    while (i < text.len and (text[i] == '\r' or text[i] == '\n' or text[i] == '/')) i += 1;
+    return i;
 }
 
 /// Pattern 2: `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+`. Returns end position of
@@ -982,6 +1318,8 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
 
     // Parse added_tokens
     var special_tokens = std.StringHashMap(u32).init(allocator);
+    var flagged = std.ArrayList(FlaggedSpecial).empty;
+    errdefer flagged.deinit(allocator);
     var bos_id: ?u32 = null;
     var eos_id: ?u32 = null;
 
@@ -994,6 +1332,13 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
             // so they are tokenized as single atomic units. The string is
             // borrowed from `parsed`'s arena — no per-entry dupe.
             try special_tokens.put(content_str, id);
+            // `special: true` entries additionally feed reserved-output
+            // suppression (see `reservedOutputIds`).
+            if (obj.get("special")) |sv| {
+                if (sv == .bool and sv.bool) {
+                    try flagged.append(allocator, .{ .id = id, .content = content_str });
+                }
+            }
             if (!vocab.contains(content_str)) {
                 try vocab.put(content_str, id);
                 try id_to_token.put(id, content_str);
@@ -1023,19 +1368,105 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         },
     });
 
-    return .{
+    var built: Tokenizer = .{
         .vocab = vocab,
         .id_to_token = id_to_token,
         .merge_ranks = merge_ranks,
         .allocator = allocator,
         .special_tokens = special_tokens,
+        .flagged_specials = try flagged.toOwnedSlice(allocator),
         .tok_type = tok_type,
+        .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
+        .pretok_style = if (root.get("pre_tokenizer")) |pt| pretokStyleFromPreTokenizer(pt) else .gpt2,
         .byte_to_unicode = byte_to_unicode,
         .unicode_to_byte = unicode_to_byte,
         .bos_id = bos_id,
         .eos_id = eos_id,
         .parsed_json = parsed,
     };
+    if (built.installMarkerAliases()) log.info("Tokenizer: K2-Horizon markers alias to <think> / GLM tool tags\n", .{});
+    return built;
+}
+
+/// Digits per pre-token from the tokenizer.json `pre_tokenizer` spec: a
+/// `Split` rule (top-level or inside a `Sequence`) whose regex is exactly
+/// `\p{N}{1,3}` selects 3-digit grouping; anything else keeps the GPT-2
+/// single-digit rule. Deliberately exact-match — an unrecognized digit rule
+/// keeps the conservative behavior rather than guessing.
+fn digitGroupFromPreTokenizer(pt: std.json.Value) u8 {
+    if (pt != .object) return 1;
+    if (splitRegexIsDigits13(pt)) return 3;
+    var group: u8 = 1;
+    if (pt.object.get("pretokenizers")) |list| {
+        if (list == .array) {
+            for (list.array.items) |sub| {
+                if (sub != .object) continue;
+                if (splitRegexIsDigits13(sub)) group = 3;
+                // A later `Digits(individual_digits)` rule re-splits every
+                // group the {1,3} rule formed (Spark-X2.5).
+                if (isIndividualDigitsRule(sub)) group = 1;
+            }
+        }
+    }
+    return group;
+}
+
+fn isIndividualDigitsRule(node: std.json.Value) bool {
+    const t = node.object.get("type") orelse return false;
+    if (t != .string or !std.mem.eql(u8, t.string, "Digits")) return false;
+    const ind = node.object.get("individual_digits") orelse return false;
+    return ind == .bool and ind.bool;
+}
+
+/// Pre-tokenizer grammar from the tokenizer.json Split regex. The muse /
+/// Llama-3 family ships ONE combined pattern whose signature is the attached
+/// contraction group PLUS the {1,3} digit rule — the exact-match digit
+/// detection alone misses it because `\p{N}{1,3}` is an alternation branch,
+/// not the whole regex (live 2026-08-10: "84" served per-digit, the model
+/// echoed "8 4" — the DSV4 echo-precision class on a new spelling).
+fn pretokStyleFromPreTokenizer(pt: std.json.Value) PretokStyle {
+    if (pt != .object) return .gpt2;
+    if (splitRegexIsLlama3(pt)) return .llama3;
+    if (pt.object.get("pretokenizers")) |list| {
+        if (list == .array) {
+            for (list.array.items) |sub| {
+                if (sub == .object and splitRegexIsLlama3(sub)) return .llama3;
+            }
+        }
+    }
+    return .gpt2;
+}
+
+fn splitRegexIsLlama3(node: std.json.Value) bool {
+    const rx = splitRegexOf(node) orelse return false;
+    return llama3StyleFromSplitRegex(rx);
+}
+
+fn llama3StyleFromSplitRegex(rx: []const u8) bool {
+    return std.mem.indexOf(u8, rx, "'s|'t|'re|'ve|'m|'ll|'d") != null and
+        std.mem.indexOf(u8, rx, "\\p{N}{1,3}") != null;
+}
+
+fn splitRegexOf(node: std.json.Value) ?[]const u8 {
+    const obj = node.object;
+    const ty = obj.get("type") orelse return null;
+    if (ty != .string or !std.mem.eql(u8, ty.string, "Split")) return null;
+    const pat = obj.get("pattern") orelse return null;
+    if (pat != .object) return null;
+    const rx = pat.object.get("Regex") orelse return null;
+    if (rx != .string) return null;
+    return rx.string;
+}
+
+/// The digit rule is a BRANCH, not necessarily the whole pattern: DeepSeek-V4
+/// gives `\p{N}{1,3}` its own Split entry, while LFM2.5-VL / Llama-3 bury it in
+/// one combined alternation. An exact-match test reads the combined spelling as
+/// per-digit, which puts every number in the prompt off-distribution — and the
+/// style detector cannot stand in for it, since a checkpoint can carry this
+/// digit rule with a non-Llama-3 contraction group (LFM2.5-VL does).
+fn splitRegexIsDigits13(node: std.json.Value) bool {
+    const rx = splitRegexOf(node) orelse return false;
+    return std.mem.indexOf(u8, rx, "\\p{N}{1,3}") != null;
 }
 
 /// Parse one BPE merge entry, accepting both on-disk formats:
@@ -1432,12 +1863,38 @@ test "WordPiece encode lowercases input" {
 // Helper for pre-tokenizer tests: run gpt2PreTokenize and compare the
 // emitted word strings to an expected slice. Owns the dupe'd word memory.
 fn expectPreTokens(allocator: std.mem.Allocator, input: []const u8, expected: []const []const u8) !void {
+    return expectPreTokensG(allocator, input, 1, expected);
+}
+
+fn expectPreTokensL3(allocator: std.mem.Allocator, input: []const u8, expected: []const []const u8) !void {
     var words: std.ArrayList([]const u8) = .empty;
     defer {
         for (words.items) |w| allocator.free(w);
         words.deinit(allocator);
     }
-    try gpt2PreTokenize(allocator, input, &words);
+    try llama3PreTokenize(allocator, input, &words);
+    if (words.items.len != expected.len) {
+        std.debug.print("\n  llama3 pre-tokenize on {s}: got {d} words, expected {d}\n", .{
+            input, words.items.len, expected.len,
+        });
+        for (words.items, 0..) |w, i| std.debug.print("    [{d}] '{s}'\n", .{ i, w });
+        return error.WordCountMismatch;
+    }
+    for (words.items, expected, 0..) |got, want, idx| {
+        if (!std.mem.eql(u8, got, want)) {
+            std.debug.print("\n  llama3 pre-tokenize on {s}: word [{d}] got '{s}', expected '{s}'\n", .{ input, idx, got, want });
+            return error.WordMismatch;
+        }
+    }
+}
+
+fn expectPreTokensG(allocator: std.mem.Allocator, input: []const u8, digit_group: u8, expected: []const []const u8) !void {
+    var words: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (words.items) |w| allocator.free(w);
+        words.deinit(allocator);
+    }
+    try gpt2PreTokenize(allocator, input, digit_group, &words);
     if (words.items.len != expected.len) {
         std.debug.print("\n  pre-tokenize on {s}: got {d} words, expected {d}\n", .{
             input, words.items.len, expected.len,
@@ -1474,6 +1931,43 @@ test "gpt2PreTokenize: leading space combines with letters" {
     try expectPreTokens(testing.allocator, "def total", &.{ "def", " total" });
 }
 
+test "llama3PreTokenize: boundaries match the reference regex (muse_glimmer class)" {
+    // Expected boundaries generated with python `regex` findall of the exact
+    // Llama-3-style Split pattern Muse-Glimmer-30B ships (case-transition
+    // word splits, attached (?i) contractions, {1,3} digit groups, `/` in the
+    // punct tail class). BPE cannot merge across pre-tokens, so these
+    // boundaries drive final token ids — per-digit splitting here was the
+    // DSV4 echo-precision class all over again ("8 4" echoed for "84", live
+    // 2026-08-10 first boot).
+    const a = testing.allocator;
+    try expectPreTokensL3(a, "What is 84 * 3 / 2? In 1234 years.", &.{
+        "What", " is", " ", "84", " *", " ", "3", " /", " ", "2", "?", " In", " ", "123", "4", " years", ".",
+    });
+    try expectPreTokensL3(a, "don't stop", &.{ "don't", " stop" });
+    // (?i) contractions attach in ANY case; the pre-token stays whole.
+    try expectPreTokensL3(a, "I'LL be DON'T", &.{ "I'LL", " be", " DON'T" });
+    // Case-transition split (lower→upper) but ABCdef joins (upper*lower+).
+    try expectPreTokensL3(a, "HelloWorld ABCdef", &.{ "Hello", "World", " ABCdef" });
+    try expectPreTokensL3(a, "hello   world", &.{ "hello", "  ", " world" });
+    try expectPreTokensL3(a, "x=1; a/b/ c", &.{ "x", "=", "1", ";", " a", "/b", "/", " c" });
+    try expectPreTokensL3(a, " 12345.67", &.{ " ", "123", "45", ".", "67" });
+    // `/` joins the punct tail (the [\r\n/]* quirk).
+    try expectPreTokensL3(a, "https://a.b/c", &.{ "https", "://", "a", ".b", "/c" });
+    try expectPreTokensL3(a, "foo\n\n  bar", &.{ "foo", "\n\n", " ", " bar" });
+    try expectPreTokensL3(a, "It's 3.14", &.{ "It's", " ", "3", ".", "14" });
+}
+
+test "llama3 style detection: muse's combined Split regex selects it, others keep gpt2" {
+    // The muse regex carries the contraction group AND the {1,3} digit rule
+    // inside ONE combined Split — the exact-match digit detection alone
+    // misses it (that was the live "8 4" bug).
+    const muse_pattern = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    try testing.expect(llama3StyleFromSplitRegex(muse_pattern));
+    // Qwen/GPT-2-style and the DSV4 standalone digit rule stay gpt2.
+    try testing.expect(!llama3StyleFromSplitRegex("\\p{N}{1,3}"));
+    try testing.expect(!llama3StyleFromSplitRegex("[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}"));
+}
+
 test "gpt2PreTokenize: leading space combines with punctuation" {
     // Pattern 4 is ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*`.
     try expectPreTokens(testing.allocator, " =", &.{" ="});
@@ -1487,6 +1981,80 @@ test "gpt2PreTokenize: digits are single-codepoint pre-tokens" {
     // BPE will not merge across pre-tokens, so this drives final token IDs.
     try expectPreTokens(testing.allocator, "100", &.{ "1", "0", "0" });
     try expectPreTokens(testing.allocator, " 100", &.{ " ", "1", "0", "0" });
+}
+
+test "gpt2PreTokenize: {1,3} digit groups when the spec declares them (DSV4 class)" {
+    // DeepSeek-V4's tokenizer.json isolates digit runs with `\p{N}{1,3}` —
+    // greedy left-to-right groups of up to three. Our per-digit splitting fed
+    // the model an alien segmentation of every number: the ROOT CAUSE of the
+    // echo-precision slip class (`1o` for `10`, o-for-0, split digits) that
+    // was chased through expert quantization for days. Reference HF ids for
+    // "1048576": [104][857][6]; our per-digit split can never produce them.
+    try expectPreTokensG(testing.allocator, "1048576", 3, &.{ "104", "857", "6" });
+    try expectPreTokensG(testing.allocator, "100", 3, &.{"100"});
+    try expectPreTokensG(testing.allocator, " 100 units", 3, &.{ " ", "100", " units" });
+    try expectPreTokensG(testing.allocator, "26.7.12", 3, &.{ "26", ".", "7", ".", "12" });
+    try expectPreTokensG(testing.allocator, "v2", 3, &.{ "v", "2" });
+    // group 1 keeps the Qwen behavior byte-identical
+    try expectPreTokensG(testing.allocator, "1048576", 1, &.{ "1", "0", "4", "8", "5", "7", "6" });
+}
+
+test "tokenizer.json digit-group parse: a trailing Digits(individual) rule overrides {1,3} back to 1" {
+    // Spark-X2.5: DeepSeek's {1,3} Split followed by a `Digits` pretokenizer
+    // with individual_digits — the later rule re-splits every group.
+    const json =
+        \\{"type":"Sequence","pretokenizers":[
+        \\  {"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},
+        \\  {"type":"Digits","individual_digits":true},
+        \\  {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u8, 1), digitGroupFromPreTokenizer(parsed.value));
+}
+
+test "tokenizer.json digit-group parse: {1,3} Split rule sets digit_group 3" {
+    const json_13 =
+        \\{"type":"Sequence","pretokenizers":[
+        \\  {"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},
+        \\  {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}
+    ;
+    var p1 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_13, .{});
+    defer p1.deinit();
+    try testing.expectEqual(@as(u8, 3), digitGroupFromPreTokenizer(p1.value));
+
+    const json_single =
+        \\{"type":"ByteLevel"}
+    ;
+    var p2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_single, .{});
+    defer p2.deinit();
+    try testing.expectEqual(@as(u8, 1), digitGroupFromPreTokenizer(p2.value));
+}
+
+test "tokenizer.json digit-group parse: {1,3} inside a COMBINED Split regex" {
+    // LFM2.5-VL ships one alternation carrying the digit rule as a branch, so
+    // an exact-match detector reads it as per-digit and every number in the
+    // prompt goes off-distribution (live 2026-08-14: "973, 162" served as
+    // '9','7','3' / '1','6','2' against HF's '973' / '162', measured on the
+    // ScreenSpot-v2 grounding track). The contraction group is spelled
+    // `'(?i:[sdmt]|ll|ve|re)`, not Llama-3's, so the style detector does not
+    // cover it either — the digit rule is its own question.
+    const json_combined =
+        \\{"type":"Sequence","pretokenizers":[
+        \\  {"type":"Split","pattern":{"Regex":"'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]|\\s+(?!\\S)|\\s"},"behavior":"Isolated","invert":false},
+        \\  {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}
+    ;
+    var p3 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_combined, .{});
+    defer p3.deinit();
+    try testing.expectEqual(@as(u8, 3), digitGroupFromPreTokenizer(p3.value));
+
+    // A tokenizer with no digit rule at all still groups per digit.
+    const json_no_digits =
+        \\{"type":"Split","pattern":{"Regex":"[^\\r\\n\\p{L}\\p{N}]?\\p{L}+"},"behavior":"Isolated","invert":false}
+    ;
+    var p4 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_no_digits, .{});
+    defer p4.deinit();
+    try testing.expectEqual(@as(u8, 1), digitGroupFromPreTokenizer(p4.value));
 }
 
 test "gpt2PreTokenize: newline run after whitespace" {
@@ -1701,4 +2269,124 @@ test "parseMergePair handles both array and space-joined-string formats" {
         defer p.deinit();
         try testing.expect(parseMergePair(p.value) == null);
     }
+}
+
+test "reservedOutputIds: an OUTPUT-ONLY special is legit output the template cannot vouch for" {
+    // Live 2026-08-12, gpt-oss-20b. Harmony declares a tool call's argument
+    // content type INSIDE the segment header the model generates:
+    //   ...to=functions.get_weather <|constrain|>json<|message|>{...}<|call|>
+    // The chat template renders tool calls only for HISTORY, and that rendering
+    // omits <|constrain|> entirely — so the token appears nowhere in the
+    // template source and the template-presence derivation filed it as
+    // reserved. Masked, the model substituted the nearest thing it could still
+    // draw and produced `to=functions.get_weather <|channel|>commentary 1.0`,
+    // a malformed header that sent it into a repetition loop.
+    const alloc = testing.allocator;
+    const flagged = [_]FlaggedSpecial{
+        .{ .id = 200003, .content = "<|constrain|>" },
+        .{ .id = 200005, .content = "<|channel|>" },
+        .{ .id = 200013, .content = "<|reserved_200013|>" },
+    };
+    // A harmony template: mentions <|channel|>, never <|constrain|>.
+    const template = "<|start|>assistant<|channel|>final<|message|>{{ content }}";
+    const eos = [_]u32{200002};
+    const ids = try reservedOutputIds(alloc, &flagged, template, &eos);
+    defer alloc.free(ids);
+    // Only the genuinely-reserved slot is suppressed.
+    try testing.expectEqual(@as(usize, 1), ids.len);
+    try testing.expectEqual(@as(u32, 200013), ids[0]);
+}
+
+test "reservedOutputIds: specials minus template markers minus eos" {
+    // A reserved marker (`<|fim_hole|>` at a collapsed position) in
+    // chat output is always a bug; the suppression set is every `special:
+    // true` added token MINUS legitimate output. Legitimacy is DERIVED, never
+    // hardcoded: EOS/stop ids stay, and so does any special whose literal
+    // text appears in the chat template source (thinking tags, tool markers,
+    // role markers) — a hardcoded list breaks thinking/tool-calling on the
+    // next arch.
+    const alloc = testing.allocator;
+    const flagged = [_]FlaggedSpecial{
+        .{ .id = 10, .content = "<|fim_hole|>" },
+        .{ .id = 11, .content = "<|fim_begin|>" },
+        .{ .id = 20, .content = "<think>" },
+        .{ .id = 21, .content = "</think>" },
+        .{ .id = 22, .content = "<tool_call>" },
+        .{ .id = 30, .content = "<|endoftext|>" },
+        .{ .id = 31, .content = "<|role_end|>" },
+    };
+    const template = "<role>HUMAN</role>{{ content }}<|role_end|>" ++
+        "<role>ASSISTANT</role>\n<think></think>{% if tools %}<tool_call>{% endif %}";
+    const eos = [_]u32{30};
+
+    const ids = try reservedOutputIds(alloc, &flagged, template, &eos);
+    defer alloc.free(ids);
+    // Only the FIM markers survive: think/tool/role markers appear in the
+    // template, <|endoftext|> is EOS.
+    try testing.expectEqualSlices(u32, &[_]u32{ 10, 11 }, ids);
+
+    // No template at all => suppression disabled entirely (fallback-formatted
+    // models keep pre-change behavior; ChatML markers are not in any template
+    // source we could consult).
+    const none = try reservedOutputIds(alloc, &flagged, "", &eos);
+    defer alloc.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "reservedOutputIds: every flagged special exempt yields empty set" {
+    const alloc = testing.allocator;
+    const flagged = [_]FlaggedSpecial{
+        .{ .id = 5, .content = "<eos>" },
+        .{ .id = 6, .content = "<think>" },
+    };
+    const ids = try reservedOutputIds(alloc, &flagged, "x<think>y", &[_]u32{5});
+    defer alloc.free(ids);
+    try testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "K2-Horizon markers decode to the canonical think / GLM tool-tag spellings" {
+    const allocator = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.deinit();
+    const specials = [_][]const u8{
+        "<ifm|think>",      "</ifm|think>",      "<ifm|think_fast>", "</ifm|think_fast>",
+        "<ifm|tool_calls>", "</ifm|tool_calls>", "<ifm|tool_call>",  "</ifm|tool_call>",
+        "<ifm|arg_key>",    "</ifm|arg_key>",    "<ifm|arg_value>",  "</ifm|arg_value>",
+    };
+    for (specials, 0..) |t, i| {
+        try tok.id_to_token.put(@intCast(i), t);
+        try tok.special_tokens.put(try allocator.dupe(u8, t), @intCast(i));
+    }
+    try tok.id_to_token.put(100, "ok");
+    try testing.expect(tok.installMarkerAliases());
+    const ids = [_]u32{ 0, 100, 1, 4, 6, 8, 100, 9, 10, 100, 11, 7, 5, 2, 3 };
+    const out = try tok.decode(allocator, &ids, false);
+    defer allocator.free(out);
+    try testing.expectEqualStrings(
+        "<think>ok</think><tool_calls><tool_call><arg_key>ok</arg_key><arg_value>ok</arg_value></tool_call></tool_calls><think></think>",
+        out,
+    );
+    // Encoding the marker text still lands on the special id: the alias is decode-only.
+    try testing.expectEqual(@as(?u32, 0), tok.specialTokenId("<ifm|think>"));
+}
+
+test "markerCloserFor: K2 think openers pair with their own closer" {
+    const allocator = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.deinit();
+    const specials = [_][]const u8{
+        "<ifm|think>",      "</ifm|think>",      "<ifm|think_fast>",   "</ifm|think_fast>",
+        "<ifm|think_faster>", "</ifm|think_faster>", "<ifm|tool_calls>", "</ifm|tool_calls>",
+    };
+    for (specials, 0..) |t, i| {
+        try tok.id_to_token.put(@intCast(i), t);
+        try tok.special_tokens.put(try allocator.dupe(u8, t), @intCast(i));
+    }
+    try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(0));
+    try testing.expect(tok.installMarkerAliases());
+    try testing.expectEqual(@as(?u32, 1), tok.markerCloserFor(0));
+    try testing.expectEqual(@as(?u32, 3), tok.markerCloserFor(2));
+    try testing.expectEqual(@as(?u32, 5), tok.markerCloserFor(4));
+    try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(6));
+    try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(1));
 }

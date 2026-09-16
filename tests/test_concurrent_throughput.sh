@@ -17,7 +17,7 @@
 # Requires:
 #   - A built mlx-serve binary
 #   - Either CONCURRENT_TEST_MODEL set or default at
-#     ~/.mlx-serve/models/gemma-4-e4b-it-8bit
+#     ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
 #
 # Usage:
 #   CONCURRENT_TEST_MODEL=/path/to/model ./tests/test_concurrent_throughput.sh [port]
@@ -31,7 +31,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${CONCURRENT_TEST_MODEL:-${PLD_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}}"
+MODEL="${CONCURRENT_TEST_MODEL:-${PLD_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}}"
 MAX_TOKENS=${MAX_TOKENS:-200}
 SPEEDUP_THRESHOLD=${SPEEDUP_THRESHOLD:-1.6}
 N_PARALLEL=${N_PARALLEL:-4}
@@ -39,7 +39,7 @@ N_PARALLEL=${N_PARALLEL:-4}
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_concurrent_throughput: model directory not found."
     echo "  Set CONCURRENT_TEST_MODEL or place an MLX checkpoint at"
-    echo "  ~/.mlx-serve/models/gemma-4-e4b-it-8bit."
+    echo "  ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit."
     exit 0
 fi
 
@@ -54,29 +54,8 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-# Skip MoE / hybrid / encoder-only models — those clamp max_concurrent to 1
-# at server start because the batched kernel doesn't model their state. The
-# test wouldn't be measuring continuous batching on them.
-ARCH=$(python3 -c "
-import json, sys
-with open('$MODEL/config.json') as f:
-    c = json.load(f)
-mt = c.get('model_type', '')
-moe_layers = c.get('num_local_experts', 0) > 0 or c.get('num_experts', 0) > 0
-hybrid = mt in ('qwen3_5', 'qwen3_5_moe', 'qwen3_5_moe_text', 'qwen3_next', 'nemotron_h', 'lfm2', 'lfm2_vl')
-encoder = c.get('is_encoder_only', False) or 'bert' in mt.lower()
-if moe_layers or hybrid or encoder:
-    print(f'SKIP_INCOMPATIBLE {mt}')
-else:
-    print(f'OK {mt}')
-")
-if [[ "$ARCH" == SKIP_INCOMPATIBLE* ]]; then
-    arch_name="${ARCH#SKIP_INCOMPATIBLE }"
-    echo -e "${YELLOW}SKIP${NC} test_concurrent_throughput: model arch '$arch_name' clamps max_concurrent to 1."
-    echo "  Continuous batching only applies to pure-attention models. Use a"
-    echo "  Gemma-4 / Llama / Mistral / Qwen3 dense checkpoint to exercise it."
-    exit 0
-fi
+# Whether the model batches is the SERVER's answer: the boot line says
+# "batched decode on|off" and the script keys on that after startup.
 
 # Decode-bound prompt — short input, long output. We want the timing to be
 # dominated by per-token decode work so the batching benefit is visible.
@@ -121,10 +100,9 @@ if [ "$up" != "1" ]; then
     exit 1
 fi
 
-# Confirm the server actually accepted the concurrent setting (didn't clamp
-# to 1 because of an unexpected arch detection).
-if grep -q "Concurrency: requested .* falling back to 1" "$LOGFILE"; then
-    echo -e "${YELLOW}SKIP${NC} server clamped max_concurrent to 1:"
+# Confirm the model batches (a serial-interleave arch has no throughput to measure).
+if grep -q "Concurrency: .* batched decode off" "$LOGFILE"; then
+    echo -e "${YELLOW}SKIP${NC} model does not batch decode:"
     grep "Concurrency:" "$LOGFILE" | sed 's/^/    /'
     exit 0
 fi

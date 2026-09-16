@@ -11,46 +11,34 @@ Timings measured 2026-07-16 on the M4 Max 128 GB, AFTER the `stop_all_engines` p
 |---|---|---|---|
 | 1 | Hermetic suite | `zig build test` (**must** be 6/6 steps, 0 fail) + `cd app && swift test` | ~1 min |
 | 2 | ReleaseFast binary | `zig build -Doptimize=ReleaseFast` → `du -h zig-out/bin/mlx-serve` ≈ **7 MB** (Debug ≈ 2× = fake regression) | ~10 s |
-| 3 | **Perf gate** (did WE regress?) | `./tests/bench.sh --family all` (mlx-serve only) → diff vs `docs/perf-csvs/all-<prev>.csv` → append this release's column to `benchmarks.md` | **~4 min** |
+| 3 | **Perf gate** (did WE regress?) | `./tests/bench.sh` (mlx-serve only, llmprobe) → diff vs the previous column in `benchmarks.md` → append this release's column | ~15 min |
 | 4 | Tool-call correctness | `zig build test -Dtest-filter="format corpus"` + `-Dtest-filter="tool traffic"`; live: `./tests/test_tool_matrix_small.sh` | ~3 min |
 | 5 | API conformance | `npx llmprobe@latest http://127.0.0.1:<port>/v1 --quick` → expect **100%** engine conformance | ~10 s/model |
 | 6 | Regression scripts | `integration_test.sh`, `test_anthropic_api.sh`, `test_ollama_api.sh`, `test_stream_keepalive.sh`, `test_disconnect_cancel.sh`, `test_pld_equivalence.sh`, `test_mtp_equivalence.sh` | ~15 min |
 | 7 | Soak (bigger releases) | `SOAK_DURATION_HOURS=1 ./tests/test_soak_24h.sh` — RSS drift < 10% | 1 h |
-| 8 | **Marketing chart** (only when an ENGINE version changed, or before a public claim) | `./tests/bench.sh --family all --lmstudio --omlx --mtplx` | **~12.5 min** |
+| 8 | **Cross-engine check** (only before a public claim) | start each engine yourself, `./tests/bench.sh --url <host:port> -m <id> --full` per engine; record in `~/claude-tmp/bench-<tag>/`, name the engine in every win — `benchmarks.md` carries mlx-serve only | ~90 min |
 | 9 | Bundle | `SKIP_NOTARIZE=1 bash app/build.sh` (both binaries move together) | ~2 min |
 
 **Rules:**
-- **Steps 3 and 8 are different questions.** 3 = "did our code regress" — mlx-serve only, the ONLY one needed every release. 8 = the public chart; LM Studio/oMLX/MTPLX numbers cannot move when only OUR code changes, so re-run 8 only when an engine version bumps. 22 of 56 cells measure other engines.
-- **Diff step 3 against `all-<version>.csv`, never `{gemma,qwen36}-26.7.6.csv`** (different methodology AND pre-`verifyQmm` — see BenchmarkLog rules).
-- **`--only <substr>`** runs a single model row (~30 s) for tight dev loops.
-- **`--runs N`**: default 2 = run 1 dropped as warmup ⇒ **one measured sample per cell**. For any regression CLAIM use `--runs 3`+ and sample across runs — see the "reproducible ≠ not variance" rule in BenchmarkLog.
+- **Steps 3 and 8 are different questions.** 3 = "did our code regress" — mlx-serve only, the ONLY one needed every release. 8 = the public comparison; LM Studio/oMLX/MTPLX numbers cannot move when only OUR code changes, so re-run 8 only when an engine version bumps.
+- **Diff step 3 against llmprobe columns only.** Columns through 26.7.12 are the pre-2026-08 hand-rolled bench, a DIFFERENT methodology — frozen history, never a diff target. See /bench.
+- **`--only <substr>`** runs a single model row for tight dev loops.
+- **Depth**: default `--bench-only` is one run per ladder rung to 16k. `--full` takes median-of-3 per rung and climbs to 32k/64k — that's the release artifact depth (step 8). For a regression CLAIM on a spec-decode cell, sample across runs and boot orders regardless of depth: "reproducible ≠ not variance".
 - **Never quote a win without naming the engine it is over** — vs LM-GGUF the 26B-A4B row reads +33%; vs oMLX it is +1.6%.
-- **`benchmarks.md` gets one new COLUMN per release, from step 3's cells** (best-config table on top, raw decode below; Laguna's raw number comes from its live A/B harness, not the bench matrix). Obey the file's own header rules: results into the tables only, no text; **Apple M4 Max 128 GB only** — skip the update entirely when releasing from any other machine (the M4 mini), a mixed column poisons the history.
+- **`benchmarks.md` gets one new COLUMN per release, from the rows step 3 prints** (Laguna's number comes from its own A/B harness, not the bench matrix). Obey the file's own header rules: results into the tables only, no text; **Apple M4 Max 128 GB only** — skip the update entirely when releasing from any other machine (the M4 mini), a mixed column poisons the history.
 
 ## Release benchmark artifacts
 
-Each release ships exactly **TWO CSVs + TWO PNGs**, all measured on the FINAL release tree (a chart generated mid-cycle is stale the moment another perf round lands):
+The record is `benchmarks.md` plus the saved llmprobe reports under `~/claude-tmp/bench-<tag>/`. Nothing lands in `docs/` any more — no CSVs, no charts. Run the gate on the FINAL release tree (a number taken mid-cycle is stale the moment another perf round lands):
 
-1. `docs/perf-csvs/all-<ver>.csv` + `docs/perf-pngs/perf-vs-lmstudio-omlx-all-<ver>.png` — one bench.sh run serves both (the mlx-serve cells are the next release's step-3 gate-diff target, the engine cells are the chart):
-   ```
-   ./tests/bench.sh --family all --lmstudio --omlx --mtplx \
-     --out docs/perf-pngs/perf-vs-lmstudio-omlx-all-<ver>.png \
-     --keep-csv docs/perf-csvs/all-<ver>.csv
-   ```
-2. `docs/perf-csvs/mtp-ladder-<ver>.csv` + `docs/perf-pngs/perf-mtp-ladder-<ver>.png` — **WARM protocol** via `tests/mtp_ladder_pair.sh` (one boot per engine, discarded warmup, COLD prompts, prefix caches off, ours first): one default run (→ `oursjundot` + `omlx` lanes) + one `OURS_ONLY=1 MODEL=<27B-MTPLX-Optimized-Speed path>` run (→ `oursmtplx` lane). **MTPLX lanes are CARRIED from the previous release's ladder CSV unless MTPLX shipped a new version** (their numbers cannot move when our release changes); the subtitle must disclose the carry. Pinned plot invocation (26.7.12 wording — bump versions/subtitle per release):
-   ```
-   python3 tests/plot_mtp_ladder.py docs/perf-csvs/mtp-ladder-<ver>.csv \
-     docs/perf-pngs/perf-mtp-ladder-<ver>.png \
-     --engines "mtplx:MTPLX 2.3.0 · 27B-mtplx-speed:#a78bfa,omlx:oMLX 0.5.2 Lightning · 27B-oQ4e:#38bdf8,oursjundot:mlx-serve · 27B-oQ4e:#f59e0b,oursmtplx:mlx-serve · 27B-mtplx-speed:#ea580c" \
-     --delta oursjundot:omlx \
-     --title "Native MTP context ladder — MLX-serve vs oMLX (27B-oQ4e) & MTPLX (27B-mtplx-speed), 0.5K–64K" \
-     --subtitle "Qwen3.6-27B · WARM: one boot/engine, discarded warmup, COLD prompts, prefix-cache off, ours-first, idle M4 Max 128GB · MLX-serve <ver> · MTPLX 2.3.0 lanes carried from the <prev> run · temp 0.6, thinking off"
-   ```
+```
+./tests/bench.sh --tag <ver>
+```
 
 Rules:
-- **Delete the cycle's untracked dev CSVs/PNGs before cutting** (fwd-probes, timestamped bench-* runs, medians scratch files) — only the four artifacts above land; committed history stays.
-- **Never re-render an old CSV with new styling or lane specs** — a chart and its CSV travel together; if the numbers are being kept, the chart is too.
-- Both charts must be visually consistent with the previous release's (same lane order, names pattern, colors, panels) so releases compare at a glance.
+- **Paste the printed rows into the `Decode tok/s by release` table**, one new column, mode suffix included. A cell that lost its mode suffix is the signal that speculation stopped engaging — chase it before shipping.
+- **`--full`** takes median-of-3 per rung and climbs to 32k/64k; the default is one run per rung to 16k. For a regression CLAIM on a spec cell, sample across runs and boot orders regardless of depth.
+- **The one chart left is `docs/perf-vs-engines.png`**, frozen at the release it was rendered for and named as such in the README caption. There is no longer a script that regenerates it, and `benchmarks.md` no longer carries a cross-engine table (dropped 26.9.2).
 
 ## Versioning & Releases
 
