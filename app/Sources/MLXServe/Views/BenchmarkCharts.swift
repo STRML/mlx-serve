@@ -283,32 +283,3 @@ struct BenchRow<Value: View>: View {
         }
     }
 }
-
-/// The number the user came for, sized like it.
-struct StatTile: View {
-    let value: String
-    let unit: String
-    let label: String
-    var emphasis: Bool = false
-
-    var body: some View {
-        VStack(spacing: 3) {
-            HStack(alignment: .firstTextBaseline, spacing: 3) {
-                Text(value)
-                    .font(.system(size: emphasis ? 30 : 23, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(emphasis ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary))
-                Text(unit)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            Text(label.uppercased())
-                .font(.system(size: 9, weight: .semibold))
-                .tracking(0.6)
-                .foregroundStyle(.tertiary)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 12)
-        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 9))
-    }
-}

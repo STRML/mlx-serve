@@ -274,6 +274,11 @@ final class BenchmarkLogicTests: XCTestCase {
         var oneRun = makeResult(session: "s", suite: "ctx-v1-512", target: 512, decode: 42)
         oneRun.runs = 1
         XCTAssertTrue(oneRun.isPublishable)
+        // No settings = no comparison axis, and the board drops the row
+        // anyway (Firebase stores `{}` as absent). Never offered for sharing.
+        var noSettings = oneRun
+        noSettings.settings = [:]
+        XCTAssertFalse(noSettings.isPublishable)
     }
 
     // MARK: - Wire format

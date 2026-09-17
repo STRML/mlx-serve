@@ -1,6 +1,6 @@
 // website_benchmarks_logic.mjs — unit-tests the pure logic embedded in
 // website/benchmarks/index.html: row validation (v1 + v2), RTDB payload
-// parsing, median, settings signature, cell grouping, cell families and the
+// parsing, median, settings signature, cell families and the
 // speculation-headroom view, and filtering.
 // Invoked by test_website_pages.sh when node is available; exits non-zero on
 // the first failed assertion.
@@ -90,24 +90,20 @@ const chips = settingsChips(SETTINGS);
 assert(chips.join(",") === "KV 8-bit,PLD,MTP off,ctx 48K", "chips name what matters: " + chips.join(","));
 assert(settingsChips(undefined).length === 0, "no settings, no chips");
 
-// ── cell grouping: only genuinely comparable rows share a median ───────────
+// ── family grouping: only genuinely comparable rows share a median ────────
 const m4max40 = row();
 const m4max32 = row({ hardware: { chip: "Apple M4 Max", gpuCores: 32, ramGB: 128 } });
-assert(cellKey(m4max40) !== cellKey(m4max32),
-       "GPU core count separates cells — 32 and 40 core M4 Max are different machines");
-assert(cellKey(row({ decodeTps: 99 })) === cellKey(row()),
+assert(familyKey(m4max40) !== familyKey(m4max32),
+       "GPU core count separates families — 32 and 40 core M4 Max are different machines");
+assert(familyKey(row({ decodeTps: 99 })) === familyKey(row()),
        "the measurement itself is not part of the key");
-assert(cellKey(row({ modelId: "other" })) !== cellKey(row()), "model separates cells");
-assert(cellKey(row({ settings: Object.assign({}, SETTINGS, { kv_quant: "off" }) })) !== cellKey(row()),
-       "settings signature separates cells");
-assert(cellKey(row({ engineVersion: "26.9.0" })) === cellKey(row({ engineVersion: "26.8.1" })),
-       "engine version does not fragment cells");
-
-// ── aggregate ─────────────────────────────────────────────────────────────
-const agg = aggregate([row({ decodeTps: 40 }), row({ decodeTps: 50 }), row({ decodeTps: 60 })]);
-assert(agg.length === 1, "identical machines collapse into one cell");
-assert(agg[0].decodeTps === 50, "cell reports the median");
-assert(agg[0].sampleCount === 3, "cell reports how many results it came from");
+assert(familyKey(row({ modelId: "other" })) !== familyKey(row()), "model separates families");
+assert(familyKey(row({ settings: Object.assign({}, SETTINGS, { kv_quant: "off" }) })) !== familyKey(row()),
+       "settings signature separates families");
+assert(familyKey(row({ engineVersion: "26.9.0" })) === familyKey(row({ engineVersion: "26.8.1" })),
+       "engine version does not fragment families");
+assert(familyKey(row({ suiteId: "ctx-v1-512", targetTokens: 512 })) === familyKey(row()),
+       "the rung is a column, not a family");
 
 // ── cell families: one row per machine × model × settings, a column per rung
 const fam = aggregateFamilies([

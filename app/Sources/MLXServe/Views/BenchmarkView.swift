@@ -40,6 +40,7 @@ struct BenchmarkView: View {
     @AppStorage("benchmarkNote") private var note = ""
     /// The model to benchmark, by path. Empty = follow the tray's selection.
     @State private var pickedModelPath = ""
+    @State private var confirmingClear = false
 
     /// Community filters. Machine defaults to THIS Mac once the board has a
     /// row for it — the point of the board is "what will I get".
@@ -374,9 +375,14 @@ struct BenchmarkView: View {
                             Label("Shared", systemImage: "checkmark.circle.fill")
                                 .foregroundStyle(.green)
                         case .failed(let message):
-                            Label(message, systemImage: "exclamationmark.octagon.fill")
-                                .font(.caption)
-                                .foregroundStyle(.red)
+                            // Retry sends only the rows that did not land.
+                            VStack(alignment: .leading, spacing: 4) {
+                                Label(message, systemImage: "exclamationmark.octagon.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                                Button("Try Again") { Task { await submit() } }
+                                    .controlSize(.small)
+                            }
                         }
                         Spacer(minLength: 0)
                         Text("Sends these numbers plus the server settings, your chip, GPU cores, memory and macOS version. No account, nothing identifying.")
@@ -466,12 +472,20 @@ struct BenchmarkView: View {
                         Text("\(historySessions.count) session\(historySessions.count == 1 ? "" : "s") · decode tok/s per rung · double-click for detail")
                         Spacer()
                         Button(role: .destructive) {
-                            BenchmarkStore.saveLocal([])
-                            history = []
+                            confirmingClear = true
                         } label: {
                             Label("Clear", systemImage: "trash")
                         }
                         .controlSize(.small)
+                        .confirmationDialog("Delete every benchmark run kept on this Mac?",
+                                            isPresented: $confirmingClear, titleVisibility: .visible) {
+                            Button("Delete History", role: .destructive) {
+                                BenchmarkStore.saveLocal([])
+                                history = []
+                            }
+                        } message: {
+                            Text("Results already shared to the community stay on the board.")
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -649,8 +663,11 @@ struct BenchmarkView: View {
     }
 
     private func refreshSettings() async {
-        guard server.status == .running else { liveSettings = [:]; return }
-        let props = (try? await api.fetchPropsRaw(port: server.port)) ?? [:]
+        guard server.status == .running, let model = server.residentChatModel?.name else {
+            liveSettings = [:]
+            return
+        }
+        let props = (try? await api.fetchPropsRaw(port: server.port, model: model)) ?? [:]
         liveSettings = BenchmarkSettings.flatten(props: props)
     }
 
@@ -701,13 +718,13 @@ struct BenchmarkView: View {
 
     private func submit() async {
         submitState = .sending
-        do {
-            try await client.submit(lastResults)
-            if let id = lastResults.first?.sessionId { BenchmarkStore.markShared(id) }
+        let outcome = await client.submit(BenchmarkStore.unsent(lastResults))
+        BenchmarkStore.markShared(outcome.sentIds)
+        if let error = outcome.error {
+            submitState = .failed(error.localizedDescription)
+        } else {
             submitState = .sent
             community = []   // stale until the next visit re-fetches
-        } catch {
-            submitState = .failed(error.localizedDescription)
         }
     }
 

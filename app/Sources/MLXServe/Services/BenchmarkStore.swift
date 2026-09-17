@@ -76,23 +76,35 @@ enum BenchmarkStore {
 
     // MARK: - Shared marker
 
-    /// Session ids already sent to the community database. Local only: a
-    /// field on the row would ride the POST and the rules reject unknown
-    /// fields, so it lives beside the history instead of in it.
-    static let sharedKey = "benchmarkSharedSessions"
+    /// Row ids already sent to the community database. Local only: a field
+    /// on the row would ride the POST and the rules reject unknown fields,
+    /// so it lives beside the history instead of in it. Per ROW, not per
+    /// session: rows POST one at a time, and a retry after a failure halfway
+    /// must send only what did not land, or the board counts the rest twice.
+    static let sharedKey = "benchmarkSharedRows"
 
-    static func sharedSessionIds(_ defaults: UserDefaults = .standard) -> Set<String> {
+    static func sharedRowIds(_ defaults: UserDefaults = .standard) -> Set<String> {
         Set(defaults.stringArray(forKey: sharedKey) ?? [])
     }
 
-    static func isShared(_ sessionId: String, defaults: UserDefaults = .standard) -> Bool {
-        sharedSessionIds(defaults).contains(sessionId)
+    static func markShared(_ rowIds: [String], defaults: UserDefaults = .standard) {
+        var ids = sharedRowIds(defaults)
+        ids.formUnion(rowIds)
+        defaults.set(Array(ids).sorted(), forKey: sharedKey)
     }
 
-    static func markShared(_ sessionId: String, defaults: UserDefaults = .standard) {
-        var ids = sharedSessionIds(defaults)
-        ids.insert(sessionId)
-        defaults.set(Array(ids).sorted(), forKey: sharedKey)
+    /// A session is shared once every row worth sharing has landed.
+    static func isShared(_ session: BenchmarkSession, defaults: UserDefaults = .standard) -> Bool {
+        let rows = session.rungs.filter(\.isPublishable)
+        guard !rows.isEmpty else { return false }
+        let ids = sharedRowIds(defaults)
+        return rows.allSatisfy { ids.contains($0.id) }
+    }
+
+    /// The publishable rows of `rows` not yet sent.
+    static func unsent(_ rows: [BenchmarkResult], defaults: UserDefaults = .standard) -> [BenchmarkResult] {
+        let ids = sharedRowIds(defaults)
+        return rows.filter { $0.isPublishable && !ids.contains($0.id) }
     }
 
     // MARK: - Community database
@@ -137,7 +149,8 @@ enum BenchmarkStore {
 
     // MARK: - Aggregation
 
-    /// The grouping that decides which rows may share a median.
+    /// The grouping that decides which rows may share a median: one machine
+    /// × model × settings, every rung.
     ///
     /// GPU cores are part of the key because a 32-core and a 40-core M4 Max
     /// report the same chip string and do not share a decode speed. The
@@ -145,44 +158,10 @@ enum BenchmarkStore {
     /// row measured the same rung on the same Mac and describe different
     /// speeds. Engine version is deliberately NOT in the key: fragmenting by
     /// release would leave every cell at n=1 forever.
-    static func cellKey(_ row: BenchmarkResult) -> String {
-        [row.suiteId, row.modelId, row.settingsSignature,
+    static func familyKey(_ row: BenchmarkResult) -> String {
+        [row.modelId, row.settingsSignature,
          row.hardware.chip, String(row.hardware.gpuCores), String(row.hardware.ramGB)]
             .joined(separator: "|")
-    }
-
-    struct Cell: Identifiable, Hashable {
-        var id: String
-        var suiteId: String
-        var modelId: String
-        var settings: [String: String]
-        var isLossy: Bool
-        var hardware: BenchmarkHardware
-        var prefillTps: Double
-        var decodeTps: Double
-        var sampleCount: Int
-    }
-
-    /// Median per comparable cell (one rung), with the sample count.
-    static func aggregate(_ rows: [BenchmarkResult]) -> [Cell] {
-        var groups: [String: [BenchmarkResult]] = [:]
-        for row in rows { groups[cellKey(row), default: []].append(row) }
-
-        return groups.compactMap { key, members -> Cell? in
-            guard let first = members.first else { return nil }
-            return Cell(
-                id: key,
-                suiteId: first.suiteId,
-                modelId: first.modelId,
-                settings: first.settings ?? [:],
-                isLossy: first.isLossy,
-                hardware: first.hardware,
-                prefillTps: BenchmarkStats.median(members.map(\.prefillTps)),
-                decodeTps: BenchmarkStats.median(members.map(\.decodeTps)),
-                sampleCount: members.count
-            )
-        }
-        .sorted { $0.decodeTps > $1.decodeTps }
     }
 
     /// A family of cells: one machine × model × settings, every rung.
@@ -213,12 +192,6 @@ enum BenchmarkStore {
         func rung(at target: Int) -> Rung? { rungs.first { $0.targetTokens == target } }
         func decode(at target: Int) -> Double? { rung(at: target)?.decodeTps }
         func samples(at target: Int) -> Int { rung(at: target)?.sampleCount ?? 0 }
-    }
-
-    static func familyKey(_ row: BenchmarkResult) -> String {
-        [row.modelId, row.settingsSignature,
-         row.hardware.chip, String(row.hardware.gpuCores), String(row.hardware.ramGB)]
-            .joined(separator: "|")
     }
 
     /// Per-rung medians per family, sorted by the fastest smallest rung.
@@ -306,19 +279,35 @@ actor BenchmarkCommunityClient {
         return BenchmarkStore.decodeCommunity(data)
     }
 
-    /// Publish one session's rows. Opt-in only — never called without an
+    /// What a submission managed: every row that landed, then the failure
+    /// that stopped it, if any. Landed rows are the caller's to remember, so a
+    /// retry sends the rest and never the same row twice.
+    struct Outcome {
+        var sentIds: [String] = []
+        var error: Error?
+    }
+
+    /// Publish rows one at a time. Opt-in only — never called without an
     /// explicit press of Share.
-    func submit(_ rows: [BenchmarkResult]) async throws {
-        guard let url = BenchmarkStore.communitySubmitURL() else { return }
+    func submit(_ rows: [BenchmarkResult]) async -> Outcome {
+        var outcome = Outcome()
+        guard let url = BenchmarkStore.communitySubmitURL() else { return outcome }
         for row in rows {
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try BenchmarkStore.encoder.encode(row)
-            let (_, response) = try await session.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                throw BenchmarkCommunityError.from(status: (response as? HTTPURLResponse)?.statusCode ?? -1)
+            do {
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try BenchmarkStore.encoder.encode(row)
+                let (_, response) = try await session.data(for: request)
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                    throw BenchmarkCommunityError.from(status: (response as? HTTPURLResponse)?.statusCode ?? -1)
+                }
+                outcome.sentIds.append(row.id)
+            } catch {
+                outcome.error = error
+                break
             }
         }
+        return outcome
     }
 }

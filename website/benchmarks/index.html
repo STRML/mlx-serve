@@ -45,17 +45,17 @@
     .controls {
       display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end;
       padding: 16px; border: 1px solid var(--border); border-radius: 12px;
-      background: var(--surface); margin-bottom: 18px;
+      background: var(--bg-alt); margin-bottom: 18px;
     }
     .control { display: flex; flex-direction: column; gap: 5px; }
     .control label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-secondary); }
     .control select {
-      background: var(--bg); color: var(--text-primary); border: 1px solid var(--border);
+      background: var(--white); color: var(--text-primary); border: 1px solid var(--border);
       border-radius: 8px; padding: 7px 10px; font: inherit; font-size: 13px; min-width: 150px;
     }
     .modes { display: flex; gap: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
     .modes button {
-      background: var(--bg); color: var(--text-secondary); border: 0; padding: 8px 14px;
+      background: var(--white); color: var(--text-secondary); border: 0; padding: 8px 14px;
       font: inherit; font-size: 13px; cursor: pointer;
     }
     .modes button[aria-pressed="true"] { background: var(--accent); color: #fff; }
@@ -80,7 +80,7 @@
     .badge.thin  { background: rgba(255,159,10,.14); color: #ff9f0a; }
     .chip {
       display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 999px;
-      background: var(--bg); border: 1px solid var(--border); color: var(--text-secondary); margin-right: 4px;
+      background: var(--white); border: 1px solid var(--border); color: var(--text-secondary); margin-right: 4px;
     }
     .chips { white-space: normal; min-width: 180px; }
     .note-cell { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
@@ -106,9 +106,33 @@
     </a>
     <input type="checkbox" id="nav-toggle" class="nav-toggle-input">
     <ul class="nav-links" onclick="if(event.target.closest('a')) document.getElementById('nav-toggle').checked=false">
-      <li><a href="../#explore" class="hide-mobile">Deep dives</a></li>
-      <li><a href="../#performance" class="hide-mobile">Performance</a></li>
-      <li><a href="../#features" class="hide-mobile">Features</a></li>
+      <li class="nav-sub hide-mobile">
+        <a href="../#explore" class="nav-sub-trigger" aria-haspopup="true">Overview <svg viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4"/></svg></a>
+        <ul class="nav-submenu">
+          <li><a href="../#explore">Deep dives</a></li>
+          <li><a href="../#performance">Performance</a></li>
+          <li><a href="../#features">Features</a></li>
+          <li><a href="../#faq">FAQ</a></li>
+        </ul>
+      </li>
+      <li class="nav-sub hide-mobile">
+        <a href="../#explore" class="nav-sub-trigger" aria-haspopup="true">Features <svg viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4"/></svg></a>
+        <ul class="nav-submenu nav-submenu-wide">
+          <li><a href="../onboarding/">Getting started</a></li>
+          <li><a href="../image-generation/">Image generation</a></li>
+          <li><a href="../video-generation/">Video generation</a></li>
+          <li><a href="../music-generation/">Music generation</a></li>
+          <li><a href="../3d-generation/">3D generation</a></li>
+          <li><a href="../voice-cloning/">Voice cloning</a></li>
+          <li><a href="../claude-code-local/">Claude Code, local</a></li>
+          <li><a href="../local-ai-assistant/">AI assistant</a></li>
+          <li><a href="../agent-sandbox/">Agent sandbox</a></li>
+          <li><a href="../speculative-decoding/">Speculative decoding</a></li>
+          <li><a href="../tool-calling/">Tool calling</a></li>
+          <li><a href="../lm-studio-alternative/">vs LM Studio</a></li>
+          <li><a href="../ollama-alternative/">vs Ollama</a></li>
+        </ul>
+      </li>
       <li><a href="../api/" class="hide-mobile">API</a></li>
       <li><a href="../cli/" class="hide-mobile">CLI</a></li>
       <li><a href="../llm-tier-list/" class="hide-mobile">Tier list</a></li>
@@ -123,9 +147,9 @@
 <div class="board-wrap" style="padding-top: 72px;">
 
   <div class="intro">
-    <h1>What local LLMs actually do on your Mac</h1>
+    <h1>Community Benchmarks</h1>
     <p>Tokens per second measured by the people running the models, not by us. Pick your chip to see what to expect, or compare settings to find out which ones are worth turning on.</p>
-    <p>Every result comes from the same pinned workload: a context ladder (512 / 1k / 2k / 4k / 8k / 16k tokens of synthetic code with a planted constant), a 192-token coding task per rung, greedy sampling, thinking off, plus a count-to-200 run on the same prefix as the speculation ceiling. Each row records the server settings that produced it (KV quant, PLD, MTP, context). Run it yourself from the menu bar in <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg">MLX Core</a>.</p>
+    <p>Every result comes from the same pinned workload: a context ladder (512 / 1k / 2k / 4k / 8k / 16k tokens of synthetic code with a planted constant). Run it yourself from the menu bar in <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg">MLX Core</a>.</p>
   </div>
 
   <div class="controls">
@@ -180,8 +204,8 @@
   // request. RTDB was chosen over Firestore precisely so this page can be a
   // static file with a bare fetch().
   //
-  // DOCUMENTED DUPLICATION: `cellKey`, `settingsSignature`, `median`,
-  // `aggregate` and `aggregateFamilies` below mirror `BenchmarkStore` and
+  // DOCUMENTED DUPLICATION: `familyKey`, `settingsSignature`, `median` and
+  // `aggregateFamilies` below mirror `BenchmarkStore` and
   // `BenchmarkSettings` in the Swift app
   // (app/Sources/MLXServe/Services/BenchmarkStore.swift,
   // app/Sources/MLXServe/Models/BenchmarkModels.swift). They must stay in
@@ -267,43 +291,12 @@
 
   function rungOf(r) { return r.targetTokens; }
 
-  // ── aggregation (mirrors BenchmarkStore.cellKey / aggregate) ─────────────
-  // GPU cores are part of the key: a 32-core and a 40-core M4 Max report the
-  // same chip string and do not share a decode speed. The settings signature
-  // is part of it: a kv-quant 8 row and a dense row describe different speeds.
-  function cellKey(r) {
-    return [r.suiteId, r.modelId, settingsSignature(r.settings),
-            r.hardware.chip, String(r.hardware.gpuCores || 0), String(r.hardware.ramGB)].join("|");
-  }
-
-  function aggregate(rows) {
-    const groups = new Map();
-    for (const r of rows) {
-      const key = cellKey(r);
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(r);
-    }
-    const out = [];
-    for (const [key, members] of groups) {
-      const first = members[0];
-      out.push({
-        key,
-        suiteId: first.suiteId,
-        modelId: first.modelId,
-        settings: first.settings || {},
-        isLossy: !!first.isLossy,
-        hardware: first.hardware,
-        decodeTps: median(members.map((m) => m.decodeTps)),
-        prefillTps: median(members.map((m) => m.prefillTps)),
-        sampleCount: members.length,
-      });
-    }
-    return out.sort((a, b) => b.decodeTps - a.decodeTps);
-  }
-
-  // ── cell families (mirrors BenchmarkStore.aggregateSessions) ─────────────
+  // ── cell families (mirrors BenchmarkStore.familyKey / aggregateSessions) ─
   // One row per machine × model × settings, with a median per rung and the
-  // number of results behind each.
+  // number of results behind each. GPU cores are part of the key: a 32-core
+  // and a 40-core M4 Max report the same chip string and do not share a
+  // decode speed. The settings signature is part of it: a kv-quant 8 row and
+  // a dense row describe different speeds.
   function familyKey(r) {
     return [r.modelId, settingsSignature(r.settings),
             r.hardware.chip, String(r.hardware.gpuCores || 0), String(r.hardware.ramGB)].join("|");

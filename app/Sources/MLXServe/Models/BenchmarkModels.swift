@@ -138,8 +138,9 @@ struct BenchmarkResult: Codable, Identifiable, Hashable {
     var effectiveTargetTokens: Int { targetTokens ?? promptTokens }
 
     /// Only ladder rows are read back: the pre-release single-prompt suite
-    /// carried no rung and is not worth a column.
-    var isLadderRow: Bool { schemaVersion >= 2 && targetTokens != nil }
+    /// carried no rung and is not worth a column. Settings are required too,
+    /// same as the website's `isValidRow`, so both read one table.
+    var isLadderRow: Bool { schemaVersion >= 2 && targetTokens != nil && settings != nil }
 
     init(
         id: String = UUID().uuidString,
@@ -247,8 +248,10 @@ extension BenchmarkResult {
     /// A rung whose every coding run was discarded still exists as a row full
     /// of zeroes. Letting one through renders a table of dashes above a Share
     /// button, and if shared it drags a 0 tok/s sample into the community
-    /// median for that cell.
-    var isPublishable: Bool { runs > 0 && decodeTps > 0 }
+    /// median for that cell. Empty settings (the `/props` read failed) have
+    /// no comparison axis, and Firebase stores `{}` as absent, which the
+    /// board rejects.
+    var isPublishable: Bool { runs > 0 && decodeTps > 0 && !(settings ?? [:]).isEmpty }
 }
 
 // MARK: - Suite

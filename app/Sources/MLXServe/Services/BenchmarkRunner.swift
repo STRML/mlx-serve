@@ -78,7 +78,7 @@ final class BenchmarkRunner: ObservableObject {
                             total: 1 + ladder.reduce(0) { $0 + $1.warmups + $1.runs * 2 }
                                 + (ladder.first?.runs ?? 0))
 
-        let props = (try? await api.fetchPropsRaw(port: port)) ?? [:]
+        let props = (try? await api.fetchPropsRaw(port: port, model: modelId)) ?? [:]
         let settings = BenchmarkSettings.flatten(props: props)
         let engineVersion = settings["version"] ?? "unknown"
 

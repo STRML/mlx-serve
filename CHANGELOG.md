@@ -2,6 +2,7 @@
 
 ## v26.9.4 — Request edges
 
+- **Benchmark your Mac from the menu bar.** A new Benchmarks window runs a pinned context ladder (512 to 16k tokens of synthetic code, a coding task per rung, plus a count-to-200 run as the speculation ceiling) against the loaded model, using the server's own timings. Runs are kept locally, and you can share one to the community board at mlxserve.com/benchmarks, which shows median tok/s by chip, GPU cores, memory and server settings. Sharing is opt-in and sends nothing that identifies you.
 - **`top_p: 0` is greedy.** It masked every token and sampled random vocabulary; it now behaves like `top_k: 1`.
 - **An image the server cannot read is refused by name.** A remote image URL (never fetched), bad base64 or an unreadable payload used to vanish from the prompt and answer "you haven't provided an image" with a 200 on every surface; it is a 400 that says what to send.
 - **Structured-output and stop-sequence edges.** A `json_schema` request without an object schema is a 400 instead of unconstrained JSON, on chat, Messages and Responses; an empty stop string no longer cuts the reply at position 0.

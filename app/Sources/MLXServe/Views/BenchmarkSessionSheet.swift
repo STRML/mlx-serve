@@ -59,7 +59,7 @@ struct BenchmarkSessionSheet: View {
         .padding(20)
         .frame(width: 1000)
         .onAppear {
-            if case .session(let s) = source, BenchmarkStore.isShared(s.id) { shareState = .sent }
+            if case .session(let s) = source, BenchmarkStore.isShared(s) { shareState = .sent }
         }
     }
 
@@ -81,19 +81,17 @@ struct BenchmarkSessionSheet: View {
             case .failed(let message):
                 Label(message, systemImage: "exclamationmark.octagon.fill")
                     .font(.caption).foregroundStyle(.red)
+                Button("Try Again") { Task { await share(session) } }
+                    .controlSize(.small)
             }
         }
     }
 
     private func share(_ session: BenchmarkSession) async {
         shareState = .sending
-        do {
-            try await client.submit(session.rungs.filter(\.isPublishable))
-            BenchmarkStore.markShared(session.id)
-            shareState = .sent
-        } catch {
-            shareState = .failed(error.localizedDescription)
-        }
+        let outcome = await client.submit(BenchmarkStore.unsent(session.rungs))
+        BenchmarkStore.markShared(outcome.sentIds)
+        shareState = outcome.error.map { .failed($0.localizedDescription) } ?? .sent
     }
 
     // MARK: - Pieces

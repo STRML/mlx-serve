@@ -406,11 +406,16 @@ class APIClient {
         return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json))
     }
 
-    /// The whole `/props` document. The benchmark runner records the
-    /// server's `settings` block on every row; parsing it lives in
-    /// `BenchmarkSettings.flatten`, so this hands back the raw JSON.
-    func fetchPropsRaw(port: UInt16) async throws -> [String: Any] {
-        let url = serverURL(port: port, path: "/props")
+    /// The whole `/props` document. Settings are per MODEL and the bare
+    /// route answers for the default one, so a benchmark names the model it
+    /// measures (with two chat models resident a row would otherwise record
+    /// the other's KV quant); nil is the bare route, for discovering that
+    /// default. Parsing lives in `BenchmarkSettings.flatten`; this hands
+    /// back raw JSON.
+    func fetchPropsRaw(port: UInt16, model: String? = nil) async throws -> [String: Any] {
+        var components = URLComponents(url: serverURL(port: port, path: "/props"), resolvingAgainstBaseURL: false)
+        components?.queryItems = model.map { [URLQueryItem(name: "model", value: $0)] }
+        let url = components?.url ?? serverURL(port: port, path: "/props")
         let (data, _) = try await session.data(from: url)
         return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }

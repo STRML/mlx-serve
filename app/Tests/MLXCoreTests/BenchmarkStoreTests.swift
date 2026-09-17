@@ -102,32 +102,24 @@ final class BenchmarkStoreTests: XCTestCase {
 
     // MARK: - Aggregation
 
-    func testCellKeyGroupsOnlyRowsThatAreActuallyComparable() {
+    func testFamilyKeyGroupsOnlyRowsThatAreActuallyComparable() {
         let a = makeRow(decode: 50, gpuCores: 40)
         let b = makeRow(decode: 30, gpuCores: 32)
-        XCTAssertNotEqual(BenchmarkStore.cellKey(a), BenchmarkStore.cellKey(b))
+        XCTAssertNotEqual(BenchmarkStore.familyKey(a), BenchmarkStore.familyKey(b))
         let c = makeRow(decode: 52, gpuCores: 40)
-        XCTAssertEqual(BenchmarkStore.cellKey(a), BenchmarkStore.cellKey(c))
+        XCTAssertEqual(BenchmarkStore.familyKey(a), BenchmarkStore.familyKey(c))
     }
 
-    func testCellKeySeparatesSettingsSignatures() {
+    func testFamilyKeySeparatesSettingsSignatures() {
         // A kv-quant 8 row and a lossless row measured the same rung on the
         // same Mac and must never share a median.
         let quant = makeRow(decode: 50, settings: ["kv_quant": "8", "pld_default_on": "true"])
         let dense = makeRow(decode: 45, settings: ["kv_quant": "off", "pld_default_on": "true"])
-        XCTAssertNotEqual(BenchmarkStore.cellKey(quant), BenchmarkStore.cellKey(dense))
-        // ...but a different server version or cache size is the same cell.
+        XCTAssertNotEqual(BenchmarkStore.familyKey(quant), BenchmarkStore.familyKey(dense))
+        // ...but a different server version or cache size is the same family.
         let later = makeRow(decode: 51, settings: ["kv_quant": "8", "pld_default_on": "true",
                                                     "version": "27.0.0", "prefix_cache_mem": "1"])
-        XCTAssertEqual(BenchmarkStore.cellKey(quant), BenchmarkStore.cellKey(later))
-    }
-
-    func testAggregateReportsTheMedianAndTheSampleCount() {
-        let rows = [makeRow(decode: 40), makeRow(decode: 50), makeRow(decode: 60)]
-        let cells = BenchmarkStore.aggregate(rows)
-        XCTAssertEqual(cells.count, 1)
-        XCTAssertEqual(cells.first?.decodeTps ?? 0, 50, accuracy: 0.001)
-        XCTAssertEqual(cells.first?.sampleCount, 3)
+        XCTAssertEqual(BenchmarkStore.familyKey(quant), BenchmarkStore.familyKey(later))
     }
 
     func testAggregateSessionsBuildsOneFamilyPerMachineModelAndSettings() {
@@ -156,20 +148,44 @@ final class BenchmarkStoreTests: XCTestCase {
 
     // MARK: - Shared marker
 
-    func testASharedSessionIsRememberedLocallyAndNeverOnTheRow() throws {
+    func testSharedRowsAreRememberedLocallyAndNeverOnTheRow() throws {
         // The marker must not ride the POST: the rules reject unknown fields,
         // so a `shared` field on the row would 401 every submission.
         let defaults = UserDefaults(suiteName: "BenchmarkStoreTests.\(UUID().uuidString)")!
-        XCTAssertFalse(BenchmarkStore.isShared("s1", defaults: defaults))
-        BenchmarkStore.markShared("s1", defaults: defaults)
-        BenchmarkStore.markShared("s1", defaults: defaults)
-        XCTAssertTrue(BenchmarkStore.isShared("s1", defaults: defaults))
-        XCTAssertFalse(BenchmarkStore.isShared("s2", defaults: defaults))
-        XCTAssertEqual(BenchmarkStore.sharedSessionIds(defaults).count, 1)
+        let r1 = makeRow(decode: 50, suite: "ctx-v1-512", target: 512)
+        let r2 = makeRow(decode: 40, suite: "ctx-v1-1k", target: 1024)
+        let session = BenchmarkSession(id: "s1", rungs: [r1, r2])
+        XCTAssertFalse(BenchmarkStore.isShared(session, defaults: defaults))
+        BenchmarkStore.markShared([r1.id], defaults: defaults)
+        BenchmarkStore.markShared([r1.id], defaults: defaults)
+        XCTAssertEqual(BenchmarkStore.sharedRowIds(defaults).count, 1)
+        XCTAssertFalse(BenchmarkStore.isShared(session, defaults: defaults), "half a session is not shared")
+        BenchmarkStore.markShared([r2.id], defaults: defaults)
+        XCTAssertTrue(BenchmarkStore.isShared(session, defaults: defaults))
 
-        let wire = try JSONSerialization.jsonObject(with: BenchmarkStore.encoder.encode(makeRow(decode: 50))) as! [String: Any]
+        let wire = try JSONSerialization.jsonObject(with: BenchmarkStore.encoder.encode(r1)) as! [String: Any]
         XCTAssertNil(wire["shared"])
         XCTAssertNil(wire["sharedAt"])
+    }
+
+    func testARetryAfterAPartialShareSendsOnlyTheRowsThatDidNotLand() {
+        // A session POSTs one row at a time. When row 2 fails, row 1 is
+        // already in the database; sharing again must not send it twice.
+        let defaults = UserDefaults(suiteName: "BenchmarkStoreTests.\(UUID().uuidString)")!
+        let r1 = makeRow(decode: 50, suite: "ctx-v1-512", target: 512)
+        let r2 = makeRow(decode: 40, suite: "ctx-v1-1k", target: 1024)
+        BenchmarkStore.markShared([r1.id], defaults: defaults)
+        XCTAssertEqual(BenchmarkStore.unsent([r1, r2], defaults: defaults).map(\.id), [r2.id])
+    }
+
+    func testARowWithoutSettingsIsDroppedOnReadLikeTheWebsiteDoes() throws {
+        // Firebase stores no empty object, so a row shared with `settings: {}`
+        // comes back without the key. The website rejects such a row; the app
+        // must too, or the two quote different tables for one database.
+        var row = makeRow(decode: 50)
+        row.settings = nil
+        let wire = try String(data: BenchmarkStore.encoder.encode(row), encoding: .utf8)!
+        XCTAssertTrue(BenchmarkStore.decodeCommunity(Data("{\"-Na\":\(wire)}".utf8)).isEmpty)
     }
 
     // MARK: - Helpers
