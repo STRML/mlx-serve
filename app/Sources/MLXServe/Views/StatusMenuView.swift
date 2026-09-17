@@ -161,7 +161,6 @@ struct StatusMenuView: View {
     let openSettings: () -> Void
     let openServerLog: () -> Void
     var openModelSettings: () -> Void = {}
-    let openTasks: () -> Void
     var openAgents: () -> Void = {}
     var openBenchmarks: () -> Void = {}
 
@@ -395,18 +394,6 @@ struct StatusMenuView: View {
             .buttonStyle(.bordered)
             .controlSize(.regular)
             .help("Open Server Log in a separate window (easier copy/paste)")
-
-            // Needs a running server with a model loaded — the benchmark
-            // measures whatever is currently served.
-            Button {
-                openBenchmarks()
-            } label: {
-                Image(systemName: "speedometer")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.regular)
-            .disabled(server.status != .running)
-            .help("Benchmark this Mac and compare with the community")
         }
     }
 
@@ -599,7 +586,7 @@ struct StatusMenuView: View {
 
     // MARK: - Footer
 
-    /// Chat, Tasks, Claude Code & Quit — the panel's exits, on their own bar so
+    /// Chat, Benchmark, Claude Code & Quit — the panel's exits, on their own bar so
     /// they read as chrome rather than as one more section. Same tiles as the
     /// Media Generation row: one shape for everything you can open from here.
     private var footer: some View {
@@ -609,8 +596,10 @@ struct StatusMenuView: View {
                 TrayTile(icon: "bubble.left.and.bubble.right", title: "Chat",
                          help: "Open the chat window") { openChat() }
 
-                TrayTile(icon: "clock.badge.checkmark", title: "Tasks",
-                         help: "Scheduled Tasks") { openTasks() }
+                // Tasks moved to the chat sidebar; the benchmark loads its own
+                // model, so the tile needs no running server.
+                TrayTile(icon: "speedometer", title: "Benchmark",
+                         help: "Benchmark this Mac and compare with the community") { openBenchmarks() }
 
                 // The App Store build can't detect or launch other apps'
                 // CLIs, so its Code button shows copy-paste terminal

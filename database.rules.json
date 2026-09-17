@@ -31,6 +31,17 @@
         "runs":             { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 1000" },
         "spreadPercent":    { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 100000" },
 
+        "targetTokens":     { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 10000000" },
+        "ceilingDecodeTps": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 10000" },
+        "contextUsed":      { ".validate": "newData.isBoolean()" },
+        "note":             { ".validate": "newData.isString() && newData.val().length <= 120" },
+        "driftDecodeTps":   { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 10000" },
+        "driftPercent":     { ".validate": "newData.isNumber() && newData.val() >= -1000 && newData.val() <= 1000" },
+
+        "settings": {
+          "$key": { ".validate": "newData.isString() && newData.val().length <= 60" }
+        },
+
         "flags": {
           "$flag": { ".validate": "newData.isString() && newData.val().length <= 40" }
         },

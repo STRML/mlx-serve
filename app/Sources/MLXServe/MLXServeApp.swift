@@ -96,7 +96,6 @@ struct MLXCoreApp: App {
                         path: path, title: ModelDisplayName.pretty((path as NSString).lastPathComponent))
                     openAndFocus("modelSettings")
                 },
-                openTasks: { appState.showTasks() },
                 openAgents: { openAndFocus("agents") },
                 openBenchmarks: { openAndFocus("benchmarks") }
             )

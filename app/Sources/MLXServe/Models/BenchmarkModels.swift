@@ -8,10 +8,11 @@ import Foundation
 //
 //  * A suite id pins a WORKLOAD forever. New workload = new id, so rows
 //    submitted a year apart stay comparable and old rows never need migrating.
-//  * A session is a group of ARMS measured back to back on one machine. The
-//    within-session ratio between arms is the only comparison that survives
-//    different thermals, background load and OS versions, which is why every
-//    session is required to carry the `defaults` arm as its anchor.
+//  * A run measures the server exactly as configured. There are no arms: the
+//    settings that shaped a number (kv-quant, MTP, PLD, context) are read from
+//    the server's `/props` and recorded on every row, and rows only share a
+//    median when those settings agree.
+//  * A session is one climb of the context ladder: one row per rung.
 
 // MARK: - Hardware
 
@@ -63,13 +64,20 @@ struct BenchmarkHardware: Codable, Hashable {
 
 // MARK: - Result
 
-/// One arm's measured result. Written to local history and POSTed verbatim to
+/// One rung's measured result. Written to local history and POSTed verbatim to
 /// the community database.
+///
+/// Every v1 field is kept (the database rules still require `armId` and
+/// friends); v2 writes the constant `configured` arm and carries the rung, the
+/// speculation ceiling, whether the answer used the planted constant, and the
+/// server settings. All four are optional on decode so v1 rows still load.
 struct BenchmarkResult: Codable, Identifiable, Hashable {
-    /// Bumped when a field changes meaning. Phase 2 adds attestation, and rows
-    /// written now must stay identifiable as pre-attestation rather than being
-    /// silently read as verified.
-    static let currentSchemaVersion = 1
+    /// Bumped when a field changes meaning. 2 = the context ladder with
+    /// settings capture; 1 = the retired 2K single-prompt suite.
+    static let currentSchemaVersion = 2
+
+    static let configuredArmId = "configured"
+    static let configuredArmLabel = "As configured"
 
     var id: String = UUID().uuidString
     var schemaVersion: Int = BenchmarkResult.currentSchemaVersion
@@ -84,6 +92,7 @@ struct BenchmarkResult: Codable, Identifiable, Hashable {
 
     var modelId: String
     var quant: String?
+    /// The SERVER build (`/props.settings.version`), not the app bundle.
     var engineVersion: String
 
     var prefillTps: Double
@@ -98,20 +107,49 @@ struct BenchmarkResult: Codable, Identifiable, Hashable {
     var hardware: BenchmarkHardware
     var date: Date = Date()
 
+    // v2
+    /// The rung: 512 … 16384. Nobody parses suite ids.
+    var targetTokens: Int?
+    /// Count-to-200 decode over the same prefix; 0 when that run failed.
+    var ceilingDecodeTps: Double?
+    /// Did the coding answer use the constant planted mid-corpus?
+    var contextUsed: Bool?
+    /// Flattened `/props.settings` + `n_ctx` — see `BenchmarkSettings`.
+    var settings: [String: String]?
+    /// Free text the user typed in Setup: a name, a nickname, "fan on max".
+    var note: String?
+    /// The first rung's decode, re-measured after the whole ladder: did the
+    /// machine hold its speed? Same values on every row of a session.
+    var driftDecodeTps: Double?
+    var driftPercent: Double?
+
+    static let maxNoteLength = 120
+
     // Flattened accessors — the grids and the website read these names.
     var chip: String { hardware.chip }
     var gpuCores: Int { hardware.gpuCores }
     var ramGB: Int { hardware.ramGB }
+
+    /// What may share a median with this row.
+    var settingsSignature: String { BenchmarkSettings.signature(settings ?? [:]) }
+
+    /// The rung. Rows without one (the pre-release 2K suite) are dropped at
+    /// read time, so this only falls back for a hand-built row.
+    var effectiveTargetTokens: Int { targetTokens ?? promptTokens }
+
+    /// Only ladder rows are read back: the pre-release single-prompt suite
+    /// carried no rung and is not worth a column.
+    var isLadderRow: Bool { schemaVersion >= 2 && targetTokens != nil }
 
     init(
         id: String = UUID().uuidString,
         schemaVersion: Int = BenchmarkResult.currentSchemaVersion,
         sessionId: String,
         suiteId: String,
-        armId: String,
-        armLabel: String,
-        flags: [String: String],
-        isLossy: Bool,
+        armId: String = BenchmarkResult.configuredArmId,
+        armLabel: String = BenchmarkResult.configuredArmLabel,
+        flags: [String: String] = [:],
+        isLossy: Bool? = nil,
         modelId: String,
         quant: String? = nil,
         engineVersion: String,
@@ -123,7 +161,14 @@ struct BenchmarkResult: Codable, Identifiable, Hashable {
         runs: Int,
         spreadPercent: Double,
         hardware: BenchmarkHardware,
-        date: Date = Date()
+        date: Date = Date(),
+        targetTokens: Int? = nil,
+        ceilingDecodeTps: Double? = nil,
+        contextUsed: Bool? = nil,
+        settings: [String: String]? = nil,
+        note: String? = nil,
+        driftDecodeTps: Double? = nil,
+        driftPercent: Double? = nil
     ) {
         self.id = id
         self.schemaVersion = schemaVersion
@@ -132,7 +177,7 @@ struct BenchmarkResult: Codable, Identifiable, Hashable {
         self.armId = armId
         self.armLabel = armLabel
         self.flags = flags
-        self.isLossy = isLossy
+        self.isLossy = isLossy ?? BenchmarkSettings.isLossy(settings ?? [:])
         self.modelId = modelId
         self.quant = quant
         self.engineVersion = engineVersion
@@ -145,14 +190,62 @@ struct BenchmarkResult: Codable, Identifiable, Hashable {
         self.spreadPercent = spreadPercent
         self.hardware = hardware
         self.date = date
+        self.targetTokens = targetTokens
+        self.ceilingDecodeTps = ceilingDecodeTps
+        self.contextUsed = contextUsed
+        self.settings = settings
+        self.note = note
+        self.driftDecodeTps = driftDecodeTps
+        self.driftPercent = driftPercent
+    }
+
+    /// Firebase stores no empty object, so a v2 row's `flags: {}` comes back
+    /// ABSENT and the synthesized decoder refused every shared row. Every
+    /// key that can legitimately be missing decodes with a default.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
+        schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        sessionId = try c.decode(String.self, forKey: .sessionId)
+        suiteId = try c.decode(String.self, forKey: .suiteId)
+        armId = try c.decodeIfPresent(String.self, forKey: .armId) ?? BenchmarkResult.configuredArmId
+        armLabel = try c.decodeIfPresent(String.self, forKey: .armLabel) ?? BenchmarkResult.configuredArmLabel
+        flags = try c.decodeIfPresent([String: String].self, forKey: .flags) ?? [:]
+        modelId = try c.decode(String.self, forKey: .modelId)
+        quant = try c.decodeIfPresent(String.self, forKey: .quant)
+        engineVersion = try c.decodeIfPresent(String.self, forKey: .engineVersion) ?? ""
+        prefillTps = try c.decodeIfPresent(Double.self, forKey: .prefillTps) ?? 0
+        decodeTps = try c.decode(Double.self, forKey: .decodeTps)
+        ttftMs = try c.decodeIfPresent(Double.self, forKey: .ttftMs) ?? 0
+        promptTokens = try c.decodeIfPresent(Int.self, forKey: .promptTokens) ?? 0
+        completionTokens = try c.decodeIfPresent(Int.self, forKey: .completionTokens) ?? 0
+        runs = try c.decodeIfPresent(Int.self, forKey: .runs) ?? 0
+        spreadPercent = try c.decodeIfPresent(Double.self, forKey: .spreadPercent) ?? 0
+        hardware = try c.decode(BenchmarkHardware.self, forKey: .hardware)
+        date = try c.decodeIfPresent(Date.self, forKey: .date) ?? Date()
+        targetTokens = try c.decodeIfPresent(Int.self, forKey: .targetTokens)
+        ceilingDecodeTps = try c.decodeIfPresent(Double.self, forKey: .ceilingDecodeTps)
+        contextUsed = try c.decodeIfPresent(Bool.self, forKey: .contextUsed)
+        settings = try c.decodeIfPresent([String: String].self, forKey: .settings)
+        note = try c.decodeIfPresent(String.self, forKey: .note)
+        driftDecodeTps = try c.decodeIfPresent(Double.self, forKey: .driftDecodeTps)
+        driftPercent = try c.decodeIfPresent(Double.self, forKey: .driftPercent)
+        isLossy = try c.decodeIfPresent(Bool.self, forKey: .isLossy) ?? BenchmarkSettings.isLossy(settings ?? [:])
+    }
+
+    /// Trimmed and capped; empty becomes nil so the row carries no field.
+    static func cleanNote(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(maxNoteLength))
     }
 }
 
 extension BenchmarkResult {
     /// A row that actually measured something.
     ///
-    /// An arm whose every run was discarded still exists as a row full of
-    /// zeroes. Letting one through renders a table of dashes above a Share
+    /// A rung whose every coding run was discarded still exists as a row full
+    /// of zeroes. Letting one through renders a table of dashes above a Share
     /// button, and if shared it drags a 0 tok/s sample into the community
     /// median for that cell.
     var isPublishable: Bool { runs > 0 && decodeTps > 0 }
@@ -160,302 +253,320 @@ extension BenchmarkResult {
 
 // MARK: - Suite
 
-/// A named, versioned workload. One request shape yields BOTH numbers: the
-/// prompt measures prefill, the capped completion measures decode.
+/// One rung of the context ladder. The id pins the workload: the llmprobe
+/// corpus at `targetTokens` of prompt, `genTokens` of coding answer, and a
+/// count-to-200 ceiling run on the same prefix.
 struct BenchmarkSuite: Identifiable, Hashable {
     let id: String
     let title: String
-    let detail: String
-    let promptTokens: Int
-    let maxTokens: Int
-    let ctxSize: Int
+    let targetTokens: Int
+    let genTokens: Int
     let runs: Int
     let warmups: Int
 
-    static let standardV1 = BenchmarkSuite(
-        id: "standard-v1",
-        title: "Standard",
-        detail: "2K prompt, 128 tokens out. Measures prefill and decode in one request.",
-        promptTokens: 2048,
-        maxTokens: 128,
-        ctxSize: 4096,
-        runs: 3,
-        warmups: 1
-    )
+    static let ladder: [BenchmarkSuite] = [
+        BenchmarkSuite(id: "ctx-v1-512", title: "512", targetTokens: 512, genTokens: 192, runs: 2, warmups: 1),
+        BenchmarkSuite(id: "ctx-v1-1k", title: "1k", targetTokens: 1024, genTokens: 192, runs: 2, warmups: 1),
+        BenchmarkSuite(id: "ctx-v1-2k", title: "2k", targetTokens: 2048, genTokens: 192, runs: 2, warmups: 1),
+        BenchmarkSuite(id: "ctx-v1-4k", title: "4k", targetTokens: 4096, genTokens: 192, runs: 2, warmups: 1),
+        BenchmarkSuite(id: "ctx-v1-8k", title: "8k", targetTokens: 8192, genTokens: 192, runs: 2, warmups: 1),
+        BenchmarkSuite(id: "ctx-v1-16k", title: "16k", targetTokens: 16384, genTokens: 192, runs: 2, warmups: 1),
+    ]
 
-    static let all: [BenchmarkSuite] = [.standardV1]
+    static func byId(_ id: String) -> BenchmarkSuite? { ladder.first { $0.id == id } }
 
-    static func byId(_ id: String) -> BenchmarkSuite? { all.first { $0.id == id } }
+    /// "512" / "4k" / "16k" for a rung that may not be in the ladder.
+    static func title(forTarget tokens: Int) -> String {
+        if let suite = ladder.first(where: { $0.targetTokens == tokens }) { return suite.title }
+        return tokens >= 1024 ? "\(tokens / 1024)k" : "\(tokens)"
+    }
 }
 
-// MARK: - Prompt
+// MARK: - Cache contamination
 
-/// Builds the fixed workload text.
-///
-/// Generated rather than pasted so a new suite is a new token count instead of
-/// a new 8 KB literal, and so the no-long-repeats property is guaranteed by
-/// construction rather than by inspection.
 enum BenchmarkPrompt {
-
-    /// Instruction prefix — asks for a long continuation so the completion
-    /// reliably reaches the suite's token cap instead of stopping early and
-    /// leaving the decode measurement short.
-    static let instruction = """
-        Read the notes below and write a detailed technical summary. \
-        Cover the trade-offs in full and keep writing until you have \
-        explained every point.
-
-
-        """
-
-    /// Deterministic filler prose of roughly `approxTokens` tokens.
-    ///
-    /// A fixed 64-bit LCG walks a small word bank, so the text is identical on
-    /// every machine (no `Date`, no `random`, no locale) while never repeating
-    /// a long n-gram — a prompt built by repeating one paragraph is exactly
-    /// PLD's best case and would post a speculative-decoding win no real
-    /// workload sees.
-    static func body(approxTokens: Int) -> String {
-        let targetWords = max(16, Int(Double(approxTokens) * 0.75))
-        var rng: UInt64 = 0x9E3779B97F4A7C15
-        func next(_ bound: Int) -> Int {
-            // xorshift64* — fixed seed, integer only, identical everywhere.
-            rng ^= rng >> 12
-            rng ^= rng << 25
-            rng ^= rng >> 27
-            let value = rng &* 0x2545F4914F6CDD1D
-            return Int((value >> 33) % UInt64(bound))
-        }
-
-        var words: [String] = []
-        words.reserveCapacity(targetWords)
-        var sentenceLength = 0
-        while words.count < targetWords {
-            var word = wordBank[next(wordBank.count)]
-            if sentenceLength == 0 { word = word.prefix(1).uppercased() + word.dropFirst() }
-            sentenceLength += 1
-            // Vary sentence length so the shape of the text isn't periodic either.
-            if sentenceLength >= 9 + next(8) {
-                word += "."
-                sentenceLength = 0
-            }
-            words.append(word)
-        }
-        if !words[words.count - 1].hasSuffix(".") { words[words.count - 1] += "." }
-
-        var text = instruction
-        for (index, word) in words.enumerated() {
-            text += word
-            // Paragraph breaks keep it looking like prose rather than one blob.
-            text += (index % 60 == 59) ? "\n\n" : " "
-        }
-        return text
-    }
-
-    /// Prefixes a per-run marker.
-    ///
-    /// The server reuses KV by prompt-PREFIX match, so this has to land at the
-    /// FRONT. A nonce appended at the end shares the entire prefix and defeats
-    /// nothing: run 2 would report the prefill speed of a cache lookup, which
-    /// is several times the real number.
-    static func nonced(_ body: String, run: Int) -> String {
-        "Benchmark request \(run), sequence \(run &* 7919). \(body)"
-    }
-
     /// The largest share of a prompt that may come from the KV cache before the
     /// run stops being a prefill measurement.
     ///
-    /// It cannot be zero. The chat template's header and this file's own
-    /// "Benchmark request " prefix are byte-identical across runs, so a few
-    /// tokens ALWAYS match — measured at `cached_n = 7` of `prompt_n = 1522` on
-    /// gemma-4-e2b. The server already divides `prompt_per_second` by the
-    /// tokens it actually computed, so a header-sized overlap costs nothing;
-    /// what has to be caught is a genuine warm hit covering the whole prompt.
+    /// It cannot be zero. The chat template's header and the `[probe ` lead-in
+    /// are byte-identical across runs, so a few tokens ALWAYS match. The
+    /// server divides `prompt_per_second` by the tokens it actually computed,
+    /// so a header-sized overlap costs nothing; what has to be caught is a
+    /// genuine warm hit covering the whole prompt.
     static let maxCachedFraction = 0.10
 
-    /// True when the prefill was served from cache to a degree that invalidates
-    /// the measurement.
     static func prefillWasReused(promptTokens: Int, cachedTokens: Int) -> Bool {
         guard promptTokens > 0 else { return true }   // measured nothing
         return Double(cachedTokens) > Double(promptTokens) * maxCachedFraction
     }
+}
 
-    private static let wordBank: [String] = [
-        "memory", "bandwidth", "throughput", "latency", "kernel", "quantization",
-        "attention", "context", "inference", "decode", "prefill", "cache",
-        "scheduler", "tensor", "weights", "activation", "residual", "embedding",
-        "router", "expert", "speculative", "acceptance", "checkpoint", "pipeline",
-        "allocator", "buffer", "dispatch", "occupancy", "register", "threadgroup",
-        "precision", "rounding", "accumulator", "reduction", "gradient", "sampling",
-        "temperature", "token", "vocabulary", "sequence", "batch", "window",
-        "sliding", "recurrent", "convolution", "normalization", "projection", "matrix",
-        "product", "vector", "lookup", "table", "compression", "ratio",
-        "measured", "observed", "baseline", "regression", "variance", "median",
-        "thermal", "sustained", "peak", "budget", "ceiling", "pressure",
-        "engine", "runtime", "backend", "device", "unified", "resident",
-        "streaming", "chunked", "parallel", "serial", "concurrent", "queue",
+/// Which of a rung's two requests a sample came from, and whether it counts.
+enum LadderSample {
+    enum Kind { case coding, counting }
+
+    /// A decode rate over fewer tokens than this is noise, not a ceiling: a
+    /// checkpoint that answers the counting task with "1" and stops reports a
+    /// one-token rate that says nothing about speculation.
+    static let minCeilingTokens = 32
+
+    /// The cache discard applies to the CODING run only: its prefill figure is
+    /// the measurement. The counting run rides the same archive on purpose —
+    /// a prefix hit there is what makes it a decode-only measurement — and is
+    /// kept only when it generated enough to time.
+    static func keep(kind: Kind, promptTokens: Int, cachedTokens: Int, completionTokens: Int) -> Bool {
+        switch kind {
+        case .coding: return !BenchmarkPrompt.prefillWasReused(promptTokens: promptTokens, cachedTokens: cachedTokens)
+        case .counting: return completionTokens >= minCeilingTokens
+        }
+    }
+}
+
+// MARK: - Preflight
+
+enum LadderPreflight: Equatable {
+    case ready
+    case contextTooSmall(have: Int, need: Int)
+    case noModel
+
+    /// Template slack on top of the widest rung's prompt + answer.
+    static let templateSlack = 256
+
+    static func need(_ ladder: [BenchmarkSuite]) -> Int {
+        (ladder.map { $0.targetTokens + $0.genTokens }.max() ?? 0) + templateSlack
+    }
+
+    static func decide(contextLength: Int?, ladder: [BenchmarkSuite]) -> LadderPreflight {
+        guard let have = contextLength, have > 0 else { return .noModel }
+        let required = need(ladder)
+        return have >= required ? .ready : .contextTooSmall(have: have, need: required)
+    }
+}
+
+// MARK: - Settings
+
+/// The server settings that shaped a number, as recorded on every row.
+enum BenchmarkSettings {
+
+    /// Flattened `/props`: the `settings` object plus `n_ctx`. Every value is
+    /// a string so the row's wire shape is one flat map the rules can bound.
+    static func flatten(props: [String: Any]) -> [String: String] {
+        guard let settings = props["settings"] as? [String: Any] else { return [:] }
+        var out: [String: String] = [:]
+        func put(_ key: String, _ value: Any?) {
+            guard let value else { return }
+            // JSONSerialization hands booleans back as NSNumber too, and any
+            // NSNumber casts to Bool — ask the CF type, not the cast.
+            if let n = value as? NSNumber {
+                if CFGetTypeID(n) == CFBooleanGetTypeID() { out[key] = n.boolValue ? "true" : "false" }
+                else { out[key] = n.stringValue }
+                return
+            }
+            if let s = value as? String { out[key] = s; return }
+        }
+        put("engine", settings["engine"])
+        put("version", settings["version"])
+        put("kv_quant", settings["kv_quant"])
+        put("kv_attn_mode", settings["kv_attn_mode"])
+        put("decode_attn_quant", settings["decode_attn_quant"])
+        put("prefill_chunk", settings["prefill_chunk"])
+        put("drafter", settings["drafter"])
+        put("max_concurrent", settings["max_concurrent"])
+        if let mtp = settings["mtp"] as? [String: Any] {
+            put("mtp_loaded", mtp["loaded"])
+            put("mtp_default_on", mtp["default_on"])
+            put("mtp_depth", mtp["depth"])
+            put("mtp_adaptive", mtp["adaptive"])
+            put("mtp_acceptance", mtp["acceptance"])
+        }
+        if let pld = settings["pld"] as? [String: Any] {
+            put("pld_default_on", pld["default_on"])
+            put("pld_draft_len", pld["draft_len"])
+            put("pld_key_len", pld["key_len"])
+        }
+        if let cache = settings["prefix_cache"] as? [String: Any] {
+            put("prefix_cache_mem", cache["mem_bytes"])
+        }
+        if let gen = props["default_generation_settings"] as? [String: Any] {
+            put("n_ctx", gen["n_ctx"])
+        }
+        return out
+    }
+
+    /// What changes a request's speed, so what may not share a median.
+    /// Cache size, concurrency and the server version stay out — fragmenting
+    /// by release would leave every cell at n=1 forever.
+    static func signature(_ s: [String: String]) -> String {
+        func flag(_ key: String) -> String {
+            switch s[key] { case "true": return "1"; case "false": return "0"; default: return "?" }
+        }
+        return ["kv" + (s["kv_quant"] ?? "?"),
+                "daq" + flag("decode_attn_quant"),
+                "mtp" + flag("mtp_default_on"),
+                "pld" + flag("pld_default_on"),
+                s["drafter"] ?? "?"].joined(separator: "|")
+    }
+
+    /// `--kv-quant` and `--decode-attn-quant` trade output quality for speed.
+    /// Speculative decoding is NOT lossy — it reproduces the same tokens.
+    static func isLossy(_ s: [String: String]) -> Bool {
+        if let kv = s["kv_quant"], kv != "off" { return true }
+        return s["decode_attn_quant"] == "true"
+    }
+
+    /// Short chips for a table row: "KV 8-bit", "PLD", "MTP off", "ctx 48K".
+    static func summaryChips(_ s: [String: String]) -> [String] {
+        var chips: [String] = []
+        if let kv = s["kv_quant"] { chips.append(kv == "off" ? "KV off" : "KV \(kv)-bit") }
+        if s["decode_attn_quant"] == "true" { chips.append("Attn quant") }
+        if s["pld_default_on"] == "true" { chips.append("PLD") }
+        if let mtp = s["mtp_default_on"] { chips.append(mtp == "true" ? "MTP" : "MTP off") }
+        if let drafter = s["drafter"], drafter != "none" {
+            chips.append(drafter == "dflash" ? "DFlash" : "Drafter")
+        }
+        if let ctx = s["n_ctx"].flatMap(Int.init), ctx > 0 {
+            chips.append("ctx \(ctx / 1024)K")
+        }
+        return chips
+    }
+
+    /// Human labels for the detail sheet's settings grid.
+    static let labels: [(key: String, label: String)] = [
+        ("version", "Server"), ("engine", "Engine"), ("n_ctx", "Context"),
+        ("kv_quant", "KV quant"), ("kv_attn_mode", "KV attention"),
+        ("decode_attn_quant", "Decode attn quant"), ("prefill_chunk", "Prefill chunk"),
+        ("mtp_loaded", "MTP head"), ("mtp_default_on", "MTP on"), ("mtp_depth", "MTP depth"),
+        ("mtp_adaptive", "MTP adaptive"), ("mtp_acceptance", "MTP acceptance"),
+        ("drafter", "Drafter"), ("pld_default_on", "PLD"), ("pld_draft_len", "PLD draft len"),
+        ("pld_key_len", "PLD key len"), ("max_concurrent", "Max concurrent"),
+        ("prefix_cache_mem", "Prefix cache"),
     ]
 }
 
-// MARK: - Arms
+// MARK: - Sessions
 
-/// One configuration measured inside a session.
-///
-/// Split by HOW the setting is applied, because it decides what a session can
-/// afford to measure. Speculation is a per-REQUEST body field, so those arms
-/// interleave for free. `--kv-quant` and friends are launch flags, and since
-/// interleaving alternates arms on every run, offering them would mean a model
-/// reload per run (30 s+ each on a large checkpoint). Phase 1 runs the
-/// per-request arms only; the launch-flag arms are defined so the grids and
-/// the website can label rows a later version submits.
-struct BenchmarkArm: Identifiable, Hashable {
+/// One climb of the ladder: the rows sharing a `sessionId`, sorted by rung.
+struct BenchmarkSession: Identifiable, Hashable {
     let id: String
-    let label: String
-    let detail: String
+    let rungs: [BenchmarkResult]
 
-    /// Per-request body overrides. `nil` = leave the field out and let the
-    /// server's own default win.
-    let enablePLD: Bool?
-    let enableMTP: Bool?
+    var first: BenchmarkResult { rungs[0] }
+    var modelId: String { first.modelId }
+    var hardware: BenchmarkHardware { first.hardware }
+    var settings: [String: String] { first.settings ?? [:] }
+    var date: Date { rungs.map(\.date).max() ?? first.date }
+    var isLossy: Bool { rungs.contains { $0.isLossy } }
+    var engineVersion: String { first.engineVersion }
+    var note: String? { rungs.compactMap(\.note).first }
+    var driftPercent: Double? { rungs.compactMap(\.driftPercent).first }
+    var driftDecodeTps: Double? { rungs.compactMap(\.driftDecodeTps).first }
+    /// The decode the drift is measured against: the smallest rung's.
+    var driftBaselineTps: Double? { driftPercent == nil ? nil : rungs.first?.decodeTps }
 
-    /// Settings that can only be applied at server launch. Empty = runnable
-    /// without restarting anything.
-    let launchFlags: [String: String]
-
-    init(id: String, label: String, detail: String,
-         enablePLD: Bool? = nil, enableMTP: Bool? = nil,
-         launchFlags: [String: String] = [:]) {
-        self.id = id
-        self.label = label
-        self.detail = detail
-        self.enablePLD = enablePLD
-        self.enableMTP = enableMTP
-        self.launchFlags = launchFlags
+    func rung(at target: Int) -> BenchmarkResult? {
+        rungs.first { $0.effectiveTargetTokens == target }
     }
 
-    /// Canonical recorded representation — what gets stored, filtered and
-    /// displayed. Derived from the overrides so there is ONE source of truth:
-    /// an arm can't record a configuration different from the one it ran.
-    var flags: [String: String] {
-        var out = launchFlags
-        if let pld = enablePLD { out["--pld"] = pld ? "on" : "off" }
-        if let mtp = enableMTP { out["--mtp"] = mtp ? "on" : "off" }
-        return out
+    func decode(at target: Int) -> Double? {
+        rung(at: target).map(\.decodeTps)
     }
 
-    var requiresRestart: Bool { !launchFlags.isEmpty }
 
-    /// True when the arm trades output quality for speed.
-    ///
-    /// `--kv-quant` and `--decode-attn-quant` are lossy by design, so a board
-    /// that ranks by speed alone would quietly recommend degrading answers.
-    /// Speculative decoding is NOT lossy — it reproduces the same tokens.
-    var isLossy: Bool { BenchmarkArm.lossy(flags) }
-
-    static func lossy(_ flags: [String: String]) -> Bool {
-        if let kv = flags["--kv-quant"], kv != "off" { return true }
-        if flags["--decode-attn-quant"] != nil { return true }
-        return false
-    }
-
-    static let defaults = BenchmarkArm(
-        id: "defaults",
-        label: "Defaults",
-        detail: "The server's shipping configuration. Anchors every comparison."
-    )
-
-    static let pld = BenchmarkArm(
-        id: "pld",
-        label: "PLD on",
-        detail: "Prompt-lookup speculative decoding. Output-preserving.",
-        enablePLD: true
-    )
-
-    static let noSpec = BenchmarkArm(
-        id: "no-spec",
-        label: "No speculation",
-        detail: "PLD and MTP off — the plain autoregressive floor.",
-        enablePLD: false, enableMTP: false
-    )
-
-    static let kvQuant4 = BenchmarkArm(
-        id: "kv-quant-4",
-        label: "KV quant 4-bit",
-        detail: "Smaller KV cache, more context per GB. Lossy.",
-        launchFlags: ["--kv-quant": "4"]
-    )
-
-    static let kvQuant8 = BenchmarkArm(
-        id: "kv-quant-8",
-        label: "KV quant 8-bit",
-        detail: "Smaller KV cache at higher precision than 4-bit. Lossy.",
-        launchFlags: ["--kv-quant": "8"]
-    )
-
-    /// What a session can actually run today: no restarts, so interleaving is
-    /// free and a full session is a handful of requests.
-    static let runnable: [BenchmarkArm] = [defaults, noSpec, pld]
-
-    /// Every arm the schema knows about, including ones only a later version
-    /// will run. Used to label community rows, never to offer a control.
-    static let catalog: [BenchmarkArm] = [defaults, noSpec, pld, kvQuant8, kvQuant4]
-
-    static func byId(_ id: String) -> BenchmarkArm? { catalog.first { $0.id == id } }
-}
-
-// MARK: - Plan
-
-enum BenchmarkPlan {
-
-    /// Guarantees the `defaults` anchor is present exactly once, first.
-    ///
-    /// Without it a session contributes only absolute tok/s, which is the
-    /// cross-machine comparison the bench rules forbid.
-    static func normalize(_ arms: [BenchmarkArm]) -> [BenchmarkArm] {
-        var seen = Set<String>([BenchmarkArm.defaults.id])
-        var out = [BenchmarkArm.defaults]
-        for arm in arms where !seen.contains(arm.id) {
-            seen.insert(arm.id)
-            out.append(arm)
+    /// Newest session first, rungs ascending inside each.
+    static func group(_ rows: [BenchmarkResult]) -> [BenchmarkSession] {
+        var bySession: [String: [BenchmarkResult]] = [:]
+        for row in rows { bySession[row.sessionId, default: []].append(row) }
+        return bySession.map { id, rungs in
+            BenchmarkSession(id: id, rungs: rungs.sorted { $0.effectiveTargetTokens < $1.effectiveTargetTokens })
         }
-        return out
-    }
-
-    /// Interleaved execution order: every arm runs once, then every arm again.
-    ///
-    /// Running arm A's three runs before arm B's puts the machine's whole
-    /// warm-up on A and its heat on B, which reads as a regression that isn't
-    /// there. Interleaving spreads drift evenly so it cancels in the ratio.
-    static func runOrder(armCount: Int, runs: Int) -> [(arm: Int, run: Int)] {
-        guard armCount > 0, runs > 0 else { return [] }
-        var order: [(arm: Int, run: Int)] = []
-        order.reserveCapacity(armCount * runs)
-        for run in 0..<runs {
-            for arm in 0..<armCount { order.append((arm: arm, run: run)) }
-        }
-        return order
+        .sorted { $0.date > $1.date }
     }
 }
 
-// MARK: - Ratios
+// MARK: - Community sorting
 
-enum BenchmarkRatios {
+/// One comparator type for every column of the Community table, so a
+/// dynamic rung column can be a sort key like a fixed one.
+struct BenchmarkFamilySort: SortComparator, Hashable {
+    enum Key: Hashable {
+        case machine, model, sessions, date
+        case rung(Int)
+    }
 
-    /// Decode speed of each arm relative to the session's own `defaults` arm.
-    ///
-    /// This is the figure that aggregates honestly across machines: absolute
-    /// tok/s moves with thermals, background load and OS version, but the
-    /// same-session ratio does not. Returns empty when there is no usable
-    /// anchor — falling back to "ratio against the fastest arm" would publish
-    /// a different quantity under the same name.
-    static func toDefaults(_ results: [BenchmarkResult]) -> [String: Double] {
-        guard let anchor = results.first(where: { $0.armId == BenchmarkArm.defaults.id }),
-              anchor.decodeTps > 0 else { return [:] }
-        var out: [String: Double] = [:]
-        for result in results where result.decodeTps > 0 || result.armId == anchor.armId {
-            out[result.armId] = result.decodeTps / anchor.decodeTps
+    var key: Key
+    var order: SortOrder = .forward
+
+    init(_ key: Key, order: SortOrder = .forward) {
+        self.key = key
+        self.order = order
+    }
+
+    func compare(_ a: BenchmarkStore.CellFamily, _ b: BenchmarkStore.CellFamily) -> ComparisonResult {
+        let result: ComparisonResult
+        switch key {
+        case .machine: result = a.hardware.displayName.localizedStandardCompare(b.hardware.displayName)
+        case .model: result = a.modelId.localizedStandardCompare(b.modelId)
+        case .sessions: result = Self.compare(Double(a.sessionCount), Double(b.sessionCount))
+        case .date: result = Self.compare(a.latestDate.timeIntervalSince1970, b.latestDate.timeIntervalSince1970)
+        case .rung(let target):
+            // A family with no figure at this rung sorts LAST either way: a
+            // dash is not a small number.
+            switch (a.decode(at: target), b.decode(at: target)) {
+            case (nil, nil): return .orderedSame
+            case (nil, _): return .orderedDescending
+            case (_, nil): return .orderedAscending
+            case (let x?, let y?): result = Self.compare(x, y)
+            }
         }
-        return out
+        return order == .forward ? result : result.reversed
+    }
+
+    private static func compare(_ x: Double, _ y: Double) -> ComparisonResult {
+        x < y ? .orderedAscending : x > y ? .orderedDescending : .orderedSame
+    }
+}
+
+private extension ComparisonResult {
+    var reversed: ComparisonResult {
+        switch self {
+        case .orderedAscending: return .orderedDescending
+        case .orderedDescending: return .orderedAscending
+        case .orderedSame: return .orderedSame
+        }
+    }
+}
+
+// MARK: - Drift
+
+/// Did the machine hold its speed for the length of the run? (llmprobe's
+/// `classifyLoadDrift`.) The smallest rung's coding decode is measured again
+/// after the whole ladder, minutes of sustained load apart. A drop is thermal
+/// throttling or something else arriving on the box; a rise means the warmup
+/// did not warm it. Either way the figures were taken on moving ground.
+enum BenchmarkDrift {
+    enum Verdict: String { case steady, degraded, improved, unknown }
+
+    /// Beyond this much movement, the run's numbers are a range, not figures.
+    static let tolerancePercent = 10.0
+
+    static func percent(first: Double?, last: Double?) -> Double? {
+        guard let first, let last, first > 0, last > 0 else { return nil }
+        return ((last - first) / first * 1000).rounded() / 10
+    }
+
+    static func verdict(percent: Double?) -> Verdict {
+        guard let percent else { return .unknown }
+        if percent <= -tolerancePercent { return .degraded }
+        if percent >= tolerancePercent { return .improved }
+        return .steady
+    }
+
+    /// "61.2 → 58.4 tok/s (−4.6%, steady)"
+    static func summary(first: Double?, last: Double?, percent: Double?) -> String {
+        guard let first, let last, let percent else { return "not measured" }
+        let sign = percent > 0 ? "+" : ""
+        return String(format: "%.1f → %.1f tok/s (%@%.1f%%, %@)", first, last, sign, percent,
+                      verdict(percent: percent).rawValue)
     }
 }
 

@@ -71,6 +71,28 @@ enum BenchmarkStore {
             guard let itemData = try? JSONSerialization.data(withJSONObject: item) else { return nil }
             return try? decoder.decode(BenchmarkResult.self, from: itemData)
         }
+        .filter(\.isLadderRow)
+    }
+
+    // MARK: - Shared marker
+
+    /// Session ids already sent to the community database. Local only: a
+    /// field on the row would ride the POST and the rules reject unknown
+    /// fields, so it lives beside the history instead of in it.
+    static let sharedKey = "benchmarkSharedSessions"
+
+    static func sharedSessionIds(_ defaults: UserDefaults = .standard) -> Set<String> {
+        Set(defaults.stringArray(forKey: sharedKey) ?? [])
+    }
+
+    static func isShared(_ sessionId: String, defaults: UserDefaults = .standard) -> Bool {
+        sharedSessionIds(defaults).contains(sessionId)
+    }
+
+    static func markShared(_ sessionId: String, defaults: UserDefaults = .standard) {
+        var ids = sharedSessionIds(defaults)
+        ids.insert(sessionId)
+        defaults.set(Array(ids).sorted(), forKey: sharedKey)
     }
 
     // MARK: - Community database
@@ -109,6 +131,7 @@ enum BenchmarkStore {
             guard let rowData = try? JSONSerialization.data(withJSONObject: value) else { return nil }
             return try? decoder.decode(BenchmarkResult.self, from: rowData)
         }
+        .filter(\.isLadderRow)
         .sorted { $0.date > $1.date }
     }
 
@@ -117,15 +140,13 @@ enum BenchmarkStore {
     /// The grouping that decides which rows may share a median.
     ///
     /// GPU cores are part of the key because a 32-core and a 40-core M4 Max
-    /// report the same chip string and do not share a decode speed — averaging
-    /// them produces a number that describes neither machine.
-    ///
-    /// Engine version is deliberately NOT in the key: fragmenting by release
-    /// would leave every cell at n=1 forever. It rides each row instead, and
-    /// the ratio-to-defaults view is version-robust by construction since both
-    /// arms were measured in one session on one build.
+    /// report the same chip string and do not share a decode speed. The
+    /// settings SIGNATURE is part of it because a kv-quant 8 row and a dense
+    /// row measured the same rung on the same Mac and describe different
+    /// speeds. Engine version is deliberately NOT in the key: fragmenting by
+    /// release would leave every cell at n=1 forever.
     static func cellKey(_ row: BenchmarkResult) -> String {
-        [row.suiteId, row.modelId, row.armId,
+        [row.suiteId, row.modelId, row.settingsSignature,
          row.hardware.chip, String(row.hardware.gpuCores), String(row.hardware.ramGB)]
             .joined(separator: "|")
     }
@@ -134,8 +155,7 @@ enum BenchmarkStore {
         var id: String
         var suiteId: String
         var modelId: String
-        var armId: String
-        var armLabel: String
+        var settings: [String: String]
         var isLossy: Bool
         var hardware: BenchmarkHardware
         var prefillTps: Double
@@ -143,11 +163,7 @@ enum BenchmarkStore {
         var sampleCount: Int
     }
 
-    /// Median per comparable cell, with the sample count that produced it.
-    ///
-    /// `sampleCount` is displayed next to every figure: a cell built from one
-    /// submission is a data point, not a benchmark, and the reader has to be
-    /// able to tell the difference.
+    /// Median per comparable cell (one rung), with the sample count.
     static func aggregate(_ rows: [BenchmarkResult]) -> [Cell] {
         var groups: [String: [BenchmarkResult]] = [:]
         for row in rows { groups[cellKey(row), default: []].append(row) }
@@ -158,8 +174,7 @@ enum BenchmarkStore {
                 id: key,
                 suiteId: first.suiteId,
                 modelId: first.modelId,
-                armId: first.armId,
-                armLabel: first.armLabel,
+                settings: first.settings ?? [:],
                 isLossy: first.isLossy,
                 hardware: first.hardware,
                 prefillTps: BenchmarkStats.median(members.map(\.prefillTps)),
@@ -168,6 +183,74 @@ enum BenchmarkStore {
             )
         }
         .sorted { $0.decodeTps > $1.decodeTps }
+    }
+
+    /// A family of cells: one machine × model × settings, every rung.
+    ///
+    /// `samples(at:)` is displayed next to every figure: a rung built from
+    /// one submission is a data point, not a benchmark, and the reader has to
+    /// be able to tell the difference.
+    struct CellFamily: Identifiable, Hashable {
+        struct Rung: Hashable {
+            var targetTokens: Int
+            var decodeTps: Double
+            var prefillTps: Double
+            var ceilingDecodeTps: Double
+            var ttftMs: Double
+            var sampleCount: Int
+        }
+
+        var id: String
+        var modelId: String
+        var settings: [String: String]
+        var isLossy: Bool
+        var hardware: BenchmarkHardware
+        var rungs: [Rung]
+        var sessionCount: Int
+        /// The newest session behind the row.
+        var latestDate: Date
+
+        func rung(at target: Int) -> Rung? { rungs.first { $0.targetTokens == target } }
+        func decode(at target: Int) -> Double? { rung(at: target)?.decodeTps }
+        func samples(at target: Int) -> Int { rung(at: target)?.sampleCount ?? 0 }
+    }
+
+    static func familyKey(_ row: BenchmarkResult) -> String {
+        [row.modelId, row.settingsSignature,
+         row.hardware.chip, String(row.hardware.gpuCores), String(row.hardware.ramGB)]
+            .joined(separator: "|")
+    }
+
+    /// Per-rung medians per family, sorted by the fastest smallest rung.
+    static func aggregateSessions(_ rows: [BenchmarkResult]) -> [CellFamily] {
+        var groups: [String: [BenchmarkResult]] = [:]
+        for row in rows { groups[familyKey(row), default: []].append(row) }
+
+        return groups.compactMap { key, members -> CellFamily? in
+            guard let first = members.first else { return nil }
+            var byRung: [Int: [BenchmarkResult]] = [:]
+            for row in members { byRung[row.effectiveTargetTokens, default: []].append(row) }
+            let rungs = byRung.keys.sorted().map { target -> CellFamily.Rung in
+                let rows = byRung[target] ?? []
+                return CellFamily.Rung(
+                    targetTokens: target,
+                    decodeTps: BenchmarkStats.median(rows.map(\.decodeTps)),
+                    prefillTps: BenchmarkStats.median(rows.map(\.prefillTps)),
+                    ceilingDecodeTps: BenchmarkStats.median(rows.compactMap(\.ceilingDecodeTps).filter { $0 > 0 }),
+                    ttftMs: BenchmarkStats.median(rows.map(\.ttftMs)),
+                    sampleCount: rows.count)
+            }
+            return CellFamily(
+                id: key,
+                modelId: first.modelId,
+                settings: first.settings ?? [:],
+                isLossy: members.contains { $0.isLossy },
+                hardware: first.hardware,
+                rungs: rungs,
+                sessionCount: Set(members.map(\.sessionId)).count,
+                latestDate: members.map(\.date).max() ?? .distantPast)
+        }
+        .sorted { ($0.rungs.first?.decodeTps ?? 0) > ($1.rungs.first?.decodeTps ?? 0) }
     }
 }
 

@@ -1,22 +1,28 @@
 import Foundation
 
-/// Runs a benchmark session: one suite, several arms, interleaved.
+/// Runs one climb of the context ladder against the server as configured.
 ///
-/// The methodology rules live in `BenchmarkModels` (interleaving, the defaults
-/// anchor, the prompt nonce). This type owns the IO and the two live checks
-/// that can only be made while a run is happening:
+/// The methodology (corpus, byte fit, cache-bust lead-in) lives in
+/// `BenchmarkCorpus`; the settings capture in `BenchmarkSettings`. This type
+/// owns the IO and the two live checks that can only be made while a run is
+/// happening:
 ///
-///  * a run whose prompt hit the KV prefix cache is DISCARDED — its prefill
-///    figure measured a cache lookup and is several times the real number;
-///  * a run that stopped before the token cap is kept but recorded, because a
-///    short completion makes the decode figure noisier.
+///  * a CODING run whose prompt hit the KV prefix cache is DISCARDED — its
+///    prefill figure measured a cache lookup;
+///  * the COUNTING run on the same archive is kept whatever the cache did —
+///    its prefix hit is the point, it measures decode over the same prefix.
 @MainActor
 final class BenchmarkRunner: ObservableObject {
 
     enum Phase: Equatable {
         case idle
-        case warmup(arm: String)
-        case running(arm: String, run: Int, of: Int)
+        case calibrating
+        case warmup(rung: String)
+        case running(rung: String, run: Int, of: Int)
+        /// The first rung again, after the ladder: the drift check.
+        case drift(run: Int, of: Int)
+        case stopping
+        case cancelled
         case done
         case failed(String)
     }
@@ -29,127 +35,207 @@ final class BenchmarkRunner: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var progress = Progress(completed: 0, total: 0)
-    /// Runs thrown away because the prompt hit the prefix cache. Surfaced so a
-    /// session that silently measured nothing can't look like a clean result.
+    /// Coding runs thrown away because the prompt hit the prefix cache.
     @Published private(set) var discardedRuns = 0
+    /// Rungs completed so far, so the charts fill in rung by rung.
+    @Published private(set) var completedRungs: [BenchmarkResult] = []
 
     private let api: APIClient
     init(api: APIClient = APIClient()) { self.api = api }
 
-    /// Measure `arms` on `suite`. Returns one result per arm.
-    ///
-    /// `normalize` guarantees the defaults anchor is present, so the caller
-    /// cannot accidentally submit a session whose ratios mean nothing.
+    private var cancelRequested = false
+
+    /// Stop after the request in flight. Completed rungs are kept; the
+    /// drift check is skipped because a cut ladder has no "end".
+    func cancel() {
+        guard case .stopping = phase else {
+            cancelRequested = true
+            phase = .stopping
+            return
+        }
+    }
+
+    /// Measure the ladder. Returns one result per completed rung; a coding
+    /// request that fails ends the ladder and the completed rungs are kept
+    /// with the server's error surfaced through `phase`.
     func run(
-        suite: BenchmarkSuite,
-        arms requested: [BenchmarkArm],
+        ladder: [BenchmarkSuite],
         modelId: String,
         port: UInt16,
-        engineVersion: String,
+        note: String? = nil,
         hardware: BenchmarkHardware = SystemMetrics.benchmarkHardware()
-    ) async throws -> [BenchmarkResult] {
-        let arms = BenchmarkPlan.normalize(requested)
-        let order = BenchmarkPlan.runOrder(armCount: arms.count, runs: suite.runs)
-        let body = BenchmarkPrompt.body(approxTokens: suite.promptTokens)
+    ) async -> [BenchmarkResult] {
         let sessionId = UUID().uuidString
+        let tag = String(UInt64(Date().timeIntervalSince1970 * 1000), radix: 36)
+        var seq = 0
 
         discardedRuns = 0
-        progress = Progress(completed: 0, total: order.count + arms.count * suite.warmups)
+        completedRungs = []
+        cancelRequested = false
+        // 1 calibration + per rung: 1 warmup + runs × (coding + counting),
+        // + the first rung's runs again at the end for the drift check.
+        progress = Progress(completed: 0,
+                            total: 1 + ladder.reduce(0) { $0 + $1.warmups + $1.runs * 2 }
+                                + (ladder.first?.runs ?? 0))
 
-        // Per-arm samples, keyed by arm id.
-        var prefill: [String: [Double]] = [:]
-        var decode: [String: [Double]] = [:]
-        var ttft: [String: [Double]] = [:]
-        var lastPromptTokens: [String: Int] = [:]
-        var lastCompletionTokens: [String: Int] = [:]
+        let props = (try? await api.fetchPropsRaw(port: port)) ?? [:]
+        let settings = BenchmarkSettings.flatten(props: props)
+        let engineVersion = settings["version"] ?? "unknown"
 
-        // Warmups: paged-in weights and a settled clock. Never recorded.
-        // Each still gets a distinct nonce, or the warmup would prime the very
-        // cache the measured runs are trying to miss.
-        var nonce = 0
-        for arm in arms {
-            for _ in 0..<suite.warmups {
-                nonce += 1
-                phase = .warmup(arm: arm.label)
-                _ = try? await request(suite: suite, body: body, nonce: nonce,
-                                       arm: arm, modelId: modelId, port: port)
+        // One throwaway request in exactly the ladder's shape, generating a
+        // single token, so even the first rung is sized against this tokenizer
+        // instead of a guess.
+        phase = .calibrating
+        var fits: [BenchmarkCorpus.LadderFit] = []
+        seq += 1
+        let calibration = try? await request(
+            archive: BenchmarkCorpus.buildCodeContextWithConstant(bytes: BenchmarkCorpus.calibrationFillerBytes),
+            tag: tag, seq: seq, instruction: BenchmarkCorpus.codeInstruction,
+            maxTokens: 1, model: modelId, port: port)
+        if let calibration, calibration.promptTokens > 0 {
+            fits.append(.init(bytes: BenchmarkCorpus.calibrationFillerBytes, tokens: calibration.promptTokens))
+        }
+        progress.completed += 1
+
+        var results: [BenchmarkResult] = []
+        var failure: String?
+        // The first rung's archive and decode, kept for the drift re-measure.
+        var firstArchive: String?
+        var firstDecode: Double?
+
+        rungs: for rung in ladder {
+            if cancelRequested { break }
+            let fillerBytes = BenchmarkCorpus.fillerBytesFor(
+                target: rung.targetTokens, fits: fits, fixedChars: BenchmarkCorpus.rungFixedChars)
+            let archive = BenchmarkCorpus.buildCodeContextWithConstant(bytes: fillerBytes)
+
+            for _ in 0..<rung.warmups {
+                if cancelRequested { break rungs }
+                seq += 1
+                phase = .warmup(rung: rung.title)
+                _ = try? await request(archive: archive, tag: tag, seq: seq,
+                                       instruction: BenchmarkCorpus.codeInstruction,
+                                       maxTokens: rung.genTokens, model: modelId, port: port)
                 progress.completed += 1
             }
-        }
 
-        for step in order {
-            let arm = arms[step.arm]
-            nonce += 1
-            phase = .running(arm: arm.label, run: step.run + 1, of: suite.runs)
+            var prefill: [Double] = [], decode: [Double] = [], ttft: [Double] = [], ceiling: [Double] = []
+            var promptTokens = 0, completionTokens = 0
+            var contextUsed = false
 
-            let timings: APIClient.CompletionTimings
-            do {
-                timings = try await request(suite: suite, body: body, nonce: nonce,
-                                            arm: arm, modelId: modelId, port: port)
-            } catch {
-                phase = .failed(error.localizedDescription)
-                throw error
+            for run in 0..<rung.runs {
+                if cancelRequested { break rungs }
+                seq += 1
+                phase = .running(rung: rung.title, run: run + 1, of: rung.runs)
+
+                let coding: APIClient.CompletionTimings
+                do {
+                    coding = try await request(archive: archive, tag: tag, seq: seq,
+                                               instruction: BenchmarkCorpus.codeInstruction,
+                                               maxTokens: rung.genTokens, model: modelId, port: port,
+                                               returnsContent: true)
+                } catch {
+                    failure = error.localizedDescription
+                    break rungs
+                }
+                progress.completed += 1
+
+                if LadderSample.keep(kind: .coding, promptTokens: coding.promptTokens,
+                                     cachedTokens: coding.cachedTokens,
+                                     completionTokens: coding.completionTokens) {
+                    prefill.append(coding.prefillTps)
+                    decode.append(coding.decodeTps)
+                    ttft.append(coding.ttftMs)
+                    promptTokens = coding.promptTokens
+                    completionTokens = coding.completionTokens
+                    if BenchmarkCorpus.usedPlantedConstant(coding.content) { contextUsed = true }
+                } else {
+                    discardedRuns += 1
+                }
+
+                // Same archive, same tag and seq: a prefix hit by design.
+                if let counting = try? await request(archive: archive, tag: tag, seq: seq,
+                                                     instruction: BenchmarkCorpus.countInstruction,
+                                                     maxTokens: rung.genTokens, model: modelId, port: port),
+                   counting.decodeTps > 0,
+                   LadderSample.keep(kind: .counting, promptTokens: counting.promptTokens,
+                                     cachedTokens: counting.cachedTokens,
+                                     completionTokens: counting.completionTokens) {
+                    ceiling.append(counting.decodeTps)
+                }
+                progress.completed += 1
             }
-            progress.completed += 1
 
-            // The one check that can only be made live. A warm hit reports a
-            // prefill speed that never happened. Note this is a FRACTION of the
-            // prompt, not `cached > 0` — the template header always matches.
-            guard !BenchmarkPrompt.prefillWasReused(promptTokens: timings.promptTokens,
-                                                    cachedTokens: timings.cachedTokens) else {
-                discardedRuns += 1
-                continue
-            }
+            if promptTokens > 0 { fits.append(.init(bytes: fillerBytes, tokens: promptTokens)) }
 
-            prefill[arm.id, default: []].append(timings.prefillTps)
-            decode[arm.id, default: []].append(timings.decodeTps)
-            ttft[arm.id, default: []].append(timings.ttftMs)
-            lastPromptTokens[arm.id] = timings.promptTokens
-            lastCompletionTokens[arm.id] = timings.completionTokens
-        }
-
-        let results = arms.compactMap { arm -> BenchmarkResult? in
             let row = BenchmarkResult(
                 sessionId: sessionId,
-                suiteId: suite.id,
-                armId: arm.id,
-                armLabel: arm.label,
-                flags: arm.flags,
-                isLossy: arm.isLossy,
+                suiteId: rung.id,
                 modelId: modelId,
                 engineVersion: engineVersion,
-                prefillTps: BenchmarkStats.median(prefill[arm.id] ?? []),
-                decodeTps: BenchmarkStats.median(decode[arm.id] ?? []),
-                ttftMs: BenchmarkStats.median(ttft[arm.id] ?? []),
-                promptTokens: lastPromptTokens[arm.id] ?? 0,
-                completionTokens: lastCompletionTokens[arm.id] ?? 0,
-                runs: (decode[arm.id] ?? []).count,
-                spreadPercent: BenchmarkStats.spreadPercent(decode[arm.id] ?? []),
-                hardware: hardware
+                prefillTps: BenchmarkStats.median(prefill),
+                decodeTps: BenchmarkStats.median(decode),
+                ttftMs: BenchmarkStats.median(ttft),
+                promptTokens: promptTokens,
+                completionTokens: completionTokens,
+                runs: decode.count,
+                spreadPercent: BenchmarkStats.spreadPercent(decode),
+                hardware: hardware,
+                targetTokens: rung.targetTokens,
+                ceilingDecodeTps: BenchmarkStats.median(ceiling),
+                contextUsed: contextUsed,
+                settings: settings,
+                note: note
             )
-            // An arm whose every run was discarded measured nothing. Returning
-            // it anyway is how a table of dashes ends up above a Share button.
-            return row.isPublishable ? row : nil
+            // A rung whose every coding run was discarded measured nothing.
+            if row.isPublishable {
+                results.append(row)
+                completedRungs = results
+                if firstArchive == nil { firstArchive = archive; firstDecode = row.decodeTps }
+            }
         }
-        phase = .done
+
+        // Drift: the smallest rung's coding scenario once more, minutes of
+        // sustained load later, same bytes, fresh cache-bust tag. Only after
+        // a ladder that ran to the end — a failed climb has no "end".
+        if failure == nil, !cancelRequested, let firstArchive, let first = ladder.first {
+            var again: [Double] = []
+            for run in 0..<first.runs {
+                seq += 1
+                phase = .drift(run: run + 1, of: first.runs)
+                if let t = try? await request(archive: firstArchive, tag: tag, seq: seq,
+                                              instruction: BenchmarkCorpus.codeInstruction,
+                                              maxTokens: first.genTokens, model: modelId, port: port),
+                   LadderSample.keep(kind: .coding, promptTokens: t.promptTokens,
+                                     cachedTokens: t.cachedTokens, completionTokens: t.completionTokens) {
+                    again.append(t.decodeTps)
+                }
+                progress.completed += 1
+            }
+            let last = again.isEmpty ? nil : BenchmarkStats.median(again)
+            if let percent = BenchmarkDrift.percent(first: firstDecode, last: last) {
+                for i in results.indices {
+                    results[i].driftDecodeTps = last
+                    results[i].driftPercent = percent
+                }
+                completedRungs = results
+            }
+        }
+
+        phase = failure.map { .failed($0) } ?? (cancelRequested ? .cancelled : .done)
         return results
     }
 
     private func request(
-        suite: BenchmarkSuite,
-        body: String,
-        nonce: Int,
-        arm: BenchmarkArm,
-        modelId: String,
-        port: UInt16
+        archive: String, tag: String, seq: Int, instruction: String,
+        maxTokens: Int, model: String, port: UInt16, returnsContent: Bool = false
     ) async throws -> APIClient.CompletionTimings {
         try await api.benchmarkCompletion(
             port: port,
-            model: modelId,
-            prompt: BenchmarkPrompt.nonced(body, run: nonce),
-            maxTokens: suite.maxTokens,
-            enablePLD: arm.enablePLD,
-            enableMTP: arm.enableMTP
+            model: model,
+            prompt: BenchmarkCorpus.prompt(archive: archive, tag: tag, seq: seq, instruction: instruction),
+            maxTokens: maxTokens,
+            returnsContent: returnsContent
         )
     }
 }

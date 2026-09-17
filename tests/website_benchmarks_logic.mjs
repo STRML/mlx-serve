@@ -1,6 +1,7 @@
 // website_benchmarks_logic.mjs — unit-tests the pure logic embedded in
-// website/benchmarks/index.html: row validation, RTDB payload parsing, median,
-// cell grouping, cross-session ratio aggregation and filtering.
+// website/benchmarks/index.html: row validation (v1 + v2), RTDB payload
+// parsing, median, settings signature, cell grouping, cell families and the
+// speculation-headroom view, and filtering.
 // Invoked by test_website_pages.sh when node is available; exits non-zero on
 // the first failed assertion.
 //
@@ -8,9 +9,10 @@
 // DOM-dependent rendering section, so the code under test is the exact code the
 // browser runs — no copies.
 //
-// The grouping logic here MIRRORS BenchmarkStore.cellKey/aggregate in the Swift
-// app. If the two diverge, the app and the website quote different numbers for
-// the same data, so both sides are tested and the duplication is deliberate.
+// The grouping logic here MIRRORS BenchmarkStore / BenchmarkSettings in the
+// Swift app. If the two diverge, the app and the website quote different
+// numbers for the same data, so both sides are tested and the duplication is
+// deliberate.
 import { readFileSync } from "node:fs";
 
 const html = readFileSync("website/benchmarks/index.html", "utf8");
@@ -22,17 +24,32 @@ if (pure.length === script.length) { console.error("ASSERT FAIL: rendering marke
 const asserts = `
 function assert(c, m) { if (!c) { console.error("ASSERT FAIL: " + m); process.exit(1); } }
 
+const SETTINGS = { kv_quant: "8", decode_attn_quant: "false", mtp_loaded: "false",
+                   mtp_default_on: "false", pld_default_on: "true", drafter: "none",
+                   n_ctx: "49152", version: "26.9.4", prefix_cache_mem: "2147483648" };
+
 function row(over) {
   return Object.assign({
-    sessionId: "s1", suiteId: "standard-v1", armId: "defaults", armLabel: "Defaults",
-    modelId: "mlx-community/Qwen3.6-27B-4bit", isLossy: false,
-    prefillTps: 900, decodeTps: 50,
+    schemaVersion: 2, sessionId: "s1", suiteId: "ctx-v1-4k", armId: "configured", armLabel: "As configured",
+    modelId: "mlx-community/Qwen3.6-27B-4bit", isLossy: true,
+    prefillTps: 900, decodeTps: 50, ceilingDecodeTps: 90, targetTokens: 4096, promptTokens: 4100,
+    settings: SETTINGS,
     hardware: { chip: "Apple M4 Max", gpuCores: 40, ramGB: 128, osVersion: "27.0", onBattery: false },
   }, over || {});
 }
 
+function v1row(over) {
+  return Object.assign({
+    schemaVersion: 1, sessionId: "old", suiteId: "standard-v1", armId: "defaults", armLabel: "Defaults",
+    modelId: "mlx-community/Qwen3.6-27B-4bit", isLossy: false, flags: {},
+    prefillTps: 900, decodeTps: 40, promptTokens: 2048,
+    hardware: { chip: "Apple M4 Max", gpuCores: 40, ramGB: 128 },
+  }, over || {});
+}
+
 // ── row validation: an open database means anything can arrive ─────────────
-assert(isValidRow(row()), "a well-formed row validates");
+assert(isValidRow(row()), "a well-formed v2 row validates");
+assert(!isValidRow(v1row()), "a pre-release v1 row is dropped: no rung, no column");
 assert(!isValidRow(null), "null is not a row");
 assert(!isValidRow({}), "an empty object is not a row");
 assert(!isValidRow(row({ decodeTps: 0 })), "zero decode is not a measurement");
@@ -41,12 +58,18 @@ assert(!isValidRow(row({ decodeTps: "fast" })), "a string decode is rejected");
 assert(!isValidRow(row({ hardware: null })), "a row with no hardware is unfilterable");
 assert(!isValidRow(row({ hardware: { chip: "", ramGB: 8 } })), "a blank chip is unfilterable");
 assert(!isValidRow(row({ modelId: "" })), "a blank model is unusable");
+assert(!isValidRow(row({ targetTokens: undefined })), "a v2 row without its rung is rejected");
+assert(!isValidRow(row({ settings: undefined })), "a v2 row without settings is rejected");
+assert(!isValidRow(row({ targetTokens: "4k" })), "a non-integer rung is rejected");
+assert(isValidRow(row({ note: "david, fans on max" })), "a note is optional free text");
+assert(!isValidRow(row({ note: 42 })), "a non-string note is rejected");
+assert(isValidRow(row({ driftPercent: -4.6, driftDecodeTps: 58.4 })), "drift fields are optional numbers");
+assert(!isValidRow(row({ driftPercent: "steady" })), "a non-numeric drift is rejected");
 
 // ── RTDB payload shape: an OBJECT keyed by push id, or null when empty ─────
 assert(parseRows(null).length === 0, "an empty database renders as no rows");
 assert(parseRows({}).length === 0, "an empty object yields no rows");
 assert(parseRows({ "-Na": row(), "-Nb": row() }).length === 2, "push-keyed object yields its rows");
-// One junk write must never blank the board.
 assert(parseRows({ "-Na": row(), "-Njunk": { nonsense: true } }).length === 1,
        "a malformed row is skipped, the good one survives");
 
@@ -56,6 +79,17 @@ assert(median([42]) === 42, "median of one");
 assert(median([10, 20]) === 15, "median of two averages");
 assert(median([50, 51, 20]) === 50, "one slow run does not drag the median");
 
+// ── settings signature (mirrors BenchmarkSettings.signature) ──────────────
+assert(settingsSignature(SETTINGS) === "kv8|daq0|mtp0|pld1|none", "signature spells what changes speed");
+assert(settingsSignature(undefined) === "kv?|daq?|mtp?|pld?|?", "missing settings have an unknown signature");
+assert(settingsSignature(Object.assign({}, SETTINGS, { version: "27.0.0", prefix_cache_mem: "1" }))
+       === settingsSignature(SETTINGS), "server version and cache size do not change the signature");
+assert(settingsSignature(Object.assign({}, SETTINGS, { kv_quant: "off" })) !== settingsSignature(SETTINGS),
+       "kv quant changes the signature");
+const chips = settingsChips(SETTINGS);
+assert(chips.join(",") === "KV 8-bit,PLD,MTP off,ctx 48K", "chips name what matters: " + chips.join(","));
+assert(settingsChips(undefined).length === 0, "no settings, no chips");
+
 // ── cell grouping: only genuinely comparable rows share a median ───────────
 const m4max40 = row();
 const m4max32 = row({ hardware: { chip: "Apple M4 Max", gpuCores: 32, ramGB: 128 } });
@@ -64,9 +98,8 @@ assert(cellKey(m4max40) !== cellKey(m4max32),
 assert(cellKey(row({ decodeTps: 99 })) === cellKey(row()),
        "the measurement itself is not part of the key");
 assert(cellKey(row({ modelId: "other" })) !== cellKey(row()), "model separates cells");
-assert(cellKey(row({ armId: "pld" })) !== cellKey(row()), "arm separates cells");
-// Engine version is deliberately NOT in the key: fragmenting by release would
-// leave every cell at n=1 forever.
+assert(cellKey(row({ settings: Object.assign({}, SETTINGS, { kv_quant: "off" }) })) !== cellKey(row()),
+       "settings signature separates cells");
 assert(cellKey(row({ engineVersion: "26.9.0" })) === cellKey(row({ engineVersion: "26.8.1" })),
        "engine version does not fragment cells");
 
@@ -76,49 +109,45 @@ assert(agg.length === 1, "identical machines collapse into one cell");
 assert(agg[0].decodeTps === 50, "cell reports the median");
 assert(agg[0].sampleCount === 3, "cell reports how many results it came from");
 
-const split = aggregate([row(), row({ armId: "kv-quant-4", isLossy: true })]);
-assert(split.length === 2, "different arms never share a median");
-assert(aggregate([row({ decodeTps: 10 }), row({ armId: "pld", decodeTps: 90 })])[0].armId === "pld",
-       "cells sort fastest first");
+// ── cell families: one row per machine × model × settings, a column per rung
+const fam = aggregateFamilies([
+  row({ sessionId: "a", suiteId: "ctx-v1-512", targetTokens: 512, decodeTps: 60, ceilingDecodeTps: 120 }),
+  row({ sessionId: "a", suiteId: "ctx-v1-4k", targetTokens: 4096, decodeTps: 50, ceilingDecodeTps: 90 }),
+  row({ sessionId: "b", suiteId: "ctx-v1-512", targetTokens: 512, decodeTps: 70, ceilingDecodeTps: 100 }),
+  row({ sessionId: "c", suiteId: "ctx-v1-512", targetTokens: 512, decodeTps: 30,
+        settings: Object.assign({}, SETTINGS, { kv_quant: "off" }) }),
+]);
+assert(fam.length === 2, "two settings signatures make two families");
+const kv8 = fam.find((f) => f.settings.kv_quant === "8");
+assert(kv8.rungs.get(512).decodeTps === 65, "per-rung median across sessions");
+assert(kv8.rungs.get(512).sampleCount === 2, "per-rung n");
+assert(kv8.rungs.get(4096).decodeTps === 50 && kv8.rungs.get(4096).sampleCount === 1, "a rung one session reached");
+assert(kv8.sessionCount === 2, "n on the row is sessions, not rungs");
+const noted = aggregateFamilies([row({ note: " david " }), row({ sessionId: "b", note: "david" }), row({ sessionId: "c", note: "m4 fanless" })]);
+assert(noted[0].notes.join("|") === "david|m4 fanless", "notes are trimmed and de-duplicated: " + noted[0].notes.join("|"));
+assert(aggregateFamilies([row()])[0].notes.length === 0, "no note, no notes");
+assert(fam[0] === kv8, "families sort by the fastest smallest rung");
 
-// ── ratio view: the only comparison valid across machines ─────────────────
-const oneSession = [
-  row({ sessionId: "a", armId: "defaults", decodeTps: 50 }),
-  row({ sessionId: "a", armId: "pld", armLabel: "PLD on", decodeTps: 60 }),
-];
-const r1 = ratiosBySession(oneSession);
-assert(r1.length === 1 && r1[0].armId === "pld", "the non-anchor arm is reported");
-assert(Math.abs(r1[0].ratio - 1.2) < 1e-9, "ratio is against the session's own defaults");
 
-// A session with no anchor contributes nothing — comparing it against someone
-// else's baseline would publish a different quantity under the same name.
-assert(ratiosBySession([row({ sessionId: "b", armId: "pld", decodeTps: 60 })]).length === 0,
-       "an anchorless session is dropped");
-assert(ratiosBySession([
-  row({ sessionId: "c", armId: "defaults", decodeTps: 0 }),
-  row({ sessionId: "c", armId: "pld", decodeTps: 60 }),
-]).length === 0, "a zero anchor never produces an infinite ratio");
-
-// Ratios median ACROSS sessions, so a fast Mac cannot outvote a slow one.
-const twoSessions = [
-  row({ sessionId: "a", armId: "defaults", decodeTps: 10 }),
-  row({ sessionId: "a", armId: "pld", decodeTps: 20 }),          // 2.0x on a slow Mac
-  row({ sessionId: "b", armId: "defaults", decodeTps: 100 }),
-  row({ sessionId: "b", armId: "pld", decodeTps: 140 }),         // 1.4x on a fast Mac
-];
-const r2 = ratiosBySession(twoSessions);
-assert(r2.length === 1 && r2[0].sampleCount === 2, "both sessions counted once each");
-assert(Math.abs(r2[0].ratio - 1.7) < 1e-9, "ratios median across sessions, not weighted by speed");
+// ── speculation headroom: ceiling ÷ decode per rung, inside one session ────
+const head = headroomByCell([
+  row({ sessionId: "a", suiteId: "ctx-v1-512", targetTokens: 512, decodeTps: 50, ceilingDecodeTps: 100 }),
+  row({ sessionId: "a", suiteId: "ctx-v1-4k", targetTokens: 4096, decodeTps: 40, ceilingDecodeTps: 0 }),
+]);
+assert(head.length === 1, "a family with any measurable rung is reported");
+assert(Math.abs(head[0].rungs.get(512).headroom - 2.0) < 1e-9, "headroom is ceiling over decode");
+assert(head[0].rungs.get(4096).headroom === null, "a failed ceiling run never yields a ratio");
+assert(headroomByCell([row({ ceilingDecodeTps: 0 })]).length === 0, "a family with no ceiling anywhere is dropped from the view");
 
 // ── filters ───────────────────────────────────────────────────────────────
 const mixed = [
   row({ hardware: { chip: "Apple M4 Max", gpuCores: 40, ramGB: 128 } }),
   row({ hardware: { chip: "Apple M4", gpuCores: 10, ramGB: 16 } }),
-  row({ armId: "kv-quant-4", isLossy: true }),
+  row({ isLossy: false, settings: Object.assign({}, SETTINGS, { kv_quant: "off" }) }),
 ];
 assert(applyFilters(mixed, { chip: "Apple M4" }).length === 1, "chip filter");
 assert(applyFilters(mixed, { ram: "16" }).length === 1, "memory filter");
-assert(applyFilters(mixed, { quality: "lossless" }).length === 2, "lossless filter drops lossy rows");
+assert(applyFilters(mixed, { quality: "lossless" }).length === 1, "lossless filter drops lossy rows");
 assert(applyFilters(mixed, {}).length === 3, "no filters keeps everything");
 assert(applyFilters(mixed, { model: "nope" }).length === 0, "unknown model matches nothing");
 

@@ -12,60 +12,78 @@ final class BenchmarkStoreTests: XCTestCase {
     // MARK: - Wire format
 
     func testDatesRideAsISO8601SoTheWebsiteCanReadThemDirectly() throws {
-        // The website parses this JSON with plain `fetch` and no SDK. Swift's
-        // default Date encoding is a reference-epoch Double, which reads as a
-        // meaningless number in JS and silently renders as 2001.
-        let row = makeRow(arm: BenchmarkArm.defaults.id, decode: 50)
+        let row = makeRow(decode: 50)
         let data = try BenchmarkStore.encoder.encode(row)
         let text = String(data: data, encoding: .utf8) ?? ""
         XCTAssertTrue(text.contains("\"date\":\""), "date is not a string — the website can't parse it")
         XCTAssertTrue(text.contains("T"), "date is not ISO8601")
     }
 
-    func testWireRoundTripsThroughTheSharedCoders() throws {
-        let row = makeRow(arm: BenchmarkArm.pld.id, decode: 61.5)
+    func testWireRoundTripsThroughTheSharedCodersWithSettings() throws {
+        let row = makeRow(decode: 61.5)
         let data = try BenchmarkStore.encoder.encode(row)
         let back = try BenchmarkStore.decoder.decode(BenchmarkResult.self, from: data)
         XCTAssertEqual(back.id, row.id)
         XCTAssertEqual(back.decodeTps, row.decodeTps, accuracy: 0.0001)
         XCTAssertEqual(back.hardware.gpuCores, row.hardware.gpuCores)
         XCTAssertEqual(back.date.timeIntervalSince1970, row.date.timeIntervalSince1970, accuracy: 1.0)
+        XCTAssertEqual(back.settings, row.settings)
+        XCTAssertEqual(back.targetTokens, 4096)
+        XCTAssertEqual(back.ceilingDecodeTps ?? 0, 88, accuracy: 0.0001)
+    }
+
+    func testAPreReleaseRowIsDroppedOnRead() throws {
+        // The single-prompt suite that shipped before the ladder carried no
+        // rung; it is not carried forward, on disk or from the database.
+        let v1 = """
+        {"id":"r1","schemaVersion":1,"sessionId":"s","suiteId":"standard-v1","armId":"defaults",
+         "armLabel":"Defaults","isLossy":false,"modelId":"m","engineVersion":"26.8.1",
+         "prefillTps":900,"decodeTps":50,"ttftMs":200,"promptTokens":2048,"completionTokens":128,
+         "runs":3,"spreadPercent":4,"date":"2026-09-01T10:00:00Z",
+         "hardware":{"chip":"Apple M4","gpuCores":10,"ramGB":16,"osVersion":"27.0","onBattery":false}}
+        """
+        XCTAssertTrue(BenchmarkStore.decodeCommunity(Data("{\"-Nold\":\(v1)}".utf8)).isEmpty)
+        let v2 = try String(data: BenchmarkStore.encoder.encode(makeRow(decode: 50)), encoding: .utf8)!
+        XCTAssertEqual(BenchmarkStore.decodeCommunity(Data("{\"-Nold\":\(v1),\"-Nnew\":\(v2)}".utf8)).count, 1)
+    }
+
+    func testARowFirebaseHandedBackWithoutItsEmptyFlagsStillDecodes() throws {
+        // RTDB stores no empty object: `flags: {}` is dropped on write, so
+        // every shared v2 row came back without it and the board was blank
+        // while the rows sat in the database (live, 2026-09-17).
+        var object = try JSONSerialization.jsonObject(
+            with: BenchmarkStore.encoder.encode(makeRow(decode: 50))) as! [String: Any]
+        object.removeValue(forKey: "flags")
+        let row = try BenchmarkStore.decoder.decode(BenchmarkResult.self,
+                                                    from: try JSONSerialization.data(withJSONObject: object))
+        XCTAssertEqual(row.flags, [:])
+        XCTAssertEqual(row.decodeTps, 50, accuracy: 0.001)
     }
 
     // MARK: - Reading the community database
 
     func testRTDBResponseIsADictionaryOfRowsNotAnArray() throws {
-        // A POST to `/results.json` creates a child under a generated push key,
-        // so the collection reads back as an object keyed by those pushes.
-        let row = try String(data: BenchmarkStore.encoder.encode(makeRow(arm: "defaults", decode: 50)),
-                             encoding: .utf8)!
+        let row = try String(data: BenchmarkStore.encoder.encode(makeRow(decode: 50)), encoding: .utf8)!
         let payload = "{\"-NpushKeyA\":\(row),\"-NpushKeyB\":\(row)}"
-        let rows = BenchmarkStore.decodeCommunity(Data(payload.utf8))
-        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(BenchmarkStore.decodeCommunity(Data(payload.utf8)).count, 2)
     }
 
     func testAnEmptyDatabaseReadsAsNoRowsRatherThanAnError() {
-        // RTDB returns literal `null` for an empty path.
         XCTAssertTrue(BenchmarkStore.decodeCommunity(Data("null".utf8)).isEmpty)
         XCTAssertTrue(BenchmarkStore.decodeCommunity(Data("".utf8)).isEmpty)
     }
 
     func testOneMalformedRowDoesNotBlankTheWholeBoard() throws {
-        // Anyone can write to this database in phase 1. Decoding the collection
-        // as a single unit would let one junk row hide every real result.
-        let good = try String(data: BenchmarkStore.encoder.encode(makeRow(arm: "defaults", decode: 50)),
-                              encoding: .utf8)!
+        let good = try String(data: BenchmarkStore.encoder.encode(makeRow(decode: 50)), encoding: .utf8)!
         let payload = "{\"-Ngood\":\(good),\"-Njunk\":{\"nonsense\":true}}"
         let rows = BenchmarkStore.decodeCommunity(Data(payload.utf8))
         XCTAssertEqual(rows.count, 1)
-        XCTAssertEqual(rows.first?.armId, "defaults")
+        XCTAssertEqual(rows.first?.armId, "configured")
     }
 
     func testUnknownFieldsFromAFutureVersionAreIgnored() throws {
-        // Phase 2 adds attestation fields. A client shipped today must keep
-        // reading rows written by a client shipped later.
         var object = try JSONSerialization.jsonObject(
-            with: BenchmarkStore.encoder.encode(makeRow(arm: "defaults", decode: 50))) as! [String: Any]
+            with: BenchmarkStore.encoder.encode(makeRow(decode: 50))) as! [String: Any]
         object["trust"] = "attested"
         object["attestationKeyId"] = "abc123"
         let wrapped = try JSONSerialization.data(withJSONObject: ["-Nrow": object])
@@ -75,72 +93,109 @@ final class BenchmarkStoreTests: XCTestCase {
     // MARK: - Local history
 
     func testMergeKeepsNewestFirstAndDedupesById() {
-        // A resubmitted session must not appear twice in local history.
-        let old = makeRow(arm: "defaults", decode: 50, date: Date(timeIntervalSince1970: 1_000))
-        let new = makeRow(arm: "pld", decode: 60, date: Date(timeIntervalSince1970: 2_000))
+        let old = makeRow(decode: 50, date: Date(timeIntervalSince1970: 1_000))
+        let new = makeRow(decode: 60, date: Date(timeIntervalSince1970: 2_000))
         let merged = BenchmarkStore.merged([old], adding: [new, old])
         XCTAssertEqual(merged.count, 2)
-        XCTAssertEqual(merged.first?.armId, "pld", "newest row is not first")
+        XCTAssertEqual(merged.first?.decodeTps ?? 0, 60, accuracy: 0.001, "newest row is not first")
     }
 
     // MARK: - Aggregation
 
     func testCellKeyGroupsOnlyRowsThatAreActuallyComparable() {
-        // Same everything except GPU cores: a 32-core and a 40-core M4 Max are
-        // different machines and must not land in one median.
-        let a = makeRow(arm: "defaults", decode: 50, gpuCores: 40)
-        let b = makeRow(arm: "defaults", decode: 30, gpuCores: 32)
+        let a = makeRow(decode: 50, gpuCores: 40)
+        let b = makeRow(decode: 30, gpuCores: 32)
         XCTAssertNotEqual(BenchmarkStore.cellKey(a), BenchmarkStore.cellKey(b))
-
-        let c = makeRow(arm: "defaults", decode: 52, gpuCores: 40)
+        let c = makeRow(decode: 52, gpuCores: 40)
         XCTAssertEqual(BenchmarkStore.cellKey(a), BenchmarkStore.cellKey(c))
     }
 
+    func testCellKeySeparatesSettingsSignatures() {
+        // A kv-quant 8 row and a lossless row measured the same rung on the
+        // same Mac and must never share a median.
+        let quant = makeRow(decode: 50, settings: ["kv_quant": "8", "pld_default_on": "true"])
+        let dense = makeRow(decode: 45, settings: ["kv_quant": "off", "pld_default_on": "true"])
+        XCTAssertNotEqual(BenchmarkStore.cellKey(quant), BenchmarkStore.cellKey(dense))
+        // ...but a different server version or cache size is the same cell.
+        let later = makeRow(decode: 51, settings: ["kv_quant": "8", "pld_default_on": "true",
+                                                    "version": "27.0.0", "prefix_cache_mem": "1"])
+        XCTAssertEqual(BenchmarkStore.cellKey(quant), BenchmarkStore.cellKey(later))
+    }
+
     func testAggregateReportsTheMedianAndTheSampleCount() {
-        // n is displayed next to every median: a cell built from one submission
-        // is a data point, not a benchmark.
-        let rows = [
-            makeRow(arm: "defaults", decode: 40),
-            makeRow(arm: "defaults", decode: 50),
-            makeRow(arm: "defaults", decode: 60),
-        ]
+        let rows = [makeRow(decode: 40), makeRow(decode: 50), makeRow(decode: 60)]
         let cells = BenchmarkStore.aggregate(rows)
         XCTAssertEqual(cells.count, 1)
         XCTAssertEqual(cells.first?.decodeTps ?? 0, 50, accuracy: 0.001)
         XCTAssertEqual(cells.first?.sampleCount, 3)
     }
 
-    func testAggregateSeparatesArmsSoLossyRowsNeverJoinALosslessMedian() {
+    func testAggregateSessionsBuildsOneFamilyPerMachineModelAndSettings() {
+        // Two sessions on one machine at the same settings → one family with
+        // per-rung medians and n = sessions behind each rung.
         let rows = [
-            makeRow(arm: "defaults", decode: 50),
-            makeRow(arm: BenchmarkArm.kvQuant4.id, decode: 70),
+            makeRow(decode: 50, date: Date(timeIntervalSince1970: 1_000), session: "a", suite: "ctx-v1-512", target: 512),
+            makeRow(decode: 40, date: Date(timeIntervalSince1970: 1_100), session: "a", suite: "ctx-v1-4k", target: 4096),
+            makeRow(decode: 60, date: Date(timeIntervalSince1970: 3_000), session: "b", suite: "ctx-v1-512", target: 512),
+            makeRow(decode: 30, date: Date(timeIntervalSince1970: 9_000), session: "c", suite: "ctx-v1-512", target: 512,
+                    settings: ["kv_quant": "off"]),
         ]
-        XCTAssertEqual(BenchmarkStore.aggregate(rows).count, 2)
+        let families = BenchmarkStore.aggregateSessions(rows)
+        XCTAssertEqual(families.count, 2)
+        guard let quant = families.first(where: { $0.settings["kv_quant"] == "8" }) else {
+            return XCTFail("kv-8 family missing")
+        }
+        XCTAssertEqual(quant.decode(at: 512) ?? 0, 55, accuracy: 0.001)
+        XCTAssertEqual(quant.samples(at: 512), 2)
+        XCTAssertEqual(quant.decode(at: 4096) ?? 0, 40, accuracy: 0.001)
+        XCTAssertEqual(quant.samples(at: 4096), 1)
+        XCTAssertNil(quant.decode(at: 16384))
+        XCTAssertEqual(quant.sessionCount, 2)
+        XCTAssertEqual(quant.latestDate, Date(timeIntervalSince1970: 3_000), "newest of ITS OWN sessions, not the board's")
+    }
+
+    // MARK: - Shared marker
+
+    func testASharedSessionIsRememberedLocallyAndNeverOnTheRow() throws {
+        // The marker must not ride the POST: the rules reject unknown fields,
+        // so a `shared` field on the row would 401 every submission.
+        let defaults = UserDefaults(suiteName: "BenchmarkStoreTests.\(UUID().uuidString)")!
+        XCTAssertFalse(BenchmarkStore.isShared("s1", defaults: defaults))
+        BenchmarkStore.markShared("s1", defaults: defaults)
+        BenchmarkStore.markShared("s1", defaults: defaults)
+        XCTAssertTrue(BenchmarkStore.isShared("s1", defaults: defaults))
+        XCTAssertFalse(BenchmarkStore.isShared("s2", defaults: defaults))
+        XCTAssertEqual(BenchmarkStore.sharedSessionIds(defaults).count, 1)
+
+        let wire = try JSONSerialization.jsonObject(with: BenchmarkStore.encoder.encode(makeRow(decode: 50))) as! [String: Any]
+        XCTAssertNil(wire["shared"])
+        XCTAssertNil(wire["sharedAt"])
     }
 
     // MARK: - Helpers
 
-    private func makeRow(arm: String, decode: Double,
-                         gpuCores: Int = 40, date: Date = Date()) -> BenchmarkResult {
+    private func makeRow(decode: Double, gpuCores: Int = 40, date: Date = Date(),
+                         session: String = "s1", suite: String = "ctx-v1-4k", target: Int = 4096,
+                         settings: [String: String] = ["kv_quant": "8", "pld_default_on": "true"]) -> BenchmarkResult {
         BenchmarkResult(
-            sessionId: "s1",
-            suiteId: BenchmarkSuite.standardV1.id,
-            armId: arm,
-            armLabel: arm,
-            flags: [:],
-            isLossy: false,
+            sessionId: session,
+            suiteId: suite,
             modelId: "mlx-community/Qwen3.6-27B-4bit",
-            engineVersion: "26.8.1",
+            engineVersion: "26.9.4",
             prefillTps: 900,
             decodeTps: decode,
             ttftMs: 240,
-            promptTokens: 2048,
-            completionTokens: 128,
-            runs: 3,
+            promptTokens: target,
+            completionTokens: 192,
+            runs: 2,
             spreadPercent: 4,
             hardware: BenchmarkHardware(chip: "Apple M4 Max", gpuCores: gpuCores,
                                         ramGB: 128, osVersion: "27.0", onBattery: false),
-            date: date
+            date: date,
+            targetTokens: target,
+            ceilingDecodeTps: 88,
+            contextUsed: true,
+            settings: settings
         )
     }
 }

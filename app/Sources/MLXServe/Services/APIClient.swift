@@ -406,6 +406,15 @@ class APIClient {
         return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json))
     }
 
+    /// The whole `/props` document. The benchmark runner records the
+    /// server's `settings` block on every row; parsing it lives in
+    /// `BenchmarkSettings.flatten`, so this hands back the raw JSON.
+    func fetchPropsRaw(port: UInt16) async throws -> [String: Any] {
+        let url = serverURL(port: port, path: "/props")
+        let (data, _) = try await session.data(from: url)
+        return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
     /// Live throughput feed. 503s when the server was launched without
     /// `--metrics`, which reads as nil (the tray hides the rows).
     func fetchThroughput(port: UInt16) async throws -> ThroughputSnapshot? {
@@ -435,6 +444,8 @@ class APIClient {
         var decodeTps: Double
         var tokenizeMs: Double
         var finishReason: String
+        /// The answer text, only when the caller asked for it.
+        var content: String
 
         /// Server-side time to first token.
         var ttftMs: Double { tokenizeMs + prefillMs }
@@ -453,8 +464,7 @@ class APIClient {
         model: String,
         prompt: String,
         maxTokens: Int,
-        enablePLD: Bool? = nil,
-        enableMTP: Bool? = nil,
+        returnsContent: Bool = false,
         timeout: TimeInterval = 900
     ) async throws -> CompletionTimings {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
@@ -476,8 +486,6 @@ class APIClient {
             // making the decode figure depend on the model's mood.
             "enable_thinking": false,
         ]
-        if let pld = enablePLD { body["enable_pld"] = pld }
-        if let mtp = enableMTP { body["enable_mtp"] = mtp }
         // withoutEscapingSlashes: a LAN model id must not ship as `\/`.
         request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
 
@@ -499,7 +507,11 @@ class APIClient {
         func number(_ key: String) -> Double {
             (timings[key] as? NSNumber)?.doubleValue ?? 0
         }
-        let finish = (json["choices"] as? [[String: Any]])?.first?["finish_reason"] as? String ?? ""
+        let choice = (json["choices"] as? [[String: Any]])?.first
+        let finish = choice?["finish_reason"] as? String ?? ""
+        let content = returnsContent
+            ? ((choice?["message"] as? [String: Any])?["content"] as? String ?? "")
+            : ""
 
         return CompletionTimings(
             promptTokens: Int(number("prompt_n")),
@@ -510,7 +522,8 @@ class APIClient {
             decodeMs: number("predicted_ms"),
             decodeTps: number("predicted_per_second"),
             tokenizeMs: number("tokenize_ms"),
-            finishReason: finish
+            finishReason: finish,
+            content: content
         )
     }
 

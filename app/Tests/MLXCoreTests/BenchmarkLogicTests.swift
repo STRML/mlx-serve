@@ -7,306 +7,329 @@ import XCTest
 /// methodology holds, and every rule below is one that silently produces
 /// plausible-but-wrong data when it's missing:
 ///
-///  * A repeated prompt hits the server's KV prefix cache, so run 2 and 3
-///    measure a cache lookup instead of prefill and the number triples.
-///  * A prompt built by repeating one paragraph is exactly PLD's best case,
-///    so a spec-on arm would look far better than it does on real text.
-///  * Running all of arm A then all of arm B lets thermal drift land entirely
-///    on B (root CLAUDE.md: interleaved A/B, same boot, drift cancels per pair).
-///  * Without a `defaults` arm in every session there is no shared anchor, so
-///    only absolute tok/s can be compared across machines — which is the
-///    cross-version-absolute-diff trap the bench rules exist to prevent.
+///  * A repeated prompt hits the server's KV prefix cache, so a coding run
+///    that reused its prefix measured a cache lookup instead of prefill.
+///  * The counting run is MEANT to hit the cache: it measures decode over the
+///    same prefix, so the discard rule must not apply to it.
+///  * A run measures the server as configured. The settings that shaped a
+///    number ride the row, or two rows with different kv-quant share a median.
 final class BenchmarkLogicTests: XCTestCase {
 
     // MARK: - Stats
 
     func testMedianUsesTheMiddleValueNotTheMean() {
-        // A single slow run (thermal blip, background compile) must not drag
-        // the reported number: that's why we publish a median, not a mean.
         XCTAssertEqual(BenchmarkStats.median([50, 51, 20]), 50, accuracy: 0.001)
         XCTAssertEqual(BenchmarkStats.median([10, 20]), 15, accuracy: 0.001)
         XCTAssertEqual(BenchmarkStats.median([42]), 42, accuracy: 0.001)
     }
 
     func testMedianOfNothingIsZeroRatherThanACrash() {
-        // Every run discarded (all cache hits) is a real outcome the UI renders.
         XCTAssertEqual(BenchmarkStats.median([]), 0, accuracy: 0.001)
     }
 
     func testSpreadIsRelativeToTheMedianSoItComparesAcrossModels() {
-        // 2 tok/s of spread means something different on a 3 tok/s 235B than on
-        // a 200 tok/s 2B, so the published figure is a percentage.
         XCTAssertEqual(BenchmarkStats.spreadPercent([48, 50, 52]), 8, accuracy: 0.001)
         XCTAssertEqual(BenchmarkStats.spreadPercent([50, 50, 50]), 0, accuracy: 0.001)
         XCTAssertEqual(BenchmarkStats.spreadPercent([]), 0, accuracy: 0.001)
     }
 
-    // MARK: - Prompt construction
-
-    func testPromptIsIdenticalOnEveryMachine() {
-        // Two submissions of the same suite must have run the same workload,
-        // or the whole board is comparing different questions.
-        XCTAssertEqual(BenchmarkPrompt.body(approxTokens: 2048),
-                       BenchmarkPrompt.body(approxTokens: 2048))
-    }
-
-    func testPromptHasNoLongRepeatsSoItIsNotAFreeWinForPLD() {
-        // Prompt-lookup decoding drafts from n-grams already in the context. A
-        // prompt assembled by repeating one paragraph would let PLD replay it
-        // verbatim and post an acceptance rate no real workload sees.
-        let words = BenchmarkPrompt.body(approxTokens: 2048)
-            .split(whereSeparator: { $0 == " " || $0 == "\n" })
-            .map(String.init)
-        XCTAssertGreaterThan(words.count, 200, "prompt too short to be a prefill measurement")
-
-        var seen = Set<String>()
-        let window = 8
-        for start in 0...(words.count - window) {
-            let gram = words[start..<(start + window)].joined(separator: " ")
-            XCTAssertFalse(seen.contains(gram), "8-word run repeats verbatim: \(gram)")
-            seen.insert(gram)
-        }
-    }
-
-    func testPromptLengthTracksTheRequestedSize() {
-        let small = BenchmarkPrompt.body(approxTokens: 512)
-        let large = BenchmarkPrompt.body(approxTokens: 4096)
-        XCTAssertLessThan(small.count, large.count)
-        // Rough band only — the authoritative count is the server's `prompt_n`,
-        // which every result records.
-        XCTAssertGreaterThan(large.count, small.count * 4)
-    }
-
-    // MARK: - Cache defeat
-
-    func testNonceLandsAtTheFrontBecauseTheCacheMatchesOnPrefix() {
-        // The server reuses KV by prompt-PREFIX match. A nonce appended at the
-        // end still shares the whole prefix, so it defeats nothing — run 2
-        // would report a cache hit's prefill speed.
-        let body = "shared body text that would otherwise match"
-        let first = BenchmarkPrompt.nonced(body, run: 1)
-        let second = BenchmarkPrompt.nonced(body, run: 2)
-
-        XCTAssertNotEqual(first, second)
-        XCTAssertFalse(first.hasPrefix(second.prefix(40)),
-                       "runs share a 40-char prefix — the KV cache will match")
-        XCTAssertTrue(first.hasSuffix(body), "the measured workload must be unchanged")
-        XCTAssertTrue(second.hasSuffix(body))
-    }
-
     // MARK: - Cache contamination
 
     func testTheTemplateHeaderAlwaysMatchesSoCachedTokensIsNeverZero() {
-        // Live measurement on gemma-4-e2b, three nonced runs: prompt_n=1522,
-        // cached_n=7 every time. The chat template's own header plus the
-        // literal "Benchmark request " prefix are identical across runs by
-        // construction, so a `cached > 0` rule discards EVERY run and the
-        // whole session reports nothing. (Shipped exactly that way once.)
+        // The chat template's own header and the "[probe " lead-in are
+        // identical across runs by construction, so a `cached > 0` rule
+        // discards EVERY run. (Shipped exactly that way once.)
         XCTAssertFalse(BenchmarkPrompt.prefillWasReused(promptTokens: 1522, cachedTokens: 7))
         XCTAssertFalse(BenchmarkPrompt.prefillWasReused(promptTokens: 2048, cachedTokens: 40))
     }
 
     func testAWarmHitOnTheWholePromptIsStillDiscarded() {
-        // The case the check exists for: the prompt was genuinely served from
-        // cache, so the prefill figure describes a lookup and not compute.
         XCTAssertTrue(BenchmarkPrompt.prefillWasReused(promptTokens: 1522, cachedTokens: 1500))
         XCTAssertTrue(BenchmarkPrompt.prefillWasReused(promptTokens: 2048, cachedTokens: 2048))
     }
 
     func testTheThresholdIsAFractionOfThePromptNotAFixedCount() {
-        // A fixed allowance can't serve both a 512-token and a 32K-token
-        // suite. 10% of the prompt is far above any template header and far
-        // below a real reuse.
         XCTAssertFalse(BenchmarkPrompt.prefillWasReused(promptTokens: 1000, cachedTokens: 100))
         XCTAssertTrue(BenchmarkPrompt.prefillWasReused(promptTokens: 1000, cachedTokens: 101))
     }
 
     func testADegenerateRunCountsAsUnusable() {
-        // A zero-token prompt measured nothing; treating it as valid would
-        // publish a divide-by-nothing rate.
         XCTAssertTrue(BenchmarkPrompt.prefillWasReused(promptTokens: 0, cachedTokens: 0))
     }
 
-    // MARK: - Arms
-
-    func testEverySessionCarriesTheDefaultsAnchor() {
-        // Ratio-to-defaults is what makes results comparable across machines.
-        // A session without the anchor can only contribute absolute tok/s.
-        let normalized = BenchmarkPlan.normalize([BenchmarkArm.kvQuant4])
-        XCTAssertEqual(normalized.first?.id, BenchmarkArm.defaults.id)
-        XCTAssertEqual(normalized.count, 2)
+    func testTheCacheDiscardAppliesToTheCodingRunAndNeverToTheCountingRun() {
+        // The counting run rides the coding run's archive on purpose: its
+        // prefix hit is what makes it a decode-only measurement. Discarding it
+        // for the hit would leave every ceiling at 0.
+        XCTAssertFalse(LadderSample.keep(kind: .coding, promptTokens: 4000, cachedTokens: 3900, completionTokens: 192))
+        XCTAssertTrue(LadderSample.keep(kind: .coding, promptTokens: 4000, cachedTokens: 12, completionTokens: 192))
+        XCTAssertTrue(LadderSample.keep(kind: .counting, promptTokens: 4000, cachedTokens: 3900, completionTokens: 192))
+        XCTAssertTrue(LadderSample.keep(kind: .counting, promptTokens: 4000, cachedTokens: 4000, completionTokens: 192))
     }
 
-    func testDefaultsIsNotDuplicatedWhenTheUserAlreadyPickedIt() {
-        let normalized = BenchmarkPlan.normalize([BenchmarkArm.defaults, BenchmarkArm.kvQuant4])
-        XCTAssertEqual(normalized.filter { $0.id == BenchmarkArm.defaults.id }.count, 1)
-        XCTAssertEqual(normalized.count, 2)
+    func testAOneTokenCountingAnswerIsNotACeiling() {
+        // gemma-4-e2b answers the counting task over a code context with "1"
+        // and stops (live, 2026-09-17): a one-token decode rate is noise, and
+        // publishing it as the speculation ceiling would be a lie. Below the
+        // floor the rung's ceiling stays 0, which the table draws as a dash.
+        XCTAssertFalse(LadderSample.keep(kind: .counting, promptTokens: 4000, cachedTokens: 4000, completionTokens: 1))
+        XCTAssertFalse(LadderSample.keep(kind: .counting, promptTokens: 4000, cachedTokens: 4000,
+                                         completionTokens: LadderSample.minCeilingTokens - 1))
+        XCTAssertTrue(LadderSample.keep(kind: .counting, promptTokens: 4000, cachedTokens: 4000,
+                                        completionTokens: LadderSample.minCeilingTokens))
+        // A short CODING answer is still a prefill measurement.
+        XCTAssertTrue(LadderSample.keep(kind: .coding, promptTokens: 4000, cachedTokens: 12, completionTokens: 1))
     }
 
-    func testLossyArmsAreLabelledSoFastestNeverQuietlyMeansWorse() {
-        // --kv-quant and --decode-attn-quant trade output quality for speed by
-        // design. A "fastest config" row that doesn't say so is a
-        // recommendation to degrade answers.
-        XCTAssertTrue(BenchmarkArm.kvQuant4.isLossy)
-        XCTAssertFalse(BenchmarkArm.defaults.isLossy)
-        XCTAssertFalse(BenchmarkArm.pld.isLossy, "speculative decoding is output-preserving")
-    }
+    // MARK: - Suite
 
-    func testCatalogArmsAllCarryFlagsExceptDefaults() {
-        for arm in BenchmarkArm.catalog where arm.id != BenchmarkArm.defaults.id {
-            XCTAssertFalse(arm.flags.isEmpty, "\(arm.id) changes nothing — it is a duplicate of defaults")
-        }
-        XCTAssertTrue(BenchmarkArm.defaults.flags.isEmpty)
-    }
-
-    func testRunnableArmsNeedNoServerRestart() {
-        // Interleaving alternates arms on EVERY run, so an arm that needs a
-        // launch flag would cost a model reload per run — 30 s+ each on a large
-        // checkpoint. Offering one would turn a 2-minute session into an hour.
-        for arm in BenchmarkArm.runnable {
-            XCTAssertFalse(arm.requiresRestart, "\(arm.id) would force a reload mid-session")
-        }
-        XCTAssertTrue(BenchmarkArm.kvQuant4.requiresRestart)
-    }
-
-    func testRunnableArmsAreAllInTheCatalog() {
-        // The catalog is what labels a stored row. An arm we can run but can't
-        // name would show up in history as a bare id.
-        for arm in BenchmarkArm.runnable {
-            XCTAssertNotNil(BenchmarkArm.byId(arm.id), "\(arm.id) is runnable but unlabelled")
+    func testTheLadderIsSixRungsInAscendingOrder() {
+        XCTAssertEqual(BenchmarkSuite.ladder.map(\.targetTokens), [512, 1024, 2048, 4096, 8192, 16384])
+        XCTAssertEqual(BenchmarkSuite.ladder.map(\.id), ["ctx-v1-512", "ctx-v1-1k", "ctx-v1-2k", "ctx-v1-4k", "ctx-v1-8k", "ctx-v1-16k"])
+        for rung in BenchmarkSuite.ladder {
+            XCTAssertEqual(rung.genTokens, 192)
+            XCTAssertEqual(rung.runs, 2)
+            XCTAssertEqual(rung.warmups, 1)
         }
     }
 
-    func testRecordedFlagsAreDerivedFromWhatTheArmActuallySends() {
-        // One source of truth: an arm must not be able to record a
-        // configuration different from the one it ran.
-        XCTAssertEqual(BenchmarkArm.pld.flags, ["--pld": "on"])
-        XCTAssertEqual(BenchmarkArm.noSpec.flags, ["--pld": "off", "--mtp": "off"])
-        XCTAssertEqual(BenchmarkArm.kvQuant4.flags, ["--kv-quant": "4"])
+    func testSuiteLookupKnowsOnlyTheLadder() {
+        XCTAssertEqual(BenchmarkSuite.byId("ctx-v1-4k")?.title, "4k")
+        XCTAssertNil(BenchmarkSuite.byId("standard-v1"), "the pre-release suite is not carried")
     }
 
-    // MARK: - Interleaving
+    // MARK: - Preflight
 
-    func testRunsAreInterleavedAcrossArmsSoThermalDriftCancels() {
-        // Sequential blocks (A,A,A,B,B,B) put all of the machine's heat-up on
-        // the arm that ran last, which reads as a regression that isn't there.
-        let order = BenchmarkPlan.runOrder(armCount: 3, runs: 2)
-        XCTAssertEqual(order.map(\.arm), [0, 1, 2, 0, 1, 2])
-        XCTAssertEqual(order.map(\.run), [0, 0, 0, 1, 1, 1])
+    func testPreflightBlocksALadderTheContextCannotHold() {
+        // 16384 prompt + 192 answer + 256 template slack.
+        XCTAssertEqual(LadderPreflight.need(BenchmarkSuite.ladder), 16832)
+        switch LadderPreflight.decide(contextLength: 8192, ladder: BenchmarkSuite.ladder) {
+        case .contextTooSmall(let have, let need):
+            XCTAssertEqual(have, 8192)
+            XCTAssertEqual(need, 16832)
+        default: XCTFail("8K must block the 16k rung")
+        }
     }
 
-    func testRunOrderCoversEveryArmAndRunExactlyOnce() {
-        let order = BenchmarkPlan.runOrder(armCount: 4, runs: 3)
-        XCTAssertEqual(order.count, 12)
-        XCTAssertEqual(Set(order.map { "\($0.arm)-\($0.run)" }).count, 12)
+    func testPreflightIsReadyAtOrAboveTheNeed() {
+        XCTAssertEqual(LadderPreflight.decide(contextLength: 16832, ladder: BenchmarkSuite.ladder), .ready)
+        XCTAssertEqual(LadderPreflight.decide(contextLength: 49152, ladder: BenchmarkSuite.ladder), .ready)
     }
 
-    func testDegenerateRunOrdersAreEmptyRatherThanCrashing() {
-        XCTAssertTrue(BenchmarkPlan.runOrder(armCount: 0, runs: 3).isEmpty)
-        XCTAssertTrue(BenchmarkPlan.runOrder(armCount: 3, runs: 0).isEmpty)
+    func testPreflightWithNoModelIsItsOwnOutcome() {
+        XCTAssertEqual(LadderPreflight.decide(contextLength: nil, ladder: BenchmarkSuite.ladder), .noModel)
     }
 
-    // MARK: - Ratios
+    // MARK: - Settings capture
 
-    func testRatiosAreComputedAgainstTheSessionsOwnDefaultsArm() {
-        // The point of the anchor: absolute tok/s varies with thermals and
-        // background load, but the within-session ratio does not.
-        let results = [
-            makeResult(arm: BenchmarkArm.defaults.id, decode: 50),
-            makeResult(arm: BenchmarkArm.kvQuant4.id, decode: 60),
+    private var propsFixture: [String: Any] {
+        // Captured from a live `/props` on 26.9.4-dev.
+        let json = """
+        {"default_generation_settings":{"model":"gemma4","n_ctx":49152},"total_slots":1,
+         "settings":{"version":"26.9.4-dev","engine":"mlx","kv_quant":"8","kv_attn_mode":"auto",
+           "decode_attn_quant":false,"prefill_chunk":8192,
+           "mtp":{"loaded":false,"default_on":false,"acceptance":"exact","acceptance_param":null,"depth":4,"adaptive":true,"max_ctx":0},
+           "drafter":"none","pld":{"default_on":true,"draft_len":5,"key_len":3},
+           "max_concurrent":1,"prefix_cache":{"mem_bytes":2147483648,"disk_bytes":0}}}
+        """
+        return try! JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+    }
+
+    func testFlattenReadsEveryKeyTheBoardShows() {
+        let flat = BenchmarkSettings.flatten(props: propsFixture)
+        XCTAssertEqual(flat["engine"], "mlx")
+        XCTAssertEqual(flat["version"], "26.9.4-dev")
+        XCTAssertEqual(flat["n_ctx"], "49152")
+        XCTAssertEqual(flat["kv_quant"], "8")
+        XCTAssertEqual(flat["kv_attn_mode"], "auto")
+        XCTAssertEqual(flat["decode_attn_quant"], "false")
+        XCTAssertEqual(flat["prefill_chunk"], "8192")
+        XCTAssertEqual(flat["mtp_loaded"], "false")
+        XCTAssertEqual(flat["mtp_default_on"], "false")
+        XCTAssertEqual(flat["mtp_depth"], "4")
+        XCTAssertEqual(flat["mtp_adaptive"], "true")
+        XCTAssertEqual(flat["mtp_acceptance"], "exact")
+        XCTAssertEqual(flat["drafter"], "none")
+        XCTAssertEqual(flat["pld_default_on"], "true")
+        XCTAssertEqual(flat["pld_draft_len"], "5")
+        XCTAssertEqual(flat["pld_key_len"], "3")
+        XCTAssertEqual(flat["max_concurrent"], "1")
+        XCTAssertEqual(flat["prefix_cache_mem"], "2147483648")
+    }
+
+    func testFlattenOfAServerWithoutSettingsIsEmptyNotACrash() {
+        XCTAssertTrue(BenchmarkSettings.flatten(props: [:]).isEmpty)
+        XCTAssertTrue(BenchmarkSettings.flatten(props: ["settings": "junk"]).isEmpty)
+    }
+
+    func testTheSignatureIsWhatChangesSpeed() {
+        // Two rows may share a median only when these agree. Prefix-cache
+        // size, max_concurrent and the server version do not move a single
+        // request's tok/s, so they stay out.
+        let base = BenchmarkSettings.flatten(props: propsFixture)
+        XCTAssertEqual(BenchmarkSettings.signature(base), "kv8|daq0|mtp0|pld1|none")
+        var kvOff = base; kvOff["kv_quant"] = "off"
+        XCTAssertNotEqual(BenchmarkSettings.signature(kvOff), BenchmarkSettings.signature(base))
+        var otherVersion = base; otherVersion["version"] = "27.0.0"; otherVersion["prefix_cache_mem"] = "1"
+        XCTAssertEqual(BenchmarkSettings.signature(otherVersion), BenchmarkSettings.signature(base))
+        XCTAssertEqual(BenchmarkSettings.signature([:]), "kv?|daq?|mtp?|pld?|?")
+    }
+
+    func testLossyIsDerivedFromTheRecordedSettings() {
+        XCTAssertTrue(BenchmarkSettings.isLossy(["kv_quant": "8"]))
+        XCTAssertTrue(BenchmarkSettings.isLossy(["kv_quant": "off", "decode_attn_quant": "true"]))
+        XCTAssertFalse(BenchmarkSettings.isLossy(["kv_quant": "off", "decode_attn_quant": "false"]))
+        XCTAssertFalse(BenchmarkSettings.isLossy([:]), "unknown settings are not accused of anything")
+    }
+
+    func testSummaryChipsNameWhatMattersInHumanWords() {
+        let chips = BenchmarkSettings.summaryChips(BenchmarkSettings.flatten(props: propsFixture))
+        XCTAssertEqual(chips, ["KV 8-bit", "PLD", "MTP off", "ctx 48K"])
+        let lossless = BenchmarkSettings.summaryChips(["kv_quant": "off", "pld_default_on": "false",
+                                                       "mtp_loaded": "true", "mtp_default_on": "true",
+                                                       "drafter": "dflash", "n_ctx": "8192"])
+        XCTAssertEqual(lossless, ["KV off", "MTP", "DFlash", "ctx 8K"])
+        XCTAssertEqual(BenchmarkSettings.summaryChips([:]), [])
+    }
+
+    // MARK: - Sessions
+
+    func testSessionsGroupBySessionIdAndSortRungsAscending() {
+        let rows = [
+            makeResult(session: "a", suite: "ctx-v1-8k", target: 8192, decode: 30),
+            makeResult(session: "a", suite: "ctx-v1-512", target: 512, decode: 50),
+            makeResult(session: "b", suite: "ctx-v1-512", target: 512, decode: 55, date: Date(timeIntervalSince1970: 5)),
+            makeResult(session: "a", suite: "ctx-v1-4k", target: 4096, decode: 40),
         ]
-        let ratios = BenchmarkRatios.toDefaults(results)
-        XCTAssertEqual(ratios[BenchmarkArm.kvQuant4.id] ?? 0, 1.2, accuracy: 0.0001)
-        XCTAssertEqual(ratios[BenchmarkArm.defaults.id] ?? 0, 1.0, accuracy: 0.0001)
+        let sessions = BenchmarkSession.group(rows)
+        XCTAssertEqual(sessions.map(\.id), ["a", "b"], "newest session first")
+        XCTAssertEqual(sessions[0].rungs.map(\.targetTokens), [512, 4096, 8192])
+        XCTAssertEqual(sessions[0].decode(at: 4096) ?? 0, 40, accuracy: 0.001)
+        XCTAssertNil(sessions[0].decode(at: 16384))
+        XCTAssertEqual(sessions[0].settings["kv_quant"], "8")
     }
 
-    func testRatiosAreEmptyWithoutAnAnchorRatherThanInventingOne() {
-        // Falling back to "ratio against the fastest arm" would publish a
-        // number that means something completely different under the same name.
-        let ratios = BenchmarkRatios.toDefaults([makeResult(arm: BenchmarkArm.kvQuant4.id, decode: 60)])
-        XCTAssertTrue(ratios.isEmpty)
+    func testCommunitySortOrdersRungsNumericallyWithDashesLast() {
+        let fast = family("a", decodes: [512: 60, 4096: 50])
+        let slow = family("b", decodes: [512: 30, 4096: 25])
+        let gap = family("c", decodes: [512: 90])   // no 4k rung
+        let by4k = [gap, slow, fast].sorted(using: [BenchmarkFamilySort(.rung(4096), order: .reverse)])
+        XCTAssertEqual(by4k.map(\.id), ["a", "b", "c"], "descending, missing rung last")
+        let by4kAsc = [gap, slow, fast].sorted(using: [BenchmarkFamilySort(.rung(4096))])
+        XCTAssertEqual(by4kAsc.map(\.id), ["b", "a", "c"], "ascending, missing rung still last")
+        let byModel = [fast, slow].sorted(using: [BenchmarkFamilySort(.model)])
+        XCTAssertEqual(byModel.map(\.id), ["a", "b"])
+        let byDate = [slow, fast].sorted(using: [BenchmarkFamilySort(.date, order: .reverse)])
+        XCTAssertEqual(byDate.map(\.id), ["a", "b"], "newest session first")
     }
 
-    func testAZeroAnchorProducesNoRatiosInsteadOfInfinity() {
-        let results = [
-            makeResult(arm: BenchmarkArm.defaults.id, decode: 0),
-            makeResult(arm: BenchmarkArm.kvQuant4.id, decode: 60),
-        ]
-        XCTAssertTrue(BenchmarkRatios.toDefaults(results).isEmpty)
+    private func family(_ id: String, decodes: [Int: Double]) -> BenchmarkStore.CellFamily {
+        BenchmarkStore.CellFamily(
+            id: id, modelId: "model-\(id)", settings: [:], isLossy: false,
+            hardware: BenchmarkHardware(chip: "Apple M4", gpuCores: 10, ramGB: 16, osVersion: "27.0", onBattery: false),
+            rungs: decodes.keys.sorted().map {
+                BenchmarkStore.CellFamily.Rung(targetTokens: $0, decodeTps: decodes[$0]!, prefillTps: 0,
+                                               ceilingDecodeTps: 0, ttftMs: 0, sampleCount: 1)
+            },
+            sessionCount: 1,
+            latestDate: Date(timeIntervalSince1970: id == "a" ? 2000 : 1000))
+    }
+
+    // MARK: - Drift
+
+    func testDriftIsTheEndRemeasureAgainstTheStartAtATenPercentBar() {
+        // llmprobe's classifyLoadDrift: (last − first) / first, ±10% is the
+        // line between "figures" and "a range".
+        XCTAssertEqual(BenchmarkDrift.percent(first: 60, last: 57) ?? 0, -5, accuracy: 0.001)
+        XCTAssertEqual(BenchmarkDrift.verdict(percent: -5), .steady)
+        XCTAssertEqual(BenchmarkDrift.verdict(percent: -10), .degraded)
+        XCTAssertEqual(BenchmarkDrift.verdict(percent: 12.3), .improved)
+        XCTAssertEqual(BenchmarkDrift.verdict(percent: nil), .unknown)
+        XCTAssertNil(BenchmarkDrift.percent(first: 0, last: 50), "a zero start is no measurement")
+        XCTAssertNil(BenchmarkDrift.percent(first: 50, last: nil))
+        XCTAssertEqual(BenchmarkDrift.percent(first: 63.39, last: 60.1) ?? 0, -5.2, accuracy: 0.001, "rounded to one decimal")
+        XCTAssertEqual(BenchmarkDrift.summary(first: 61.2, last: 58.4, percent: -4.6), "61.2 → 58.4 tok/s (-4.6%, steady)")
+        XCTAssertEqual(BenchmarkDrift.summary(first: nil, last: nil, percent: nil), "not measured")
+    }
+
+    func testDriftRidesEveryRowAndTheSessionReadsItOnce() throws {
+        var a = makeResult(session: "s", suite: "ctx-v1-512", target: 512, decode: 60)
+        var b = makeResult(session: "s", suite: "ctx-v1-4k", target: 4096, decode: 50)
+        a.driftDecodeTps = 57; a.driftPercent = -5
+        b.driftDecodeTps = 57; b.driftPercent = -5
+        let session = BenchmarkSession.group([b, a]).first!
+        XCTAssertEqual(session.driftPercent ?? 0, -5, accuracy: 0.001)
+        XCTAssertEqual(session.driftBaselineTps ?? 0, 60, accuracy: 0.001, "the baseline is the smallest rung")
+        let back = try JSONDecoder().decode(BenchmarkResult.self, from: try JSONEncoder().encode(a))
+        XCTAssertEqual(back.driftPercent ?? 0, -5, accuracy: 0.001)
+        XCTAssertNil(BenchmarkSession.group([makeResult(session: "t", suite: "ctx-v1-512", target: 512, decode: 1)]).first?.driftBaselineTps)
     }
 
     // MARK: - Publishability
 
     func testARowWithNoCompletedRunsMeasuredNothing() {
-        // Every run discarded still produced an arm. Publishing it puts a
-        // 0 tok/s row in the community median and shows the user a table of
-        // dashes above a Share button.
-        var empty = makeResult(arm: BenchmarkArm.defaults.id, decode: 0)
+        var empty = makeResult(session: "s", suite: "ctx-v1-512", target: 512, decode: 0)
         empty.runs = 0
         XCTAssertFalse(empty.isPublishable)
-
-        var oneRun = makeResult(arm: BenchmarkArm.defaults.id, decode: 42)
+        var oneRun = makeResult(session: "s", suite: "ctx-v1-512", target: 512, decode: 42)
         oneRun.runs = 1
         XCTAssertTrue(oneRun.isPublishable)
-    }
-
-    func testAZeroRateIsNeverPublishableEvenWithRunsRecorded() {
-        var broken = makeResult(arm: BenchmarkArm.defaults.id, decode: 0)
-        broken.runs = 3
-        XCTAssertFalse(broken.isPublishable)
     }
 
     // MARK: - Wire format
 
     func testResultSurvivesACodableRoundTrip() throws {
-        // The same struct is written to disk and POSTed to RTDB; a field that
-        // silently fails to decode is a row that vanishes from local history.
-        let original = makeResult(arm: BenchmarkArm.kvQuant4.id, decode: 61.5)
+        let original = makeResult(session: "s", suite: "ctx-v1-4k", target: 4096, decode: 61.5)
         let data = try JSONEncoder().encode(original)
         let decoded = try JSONDecoder().decode(BenchmarkResult.self, from: data)
-
         XCTAssertEqual(decoded.sessionId, original.sessionId)
-        XCTAssertEqual(decoded.armId, original.armId)
-        XCTAssertEqual(decoded.suiteId, original.suiteId)
-        XCTAssertEqual(decoded.decodeTps, original.decodeTps, accuracy: 0.0001)
-        XCTAssertEqual(decoded.flags, original.flags)
-        XCTAssertEqual(decoded.chip, original.chip)
+        XCTAssertEqual(decoded.targetTokens, 4096)
+        XCTAssertEqual(decoded.ceilingDecodeTps ?? 0, 90, accuracy: 0.001)
+        XCTAssertEqual(decoded.contextUsed, true)
+        XCTAssertEqual(decoded.settings?["kv_quant"], "8")
+        XCTAssertEqual(decoded.armId, "configured")
     }
 
-    func testResultCarriesTheSchemaVersionSoPhase2CanMigrate() {
-        // App Attest adds a trust field later; rows written today must be
-        // identifiable as pre-attestation rather than assumed verified.
-        XCTAssertEqual(makeResult(arm: BenchmarkArm.defaults.id, decode: 1).schemaVersion,
-                       BenchmarkResult.currentSchemaVersion)
-        XCTAssertGreaterThan(BenchmarkResult.currentSchemaVersion, 0)
+    func testTheNoteIsTrimmedCappedAndAbsentWhenEmpty() {
+        XCTAssertNil(BenchmarkResult.cleanNote("   \n"))
+        XCTAssertEqual(BenchmarkResult.cleanNote("  david, fans on max "), "david, fans on max")
+        XCTAssertEqual(BenchmarkResult.cleanNote(String(repeating: "x", count: 500))?.count, BenchmarkResult.maxNoteLength)
+        var row = makeResult(session: "s", suite: "ctx-v1-512", target: 512, decode: 1)
+        row.note = "david"
+        let back = try! JSONDecoder().decode(BenchmarkResult.self, from: try! JSONEncoder().encode(row))
+        XCTAssertEqual(back.note, "david")
+        XCTAssertEqual(BenchmarkSession.group([row]).first?.note, "david")
+        XCTAssertNil(BenchmarkSession.group([makeResult(session: "t", suite: "ctx-v1-512", target: 512, decode: 1)]).first?.note)
+    }
+
+    func testResultCarriesTheSchemaVersion() {
+        XCTAssertEqual(BenchmarkResult.currentSchemaVersion, 2)
+        XCTAssertEqual(makeResult(session: "s", suite: "ctx-v1-512", target: 512, decode: 1).schemaVersion, 2)
     }
 
     // MARK: - Helpers
 
-    private func makeResult(arm: String, decode: Double) -> BenchmarkResult {
+    private func makeResult(session: String, suite: String, target: Int?, decode: Double,
+                            date: Date = Date(timeIntervalSince1970: 10)) -> BenchmarkResult {
         BenchmarkResult(
-            sessionId: "session-1",
-            suiteId: BenchmarkSuite.standardV1.id,
-            armId: arm,
-            armLabel: arm,
-            flags: arm == BenchmarkArm.defaults.id ? [:] : ["--kv-quant": "4"],
-            isLossy: arm != BenchmarkArm.defaults.id,
+            sessionId: session,
+            suiteId: suite,
             modelId: "mlx-community/Qwen3.6-27B-4bit",
-            engineVersion: "26.8.1",
+            engineVersion: "26.9.4",
             prefillTps: 900,
             decodeTps: decode,
             ttftMs: 240,
-            promptTokens: 2048,
-            completionTokens: 128,
-            runs: 3,
+            promptTokens: target ?? 2048,
+            completionTokens: 192,
+            runs: 2,
             spreadPercent: 4,
-            hardware: BenchmarkHardware(
-                chip: "Apple M4 Max",
-                gpuCores: 40,
-                ramGB: 128,
-                osVersion: "27.0",
-                onBattery: false
-            )
+            hardware: BenchmarkHardware(chip: "Apple M4 Max", gpuCores: 40, ramGB: 128,
+                                        osVersion: "27.0", onBattery: false),
+            date: date,
+            targetTokens: target,
+            ceilingDecodeTps: target == nil ? nil : 90,
+            contextUsed: target == nil ? nil : true,
+            settings: target == nil ? nil : ["kv_quant": "8", "pld_default_on": "true"]
         )
     }
 }

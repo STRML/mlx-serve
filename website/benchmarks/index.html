@@ -78,6 +78,12 @@
     }
     .badge.lossy { background: rgba(255,159,10,.18); color: #ff9f0a; }
     .badge.thin  { background: rgba(255,159,10,.14); color: #ff9f0a; }
+    .chip {
+      display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 999px;
+      background: var(--bg); border: 1px solid var(--border); color: var(--text-secondary); margin-right: 4px;
+    }
+    .chips { white-space: normal; min-width: 180px; }
+    .note-cell { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
     .gain { color: #30d158; font-weight: 600; }
     .loss { color: var(--text-secondary); }
 
@@ -119,7 +125,7 @@
   <div class="intro">
     <h1>What local LLMs actually do on your Mac</h1>
     <p>Tokens per second measured by the people running the models, not by us. Pick your chip to see what to expect, or compare settings to find out which ones are worth turning on.</p>
-    <p>Every result comes from the same pinned workload: a 2K-token prompt and a 128-token reply, greedy sampling, thinking off. Run it yourself from the menu bar in <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg">MLX Core</a>.</p>
+    <p>Every result comes from the same pinned workload: a context ladder (512 / 1k / 2k / 4k / 8k / 16k tokens of synthetic code with a planted constant), a 192-token coding task per rung, greedy sampling, thinking off, plus a count-to-200 run on the same prefix as the speculation ceiling. Each row records the server settings that produced it (KV quant, PLD, MTP, context). Run it yourself from the menu bar in <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg">MLX Core</a>.</p>
   </div>
 
   <div class="controls">
@@ -145,8 +151,9 @@
     <div class="control">
       <label>View</label>
       <div class="modes">
-        <button id="mode-absolute" aria-pressed="true">Speed</button>
-        <button id="mode-ratio" aria-pressed="false">vs Defaults</button>
+        <button id="mode-absolute" aria-pressed="true">Decode</button>
+        <button id="mode-prefill" aria-pressed="false">Prefill</button>
+        <button id="mode-ratio" aria-pressed="false">Speculation headroom</button>
       </div>
     </div>
   </div>
@@ -173,9 +180,11 @@
   // request. RTDB was chosen over Firestore precisely so this page can be a
   // static file with a bare fetch().
   //
-  // DOCUMENTED DUPLICATION: `cellKey`, `median` and `aggregate` below mirror
-  // `BenchmarkStore.cellKey/aggregate` and `BenchmarkStats.median` in the Swift
-  // app (app/Sources/MLXServe/Services/BenchmarkStore.swift). They must stay in
+  // DOCUMENTED DUPLICATION: `cellKey`, `settingsSignature`, `median`,
+  // `aggregate` and `aggregateFamilies` below mirror `BenchmarkStore` and
+  // `BenchmarkSettings` in the Swift app
+  // (app/Sources/MLXServe/Services/BenchmarkStore.swift,
+  // app/Sources/MLXServe/Models/BenchmarkModels.swift). They must stay in
   // sync — if the grouping diverges, the app and the website quote different
   // numbers for the same data. Both sides are unit-tested.
   //
@@ -185,8 +194,8 @@
   // ════════════════════════════════════════════════════════════════════════
 
   const DB_URL = "https://mlxserve-default-rtdb.firebaseio.com/results.json";
-  const FETCH_LIMIT = 1000;
-  const DEFAULTS_ARM = "defaults";
+  const FETCH_LIMIT = 2000;
+  const LADDER = [512, 1024, 2048, 4096, 8192, 16384];
 
   function fetchURL() {
     return `${DB_URL}?orderBy=${encodeURIComponent('"$key"')}&limitToLast=${FETCH_LIMIT}`;
@@ -195,7 +204,8 @@
   // ── row validation ───────────────────────────────────────────────────────
   // An openly-writable database means a row can be anything. A row that fails
   // any of these checks is dropped: a board that renders "undefined tok/s" is
-  // worse than one that renders one row fewer.
+  // worse than one that renders one row fewer. v1 rows (the retired 2K suite)
+  // still validate; v2 rows must carry their rung and their settings.
   function isValidRow(r) {
     if (!r || typeof r !== "object") return false;
     if (typeof r.suiteId !== "string" || !r.suiteId) return false;
@@ -207,6 +217,12 @@
     if (!hw || typeof hw !== "object") return false;
     if (typeof hw.chip !== "string" || !hw.chip) return false;
     if (typeof hw.ramGB !== "number" || hw.ramGB <= 0) return false;
+    // Ladder rows only: the pre-release single-prompt suite carried no rung.
+    if ((r.schemaVersion || 1) < 2) return false;
+    if (!Number.isInteger(r.targetTokens) || r.targetTokens <= 0) return false;
+    if (!r.settings || typeof r.settings !== "object") return false;
+    if (r.note !== undefined && typeof r.note !== "string") return false;
+    if (r.driftPercent !== undefined && typeof r.driftPercent !== "number") return false;
     return true;
   }
 
@@ -224,13 +240,39 @@
     return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
   }
 
+  // ── settings (mirrors BenchmarkSettings) ─────────────────────────────────
+  // What changes a request's speed, so what may not share a median. Cache
+  // size, concurrency and the server version stay out — fragmenting by
+  // release would leave every cell at n=1 forever.
+  function settingsSignature(s) {
+    s = s || {};
+    const flag = (k) => (s[k] === "true" ? "1" : s[k] === "false" ? "0" : "?");
+    return ["kv" + (s.kv_quant ?? "?"), "daq" + flag("decode_attn_quant"),
+            "mtp" + flag("mtp_default_on"), "pld" + flag("pld_default_on"),
+            s.drafter ?? "?"].join("|");
+  }
+
+  function settingsChips(s) {
+    s = s || {};
+    const chips = [];
+    if (s.kv_quant !== undefined) chips.push(s.kv_quant === "off" ? "KV off" : `KV ${s.kv_quant}-bit`);
+    if (s.decode_attn_quant === "true") chips.push("Attn quant");
+    if (s.pld_default_on === "true") chips.push("PLD");
+    if (s.mtp_default_on !== undefined) chips.push(s.mtp_default_on === "true" ? "MTP" : "MTP off");
+    if (s.drafter && s.drafter !== "none") chips.push(s.drafter === "dflash" ? "DFlash" : "Drafter");
+    const ctx = parseInt(s.n_ctx, 10);
+    if (ctx > 0) chips.push(`ctx ${Math.floor(ctx / 1024)}K`);
+    return chips;
+  }
+
+  function rungOf(r) { return r.targetTokens; }
+
   // ── aggregation (mirrors BenchmarkStore.cellKey / aggregate) ─────────────
   // GPU cores are part of the key: a 32-core and a 40-core M4 Max report the
-  // same chip string and do not share a decode speed, so averaging them would
-  // describe neither machine. Engine version is deliberately NOT in the key —
-  // fragmenting by release would leave every cell at n=1 forever.
+  // same chip string and do not share a decode speed. The settings signature
+  // is part of it: a kv-quant 8 row and a dense row describe different speeds.
   function cellKey(r) {
-    return [r.suiteId, r.modelId, r.armId,
+    return [r.suiteId, r.modelId, settingsSignature(r.settings),
             r.hardware.chip, String(r.hardware.gpuCores || 0), String(r.hardware.ramGB)].join("|");
   }
 
@@ -246,9 +288,9 @@
       const first = members[0];
       out.push({
         key,
+        suiteId: first.suiteId,
         modelId: first.modelId,
-        armId: first.armId,
-        armLabel: first.armLabel || first.armId,
+        settings: first.settings || {},
         isLossy: !!first.isLossy,
         hardware: first.hardware,
         decodeTps: median(members.map((m) => m.decodeTps)),
@@ -259,34 +301,68 @@
     return out.sort((a, b) => b.decodeTps - a.decodeTps);
   }
 
-  // ── ratio view ───────────────────────────────────────────────────────────
-  // The figure that aggregates honestly across machines. Absolute tok/s moves
-  // with thermals, background load and OS version; the ratio measured inside
-  // ONE session against that session's own `defaults` arm does not. A session
-  // with no anchor contributes nothing rather than being compared against
-  // someone else's baseline.
-  function ratiosBySession(rows) {
-    const sessions = new Map();
+  // ── cell families (mirrors BenchmarkStore.aggregateSessions) ─────────────
+  // One row per machine × model × settings, with a median per rung and the
+  // number of results behind each.
+  function familyKey(r) {
+    return [r.modelId, settingsSignature(r.settings),
+            r.hardware.chip, String(r.hardware.gpuCores || 0), String(r.hardware.ramGB)].join("|");
+  }
+
+  function aggregateFamilies(rows) {
+    const groups = new Map();
     for (const r of rows) {
-      if (!r.sessionId) continue;
-      if (!sessions.has(r.sessionId)) sessions.set(r.sessionId, []);
-      sessions.get(r.sessionId).push(r);
+      const key = familyKey(r);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
     }
-    const perArm = new Map();
-    for (const members of sessions.values()) {
-      const anchor = members.find((m) => m.armId === DEFAULTS_ARM);
-      if (!anchor || !(anchor.decodeTps > 0)) continue;
+    const out = [];
+    for (const [key, members] of groups) {
+      const first = members[0];
+      const byRung = new Map();
       for (const m of members) {
-        if (m.armId === DEFAULTS_ARM) continue;
-        if (!perArm.has(m.armId)) {
-          perArm.set(m.armId, { armId: m.armId, armLabel: m.armLabel || m.armId, isLossy: !!m.isLossy, ratios: [] });
-        }
-        perArm.get(m.armId).ratios.push(m.decodeTps / anchor.decodeTps);
+        const t = rungOf(m);
+        if (!byRung.has(t)) byRung.set(t, []);
+        byRung.get(t).push(m);
+      }
+      const rungs = new Map();
+      for (const [t, rs] of byRung) {
+        const ceilings = rs.map((m) => m.ceilingDecodeTps).filter((v) => typeof v === "number" && v > 0);
+        rungs.set(t, {
+          decodeTps: median(rs.map((m) => m.decodeTps)),
+          prefillTps: median(rs.map((m) => m.prefillTps)),
+          ceilingDecodeTps: median(ceilings),
+          sampleCount: rs.length,
+        });
+      }
+      out.push({
+        key,
+        modelId: first.modelId,
+        settings: first.settings || {},
+        isLossy: members.some((m) => !!m.isLossy),
+        hardware: first.hardware,
+        // Free text the submitters typed; distinct, capped at three.
+        notes: [...new Set(members.map((m) => (m.note || "").trim()).filter(Boolean))].slice(0, 3),
+        rungs,
+        sessionCount: new Set(members.map((m) => m.sessionId)).size,
+      });
+    }
+    const lead = (f) => { const t = [...f.rungs.keys()].sort((a, b) => a - b)[0]; return f.rungs.get(t)?.decodeTps || 0; };
+    return out.sort((a, b) => lead(b) - lead(a));
+  }
+
+  // ── speculation headroom ─────────────────────────────────────────────────
+  // ceiling ÷ decode per rung: how much a draft path could still gain at that
+  // context size. Measured inside ONE session over the same prefix, so it
+  // survives thermals and machine differences the way raw tok/s does not.
+  function headroomByCell(rows) {
+    const families = aggregateFamilies(rows);
+    for (const f of families) {
+      for (const [t, r] of f.rungs) {
+        r.headroom = r.ceilingDecodeTps > 0 && r.decodeTps > 0 ? r.ceilingDecodeTps / r.decodeTps : null;
       }
     }
-    return [...perArm.values()]
-      .map((a) => ({ ...a, ratio: median(a.ratios), sampleCount: a.ratios.length }))
-      .sort((a, b) => b.ratio - a.ratio);
+    return families.filter((f) => [...f.rungs.values()].some((r) => r.headroom !== null));
   }
 
   // ── filtering ────────────────────────────────────────────────────────────
@@ -343,47 +419,62 @@
     return parts.join(" · ");
   }
 
-  function renderAbsolute(rows) {
-    const cells = aggregate(rows);
+  function rungTitle(t) { return t >= 1024 ? `${Math.round(t / 1024)}k` : String(t); }
+
+  function chipsHtml(f) {
+    return settingsChips(f.settings).map((c) => `<span class="chip">${esc(c)}</span>`).join("")
+      + (f.isLossy ? '<span class="badge lossy">lossy</span>' : "");
+  }
+
+  /// One row per family with a column per ladder rung; `pick` reads the
+  /// figure to show, `fmt` renders it.
+  function renderFamilies(families, columnsTitle, pick, fmt, note) {
+    const columns = LADDER;
     $("board-head").innerHTML = `
       <tr>
-        <th>Machine</th><th>Model</th><th>Setting</th>
-        <th class="num">Prefill</th><th class="num">Decode</th><th class="num">n</th>
+        <th>Machine</th><th>Model</th><th>Settings</th>
+        ${columns.map((t) => `<th class="num">${esc(rungTitle(t))}</th>`).join("")}
+        <th class="num">n</th>
       </tr>`;
-    $("board-body").innerHTML = cells.map((c) => `
+    $("board-body").innerHTML = families.map((f) => `
       <tr>
-        <td>${esc(machineLabel(c.hardware))}</td>
-        <td class="model-cell">${esc(c.modelId)}</td>
-        <td>${esc(c.armLabel)}${c.isLossy ? '<span class="badge lossy">lossy</span>' : ""}</td>
-        <td class="num">${Math.round(c.prefillTps)}</td>
-        <td class="num">${c.decodeTps.toFixed(1)}</td>
-        <td class="num">${c.sampleCount}${c.sampleCount === 1 ? '<span class="badge thin">n=1</span>' : ""}</td>
+        <td>${esc(machineLabel(f.hardware))}</td>
+        <td class="model-cell">${esc(f.modelId)}${f.notes.length ? `<div class="note-cell">${esc(f.notes.join(" · "))}</div>` : ""}</td>
+        <td class="chips">${chipsHtml(f)}</td>
+        ${columns.map((t) => {
+          const r = f.rungs.get(t);
+          const v = r ? pick(r) : null;
+          return `<td class="num">${v ? fmt(v) : "—"}</td>`;
+        }).join("")}
+        <td class="num">${f.sessionCount}${f.sessionCount === 1 ? '<span class="badge thin">n=1</span>' : ""}</td>
       </tr>`).join("");
-    $("board-note").textContent =
-      "Tokens per second, median of every submission in each cell. n is how many results that median came from — a cell at n=1 is one person's data point, not a benchmark. Lossy settings trade output quality for speed.";
-    return cells.length;
+    $("board-note").textContent = `${columnsTitle} ${note}`;
+    return families.length;
+  }
+
+  function renderAbsolute(rows) {
+    return renderFamilies(aggregateFamilies(rows), "Decode tokens per second per context size,",
+      (r) => r.decodeTps, (v) => v.toFixed(1),
+      "median of every submission in each cell. n is how many sessions that row came from — a row at n=1 is one person's data point, not a benchmark. Lossy settings trade output quality for speed.");
+  }
+
+  function renderPrefill(rows) {
+    return renderFamilies(aggregateFamilies(rows), "Prefill tokens per second per context size,",
+      (r) => r.prefillTps, (v) => String(Math.round(v)),
+      "median of every submission in each cell. Prefill is how fast the prompt is read; it decides the wait before the first token.");
   }
 
   function renderRatio(rows) {
-    const arms = ratiosBySession(rows);
-    $("board-head").innerHTML = `
-      <tr>
-        <th>Setting</th><th class="num">Decode vs defaults</th><th class="num">Sessions</th>
-      </tr>`;
-    $("board-body").innerHTML = arms.map((a) => `
-      <tr>
-        <td>${esc(a.armLabel)}${a.isLossy ? '<span class="badge lossy">lossy</span>' : ""}</td>
-        <td class="num ${a.ratio >= 1 ? "gain" : "loss"}">${a.ratio.toFixed(2)}×</td>
-        <td class="num">${a.sampleCount}${a.sampleCount === 1 ? '<span class="badge thin">n=1</span>' : ""}</td>
-      </tr>`).join("");
-    $("board-note").textContent =
-      "Each number is measured inside a single session against that machine's own defaults run, then medianed across every session. That makes it comparable across different Macs in a way raw tokens per second is not.";
-    return arms.length;
+    return renderFamilies(headroomByCell(rows), "Speculation headroom per context size:",
+      (r) => r.headroom, (v) => `${v.toFixed(2)}×`,
+      "the count-to-200 ceiling divided by the coding decode rate, measured inside one session over the same prefix. 1.0× means speculation has nothing left to gain there.");
   }
 
   function render() {
     const filtered = applyFilters(state.rows, currentFilters());
-    const count = state.mode === "absolute" ? renderAbsolute(filtered) : renderRatio(filtered);
+    const count = state.mode === "absolute" ? renderAbsolute(filtered)
+                : state.mode === "prefill" ? renderPrefill(filtered)
+                : renderRatio(filtered);
     const empty = count === 0;
     $("table-wrap").hidden = empty;
     $("board-state").hidden = !empty;
@@ -397,13 +488,15 @@
 
   function setMode(mode) {
     state.mode = mode;
-    $("mode-absolute").setAttribute("aria-pressed", String(mode === "absolute"));
-    $("mode-ratio").setAttribute("aria-pressed", String(mode === "ratio"));
+    for (const m of ["absolute", "prefill", "ratio"]) {
+      $(`mode-${m}`).setAttribute("aria-pressed", String(mode === m));
+    }
     render();
   }
 
   async function boot() {
     $("mode-absolute").addEventListener("click", () => setMode("absolute"));
+    $("mode-prefill").addEventListener("click", () => setMode("prefill"));
     $("mode-ratio").addEventListener("click", () => setMode("ratio"));
     for (const id of ["f-chip", "f-ram", "f-model", "f-quality"]) {
       $(id).addEventListener("change", render);

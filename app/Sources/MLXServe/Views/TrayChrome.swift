@@ -282,9 +282,12 @@ struct TrayTileFace: View {
 
     var body: some View {
         VStack(spacing: 4) {
+            // Glyphs differ in height (speedometer is taller than the chat
+            // bubbles); a fixed box keeps every tile's title on one baseline.
             Image(systemName: icon)
                 .font(.system(size: 15, weight: .regular))
                 .foregroundStyle(isEnabled ? tint : Color.secondary)
+                .frame(height: 18)
             Text(L10n.text(title))
                 .font(.caption2.weight(.medium))
                 .foregroundStyle(isEnabled ? .primary : .secondary)
