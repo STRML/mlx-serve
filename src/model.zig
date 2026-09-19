@@ -1029,6 +1029,16 @@ pub const ModelConfig = struct {
             std.mem.eql(u8, self.model_type, "diffusion_gemma");
     }
 
+    /// Takes the sampling recommendations + extra eos ids of a generation_config.json.
+    fn applyGenerationDefaults(self: *ModelConfig, gen_content: []const u8) void {
+        const gd = parseGenerationDefaultsFromJson(gen_content);
+        self.gen_temperature = gd.temperature;
+        self.gen_top_p = gd.top_p;
+        self.gen_top_k = gd.top_k;
+        self.gen_enable_thinking = gd.enable_thinking;
+        self.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
+    }
+
     /// Additive + dedup-guarded, like every terminator merge here.
     pub fn mergeEosTokens(self: *ModelConfig, ids: []const u32) void {
         for (ids) |id| if (!self.isEosToken(id)) self.addEosToken(id);
@@ -1355,18 +1365,17 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // any failure (missing file, bad JSON) leaves the fields null.
     const gen_path = try std.fmt.allocPrint(allocator, "{s}/generation_config.json", .{model_dir});
     defer allocator.free(gen_path);
-    if (std.Io.Dir.openFileAbsolute(io, gen_path, .{})) |gen_file| {
+    const gen_sidecar: ?[]u8 = mlx_gguf.sidecar(io, allocator, model_dir, .generation_config) catch null;
+    if (gen_sidecar) |gen_content| {
+        defer allocator.free(gen_content);
+        config.applyGenerationDefaults(gen_content);
+    } else if (std.Io.Dir.openFileAbsolute(io, gen_path, .{})) |gen_file| {
         defer gen_file.close(io);
         var gen_buf: [4096]u8 = undefined;
         var gen_reader = gen_file.reader(io, &gen_buf);
         if (gen_reader.interface.allocRemaining(allocator, .limited(1024 * 1024))) |gen_content| {
             defer allocator.free(gen_content);
-            const gd = parseGenerationDefaultsFromJson(gen_content);
-            config.gen_temperature = gd.temperature;
-            config.gen_top_p = gd.top_p;
-            config.gen_top_k = gd.top_k;
-            config.gen_enable_thinking = gd.enable_thinking;
-            config.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
+            config.applyGenerationDefaults(gen_content);
         } else |_| {}
     } else |_| {}
     // Pooling (issue #116), priority: explicit config.json `pooling_mode`

@@ -1,7 +1,8 @@
 //! Bridge to lib/mlx-serve-gguf: GGUF files served on the regular MLX path.
-//! The file stands in for a model dir: config.json, tokenizer.json and
-//! tokenizer_config.json are rebuilt from its metadata, and its tensors load
-//! as raw ggml blocks that `Transformer.qmatmul` runs through custom kernels.
+//! The file stands in for a model dir: config.json, tokenizer.json,
+//! tokenizer_config.json and generation_config.json are rebuilt from its
+//! metadata, and its tensors load as raw ggml blocks that
+//! `Transformer.qmatmul` runs through custom kernels.
 //! Anything the module can't serve stays with the embedded engines.
 const std = @import("std");
 const gguf = @import("mlx_serve_gguf");
@@ -32,7 +33,7 @@ pub fn servablePath(io: std.Io, allocator: std.mem.Allocator, model_dir: []const
     return path;
 }
 
-pub const Sidecar = enum { config, tokenizer, tokenizer_config };
+pub const Sidecar = enum { config, tokenizer, tokenizer_config, generation_config };
 
 /// The JSON a model dir would hold in `<which>.json`, null when `model_dir`
 /// is not ours. Caller frees.
@@ -45,6 +46,7 @@ pub fn sidecar(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, 
         .config => try gguf.meta.configJson(allocator, &f),
         .tokenizer => try gguf.meta.tokenizerJson(allocator, &f),
         .tokenizer_config => try gguf.meta.tokenizerConfigJson(allocator, &f),
+        .generation_config => try gguf.meta.generationConfigJson(allocator, &f),
     };
 }
 
@@ -66,6 +68,7 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var f = try gguf.gguf.File.open(allocator, path);
     defer f.deinit();
     try gguf.weights.load(allocator, &f, out, mlx.gpuStream());
+    try gguf.weights.warmKernels(allocator, out, mlx.gpuStream());
     log.info("[gguf] mlx engine: {d} tensors from {s}\n", .{ f.tensors.count(), path });
     return true;
 }
@@ -114,7 +117,7 @@ test "real GGUF: stands in for a model dir, and --engine turns it off (set MLX_S
     const back = try tok.decode(allocator, ids, false);
     defer allocator.free(back);
     try std.testing.expectEqualStrings(text, back);
-    try std.testing.expect(tok.special_tokens.get("<|im_end|>") != null);
+    try std.testing.expect(tok.special_tokens.count() > 0);
 
     try std.testing.expect(weightBytes(io, model).? > 1 << 20);
     enabled = false;

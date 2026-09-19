@@ -18296,6 +18296,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_astype(&result, tw, .bfloat16, self.s));
             return result;
         }
+        if (mlx_gguf.kernels.infoOf(w, sc)) |info| return mlx_gguf.kernels.dequantize(info.ty, tw, .bfloat16, self.s);
         var ts = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ts);
         try mlx.check(mlx.mlx_take_axis(&ts, sc, ids, 0, self.s));
@@ -32608,6 +32609,7 @@ pub fn gatherDecodeForcedStock() bool {
 fn useGatherQmvDecode(self: *const Transformer, gate_qp: QuantParams, up_qp: QuantParams) bool {
     if (envFlagCached(&moe_gather_force_env, "MLX_SERVE_MOE_GATHER_DECODE")) return false;
     if (useBatchedExpertDecode(self)) return true; // explicit batched opt-in still tries it first
+    if (gate_qp.mode == .gguf) return false; // raw ggml blocks: gatherExpertMm has their kernel
     if (self.config.hidden_act != .silu) return false;
     if (!gatherQmvGateUpEnabled()) return false;
     return gate_qp.bits == up_qp.bits and
@@ -36963,6 +36965,12 @@ pub fn msvQmvRows(
 /// (maybeTransposeForBf16 + generalized transposeBf16Weight), so x @ w is correct with no
 /// transpose flag — mirrors mlx-lm's `gather_mm(x, weight.swapaxes(-1,-2))`.
 fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, sorted: bool, s: mlx.mlx_stream) !void {
+    if (mlx_gguf.kernels.infoOf(w, sc)) |info| {
+        const y = try mlx_gguf.kernels.gatherLinear(info, x, w, lhs_idx, rhs_idx, s);
+        _ = mlx.mlx_array_free(res.*);
+        res.* = y;
+        return;
+    }
     if (sc.ctx == null) {
         // mlx 0.31.2's `mlx_gather_mm` returns WRONG results with sorted_indices=true
         // for the dense (non-quantized) path — the quantized `mlx_gather_qmm` honors
