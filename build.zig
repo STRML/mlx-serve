@@ -169,6 +169,7 @@ pub fn build(b: *std.Build) void {
     // Staged by `scripts/fetch-llama.sh` into lib/llama/ (a single self-contained
     // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
     addLlamaLib(b, mod);
+    addGgufModule(b, mod, target, optimize);
 
     // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
     // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
@@ -234,6 +235,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib/ds4"));
     addAneSources(b, test_mod);
     addLlamaLib(b, test_mod);
+    addGgufModule(b, test_mod, target, optimize);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -418,6 +420,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
             .{ .name = "build_options", .module = ios_options.createModule() },
         },
     });
+    addGgufModule(b, mod, ios_target, .ReleaseFast);
 
     // Apple cross-compiles don't auto-resolve the SDK's libc/frameworks from
     // --sysroot alone, so wire them explicitly (resolved per slice via xcrun).
@@ -578,6 +581,19 @@ fn readLlamaTag(b: *std.Build) ?[]const u8 {
     ) catch return null;
     const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
     return if (trimmed.len == 0) null else b.dupe(trimmed);
+}
+
+/// lib/mlx-serve-gguf: GGUF files served on MLX (no llama.cpp). It reaches
+/// MLX through `host.mlx`, so the host root file must expose `pub const mlx`.
+fn addGgufModule(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const gguf = b.createModule(.{
+        .root_source_file = b.path("lib/mlx-serve-gguf/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mlx_host", .module = host }},
+    });
+    host.addImport("mlx_serve_gguf", gguf);
 }
 
 fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {

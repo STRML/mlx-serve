@@ -10,6 +10,7 @@ const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const rht = @import("rht.zig");
 const qmv2 = @import("qmv2.zig");
+const mlx_gguf = @import("arch/mlx_gguf.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const kv_quant = @import("kv_quant.zig");
 
@@ -16315,6 +16316,7 @@ pub const Transformer = struct {
     // ── Core ops ──
 
     inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
+        if (mlx_gguf.kernels.infoOf(w, sc)) |info| return mlx_gguf.kernels.linear(info, x, w, self.s);
         // Resolve (bits, group_size, mode) per weight. Most weights inherit the
         // global config; per-weight overrides (mixed-precision checkpoints, e.g.
         // affine 8-bit shared MLP inside an nvfp4 QAT model) are detected on
@@ -17060,6 +17062,8 @@ pub const Transformer = struct {
         if (self.emb_s.ctx == null) {
             // Dense bf16 embedding table: the gathered rows ARE the embeddings.
             try mlx.check(mlx.mlx_astype(&emb, taken_w, .bfloat16, self.s));
+        } else if (mlx_gguf.kernels.infoOf(self.emb_w, self.emb_s)) |info| {
+            emb = try mlx_gguf.kernels.dequantize(info.ty, taken_w, self.actDtype(), self.s);
         } else {
             var taken_s = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(taken_s);
@@ -37874,6 +37878,7 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
 }
 
 fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (mlx_gguf.kernels.infoOf(w, sc)) |info| return mlx_gguf.kernels.linear(info, x, w, s);
     // Plain BF16 weight: scales array is unset. Used by mixed-precision Unsloth
     // Dynamic checkpoints that leave a subset of layers (e.g. linear_attn
     // projections in Qwen3.6 UD) unquantized. The weight is pre-transposed at

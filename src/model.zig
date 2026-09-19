@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const mlx_gguf = @import("arch/mlx_gguf.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
@@ -25,6 +26,9 @@ pub const QuantMode = enum {
     nvfp4,
     mxfp4,
     mxfp8,
+    /// Raw ggml blocks (lib/mlx-serve-gguf). Never reaches an MLX quantized op:
+    /// the per-tensor type rides on the weight, see `mlx_gguf.kernels.Info`.
+    gguf,
 
     pub fn fromString(name: []const u8) ?QuantMode {
         return std.meta.stringToEnum(QuantMode, name);
@@ -37,6 +41,7 @@ pub const QuantMode = enum {
             .nvfp4 => "nvfp4",
             .mxfp4 => "mxfp4",
             .mxfp8 => "mxfp8",
+            .gguf => "gguf",
         };
     }
 
@@ -1328,15 +1333,17 @@ pub fn pickUserTurnPrefix(chat_template: []const u8) ?[]const u8 {
 }
 
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
-    const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
-    defer allocator.free(path);
+    const content = (try mlx_gguf.sidecar(io, allocator, model_dir, .config)) orelse blk: {
+        const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
+        defer allocator.free(path);
 
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
+        const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+        defer file.close(io);
 
-    var read_buf: [4096]u8 = undefined;
-    var reader_state = file.reader(io, &read_buf);
-    const content = try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
+        var read_buf: [4096]u8 = undefined;
+        var reader_state = file.reader(io, &read_buf);
+        break :blk try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
+    };
     defer allocator.free(content);
 
     var config = try parseConfigFromJson(allocator, content);
@@ -3659,6 +3666,9 @@ pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false };
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
+    var gguf_weights = Weights.init(allocator);
+    errdefer gguf_weights.deinit();
+    if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
     return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16 });
 }
 
