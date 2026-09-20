@@ -8,6 +8,7 @@
 - **Bonsai 2 runs in its own numerics.** f16 activations over the pack's f16 scales and an f32 GatedDeltaNet state, as Prism's reference runtime does: 60x closer to an f32 reference of the pack than the old bf16 path (KL 2.9e-6 vs 1.7e-4), same speed.
 
 ### Changes
+- Qwen-Image-2.1 image generation (quantized packs, `tests/convert_qwen_image21_weights.py`): text-to-image, image-to-image and optional negative-prompt guidance; on smaller Macs the text encoder is loaded per request so the 8-bit pack fits in 32 GB.
 - Concurrent long prompts that do not fit in GPU memory together now wait their turn instead of overrunning it (a crash, or a kernel panic on macOS 26.5); a DFlash drafter's context is part of the memory bill.
 - With a DFlash drafter loaded, concurrent requests use the MTP head so they batch: four streams on the 27B went from 64 to 122 tok/s (M4 Max).
 - Qwen3.8 family: a thinking request that names no `reasoning_effort` renders as low and now gets low's 2048-token budget on chat, messages and responses; an explicit effort or `--reasoning-budget` still wins.
