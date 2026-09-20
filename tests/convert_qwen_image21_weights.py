@@ -44,13 +44,86 @@ COMPONENTS = {
     "vae": (None, (".time_conv.",)),
 }
 COPY = {
-    "": ["model_index.json", "LICENSE", "README.md"],
+    "": ["model_index.json", "LICENSE"],
     "scheduler": ["scheduler_config.json"],
     "transformer": ["config.json"],
     "vae": ["config.json"],
     "text_encoder": ["config.json"],
     "processor": ["tokenizer.json", "tokenizer_config.json"],
 }
+
+
+README = """---
+license: apache-2.0
+base_model: Qwen/Qwen-Image-2.1
+base_model_relation: quantized
+library_name: mlx-serve
+tags:
+  - mlx
+  - mlx-serve
+  - quantized
+  - text-to-image
+pipeline_tag: text-to-image
+---
+
+# Qwen-Image-2.1 MLX-Serve {bits}-bit
+
+{bits}-bit pack of [Qwen/Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) for
+[mlx-serve](https://github.com/ddalcu/mlx-serve): {size_gb:.1f} GB, for {target} Macs.
+
+> **Not released yet.** These packs load only on the mlx-serve branch
+> [`feat/qwen-image-2.1`](https://github.com/ddalcu/mlx-serve/pull/477). No released
+> mlx-serve or MLX Core build can run them. This notice goes away when the PR ships.
+
+![sample]({sample})
+
+## What is in it
+
+The checkpoint's own diffusers layout and key names, with the DiT block linears and the
+text-encoder layer linears affine-quantized to {bits}-bit (group 64). Kept dense: the VAE
+(f32), `embed_tokens`, norms, and the DiT's small or shared linears. Dropped: the Qwen3-VL
+vision tower and `lm_head` (text-to-image only) and the VAE's per-frame `time_conv`s.
+Built by `tests/convert_qwen_image21_weights.py --preset {preset}`.
+
+## Measured (M1 Pro, 32 GB)
+
+| Pack | Size | Steps | Wall clock incl. load | Peak memory |
+|---|---|---|---|---|
+| 8-bit | 1024x1024 | 40 | 985 s (~23 s/step) | 12.95 GB |
+| 4-bit | 1024x1024 | 3 | 87 s | 9.55 GB |
+| 4-bit | 512x512 | 20 | 118 s | - |
+
+On a Mac the full set would crowd, mlx-serve loads the text encoder per request and frees
+it before the denoise, so the resident set is the DiT and VAE.
+
+## Run it (from the branch)
+
+```sh
+git clone -b feat/qwen-image-2.1 https://github.com/ddalcu/mlx-serve && cd mlx-serve
+./scripts/fetch-zig.sh && ./scripts/build-mlx.sh && .zig-toolchain/zig build -Doptimize=ReleaseFast
+./zig-out/bin/mlx-serve pull {repo}
+./zig-out/bin/mlx-serve serve
+curl localhost:11234/v1/images/generations -H 'Content-Type: application/json' \\
+  -d '{{"model":"{repo}","prompt":"a red fox in fresh snow","size":"1024x1024"}}'
+```
+
+40 steps when `steps` is omitted. `guidance_scale` above 1 with a `negative_prompt` runs
+real CFG (two forwards per step). `image` + `strength` does image-to-image.
+
+Apache-2.0, same as the base model.
+"""
+
+CARDS = {
+    "32gb": dict(bits=8, target="32 GB", repo="ddalcu/Qwen-Image-2.1-MLX-Serve-8bit",
+                 sample="https://raw.githubusercontent.com/ddalcu/mlx-serve/feat/qwen-image-2.1/website/screenshots/qwen-image-2.1-8bit-1024.jpg"),
+    "16gb": dict(bits=4, target="16 GB", repo="ddalcu/Qwen-Image-2.1-MLX-Serve-4bit",
+                 sample="https://raw.githubusercontent.com/ddalcu/mlx-serve/feat/qwen-image-2.1/website/screenshots/qwen-image-2.1-4bit-512.jpg"),
+}
+
+
+def write_card(out, preset, size_gb):
+    with open(os.path.join(out, "README.md"), "w") as f:
+        f.write(README.format(preset=preset, size_gb=size_gb, **CARDS[preset]))
 
 
 def should_drop(component, name):
@@ -101,9 +174,12 @@ def main():
     ap.add_argument("--dit-bits", type=int)
     ap.add_argument("--te-bits", type=int)
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--card-only", type=float, metavar="GB", help="rewrite <out>/README.md for an existing pack of this size")
     args = ap.parse_args()
     if args.self_test:
         return self_test()
+    if args.card_only:
+        return write_card(args.out, args.preset, args.card_only)
     if not args.src or not args.out:
         ap.error("--src and --out are required")
 
@@ -120,6 +196,7 @@ def main():
                 shutil.copy(path, os.path.join(args.out, sub, name))
     root = {"model_type": "qwen_image21", "quantization": {"group_size": GROUP_SIZE, "dit_bits": dit_bits, "te_bits": te_bits}}
     json.dump(root, open(os.path.join(args.out, "config.json"), "w"), indent=2)
+    write_card(args.out, args.preset, total / 1e9)
     print(f"done: {total / 1e9:.2f} GB of weights -> {args.out}")
 
 
@@ -138,6 +215,8 @@ def self_test():
     assert should_drop("text_encoder", "lm_head.weight")
     assert should_drop("vae", "decoder.up_blocks.0.upsampler.time_conv.weight")
     assert not should_drop("vae", "decoder.up_blocks.0.upsampler.resample.1.weight")
+    for preset in CARDS:
+        assert "Not released yet" in README.format(preset=preset, size_gb=1.0, **CARDS[preset])
     print("ok")
 
 
