@@ -147,6 +147,10 @@ fn printUsage(io: std.Io) void {
         \\  --no-vision         Disable vision encoder (saves memory)
         \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
         \\                      loads. Display sleep is always allowed.
+        \\  --os-reserve-gib <n>  Free RAM left out of every memory plan so macOS keeps
+        \\                        room (default: an eighth of RAM, 2 to 8 GB). 0 turns
+        \\                        it off: more context and concurrency, but a small Mac
+        \\                        under heavy load can freeze or restart.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -853,6 +857,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
             server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
+        } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
+            i += 1;
+            server_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {
+                log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {

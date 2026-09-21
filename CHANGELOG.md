@@ -9,8 +9,16 @@
 
 ### Changes
 - Qwen-Image-2.1 image generation (quantized packs, `tests/convert_qwen_image21_weights.py`): text-to-image, image-to-image and optional negative-prompt guidance; on smaller Macs the text encoder is loaded per request so the 8-bit pack fits in 32 GB.
+- A model larger than the GPU memory limit (a lowered `iogpu.wired_limit_mb`) is refused at load with a clear message; it used to load, fail in warmup and then refuse every request.
+- Downloads into a model folder on an exFAT, NTFS or network drive no longer fail with "only 0 B available" (#474).
+- The app is now called MLX-Serve everywhere in its UI, same as the server; the welcome screen shows the new app icon.
+- Several long requests restored from the prefix cache at once no longer overrun GPU memory (a failed generation, or a kernel panic on a 16 GB Mac): each is billed against what the others were promised, and the server now leaves the OS a memory reserve (`--os-reserve-gib`, a toggle in Settings).
 - Concurrent long prompts that do not fit in GPU memory together now wait their turn instead of overrunning it (a crash, or a kernel panic on macOS 26.5); a DFlash drafter's context is part of the memory bill.
 - With a DFlash drafter loaded, concurrent requests use the MTP head so they batch: four streams on the 27B went from 64 to 122 tok/s (M4 Max).
+- 8-bit KV is now as fast as or faster than bf16 KV at long context: quantized attention runs through Apple's matmul2d tensor op (Qwen3.8-27B MTP on M4 Max: 16K 45 to 55 tok/s, 32K 37 to 51).
+- A long prompt arriving while other requests stream no longer freezes them for a whole 8192-token chunk: prefill narrows to 2048 and runs several decode ticks per chunk boundary.
+- The first request of a burst no longer stays on the DFlash drafter beside the batched group; it joins the group.
+- MTP on sidecar-head models can fall back to plain decode when measured rounds cost more per token (32k+ context).
 - Qwen3.8 family: a thinking request that names no `reasoning_effort` renders as low and now gets low's 2048-token budget on chat, messages and responses; an explicit effort or `--reasoning-budget` still wins.
 - `/v1/responses` enforces the reasoning budget (effort word or `reasoning_budget_tokens`) like chat; a capped thought used to run until `max_output_tokens`.
 - Logprobs are computed in f32: f16-logit models returned `-inf`/NaN (invalid JSON) and bf16 ones were rounded.

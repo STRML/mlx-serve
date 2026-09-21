@@ -2533,6 +2533,32 @@ was +0.03%/+0.39%/+0.26% at q4/q6/q8, respectively. Machine-specific
 adoption belongs in a named predicate; a kernel's mathematical eligibility is
 not evidence that its previous machine's default transfers.
 
+**The M4 adoption result expired too (2026-09-20).** Splash's M5 Pro table showed
+kv8 MTP well under bf16 KV at 16K/32K. A one-process surface µbench
+(`MLX_SERVE_KVQ_UBENCH=1`, 27B shapes, kv 4K..64K x t_q 1..8, packed vs dequant +
+sdpa vs bf16 sdpa) read the same ratio at EVERY kv length: packed wins at t_q 1-2,
+ties at 3-4, loses 1.7-1.9x at 5-8. The kernel keeps one accumulator per q row
+(gqa x t_q); past 12 they spill out of registers, and the dense arm got faster
+since August (mlx 0.32.2, `splitCausalSdpa`). Local arrays, float4 lanes and
+threadgroup-memory accumulation were all slower; 12-row passes only tie. Fix:
+`qkvVerifyRowsPay` declines past 12 rows unless `MLX_SERVE_KV_ATTN_VERIFY=1`.
+27B kv8 32K, forced depth 5: 131.5 -> 111.0 ms/round; depth 3 unchanged (83 vs 82).
+Guard: `qkv verify kernel serves by default only...`.
+
+**What closed the gap: `matmul2d` over a threadgroup tile (`qkvAttnMppKernel`).** A
+hand-rolled MSL dot product cannot match the tensor op's compute rate, and dequant +
+sdpa pays a full-KV write per layer per round. Splash feeds int8 pages to
+MetalPerformancePrimitives `matmul2d` directly; our cache is affine gs64, so each
+32-token page is dequantized into THREADGROUP memory (one thread per row-group:
+contiguous word loads, one scale, one bias) and QK / PV run through `matmul2d`
+(8 simdgroups, rows padded to a multiple of 8 with zero queries), online softmax with
+a running rescale, split-KV partials into the shared merge. 27B shapes, 32K, ms per
+layer: t_q 1 0.44 (old packed 0.54, bf16 sdpa 0.37), t_q 4 0.77 (dequant path 1.54,
+bf16 0.98), t_q 8 1.22 (2.65, 1.99). Window `qkvMppWins`: t_q>=4 from 2K, 2-3 from
+8K, 1 from 16K. e2e 27B kv8 MTP: 16K 45.1 -> 54.7, 32K 37.1 -> 50.8 tok/s (bf16 KV
+51.9 / 46.1). The first cut dequantized one thread per ELEMENT (3 strided loads each)
+and lost to everything at t_q 1. NAX check (A20 Pro, hermetic, two runs): parity 21/21, mpp at or under the dequant path in 35 of 36 cells and under the old packed kernel inside the whole window, so the window holds there; against bf16 KV it wins at t_q 6-8 everywhere and at t_q 4 from 16K. Guards: `qkv matmul2d kernel parity`, `qkvMppWins`.
+
 **Two pre-existing t_q==1 losses found by the gemma4 sanity pass** (auto was
 a 1.45x decode LOSS on gemma4-12B kv8 at 11k — 21.1 vs 30.5 tok/s, present
 before Phase 1):

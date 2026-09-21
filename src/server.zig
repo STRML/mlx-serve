@@ -1640,6 +1640,8 @@ pub fn serve(
     // The inference thread's evict-or-refuse hook (#353); the scheduler has no server import.
     scheduler_mod.prefill_admission_fits = &prefillFitsNow;
     defer scheduler_mod.prefill_admission_fits = null;
+    scheduler_mod.prefill_admission_numbers = &prefillBillNumbersNow;
+    defer scheduler_mod.prefill_admission_numbers = null;
     scheduler_mod.prefill_request_chunk = &requestPrefillChunkNow;
     defer scheduler_mod.prefill_request_chunk = null;
     // The published budget is per model; retire it whenever the scheduler drops the cache.
@@ -3107,17 +3109,8 @@ fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
 /// is unavailable (CI / non-Metal hosts).
 fn getGpuWorkingSetLimit() u64 {
     if (static_ceiling_override) |v| return v;
-    var dev = mlx.mlx_device{ .ctx = null };
-    _ = mlx.mlx_get_default_device(&dev);
-    var info = mlx.mlx_device_info_new();
-    defer _ = mlx.mlx_device_info_free(info);
-    if (mlx.mlx_device_info_get(&info, dev) == 0) {
-        var max_rec: usize = 0;
-        if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
-            return @as(u64, max_rec);
-        }
-    }
-    return getMetalBufferLimit();
+    const max_rec = mlx.maxRecommendedWorkingSet();
+    return if (max_rec > 0) max_rec else getMetalBufferLimit();
 }
 
 /// PURE (unit-testable): the real ceiling a NEW MLX allocation must fit under.
@@ -3313,6 +3306,23 @@ pub fn applyGpuCeilingEnv() void {
 
 /// THE ceiling helper: `available`, `/props`, the hot-cache clamp, the auto-context pin and the
 /// admission bill all read it, so the wired-limit floor cannot reach some of them and not others.
+/// Free RAM the plan never touches. MLX wires what it allocates, so planning down to the last
+/// free page leaves the OS nothing to reclaim: a 16 GB Mac died on wired memory (15.4 GB wired,
+/// 14 MB free) with every request admitted.
+pub fn osReserveBytes(total_ram: u64) u64 {
+    if (os_reserve_override) |v| return v;
+    return std.math.clamp(total_ram / 8, 2 << 30, 8 << 30);
+}
+
+/// `--os-reserve-gib N` in bytes; 0 turns the reserve off. Null = the automatic eighth.
+pub var os_reserve_override: ?u64 = null;
+
+pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
+    const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidOsReserve;
+    if (n > 64) return error.InvalidOsReserve;
+    return @as(u64, n) << 30;
+}
+
 fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
     // The ANE's int8 copies are wired host buffers: invisible to MLX's own
     // accounting, but genuinely gone from free RAM. Left to leak in through
@@ -3326,7 +3336,7 @@ fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u6
     return gpuCeilingWithWiredFloor(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
-        metrics.getAvailableMemBytes() +| ane_bytes,
+        (metrics.getAvailableMemBytes() -| osReserveBytes(metrics.getTotalMemBytes())) +| ane_bytes,
         wiredCeilingFloorFor(config),
     ) -| ane_bytes;
 }
@@ -5977,6 +5987,12 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
         .will_donate = warm_will_donate,
         .mtp_on = enable_mtp,
     }).fits();
+}
+
+/// {needed, available} of the cold bill, live memory re-read, for the scheduler's sibling ledger.
+pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) [2]u64 {
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{ .mtp_on = enable_mtp });
+    return .{ bill.needed, bill.available };
 }
 
 /// The inference thread's refusal, quoting the numbers it compared.
@@ -22299,6 +22315,18 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     try t.expect(std.mem.indexOf(u8, src, "ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
+test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB" {
+    const gb: u64 = 1 << 30;
+    try std.testing.expectEqual(2 * gb, osReserveBytes(8 * gb));
+    try std.testing.expectEqual(2 * gb, osReserveBytes(16 * gb));
+    try std.testing.expectEqual(4 * gb, osReserveBytes(32 * gb));
+    try std.testing.expectEqual(8 * gb, osReserveBytes(128 * gb));
+    os_reserve_override = try parseOsReserveGib("0");
+    defer os_reserve_override = null;
+    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb));
+    try std.testing.expectError(error.InvalidOsReserve, parseOsReserveGib("lots"));
+}
+
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
     // Fatal-class drift: the bill is linear in the chunk, so a guard that
     // models 512 while `generate` forwards 8192 admits a prefill that dies in
@@ -22348,7 +22376,8 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
     // guard bills against.
     const sched = @embedFile("scheduler.zig");
     // The width is chosen per request (`req_prefill_chunk`) and falls back to `cfg.pinned_prefill_chunk`.
-    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = req_prefill_chunk,") != null);
+    // `companyPrefillChunk` only narrows it, so the bill stays an upper bound.
+    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk,") != null);
     try t.expect(std.mem.indexOf(u8, sched, "const req_prefill_chunk: u32 = if (slot.model.config) |cfg| blk: {") != null);
     try t.expect(std.mem.indexOf(u8, sched, "const pin = cfg.pinned_prefill_chunk;") != null);
     try t.expect(std.mem.indexOf(u8, srcs[1], "xfm.config.pinned_prefill_chunk") == null);

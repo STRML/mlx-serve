@@ -97,6 +97,8 @@ pub const SpecDisableReason = enum {
     think_bound,
     /// The measured round cost more per token than a measured serial token (`MtpAdaptive`).
     adaptive,
+    /// A DFlash slot gained company: it decodes plain so it can join the batched group.
+    company,
 };
 
 /// Effective MTP history window for a prefill forwarding `prefix_len`
@@ -1588,6 +1590,8 @@ pub const Generator = struct {
     mtp_price: MtpPriceWindow = .{},
     /// Ticks left in a bounded serial block (the serial probe); the slot stays an MTP slot.
     mtp_serial_left: u32 = 0,
+    mtp_low_accept: u32 = 0,
+    mtp_tok_ema: f32 = 0,
     /// Where a serial block sits in its ramp back to `nextMtp`'s entry invariant.
     mtp_serial_exit: MtpSerialExit = .none,
     /// Ticks of the current serial block spent warming (the previous round's tail).
@@ -5381,6 +5385,14 @@ pub const Generator = struct {
         };
     }
 
+    /// Sticky like every DFlash serial switch: plain rounds do not extend the assistant context.
+    pub fn dflashYieldToCompany(self: *Generator) void {
+        if (self.dflash == null or self.spec_disabled_runtime) return;
+        log.info("  dflash=disabled (company: decoding plain in the batched group)\n", .{});
+        self.spec_disabled_runtime = true;
+        self.spec_disable_reason = .company;
+    }
+
     /// DFlash runtime economics gate. Sticky within the request: once a
     /// `DFLASH_GATE_WARMUP`-round sample proves the block-parallel path yields
     /// less than its width-normalized request-class threshold, subsequent
@@ -6656,14 +6668,8 @@ pub const Generator = struct {
         return null;
     }
 
-    /// Model-level twin of `mtpAdaptiveArchEligible`: only the in-checkpoint qwen4 head was
-    /// calibrated. `model_has_mtp` alone let every sidecar pack fold a cell nothing reads.
-    pub fn mtpAdaptiveModelEligible(model_has_mtp: bool, module_head_loaded: bool) bool {
-        return model_has_mtp and module_head_loaded;
-    }
-
     fn mtpAdaptiveModelOk(self: *const Generator) bool {
-        return mtpAdaptiveModelEligible(self.model_has_mtp, self.xfm.qwen4_mtp != null);
+        return self.model_has_mtp;
     }
 
     /// Will anyone read a serial cell for this model? Gated on the model, not the request: a
@@ -8512,6 +8518,10 @@ pub const Generator = struct {
         // The realized price of speculation for this request (every non-trial round, extension
         // included). Gated with its one consumer, `mtpAdaptiveVoteFor`.
         if (post_warmup and self.spec_cost_solo and self.mtpAdaptiveModelOk()) self.mtp_price.observe(wall, tok, width_trial);
+        if (!width_trial) {
+            self.mtp_tok_ema = if (self.mtp_tok_ema == 0) tok else self.mtp_tok_ema + 0.125 * (tok - self.mtp_tok_ema);
+            self.mtp_low_accept = mtpLowAcceptStreak(self.mtp_low_accept, self.mtp_tok_ema);
+        }
         self.specObserveRound(m, wall, tok, ev_planned and !two_chunk, shape_changed);
     }
 
@@ -10029,11 +10039,23 @@ pub const Generator = struct {
         );
     }
 
-    /// Only the in-checkpoint qwen4 head was calibrated for the adaptive serial switch; a
-    /// sidecar pack has a different verify surface. Not `moduleOwned()`: different question.
     fn mtpAdaptiveArchEligible(self: *const Generator) bool {
-        const head = self.mtp orelse return false;
-        return head == .qwen4;
+        return self.mtp != null;
+    }
+
+    /// Rounds in a row with the tokens-per-round EMA (bonus included) under this before a
+    /// sidecar head may pay a serial probe.
+    pub const MTP_PROBE_LOW_TOK: f32 = 2.0;
+    pub const MTP_PROBE_LOW_ROUNDS: u32 = 16;
+
+    pub fn mtpLowAcceptStreak(streak: u32, round_tokens: f32) u32 {
+        return if (round_tokens < MTP_PROBE_LOW_TOK) streak +| 1 else 0;
+    }
+
+    /// The module head's switch was calibrated with an immediate probe; a sidecar head wins
+    /// wherever it accepts, so only a run of near-serial rounds buys its probe.
+    pub fn mtpSerialProbeEarned(module_head: bool, low_streak: u32) bool {
+        return module_head or low_streak >= MTP_PROBE_LOW_ROUNDS;
     }
 
     fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
@@ -10066,7 +10088,8 @@ pub const Generator = struct {
             }
             // Nothing to decide with: teach the bucket a serial token, once.
             const idle = self.mtp_serial_left == 0 and self.mtp_serial_exit == .none;
-            if (mtpSerialProbeArm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume(), mtpSerialProbeUseful(window_ms_tok))) |own| {
+            const useful = mtpSerialProbeUseful(window_ms_tok) and mtpSerialProbeEarned(self.xfm.qwen4_mtp != null, self.mtp_low_accept);
+            if (mtpSerialProbeArm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume(), useful)) |own| {
                 self.mtp_serial_left = MTP_ADAPTIVE_PROBE_TOKENS;
                 log.info(
                     "  [mtp] adaptive: bucket {s} has no serial cell -> probing {d} serial tokens\n",
@@ -18387,13 +18410,15 @@ test "characterization: a sidecar boot's width-trial SCHEDULE re-reads its perio
     try testing.expectEqual(@as(?u32, 20), run(true)); // shipped: every layout
 }
 
-test "mtpAdaptiveModelEligible: the serial row and its price window are the module head's, not every MTP model's" {
+test "mtpSerialProbeEarned: a sidecar head probes only after a run of low-acceptance rounds" {
     const G = Generator;
-    try testing.expect(!G.mtpAdaptiveModelEligible(true, false));
-    try testing.expect(G.mtpAdaptiveModelEligible(true, true));
-    // `--no-mtp` on the calibrated arch still declines: the head's weights load with the trunk.
-    try testing.expect(!G.mtpAdaptiveModelEligible(false, true));
-    try testing.expect(!G.mtpAdaptiveModelEligible(false, false));
+    try testing.expect(G.mtpSerialProbeEarned(true, 0)); // the calibrated module head probes at once
+    try testing.expect(!G.mtpSerialProbeEarned(false, G.MTP_PROBE_LOW_ROUNDS - 1));
+    try testing.expect(G.mtpSerialProbeEarned(false, G.MTP_PROBE_LOW_ROUNDS));
+    var streak: u32 = 0;
+    for (0..20) |_| streak = G.mtpLowAcceptStreak(streak, 1.0);
+    try testing.expectEqual(@as(u32, 20), streak);
+    try testing.expectEqual(@as(u32, 0), G.mtpLowAcceptStreak(streak, 3.0)); // code/echo never earn it
 }
 
 test "mtpSerialProbeUseful: a probe buys the LAST missing input, never the first" {
