@@ -1822,6 +1822,7 @@ pub const Generator = struct {
     pub fn logSpecStats(self: *const Generator) void {
         var table_buf: [256]u8 = undefined;
         var hist_buf: [256]u8 = undefined;
+        var lookup_buf: [256]u8 = undefined;
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
         if (self.dspark_enabled and self.dspark_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
@@ -1883,6 +1884,10 @@ pub const Generator = struct {
                     self.mtp_lookup_accepted,
                 },
             );
+            if (self.mtp_lookup_rounds > 0) log.info("  [spec-stats] lookup_table={s}:{s}\n", .{
+                round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
+                self.xfm.round_cost.formatLookupBucket(table_bucket, &lookup_buf),
+            });
             return;
         }
         if (self.dflash != null and self.dflash_attempted > 0) {
@@ -5639,6 +5644,24 @@ pub const Generator = struct {
         self.mtp_serial_warm = 0;
     }
 
+    /// Price a lookup round into the table's lookup row: the wall since the previous round
+    /// ended, the quantity the width grid stores. No sample before the regime clock runs.
+    fn mtpLookupObserve(self: *Generator, drafts: u32, tokens: u32) void {
+        const c = if (self.mtp_regime_clock) |*c| c else return;
+        const ms = @as(f32, @floatFromInt(c.read())) / @as(f32, std.time.ns_per_ms);
+        _ = self.xfm.round_cost.observeLookup(drafts, self.mtpKvLen(), ms, @floatFromInt(tokens), self.spec_cost_solo);
+    }
+
+    /// What this machine measured for an MTP round at `width` and for each lookup size.
+    fn mtpLookupCosts(self: *const Generator, width: u32) mtp_lookup.Costs {
+        const t = &self.xfm.round_cost;
+        const kv = self.mtpKvLen();
+        var costs = mtp_lookup.Costs{ .mtp_ms = if (t.bucketToRead(kv)) |b| t.roundMs(width, b) else null };
+        const bucket = t.bucketOf(kv);
+        for (&costs.lookup_ms, 0..) |*ms, k| ms.* = t.lookupMs(@intCast(k), bucket);
+        return costs;
+    }
+
     /// Count a round's accepted drafts toward its kind and that kind's EMA.
     fn mtpRoundAcceptObserve(self: *Generator, lookup: bool, drafted: u32, accepted: u32) void {
         if (lookup) {
@@ -5675,7 +5698,7 @@ pub const Generator = struct {
         const idx = try self.mtpLookupIndex(allocator);
         const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
         const got = idx.match(t1, mtp_lookup.MAX_DRAFT_STRONG);
-        const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak);
+        const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, self.mtpLookupCosts(plan.m_lo));
         if (k == 0) return null;
         const Once = struct {
             var logged = false;
@@ -8035,7 +8058,10 @@ pub const Generator = struct {
             if (times_round) {
                 self.mtpRoundEndObserve(m, m + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
                 if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
-            } else self.mtpRoundUntimed();
+            } else {
+                if (chain.lookup) self.mtpLookupObserve(m, m + 1);
+                self.mtpRoundUntimed();
+            }
             return DrafterStepResult{
                 .tokens = tokens,
                 .accepted_tokens = m,
@@ -8138,7 +8164,10 @@ pub const Generator = struct {
         if (times_round) {
             self.mtpRoundEndObserve(m, accepted + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
             if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
-        } else self.mtpRoundUntimed();
+        } else {
+            if (chain.lookup) self.mtpLookupObserve(m, accepted + 1);
+            self.mtpRoundUntimed();
+        }
         return DrafterStepResult{
             .tokens = tokens,
             .accepted_tokens = accepted,
