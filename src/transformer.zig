@@ -11156,114 +11156,208 @@ test "qwen4 MTP head: N=1 FORCE_BATCHED draft ids and logits mlx_equal solo at d
     }
 }
 
-fn argmaxHost(alloc: std.mem.Allocator, logits: mlx.mlx_array, st: mlx.mlx_stream) !i32 {
-    const f = try qwen4ReadF32(alloc, logits, st);
-    defer alloc.free(f);
-    var best: f32 = -std.math.inf(f32);
-    var id: i32 = 0;
-    for (f, 0..) |x, i| if (x > best) {
-        best = x;
-        id = @intCast(i);
-    };
-    return id;
-}
+/// A loaded qwen4_exp pack for the head tests; heap-held because the Transformer keeps a pointer to the weights.
+const Qwen4HeadRig = struct {
+    config: model_mod.ModelConfig,
+    weights: model_mod.Weights,
+    xfm: Transformer,
 
-test "qwen4 MTP head: a history append padded to 2+m rows keeps the draft row bit-identical (QWEN4_TEST_MODEL)" {
-    // Bar: row a+1 of a 2+m-row append bit-equals the last row of the eager 2+a-row append.
-    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    fn load(alloc: std.mem.Allocator) !*Qwen4HeadRig {
+        const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+        if (mlx.noGpuBackend()) return error.SkipZigTest;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const rig = try alloc.create(Qwen4HeadRig);
+        errdefer alloc.destroy(rig);
+        rig.config = try model_mod.parseConfig(io, alloc, std.mem.span(model_dir));
+        rig.weights = try model_mod.loadWeights(io, alloc, std.mem.span(model_dir));
+        model_mod.resolveWeightPrefix(&rig.config, &rig.weights);
+        rig.xfm = try Transformer.init(io, alloc, rig.config, &rig.weights);
+        rig.xfm.compileQwen4Hc();
+        rig.xfm.compileGdnGate();
+        rig.xfm.compileMoeRouting();
+        return rig;
+    }
+
+    fn deinit(rig: *Qwen4HeadRig, alloc: std.mem.Allocator) void {
+        rig.xfm.deinit();
+        rig.weights.deinit();
+        if (rig.config.ngram_table_path) |p| alloc.free(p);
+        alloc.destroy(rig);
+    }
+
+    /// `n` seeded pre-mixer stream rows `[1,n,hc*H]`.
+    fn stream(rig: *Qwen4HeadRig, seed: u64, n: c_int) !mlx.mlx_array {
+        const width: c_int = @intCast(rig.config.hc_count * rig.config.hidden_size);
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, seed));
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&out, &[_]c_int{ 1, n, width }, 3, .bfloat16, 0, 1, key, rig.xfm.s));
+        return out;
+    }
+
+    fn ids(rig: *Qwen4HeadRig, first: c_int, n: c_int) !mlx.mlx_array {
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_arange(&out, @floatFromInt(first), @floatFromInt(first + n), 1, .int32, rig.xfm.s));
+        return out;
+    }
+
+    /// Committed history of `n` rows, appended in prefill-sized chunks.
+    fn history(rig: *Qwen4HeadRig, st: *Transformer.Qwen4MtpState, n: c_int) !void {
+        var done: c_int = 0;
+        while (done < n) {
+            const chunk = @min(n - done, 2048);
+            const h = try rig.stream(@intCast(done + 1), chunk);
+            defer _ = mlx.mlx_array_free(h);
+            const id = try rig.ids(100 + done, chunk);
+            defer _ = mlx.mlx_array_free(id);
+            const out = try rig.xfm.qwen4MtpForwardOn(st, h, id, st.pos_base + @as(c_int, @intCast(st.seq_offset)) + @intFromBool(st.seq_offset == 0), null, .none);
+            try mlx.check(mlx.mlx_array_eval(out.stream));
+            _ = mlx.mlx_array_free(out.stream);
+            done += chunk;
+        }
+    }
+
+    /// One round's padded history: `1+m` rows at the committed end, rows past `a` built from `dead_seed`.
+    fn paddedHistory(rig: *Qwen4HeadRig, st: *Transformer.Qwen4MtpState, m: c_int, a: c_int, dead_seed: u64) !void {
+        const live = try rig.stream(77, 1 + a);
+        defer _ = mlx.mlx_array_free(live);
+        const dead = try rig.stream(dead_seed, m - a);
+        defer _ = mlx.mlx_array_free(dead);
+        var h = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h);
+        const hv = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ live, dead }, 2);
+        defer _ = mlx.mlx_vector_array_free(hv);
+        try mlx.check(mlx.mlx_concatenate_axis(&h, hv, 1, rig.xfm.s));
+        const live_ids = try rig.ids(5000, 1 + a);
+        defer _ = mlx.mlx_array_free(live_ids);
+        const dead_ids = try rig.ids(9000 + @as(c_int, @intCast(dead_seed)), m - a);
+        defer _ = mlx.mlx_array_free(dead_ids);
+        var id = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(id);
+        const iv = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ live_ids, dead_ids }, 2);
+        defer _ = mlx.mlx_vector_array_free(iv);
+        try mlx.check(mlx.mlx_concatenate_axis(&id, iv, 0, rig.xfm.s));
+        const out = try rig.xfm.qwen4MtpForwardOn(st, h, id, st.pos_base + @as(c_int, @intCast(st.seq_offset)), null, .none);
+        _ = mlx.mlx_array_free(out.stream);
+    }
+
+    /// `steps` placed draft rows chained like `mtpChainBuild`: each feeds the next its stream and argmax.
+    /// Returns every step's logits, concatenated `[steps, V]`.
+    fn placedDrafts(rig: *Qwen4HeadRig, alloc: std.mem.Allocator, st: *Transformer.Qwen4MtpState, place: *const Transformer.HeadPlace, steps: usize) !mlx.mlx_array {
+        const s = rig.xfm.s;
+        var h = try rig.stream(55, 1);
+        defer _ = mlx.mlx_array_free(h);
+        var tok = mlx.mlx_array_new_int(4242);
+        defer _ = mlx.mlx_array_free(tok);
+        const parts = try alloc.alloc(mlx.mlx_array, steps);
+        defer alloc.free(parts);
+        var built: usize = 0;
+        defer for (parts[0..built]) |p| {
+            _ = mlx.mlx_array_free(p);
+        };
+        for (parts) |*p| {
+            var id = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(id);
+            try mlx.check(mlx.mlx_reshape(&id, tok, &[_]c_int{1}, 1, s));
+            const out = try rig.xfm.qwen4MtpForwardPlacedOn(st, h, id, place, .last_row);
+            _ = mlx.mlx_array_free(h);
+            h = out.stream;
+            p.* = out.logits;
+            built += 1;
+            _ = mlx.mlx_array_free(tok);
+            tok = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_argmax_axis(&tok, out.logits, -1, false, s));
+        }
+        const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var all = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&all, vec, 1, s));
+        return all;
+    }
+};
+
+test "qwen4 MTP head: placed draft rows ignore dead history rows, below and past the QSA budget and the gather floor (QWEN4_TEST_MODEL)" {
+    // Bar: changing the dead rows' ids and streams leaves every placed draft's logits bit-equal; a rerun is bit-equal.
     const t = std.testing;
     const allocator = t.allocator;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    defer if (config.ngram_table_path) |p| allocator.free(p);
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
-    defer xfm.deinit();
-    try t.expect(xfm.qwen4_mtp != null);
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
-
-    var host_ids: [16]i32 = undefined;
-    for (&host_ids, 0..) |*v, i| v.* = @intCast(1000 + 37 * i);
-    const slot = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
-    defer slot.deinit(allocator);
-    var stream = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(stream);
-    slot.ctx.capture_stream_all = &stream;
-    _ = mlx.mlx_array_free(try slot.forward(&xfm, host_ids[0..16]));
-
-    const H = struct {
-        fn rows(st: mlx.mlx_stream, arr: mlx.mlx_array, from: usize, to: usize) !mlx.mlx_array {
-            const sh = mlx.getShape(arr);
-            var out = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&out, arr, &[_]c_int{ 0, @intCast(from), 0 }, 3, &[_]c_int{ sh[0], @intCast(to), sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, st));
-            return out;
+    const rig = try Qwen4HeadRig.load(allocator);
+    defer rig.deinit(allocator);
+    const s = rig.xfm.s;
+    const m: c_int = 5;
+    for ([_]c_int{ 40, 2100, 9000 }) |base| {
+        for ([_]c_int{ 0, 2, 4, 5 }) |a| {
+            var outs: [3]mlx.mlx_array = undefined;
+            var n_out: usize = 0;
+            defer for (outs[0..n_out]) |o| {
+                _ = mlx.mlx_array_free(o);
+            };
+            for ([_]u64{ 11, 12, 11 }) |dead_seed| {
+                var st = try rig.xfm.qwen4MtpStateNew();
+                defer st.deinit();
+                try rig.history(&st, base);
+                const hist0: c_int = @intCast(st.seq_offset);
+                try rig.paddedHistory(&st, m, a, dead_seed);
+                var place: Transformer.HeadPlace = .{ .live_end = mlx.mlx_array_new_int(hist0 + 1 + a), .dead_end = hist0 + 1 + m };
+                defer _ = mlx.mlx_array_free(place.live_end);
+                outs[n_out] = try rig.placedDrafts(allocator, &st, &place, 3);
+                try mlx.check(mlx.mlx_array_eval(outs[n_out]));
+                n_out += 1;
+            }
+            const dead_blind = try qsaArraysAllEqual(outs[0], outs[1], s);
+            const rerun = try qsaArraysAllEqual(outs[0], outs[2], s);
+            std.debug.print("[mtp placed] base={d} a={d} m={d} dead_blind={} rerun_equal={}\n", .{ base, a, m, dead_blind, rerun });
+            try t.expect(dead_blind);
+            try t.expect(rerun);
         }
-        fn ids(v: []const i32) mlx.mlx_array {
-            const sh = [_]c_int{@intCast(v.len)};
-            return mlx.mlx_array_new_data(@ptrCast(v.ptr), &sh, 1, .int32);
-        }
-        // Head row j pairs token ids[j+1] with trunk stream row j; history is rows 0..4.
-        fn append(x: *Transformer, st: *Transformer.Qwen4MtpState, sa: mlx.mlx_array, all_ids: []const i32, from: usize, to: usize, sm: mlx.mlx_stream) !mlx.mlx_array {
-            const h = try rows(sm, sa, from, to);
-            defer _ = mlx.mlx_array_free(h);
-            const id = ids(all_ids[from + 1 .. to + 1]);
-            defer _ = mlx.mlx_array_free(id);
-            const po: c_int = @intCast(1 + from);
-            const out = try x.qwen4MtpForwardOn(st, h, id, po, null, .none);
-            return out.stream;
-        }
-        fn draftLogits(x: *Transformer, row: mlx.mlx_array) !mlx.mlx_array {
-            var mix = try x.hcRead(row, &x.qwen4_mtp.?.mixer, 1, 1);
-            defer mix.deinit();
-            return x.lmHeadProject(mix.mixed, false);
-        }
-    };
-
-    const base: usize = 4;
-    const m: usize = 5;
-    var mismatched: usize = 0;
-    for (0..m) |a| {
-        var eager = try xfm.qwen4MtpStateNew();
-        defer eager.deinit();
-        var padded = try xfm.qwen4MtpStateNew();
-        defer padded.deinit();
-        _ = mlx.mlx_array_free(try H.append(&xfm, &eager, stream, &host_ids, 0, base, s));
-        _ = mlx.mlx_array_free(try H.append(&xfm, &padded, stream, &host_ids, 0, base, s));
-        const se = try H.append(&xfm, &eager, stream, &host_ids, base, base + 2 + a, s);
-        defer _ = mlx.mlx_array_free(se);
-        const sp = try H.append(&xfm, &padded, stream, &host_ids, base, base + 2 + m, s);
-        defer _ = mlx.mlx_array_free(sp);
-        const row_e = try H.rows(s, se, 1 + a, 2 + a);
-        defer _ = mlx.mlx_array_free(row_e);
-        const row_p = try H.rows(s, sp, 1 + a, 2 + a);
-        defer _ = mlx.mlx_array_free(row_p);
-        const le = try H.draftLogits(&xfm, row_e);
-        defer _ = mlx.mlx_array_free(le);
-        const lp = try H.draftLogits(&xfm, row_p);
-        defer _ = mlx.mlx_array_free(lp);
-        var again = try xfm.qwen4MtpStateNew();
-        defer again.deinit();
-        _ = mlx.mlx_array_free(try H.append(&xfm, &again, stream, &host_ids, 0, base, s));
-        const sa2 = try H.append(&xfm, &again, stream, &host_ids, base, base + 2 + a, s);
-        defer _ = mlx.mlx_array_free(sa2);
-        const row0_e = try H.rows(s, se, 0, 1);
-        defer _ = mlx.mlx_array_free(row0_e);
-        const row0_p = try H.rows(s, sp, 0, 1);
-        defer _ = mlx.mlx_array_free(row0_p);
-        std.debug.print("[mtp pad] a={d} eager_repeat_equal={} row0_equal={} id_e={d} id_p={d}\n", .{ a, try qsaArraysAllEqual(se, sa2, s), try qsaArraysAllEqual(row0_e, row0_p, s), try argmaxHost(allocator, le, s), try argmaxHost(allocator, lp, s) });
-        const same_stream = try qsaArraysAllEqual(row_e, row_p, s);
-        const same_logits = try qsaArraysAllEqual(le, lp, s);
-        std.debug.print("[mtp pad] a={d} m={d} stream_equal={} logits_equal={} stream_maxdiff={d} logits_maxdiff={d}\n", .{ a, m, same_stream, same_logits, try attn256MaxDiff(row_e, row_p, s), try attn256MaxDiff(le, lp, s) });
-        if (!same_stream or !same_logits) mismatched += 1;
     }
-    try t.expectEqual(@as(usize, 0), mismatched);
+}
+
+test "qwen4 MTP head: truncating to the live end after placed drafts leaves the committed head unchanged (QWEN4_TEST_MODEL)" {
+    // Bar: a head that ran placed drafts and one that did not are bit-equal after the truncate, below and past the QSA budget.
+    const t = std.testing;
+    const allocator = t.allocator;
+    const rig = try Qwen4HeadRig.load(allocator);
+    defer rig.deinit(allocator);
+    const s = rig.xfm.s;
+    const m: c_int = 5;
+    const a: c_int = 2;
+    for ([_]c_int{ 40, 2100 }) |base| {
+        var next: [2]mlx.mlx_array = undefined;
+        var n_next: usize = 0;
+        defer for (next[0..n_next]) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        var lens: [2]usize = undefined;
+        for ([_]usize{ 3, 0 }, 0..) |steps, arm| {
+            var st = try rig.xfm.qwen4MtpStateNew();
+            defer st.deinit();
+            try rig.history(&st, base);
+            const hist0: c_int = @intCast(st.seq_offset);
+            try rig.paddedHistory(&st, m, a, 11);
+            var place: Transformer.HeadPlace = .{ .live_end = mlx.mlx_array_new_int(hist0 + 1 + a), .dead_end = hist0 + 1 + m };
+            defer _ = mlx.mlx_array_free(place.live_end);
+            if (steps > 0) {
+                const d = try rig.placedDrafts(allocator, &st, &place, steps);
+                try mlx.check(mlx.mlx_array_eval(d));
+                _ = mlx.mlx_array_free(d);
+            }
+            try rig.xfm.qwen4MtpTruncateOn(&st, @intCast(hist0 + 1 + a));
+            lens[arm] = st.seq_offset;
+            // The next round's history and draft read the committed rows, and nothing past them.
+            try rig.paddedHistory(&st, m, m, 13);
+            const end: c_int = @intCast(st.seq_offset);
+            var place2: Transformer.HeadPlace = .{ .live_end = mlx.mlx_array_new_int(end), .dead_end = end };
+            defer _ = mlx.mlx_array_free(place2.live_end);
+            next[n_next] = try rig.placedDrafts(allocator, &st, &place2, 2);
+            try mlx.check(mlx.mlx_array_eval(next[n_next]));
+            n_next += 1;
+        }
+        const same = try qsaArraysAllEqual(next[0], next[1], s);
+        std.debug.print("[mtp truncate] base={d} len_after={d}/{d} next_round_equal={}\n", .{ base, lens[0], lens[1], same });
+        try t.expectEqual(lens[1], lens[0]);
+        try t.expect(same);
+    }
 }
 
 test "MTP head row widths pick the verify lane, the MoE arm and the QSA score kernel" {
@@ -22687,6 +22781,25 @@ pub const Transformer = struct {
         const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
         var live = qwen4MtpLiveState(st);
         return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project);
+    }
+
+    /// A draft row written past a padded history append. Key slots `[live_end, dead_end)`
+    /// are dead history rows: hidden from its attention and its QSA block selection. The
+    /// row ropes at `live_end + (slot - dead_end)`, the position it would hold with no pad.
+    pub const HeadPlace = struct {
+        /// 0-d int32 slot one past the last live history row.
+        live_end: mlx.mlx_array,
+        dead_end: c_int,
+    };
+
+    pub fn qwen4MtpForwardPlacedOn(self: *Transformer, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject) !Qwen4MtpOut {
+        _ = self;
+        _ = st;
+        _ = stream_prev;
+        _ = token_ids_in;
+        _ = place;
+        _ = project;
+        return error.Unimplemented;
     }
 
     pub const Qwen4MtpBatchRow = struct {
