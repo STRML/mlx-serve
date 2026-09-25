@@ -67,8 +67,10 @@ run_arm() { # $1 = arm name, $2 = MLX_SERVE_MTP_PADDED_HEAD, $3 = reps
 
 echo "[1] padded head (default)"
 run_arm padded 1 2
+# Sum of MTP attempts over the log's spec-stats lines (a lookup-only line logs attempts=0).
+mtp_attempts() { grep -o 'mode=mtp attempts=[0-9]*' "$1" | awk -F= '{s += $NF} END {print s + 0}'; }
 check "padded path engaged" "$(grep -c '\[mtp\] padded head history engaged' "$DIR/padded.log")" "1"
-check "MTP rounds ran" "$(grep -c 'mode=mtp' "$DIR/padded.log" | sed 's/^[1-9][0-9]*$/1/')" "1"
+check "MTP rounds ran" "$([ "$(mtp_attempts "$DIR/padded.log")" -gt 0 ] && echo yes)" "yes"
 for p in $PROMPTS; do
   check "$p reruns byte-identical" "$(cmp -s "$DIR/padded-$p-1.txt" "$DIR/padded-$p-2.txt" && echo same)" "same"
   check "$p answered" "$([ -s "$DIR/padded-$p-1.txt" ] && echo yes)" "yes"
@@ -82,7 +84,7 @@ check "needle found past the head's QSA budget" "$(grep -c 'PELICAN-42' "$DIR/pa
 echo "[2] MLX_SERVE_MTP_PADDED_HEAD=0 keeps the merged step"
 run_arm merged 0 1
 check "padded path off" "$(grep -c '\[mtp\] padded head history engaged' "$DIR/merged.log")" "0"
-check "merged arm ran MTP rounds" "$(grep -c 'mode=mtp' "$DIR/merged.log" | sed 's/^[1-9][0-9]*$/1/')" "1"
+check "merged arm ran MTP rounds" "$([ "$(mtp_attempts "$DIR/merged.log")" -gt 0 ] && echo yes)" "yes"
 for p in $PROMPTS; do
   if cmp -s "$DIR/padded-$p-1.txt" "$DIR/merged-$p-1.txt"; then echo "  info $p: padded == merged"; else echo "  info $p: padded and merged differ (drafts move acceptance, like a width change)"; fi
 done
