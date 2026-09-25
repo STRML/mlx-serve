@@ -5873,10 +5873,13 @@ pub const Generator = struct {
         lookup_round: bool,
         planner_owned: bool,
         spec_live: bool,
+        /// A full accept still leaves budget for another round. Without one the chain
+        /// would be dispatched and thrown away, and a head failure would fail a finished request.
+        successor: bool,
     };
 
     pub fn mtpLazyPredraftAllowedFor(g: LazyGate) bool {
-        if (!g.enabled or !g.greedy or !g.solo or !g.padded or !g.spec_live) return false;
+        if (!g.enabled or !g.greedy or !g.solo or !g.padded or !g.spec_live or !g.successor) return false;
         return !g.lookup_round and !g.planner_owned;
     }
 
@@ -5902,11 +5905,15 @@ pub const Generator = struct {
             .lookup_round = st.chain.lookup,
             .planner_owned = self.mtp_planner_owned,
             .spec_live = !self.spec_disabled_runtime and self.mtp_serial_left == 0 and !self.mtp_planner_pending,
+            .successor = self.max_tokens -| self.completion_tokens > 1 + st.chain.m,
         };
     }
 
     /// Round N+1's chunk-A chain from round N's lazy verdict, built and dispatched before the
     /// host reads round N. Null when this round's plan ends speculation. `chain` is round N's.
+    /// The plan is drawn before round N updates acceptance, so an adaptive depth change lands
+    /// one round later than on the tail path. Drawing it again after the read would advance the
+    /// planner's probes and trials twice per round, so the lag is kept.
     fn mtpLazyPreDraft(self: *Generator, allocator: std.mem.Allocator, chain: *const MtpPreDraft, am: mlx.mlx_array, verify_hidden_all: mlx.mlx_array) !?MtpPreDraft {
         const s = self.xfm.s;
         const m = chain.m;
@@ -5968,13 +5975,15 @@ pub const Generator = struct {
     /// `planned`: the lazy build already took this round's plan, so no second plan is drawn.
     fn mtpPreDraftResolve(self: *Generator, allocator: std.mem.Allocator, lazy: *?MtpPreDraft, exact: bool, planned: bool) !void {
         if (lazy.* == null and planned) return;
-        var chain = lazy.* orelse return self.mtpMaybePreDraft(allocator);
+        const plan = (lazy.* orelse return self.mtpMaybePreDraft(allocator)).plan;
+        const keeps = self.mtpLazyKeeps(exact);
+        // Before taking the chain: on error the round's errdefer still owns and rolls it back.
+        const lookup = keeps and try self.mtpLookupDrafts(allocator, plan, self.next_token_id) > 0;
+        const discard = !keeps or lookup or mtp_lazy_force_discard;
+        var chain = lazy.*.?;
         lazy.* = null;
         const st = &self.mtp_hist_stash.?;
-        const plan = chain.plan;
-        const keeps = self.mtpLazyKeeps(exact);
-        const lookup = keeps and (self.mtpLookupDrafts(allocator, plan, self.next_token_id) catch 0) > 0;
-        if (!keeps or lookup) {
+        if (discard) {
             chain.deinit(allocator);
             try self.mtp_cache.?.truncate(st.off0, self.xfm.s);
             if (lookup) self.mtp_pre_draft = try self.mtpLookupChain(allocator, plan, self.next_token_id);
@@ -5987,6 +5996,8 @@ pub const Generator = struct {
         self.mtp_pre_draft = chain;
         self.mtp_lazy_kept += 1;
     }
+    /// Test seam: discard every lazy chain, as a lookup pick does.
+    pub var mtp_lazy_force_discard: bool = false;
     /// Test seam: fail the round right after its lazy chain is dispatched.
     pub var mtp_lazy_fail_after_dispatch: bool = false;
 
@@ -19081,9 +19092,9 @@ test "lazy predraft: the lazy verdict matches the host greedy verdict at zero, p
 
 test "lazy predraft: only solo greedy padded rounds with speculation live build a lazy chain" {
     // Bar: every open gate allows it; closing any single gate (sampled, group, lookup round, ...) forbids it.
-    const open: Generator.LazyGate = .{ .enabled = true, .greedy = true, .solo = true, .padded = true, .lookup_round = false, .planner_owned = false, .spec_live = true };
+    const open: Generator.LazyGate = .{ .enabled = true, .greedy = true, .solo = true, .padded = true, .lookup_round = false, .planner_owned = false, .spec_live = true, .successor = true };
     try testing.expect(Generator.mtpLazyPredraftAllowedFor(open));
-    inline for (.{ "enabled", "greedy", "solo", "padded", "spec_live" }) |field| {
+    inline for (.{ "enabled", "greedy", "solo", "padded", "spec_live", "successor" }) |field| {
         var g = open;
         @field(g, field) = false;
         try testing.expect(!Generator.mtpLazyPredraftAllowedFor(g));
@@ -19410,14 +19421,14 @@ const LazyRig = struct {
             defer a.free(r.tokens);
             try ids.appendSlice(a, r.tokens);
         }
-        // Nothing past the committed history may outlive the last round.
+        // Whether a pre-draft outlives the last round (the eager tail builds one at max_tokens).
         const residue = g.mtp_pre_draft != null;
         return .{ .ids = try ids.toOwnedSlice(a), .built = g.mtp_lazy_built, .kept = g.mtp_lazy_kept, .lookup_rounds = g.mtp_lookup_rounds, .completion = g.completion_tokens, .residue = residue };
     }
 };
 
 test "lazy predraft: greedy tokens equal the eager padded path, lookup off and on, to and short of max_tokens (QWEN4_TEST_MODEL)" {
-    // Bar: byte-identical ids; the lazy arm built and kept chains; a max_tokens stop leaves no lazy chain behind.
+    // Bar: byte-identical ids; the lazy arm built and kept chains; the final rounds leave what the eager path leaves.
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const rig = try LazyRig.load(a, io);
@@ -19438,10 +19449,23 @@ test "lazy predraft: greedy tokens equal the eager padded path, lookup off and o
             try testing.expectEqual(@as(u32, 0), eager.built);
             try testing.expect(lazy.kept > 0);
             try testing.expectEqual(max_tokens, lazy.completion);
-            try testing.expect(!lazy.residue);
-            if (lookup) try testing.expect(lazy.lookup_rounds > 0 and lazy.built > lazy.kept);
+            try testing.expectEqual(eager.residue, lazy.residue);
+            if (lookup) try testing.expect(lazy.lookup_rounds > 0);
         }
     }
+    // A lookup pick discards the lazy chain; force that on every round so the discard path
+    // (head back at the stash origin, stash pending) runs whatever lookup decides.
+    Generator.mtp_lookup_override = false;
+    Generator.mtp_lazy_force_discard = true;
+    defer Generator.mtp_lazy_force_discard = false;
+    const eager = try rig.run(a, io, false, 120);
+    defer a.free(eager.ids);
+    const discarded = try rig.run(a, io, true, 120);
+    defer a.free(discarded.ids);
+    std.debug.print("[lazy predraft] forced discard tokens={d}/{d} built={d} kept={d}\n", .{ eager.ids.len, discarded.ids.len, discarded.built, discarded.kept });
+    try testing.expectEqualSlices(u32, eager.ids, discarded.ids);
+    try testing.expect(discarded.built > 0);
+    try testing.expectEqual(@as(u32, 0), discarded.kept);
 }
 
 test "lazy predraft: a failure after the lazy dispatch leaves the head committed-only (QWEN4_TEST_MODEL)" {

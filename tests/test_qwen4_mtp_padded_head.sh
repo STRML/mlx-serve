@@ -82,6 +82,7 @@ check "needle found past the head's QSA budget" "$(grep -c 'PELICAN-42' "$DIR/pa
 echo "[2] MLX_SERVE_MTP_PADDED_HEAD=0 keeps the merged step"
 run_arm merged 0 1
 check "padded path off" "$(grep -c '\[mtp\] padded head history engaged' "$DIR/merged.log")" "0"
+check "merged arm ran MTP rounds" "$(grep -c 'mode=mtp' "$DIR/merged.log" | sed 's/^[1-9][0-9]*$/1/')" "1"
 for p in $PROMPTS; do
   if cmp -s "$DIR/padded-$p-1.txt" "$DIR/merged-$p-1.txt"; then echo "  info $p: padded == merged"; else echo "  info $p: padded and merged differ (drafts move acceptance, like a width change)"; fi
 done

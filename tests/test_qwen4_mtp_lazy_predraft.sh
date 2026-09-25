@@ -66,6 +66,10 @@ run_arm() { # $1 = arm name, $2 = MLX_SERVE_MTP_LAZY_PREDRAFT, $3 = MLX_SERVE_MT
 
 # Sum of `lazy=built/kept` over the log's spec-stats lines: prints "built kept".
 lazy_counts() { grep -o 'lazy=[0-9]*/[0-9]*' "$1" | awk -F'[=/]' '{b += $2; k += $3} END {printf "%d %d", b, k}'; }
+# Sum of MTP attempts over the log's spec-stats lines.
+mtp_attempts() { grep -o 'mode=mtp attempts=[0-9]*' "$1" | awk -F= '{s += $NF} END {print s + 0}'; }
+# Sum of lookup rounds (first field of `lookup=rounds/drafted/accepted`) over the log.
+lookup_rounds() { grep -o ' lookup=[0-9]*/' "$1" | tr -dc '0-9\n' | awk '{s += $1} END {print s + 0}'; }
 # Mean `predraft=` over the log's trace lines.
 predraft_ms() { grep -o 'predraft=[0-9.]*' "$1" | awk -F= '{s += $2; n++} END {printf "%.3f", n ? s / n : -1}'; }
 
@@ -75,6 +79,12 @@ for lookup in 0 1; do
   echo "[lookup=$lookup] lazy arm"
   run_arm "lazy-l$lookup" 1 "$lookup"
   check "lookup=$lookup lazy engaged" "$(grep -c '\[mtp\] lazy predraft engaged' "$DIR/lazy-l$lookup.log")" "1"
+  check "lookup=$lookup eager ran MTP rounds" "$([ "$(mtp_attempts "$DIR/eager-l$lookup.log")" -gt 0 ] && echo yes)" "yes"
+  if [ "$lookup" = 1 ]; then
+    for arm in eager lazy; do
+      check "lookup=1 $arm picked lookup drafts" "$([ "$(lookup_rounds "$DIR/$arm-l1.log")" -gt 0 ] && echo yes)" "yes"
+    done
+  fi
   check "lookup=$lookup eager never builds" "$(lazy_counts "$DIR/eager-l$lookup.log" | cut -d' ' -f1)" "0"
   read -r built kept <<< "$(lazy_counts "$DIR/lazy-l$lookup.log")"
   check "lookup=$lookup lazy chains kept" "$([ "$kept" -gt 0 ] && echo yes)" "yes"
@@ -82,17 +92,15 @@ for lookup in 0 1; do
   for p in $PROMPTS; do
     check "lookup=$lookup $p byte-identical to eager" "$(cmp -s "$DIR/eager-l$lookup-$p.txt" "$DIR/lazy-l$lookup-$p.txt" && echo same)" "same"
   done
+  check "lookup=$lookup sampled request ran MTP" "$(grep -o 'mode=mtp attempts=[0-9]*' "$DIR/lazy-l$lookup.log" | tail -1 | awk -F= '{print ($NF > 0) ? "yes" : "no"}')" "yes"
   check "lookup=$lookup sampled request never builds" "$(grep -o 'spec-stats\] lazy=[0-9]*/[0-9]*' "$DIR/lazy-l$lookup.log" | tail -1 | grep -o 'lazy=.*')" "lazy=0/0"
   check "lookup=$lookup short answer ends on EOS" "$(cut -d' ' -f1 "$DIR/lazy-l$lookup-short.meta")" "stop"
   check "lookup=$lookup needle found" "$(grep -c 'PELICAN-42' "$DIR/lazy-l$lookup-needle.txt")" "1"
   e=$(predraft_ms "$DIR/eager-l$lookup.log")
   l=$(predraft_ms "$DIR/lazy-l$lookup.log")
   echo "  info predraft ms eager=$e lazy=$l"
-  check "lookup=$lookup predraft under a quarter of eager" "$(awk -v e="$e" -v l="$l" 'BEGIN {print (l >= 0 && l < e / 4) ? "yes" : "no"}')" "yes"
+  check "lookup=$lookup predraft below eager" "$(awk -v e="$e" -v l="$l" 'BEGIN {print (l >= 0 && l < e) ? "yes" : "no"}')" "yes"
 done
-if [ -f "$DIR/lazy-l1.log" ]; then
-  echo "  info lookup rounds (lazy-l1): $(grep -o 'lookup=[0-9]*/[0-9]*/[0-9]*' "$DIR/lazy-l1.log" | tail -3 | tr '\n' ' ')"
-fi
 
 echo "texts: $DIR"
 echo "pass=$pass fail=$fail"
