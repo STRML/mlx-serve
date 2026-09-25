@@ -6492,6 +6492,84 @@ pub fn qsaMaskFromBlocks(s: mlx.mlx_stream, blocks: mlx.mlx_array, kv: c_int, ra
 /// selected blocks' tokens (zero-padded to kv) ∪ each query's own incomplete
 /// tail (tokens at/after ratio*floor((p+1)/ratio) — always visible), ∧ the
 /// causal bound. `offset` is the cache position of row 0.
+/// `[1]` int32 RoPE position of a placed draft row: `live_end + (slot - dead_end)`, with the
+/// head's absolute origin folded into `shift` (`pos_base + slot - dead_end`).
+fn headPlaceRopePos(s: mlx.mlx_stream, p: *const Transformer.HeadPlace, shift: c_int) !mlx.mlx_array {
+    const shift_v = mlx.mlx_array_new_int(shift);
+    defer _ = mlx.mlx_array_free(shift_v);
+    var pos = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pos);
+    try mlx.check(mlx.mlx_add(&pos, p.live_end, shift_v, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, pos, &[_]c_int{1}, 1, s));
+    return out;
+}
+
+/// Block scores with every block that reaches a dead row (or lies past one) at -inf, so a
+/// dead row's pooled key can never win or displace a top-k pick.
+fn headPlaceScores(s: mlx.mlx_stream, scores: mlx.mlx_array, p: *const Transformer.HeadPlace, ratio: c_int, nb: c_int) !mlx.mlx_array {
+    const ratio_v = mlx.mlx_array_new_int(ratio);
+    defer _ = mlx.mlx_array_free(ratio_v);
+    var eligible_n = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eligible_n);
+    try mlx.check(mlx.mlx_floor_divide(&eligible_n, p.live_end, ratio_v, s));
+    var blk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blk);
+    try mlx.check(mlx.mlx_arange(&blk, 0, @floatFromInt(nb), 1, .int32, s));
+    var eligible = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eligible);
+    try mlx.check(mlx.mlx_less(&eligible, blk, eligible_n, s));
+    const floor_v = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(floor_v);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_where(&out, eligible, scores, floor_v, s));
+    return out;
+}
+
+/// Key visibility `[1,1,1,kv]` for a placed draft row: every row but the dead ones, narrowed
+/// by the QSA selection when there is one. Rows from the first block that reaches a dead row
+/// on stay visible, since `headPlaceScores` keeps those blocks out of the selection.
+fn headPlaceVisibility(s: mlx.mlx_stream, qsa_mask: mlx.mlx_array, p: *const Transformer.HeadPlace, ratio: c_int, kv: c_int) !mlx.mlx_array {
+    var r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(r);
+    try mlx.check(mlx.mlx_arange(&r, 0, @floatFromInt(kv), 1, .int32, s));
+    var live = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(live);
+    try mlx.check(mlx.mlx_less(&live, r, p.live_end, s));
+    const dead_end_v = mlx.mlx_array_new_int(p.dead_end);
+    defer _ = mlx.mlx_array_free(dead_end_v);
+    var past = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(past);
+    try mlx.check(mlx.mlx_greater_equal(&past, r, dead_end_v, s));
+    var not_dead = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(not_dead);
+    try mlx.check(mlx.mlx_logical_or(&not_dead, live, past, s));
+    var vis = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vis);
+    if (qsa_mask.ctx == null) {
+        try mlx.check(mlx.mlx_array_set(&vis, not_dead));
+    } else {
+        const ratio_v = mlx.mlx_array_new_int(ratio);
+        defer _ = mlx.mlx_array_free(ratio_v);
+        var blocks = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(blocks);
+        try mlx.check(mlx.mlx_floor_divide(&blocks, p.live_end, ratio_v, s));
+        var recent_from = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(recent_from);
+        try mlx.check(mlx.mlx_multiply(&recent_from, blocks, ratio_v, s));
+        var recent = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(recent);
+        try mlx.check(mlx.mlx_greater_equal(&recent, r, recent_from, s));
+        var picked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(picked);
+        try mlx.check(mlx.mlx_logical_or(&picked, qsa_mask, recent, s));
+        try mlx.check(mlx.mlx_logical_and(&vis, picked, not_dead, s));
+    }
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, vis, &[_]c_int{ 1, 1, 1, kv }, 4, s));
+    return out;
+}
+
 fn qsaMaskFromBlockSel(s: mlx.mlx_stream, blk_sel: mlx.mlx_array, offset: c_int, seq_len: c_int, kv: c_int, nb: c_int, ratio: c_int, batch: c_int) !mlx.mlx_array {
     var pos_col = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(pos_col);
@@ -10917,6 +10995,43 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
     try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.aux_state, reference, s));
 }
 
+test "head place: blocks reaching a dead row never score, and only dead rows are hidden" {
+    // Bar: live_end 9, dead_end 12, ratio 4: blocks 0..1 keep their scores, 2.. are -inf; rows 9..11 hidden, 8 recent.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var place: Transformer.HeadPlace = .{ .live_end = mlx.mlx_array_new_int(9), .dead_end = 12 };
+    defer _ = mlx.mlx_array_free(place.live_end);
+
+    const raw = [_]f32{ 1, 2, 30, 40 };
+    const scores = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const got = try headPlaceScores(s, scores, &place, 4, 4);
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(got));
+    const g = mlx.mlx_array_data_float32(got).?[0..4];
+    try t.expectEqual(@as(f32, 1), g[0]);
+    try t.expectEqual(@as(f32, 2), g[1]);
+    try t.expect(std.math.isNegativeInf(g[2]) and std.math.isNegativeInf(g[3]));
+
+    // Selection picks block 0 only; rows 8.. are the recent run, 9..11 dead, 12..13 drafts.
+    var sel_raw: [14]bool = @splat(false);
+    for (0..4) |i| sel_raw[i] = true;
+    const sel = mlx.mlx_array_new_data(&sel_raw, &[_]c_int{ 1, 1, 1, 14 }, 4, .bool_);
+    defer _ = mlx.mlx_array_free(sel);
+    const want = [_]bool{ true, true, true, true, false, false, false, false, true, false, false, false, true, true };
+    const vis = try headPlaceVisibility(s, sel, &place, 4, 14);
+    defer _ = mlx.mlx_array_free(vis);
+    try mlx.check(mlx.mlx_array_eval(vis));
+    try t.expectEqualSlices(bool, &want, mlx.mlx_array_data_bool(vis).?[0..14]);
+
+    const dense = try headPlaceVisibility(s, .{ .ctx = null }, &place, 4, 14);
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_array_eval(dense));
+    const want_dense = [_]bool{ true, true, true, true, true, true, true, true, true, false, false, false, true, true };
+    try t.expectEqualSlices(bool, &want_dense, mlx.mlx_array_data_bool(dense).?[0..14]);
+}
+
 test "qsa rollback: a rollback that reaches past the ring is a named error, not a negative slice" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
@@ -13847,6 +13962,10 @@ pub const ForwardCtx = struct {
     qsa_entry: ?*SSMCacheEntry = null,
     /// Absolute position of this slot's QSA key row 0 (0 on the trunk).
     qsa_pos_base: c_int = 0,
+    /// MTP head draft row placed past dead history rows (`qwen4MtpForwardPlacedOn`), and its
+    /// `[1]` int32 RoPE position. Null on every other forward.
+    head_place: ?*const Transformer.HeadPlace = null,
+    head_rope_pos: mlx.mlx_array = .{ .ctx = null },
     /// qwen4_exp pipelined decode: the n-gram PLE rows are a HOST gather keyed
     /// on the token ids, and the pipelined step builds its graph on a token
     /// that is still a lazy sample. With `ple_defer` set, `pleEmbedding` hands
@@ -22012,6 +22131,13 @@ pub const Transformer = struct {
         if (ctx.mrope_cos_cur) |cos| {
             _ = mlx.mlx_array_free(q_rope);
             q_rope = try self.applyMrope(qt, cos, ctx.mrope_sin_cur.?, rope_dims);
+        } else if (ctx.head_rope_pos.ctx != null) {
+            const use_yarn = self.yarnActive();
+            try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, qt, rope_dims, false, mlx.mlx_optional_float{
+                .value = cfg.rope_theta,
+                .has_value = !use_yarn,
+            }, 1.0, ctx.head_rope_pos, if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null }, self.s));
+            if (use_yarn) try self.yarnScaleRotated(&q_rope, rope_dims);
         } else {
             const eff_off: c_int = pos_base + offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
             // The SAME spectrum attention rotates with (scaled when the config
@@ -22052,7 +22178,8 @@ pub const Transformer = struct {
         // the selection too: `qsaVerifyGatherAttn` reads the UNION of the
         // rows' selections instead of the whole cache. Its own kv floor is
         // higher than the prefill/decode one — the union is fixed-size.
-        const want_blocks = batch == 1 and kv > qsaGatherMinKv() and qsaGatherEnabled() and
+        // A placed draft row takes the mask arm: its dead rows are masked, which no gatherer reads.
+        const want_blocks = batch == 1 and ctx.head_place == null and kv > qsaGatherMinKv() and qsaGatherEnabled() and
             (seq_len >= FUSED256_MIN_Q_LEN or (seq_len == 1 and qsaDecodeGatherEnabled()) or
                 (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKvFor(ctx.cache.config.scheme == .affine)));
         if (want_blocks) {
@@ -22080,8 +22207,12 @@ pub const Transformer = struct {
             return mlx.mlx_array_new();
         }
 
-        const scores = try qsaScoreSheet(self.s, q_rope, entry.qsa_pooled, k32, fused);
-        defer _ = mlx.mlx_array_free(scores);
+        const sheet = try qsaScoreSheet(self.s, q_rope, entry.qsa_pooled, k32, fused);
+        defer _ = mlx.mlx_array_free(sheet);
+        const scores = if (ctx.head_place) |p| try headPlaceScores(self.s, sheet, p, ratio, nb) else sheet;
+        defer if (ctx.head_place != null) {
+            _ = mlx.mlx_array_free(scores);
+        };
 
         if (envFlagCached(&qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
             var f = mlx.mlx_array_new();
@@ -22311,6 +22442,11 @@ pub const Transformer = struct {
         }
         if (fa.idx_qk_w.ctx != null and !qwen4Standin().attn_qsa) {
             ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
+        }
+        if (ctx.head_place) |p| {
+            const vis = try headPlaceVisibility(self.s, ctx.qsa_mask, p, @intCast(self.config.indexer_compress_ratio), cache_len + seq_len);
+            if (ctx.qsa_mask.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_mask);
+            ctx.qsa_mask = vis;
         }
         if (layer == 3) if (qwen4_trace) |tr| {
             if (ctx.qsa_mask.ctx != null) {
@@ -22774,13 +22910,13 @@ pub const Transformer = struct {
     pub fn qwen4MtpForward(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
         const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
         var live = qwen4MtpLiveModule(m);
-        return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project);
+        return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project, null);
     }
 
     pub fn qwen4MtpForwardOn(self: *Transformer, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
         const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
         var live = qwen4MtpLiveState(st);
-        return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project);
+        return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project, null);
     }
 
     /// A draft row written past a padded history append. Key slots `[live_end, dead_end)`
@@ -22793,13 +22929,15 @@ pub const Transformer = struct {
     };
 
     pub fn qwen4MtpForwardPlacedOn(self: *Transformer, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject) !Qwen4MtpOut {
-        _ = self;
-        _ = st;
-        _ = stream_prev;
-        _ = token_ids_in;
-        _ = place;
-        _ = project;
-        return error.Unimplemented;
+        const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+        var live = qwen4MtpLiveState(st);
+        return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place);
+    }
+
+    pub fn qwen4MtpForwardPlaced(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject) !Qwen4MtpOut {
+        const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
+        var live = qwen4MtpLiveModule(m);
+        return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place);
     }
 
     pub const Qwen4MtpBatchRow = struct {
@@ -23121,7 +23259,7 @@ pub const Transformer = struct {
         return buf.abandon();
     }
 
-    fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
+    fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject, place: ?*const HeadPlace) !Qwen4MtpOut {
         qwen4_mtp_head_graphs += 1;
         self.fwd_gen +%= 1; // per-forward QSA scratch key
         const cfg = &self.config;
@@ -23131,8 +23269,12 @@ pub const Transformer = struct {
         const batch: c_int = shape[0];
         const seq_len: c_int = shape[1];
         const is_prefill = seq_len > 1;
-        if (live.seq_offset.* == 0) live.pos_base.* = pos_offset;
-        if (pos_offset != live.pos_base.* + @as(c_int, @intCast(live.seq_offset.*))) return error.MtpPositionGap;
+        if (place) |p| {
+            if (seq_len != 1 or mrope_ctx != null or p.dead_end <= 0 or p.dead_end > @as(c_int, @intCast(live.seq_offset.*))) return error.MtpPlacement;
+        } else {
+            if (live.seq_offset.* == 0) live.pos_base.* = pos_offset;
+            if (pos_offset != live.pos_base.* + @as(c_int, @intCast(live.seq_offset.*))) return error.MtpPositionGap;
+        }
 
         var token_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(token_ids);
@@ -23162,6 +23304,13 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_reshape(&h, x4, &[_]c_int{ batch, seq_len, hc * hidden }, 3, self.s));
 
         var ctx: ForwardCtx = .{ .cache = live.cache, .moe_seq_offset = live.seq_offset, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+        defer if (ctx.head_rope_pos.ctx != null) {
+            _ = mlx.mlx_array_free(ctx.head_rope_pos);
+        };
+        if (place) |p| {
+            ctx.head_place = p;
+            ctx.head_rope_pos = try headPlaceRopePos(self.s, p, live.pos_base.* + @as(c_int, @intCast(live.seq_offset.*)) - p.dead_end);
+        }
         if (mrope_ctx) |mc| {
             ctx.mrope_pos = mc.pos;
             ctx.mrope_total = mc.total;
@@ -25704,7 +25853,7 @@ pub const Transformer = struct {
         var k_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_rope);
         var fused_qk = false;
-        if (batch == 1 and seq_len == 1 and hd == 128 and ctx.mrope_cos_cur == null and
+        if (batch == 1 and seq_len == 1 and hd == 128 and ctx.mrope_cos_cur == null and ctx.head_rope_pos.ctx == null and
             fa.q_norm.ctx != null and fa.k_norm.ctx != null and
             self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
         blk: {
@@ -25725,7 +25874,7 @@ pub const Transformer = struct {
         // spec-verify widths (S 1..16) — the hd-128 gate above never fires
         // there, so those layers paid the composed chain on every step.
         if (!fused_qk and batch == 1 and hd == 256 and seq_len <= 32 and
-            ctx.mrope_cos_cur == null and
+            ctx.mrope_cos_cur == null and ctx.head_rope_pos.ctx == null and
             fa.q_norm.ctx != null and fa.k_norm.ctx != null and
             self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
         blk: {
@@ -25769,6 +25918,10 @@ pub const Transformer = struct {
                 _ = mlx.mlx_array_free(k_rope);
                 q_rope = try self.applyMrope(q_t, cos, sin, rope_dims);
                 k_rope = try self.applyMrope(k_t, cos, sin, rope_dims);
+            } else if (ctx.head_rope_pos.ctx != null) {
+                try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, q_t, rope_dims, false, rope_base, 1.0, ctx.head_rope_pos, rope_freqs, self.s));
+                try mlx.check(mlx.mlx_fast_rope_dynamic(&k_rope, k_t, rope_dims, false, rope_base, 1.0, ctx.head_rope_pos, rope_freqs, self.s));
+                if (use_yarn) try self.yarnScaleQK(&q_rope, &k_rope);
             } else if (ctx.batch_rope_offsets) |off_arr| {
                 // Batched decode: every slot sits at its own position, so the
                 // offset is an [N] array, not a scalar. The driver already
