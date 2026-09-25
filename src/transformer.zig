@@ -20033,6 +20033,9 @@ pub const Transformer = struct {
     ) !void {
         std.debug.assert(token_rows.len == ctxs.len);
         std.debug.assert(out_logits.len >= token_rows.len and out_last.len >= token_rows.len and out_all.len >= token_rows.len);
+        const outer_group_rows = verify_group_rows;
+        verify_group_rows = token_rows.len;
+        defer verify_group_rows = outer_group_rows;
         if (token_rows.len > 1 and !row_axis_verify_logged) {
             row_axis_verify_logged = true;
             log.info("[batched] row-axis mtp verify engaged (slots={d}, width={d})\n", .{ token_rows.len, mlx.getShape(token_rows[0])[1] });
@@ -37732,7 +37735,11 @@ pub fn prefillDqGemmEnabled() bool {
 /// Test seam: engagement is counted, never inferred from output equality.
 pub var prefill_dq_gemm_engaged: u64 = 0;
 
-var verify_shared_arch: ?bool = null;
+var verify_arch_buf: [128]u8 = undefined;
+var verify_arch: ?[]const u8 = null;
+var verify_arch_read = false;
+/// Streams in the batched verify running now (`forwardRowAxisVerify`); 0 outside one.
+pub var verify_group_rows: usize = 0;
 
 // Preserve MLX's affine qmv K reduction while sharing each packed word across a pair.
 const VERIFY_EXPERT_REUSE_SOURCE =
@@ -37900,7 +37907,7 @@ fn pairedGateUpArrayMatches(arr: mlx.mlx_array, dtype: mlx.mlx_dtype, dims: [3]c
 fn validatePairedGateUpPack(config: *const ModelConfig, layers_opt: ?[]MoeLayerWeights) !void {
     if (!config.isQwen4() or config.hidden_size != 2560 or config.moe_intermediate_size != 640 or
         config.num_experts != 512 or config.num_experts_per_tok != 10 or config.hidden_act != .silu or
-        config.swiglu_limit != 0.0 or !verifySharedHardware() or !swigluFusedEnabled())
+        config.swiglu_limit != 0.0 or !verifySharedCapable() or !swigluFusedEnabled())
         return error.PairedGateUpUnsupportedModel;
     const layers = layers_opt orelse return error.PairedGateUpMissingLayers;
     if (layers.len != 48) return error.PairedGateUpWrongLayerCount;
@@ -38345,14 +38352,42 @@ fn verifyIndexedExpertInput(s: mlx.mlx_stream, x: mlx.mlx_array, lhs: mlx.mlx_ar
     return view;
 }
 
+/// The fused verify kernels need an M5 GPU. A dual-die one (`...d`, the Ultra) gains from them
+/// only in a multi-stream group: they lift a batched verify and slow a solo one.
+pub fn verifySharedFor(arch: []const u8, group_rows: usize) bool {
+    if (!std.mem.startsWith(u8, arch, "applegpu_g17")) return false;
+    return !std.mem.endsWith(u8, arch, "d") or group_rows > 1;
+}
+
+fn verifyArch() ?[]const u8 {
+    if (!verify_arch_read) {
+        verify_arch_read = true;
+        verify_arch = gpuArchitecture(&verify_arch_buf);
+    }
+    return verify_arch;
+}
+
+/// Whether this GPU can run the fused verify kernels at all (load-time pack checks).
+pub fn verifySharedCapable() bool {
+    if (!verifyQmmNaxAvailable()) return false;
+    return std.mem.startsWith(u8, verifyArch() orelse return false, "applegpu_g17");
+}
+
+/// Whether the verify running now takes the fused kernels.
 pub fn verifySharedHardware() bool {
     if (!verifyQmmNaxAvailable()) return false;
-    if (verify_shared_arch) |value| return value;
-    var arch_buf: [128]u8 = undefined;
-    const arch = gpuArchitecture(&arch_buf) orelse return false;
-    const value = std.mem.startsWith(u8, arch, "applegpu_g17") and !std.mem.endsWith(u8, arch, "d");
-    verify_shared_arch = value;
-    return value;
+    return verifySharedFor(verifyArch() orelse return false, verify_group_rows);
+}
+
+test "verifySharedFor: dual-die M5 takes the fused verify kernels only for a multi-stream group" {
+    try std.testing.expect(verifySharedFor("applegpu_g17s", 0));
+    try std.testing.expect(verifySharedFor("applegpu_g17s", 4));
+    try std.testing.expect(!verifySharedFor("applegpu_g17d", 0));
+    try std.testing.expect(!verifySharedFor("applegpu_g17d", 1));
+    try std.testing.expect(verifySharedFor("applegpu_g17d", 2));
+    try std.testing.expect(verifySharedFor("applegpu_g17d", 4));
+    try std.testing.expect(!verifySharedFor("applegpu_g16d", 4));
+    try std.testing.expect(!verifySharedFor("applegpu_g16s", 0));
 }
 
 // Same subchunk and shuffle reduction as Apple's MLX qmv_wide_impl (MIT).
