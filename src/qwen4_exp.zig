@@ -1,9 +1,10 @@
 //! Qwen3.8-Flash-Next (`model_type` qwen4_exp) host-side pieces: the hashed
 //! n-gram embedding (PLE) id math and the mmapped quantized n-gram table.
 //!
-//! The 51B-parameter table (320M rows x 160) is never uploaded to the GPU:
+//! The 51B-parameter table (320M rows x 160) is never copied to the GPU:
 //! a token touches 16 rows, so the rows are dequantized from the mmap on the
-//! host and only the [T, 2560] result is sent. Memory cost = page cache.
+//! host and only the [T, 2560] result is sent, or (serial forwards, when the
+//! working set fits it) a kernel reads the mapping in place (`ple_gpu.zig`).
 //! Format: `ngram_table.bin` is a safetensors-format file holding one merged
 //! affine table (`weight` U32 [R, dim*bits/32], `scales`/`biases` BF16
 //! [R, dim/gs]) written by `tests/convert_qwen38_flash_next.py`, or one

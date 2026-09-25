@@ -432,3 +432,38 @@ test "ple gpu wrap: the mapping outlives the table until MLX drops its last refe
     _ = mlx.mlx_array_free(extra);
     try testing.expectEqual(before + 1, unmaps.load(.monotonic));
 }
+
+test "ple gpu: the real ngram table embeds bit-identical to the CPU gather past 4 GB offsets (QWEN4_TEST_MODEL)" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const model_mod = @import("model.zig");
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| a.free(p);
+    const h = try qwen4.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, config.ngram_eos);
+    qwen4.warm_override = false;
+    defer qwen4.warm_override = null;
+    var table = try qwen4.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable);
+    // Straight to `wrap`: this bar is the bits, not whether this Mac's working set fits the table.
+    const tbl = try wrap(table.map);
+    table.gpu_owns_map = true;
+    defer {
+        table.close();
+        tbl.release();
+    }
+    var prng = std.Random.DefaultPrng.init(11);
+    const r = prng.random();
+    const ids = try a.alloc(u32, 10_000);
+    defer a.free(ids);
+    for (ids) |*v| v.* = r.uintLessThan(u32, config.vocab_size);
+    for (ids[0..64]) |*v| v.* = config.ngram_eos;
+    const prev = [_]u32{ r.uintLessThan(u32, config.vocab_size), config.ngram_eos, 7, 7, 7, 7, 7 };
+    const rows = try a.alloc(i64, ids.len * h.n_heads);
+    defer a.free(rows);
+    h.rowIds(prev[0 .. h.ngram_size - 1], ids, rows);
+    const row_bytes: u64 = if (table.bits == 16) table.dim * 2 else table.wcols * 4;
+    try testing.expect(std.mem.max(i64, rows) * @as(i64, @intCast(row_bytes)) > 1 << 32);
+    try expectArmsEqual(tbl, &h, &table, prev[0 .. h.ngram_size - 1], ids);
+    try expectArmsEqual(tbl, &h, &table, prev[0 .. h.ngram_size - 1], ids[0..8192]);
+}
