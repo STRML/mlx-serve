@@ -73,9 +73,17 @@ fn onRelease(payload: ?*anyopaque) callconv(.c) void {
 
 const ROW: usize = 4096;
 
+/// `table`'s mapping as one no-copy GPU buffer. On success MLX owns the munmap, and the
+/// table stops unmapping it on close.
+pub fn wrap(table: *qwen4.NgramTable) !Table {
+    const t = try wrapMap(table.map);
+    table.gpu_owns_map = true;
+    return t;
+}
+
 /// `map` as one no-copy uint8 `[pages, 4096]` array (no dim past int32). The caller has
 /// checked the base and length (`chooseArm`); on success MLX owns the munmap.
-pub fn wrap(map: []const u8) !Table {
+fn wrapMap(map: []const u8) !Table {
     const page = std.heap.pageSize();
     if (@intFromPtr(map.ptr) % page != 0) return error.PleMapMisaligned;
     const len = std.mem.alignForward(usize, map.len, page);
@@ -116,11 +124,10 @@ pub fn load(table: *qwen4.NgramTable, env: ?[]const u8, model_bytes: u64) ?Table
         log.info("[qwen4] ple gather: cpu ({s}: weights {d:.1} GB + table {d:.1} GB + headroom {d:.0} GB vs working set {d:.1} GB, max buffer {d:.1} GB; MLX_SERVE_PLE_GPU=0 forces cpu)\n", .{ @tagName(arm), gb(model_bytes), gb(table.map.len), gb(HEADROOM), gb(b.working_set), gb(b.max_buffer) });
         return null;
     }
-    const tbl = wrap(table.map) catch |e| {
+    const tbl = wrap(table) catch |e| {
         log.warn("[qwen4] ple gather: cpu (no-copy wrap failed: {s})\n", .{@errorName(e)});
         return null;
     };
-    table.gpu_owns_map = true;
     log.info("[qwen4] ple gather: gpu (no-copy {d:.1} GB table buffer, weights {d:.1} GB, working set {d:.1} GB; MLX_SERVE_PLE_GPU=0 forces cpu)\n", .{ gb(table.map.len), gb(model_bytes), gb(b.working_set) });
     return tbl;
 }
@@ -307,7 +314,7 @@ test "ple gpu: 10k random ids embed bit-identical to the CPU gather on every hea
     const h = try testHash(3, 8);
     var fx = try writeFixture(4, h.total_rows, 64, 32, 1);
     defer fx.deinit();
-    const tbl = try wrap(fx.table.map);
+    const tbl = try wrap(&fx.table);
     defer tbl.release();
     var prng = std.Random.DefaultPrng.init(7);
     const ids = try testing.allocator.alloc(u32, 10_000);
@@ -322,7 +329,7 @@ test "ple gpu: an eos at every chunk position and inside prev hashes like rowIds
     const h = try testHash(4, 4);
     var fx = try writeFixture(4, h.total_rows, 64, 32, 2);
     defer fx.deinit();
-    const tbl = try wrap(fx.table.map);
+    const tbl = try wrap(&fx.table);
     defer tbl.release();
     var prng = std.Random.DefaultPrng.init(8);
     const r = prng.random();
@@ -354,7 +361,7 @@ test "ple gpu: every shipped width dequantizes like the CPU gather" {
         var fx = try writeFixture(bits, h.total_rows, 64, 32, 100 + bits);
         defer fx.deinit();
         try testing.expectEqual(bits, fx.table.bits);
-        const tbl = try wrap(fx.table.map);
+        const tbl = try wrap(&fx.table);
         defer tbl.release();
         try expectArmsEqual(tbl, &h, &fx.table, &prev, &ids);
     }
@@ -365,7 +372,7 @@ test "ple gpu: an 8192-token chunk that reaches the last table row matches the C
     const h = try testHash(3, 8);
     var fx = try writeFixture(4, h.total_rows, 64, 32, 3);
     defer fx.deinit();
-    const tbl = try wrap(fx.table.map);
+    const tbl = try wrap(&fx.table);
     defer tbl.release();
     var prng = std.Random.DefaultPrng.init(10);
     const ids = try testing.allocator.alloc(u32, 8192);
@@ -409,20 +416,19 @@ test "ple gpu wrap: the buffer IS the mapping, and a misaligned base never reach
     const h = try testHash(3, 8);
     var fx = try writeFixture(4, h.total_rows, 64, 32, 4);
     defer fx.deinit();
-    const tbl = try wrap(fx.table.map);
+    const tbl = try wrap(&fx.table);
     defer tbl.release();
     const d = mlx.mlx_array_data_uint8(tbl.arr) orelse return error.MlxArrayDataNull;
     try testing.expectEqual(@intFromPtr(fx.table.map.ptr), @intFromPtr(d));
     try testing.expect(mlx.mlx_array_size(tbl.arr) >= fx.table.map.len);
-    try testing.expectError(error.PleMapMisaligned, wrap(fx.table.map[16..]));
+    try testing.expectError(error.PleMapMisaligned, wrapMap(fx.table.map[16..]));
 }
 
 test "ple gpu wrap: the mapping outlives the table until MLX drops its last reference" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const h = try testHash(3, 8);
     var fx = try writeFixture(4, h.total_rows, 64, 32, 5);
-    const tbl = try wrap(fx.table.map);
-    fx.table.gpu_owns_map = true;
+    const tbl = try wrap(&fx.table);
     var extra = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_array_set(&extra, tbl.arr));
     const before = unmaps.load(.monotonic);
@@ -446,8 +452,7 @@ test "ple gpu: the real ngram table embeds bit-identical to the CPU gather past 
     defer qwen4.warm_override = null;
     var table = try qwen4.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable);
     // Straight to `wrap`: this bar is the bits, not whether this Mac's working set fits the table.
-    const tbl = try wrap(table.map);
-    table.gpu_owns_map = true;
+    const tbl = try wrap(&table);
     defer {
         table.close();
         tbl.release();
