@@ -1,0 +1,76 @@
+{
+ "title": "Qwen3.8-Flash-Next mixed-4-8bit, mlx-serve --mtp --mtp-typical 0.2",
+ "hardware": "Apple M5 Ultra, 256 GB, 64 GPU cores",
+ "x_label": "concurrent streams",
+ "method": "400-token code answers, greedy, lookup on, 3 rounds alternating arm order, median per point",
+ "arms": {
+  "main + #539 (fused kernels off on g17d)": {
+   "1": {
+    "aggregate_tps": 172.4,
+    "rounds": [
+     172.5,
+     172.4,
+     167.8
+    ]
+   },
+   "2": {
+    "aggregate_tps": 175.7,
+    "rounds": [
+     175.7,
+     175.7,
+     175.9
+    ]
+   },
+   "4": {
+    "aggregate_tps": 195.2,
+    "rounds": [
+     188.8,
+     195.2,
+     197.8
+    ]
+   },
+   "8": {
+    "aggregate_tps": 243.5,
+    "rounds": [
+     243.5,
+     238.1,
+     247.7
+    ]
+   }
+  },
+  "PR 534 (fused kernels for 2+ streams)": {
+   "1": {
+    "aggregate_tps": 172.1,
+    "rounds": [
+     172.3,
+     172.1,
+     172.0
+    ]
+   },
+   "2": {
+    "aggregate_tps": 183.1,
+    "rounds": [
+     183.2,
+     183.1,
+     182.5
+    ]
+   },
+   "4": {
+    "aggregate_tps": 220.7,
+    "rounds": [
+     220.7,
+     210.3,
+     227.0
+    ]
+   },
+   "8": {
+    "aggregate_tps": 247.1,
+    "rounds": [
+     247.6,
+     247.1,
+     246.9
+    ]
+   }
+  }
+ }
+}
