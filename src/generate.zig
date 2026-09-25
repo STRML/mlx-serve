@@ -5847,12 +5847,19 @@ pub const Generator = struct {
         return .{ .a = a, .t1 = t1, .h_prev = h_prev };
     }
 
-    /// `[n]` int32 ids from n `[1]` lazy ids of any integer dtype.
+    /// `[n]` int32 ids from n one-element lazy ids of any rank and integer dtype.
+    /// Draft producers disagree on rank ([1] from the head, [1,1] from a sampler).
     fn concatIds(out: *mlx.mlx_array, ids: []const mlx.mlx_array, s: mlx.mlx_stream) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (ids) |id| {
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_reshape(&flat, id, &[_]c_int{1}, 1, s));
+            try mlx.check(mlx.mlx_vector_array_append_value(vec, flat));
+        }
         var cat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(cat);
-        const vec = mlx.mlx_vector_array_new_data(ids.ptr, ids.len);
-        defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, s));
         try mlx.check(mlx.mlx_astype(out, cat, .int32, s));
     }
@@ -19034,8 +19041,11 @@ test "lazy predraft: the lazy verdict matches the host greedy verdict at zero, p
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const drafts_host = [_]i32{ 5, 6, 7 };
+    // Production draft ids come in mixed ranks ([1] from the head, [1,1] from a sampler).
     var drafts: [3]mlx.mlx_array = undefined;
-    for (&drafts, drafts_host) |*d, v| d.* = mlx.mlx_array_new_data(&v, &[_]c_int{1}, 1, .int32);
+    for (&drafts, drafts_host, 0..) |*d, v, i| {
+        d.* = if (i == 1) mlx.mlx_array_new_data(&v, &[_]c_int{ 1, 1 }, 2, .int32) else mlx.mlx_array_new_data(&v, &[_]c_int{1}, 1, .int32);
+    }
     defer for (drafts) |d| {
         _ = mlx.mlx_array_free(d);
     };
