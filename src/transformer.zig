@@ -11156,6 +11156,116 @@ test "qwen4 MTP head: N=1 FORCE_BATCHED draft ids and logits mlx_equal solo at d
     }
 }
 
+fn argmaxHost(alloc: std.mem.Allocator, logits: mlx.mlx_array, st: mlx.mlx_stream) !i32 {
+    const f = try qwen4ReadF32(alloc, logits, st);
+    defer alloc.free(f);
+    var best: f32 = -std.math.inf(f32);
+    var id: i32 = 0;
+    for (f, 0..) |x, i| if (x > best) {
+        best = x;
+        id = @intCast(i);
+    };
+    return id;
+}
+
+test "qwen4 MTP head: a history append padded to 2+m rows keeps the draft row bit-identical (QWEN4_TEST_MODEL)" {
+    // Bar: row a+1 of a 2+m-row append bit-equals the last row of the eager 2+a-row append.
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const allocator = t.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try t.expect(xfm.qwen4_mtp != null);
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+
+    var host_ids: [16]i32 = undefined;
+    for (&host_ids, 0..) |*v, i| v.* = @intCast(1000 + 37 * i);
+    const slot = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+    defer slot.deinit(allocator);
+    var stream = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(stream);
+    slot.ctx.capture_stream_all = &stream;
+    _ = mlx.mlx_array_free(try slot.forward(&xfm, host_ids[0..16]));
+
+    const H = struct {
+        fn rows(st: mlx.mlx_stream, arr: mlx.mlx_array, from: usize, to: usize) !mlx.mlx_array {
+            const sh = mlx.getShape(arr);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&out, arr, &[_]c_int{ 0, @intCast(from), 0 }, 3, &[_]c_int{ sh[0], @intCast(to), sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, st));
+            return out;
+        }
+        fn ids(v: []const i32) mlx.mlx_array {
+            const sh = [_]c_int{@intCast(v.len)};
+            return mlx.mlx_array_new_data(@ptrCast(v.ptr), &sh, 1, .int32);
+        }
+        // Head row j pairs token ids[j+1] with trunk stream row j; history is rows 0..4.
+        fn append(x: *Transformer, st: *Transformer.Qwen4MtpState, sa: mlx.mlx_array, all_ids: []const i32, from: usize, to: usize, sm: mlx.mlx_stream) !mlx.mlx_array {
+            const h = try rows(sm, sa, from, to);
+            defer _ = mlx.mlx_array_free(h);
+            const id = ids(all_ids[from + 1 .. to + 1]);
+            defer _ = mlx.mlx_array_free(id);
+            const po: c_int = @intCast(1 + from);
+            const out = try x.qwen4MtpForwardOn(st, h, id, po, null, .none);
+            return out.stream;
+        }
+        fn draftLogits(x: *Transformer, row: mlx.mlx_array) !mlx.mlx_array {
+            var mix = try x.hcRead(row, &x.qwen4_mtp.?.mixer, 1, 1);
+            defer mix.deinit();
+            return x.lmHeadProject(mix.mixed, false);
+        }
+    };
+
+    const base: usize = 4;
+    const m: usize = 5;
+    var mismatched: usize = 0;
+    for (0..m) |a| {
+        var eager = try xfm.qwen4MtpStateNew();
+        defer eager.deinit();
+        var padded = try xfm.qwen4MtpStateNew();
+        defer padded.deinit();
+        _ = mlx.mlx_array_free(try H.append(&xfm, &eager, stream, &host_ids, 0, base, s));
+        _ = mlx.mlx_array_free(try H.append(&xfm, &padded, stream, &host_ids, 0, base, s));
+        const se = try H.append(&xfm, &eager, stream, &host_ids, base, base + 2 + a, s);
+        defer _ = mlx.mlx_array_free(se);
+        const sp = try H.append(&xfm, &padded, stream, &host_ids, base, base + 2 + m, s);
+        defer _ = mlx.mlx_array_free(sp);
+        const row_e = try H.rows(s, se, 1 + a, 2 + a);
+        defer _ = mlx.mlx_array_free(row_e);
+        const row_p = try H.rows(s, sp, 1 + a, 2 + a);
+        defer _ = mlx.mlx_array_free(row_p);
+        const le = try H.draftLogits(&xfm, row_e);
+        defer _ = mlx.mlx_array_free(le);
+        const lp = try H.draftLogits(&xfm, row_p);
+        defer _ = mlx.mlx_array_free(lp);
+        var again = try xfm.qwen4MtpStateNew();
+        defer again.deinit();
+        _ = mlx.mlx_array_free(try H.append(&xfm, &again, stream, &host_ids, 0, base, s));
+        const sa2 = try H.append(&xfm, &again, stream, &host_ids, base, base + 2 + a, s);
+        defer _ = mlx.mlx_array_free(sa2);
+        const row0_e = try H.rows(s, se, 0, 1);
+        defer _ = mlx.mlx_array_free(row0_e);
+        const row0_p = try H.rows(s, sp, 0, 1);
+        defer _ = mlx.mlx_array_free(row0_p);
+        std.debug.print("[mtp pad] a={d} eager_repeat_equal={} row0_equal={} id_e={d} id_p={d}\n", .{ a, try qsaArraysAllEqual(se, sa2, s), try qsaArraysAllEqual(row0_e, row0_p, s), try argmaxHost(allocator, le, s), try argmaxHost(allocator, lp, s) });
+        const same_stream = try qsaArraysAllEqual(row_e, row_p, s);
+        const same_logits = try qsaArraysAllEqual(le, lp, s);
+        std.debug.print("[mtp pad] a={d} m={d} stream_equal={} logits_equal={} stream_maxdiff={d} logits_maxdiff={d}\n", .{ a, m, same_stream, same_logits, try attn256MaxDiff(row_e, row_p, s), try attn256MaxDiff(le, lp, s) });
+        if (!same_stream or !same_logits) mismatched += 1;
+    }
+    try t.expectEqual(@as(usize, 0), mismatched);
+}
+
 test "MTP head row widths pick the verify lane, the MoE arm and the QSA score kernel" {
     const t = std.testing;
     try t.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 248320, false, 8, false));
