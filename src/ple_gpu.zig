@@ -23,16 +23,25 @@ pub const HEADROOM: u64 = 16 << 30;
 
 /// Kernel dispatches since start; the engagement counter the tests read.
 pub var dispatches: u64 = 0;
-/// Mappings MLX has unmapped after dropping their buffer.
-pub var unmaps: u64 = 0;
+/// Mappings unmapped by MLX dropping their buffer (MLX may drop it off the inference thread).
+pub var unmaps = std.atomic.Value(u64).init(0);
 
 pub fn chooseArm(env: ?[]const u8, bits: u32, base: usize, len: usize, b: Budget) Arm {
-    _ = env;
-    _ = bits;
-    _ = base;
-    _ = len;
-    _ = b;
+    if (env) |v| if (std.mem.eql(u8, v, "0")) return .env_off;
+    if (!kernelBits(bits)) return .bits;
+    // MLX falls back to a malloc + copy of the WHOLE table when Metal refuses the no-copy buffer.
+    if (b.page == 0 or base % b.page != 0) return .misaligned;
+    const bytes = std.mem.alignForward(u64, len, b.page);
+    if (bytes > b.max_buffer) return .too_large;
+    if (b.model_bytes +| bytes +| HEADROOM > b.working_set) return .low_memory;
     return .gpu;
+}
+
+fn kernelBits(bits: u32) bool {
+    return switch (bits) {
+        2, 3, 4, 5, 6, 8, 16 => true,
+        else => false,
+    };
 }
 
 pub const Table = struct {
@@ -43,30 +52,140 @@ pub const Table = struct {
     }
 };
 
+/// What MLX's deleter unmaps. `armed` stays false until `wrap` proved the buffer is the
+/// mapping: MLX's copy fallback calls the deleter at once, while the host gather still reads it.
+const Mapping = struct {
+    map: []align(std.heap.page_size_min) const u8,
+    armed: bool = false,
+    fired: bool = false,
+};
+
+fn onRelease(payload: ?*anyopaque) callconv(.c) void {
+    const m: *Mapping = @ptrCast(@alignCast(payload.?));
+    if (!m.armed) {
+        m.fired = true;
+        return;
+    }
+    std.posix.munmap(m.map);
+    _ = unmaps.fetchAdd(1, .monotonic);
+    std.heap.page_allocator.destroy(m);
+}
+
+const ROW: usize = 4096;
+
+/// `map` as one no-copy uint8 `[pages, 4096]` array (no dim past int32). The caller has
+/// checked the base and length (`chooseArm`); on success MLX owns the munmap.
 pub fn wrap(map: []const u8) !Table {
-    _ = map;
-    return error.Unimplemented;
+    const page = std.heap.pageSize();
+    if (@intFromPtr(map.ptr) % page != 0) return error.PleMapMisaligned;
+    const len = std.mem.alignForward(usize, map.len, page);
+    if (len / ROW > std.math.maxInt(c_int)) return error.PleMapTooLarge;
+    const m = try std.heap.page_allocator.create(Mapping);
+    errdefer std.heap.page_allocator.destroy(m);
+    m.* = .{ .map = @alignCast(map) };
+    const shape = [_]c_int{ @intCast(len / ROW), @intCast(ROW) };
+    const arr = mlx.mlx_array_new_data_managed_payload(@constCast(map.ptr), &shape, 2, .uint8, m, onRelease);
+    if (arr.ctx == null) return error.PleWrapFailed;
+    if (m.fired) {
+        _ = mlx.mlx_array_free(arr);
+        return error.PleWrapCopied;
+    }
+    m.armed = true;
+    return .{ .arr = arr };
+}
+
+fn gb(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / 1073741824.0;
 }
 
 /// Load-time arm choice for `table`; logs one line naming the arm. `env` is `MLX_SERVE_PLE_GPU`,
 /// `model_bytes` the weights already resident. Null = the host gather.
 pub fn load(table: *qwen4.NgramTable, env: ?[]const u8, model_bytes: u64) ?Table {
-    _ = table;
-    _ = env;
-    _ = model_bytes;
-    return null;
+    if (mlx.noGpuBackend()) {
+        log.info("[qwen4] ple gather: cpu (no GPU backend)\n", .{});
+        return null;
+    }
+    const b: Budget = .{
+        .page = std.heap.pageSize(),
+        .max_buffer = mlx.maxBufferLength(),
+        .working_set = mlx.maxRecommendedWorkingSet(),
+        .model_bytes = model_bytes,
+    };
+    const arm = chooseArm(env, table.bits, @intFromPtr(table.map.ptr), table.map.len, b);
+    if (arm != .gpu) {
+        log.info("[qwen4] ple gather: cpu ({s}: weights {d:.1} GB + table {d:.1} GB + headroom {d:.0} GB vs working set {d:.1} GB, max buffer {d:.1} GB; MLX_SERVE_PLE_GPU=0 forces cpu)\n", .{ @tagName(arm), gb(model_bytes), gb(table.map.len), gb(HEADROOM), gb(b.working_set), gb(b.max_buffer) });
+        return null;
+    }
+    const tbl = wrap(table.map) catch |e| {
+        log.warn("[qwen4] ple gather: cpu (no-copy wrap failed: {s})\n", .{@errorName(e)});
+        return null;
+    };
+    table.gpu_owns_map = true;
+    log.info("[qwen4] ple gather: gpu (no-copy {d:.1} GB table buffer, weights {d:.1} GB, working set {d:.1} GB; MLX_SERVE_PLE_GPU=0 forces cpu)\n", .{ gb(table.map.len), gb(model_bytes), gb(b.working_set) });
+    return tbl;
 }
+
+var kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getKernel() !mlx.mlx_fast_metal_kernel {
+    if (kernel) |k| return k;
+    const in_names = [_][*:0]const u8{ "table", "ids", "prev", "params" };
+    const out_names = [_][*:0]const u8{"out"};
+    const ins = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
+    defer _ = mlx.mlx_vector_string_free(ins);
+    const outs = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
+    defer _ = mlx.mlx_vector_string_free(outs);
+    const k = mlx.mlx_fast_metal_kernel_new("msv_ple_gather", ins, outs, @embedFile("kernels/ple_gather.metal"), @embedFile("kernels/ple_gather_header.metal"), true, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    kernel = k;
+    return k;
+}
+
+/// `params` slots the kernel reads; the three tables sit at their `P_*` offsets.
+const P_MULT = 13;
+const P_VOCAB = P_MULT + qwen4.MAX_NGRAM_SIZE;
+const P_OFFSETS = P_VOCAB + qwen4.MAX_HEADS;
+const P_LEN = P_OFFSETS + qwen4.MAX_HEADS;
 
 /// bf16 `[S, n_heads * dim]` for the `S` ids of `ids` (any integer dtype, may be lazy),
 /// hashed against `prev` (the `ngram_size - 1` tokens before them). GPU stream only.
 pub fn embed(s: mlx.mlx_stream, tbl: Table, h: *const qwen4.NgramHash, t: *const qwen4.NgramTable, ids: mlx.mlx_array, prev: []const u32) !mlx.mlx_array {
-    _ = s;
-    _ = tbl;
-    _ = h;
-    _ = t;
-    _ = ids;
-    _ = prev;
-    return error.Unimplemented;
+    std.debug.assert(prev.len == h.ngram_size - 1);
+    const n: usize = mlx.mlx_array_size(ids);
+    const width: usize = @as(usize, h.n_heads) * t.dim;
+    if (n * width > std.math.maxInt(c_int)) return error.PleChunkTooWide;
+    var p: [P_LEN]i64 = @splat(0);
+    const head = [_]i64{ @intCast(n), h.n_heads, h.heads_per_ngram, h.ngram_size, h.eos, t.dim, t.bits, t.group_size, t.wcols, t.scols, @intCast(t.w_off), @intCast(t.s_off), @intCast(t.b_off) };
+    @memcpy(p[0..P_MULT], &head);
+    @memcpy(p[P_MULT..P_VOCAB], &h.multipliers);
+    @memcpy(p[P_VOCAB..P_OFFSETS], &h.vocab);
+    @memcpy(p[P_OFFSETS..P_LEN], &h.offsets);
+    const params = mlx.mlx_array_new_data(&p, &[_]c_int{P_LEN}, 1, .int64);
+    defer _ = mlx.mlx_array_free(params);
+    var prev_i: [qwen4.MAX_NGRAM_SIZE]i32 = undefined;
+    for (prev, 0..) |v, k| prev_i[k] = @intCast(v);
+    const prev_arr = mlx.mlx_array_new_data(&prev_i, &[_]c_int{@intCast(prev.len)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(prev_arr);
+    var ids_i = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids_i);
+    try mlx.check(mlx.mlx_astype(&ids_i, ids, .int32, s));
+
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const shape = [_]c_int{ @intCast(n), @intCast(width) };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, 2, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(n * width), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    const ins = mlx.mlx_vector_array_new_data(&.{ tbl.arr, ids_i, prev_arr, params }, 4);
+    defer _ = mlx.mlx_vector_array_free(ins);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, try getKernel(), ins, cfg, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, outs, 0));
+    dispatches += 1;
+    return out;
 }
 
 // ── tests ──
@@ -306,10 +425,10 @@ test "ple gpu wrap: the mapping outlives the table until MLX drops its last refe
     fx.table.gpu_owns_map = true;
     var extra = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_array_set(&extra, tbl.arr));
-    const before = unmaps;
+    const before = unmaps.load(.monotonic);
     fx.deinit(); // closes the table: fd and pool go, the mapping stays
     tbl.release();
-    try testing.expectEqual(before, unmaps);
+    try testing.expectEqual(before, unmaps.load(.monotonic));
     _ = mlx.mlx_array_free(extra);
-    try testing.expectEqual(before + 1, unmaps);
+    try testing.expectEqual(before + 1, unmaps.load(.monotonic));
 }
