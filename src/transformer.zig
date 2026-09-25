@@ -62769,8 +62769,11 @@ test "weightsHaveDenseAttnProj: decode-attn-quant applies only to a dense text a
 
 // ── qwen4 PLE: the GPU arm against the host gather (synthetic table, no model) ──
 
-/// A zeroed Transformer carrying only what `pleEmbedding` reads, over a synthetic 4-bit table
-/// loaded through `ple_gpu.load`. `arm(false)` hides the table buffer to run the host gather.
+/// A zeroed Transformer carrying only what `pleEmbedding` reads, over a synthetic 4-bit table.
+/// With `env` the table goes through `ple_gpu.load`, so the env switch is what is tested;
+/// without it the table is wrapped directly, because `load`'s working-set gate (table plus
+/// 16 GB headroom) rightly picks the host gather on a small CI runner, and these tests are
+/// about the arms, not the gate. `arm(false)` hides the table buffer to run the host gather.
 const PleArmFixture = struct {
     fx: ple_gpu.Fixture,
     st: qwen4_mod.Qwen4State,
@@ -62782,7 +62785,7 @@ const PleArmFixture = struct {
     fn init(self: *PleArmFixture, env: ?[]const u8) !void {
         const hash = try qwen4_mod.NgramHash.init(1000, 3, 8, 500, 1, 1234, 0, 999);
         self.fx = try ple_gpu.writeFixture(4, hash.total_rows, 64, 32, 21);
-        self.gpu = ple_gpu.load(&self.fx.table, env, 0);
+        self.gpu = if (env != null) ple_gpu.load(&self.fx.table, env, 0) else try ple_gpu.wrap(&self.fx.table);
         self.st = .{ .hash = hash, .table = self.fx.table, .gpu = self.gpu };
         self.xfm_bytes = @splat(0);
         self.cache_bytes = @splat(0);
