@@ -7422,9 +7422,11 @@ pub const Generator = struct {
         // Fill the deferred PLE leaf: the one host read of the verify ids, and
         // the point at which the entry's n-gram history + `spec_ple_tokens`
         // advance. Must precede BOTH the first eval of anything downstream of
-        // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5).
+        // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5). The GPU
+        // arm has no leaf: its history settles from the draft read in the
+        // finish, still before Phase 5, so this round reads no ids here.
         errdefer xfm.discardDeferredPle(&self.ctx);
-        try xfm.flushDeferredPle(&self.ctx);
+        if (!Transformer.deferredPleOnGpu(&self.ctx)) try xfm.flushDeferredPle(&self.ctx);
         st.verify_logits = verify_logits;
         st.new_hidden = new_hidden;
         st.verify_hidden_all = verify_hidden_all;
@@ -7641,6 +7643,9 @@ pub const Generator = struct {
         st.new_hidden = .{ .ctx = null };
         errdefer _ = mlx.mlx_array_free(new_hidden);
         const verify_hidden_all = st.verify_hidden_all;
+        // A GPU-arm verify still owes its PLE history (`mtpRoundVerify`); a round that
+        // exits before the draft read drops it with the verify.
+        defer xfm.discardDeferredPle(&self.ctx);
         // Always free the transient capture buffers before returning, however
         // we exit this round (full accept, partial accept, or error).
         defer if (self.ctx.ssm_entries) |entries| {
@@ -7893,6 +7898,15 @@ pub const Generator = struct {
             var v: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&v, arr));
             drafts[idx] = @intCast(v);
+        }
+        if (Transformer.deferredPleOnGpu(&self.ctx)) {
+            // The verify ids are `[t1, drafts]`, read just above: the PLE history moves here,
+            // before Phase 5 rolls it back.
+            const verify_ids = try allocator.alloc(u32, 1 + m);
+            defer allocator.free(verify_ids);
+            verify_ids[0] = t1;
+            @memcpy(verify_ids[1..], drafts[0..m]);
+            try xfm.settleDeferredPle(&self.ctx, verify_ids);
         }
         if (!stochastic) {
             // Separate graph branch from the draft chain — force it before
