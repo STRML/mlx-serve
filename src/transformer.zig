@@ -22131,13 +22131,6 @@ pub const Transformer = struct {
         if (ctx.mrope_cos_cur) |cos| {
             _ = mlx.mlx_array_free(q_rope);
             q_rope = try self.applyMrope(qt, cos, ctx.mrope_sin_cur.?, rope_dims);
-        } else if (ctx.head_rope_pos.ctx != null) {
-            const use_yarn = self.yarnActive();
-            try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, qt, rope_dims, false, mlx.mlx_optional_float{
-                .value = cfg.rope_theta,
-                .has_value = !use_yarn,
-            }, 1.0, ctx.head_rope_pos, if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null }, self.s));
-            if (use_yarn) try self.yarnScaleRotated(&q_rope, rope_dims);
         } else {
             const eff_off: c_int = pos_base + offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
             // The SAME spectrum attention rotates with (scaled when the config
@@ -22150,10 +22143,12 @@ pub const Transformer = struct {
             // fillCosSin; this scalar arm must too. Never yarnScaleQK here
             // (that table is [head_dim] = 256). Keep mlx_fast_rope scale=1.0.
             const use_yarn = self.yarnActive();
-            try mlx.check(mlx.mlx_fast_rope(&q_rope, qt, rope_dims, false, mlx.mlx_optional_float{
-                .value = cfg.rope_theta,
-                .has_value = !use_yarn,
-            }, 1.0, eff_off, if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null }, self.s));
+            const freqs: mlx.mlx_array = if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null };
+            if (ctx.head_rope_pos.ctx != null) {
+                try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, qt, rope_dims, false, .{ .value = cfg.rope_theta, .has_value = !use_yarn }, 1.0, ctx.head_rope_pos, freqs, self.s));
+            } else {
+                try mlx.check(mlx.mlx_fast_rope(&q_rope, qt, rope_dims, false, .{ .value = cfg.rope_theta, .has_value = !use_yarn }, 1.0, eff_off, freqs, self.s));
+            }
             if (use_yarn) try self.yarnScaleRotated(&q_rope, rope_dims);
         }
 

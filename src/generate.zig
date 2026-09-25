@@ -331,6 +331,22 @@ pub const MtpHeadRef = union(enum) {
         };
     }
 
+    /// One draft row past a padded history append (`Transformer.HeadPlace`); qwen4 only.
+    pub fn forwardPlaced(self: MtpHeadRef, cache: *MtpCacheRef, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, place: *const Transformer.HeadPlace, want: mtp_mod.StepWant) !mtp_mod.StepOut {
+        const t = switch (self) {
+            .qwen => return error.MtpPlacement,
+            .qwen4 => |t| t,
+        };
+        cache.activate();
+        const project: Transformer.Qwen4MtpProject = switch (want) {
+            .logits => .last_row,
+            .mixed => .mixed_last_row,
+            .none => .none,
+        };
+        const out = try t.qwen4MtpForwardPlaced(hidden, id_arr, place, project);
+        return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
+    }
+
     /// Append committed history without projecting logits.
     pub fn appendHistory(
         self: MtpHeadRef,
@@ -5483,10 +5499,17 @@ pub const Generator = struct {
         /// mtp_off0). The consume-time truncate drops the producing round's
         /// stale draft tail past it.
         off0: usize,
+        /// The whole verify row `[t1, drafts[0..m]]` and its `[1, 1+m, H]` hiddens, for a
+        /// padded append (`mtpPaddedHistory`); `ids`/`hidden` are its first `n` rows.
+        pad: ?struct { ids: mlx.mlx_array, hidden: mlx.mlx_array, rows: usize } = null,
 
         pub fn deinit(self: *MtpHistStash) void {
             _ = mlx.mlx_array_free(self.ids);
             _ = mlx.mlx_array_free(self.hidden);
+            if (self.pad) |p| {
+                _ = mlx.mlx_array_free(p.ids);
+                _ = mlx.mlx_array_free(p.hidden);
+            }
         }
     };
 
@@ -5576,9 +5599,12 @@ pub const Generator = struct {
         /// Drafts are a context continuation (`mtpLookupChain`): nothing to
         /// build, and no MTP statistics are fed.
         lookup: bool = false,
+        /// Set when step 0 consumed a padded history append: every draft step sits past its dead rows.
+        place: ?Transformer.HeadPlace = null,
 
         pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
             _ = mlx.mlx_array_free(self.t1_arr);
+            if (self.place) |p| _ = mlx.mlx_array_free(p.live_end);
             for (self.draft_arrs[0..self.n_drafted]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(self.draft_arrs);
             if (self.conf_arrs) |slots| {
@@ -5743,6 +5769,50 @@ pub const Generator = struct {
         };
     }
 
+    /// `MLX_SERVE_MTP_PADDED_HEAD=0` keeps the merged `1 + accepted` history step.
+    pub var mtp_padded_head_override: ?bool = null;
+    var mtp_padded_head_cache: ?bool = null;
+    fn mtpPaddedHeadEnabled() bool {
+        if (mtp_padded_head_override) |v| return v;
+        if (mtp_padded_head_cache) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_MTP_PADDED_HEAD");
+        mtp_padded_head_cache = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+        return mtp_padded_head_cache.?;
+    }
+
+    /// Does this request's head append the whole verify row as history and draft past its
+    /// dead rows (`Transformer.HeadPlace`)? The qwen4 head, solo, text-only.
+    fn mtpPaddedHistory(self: *const Generator) bool {
+        if (!mtpPaddedHeadEnabled() or self.mtp_batch_head) return false;
+        if (self.mtp.? != .qwen4) return false;
+        return self.mtpMropeContext() == null;
+    }
+
+    /// Consume the stash as a padded `1+m`-row history append and place `chain` past it.
+    fn mtpPaddedHistoryAppend(self: *Generator, chain: *MtpPreDraft) !void {
+        const mc = &self.mtp_cache.?;
+        var st = self.mtp_hist_stash.?;
+        self.mtp_hist_stash = null;
+        defer st.deinit();
+        const pad = st.pad.?;
+        try mc.truncate(st.off0, self.xfm.s);
+        const out = try self.mtp.?.forward(self.xfm, mc, pad.ids, pad.hidden, @intCast(st.off0), .none, null);
+        if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
+        if (out.hidden_next.ctx != null) _ = mlx.mlx_array_free(out.hidden_next);
+        if (out.rerank_x.ctx != null) _ = mlx.mlx_array_free(out.rerank_x);
+        chain.place = .{
+            .live_end = mlx.mlx_array_new_int(@intCast(st.off0 + st.n)),
+            .dead_end = @intCast(st.off0 + pad.rows),
+        };
+        const Once = struct {
+            var logged = false;
+        };
+        if (!Once.logged) {
+            Once.logged = true;
+            log.info("[mtp] padded head history engaged (MLX_SERVE_MTP_PADDED_HEAD=0 restores the merged step)\n", .{});
+        }
+    }
+
     /// Build draft steps [from..to) of `chain` — graph construction only, no
     /// sync; the caller dispatches. Each step's sampled token ([1] lazy
     /// array) feeds the next step's embedding lookup; the MTP post-norm
@@ -5775,7 +5845,12 @@ pub const Generator = struct {
             // append: both skip the vocab projection, but the draft still needs
             // the vector that projection would have consumed.
             const want: mtp_mod.StepWant = if (use_rerank) .mixed else .logits;
-            var step_out = if (i == 0 and self.mtp_hist_stash != null) blk: {
+            if (i == 0 and self.mtp_hist_stash != null and self.mtp_hist_stash.?.pad != null and self.mtpPaddedHistory()) {
+                try self.mtpPaddedHistoryAppend(chain);
+            }
+            var step_out = if (chain.place) |*place|
+                try head.forwardPlaced(mc, prev_tok_arr, h_prev_arg, place, want)
+            else if (i == 0 and self.mtp_hist_stash != null) blk: {
                 // Deferred history append (stashed at the END of the
                 // previous round, Phase 5a) merged into this chain's first
                 // draft: ONE (n+1)-row head forward appends the
@@ -6781,7 +6856,8 @@ pub const Generator = struct {
     /// stash so the head history is complete up to the block. Idempotent.
     pub fn mtpDetachHead(self: *Generator, allocator: std.mem.Allocator, apply_stash: bool) !void {
         if (self.mtp_pre_draft) |*pd| {
-            if (self.mtp_planner_owned) try self.mtp_cache.?.truncate(self.mtpCommittedHistoryLen(), self.xfm.s);
+            // A placed chain left dead history rows past the committed end: never keep them.
+            if (self.mtp_planner_owned or pd.place != null) try self.mtp_cache.?.truncate(self.mtpCommittedHistoryLen(), self.xfm.s);
             pd.deinit(allocator);
             self.mtp_pre_draft = null;
         }
@@ -7597,6 +7673,28 @@ pub const Generator = struct {
         }
     }
 
+    /// The whole verify row as head history: ids `[t1, drafts]`, hiddens `last_hidden ++ verify[0..m]`.
+    fn mtpPaddedStash(self: *Generator, allocator: std.mem.Allocator, t1: u32, drafts: []const u32, verify_hidden_all: mlx.mlx_array) !@FieldType(MtpHistStash, "pad") {
+        const s = self.xfm.s;
+        const rows = 1 + drafts.len;
+        const ids_buf = try allocator.alloc(i32, rows);
+        defer allocator.free(ids_buf);
+        ids_buf[0] = @intCast(t1);
+        for (drafts, ids_buf[1..]) |d, *v| v.* = @intCast(d);
+        const ids = mlx.mlx_array_new_data(ids_buf.ptr, &[_]c_int{@intCast(rows)}, 1, .int32);
+        errdefer _ = mlx.mlx_array_free(ids);
+        const vh_shape = mlx.getShape(verify_hidden_all);
+        var vh = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(vh);
+        try mlx.check(mlx.mlx_slice(&vh, verify_hidden_all, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, @intCast(drafts.len), vh_shape[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        const parts = [_]mlx.mlx_array{ self.last_hidden, vh };
+        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var hidden = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&hidden, vec, 1, s));
+        return .{ .ids = ids, .hidden = hidden, .rows = rows };
+    }
+
     /// Phases 4–5 of a round: accept, stash the history, commit or roll back.
     /// `st.verify_len` may exceed `1 + m` when a batched group padded the row;
     /// then even a full accept takes the rollback arm (KV + SSM clamp to `1 + m`).
@@ -7989,6 +8087,11 @@ pub const Generator = struct {
             const id_shape = [_]c_int{@intCast(1 + n_commit)};
             const stash_ids = mlx.mlx_array_new_data(ids_i32.ptr, &id_shape, 1, .int32);
             errdefer _ = mlx.mlx_array_free(stash_ids);
+            const pad = if (self.mtpPaddedHistory()) try self.mtpPaddedStash(allocator, t1, drafts[0..m], verify_hidden_all) else null;
+            errdefer if (pad) |p| {
+                _ = mlx.mlx_array_free(p.ids);
+                _ = mlx.mlx_array_free(p.hidden);
+            };
 
             var hist_hidden = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(hist_hidden);
@@ -8013,6 +8116,7 @@ pub const Generator = struct {
                 .hidden = hist_hidden,
                 .n = 1 + n_commit,
                 .off0 = mtp_off0,
+                .pad = pad,
             };
         }
         if (tracing) {
@@ -18944,6 +19048,9 @@ const MtpChainTestSlot = struct {
 test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    // Group builders keep the merged history step; the solo arm must draft the same way.
+    Generator.mtp_padded_head_override = false;
+    defer Generator.mtp_padded_head_override = null;
     const predraft = Generator.mtp_predraft_cache;
     const forced = Generator.mtp_force_depth_cache;
     const planner = group_planner.enabled_override;
@@ -19452,6 +19559,9 @@ test "cold grouped MTP head seeds the solo position and preserves valid origins"
 test "cold grouped MTP rounds detach and resume exactly like solo heads" {
     const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    // Group builders keep the merged history step; the solo arm must draft the same way.
+    Generator.mtp_padded_head_override = false;
+    defer Generator.mtp_padded_head_override = null;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, a, std.mem.span(path));
