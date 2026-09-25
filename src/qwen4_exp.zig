@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const log = @import("log.zig");
+const ple_gpu = @import("ple_gpu.zig");
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const SPLITMIX_GAMMA: u64 = 0x9E3779B97F4A7C15;
@@ -197,6 +198,9 @@ pub const NgramTable = struct {
     warm_thread: ?std.Thread = null,
     warm_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     warm_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Set once `ple_gpu.wrap` hands the mapping to a no-copy Metal buffer: MLX unmaps it
+    /// when its last reference drops, so a kernel still in flight never reads freed pages.
+    gpu_owns_map: bool = false,
 
     pub fn open(path: []const u8) !NgramTable {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -365,7 +369,7 @@ pub const NgramTable = struct {
         self.pool = null;
         if (self.fd >= 0) _ = std.c.close(self.fd);
         self.fd = -1;
-        std.posix.munmap(self.map);
+        if (!self.gpu_owns_map) std.posix.munmap(self.map);
     }
 
     const WARM_CHUNK: usize = 8 << 20;
@@ -688,6 +692,12 @@ pub fn bf16ToF32(u: u16) f32 {
     return @bitCast(@as(u32, u) << 16);
 }
 
+/// Round-to-nearest-even f32 -> bf16 bits, the PLE rows' upload format.
+pub fn bf16Rne(v: f32) u16 {
+    const u: u32 = @bitCast(v);
+    return @intCast((u +% 0x7FFF +% ((u >> 16) & 1)) >> 16);
+}
+
 // ── tests ──
 
 const testing = std.testing;
@@ -826,9 +836,13 @@ test "ngram table raw bf16 rows copy out converted without scales" {
 pub const Qwen4State = struct {
     hash: NgramHash,
     table: NgramTable,
+    /// The table as one no-copy GPU buffer; null = the host gather serves every forward.
+    gpu: ?ple_gpu.Table = null,
 
     pub fn deinit(self: *Qwen4State) void {
         self.table.close();
+        if (self.gpu) |g| g.release();
+        self.gpu = null;
     }
 };
 

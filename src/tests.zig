@@ -38,6 +38,7 @@ test {
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");
+    _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");
     _ = @import("laya.zig");
     _ = @import("kokoro_g2p.zig");

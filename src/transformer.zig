@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
+const ple_gpu = @import("ple_gpu.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
 // (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
 // so has no head-shaped state of its own. mtp.zig imports this file back for
@@ -8744,6 +8745,14 @@ pub fn claimPleSpecCapture(entry: *SSMCacheEntry, n: usize, ctx_len: usize, capt
     return false;
 }
 
+/// A partial accept's n-gram history: the `ngram_size - 1` verify tokens ending at `t1` plus
+/// `accepted` drafts, read off the capture's `prev ++ ids`.
+pub fn plePrevAfterAccept(entry: *SSMCacheEntry, accepted: u32, verify_len: u32) void {
+    const ctx_len: usize = @as(usize, entry.spec_ple_len) - @as(usize, verify_len);
+    for (0..ctx_len) |i| entry.ple_prev[i] = entry.spec_ple_tokens[1 + accepted + i];
+    entry.ple_prev_valid = true;
+}
+
 pub fn fillPleSpecTokens(entry: *SSMCacheEntry, prev: []const u32, ids: []const u32) void {
     const ctx_len = prev.len;
     for (0..ctx_len) |i| entry.spec_ple_tokens[i] = prev[i];
@@ -8827,9 +8836,7 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
         const owned = try materializedOwnedCopy(s, view);
         ssmFreeQsaState(entry);
         entry.aux_state = owned;
-        const ctx_len: usize = @as(usize, entry.spec_ple_len) - @as(usize, verify_len);
-        for (0..ctx_len) |i| entry.ple_prev[i] = entry.spec_ple_tokens[1 + accepted + i];
-        entry.ple_prev_valid = true;
+        plePrevAfterAccept(entry, accepted, verify_len);
         patch_aux = true;
     } else if ((entry.aux_state.ctx != null or entry.qsa_pooled.ctx != null) and entry.conv_state.ctx == null) {
         const hist = qsaHistoryRows(entry);
@@ -13652,6 +13659,8 @@ pub const PlePending = struct {
     /// this gather has not run yet, and `spec_capture_ssm` is already back to
     /// false by the time the flush happens.
     capture: bool,
+    /// GPU arm: `emb` is the kernel's output, not a leaf; only the history is owed.
+    gpu: bool = false,
 };
 
 /// The QSA pooled-block RoPE tables, shared by every full-attention layer and across
@@ -20999,6 +21008,13 @@ pub const Transformer = struct {
                 if (verify_fail_after_flush == k) return error.InjectedGroupFlushFailure;
             }
         }
+    }
+
+    pub fn settleDeferredPle(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !void {
+        _ = self;
+        _ = ctx;
+        _ = ids;
+        return error.Unimplemented;
     }
 
     /// Drop a pending leaf without filling it (the forward that built on it
@@ -62664,4 +62680,229 @@ test "weightsHaveDenseAttnProj: decode-attn-quant applies only to a dense text a
     defer inkling.deinit();
     try put(&inkling, "model.layers.0.attn.wo_ud.weight", .bfloat16, s);
     try std.testing.expect(weightsHaveDenseAttnProj(&inkling));
+}
+
+// ── qwen4 PLE: the GPU arm against the host gather (synthetic table, no model) ──
+
+/// A zeroed Transformer carrying only what `pleEmbedding` reads, over a synthetic 4-bit table
+/// loaded through `ple_gpu.load`. `arm(false)` hides the table buffer to run the host gather.
+const PleArmFixture = struct {
+    fx: ple_gpu.Fixture,
+    st: qwen4_mod.Qwen4State,
+    gpu: ?ple_gpu.Table,
+    xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)),
+    cache_bytes: [@sizeOf(KVCache)]u8 align(@alignOf(KVCache)),
+    off: usize,
+
+    fn init(self: *PleArmFixture, env: ?[]const u8) !void {
+        const hash = try qwen4_mod.NgramHash.init(1000, 3, 8, 500, 1, 1234, 0, 999);
+        self.fx = try ple_gpu.writeFixture(4, hash.total_rows, 64, 32, 21);
+        self.gpu = ple_gpu.load(&self.fx.table, env, 0);
+        self.st = .{ .hash = hash, .table = self.fx.table, .gpu = self.gpu };
+        self.xfm_bytes = @splat(0);
+        self.cache_bytes = @splat(0);
+        self.off = 0;
+        const x = self.xfm();
+        x.allocator = testing.allocator;
+        x.s = mlx.gpuStream();
+        x.qwen4 = &self.st;
+    }
+
+    fn deinit(self: *PleArmFixture) void {
+        self.st.gpu = self.gpu;
+        self.st.deinit();
+        self.fx.td.cleanup();
+    }
+
+    fn xfm(self: *PleArmFixture) *Transformer {
+        return @ptrCast(&self.xfm_bytes);
+    }
+
+    fn ctx(self: *PleArmFixture) ForwardCtx {
+        return .{ .cache = @ptrCast(&self.cache_bytes), .moe_seq_offset = &self.off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    }
+
+    fn arm(self: *PleArmFixture, on_gpu: bool) !void {
+        if (on_gpu and self.gpu == null) return error.NoGpuArm;
+        self.st.gpu = if (on_gpu) self.gpu else null;
+    }
+};
+
+fn pleArmEntry() SSMCacheEntry {
+    return .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
+}
+
+fn pleArmIds(ids: []const u32, batch: c_int) mlx.mlx_array {
+    var buf: [64]i32 = undefined;
+    for (ids, 0..) |v, i| buf[i] = @intCast(v);
+    const shape = [_]c_int{ batch, @divExact(@as(c_int, @intCast(ids.len)), batch) };
+    return mlx.mlx_array_new_data(&buf, &shape, 2, .int32);
+}
+
+fn pleArmRead(emb: mlx.mlx_array) ![]u16 {
+    try mlx.check(mlx.mlx_array_eval(emb));
+    const d = mlx.mlx_array_data_bfloat16(emb) orelse return error.MlxArrayDataNull;
+    return testing.allocator.dupe(u16, d[0..mlx.mlx_array_size(emb)]);
+}
+
+/// One serial PLE embedding on the chosen arm, read back as bf16 bits.
+fn pleArmEmbed(fx: *PleArmFixture, ctx: *ForwardCtx, entry: *SSMCacheEntry, ids: []const u32, on_gpu: bool) ![]u16 {
+    try fx.arm(on_gpu);
+    const arr = pleArmIds(ids, 1);
+    defer _ = mlx.mlx_array_free(arr);
+    const emb = try fx.xfm().pleEmbedding(ctx, arr, entry, 0, @intCast(ids.len));
+    defer _ = mlx.mlx_array_free(emb);
+    return pleArmRead(emb);
+}
+
+fn expectPleHistoryEqual(want: *const SSMCacheEntry, got: *const SSMCacheEntry) !void {
+    try testing.expectEqual(want.ple_prev_valid, got.ple_prev_valid);
+    try testing.expectEqualSlices(u32, &want.ple_prev, &got.ple_prev);
+    try testing.expectEqual(want.spec_ple_len, got.spec_ple_len);
+    try testing.expectEqualSlices(u32, want.spec_ple_tokens[0..want.spec_ple_len], got.spec_ple_tokens[0..got.spec_ple_len]);
+}
+
+test "qwen4 PLE gpu arm: prefill chunks and decode steps embed and advance history like the host gather" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var fx: PleArmFixture = undefined;
+    try fx.init(null);
+    defer fx.deinit();
+    var ctx = fx.ctx();
+    var host = pleArmEntry();
+    var gpu = pleArmEntry();
+    // A fresh sequence: stale tokens in `ple_prev` must hash as an all-eos history.
+    host.ple_prev = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    gpu.ple_prev = host.ple_prev;
+    var prng = std.Random.DefaultPrng.init(31);
+    const r = prng.random();
+    const widths = [_]usize{ 1, 37, 5, 1, 1, 64, 1 };
+    var buf: [64]u32 = undefined;
+    const d0 = ple_gpu.dispatches;
+    for (widths) |w| {
+        const ids = buf[0..w];
+        for (ids) |*v| v.* = if (r.uintLessThan(u32, 8) == 0) 999 else r.uintLessThan(u32, 1000);
+        const want = try pleArmEmbed(&fx, &ctx, &host, ids, false);
+        defer testing.allocator.free(want);
+        const got = try pleArmEmbed(&fx, &ctx, &gpu, ids, true);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(u16, want, got);
+        try expectPleHistoryEqual(&host, &gpu);
+    }
+    try testing.expectEqual(d0 + widths.len, ple_gpu.dispatches);
+}
+
+test "qwen4 PLE gpu arm: MTP rounds with partial accepts leave the host gather's history" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var fx: PleArmFixture = undefined;
+    try fx.init(null);
+    defer fx.deinit();
+    const x = fx.xfm();
+    x.spec_capture_ssm = true;
+    var ctx = fx.ctx();
+    ctx.ple_defer = true;
+    // host: leaf filled by the flush; settled: GPU arm, history from ids the round already
+    // read (solo verify); flushed: GPU arm, the flush reads the ids (group verify, decode).
+    var host = pleArmEntry();
+    var settled = pleArmEntry();
+    var flushed = pleArmEntry();
+    var prng = std.Random.DefaultPrng.init(47);
+    const r = prng.random();
+    var t1: u32 = 42;
+    var partial: usize = 0;
+    for (0..24) |_| {
+        const m = r.intRangeAtMost(usize, 1, 6);
+        var buf: [7]u32 = undefined;
+        buf[0] = t1;
+        for (buf[1 .. 1 + m]) |*v| v.* = if (r.uintLessThan(u32, 6) == 0) 999 else r.uintLessThan(u32, 1000);
+        const ids = buf[0 .. 1 + m];
+        const arr = pleArmIds(ids, 1);
+        defer _ = mlx.mlx_array_free(arr);
+        const len: c_int = @intCast(ids.len);
+
+        try fx.arm(false);
+        const eh = try x.pleEmbedding(&ctx, arr, &host, 0, len);
+        defer _ = mlx.mlx_array_free(eh);
+        try x.flushDeferredPle(&ctx);
+        try fx.arm(true);
+        const es = try x.pleEmbedding(&ctx, arr, &settled, 0, len);
+        defer _ = mlx.mlx_array_free(es);
+        try testing.expect(ctx.ple_pending.?.gpu);
+        try x.settleDeferredPle(&ctx, ids);
+        try testing.expect(ctx.ple_pending == null);
+        const ef = try x.pleEmbedding(&ctx, arr, &flushed, 0, len);
+        defer _ = mlx.mlx_array_free(ef);
+        try x.flushDeferredPle(&ctx);
+
+        const want = try pleArmRead(eh);
+        defer testing.allocator.free(want);
+        for ([_]mlx.mlx_array{ es, ef }) |e| {
+            const got = try pleArmRead(e);
+            defer testing.allocator.free(got);
+            try testing.expectEqualSlices(u16, want, got);
+        }
+        try expectPleHistoryEqual(&host, &settled);
+        try expectPleHistoryEqual(&host, &flushed);
+
+        const accepted = r.uintAtMost(u32, @intCast(m));
+        if (accepted < m) {
+            partial += 1;
+            for ([_]*SSMCacheEntry{ &host, &settled, &flushed }) |e| plePrevAfterAccept(e, accepted, @intCast(ids.len));
+        }
+        try expectPleHistoryEqual(&host, &settled);
+        try expectPleHistoryEqual(&host, &flushed);
+        t1 = r.uintLessThan(u32, 1000);
+    }
+    try testing.expect(partial > 0);
+}
+
+test "qwen4 PLE gpu arm: batched slots keep the host gather, a serial forward dispatches the kernel" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var fx: PleArmFixture = undefined;
+    try fx.init(null);
+    defer fx.deinit();
+    try fx.arm(true);
+    var e0 = [_]SSMCacheEntry{pleArmEntry()};
+    var e1 = [_]SSMCacheEntry{pleArmEntry()};
+    e0[0].ple_prev = .{ 5, 6, 0, 0, 0, 0, 0, 0 };
+    e0[0].ple_prev_valid = true;
+    e1[0].ple_prev = .{ 7, 999, 0, 0, 0, 0, 0, 0 };
+    e1[0].ple_prev_valid = true;
+    var s0 = fx.ctx();
+    s0.ssm_entries = &e0;
+    var s1 = fx.ctx();
+    s1.ssm_entries = &e1;
+    const slots = [_]*ForwardCtx{ &s0, &s1 };
+    var bctx = fx.ctx();
+    bctx.batch_slots = &slots;
+    var merged = pleArmEntry();
+    const d0 = ple_gpu.dispatches;
+    const both = pleArmIds(&[_]u32{ 11, 12 }, 2);
+    defer _ = mlx.mlx_array_free(both);
+    const eb = try fx.xfm().pleEmbedding(&bctx, both, &merged, 0, 1);
+    defer _ = mlx.mlx_array_free(eb);
+    try testing.expectEqual(d0, ple_gpu.dispatches);
+    var serial = fx.ctx();
+    const got = try pleArmEmbed(&fx, &serial, &e0[0], &[_]u32{13}, true);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(d0 + 1, ple_gpu.dispatches);
+}
+
+test "qwen4 PLE gpu arm: MLX_SERVE_PLE_GPU=0 loads no table buffer and a forward never dispatches" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var off: PleArmFixture = undefined;
+    try off.init("0");
+    defer off.deinit();
+    try testing.expect(off.gpu == null);
+    try testing.expect(!off.st.table.gpu_owns_map);
+    var ctx = off.ctx();
+    var e = pleArmEntry();
+    const d0 = ple_gpu.dispatches;
+    const got = try pleArmEmbed(&off, &ctx, &e, &[_]u32{ 1, 2, 3 }, false);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(d0, ple_gpu.dispatches);
+
+    var on: PleArmFixture = undefined;
+    try on.init(null);
+    defer on.deinit();
+    try testing.expect(on.gpu != null and on.st.table.gpu_owns_map);
 }
