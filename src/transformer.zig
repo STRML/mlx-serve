@@ -34390,6 +34390,68 @@ pub fn qsaIdxRopeFusedEnabled() bool {
     return v;
 }
 
+// Mirrors each rounding of the composed chain it replaces, so it is bit-identical:
+//   mean  = col-reduce order r = 0..R-1 into an f32 zero, times f32(1/R) (MLX
+//           NumberOfElements), then bf16;
+//   norm  = `rms_single_row` at D = 128 (32 lanes x 4 reads, simd_sum, precise
+//           rsqrt, `w * T(x * inv)`);
+//   rope  = the bf16 cos/sin table and bf16(bf16(x*cos) + bf16(rot*sin)), with
+//           each product and the sum rounded as MLX's separate binary kernels do.
+// One simdgroup per pooled row; lane l owns dims 4l..4l+3, and rotate_half's
+// partner (d +- HALF) is HALF/4 lanes away at the same slot.
+const QSA_POOL_ROPE_SOURCE =
+    \\uint lane = thread_position_in_threadgroup.x;
+    \\uint row = threadgroup_position_in_grid.y;
+    \\uint blk = row % uint(NB);
+    \\uint kbase = row * uint(R * 128) + lane * 4;
+    \\float xs[4];
+    \\float sumsq = 0.0f;
+    \\for (uint j = 0; j < 4; ++j) {
+    \\    float acc = 0.0f;
+    \\    for (uint r = 0; r < uint(R); ++r) acc = float(kb[kbase + r * 128 + j]) + acc;
+    \\    const T pooled = T(acc * inv_r);
+    \\    xs[j] = float(pooled);
+    \\    sumsq += xs[j] * xs[j];
+    \\}
+    \\sumsq = simd_sum(sumsq);
+    \\float inv = metal::precise::rsqrt(sumsq / 128.0f + eps);
+    \\for (uint j = 0; j < 4; ++j) {
+    \\    const T nv = norm_w[lane * 4 + j] * T(xs[j] * inv);
+    \\    const float nf = float(nv);
+    \\    const float up = simd_shuffle_down(nf, ushort(HALF / 4));
+    \\    const float dn = simd_shuffle_up(nf, ushort(HALF / 4));
+    \\    uint d = lane * 4 + j;
+    \\    T o = nv;
+    \\    if (d < uint(RD)) {
+    \\        const T rot = d < uint(HALF) ? T(-up) : T(dn);
+    \\        const T a = T(nf * float(cosv[blk * RD + d]));
+    \\        const T b = T(float(rot) * float(sinv[blk * RD + d]));
+    \\        o = T(float(a) + float(b));
+    \\    }
+    \\    out[row * 128 + d] = o;
+    \\}
+;
+
+var qsa_pool_rope_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var qsa_pool_rope_engaged: bool = false;
+const QsaPoolRopeCfgKey = struct { b: c_int, nb: c_int, r: c_int, rd: c_int };
+var qsa_pool_rope_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var qsa_pool_rope_cfg_key: QsaPoolRopeCfgKey = std.mem.zeroes(QsaPoolRopeCfgKey);
+
+fn getQsaPoolRopeKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_pool_rope_kernel) |k| return k;
+    const input_names = [_][*:0]const u8{ "kb", "norm_w", "cosv", "sinv", "eps", "inv_r" };
+    const output_names = [_][*:0]const u8{"out"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("mlxserve_qsa_pool_rope", in_vec, out_vec, QSA_POOL_ROPE_SOURCE, "", true, false);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_pool_rope_kernel = kernel;
+    return kernel;
+}
+
 /// Pooled block keys in one launch: f32 block mean → bf16 → rms_norm(w) →
 /// partial RoPE with the bf16 cos/sin table `[nb, rope_dims]`. Null → the
 /// caller runs the composed chain (`qsaPoolNorm` + `qsaPooledRopeComposed`).
@@ -34402,8 +34464,54 @@ pub fn qsaPoolNormRopeFused(
     sinv: mlx.mlx_array,
     rope_dims: c_int,
 ) !?mlx.mlx_array {
-    _ = .{ s, kb4, norm_w, eps, cosv, sinv, rope_dims };
-    return null;
+    const ksh = mlx.getShape(kb4);
+    const wsh = mlx.getShape(norm_w);
+    const csh = mlx.getShape(cosv);
+    if (ksh.len != 4 or ksh[3] != 128 or ksh[1] < 1 or ksh[2] < 1) return null;
+    if (wsh.len != 1 or wsh[0] != 128) return null;
+    // rotate_half's partner must sit whole lanes away: HALF a multiple of 4.
+    if (rope_dims <= 0 or rope_dims > 128 or @mod(rope_dims, 8) != 0) return null;
+    if (csh.len != 2 or csh[0] != ksh[1] or csh[1] != rope_dims) return null;
+    if (!std.mem.eql(c_int, csh, mlx.getShape(sinv))) return null;
+    inline for (.{ kb4, norm_w, cosv, sinv }) |arr| {
+        if (mlx.mlx_array_dtype(arr) != .bfloat16) return null;
+    }
+    const key = QsaPoolRopeCfgKey{ .b = ksh[0], .nb = ksh[1], .r = ksh[2], .rd = rope_dims };
+    if (qsa_pool_rope_cfg == null or !std.meta.eql(qsa_pool_rope_cfg_key, key)) {
+        if (qsa_pool_rope_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        qsa_pool_rope_cfg = null;
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        const out_shape = [_]c_int{ ksh[0], ksh[1], 128 };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 3, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, ksh[0] * ksh[1], 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+        const ints = .{ .{ "NB", ksh[1] }, .{ "R", ksh[2] }, .{ "RD", rope_dims }, .{ "HALF", @divExact(rope_dims, 2) } };
+        inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
+        qsa_pool_rope_cfg = config;
+        qsa_pool_rope_cfg_key = key;
+    }
+    const kernel = try getQsaPoolRopeKernel();
+    const eps_a = mlx.mlx_array_new_float(eps);
+    defer _ = mlx.mlx_array_free(eps_a);
+    // MLX's mean multiplies by NumberOfElements: f32(1.0 / n) computed in f64.
+    const inv_r = mlx.mlx_array_new_float(@floatCast(1.0 / @as(f64, @floatFromInt(ksh[2]))));
+    defer _ = mlx.mlx_array_free(inv_r);
+    const inputs_arr = [_]mlx.mlx_array{ kb4, norm_w, cosv, sinv, eps_a, inv_r };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qsa_pool_rope_cfg.?, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    if (!qsa_pool_rope_engaged) {
+        qsa_pool_rope_engaged = true;
+        log.info("[qsa] fused pooled-key upkeep engaged (blocks={d} ratio={d} rope={d}) — MLX_SERVE_QSA_IDX_ROPE_FUSED=0 restores the composed chain\n", .{ ksh[1], ksh[2], rope_dims });
+    }
+    return out;
 }
 
 /// `arr[:, :, start..stop]` as a lazy view.
