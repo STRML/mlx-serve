@@ -6815,6 +6815,7 @@ var sdpa_split_logged: [16]bool = @splat(false);
 /// The vector kernel serves q_len <= 8 with q_len * gqa <= 32 at hd
 /// {64, 96, 128, 256}; q_len > 8 runs MLX's fused full kernel except at hd
 /// 256, where MLX takes its unfused fallback unless NAX force-fuses it.
+/// Engages at hd 256 only until other head dims are measured.
 fn causalSplitGroupRows(q_len: c_int, gqa: c_int, head_dim: c_int) ?c_int {
     const vector_hd = head_dim == 64 or head_dim == 96 or head_dim == 128 or head_dim == 256;
     if (!vector_hd or gqa < 1) return null;
@@ -6822,6 +6823,9 @@ fn causalSplitGroupRows(q_len: c_int, gqa: c_int, head_dim: c_int) ?c_int {
     const fits_vector = q_len <= 8 and q_len * gqa <= 32;
     if (fits_vector) return null;
     if (q_len > 8 and head_dim != 256) return null;
+    // Measured only at hd 256 (Qwen3.8-Flash-Next, gqa 12). Other head dims
+    // need their own per-arch A/B before this default-on path reaches them.
+    if (head_dim != 256) return null;
     return @min(8, @max(1, @divTrunc(32, gqa)));
 }
 
@@ -53148,9 +53152,8 @@ test "splitCausalSdpa: gqa-aware groups match one causal sdpa across widths, kv 
         // gqa 32: 1-row groups. gqa 3 at qL 11: an 8-row group + 3.
         .{ .hq = 32, .hkv = 1, .ql = 3, .kv = 100, .hd = 256 },
         .{ .hq = 6, .hkv = 2, .ql = 11, .kv = 100, .hd = 256 },
-        // Another head dim the vector kernel serves.
-        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 100, .hd = 128 },
-        .{ .hq = 16, .hkv = 2, .ql = 5, .kv = 1, .hd = 64 },
+        // gqa 8 (gemma-like hd 256): 4-row groups.
+        .{ .hq = 16, .hkv = 2, .ql = 5, .kv = 1, .hd = 256 },
     };
     const scale: f32 = 1.0 / 16.0;
     for (cases) |c| {
@@ -53188,7 +53191,7 @@ test "splitCausalSdpa: every row sees exactly its causal window (bit-identical t
         .{ .hq = 24, .hkv = 2, .ql = 15, .kv = 37, .hd = 256 },
         .{ .hq = 12, .hkv = 2, .ql = 9, .kv = 100, .hd = 256 },
         .{ .hq = 32, .hkv = 1, .ql = 3, .kv = 1, .hd = 256 },
-        .{ .hq = 24, .hkv = 2, .ql = 5, .kv = 100, .hd = 128 },
+        .{ .hq = 16, .hkv = 2, .ql = 7, .kv = 100, .hd = 256 },
     };
     const scale: f32 = 1.0 / 16.0;
     for (cases) |c| {
@@ -53221,6 +53224,11 @@ test "splitCausalSdpa: declines outside its envelope" {
         .{ .hq = 6, .hkv = 2, .ql = 7, .kv = 64, .hd = 128 },
         // qL > 8 below hd 256: MLX's fused full kernel serves it.
         .{ .hq = 6, .hkv = 2, .ql = 10, .kv = 64, .hd = 128 },
+        // Below hd 256 the split is unmeasured, so it declines even past the
+        // vector wall (Llama/Mistral hd 128 gqa 8, hd 64).
+        .{ .hq = 32, .hkv = 4, .ql = 6, .kv = 64, .hd = 128 },
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 64, .hd = 128 },
+        .{ .hq = 16, .hkv = 2, .ql = 5, .kv = 64, .hd = 64 },
         // qL >= 16: fusedSdpa256Prefill's range.
         .{ .hq = 24, .hkv = 2, .ql = 16, .kv = 64, .hd = 256 },
         // hd 192: MLX prefers its unfused path there.
