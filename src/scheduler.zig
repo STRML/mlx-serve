@@ -1728,7 +1728,6 @@ pub const Scheduler = struct {
         self.allocator.destroy(self);
     }
 
-    /// Another request is queued, prefilling or decoding right now.
     /// Decoders a tick would advance now; finished slots linger in `decoding` until the cull.
     fn liveDecodingCount(self: *Scheduler) usize {
         self.queue_mu.lockUncancelable(self.io);
@@ -1741,6 +1740,7 @@ pub const Scheduler = struct {
         return n;
     }
 
+    /// Another request is queued, prefilling or decoding right now.
     fn decodingCount(self: *Scheduler) usize {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
