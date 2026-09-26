@@ -6805,21 +6805,35 @@ fn sdpaSplitEnabled() bool {
     return v;
 }
 
-/// One engagement log per width (6..9): the first engagement is usually the
-/// warmup's own 8-token prefill (kL==qL==8) — a per-width line is what
-/// witnesses the split at REAL verify shapes in an A/B arm's log.
-var sdpa_split_logged: [4]bool = .{ false, false, false, false };
+/// One engagement log per width (2..15): the first engagement is usually the
+/// warmup's own short prefill — a per-width line is what witnesses the split
+/// at REAL verify shapes in an A/B arm's log.
+var sdpa_split_logged: [16]bool = @splat(false);
 
-/// Width-wall query split for dense causal spec-verify blocks (B==1, hd 256,
-/// q_len 6..9). MLX's sdpa has no full-kernel arm at hd 256 and its vector
-/// kernel serves q_len * gqa <= 32, so a 6..9-row verify block otherwise runs
-/// the slow internal fallback on every machine. Splitting the queries at row
-/// 5 keeps both halves on the vector path with windows byte-identical to two
-/// consecutive <= 5-row rounds at the same offsets (bottom-right causal
-/// alignment): chunk A (rows 0..<5) over keys[0 .. kL-(qL-5)], chunk B
-/// (rows 5..) over the full keys, both "causal". K/V are re-sliced views,
-/// never recomputed. Returns null outside the envelope — the caller falls
-/// through to the single sdpa call. Port of the Layr-Labs
+/// Rows per group that MLX's vector sdpa kernel serves for this geometry, or
+/// null when one call already takes the fast path (or no split can help).
+/// The vector kernel serves q_len <= 8 with q_len * gqa <= 32 at hd
+/// {64, 96, 128, 256}; q_len > 8 runs MLX's fused full kernel except at hd
+/// 256, where MLX always takes its unfused fallback.
+fn causalSplitGroupRows(q_len: c_int, gqa: c_int, head_dim: c_int) ?c_int {
+    const vector_hd = head_dim == 64 or head_dim == 96 or head_dim == 128 or head_dim == 256;
+    if (!vector_hd or gqa < 1) return null;
+    if (q_len < 2 or q_len >= FUSED256_MIN_Q_LEN) return null;
+    const fits_vector = q_len <= 8 and q_len * gqa <= 32;
+    if (fits_vector) return null;
+    if (q_len > 8 and head_dim != 256) return null;
+    return @min(8, @max(1, @divTrunc(32, gqa)));
+}
+
+/// Width-wall query split for dense causal spec-verify blocks (B==1). MLX's
+/// vector sdpa kernel serves q_len * gqa <= 32 (q_len <= 8), so a wider
+/// verify block otherwise runs the unfused fallback (~8 dispatches, scores
+/// materialized). Rows split into groups of min(8, 32/gqa): 5 at gqa 6, 2 at
+/// gqa 12 (Qwen3.8-Flash-Next). Group [r0, r1) runs "causal" over keys[0 ..
+/// kL-(qL-r1)]; bottom-right alignment then gives row r the window
+/// kL-qL+r, the same one a width-(r1-r0) round at that offset gets. K/V are
+/// views, never recomputed. Returns null outside the envelope — the caller
+/// falls through to the single sdpa call. Generalizes the Layr-Labs
 /// qwen-3.8-mtp-challenge width-wall split (see NOTICE).
 pub fn splitCausalSdpa(
     s: mlx.mlx_stream,
@@ -6833,59 +6847,52 @@ pub fn splitCausalSdpa(
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
     const vs = mlx.getShape(v);
-    if (qs[3] != 256 or ks[3] != 256 or vs[3] != 256) return null;
+    const hd = qs[3];
+    if (ks[3] != hd or vs[3] != hd) return null;
     if (qs[0] != 1 or ks[0] != 1 or vs[0] != 1) return null;
-    if (qs[2] < 6 or qs[2] > 9) return null;
-    if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1]) return null;
-
+    if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1] or ks[1] < 1) return null;
+    if (@rem(qs[1], ks[1]) != 0) return null;
     const qL = qs[2];
     const kL = ks[2];
-    const split: c_int = 5;
-    const k_split: c_int = kL - (qL - split);
+    const gqa = @divTrunc(qs[1], ks[1]);
+    const group = causalSplitGroupRows(qL, gqa, hd) orelse return null;
+
     const strides = [_]c_int{ 1, 1, 1, 1 };
-
-    // Chunk A: rows 0..<5 vs keys[0 .. kL-(qL-5)] — row i's bottom-right
-    // causal window is exactly the one a width-5 round at this offset gets.
-    var q_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q_a);
-    var k_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k_a);
-    var v_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v_a);
-    const zero4 = [_]c_int{ 0, 0, 0, 0 };
-    const qa_stop = [_]c_int{ 1, qs[1], split, 256 };
-    const ka_stop = [_]c_int{ 1, ks[1], k_split, 256 };
-    try mlx.check(mlx.mlx_slice(&q_a, q, &zero4, 4, &qa_stop, 4, &strides, 4, s));
-    try mlx.check(mlx.mlx_slice(&k_a, k, &zero4, 4, &ka_stop, 4, &strides, 4, s));
-    try mlx.check(mlx.mlx_slice(&v_a, v, &zero4, 4, &ka_stop, 4, &strides, 4, s));
-
-    // Chunk B: rows 5.. vs the full keys — the follow-up width-(qL-5) round.
-    var q_b = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q_b);
-    const qb_start = [_]c_int{ 0, 0, split, 0 };
-    const qb_stop = [_]c_int{ 1, qs[1], qL, 256 };
-    try mlx.check(mlx.mlx_slice(&q_b, q, &qb_start, 4, &qb_stop, 4, &strides, 4, s));
-
     const none_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(none_mask);
-    var out_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(out_a);
-    var out_b = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(out_b);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_a, q_a, k_a, v_a, scale, "causal", none_mask, .{ .ctx = null }, false, s));
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_b, q_b, k, v, scale, "causal", none_mask, .{ .ctx = null }, false, s));
-
-    const parts = [_]mlx.mlx_array{ out_a, out_b };
-    const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
+    var parts = std.ArrayList(mlx.mlx_array).empty;
+    defer {
+        for (parts.items) |a| _ = mlx.mlx_array_free(a);
+        parts.deinit(std.heap.c_allocator);
+    }
+    var r0: c_int = 0;
+    while (r0 < qL) : (r0 += group) {
+        const r1: c_int = @min(r0 + group, qL);
+        const k_end: c_int = kL - (qL - r1);
+        var q_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_g);
+        var k_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_g);
+        var v_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_g);
+        try mlx.check(mlx.mlx_slice(&q_g, q, &[_]c_int{ 0, 0, r0, 0 }, 4, &[_]c_int{ 1, qs[1], r1, hd }, 4, &strides, 4, s));
+        try mlx.check(mlx.mlx_slice(&k_g, k, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, ks[1], k_end, hd }, 4, &strides, 4, s));
+        try mlx.check(mlx.mlx_slice(&v_g, v, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, vs[1], k_end, hd }, 4, &strides, 4, s));
+        var o_g = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(o_g);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o_g, q_g, k_g, v_g, scale, "causal", none_mask, .{ .ctx = null }, false, s));
+        try parts.append(std.heap.c_allocator, o_g);
+    }
+    const vec = mlx.mlx_vector_array_new_data(parts.items.ptr, parts.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
 
-    const log_idx: usize = @intCast(qL - 6);
+    const log_idx: usize = @intCast(qL);
     if (!sdpa_split_logged[log_idx]) {
         sdpa_split_logged[log_idx] = true;
-        log.info("[sdpa-split] engaged: qL={d} kL={d} Hq={d} Hkv={d} (MLX_SERVE_SDPA_SPLIT=0 restores the single dispatch)\n", .{ qL, kL, qs[1], ks[1] });
+        log.info("[sdpa-split] engaged: qL={d} kL={d} Hq={d} Hkv={d} rows/group={d} (MLX_SERVE_SDPA_SPLIT=0 restores the single dispatch)\n", .{ qL, kL, qs[1], ks[1], group });
     }
     return out;
 }
@@ -19337,8 +19344,8 @@ pub const Transformer = struct {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
-                    // Verify-width (6..9) dense blocks: two vector-path halves
-                    // beat MLX's internal hd-256 fallback.
+                    // Verify widths past the vector wall (qL*gqa > 32): vector-path
+                    // row groups beat MLX's unfused fallback.
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = split_out;
                 } else {
@@ -25689,8 +25696,8 @@ pub const Transformer = struct {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
             } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
-                // Verify-width (6..9) dense blocks: two vector-path halves
-                // beat MLX's internal hd-256 fallback.
+                // Verify widths past the vector wall (qL*gqa > 32): vector-path
+                // row groups beat MLX's unfused fallback.
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = split_out;
             } else {
@@ -53129,10 +53136,10 @@ test "splitCausalSdpa: gqa-aware groups match one causal sdpa across widths, kv 
         .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 2051, .hd = 256 },
         .{ .hq = 24, .hkv = 2, .ql = 15, .kv = 2051, .hd = 256 },
         // gqa 6 (27B geometry): 6..9 as before, 10..15 now split too.
-        .{ .hq = 6, .hkv = 2, .ql = 6, .kv = 187, .hd = 256 },
-        .{ .hq = 6, .hkv = 2, .ql = 9, .kv = 184, .hd = 256 },
-        .{ .hq = 6, .hkv = 2, .ql = 10, .kv = 100, .hd = 256 },
-        .{ .hq = 6, .hkv = 2, .ql = 15, .kv = 100, .hd = 256 },
+        .{ .hq = 12, .hkv = 2, .ql = 6, .kv = 187, .hd = 256 },
+        .{ .hq = 12, .hkv = 2, .ql = 9, .kv = 184, .hd = 256 },
+        .{ .hq = 12, .hkv = 2, .ql = 10, .kv = 100, .hd = 256 },
+        .{ .hq = 12, .hkv = 2, .ql = 15, .kv = 100, .hd = 256 },
         // gqa 32: 1-row groups. gqa 3 at qL 11: an 8-row group + 3.
         .{ .hq = 32, .hkv = 1, .ql = 3, .kv = 100, .hd = 256 },
         .{ .hq = 6, .hkv = 2, .ql = 11, .kv = 100, .hd = 256 },
@@ -53172,7 +53179,7 @@ test "splitCausalSdpa: every row sees exactly its causal window (bit-identical t
     const cases = [_]CausalSplitCase{
         .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 100, .hd = 256 },
         .{ .hq = 24, .hkv = 2, .ql = 15, .kv = 37, .hd = 256 },
-        .{ .hq = 6, .hkv = 2, .ql = 9, .kv = 100, .hd = 256 },
+        .{ .hq = 12, .hkv = 2, .ql = 9, .kv = 100, .hd = 256 },
         .{ .hq = 32, .hkv = 1, .ql = 3, .kv = 1, .hd = 256 },
         .{ .hq = 24, .hkv = 2, .ql = 5, .kv = 100, .hd = 128 },
     };
@@ -53201,7 +53208,7 @@ test "splitCausalSdpa: declines outside its envelope" {
     const declines = [_]CausalSplitCase{
         // The vector kernel already serves qL*gqa <= 32.
         .{ .hq = 24, .hkv = 2, .ql = 2, .kv = 64, .hd = 256 },
-        .{ .hq = 6, .hkv = 2, .ql = 5, .kv = 64, .hd = 256 },
+        .{ .hq = 12, .hkv = 2, .ql = 5, .kv = 64, .hd = 256 },
         .{ .hq = 6, .hkv = 2, .ql = 7, .kv = 64, .hd = 128 },
         // qL > 8 below hd 256: MLX's fused full kernel serves it.
         .{ .hq = 6, .hkv = 2, .ql = 10, .kv = 64, .hd = 128 },
