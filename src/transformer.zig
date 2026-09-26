@@ -10937,6 +10937,46 @@ test "qsa pooled keys: fused kernel matches order-sensitive sums at ratios 1..8,
     }
 }
 
+// Bar: the block count is a runtime input, so decode (1 block), verify (2) and a
+// prefill chunk (512) share ONE pipeline and stay bit-identical.
+test "qsa pooled keys: block counts 1, 2, 7, 512 share one fused pipeline" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm = qsaIdxRopeTestXfm(s);
+    var prng = std.Random.DefaultPrng.init(0x919E);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    var after_first: ?usize = null;
+    for ([_]c_int{ 1, 2, 7, 512, 1 }) |nb| {
+        const kb4 = try qsaIdxTestKeys(rnd, 1, nb, 4, -1, 0.5, s);
+        defer _ = mlx.mlx_array_free(kb4);
+        try std.testing.expectEqual(@as(usize, 0), try qsaIdxRopeCase(&xfm, kb4, norm_w, 4096, null));
+        if (after_first == null) after_first = qsaPoolRopePipelineCount();
+        try std.testing.expectEqual(after_first.?, qsaPoolRopePipelineCount());
+    }
+}
+
+// Bar: a CPU stream never reaches the Metal kernel; the caller keeps the chain.
+test "qsa pooled keys: fused kernel declines a non-GPU stream" {
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try std.testing.expect(!mlx.streamIsGpu(cpu));
+    var xfm = qsaIdxRopeTestXfm(cpu);
+    var prng = std.Random.DefaultPrng.init(0xC9C);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, cpu);
+    defer _ = mlx.mlx_array_free(norm_w);
+    const kb4 = try qsaIdxTestKeys(rnd, 1, 2, 4, -1, 0.5, cpu);
+    defer _ = mlx.mlx_array_free(kb4);
+    const cs = try xfm.ropeCosSinFromFreqs(64, try xfm.ropeInvFreq(64, xfm.config.rope_theta), 0, 4, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(cs.cos);
+    defer _ = mlx.mlx_array_free(cs.sin);
+    const before = qsaPoolRopePipelineCount();
+    try std.testing.expect((try qsaPoolNormRopeFused(cpu, kb4, norm_w, 1e-6, cs.cos, cs.sin, 64)) == null);
+    try std.testing.expectEqual(before, qsaPoolRopePipelineCount());
+}
+
 test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identically to a full bank" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
@@ -34467,11 +34507,14 @@ pub fn qsaIdxRopeFusedEnabled() bool {
 //   rope  = the bf16 cos/sin table and bf16(bf16(x*cos) + bf16(rot*sin)), with
 //           each product and the sum rounded as MLX's separate binary kernels do.
 // One simdgroup per pooled row; lane l owns dims 4l..4l+3, and rotate_half's
-// partner (d +- HALF) is HALF/4 lanes away at the same slot.
+// partner (d +- HALF) is HALF/4 lanes away at the same slot. The block count
+// `nblk` varies per call (1 at decode, up to 512 per prefill chunk), so it is a
+// scalar INPUT; the templates (T, R, RD, HALF) are fixed per model and name the
+// one pipeline MLX compiles.
 const QSA_POOL_ROPE_SOURCE =
     \\uint lane = thread_position_in_threadgroup.x;
     \\uint row = threadgroup_position_in_grid.y;
-    \\uint blk = row % uint(NB);
+    \\uint blk = row % uint(nblk);
     \\uint kbase = row * uint(R * 128) + lane * 4;
     \\float xs[4];
     \\float sumsq = 0.0f;
@@ -34513,12 +34556,32 @@ const QSA_POOL_SERIAL_MAX_R: c_int = 8;
 var qsa_pool_rope_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qsa_pool_rope_engaged: bool = false;
 const QsaPoolRopeCfgKey = struct { b: c_int, nb: c_int, r: c_int, rd: c_int };
+/// Int template values handed to MLX so far (T is always bf16); each distinct
+/// tuple is a pipeline compile.
+const QsaPoolRopeTpl = [4]c_int;
+var qsa_pool_rope_tpls: [64]QsaPoolRopeTpl = undefined;
+var qsa_pool_rope_tpl_count: usize = 0;
+
+/// Distinct kernel pipelines (template tuples) the fused pooled-key helper has requested.
+pub fn qsaPoolRopePipelineCount() usize {
+    return qsa_pool_rope_tpl_count;
+}
+
+fn qsaPoolRopeNoteTemplate(t: QsaPoolRopeTpl) void {
+    const kept = @min(qsa_pool_rope_tpl_count, qsa_pool_rope_tpls.len);
+    for (qsa_pool_rope_tpls[0..kept]) |seen| {
+        if (std.meta.eql(seen, t)) return;
+    }
+    // Past the table, every unseen tuple still counts: an overcount, never a miss.
+    if (kept < qsa_pool_rope_tpls.len) qsa_pool_rope_tpls[kept] = t;
+    qsa_pool_rope_tpl_count += 1;
+}
 var qsa_pool_rope_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var qsa_pool_rope_cfg_key: QsaPoolRopeCfgKey = std.mem.zeroes(QsaPoolRopeCfgKey);
 
 fn getQsaPoolRopeKernel() !mlx.mlx_fast_metal_kernel {
     if (qsa_pool_rope_kernel) |k| return k;
-    const input_names = [_][*:0]const u8{ "kb", "norm_w", "cosv", "sinv", "eps", "inv_r" };
+    const input_names = [_][*:0]const u8{ "kb", "norm_w", "cosv", "sinv", "eps", "inv_r", "nblk" };
     const output_names = [_][*:0]const u8{"out"};
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -34542,6 +34605,7 @@ pub fn qsaPoolNormRopeFused(
     sinv: mlx.mlx_array,
     rope_dims: c_int,
 ) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
     const ksh = mlx.getShape(kb4);
     const wsh = mlx.getShape(norm_w);
     const csh = mlx.getShape(cosv);
@@ -34565,8 +34629,14 @@ pub fn qsaPoolNormRopeFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, ksh[0] * ksh[1], 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
-        const ints = .{ .{ "NB", ksh[1] }, .{ "R", ksh[2] }, .{ "RD", rope_dims }, .{ "HALF", @divExact(rope_dims, 2) } };
-        inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
+        const tpl_names = [_][*:0]const u8{ "R", "RD", "HALF" };
+        const tpl_vals = [_]c_int{ ksh[2], rope_dims, @divExact(rope_dims, 2) };
+        var noted: QsaPoolRopeTpl = .{ 0, 0, 0, 0 };
+        for (tpl_names, tpl_vals, 0..) |n, v, i| {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, n, v));
+            noted[i] = v;
+        }
+        qsaPoolRopeNoteTemplate(noted);
         qsa_pool_rope_cfg = config;
         qsa_pool_rope_cfg_key = key;
     }
@@ -34576,7 +34646,9 @@ pub fn qsaPoolNormRopeFused(
     // MLX's mean multiplies by NumberOfElements: f32(1.0 / n) computed in f64.
     const inv_r = mlx.mlx_array_new_float(@floatCast(1.0 / @as(f64, @floatFromInt(ksh[2]))));
     defer _ = mlx.mlx_array_free(inv_r);
-    const inputs_arr = [_]mlx.mlx_array{ kb4, norm_w, cosv, sinv, eps_a, inv_r };
+    const nblk = mlx.mlx_array_new_int(ksh[1]);
+    defer _ = mlx.mlx_array_free(nblk);
+    const inputs_arr = [_]mlx.mlx_array{ kb4, norm_w, cosv, sinv, eps_a, inv_r, nblk };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
