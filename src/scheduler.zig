@@ -4763,6 +4763,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
                 if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
                 slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
+                if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
+                    slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
+                });
                 // Exact time-to-first-token: elapsed from request arrival
                 // (Slot.init, pre-queue-wait) to prefill completion. Captured
                 // here rather than derived by subtraction in finishSlot, so a
@@ -6026,9 +6029,9 @@ pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDeco
     return parseDecodeShare(text);
 }
 
-/// The width a prefill admitted beside live decoders may run at, 0 = no cap. Decided when
-/// the prefill starts, so admission bills the uncapped width: a decoder that finishes in
-/// between lifts the cap.
+/// The width a prefill started beside live decoders may run at, 0 = no cap. Decided when
+/// the prefill starts, after admission, so admission bills the uncapped width. A decoder
+/// that finishes mid-prefill lifts the cap only where the adaptive width hook runs.
 pub fn decodeShareAdmissionCap(decoding: usize, share: f32) u32 {
     if (decoding == 0 or share <= 0) return 0;
     return DECODE_SHARE_PREFILL_CHUNK;
@@ -6648,7 +6651,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 0,
             // The width the admission guard billed for this request; the forward can never run wider.
             .pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk, sch.decodingCount()),
-            .decode_share_width_cap = decodeShareAdmissionCap(sch.decodingCount(), prefillDecodeShare()),
+            .decode_share_width_cap = decodeShareAdmissionCap(sch.liveDecodingCount(), prefillDecodeShare()),
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
