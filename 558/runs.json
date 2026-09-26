@@ -1,0 +1,56 @@
+{
+ "title": "Qwen3.8-Flash-Next mixed-4-8bit, S=4 verify forward at kv 1500 (fwd-ubench)",
+ "hardware": "Apple M5 Ultra, 256 GB, 64 GPU cores",
+ "method": "20 forwards per run, 6 runs per arm in alternating then reversed order, idle-gated; off = MLX_SERVE_GDN_VERIFY_FOLD=0",
+ "x_label": "run",
+ "x_order": [
+  "run 1",
+  "run 2",
+  "run 3",
+  "run 4",
+  "run 5",
+  "run 6"
+ ],
+ "arms": {
+  "folded recurSeq (this PR)": {
+   "run 1": {
+    "gpu_ms": 17.043
+   },
+   "run 2": {
+    "gpu_ms": 17.023
+   },
+   "run 3": {
+    "gpu_ms": 17.081
+   },
+   "run 4": {
+    "gpu_ms": 17.03
+   },
+   "run 5": {
+    "gpu_ms": 16.949
+   },
+   "run 6": {
+    "gpu_ms": 16.96
+   }
+  },
+  "recurSeq -> norm-gate -> concat (base)": {
+   "run 1": {
+    "gpu_ms": 17.115
+   },
+   "run 2": {
+    "gpu_ms": 17.229
+   },
+   "run 3": {
+    "gpu_ms": 17.434
+   },
+   "run 4": {
+    "gpu_ms": 17.153
+   },
+   "run 5": {
+    "gpu_ms": 17.219
+   },
+   "run 6": {
+    "gpu_ms": 17.146
+   }
+  }
+ }
+}
