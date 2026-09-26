@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-APP_NAME="MLX Core"
+APP_NAME="MLX-Serve"
 BUNDLE_ID="com.dalcu.mlx-core"
 
 # FAST_DEV=1 trades everything a RELEASE needs for iteration speed: an
@@ -30,6 +30,27 @@ if [ "$ZIG_DEBUG" = "1" ] && [ "$FAST_DEV" != "1" ]; then
     echo "ERROR: ZIG_DEBUG=1 is a FAST_DEV-only lever — a shipped mlx-serve is always ReleaseFast."
     echo "       Re-run as: FAST_DEV=1 ZIG_DEBUG=1 bash app/build.sh"
     exit 1
+fi
+
+# `bash app/build.sh ko`: once the build succeeds, quit the running app and its
+# server, then open the fresh bundle.
+case "${1:-}" in
+    "" | ko) ;;
+    *) echo "ERROR: unknown argument '$1' (usage: bash app/build.sh [ko])"; exit 1 ;;
+esac
+relaunch_app() {
+    echo "→ Relaunching $APP_NAME..."
+    osascript -e "tell application id \"$BUNDLE_ID\" to quit" 2>/dev/null || true
+    local procs="$APP_NAME.app/Contents/MacOS/"
+    for _ in $(seq 1 50); do
+        pgrep -f "$procs" >/dev/null || break
+        sleep 0.2
+    done
+    pkill -9 -f "$procs" || true
+    open "$APP"
+}
+if [ "${1:-}" = "ko" ]; then
+    trap '[ $? -eq 0 ] && relaunch_app' EXIT
 fi
 
 # Signing identity from env (set in ~/.zshrc or CI). Unset = ad-hoc ("-"), so
@@ -590,7 +611,7 @@ fi
 
 # ── Phase 7: Create DMG installer ──
 echo "→ Creating DMG..."
-DMG_PATH="$SCRIPT_DIR/MLXCore.dmg"
+DMG_PATH="$SCRIPT_DIR/MLX-Serve.dmg"
 bash "$PROJECT_ROOT/scripts/create-dmg.sh" "$APP" "$DMG_PATH"
 
 echo ""

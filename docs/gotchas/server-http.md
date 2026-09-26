@@ -22,13 +22,28 @@ Third, the feature did not survive contact with its own clients. `GET /props` fe
 
 Guards: `tests/test_idle_evict.sh` (evicts when idle, reloads under all three concurrent readers, RSS flat across cycles that all end with nothing resident, and still resident with the flag off), `testing.allocator` on the reload-frees test, and behavioural tests on each `.loading` predicate. The locking itself is comment-pinned — a source scan is the obvious guard and this repo bans them.
 
-### Historical images decoded on every text-only continuation (2026-08-30)
+### Only the latest turn's images reached the model (2026-09-23)
 
-The active-turn media fix stopped the vision tower from re-encoding images behind the latest assistant boundary, but both chat parsers still eagerly base64-decoded, JPEG-decoded, resized, normalized and patchified every attachment before that selector ran. A Harness session retaining 24 images therefore logged 24 image decodes on every later text-only request. Qwen's 44x44 patch grid retains about 8.7 MiB of preprocessed float data per image until the request ends, so the request also carried roughly 200 MiB of avoidable transient buffers. Warm prefix reuse hid most of the latency at 24 images, but the CPU and allocation work grew linearly with conversation history and multiplied under concurrency.
-
-The fix performs a metadata-only pass over the parsed JSON tree first. `activeWireMediaIndex` mirrors `activeTurnMediaMessage` across ordinary assistant boundaries, assistant-prefix continuations and tool-call/result chains, with separate OpenAI and Anthropic wire shapes. The handler's existing parse loop then materializes attachments only for that selected raw message; historical data URLs remain borrowed JSON strings and allocate no media buffers. Skipped image-only history must still append its empty user message, because the role boundary is part of the rendered prompt even when its pixels are not active.
-
-The HTTP regression sends one historical image, twenty historical images, an image-only historical turn and an Anthropic historical image. All must complete with zero new `Decoded … image` log lines; the image-only case also compares prompt-token counts against a dropped empty turn so preserving the boundary is observable. Fresh images, trailing Harness context, assistant-prefix continuation, growing image conversations and changed-image prefix reuse remain covered in the same script.
+Defect: pi reading page1..3 of a spec mid-task saw page3 only. Flash invented a 5-digit SKU
+(page1 says 4 digits), the 27B said it could not see the images and OCR'd them with tesseract.
+Images in an Anthropic `tool_result` (Claude Code's Read tool) never reached the model at all.
+Cause: since the first vision commit the server encoded only the active turn's media and spliced
+its soft tokens after a user-turn marker it searched for (`userTurnInsertPos`, end-of-prompt
+fallback). Older images were dropped from every request; the Anthropic parser kept only the
+text of a `tool_result`.
+Fix: the vLLM/llama.cpp design. A message's media serializes as content parts, the model's own
+template renders one placeholder per item where the message sits, and `expandMediaPlaceholders`
+turns the k-th placeholder into item k's run. Every item is encoded, in prompt order; a count or
+kind mismatch is a named 400. The prefix cache keys each item (`MediaSpan`), so a match stops at
+the first item that differs and history images restore from cache. Encoder outputs are cached by
+pixel hash (`EmbeddingCache`): re-encoding 20 history screenshots cost Flash ~7 s per turn. A
+tower-less model refuses only the latest user turn's media and leaves a note for the rest.
+Accepted cost: every history image is still base64/PNG-decoded and preprocessed each turn to key the
+cache (0.6 s at 24 1920x1200 screenshots, 55k image tokens); the cache skips the tower, not the decode.
+The embedding cache never evicts what the current request used (plain LRU on the history scan hit 0%).
+Guard: `media renders one template placeholder per item` (chat.zig, real Qwen3.8 template),
+the `expandMediaPlaceholders` tests (server.zig), `media spans bound the reusable prefix`
+(prefix_cache.zig), `EmbeddingCache serves a hit and evicts` (vision.zig), `tests/test_multi_image_history.sh`.
 
 ### A `seed` that only the synchronous sampler read (seeded replies flipped between identical requests)
 
@@ -2295,6 +2310,17 @@ text and the media site, so the load refuses by name with the 36 GB figure in th
 Guard: `effectiveAvailableBytes is capped by the GPU working-set limit` in `scheduler.zig`.
 Not covered: the embedded engines (ds4 / llama.cpp) keep their own open-time failure.
 
+## App-loaded models placed every image at the end of the prompt (2026-09-22)
+
+A pi session on Flash-Next kept thinking "the user attached the same image again" on every
+tool turn. The log showed each request inserting the image at `prompt_len - 5`: the silent
+end-anchored fallback of `userTurnInsertPos`, which fires when there is no user-turn marker.
+Cause: `populateUserTurnMarker` (and `populateLfm2ImageTokens`) ran only on the startup
+`--model` path in `main.zig`; the registry path (`scheduler.preloadCpuState`, used by the app's
+headless start + load) had copied main's EOS merge but not these, so the marker was empty and
+the image sat after the latest tool result on every turn.
+Fix: `ModelConfig.applyTokenizer` holds all tokenizer-derived setup and both paths call it.
+The marker itself is gone since 2026-09-23: placement comes from the template's placeholders.
 
 ## An SSD restore held one file open per chunk, and its failure failed the fallback (#495)
 
@@ -2315,3 +2341,35 @@ Guards: `DiskTier: a restore wider than the fd limit closes each chunk as it goe
 `DiskTier: a failed restore drops the latch it raised and keeps a foreign one`, and
 `tests/test_prefix_cache_disk.sh` [7] (a restore under a lowered `ulimit -n`, plus a chunk
 made unreadable after boot).
+
+## A stop string inside the thought ended the whole reply (#549)
+
+Defect: `stop: ["```"]` (or any common word) on a thinking model ended the request at the first
+match inside `<think>`: reasoning cut mid-sentence, empty content, `finish_reason: "stop"`, on
+chat, messages and responses, streamed and not.
+
+Cause: every stop site searched the RAW generated text, reasoning included, before the split.
+
+Fix: `chat.answerStopIndex` accepts a match only where `splitThinkBlockKeepingMarkup` delivers
+it as content, judged on the text up to the match. Prefix-only judgment is what keeps the stream
+and the finished text on the same byte: text a later close turns into a thought (Gemma with
+thinking off) was still answer when the stop arrived, and a thought opened after the answer
+is dropped by a stop before it. `/v1/completions` keeps matching raw text.
+Guards: corpus `a stop string ends the answer, never the reasoning` (every word of every entry
+as a stop, plus a byte-by-byte stream replay), `tests/test_stop_in_reasoning.sh`.
+
+## Logprobs were null whenever `response_format` was set (#515)
+
+Defect: a `json_object` or `json_schema` request with `logprobs: true` returned `"logprobs": null`,
+streamed or not. The constrained answer was correct; only the entries were missing.
+
+Cause: `Generator.next` hands a constrained request to `nextConstrained`, and none of its arms
+(JSON body, reasoning, opener choice, forced recovery token) computed a logprob. The regular
+decode loop publishes through `pending_logprob` with a one-token delay; the constrained path
+samples and returns the same token in one call, so it never reached that code.
+
+Fix: `nextConstrained` keeps a handle to the position's logits, lets the arm pick or force the
+token, then computes that token's entry from the raw logits, before the grammar mask. The entries
+are the model's distribution, so the emitted token need not be rank 1 under a grammar.
+Guards: `constrained generation returns one logprob entry per token` (generate.zig, gated on
+`LOGPROBS_TEST_MODEL`) and `tests/test_logprobs.sh` [7].

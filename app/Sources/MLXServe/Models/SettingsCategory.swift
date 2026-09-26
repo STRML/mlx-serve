@@ -59,7 +59,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .sandbox:           return "Agent Sandbox"
         case .messaging:         return "Messaging — Telegram bot"
         case .updates:           return "Updates"
-        case .about:             return "About mlx-serve"
+        case .about:             return "About MLX-Serve"
         }
     }
 

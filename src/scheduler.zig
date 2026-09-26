@@ -279,8 +279,8 @@ pub const SubmitParams = struct {
     /// Vision embeddings spliced at image-token positions during prefill.
     /// Ownership transferred to the slot; freed on slot.deinit.
     vision_embeddings: ?mlx.mlx_array = null,
-    /// Prefix-cache key for the media under the placeholder tokens (0 = none).
-    vision_key: u64 = 0,
+    /// Media items in the prompt, for the prefix-cache key. Borrowed; the slot copies it.
+    media: []const prefix_cache_mod.MediaSpan = &.{},
     /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
     cache_key: u64 = 0,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
@@ -423,24 +423,6 @@ pub const NextResult = union(enum) {
     err: void,
 };
 
-fn firstMediaPlaceholder(
-    has_media: bool,
-    tokens: []const u32,
-    image_token_id: u32,
-    audio_token_id: u32,
-    video_token_id: u32,
-) ?usize {
-    // The placeholder ids are ordinary vocabulary entries, so a text-only
-    // prompt can contain one; a boundary exists only where media rows do.
-    if (!has_media) return null;
-    for (tokens, 0..) |token, i| {
-        if ((image_token_id > 0 and token == image_token_id) or
-            (audio_token_id > 0 and token == audio_token_id) or
-            (video_token_id > 0 and token == video_token_id)) return i;
-    }
-    return null;
-}
-
 /// Per-request state. Owned by the Scheduler from `submit` until `complete`.
 pub const Slot = struct {
     allocator: std.mem.Allocator,
@@ -468,12 +450,10 @@ pub const Slot = struct {
     /// when never consumed.
     cancelled_prefill: Generator.CancelledCheckpointSink = .{},
     vision_embeddings: ?mlx.mlx_array,
-    vision_key: u64,
+    /// Media items in `full_prompt` (owned): the prefix-cache key of their rows.
+    media: []prefix_cache_mod.MediaSpan,
     cache_key: u64 = 0,
     skip_prefix_cache: bool = false,
-    /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
-    /// state before this position is safe to share across media hashes.
-    media_start: ?usize,
     /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.
     /// Owned by the slot; `mrope_pos` freed on deinit.
     mrope_pos: ?[]const i32,
@@ -687,13 +667,8 @@ pub const Slot = struct {
         const full_prompt_src = params.full_prompt orelse params.prompt_ids;
         const full_prompt_owned = try allocator.dupe(u32, full_prompt_src);
         errdefer allocator.free(full_prompt_owned);
-        const media_start = firstMediaPlaceholder(
-            params.vision_embeddings != null,
-            full_prompt_owned,
-            config.image_token_id,
-            config.audio_token_id,
-            config.video_token_id,
-        );
+        const media_owned = try allocator.dupe(prefix_cache_mod.MediaSpan, params.media);
+        errdefer allocator.free(media_owned);
         const eos_owned = try allocator.dupe(u32, params.eos_token_ids);
         errdefer allocator.free(eos_owned);
 
@@ -705,9 +680,8 @@ pub const Slot = struct {
             .moe_seq_offset = 0,
             .ssm_entries = ssm_entries,
             .vision_embeddings = params.vision_embeddings,
-            .vision_key = params.vision_key,
+            .media = media_owned,
             .cache_key = params.cache_key,
-            .media_start = media_start,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
             .mrope_delta = params.mrope_delta,
@@ -835,6 +809,7 @@ pub const Slot = struct {
         if (self.mrope_pos) |mp| self.allocator.free(mp);
         self.allocator.free(self.prompt_ids);
         self.allocator.free(self.full_prompt);
+        self.allocator.free(self.media);
         self.allocator.free(self.eos_token_ids);
         if (self.error_code) |code| self.allocator.free(code);
         if (self.generated_ids) |g| self.allocator.free(g);
@@ -1078,6 +1053,14 @@ pub const VisionVideoPixels = struct {
     grid_w: u32,
 };
 
+/// One encoder input. `audio` is raw float32-LE 16 kHz mono PCM, framed into
+/// `audio_samples_per_token` tokens by the unified audio embedder.
+pub const VisionItem = union(enum) {
+    image: VisionImagePixels,
+    video: VisionVideoPixels,
+    audio: []const u8,
+};
+
 /// Phase A4: vision-encode work item. Conn thread fills `images` (raw pixel
 /// data, CPU-only) and calls `Scheduler.encodeVision`, which posts the
 /// request and blocks until the inference thread fills `result` and signals
@@ -1089,26 +1072,16 @@ pub const VisionEncodeRequest = struct {
     /// request. The conn thread holds a refcount (via `ensureLoaded`) for
     /// the duration of the call.
     model: *model_registry_mod.LoadedModel,
-    /// Per-image float32 CHW pixel buffers. Borrowed; must outlive the call.
-    images: []const VisionImagePixels,
-    /// Per-video pre-patchified pixel buffers. Borrowed; must outlive the call.
-    /// Qwen-only (video_token_id != 0) — empty on every other arch.
-    videos: []const VisionVideoPixels = &.{},
-    /// Gemma 4 12B unified audio: per-clip raw float32-LE 16 kHz mono sample
-    /// buffers. Borrowed; must outlive the call. The inference thread frames
-    /// each into 640-sample tokens and projects them through the audio embedder.
-    audio: []const []const u8 = &.{},
-    /// Output: encoded embedding tensor on success — vision soft tokens, then
-    /// video soft tokens, then audio soft tokens, concatenated along the token
-    /// axis (matches the prompt's image/video/audio block insertion order).
-    /// Ownership transfers to the caller.
+    /// Encoder inputs in prompt order. Borrowed; must outlive the call.
+    items: []const VisionItem,
+    /// Each item's pixel/PCM hash, parallel to `items`: the encoder cache key.
+    item_keys: []const u64,
+    /// Output: soft tokens each item produced, parallel to `items`. Caller-owned.
+    item_tokens: []usize,
+    /// Output: every item's soft tokens, concatenated along the token axis in
+    /// prompt order (the splice scatters them positionally). Ownership
+    /// transfers to the caller.
     result: ?mlx.mlx_array = null,
-    /// Output: number of vision / video / audio soft tokens in `result` (in
-    /// that order). The caller inserts exactly this many image / video / audio
-    /// placeholders.
-    n_vision_tokens: usize = 0,
-    n_video_tokens: usize = 0,
-    n_audio_tokens: usize = 0,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
     /// Done flag (under done_mu). Caller's wait-loop drains the cond when
@@ -1755,6 +1728,18 @@ pub const Scheduler = struct {
         self.allocator.destroy(self);
     }
 
+    /// Decoders a tick would advance now; finished slots linger in `decoding` until the cull.
+    fn liveDecodingCount(self: *Scheduler) usize {
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        var n: usize = 0;
+        for (self.decoding.items) |s| {
+            if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+            n += 1;
+        }
+        return n;
+    }
+
     /// Another request is queued, prefilling or decoding right now.
     fn decodingCount(self: *Scheduler) usize {
         self.queue_mu.lockUncancelable(self.io);
@@ -1962,7 +1947,8 @@ pub const Scheduler = struct {
         // entry `.error_state` so /v1/models surfaces the failure (and
         // future ensureLoaded calls fail fast instead of re-tripping the
         // same parse error). FileNotFound / parse errors land here.
-        const settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
+        var settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
+        defer settings.deinit(self.allocator);
         const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, settings.ctx_size orelse self.gguf_ctx_size) catch |err| {
             self.registry.mutex.lockUncancelable(self.io);
             self.registry.markErrorLocked(entry, @errorName(err));
@@ -1975,7 +1961,7 @@ pub const Scheduler = struct {
         var owned = cpu_state;
         var owned_active: bool = true;
         defer if (owned_active) freeCpuState(self.allocator, &owned);
-        applyModelSettings(owned.config, settings);
+        applyModelSettings(owned.config, owned.chat_config, &settings);
         // The resolved .gguf path (when this is a GGUF entry) is borrowed by
         // the LoadRequest until `done`; the engines dupe what they keep, so
         // it's released here on success AND failure.
@@ -2702,11 +2688,17 @@ const GgufRoute = struct {
 
 /// Both load construction sites (here and main.zig's startup load) stamp the
 /// per-model settings onto the config the bills and defaults read.
-pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void {
+/// The kwargs strings MOVE to the freshly loaded `chat_config` (same allocator).
+pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *model_settings.Override) void {
     config.ctx_override = o.ctx_size orelse 0;
     config.kv_quant_override = o.kv_quant;
     config.mtp_override = o.mtp;
     config.mtp_acceptance_override = o.mtp_acceptance;
+    chat_config.chat_template_kwargs = o.chat_template_kwargs;
+    chat_config.default_enable_thinking = o.enable_thinking;
+    chat_config.default_reasoning_effort = o.reasoning_effort;
+    o.chat_template_kwargs = null;
+    o.reasoning_effort = null;
 }
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
@@ -2770,25 +2762,7 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     cc.* = try chat_mod.loadChatConfig(io, allocator, model_dir);
     errdefer cc.deinit();
 
-    // Same EOS-resolution as main.zig — merge the tokenizer's chat-terminator
-    // EOS into the stop set ALWAYS, even when config.json already specified an
-    // eos_token_id. Some checkpoints (e.g. Qwen2.5-Coder-7B) set config.json
-    // eos_token_id to <|endoftext|> but end chat turns with <|im_end|>; gating
-    // on `num_eos_tokens == 0` left <|im_end|> out of the stop set and it leaked
-    // into output. Additive + dedup-guarded: only ever ADDS a declared stop.
-    if (cc.eos_token) |eos_str| {
-        if (tok.special_tokens.get(eos_str)) |eos_id| {
-            if (!config.isEosToken(eos_id)) config.addEosToken(eos_id);
-        }
-    }
-    if (tok.special_tokens.get("<|endoftext|>")) |eot_id| {
-        if (!config.isEosToken(eot_id)) config.addEosToken(eot_id);
-    }
-    if (tok.special_tokens.get("<pad>")) |pad_id| {
-        if (pad_id > 0 and !config.isEosToken(pad_id)) {
-            config.addEosToken(pad_id);
-        }
-    }
+    config.applyTokenizer(tok, cc.eos_token);
 
     return .{ .config = config, .tok = tok, .chat_config = cc };
 }
@@ -4335,7 +4309,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.config.full_attention_interval > 0;
         const disk_ok = !has_ssm_layers or enable_ssm_cps;
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
-            const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
+            const fp = kv_disk_cache.modelFingerprintWithLayout(
+                sch.allocator,
+                sch.io,
+                entry.path,
+                params.config.cacheLayoutNamespace(),
+            ) catch |err| {
                 log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
@@ -4789,6 +4768,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
                 if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
                 slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
+                if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
+                    slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
+                });
                 // Exact time-to-first-token: elapsed from request arrival
                 // (Slot.init, pre-queue-wait) to prefill completion. Captured
                 // here rather than derived by subtraction in finishSlot, so a
@@ -4871,131 +4853,49 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         finishVisionRequest(sch, req, "VisionEncoderNotLoaded");
         return;
     };
-    if (req.images.len == 0 and req.videos.len == 0 and req.audio.len == 0) {
+    if (req.items.len == 0) {
         finishVisionRequest(sch, req, "EmptyImages");
         return;
     }
 
-    // Encode all soft tokens into `emb_parts`: vision, then video, then audio,
-    // so the single splice channel scatters them in the same order as the
-    // placeholder blocks the conn thread injected (image block, then video
-    // block, then audio block).
     var emb_parts = std.ArrayList(mlx.mlx_array).empty;
     defer emb_parts.deinit(req.allocator);
-    const failParts = struct {
-        fn f(s: *Scheduler, r: *VisionEncodeRequest, parts: []mlx.mlx_array, name: []const u8) void {
-            for (parts) |e| _ = mlx.mlx_array_free(e);
-            finishVisionRequest(s, r, name);
-        }
-    }.f;
-
-    var n_vision: usize = 0;
-    for (req.images) |img| {
+    var cached: usize = 0;
+    const epoch = vision_enc.emb_cache.beginRequest();
+    for (req.items, req.item_keys, 0..) |item, key, i| {
         var emb: mlx.mlx_array = undefined;
-        if (img.grid_h > 0) {
-            // Patch-grid ViT: pixels hold pixel_values [N, feat]; the tower
-            // produces [1, N/merge², out_hidden].
-            const n: usize = @as(usize, img.grid_h) * img.grid_w;
-            const feat: usize = (img.pixels.len / 4) / n;
-            const shape = [_]c_int{ @intCast(n), @intCast(feat) };
-            const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
-            defer _ = mlx.mlx_array_free(pixel_arr);
-            emb = vision_enc.forwardPatches(pixel_arr, img.grid_h, img.grid_w) catch |err| {
-                failParts(sch, req, emb_parts.items, @errorName(err));
-                return;
-            };
+        if (vision_enc.emb_cache.get(key)) |hit| {
+            emb = hit;
+            cached += 1;
         } else {
-            const h: c_int = @intCast(img.height);
-            const w: c_int = @intCast(img.width);
-            const shape = [_]c_int{ 1, 3, h, w };
-            const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
-            defer _ = mlx.mlx_array_free(pixel_arr);
-            emb = vision_enc.forward(pixel_arr) catch |err| {
-                failParts(sch, req, emb_parts.items, @errorName(err));
+            emb = encodeVisionItem(req, vision_enc, item) catch |err| {
+                for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
+                finishVisionRequest(sch, req, @errorName(err));
                 return;
             };
+            vision_enc.emb_cache.put(vision_enc.allocator, key, emb, vision_mod.EmbeddingCache.CAP_BYTES, epoch);
         }
-        const es = mlx.getShape(emb);
-        n_vision += @intCast(es[1]);
+        req.item_tokens[i] = @intCast(mlx.getShape(emb)[1]);
         emb_parts.append(req.allocator, emb) catch |err| {
             _ = mlx.mlx_array_free(emb);
-            failParts(sch, req, emb_parts.items, @errorName(err));
+            for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
+            finishVisionRequest(sch, req, @errorName(err));
             return;
         };
     }
-
-    var n_video: usize = 0;
-    for (req.videos) |vid| {
-        const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
-        const feat: usize = (vid.pixels.len / 4) / n;
-        const shape = [_]c_int{ @intCast(n), @intCast(feat) };
-        const pixel_arr = mlx.mlx_array_new_data(vid.pixels.ptr, &shape, 2, .float32);
-        defer _ = mlx.mlx_array_free(pixel_arr);
-        const emb = vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w) catch |err| {
-            failParts(sch, req, emb_parts.items, @errorName(err));
-            return;
-        };
-        const es = mlx.getShape(emb);
-        n_video += @intCast(es[1]);
-        emb_parts.append(req.allocator, emb) catch |err| {
-            _ = mlx.mlx_array_free(emb);
-            failParts(sch, req, emb_parts.items, @errorName(err));
-            return;
-        };
-    }
-
-    // Audio: frame each clip into 640-sample tokens, project through the
-    // unified audio embedder → [1, n_frames, hidden].
-    var n_audio: usize = 0;
-    for (req.audio) |clip| {
-        const n_samples = clip.len / 4;
-        if (n_samples == 0) continue;
-        const cfg = req.model.config orelse {
-            failParts(sch, req, emb_parts.items, "NoConfig");
-            return;
-        };
-        const samples_per_token: usize = if (cfg.audio_samples_per_token > 0) cfg.audio_samples_per_token else 640;
-        const n_frames = (n_samples + samples_per_token - 1) / samples_per_token;
-        const padded_len = n_frames * samples_per_token;
-        const buf = req.allocator.alloc(f32, padded_len) catch |err| {
-            failParts(sch, req, emb_parts.items, @errorName(err));
-            return;
-        };
-        @memset(buf, 0);
-        @memcpy(std.mem.sliceAsBytes(buf)[0..clip.len], clip);
-        const shape = [_]c_int{ 1, @intCast(n_frames), @intCast(samples_per_token) };
-        const frames_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
-        req.allocator.free(buf); // mlx_array_new_data copies into an array-owned buffer
-        defer _ = mlx.mlx_array_free(frames_arr);
-        const emb = vision_enc.forwardAudio(frames_arr) catch |err| {
-            failParts(sch, req, emb_parts.items, @errorName(err));
-            return;
-        };
-        n_audio += n_frames;
-        emb_parts.append(req.allocator, emb) catch |err| {
-            _ = mlx.mlx_array_free(emb);
-            failParts(sch, req, emb_parts.items, @errorName(err));
-            return;
-        };
-    }
-
-    if (emb_parts.items.len == 0) {
-        finishVisionRequest(sch, req, "EmptyImages");
-        return;
-    }
-
-    // Single modality/clip: pass through. Multiple: concatenate along token dim.
+    if (cached > 0) log.info("  [vision-cache] {d}/{d} encoder pieces reused\n", .{ cached, req.items.len });
     var combined: mlx.mlx_array = undefined;
     if (emb_parts.items.len == 1) {
         combined = emb_parts.items[0];
-        emb_parts.items[0] = mlx.mlx_array_new(); // sentinel so the deferred-free path is a no-op
+        emb_parts.items[0] = mlx.mlx_array_new(); // sentinel so the free below is a no-op
     } else {
         const cat_vec = mlx.mlx_vector_array_new_data(emb_parts.items.ptr, emb_parts.items.len);
         defer _ = mlx.mlx_vector_array_free(cat_vec);
         combined = mlx.mlx_array_new();
         if (mlx.mlx_concatenate_axis(&combined, cat_vec, 1, vision_enc.s) != 0) {
             _ = mlx.mlx_array_free(combined);
-            failParts(sch, req, emb_parts.items, "ConcatenateFailed");
+            for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
+            finishVisionRequest(sch, req, "ConcatenateFailed");
             return;
         }
     }
@@ -5004,11 +4904,52 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     req.done_mu.lockUncancelable(sch.io);
     defer req.done_mu.unlock(sch.io);
     req.result = combined;
-    req.n_vision_tokens = n_vision;
-    req.n_video_tokens = n_video;
-    req.n_audio_tokens = n_audio;
     req.done = true;
     req.done_cond.broadcast(sch.io);
+}
+
+/// `[1, n, hidden]` soft tokens for one item.
+fn encodeVisionItem(req: *VisionEncodeRequest, vision_enc: anytype, item: VisionItem) !mlx.mlx_array {
+    switch (item) {
+        .image => |img| {
+            if (img.grid_h > 0) {
+                // Patch-grid ViT: pixels hold pixel_values [N, feat]; the tower
+                // produces [1, N/merge², out_hidden].
+                const n: usize = @as(usize, img.grid_h) * img.grid_w;
+                const feat: usize = (img.pixels.len / 4) / n;
+                const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+                const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
+                defer _ = mlx.mlx_array_free(pixel_arr);
+                return vision_enc.forwardPatches(pixel_arr, img.grid_h, img.grid_w);
+            }
+            const shape = [_]c_int{ 1, 3, @intCast(img.height), @intCast(img.width) };
+            const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
+            defer _ = mlx.mlx_array_free(pixel_arr);
+            return vision_enc.forward(pixel_arr);
+        },
+        .video => |vid| {
+            const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
+            const feat: usize = (vid.pixels.len / 4) / n;
+            const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+            const pixel_arr = mlx.mlx_array_new_data(vid.pixels.ptr, &shape, 2, .float32);
+            defer _ = mlx.mlx_array_free(pixel_arr);
+            return vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w);
+        },
+        .audio => |clip| {
+            const cfg = req.model.config orelse return error.NoConfig;
+            const spt: usize = if (cfg.audio_samples_per_token > 0) cfg.audio_samples_per_token else 640;
+            const n_frames = (clip.len / 4 + spt - 1) / spt;
+            if (n_frames == 0) return error.EmptyAudio;
+            const buf = try req.allocator.alloc(f32, n_frames * spt);
+            defer req.allocator.free(buf); // mlx_array_new_data copies
+            @memset(buf, 0);
+            @memcpy(std.mem.sliceAsBytes(buf)[0..clip.len], clip);
+            const shape = [_]c_int{ 1, @intCast(n_frames), @intCast(spt) };
+            const frames_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
+            defer _ = mlx.mlx_array_free(frames_arr);
+            return vision_enc.forwardAudio(frames_arr);
+        },
+    }
 }
 
 fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []const u8) void {
@@ -5349,7 +5290,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             .head_marks = if (head) |t| t.qwen4MtpMarks() else &.{},
         };
     };
-    const finish_st = hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit, slot.full_prompt.len) catch |err| {
+    const finish_st = hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.media, slot.cache_key, ssm_cps_opt, dflash_commit, mtp_commit, slot.full_prompt.len) catch |err| {
         // Ownership of the checkpoints transferred to the cache regardless of
         // the outcome — its error paths free them (#330 adjacent: freeing
         // here too was a double free, with a different allocator).
@@ -5405,16 +5346,11 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
         return;
     };
     const cps: ?[]transformer_mod.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
-    // Pass the media boundary RAW: when the cancelled prefill forwarded less
-    // than the media position, the cache re-keys the pure-text entry to the
-    // null vision key (a kept pixel key with no boundary is the
-    // conservative-rejection poison shape; live 2026-09-07).
-    const media_start = slot.media_start;
     // Ownership of the checkpoints transfers to the cache unconditionally —
     // its error paths free them (#330 adjacent) — so detach from the slot
     // BEFORE the call or Slot.deinit frees them a second time.
     slot.cancelled_prefill = .{};
-    const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
+    const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.media, slot.cache_key, cps, null, null, len) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -6030,6 +5966,17 @@ pub fn prefillInterleaveEnabled() bool {
     return on;
 }
 
+/// Target fraction of wall time the decoding streams get while another slot prefills,
+/// set once by `main` from `--prefill-decode-share` or MLX_SERVE_PREFILL_DECODE_SHARE
+/// (`resolveDecodeShare`). 0 = one boundary's `interleaveTicksFor` ticks and the company
+/// width, as before. Reads 0 under the MLX_SERVE_PREFILL_INTERLEAVE=0 kill switch: no
+/// hook, nothing to share.
+pub var prefill_decode_share: f32 = 0;
+pub fn prefillDecodeShare() f32 {
+    if (!prefillInterleaveEnabled()) return 0;
+    return prefill_decode_share;
+}
+
 const InterleaveCtx = struct {
     sch: *Scheduler,
     decode_ns: u64 = 0,
@@ -6068,6 +6015,72 @@ pub fn companyPrefillChunk(chunk: u32, decoding: usize) u32 {
     return if (chunk == 0) COMPANY_PREFILL_CHUNK else @min(chunk, COMPANY_PREFILL_CHUNK);
 }
 
+/// Largest accepted decode share: at 0.9 the decoders own nine times each chunk's time.
+pub const PREFILL_DECODE_SHARE_MAX: f32 = 0.9;
+/// Prefill width while a decode share is live and someone decodes.
+pub const DECODE_SHARE_PREFILL_CHUNK: u32 = 1024;
+
+/// `--prefill-decode-share` / MLX_SERVE_PREFILL_DECODE_SHARE text to a share in [0, 0.9].
+/// Above 0.9 clamps; anything that is not a number >= 0 is an error.
+pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
+    const v = std.fmt.parseFloat(f32, text) catch return error.InvalidDecodeShare;
+    if (std.math.isNan(v) or v < 0) return error.InvalidDecodeShare;
+    return @min(v, PREFILL_DECODE_SHARE_MAX);
+}
+
+/// The flag's text if given, else the env's, else 0.
+pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDecodeShare}!f32 {
+    const text = flag orelse env orelse return 0;
+    return parseDecodeShare(text);
+}
+
+/// The width a prefill started beside live decoders may run at, 0 = no cap. Decided when
+/// the prefill starts, after admission, so admission bills the uncapped width. A decoder
+/// that finishes mid-prefill lifts the cap only where the adaptive width hook runs.
+pub fn decodeShareAdmissionCap(decoding: usize, share: f32) u32 {
+    if (decoding == 0 or share <= 0) return 0;
+    return DECODE_SHARE_PREFILL_CHUNK;
+}
+
+/// Decode wall time owed after a prefill chunk of `chunk_ns`: chunk * S / (1 - S).
+pub fn decodeShareBudgetNs(chunk_ns: u64, share: f32) u64 {
+    if (share <= 0) return 0;
+    const s: f64 = @min(share, PREFILL_DECODE_SHARE_MAX);
+    return @intFromFloat(@as(f64, @floatFromInt(chunk_ns)) * s / (1 - s));
+}
+
+/// Is another decode tick owed at this boundary? Never fewer than `interleaveTicksFor`.
+pub fn interleaveTickOwed(share: f32, chunk_ns: u64, first_ns: u64, ticks: u32, decode_ns: u64) bool {
+    if (first_ns == 0) return false;
+    if (ticks < interleaveTicksFor(chunk_ns, first_ns)) return true;
+    return decode_ns < decodeShareBudgetNs(chunk_ns, share);
+}
+
+/// The adaptive width hook's pick, capped while a decode share is live and someone decodes.
+pub fn decodeShareWidthCap(width: u32, decoding: usize, share: f32) u32 {
+    const cap = decodeShareAdmissionCap(decoding, share);
+    return if (cap == 0) width else @min(width, cap);
+}
+
+pub const OwedTicks = struct { ticks: u32, spent_ns: u64 };
+
+/// The ticks after a boundary's first one: run until none is owed or the decoders run out
+/// (`tick` returns 0).
+pub fn runOwedDecodeTicks(share: f32, chunk_ns: u64, first_ns: u64, ctx: *anyopaque, tick: *const fn (*anyopaque) u64) OwedTicks {
+    var r: OwedTicks = .{ .ticks = 1, .spent_ns = first_ns };
+    while (interleaveTickOwed(share, chunk_ns, first_ns, r.ticks, r.spent_ns)) {
+        const ns = tick(ctx);
+        if (ns == 0) break;
+        r.ticks += 1;
+        r.spent_ns +|= ns;
+    }
+    return r;
+}
+
+fn interleaveDecodeTickOpaque(ctx: *anyopaque) u64 {
+    return interleaveDecodeTick(@ptrCast(@alignCast(ctx)));
+}
+
 const INTERLEAVE_MAX_TICKS: u32 = 8;
 
 /// Decode ticks owed at a chunk boundary: enough to keep the decoding streams at a quarter
@@ -6087,7 +6100,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
     if (!hc.ssd_first) return;
     const d = if (hc.disk) |*dd| dd else return;
     if (d.writer == null) return;
-    if (slot.vision_key != 0) return;
+    if (slot.media.len != 0) return;
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
     const s = if (slot.model.transformer) |x| x.s else return;
     wc.chunks += 1;
@@ -6157,7 +6170,7 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     if (!hc.ssd_first) return false;
     const d = if (hc.disk) |*dd| dd else return false;
     const writer_up = d.writer != null;
-    if (!writer_up or slot.vision_key != 0) return false;
+    if (!writer_up or slot.media.len != 0) return false;
     if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
         if (!write_through_span_declined_logged.swap(true, .monotonic)) {
             log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) — the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
@@ -6169,6 +6182,7 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
 
 /// Context for `Generator.InitOptions.chunk_width_hook`. `cfg` is optional (embedded engines).
 const ChunkWidthCtx = struct {
+    sch: *Scheduler,
     cfg: ?*const model_mod.ModelConfig,
     kv_bits: u64,
     /// This slot's own per-model cache, never `sch.hot_prefix_cache`; only `stagedHostBytes`
@@ -6199,7 +6213,10 @@ fn chunkWidthCb(
     const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
     const cfg = wc.cfg orelse return cur;
     const pick = prefill_chunk_adapt orelse return cur;
-    return pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
+    const next = pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
+    // Only a live adaptive width may move; elsewhere the admitted width stands.
+    if (!adaptiveChunkWidthFor(cfg)) return next;
+    return decodeShareWidthCap(next, wc.sch.liveDecodingCount(), prefillDecodeShare());
 }
 
 fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
@@ -6208,16 +6225,11 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
         log.debug("[interleave] engaged: decode ticks between prefill chunks\n", .{});
     }
     const chunk_ns = ic.chunk_sw.read();
+    const share = prefillDecodeShare();
     const first_ns = interleaveDecodeTick(ic.sch);
-    ic.ticks += 1;
-    ic.decode_ns +|= first_ns;
-    var left = if (first_ns == 0) 0 else interleaveTicksFor(chunk_ns, first_ns) - 1;
-    while (left > 0) : (left -= 1) {
-        const ns = interleaveDecodeTick(ic.sch);
-        if (ns == 0) break;
-        ic.ticks += 1;
-        ic.decode_ns +|= ns;
-    }
+    const r = runOwedDecodeTicks(share, chunk_ns, first_ns, ic.sch, interleaveDecodeTickOpaque);
+    ic.ticks += r.ticks;
+    ic.decode_ns +|= r.spent_ns;
     ic.chunk_sw.reset();
 }
 
@@ -6411,8 +6423,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 xfm_ptr.s,
                 slot.full_prompt,
                 slot.has_tools,
-                slot.vision_key,
-                slot.media_start,
+                slot.media,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null,
                 @intFromPtr(slot),
@@ -6467,10 +6478,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // re-asked after the pass against the live delta.
     var admitted_prefill_chunk: u32 = 0;
     var evicted_live_bytes: u64 = 0;
-    // Arch gate for the whole pass; the connection-thread half is gated in
-    // `server.prefillAdmissionBill`. `publishHotCacheResidency` is not gated.
-    const admission_pass_armed = if (slot.model.config) |c| c.longCtxGated() else false;
-    if (admission_pass_armed) if (prefill_admission_fits) |fits_fn| {
+    if (prefill_admission_fits) |fits_fn| {
         if (slot.model.config) |cfg| {
             // Bills the request's own kv-quant scheme and vision chunking, not the process defaults.
             const Probe = struct {
@@ -6504,7 +6512,22 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .enable_mtp = slot.enable_mtp,
                 .fits = fits_fn,
             };
-            if (!Probe.call(&probe)) {
+            var fits = Probe.call(&probe);
+            // The encoder cache is the cheapest memory to give back: a miss costs one encode.
+            if (!fits) if (slot.model.vision_encoder) |ve| if (ve.emb_cache.bytes > 0) {
+                log.info("[scheduler] prefill does not fit: dropping {d}MB of cached media embeddings\n", .{ve.emb_cache.bytes / (1024 * 1024)});
+                ve.emb_cache.clear();
+                fits = Probe.call(&probe);
+            };
+            // A shared restore is billed a whole second copy; taking the entry over moves it instead.
+            if (!fits and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |*hc| {
+                if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len)) {
+                    hot_checked_out = true;
+                    probe.warm_will_donate = true;
+                    fits = Probe.call(&probe);
+                }
+            };
+            if (!fits) {
                 // The width admission was billed at, read before anything is evicted.
                 if (prefill_request_chunk) |pick_pre| {
                     admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
@@ -6530,7 +6553,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 }
             }
         }
-    };
+    }
 
     // The prefill width for this request, chosen after the admission pass evicted. Falls
     // back to the load-time pin without the hook or the arch opt-in.
@@ -6564,6 +6587,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
     // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
     var width_ctx = ChunkWidthCtx{
+        .sch = sch,
         .cfg = slot.model.config,
         .kv_bits = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits,
         .hc = if (slot.model.prefix_cache) |*p| p else null,
@@ -6632,6 +6656,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 0,
             // The width the admission guard billed for this request; the forward can never run wider.
             .pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk, sch.decodingCount()),
+            .decode_share_width_cap = decodeShareAdmissionCap(sch.liveDecodingCount(), prefillDecodeShare()),
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
@@ -7356,15 +7381,6 @@ test "a finish over a latched MLX failure ends the request as an ERROR, never a 
     try testing.expect(shape.finished == null);
     try testing.expectEqualStrings("MlxFailure", shape.errored.?);
     try testing.expect(!Slot.errorNameIsMemory(shape.errored.?));
-}
-
-test "firstMediaPlaceholder finds every dynamic media kind and ignores disabled ids" {
-    const tokens = [_]u32{ 0, 11, 22, 33, 44 };
-    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &tokens, 22, 0, 0));
-    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(true, &tokens, 0, 33, 0));
-    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(true, &tokens, 0, 0, 44));
-    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &tokens, 44, 33, 22));
-    try testing.expect(firstMediaPlaceholder(true, &tokens, 0, 0, 0) == null);
 }
 
 test "cancelled-prefill commit length: floor, clamp, and zero" {
@@ -10248,22 +10264,85 @@ test "companyPrefillChunk: a prefill narrows only while someone decodes" {
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(0, 1));
 }
 
+test "decode share: a live share caps the width only while someone decodes" {
+    const w = DECODE_SHARE_PREFILL_CHUNK;
+    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(0, 0.5));
+    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(2, 0));
+    try testing.expectEqual(w, decodeShareAdmissionCap(1, 0.5));
+    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 1, 0));
+    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 0, 0.5));
+    try testing.expectEqual(w, decodeShareWidthCap(8192, 1, 0.5));
+    try testing.expectEqual(@as(u32, 512), decodeShareWidthCap(512, 1, 0.5));
+}
+
+test "decode share: parse clamps above 0.9 and rejects anything that is not a share" {
+    try testing.expectEqual(@as(f32, 0), try parseDecodeShare("0"));
+    try testing.expectEqual(@as(f32, 0.5), try parseDecodeShare("0.5"));
+    try testing.expectEqual(PREFILL_DECODE_SHARE_MAX, try parseDecodeShare("0.95"));
+    try testing.expectEqual(PREFILL_DECODE_SHARE_MAX, try parseDecodeShare("inf"));
+    for ([_][]const u8{ "", "abc", "nan", "-0.3", "0.5x" }) |bad| {
+        try testing.expectError(error.InvalidDecodeShare, parseDecodeShare(bad));
+    }
+    // The flag outranks the env; neither set is 0; a bad env is an error, not 0.
+    try testing.expectEqual(@as(f32, 0.3), try resolveDecodeShare("0.3", "0.5"));
+    try testing.expectEqual(@as(f32, 0.5), try resolveDecodeShare(null, "0.5"));
+    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare(null, null));
+    try testing.expectError(error.InvalidDecodeShare, resolveDecodeShare(null, "abc"));
+}
+
+test "decode share: the budget is chunk * S / (1 - S), zero when off" {
+    const ms = std.time.ns_per_ms;
+    try testing.expectEqual(@as(u64, 0), decodeShareBudgetNs(400 * ms, 0));
+    try testing.expectApproxEqAbs(@as(f64, 400 * ms), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.5))), 1e3);
+    try testing.expectApproxEqAbs(@as(f64, 3600 * ms), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.9))), 1e4);
+    try testing.expectApproxEqAbs(@as(f64, 400 * ms * 3 / 7), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.3))), 1e4);
+}
+
+const FakeDecodeTicks = struct {
+    left: u32,
+    ns: u64,
+    calls: u32 = 0,
+    fn tick(ctx: *anyopaque) u64 {
+        const f: *FakeDecodeTicks = @ptrCast(@alignCast(ctx));
+        f.calls += 1;
+        if (f.left == 0) return 0;
+        f.left -= 1;
+        return f.ns;
+    }
+};
+
+test "decode share: a boundary ticks to the budget, keeps today's count at S=0, stops when decoders run out" {
+    const ms = std.time.ns_per_ms;
+    // S=0.5 on a 400 ms chunk with 8 ms ticks: 50 ticks, 400 ms of decode.
+    var full = FakeDecodeTicks{ .left = 1000, .ns = 8 * ms };
+    const r = runOwedDecodeTicks(0.5, 400 * ms, 8 * ms, &full, FakeDecodeTicks.tick);
+    try testing.expectEqual(@as(u32, 50), r.ticks);
+    try testing.expectEqual(@as(u64, 400 * ms), r.spent_ns);
+    // S=0 is exactly today's schedule, whatever the chunk cost.
+    for ([_]u64{ 100, 300, 2300, 8000 }) |c| {
+        var legacy = FakeDecodeTicks{ .left = 1000, .ns = 8 * ms };
+        const l = runOwedDecodeTicks(0, c * ms, 8 * ms, &legacy, FakeDecodeTicks.tick);
+        try testing.expectEqual(interleaveTicksFor(c * ms, 8 * ms), l.ticks);
+    }
+    // The decoders finish after 3 more ticks: the 4th call returns 0 and the loop stops.
+    var dry = FakeDecodeTicks{ .left = 3, .ns = 8 * ms };
+    const d = runOwedDecodeTicks(0.5, 400 * ms, 8 * ms, &dry, FakeDecodeTicks.tick);
+    try testing.expectEqual(@as(u32, 4), d.ticks);
+    try testing.expectEqual(@as(u32, 4), dry.calls);
+    try testing.expectEqual(@as(u64, 32 * ms), d.spent_ns);
+    // Nobody decoding at the boundary: the first tick measured 0, no more are tried.
+    var none = FakeDecodeTicks{ .left = 1000, .ns = 8 * ms };
+    const n = runOwedDecodeTicks(0.5, 2300 * ms, 0, &none, FakeDecodeTicks.tick);
+    try testing.expectEqual(@as(u32, 1), n.ticks);
+    try testing.expectEqual(@as(u32, 0), none.calls);
+}
+
 test "interleaveTicksFor: decode keeps a quarter of wall time across a slow chunk, capped" {
     const ms = std.time.ns_per_ms;
     try testing.expectEqual(@as(u32, 8), interleaveTicksFor(8000 * ms, 80 * ms));
     try testing.expectEqual(@as(u32, 2), interleaveTicksFor(300 * ms, 50 * ms));
     try testing.expectEqual(@as(u32, 1), interleaveTicksFor(100 * ms, 80 * ms));
     try testing.expectEqual(@as(u32, 1), interleaveTicksFor(8000 * ms, 0));
-}
-
-test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media boundary" {
-    // The ids are ordinary vocabulary entries, so a text-only prompt can carry
-    // one (live: a pasted source file held 248056 at index 18338 of a 73k
-    // prompt). A media boundary exists only where media rows do.
-    const image_id: u32 = 248056;
-    const text_only = [_]u32{ 7, 8, image_id, 9 };
-    try testing.expectEqual(@as(?usize, null), firstMediaPlaceholder(false, &text_only, image_id, 0, 0));
-    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &text_only, image_id, 0, 0));
 }
 
 test "a media job always clears the allocator cache, a decision job only from 256 MiB" {

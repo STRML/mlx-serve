@@ -2084,6 +2084,128 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     try testing.expectEqual(chat.StreamThinkGate.flush_text, chat.streamThinkGate("The visible answer.", true, true));
 }
 
+/// Length of a `<|…>` special-token marker starting `s`, or null.
+fn specialMarkerLenAt(s: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, s, "<|")) return null;
+    for (s[2..@min(s.len, 40)], 2..) |c, k| {
+        if (c == '<') return null;
+        if (c == '>') return k + 1;
+    }
+    return null;
+}
+
+test "format corpus: reasoning streamed mid-thought is a prefix of the delivered reasoning" {
+    // Replay of the tools-path stream order both SSE handlers use, byte by byte
+    // except `<|…>` markers, which are special tokens and arrive whole:
+    // tool hold first, then the think gate; `.hold_thinking` streams the
+    // unsent tail of the split so far. A delta cannot be retracted, so every
+    // streamed byte (bar trailing whitespace the final trim drops) must be
+    // reasoning the finished split also delivers — no tag, header or tool text.
+    const allocator = testing.allocator;
+    for (corpus) |entry| {
+        var sent = std.ArrayList(u8).empty;
+        defer sent.deinit(allocator);
+        var scan: chat.ThinkScan = .{};
+        var streamed: usize = 0;
+        var final: ?[]const u8 = null;
+        var content_started = false;
+        var i: usize = 0;
+        while (i < entry.raw.len) {
+            i += specialMarkerLenAt(entry.raw[i..]) orelse 1;
+            const buf = entry.raw[0..i];
+            if (chat.streamShouldBufferForTools(buf)) continue;
+            switch (chat.streamThinkGateScan(buf, entry.thinking, false, entry.opened_by_template, &scan)) {
+                .hold_thinking => if (!content_started) {
+                    const rc = chat.streamableReasoning(chat.splitThinkBlock(buf, true, entry.opened_by_template).reasoning_content orelse continue);
+                    if (chat.unstreamedReasoning(rc, streamed)) |fresh| {
+                        try sent.appendSlice(allocator, fresh);
+                        streamed = rc.len;
+                    }
+                },
+                .split_think => {
+                    final = chat.splitThinkBlock(buf, true, entry.opened_by_template).reasoning_content;
+                    break;
+                },
+                .flush_text => content_started = true,
+            }
+        }
+        const norm = try chat.normalizeEmbeddedThinkBlocks(allocator, entry.raw);
+        defer if (norm) |n| allocator.free(n);
+        if (final == null) final = chat.splitThinkBlock(norm orelse entry.raw, true, entry.opened_by_template).reasoning_content;
+        const got = std.mem.trimEnd(u8, sent.items, " \t\r\n");
+        if (!std.mem.startsWith(u8, final orelse "", got)) try fail(entry, "streamed reasoning is not a prefix of the delivered reasoning", got);
+    }
+}
+
+fn inMarkup(raw: []const u8, word: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, raw, i, '<')) |lt| : (i = lt + 1) {
+        const end = std.mem.indexOfAnyPos(u8, raw, lt + 1, "<> \t\r\n") orelse raw.len;
+        if (end < raw.len and raw[end] == '>' and std.mem.indexOf(u8, raw[lt..end], word) != null) return true;
+    }
+    return false;
+}
+
+test "format corpus: a stop string ends the answer, never the reasoning" {
+    // Every word of each entry, and each whitespace stop, is tried as a client stop
+    // string. A stop only the reasoning holds never cuts once the output holds reasoning
+    // (text a later close turns into a thought is still answer when the stop arrives);
+    // a stop the answer holds cuts at its first place there; a byte-by-byte stream cuts
+    // at the same byte. Words spelled inside a `<...>` marker are neither: skipped. A
+    // stop inside a tool call breaks the call either way, so tool entries skip the answer half.
+    const allocator = testing.allocator;
+    for (corpus) |entry| {
+        const norm = try chat.normalizeEmbeddedThinkBlocks(allocator, entry.raw);
+        defer if (norm) |n| allocator.free(n);
+        const full = chat.splitThinkBlockKeepingMarkup(norm orelse entry.raw, true, entry.opened_by_template);
+        const reasoning = full.reasoning_content orelse "";
+        const calls = try chat.parseToolCalls(allocator, norm orelse entry.raw);
+        defer if (calls) |cs| {
+            for (cs) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(cs);
+        };
+        const spaces = [_][]const u8{ "\n", "\n\n", " " };
+        var words = std.mem.tokenizeAny(u8, entry.raw, " \t\r\n.,:;!?()[]{}<>|\"'`=/*#-");
+        var k: usize = 0;
+        while (true) : (k += 1) {
+            const stop = if (k < spaces.len) spaces[k] else words.next() orelse break;
+            if (k >= spaces.len and (stop.len < 3 or inMarkup(entry.raw, stop))) continue;
+            const cut = chat.answerStopIndex(entry.raw, 0, stop, entry.opened_by_template);
+
+            var streamed: ?usize = null;
+            var i: usize = 0;
+            while (i < entry.raw.len and streamed == null) {
+                const emitted = i;
+                i += specialMarkerLenAt(entry.raw[i..]) orelse 1;
+                streamed = chat.answerStopIndex(entry.raw[0..i], emitted -| (stop.len - 1), stop, entry.opened_by_template);
+            }
+            if (streamed != cut) try fail(entry, "the stream cut at a different byte than the finished text", stop);
+
+            const in_c = std.mem.indexOf(u8, full.content, stop);
+            const said_reasoning = if (cut) |at| chat.splitThinkBlockKeepingMarkup(entry.raw[0 .. at + stop.len], true, entry.opened_by_template).reasoning_content != null else false;
+            if (in_c == null) {
+                if (said_reasoning and std.mem.indexOf(u8, reasoning, stop) != null)
+                    try fail(entry, "a stop inside the reasoning cut the output", stop);
+                continue;
+            }
+            // Normalization joins merged answer parts with a newline the raw text never had.
+            if (calls != null or (k < spaces.len and norm != null)) continue;
+            const at = cut orelse return fail(entry, "a stop in the answer did not cut", stop);
+            if (!said_reasoning and reasoning.len > 0) continue;
+            const cut_norm = try chat.normalizeEmbeddedThinkBlocks(allocator, entry.raw[0..at]);
+            defer if (cut_norm) |n| allocator.free(n);
+            const head = chat.splitThinkBlockKeepingMarkup(cut_norm orelse entry.raw[0..at], true, entry.opened_by_template);
+            if (!std.mem.startsWith(u8, reasoning, head.reasoning_content orelse "")) try fail(entry, "a cut in the answer garbled the reasoning", stop);
+            if (!std.mem.startsWith(u8, full.content, head.content) or head.content.len > in_c.? or
+                std.mem.trim(u8, full.content[head.content.len..in_c.?], " \t\r\n").len != 0)
+                try fail(entry, "the cut is not at the stop's first place in the answer", stop);
+        }
+    }
+}
+
 test "format corpus: streaming tool buffer never flushes Inkling call text" {
     // Replay every Inkling tool-call entry through the server's has_tools
     // streaming order (chat.streamShouldBufferForTools FIRST, then the think

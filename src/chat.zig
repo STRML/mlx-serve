@@ -144,9 +144,18 @@ pub const ChatConfig = struct {
     eos_token: ?[]const u8,
     add_bos_token: bool,
     allocator: std.mem.Allocator,
+    /// Template variables as a JSON object: the model's `chat_template_kwargs`
+    /// (`model-settings.json`), with a request's own merged over them per request.
+    chat_template_kwargs: ?[]const u8 = null,
+    /// The model's `enable_thinking` / `reasoning_effort` kwargs, typed: used
+    /// only when a request names neither (`server.resolveChatThinking`).
+    default_enable_thinking: ?bool = null,
+    default_reasoning_effort: ?[]const u8 = null,
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);
+        if (self.chat_template_kwargs) |k| self.allocator.free(k);
+        if (self.default_reasoning_effort) |e| self.allocator.free(e);
         if (self.bos_token) |t| self.allocator.free(t);
         if (self.eos_token) |t| self.allocator.free(t);
     }
@@ -658,7 +667,10 @@ fn renderChatTemplate(
     // Harmony (gpt_oss) indexes into `message.content` after only checking that
     // the KEY exists, so a null there breaks every tool round-trip. Sniffed off
     // the template's own channel marker, like the reasoning drop above.
-    const empty_content: EmptyContent = if (std.mem.indexOf(u8, tpl, "<|channel|>") != null)
+    // LFM2-VL iterates any non-string content, so a null there raises on every
+    // tool-call turn.
+    const empty_content: EmptyContent = if (std.mem.indexOf(u8, tpl, "<|channel|>") != null or
+        std.mem.indexOf(u8, tpl, "if content is not string") != null)
         .empty_string
     else
         .null_literal;
@@ -868,6 +880,9 @@ fn synthesizeToolFallbackMessages(
             try out.append(arena, .{
                 .role = "user",
                 .content = wrapped,
+                .images = msg.images,
+                .videos = msg.videos,
+                .audio = msg.audio,
             });
             continue;
         }
@@ -937,6 +952,48 @@ pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const 
     return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template));
 }
 
+pub fn messageHasMedia(msg: Message) bool {
+    return (msg.images != null and msg.images.?.len > 0) or
+        (msg.videos != null and msg.videos.?.len > 0) or
+        (msg.audio != null and msg.audio.?.len > 0);
+}
+
+/// An LFM2-VL tiled source is several `ImageData` entries (tiles + thumbnail);
+/// the template renders ONE placeholder for the source, at its first piece.
+pub fn isImageItemStart(img: ImageData) bool {
+    return img.tile_rows == 0 or img.tile_index == 0;
+}
+
+/// Media as content parts, so the model's own template renders one
+/// placeholder per item where the message sits: images, videos, audio (the
+/// order the server encodes them), then the text.
+fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), msg: Message) !void {
+    try buf.append(allocator, '[');
+    var first = true;
+    for (msg.images orelse &[_]ImageData{}) |img| {
+        if (!isImageItemStart(img)) continue;
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.appendSlice(allocator, "{\"type\":\"image\"}");
+    }
+    for (msg.videos orelse &[_]VideoData{}) |_| {
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.appendSlice(allocator, "{\"type\":\"video\"}");
+    }
+    for (msg.audio orelse &[_]AudioData{}) |_| {
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.appendSlice(allocator, "{\"type\":\"audio\"}");
+    }
+    if (msg.content.len > 0) {
+        try buf.appendSlice(allocator, ",{\"type\":\"text\",\"text\":");
+        try appendJsonString(allocator, buf, msg.content);
+        try buf.append(allocator, '}');
+    }
+    try buf.append(allocator, ']');
+}
+
 fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
@@ -948,7 +1005,9 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
         try appendJsonString(allocator, &buf, msg.role);
 
         try buf.appendSlice(allocator, ",\"content\":");
-        if (msg.content.len > 0) {
+        if (messageHasMedia(msg)) {
+            try appendMediaContentParts(allocator, &buf, msg);
+        } else if (msg.content.len > 0) {
             try appendJsonString(allocator, &buf, msg.content);
         } else switch (empty_content) {
             .null_literal => try buf.appendSlice(allocator, "null"),
@@ -1138,6 +1197,34 @@ fn k2EffortFor(effort: ?[]const u8) []const u8 {
 /// `effort` is the client's raw `reasoning_effort` string (null when the
 /// request didn't send one) — today only the dsv4 family maps it into the
 /// template; other families keep their fixed vocabulary.
+fn appendKwarg(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), key: []const u8, value: std.json.Value) !void {
+    if (buf.items.len > 1) try buf.append(allocator, ',');
+    try appendJsonString(allocator, buf, key);
+    try buf.append(allocator, ':');
+    const v = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(v);
+    try buf.appendSlice(allocator, v);
+}
+
+/// A request's `chat_template_kwargs` over the model's: one object, request keys win.
+pub fn mergeTemplateKwargs(allocator: std.mem.Allocator, model_kwargs: ?[]const u8, request: std.json.ObjectMap) ![]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '{');
+    var it = request.iterator();
+    while (it.next()) |kv| try appendKwarg(allocator, &buf, kv.key_ptr.*, kv.value_ptr.*);
+    if (model_kwargs) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            var mit = parsed.value.object.iterator();
+            while (mit.next()) |kv| if (!request.contains(kv.key_ptr.*)) try appendKwarg(allocator, &buf, kv.key_ptr.*, kv.value_ptr.*);
+        }
+    }
+    try buf.append(allocator, '}');
+    return buf.toOwnedSlice(allocator);
+}
+
 fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatConfig, enable_thinking: bool, effort: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
@@ -1243,6 +1330,32 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         try buf.appendSlice(allocator, ",\"reasoning_strength\":\"");
         try buf.appendSlice(allocator, strength);
         try buf.append(allocator, '"');
+    }
+
+    var kwargs: ?std.json.Parsed(std.json.Value) = null;
+    defer if (kwargs) |*k| k.deinit();
+    if (chat_config.chat_template_kwargs) |raw| {
+        kwargs = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch null;
+    }
+    const kw_obj: ?std.json.ObjectMap = if (kwargs) |k| (if (k.value == .object) k.value.object else null) else null;
+
+    // Qwen3.8 renders EVERY turn's <think> when `preserve_thinking` is
+    // undefined; round-tripped agent reasoning then swamps the prompt.
+    if (std.mem.indexOf(u8, chat_config.chat_template, "preserve_thinking") != null and
+        (kw_obj == null or kw_obj.?.get("preserve_thinking") == null))
+    {
+        try buf.appendSlice(allocator, ",\"preserve_thinking\":false");
+    }
+
+    if (kw_obj) |obj| {
+        // Set above from resolved values, or the wrapper's own context.
+        const reserved = [_][]const u8{ "bos_token", "eos_token", "enable_thinking", "reasoning_effort", "thinking_mode", "reasoning_strength", "messages", "tools", "add_generation_prompt" };
+        var it = obj.iterator();
+        while (it.next()) |kv| {
+            var skip = false;
+            for (reserved) |r| skip = skip or std.mem.eql(u8, r, kv.key_ptr.*);
+            if (!skip) try appendKwarg(allocator, &buf, kv.key_ptr.*, kv.value_ptr.*);
+        }
     }
 
     try buf.append(allocator, '}');
@@ -2443,6 +2556,23 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: boo
     return .{ .reasoning_content = reasoning, .content = trimLeakedToolMarkup(split.content) };
 }
 
+/// First match of a client stop string at or after `from` that the split delivers as
+/// answer content, never reasoning. Judged on the text up to the match only, so a
+/// stream and its finished text cut at the same byte.
+pub fn answerStopIndex(text: []const u8, from: usize, stop: []const u8, opened_by_template: bool) ?usize {
+    var pos = from;
+    while (std.mem.indexOfPos(u8, text, pos, stop)) |idx| : (pos = idx + 1) {
+        const head = text[0 .. idx + stop.len];
+        const c = splitThinkBlockKeepingMarkup(head, true, opened_by_template).content;
+        const start = @intFromPtr(c.ptr) -% @intFromPtr(head.ptr);
+        if (c.len == 0 or start > idx) continue;
+        // The split trims trailing whitespace off the content; a match right after it is still answer.
+        const end = start + c.len;
+        if (idx <= end or std.mem.trim(u8, head[end..idx], " \t\r\n").len == 0) return idx;
+    }
+    return null;
+}
+
 /// The split WITHOUT the leaked-markup cut — for the one caller that feeds the
 /// content back to `parseToolCalls` (the /v1/messages non-streaming path).
 /// Every arm below returns raw slices; the cut is applied ONCE in the wrapper
@@ -2870,7 +3000,8 @@ fn functionOpenerHoldsForTools(buf: []const u8) bool {
 /// streamed as visible text and a raw `</think>` leaked into Claude Code
 /// transcripts (2026-06-10 live).
 ///
-///   .hold_thinking — inside an unclosed think block; buffer, emit nothing
+///   .hold_thinking — inside an unclosed think block; buffer, stream only the
+///                    reasoning not yet sent (`unstreamedReasoning`)
 ///   .split_think   — close tag arrived; splitThinkBlock once, emit
 ///                    reasoning + visible remainder, clear the buffer, and
 ///                    set think_closed for the rest of the turn
@@ -3125,6 +3256,12 @@ pub fn streamContentLead(chunk: []const u8, content_started: bool) []const u8 {
 pub fn unstreamedReasoning(reasoning: []const u8, already: usize) ?[]const u8 {
     if (already >= reasoning.len) return null;
     return reasoning[already..];
+}
+
+/// The part of an unclosed thought safe to stream: a close tag still arriving
+/// in pieces (`</thi`) is held back until the next token decides it.
+pub fn streamableReasoning(so_far: []const u8) []const u8 {
+    return so_far[0 .. so_far.len - partialThinkCloseSuffixLen(so_far)];
 }
 
 /// Parse tool calls from model output text.
@@ -6865,7 +7002,7 @@ fn isJsonLiteral(s: []const u8) bool {
 }
 
 /// JSON's number grammar; `parseFloat` is wider (`Infinity`, `0755`, `.5`) and the literal is spliced UNQUOTED.
-fn isJsonNumber(s: []const u8) bool {
+pub fn isJsonNumber(s: []const u8) bool {
     var i: usize = 0;
     if (i < s.len and s[i] == '-') i += 1;
     if (i >= s.len or !std.ascii.isDigit(s[i])) return false;
@@ -13302,6 +13439,63 @@ test "serializeExtraContext: muse maps effort onto reasoning_strength" {
     try testing.expect(std.mem.indexOf(u8, r, "reasoning_strength") == null);
 }
 
+test "serializeExtraContext: preserve_thinking defaults false; chat_template_kwargs fill what the request did not decide" {
+    // Qwen3.8's template keeps EVERY turn's <think> block when the variable is
+    // undefined; the bar is that prior-turn reasoning stays out of the prompt.
+    const allocator = testing.allocator;
+    var qwen38 = ChatConfig{
+        .chat_template = "…{%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}…",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const r = try serializeExtraContext(allocator, &qwen38, true, null);
+    defer allocator.free(r);
+    try testing.expect(std.mem.indexOf(u8, r, "\"preserve_thinking\":false") != null);
+    // The per-model kwargs turn Qwen's trained-for behaviour back on and carry
+    // any other key; a key the request decides (enable_thinking) is not theirs.
+    qwen38.chat_template_kwargs = "{\"preserve_thinking\":true,\"custom\":{\"n\":1},\"enable_thinking\":false}";
+    const on = try serializeExtraContext(allocator, &qwen38, true, null);
+    defer allocator.free(on);
+    try testing.expect(std.mem.indexOf(u8, on, "\"preserve_thinking\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, on, "\"preserve_thinking\":false") == null);
+    try testing.expect(std.mem.indexOf(u8, on, "\"custom\":{\"n\":1}") != null);
+    try testing.expect(std.mem.indexOf(u8, on, "\"enable_thinking\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, on, "\"enable_thinking\":false") == null);
+
+    // A kwarg can never replace the conversation the wrapper puts in context.
+    qwen38.chat_template_kwargs = "{\"messages\":[],\"tools\":[],\"add_generation_prompt\":false}";
+    const core = try serializeExtraContext(allocator, &qwen38, true, null);
+    defer allocator.free(core);
+    for ([_][]const u8{ "messages", "tools", "add_generation_prompt" }) |k| try testing.expect(std.mem.indexOf(u8, core, k) == null);
+
+    var plain = ChatConfig{
+        .chat_template = "{{ messages }}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const p = try serializeExtraContext(allocator, &plain, true, null);
+    defer allocator.free(p);
+    try testing.expect(std.mem.indexOf(u8, p, "preserve_thinking") == null);
+}
+
+test "mergeTemplateKwargs: request keys win, the model's fill the rest" {
+    const allocator = testing.allocator;
+    const req = try std.json.parseFromSlice(std.json.Value, allocator, "{\"preserve_thinking\":true,\"x\":1}", .{});
+    defer req.deinit();
+    const merged = try mergeTemplateKwargs(allocator, "{\"preserve_thinking\":false,\"y\":\"m\"}", req.value.object);
+    defer allocator.free(merged);
+    const got = try std.json.parseFromSlice(std.json.Value, allocator, merged, .{});
+    defer got.deinit();
+    try testing.expectEqual(true, got.value.object.get("preserve_thinking").?.bool);
+    try testing.expectEqual(@as(i64, 1), got.value.object.get("x").?.integer);
+    try testing.expectEqualStrings("m", got.value.object.get("y").?.string);
+    try testing.expectEqual(@as(usize, 3), got.value.object.count());
+}
+
 test "renderChatTemplate: dsv4 template renders tools + DSML history + tool_result (hermetic)" {
     // src/fixtures/dsv4_chat_template.jinja is OUR faithful transcription of
     // DeepSeek-V4's encoding_dsv4.py (the checkpoint ships none): TOOLS block
@@ -14516,4 +14710,48 @@ test "foldSystemMessages: a system turn past index 0 joins the leading system me
     try plain.append(al, .{ .role = "user", .content = "hi" });
     try std.testing.expect((try foldSystemMessages(al, &plain)) == null);
     try std.testing.expectEqual(@as(usize, 2), plain.items.len);
+}
+
+test "media renders one template placeholder per item, a tool image inside its tool response" {
+    // Every vision template we serve must place a tool message's image: one it
+    // drops is a named 400 on every later turn of an agent session.
+    const allocator = testing.allocator;
+    const Case = struct { tpl: []const u8, eos: []const u8, ph: []const u8, tool_image: []const u8 };
+    const cases = [_]Case{
+        .{
+            .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
+            .eos = "<|im_end|>",
+            .ph = "<|vision_start|><|image_pad|><|vision_end|>",
+            .tool_image = "<tool_response>\n<|vision_start|><|image_pad|><|vision_end|>Read p3.png\n</tool_response>",
+        },
+        .{ .tpl = @embedFile("fixtures/muse_chat_template.jinja"), .eos = "<|eot|>", .ph = "<|patch|>", .tool_image = "\n<|patch|>Read p3.png" },
+        .{ .tpl = @embedFile("fixtures/lfm2_vl_chat_template.jinja"), .eos = "<|im_end|>", .ph = "<image>", .tool_image = "<image><tool_response>\nRead p3.png" },
+    };
+    const img = [_]ImageData{.{ .pixels = "", .width = 1, .height = 1 }};
+    const two = [_]ImageData{ img[0], img[0] };
+    const tc = [_]ToolCall{.{ .id = "c1", .name = "read", .arguments = "{\"path\":\"p3.png\"}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "page one", .images = &img },
+        .{ .role = "assistant", .content = "seen" },
+        .{ .role = "user", .content = "pages two", .images = &two },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "Read p3.png", .tool_call_id = "c1", .images = &img },
+    };
+    for (cases) |c| {
+        var config = ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = c.eos, .add_bos_token = false, .allocator = allocator };
+        const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+        defer allocator.free(rendered);
+        try testing.expectEqual(@as(usize, 4), std.mem.count(u8, rendered, c.ph));
+        try testing.expect(std.mem.indexOf(u8, rendered, c.tool_image) != null);
+    }
+}
+
+test "answerStopIndex: a stop after trailing whitespace in the answer still cuts" {
+    const t = std.testing;
+    const text = "</think>\n\nHi \n\nmore";
+    try t.expectEqual(@as(?usize, std.mem.indexOf(u8, text, "Hi ").? + 3), answerStopIndex(text, 0, "\n\n", true));
+    const hard_break = "</think>\n\nline  \nnext";
+    try t.expectEqual(@as(?usize, std.mem.indexOf(u8, hard_break, "  \n").? + 2), answerStopIndex(hard_break, 0, "\n", true));
+    // Whitespace leading the answer is never delivered, so it never matches.
+    try t.expectEqual(@as(?usize, null), answerStopIndex("</think>\n\nHi", 0, "\n\n", true));
 }

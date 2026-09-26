@@ -274,6 +274,11 @@ fn printUsage(io: std.Io) void {
         \\                        so one layer's attention scores stay within
         \\                        budget; this flag is the ceiling, not a floor.
         \\                        Lower it if a long prompt spikes memory.
+        \\  --prefill-decode-share <s>
+        \\                      Target fraction of wall time (0..0.9) the
+        \\                        decoding streams keep while another request
+        \\                        prefills; also narrows that prefill's chunks.
+        \\                        Default 0 (env MLX_SERVE_PREFILL_DECODE_SHARE).
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables the cache — which also
@@ -568,6 +573,7 @@ pub fn main(init: std.process.Init) !void {
     // file inspection); set explicitly via --engine to force ds4 or llama.
     var engine_override: ?gguf_meta.Engine = null;
     var log_level_explicit = false;
+    var decode_share_flag: ?[]const u8 = null;
     var i: usize = arg_start;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -882,6 +888,9 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--llama-kv-quant: expected off|q8|q4 (or 8/4), got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, args[i], "--prefill-decode-share") and i + 1 < args.len) {
+            i += 1;
+            decode_share_flag = args[i];
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
             i += 1;
             server_mod.max_concurrent = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -986,6 +995,12 @@ pub fn main(init: std.process.Init) !void {
     // server config in reach); the env stays the benching override.
     if (ane_media.share == null) ane_media.share = ane_mod.explicitShareEnv();
     ane_mod.media_offload = ane_media;
+
+    const decode_share_env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_PREFILL_DECODE_SHARE")) |r| std.mem.sliceTo(r, 0) else null;
+    scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag, decode_share_env) catch {
+        log.err("--prefill-decode-share / MLX_SERVE_PREFILL_DECODE_SHARE: expected a number >= 0 (above 0.9 clamps to 0.9), got '{s}'\n", .{decode_share_flag orelse decode_share_env.?});
+        std.process.exit(1);
+    };
 
     transformer_mod.Transformer.mtp_head_kv_quant_flag = mtp_head_kv_quant;
     generate_mod.mtp_acceptance_default = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
@@ -1257,7 +1272,6 @@ pub fn main(init: std.process.Init) !void {
     };
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
-    scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
     log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit {s} quant)\n", .{
         config.model_type,
         config.num_hidden_layers,
@@ -1305,41 +1319,12 @@ pub fn main(init: std.process.Init) !void {
         allocator.destroy(chat_config);
     };
 
-    // Merge the tokenizer's chat-terminator EOS into the stop set — ALWAYS,
-    // even when config.json already specified an eos_token_id. Some checkpoints
-    // (e.g. Qwen2.5-Coder-7B) set config.json eos_token_id to <|endoftext|>
-    // (151643) but their chat template ends turns with <|im_end|> (151645);
-    // stopping only on config's id leaks <|im_end|> into the output (breaks
-    // structured-JSON / tool-calling). Additive + dedup-guarded: this can only
-    // ADD a model-declared stop token, never remove one.
-    if (chat_config.eos_token) |eos_str| {
-        if (tok.special_tokens.get(eos_str)) |eos_id| {
-            if (!config.isEosToken(eos_id)) {
-                config.addEosToken(eos_id);
-                log.info("EOS token from tokenizer: {s} (id={d})\n", .{ eos_str, eos_id });
-            }
-        }
+    {
+        var settings = model_settings_mod.overrideFor(allocator, io, model_dir);
+        defer settings.deinit(allocator);
+        scheduler_mod.applyModelSettings(config, chat_config, &settings);
     }
-    // Also add <|endoftext|> if it exists and wasn't already added.
-    if (tok.special_tokens.get("<|endoftext|>")) |eot_id| {
-        if (!config.isEosToken(eot_id)) {
-            config.addEosToken(eot_id);
-        }
-    }
-
-    // Treat <pad> as a stop token, but only if it's not token ID 0
-    // (ID 0 can be produced spuriously by models under long/confusing prompts)
-    if (tok.special_tokens.get("<pad>")) |pad_id| {
-        if (pad_id > 0 and !config.isEosToken(pad_id)) {
-            config.addEosToken(pad_id);
-            log.info("Added <pad> as stop token (id={d})\n", .{pad_id});
-        }
-    }
-
-    // Pre-encode the user-turn marker so vision-image insertion can locate the
-    // latest user turn at request time, regardless of architecture.
-    try config.populateUserTurnMarker(allocator, tok, chat_config.chat_template);
-    config.populateLfm2ImageTokens(tok);
+    config.applyTokenizer(tok, chat_config.eos_token);
 
     const load_vision = config.has_vision and !no_vision;
 
@@ -1663,10 +1648,11 @@ fn chooseGgufEngine(
     defer info.deinit(allocator);
 
     const e = gguf_meta.preferredEngine(info);
-    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={})\n", .{
+    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={}, ds4-unloadable={})\n", .{
         @tagName(e),
         info.architecture orelse "?",
         info.has_ds4_lora_rank,
+        info.ds4_unloadable,
     });
     return e;
 }
@@ -1837,8 +1823,14 @@ fn runGenServe(
         e
     else if (registry.peekByPath(model_dir)) |e|
         e
-    else
-        try registry.registerStubWithArch(model_id, model_dir, null, modality.modelType());
+    else blk: {
+        // The boot stub's arch hint should be the pack's real model_type
+        // (`/v1/models` reports it); the modality marker is only the
+        // no-config fallback.
+        const real = gen_mod.peekModelType(io, allocator, model_dir);
+        defer if (real) |mt| allocator.free(mt);
+        break :blk try registry.registerStubWithArch(model_id, model_dir, null, real orelse modality.modelType());
+    };
     try registry.setDefault(entry.id);
 
     // Registry takes ownership of the stub if the inference thread installed it.
@@ -2050,7 +2042,8 @@ fn runDs4Serve(
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
 ) !void {
-    const settings = model_settings_mod.overrideFor(allocator, io, model_dir);
+    var settings = model_settings_mod.overrideFor(allocator, io, model_dir);
+    defer settings.deinit(allocator);
     const model_ctx = settings.ctx_size orelse ctx_size;
     // Resolve the GGUF file once on this thread so the engine's open() call
     // (running on the inference thread) gets an absolute path.
@@ -2349,7 +2342,8 @@ fn runLlamaServe(
     // inference thread). Used for BOTH the llama session size (via the stub
     // config's max_position_embeddings, read in runPrefillLlama) AND the
     // server's context guard (server_config.max_context_size), so they agree.
-    const settings = model_settings_mod.overrideFor(allocator, io, model_dir);
+    var settings = model_settings_mod.overrideFor(allocator, io, model_dir);
+    defer settings.deinit(allocator);
     const effective_ctx: u32 = settings.ctx_size orelse (if (ctx_size > 0) ctx_size else 8192);
 
     log.info("mlx-serve {s} (llama.cpp engine, GGUF backend)\n", .{VERSION});

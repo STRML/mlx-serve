@@ -575,14 +575,6 @@ pub const ModelConfig = struct {
     vision_start_token_id: u32 = 0,
     vision_end_token_id: u32 = 0,
 
-    // Token IDs that mark the start of a user turn in the rendered prompt.
-    // Populated at startup by encoding a chat-template-specific prefix string
-    // (e.g. "<|turn>user\n" for Gemma 4, "<|im_start|>user\n" for Qwen ChatML).
-    // Used by insertImageTokens to locate the latest user turn — a hard-coded
-    // ID search would silently break across architectures and quantizations.
-    user_turn_marker_ids: [16]u32 = @splat(0),
-    user_turn_marker_len: u8 = 0,
-
     // Gemma 4: dual head dimensions and KV sharing
     global_head_dim: u32 = 0, // 0 = same as head_dim
     num_global_key_value_heads: u32 = 0, // 0 = same as num_key_value_heads
@@ -888,7 +880,19 @@ pub const ModelConfig = struct {
     /// over-speculates in auto mode; 2 measured best (code 71 vs 58 tok/s).
     pub fn mtpDepth(self: *const ModelConfig, configured: u32) u32 {
         if (configured == 0 and self.hadamard_block > 0) return 2;
+        // Nemotron-H MoE: every verify row routes to more experts, so the
+        // round cost climbs with depth while the head's acceptance decays;
+        // depth 2 beats both 1 and 3+, the adaptive default cap (6) loses.
+        if (configured == 0 and std.mem.eql(u8, self.model_type, "nemotron_h")) return 2;
         return configured;
+    }
+
+    /// SSD prefix-cache layout marker (`kv_disk_cache.modelFingerprintWithLayout`).
+    /// Nemotron-H keys were RoPE-rotated before its attention became NoPE; the
+    /// marker gives it a fresh root. Null keeps every other arch's root.
+    pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
+        if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
+        return null;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1246,40 +1250,40 @@ pub const ModelConfig = struct {
         return self.eos_token_ids[0..self.num_eos_tokens];
     }
 
-    pub fn userTurnMarkerSlice(self: *const ModelConfig) []const u32 {
-        return self.user_turn_marker_ids[0..self.user_turn_marker_len];
-    }
-
-    /// Encode the architecture-appropriate user-turn prefix and store the IDs
-    /// on the config. Selects the prefix by matching marker tokens that appear
-    /// in `chat_template`, so a model that ships an unusual template still
-    /// gets the right tokenization. No-op (leaves length=0) when no known
-    /// pattern matches — insertImageTokens then falls back to its end-anchored
-    /// heuristic.
-    pub fn populateUserTurnMarker(
+    /// Everything a load derives from the tokenizer; both load paths call it.
+    pub fn applyTokenizer(
         self: *ModelConfig,
-        allocator: std.mem.Allocator,
         tok: *const tokenizer_mod.Tokenizer,
-        chat_template: []const u8,
-    ) !void {
-        const prefix = pickUserTurnPrefix(chat_template) orelse return;
-        const ids = try tok.encode(allocator, prefix);
-        defer allocator.free(ids);
-        const cap = self.user_turn_marker_ids.len;
-        if (ids.len == 0 or ids.len > cap) {
-            log.warn("user turn marker '{s}' encoded to {d} tokens (cap {d}); skipping\n", .{ prefix, ids.len, cap });
-            return;
+        eos_token: ?[]const u8,
+    ) void {
+        // Always merge the chat terminator, even when config.json names an EOS:
+        // Qwen2.5-Coder's config says <|endoftext|> but turns end on <|im_end|>.
+        if (eos_token) |eos_str| {
+            if (tok.special_tokens.get(eos_str)) |eos_id| {
+                if (!self.isEosToken(eos_id)) {
+                    self.addEosToken(eos_id);
+                    log.info("EOS token from tokenizer: {s} (id={d})\n", .{ eos_str, eos_id });
+                }
+            }
         }
-        @memcpy(self.user_turn_marker_ids[0..ids.len], ids);
-        self.user_turn_marker_len = @intCast(ids.len);
-        log.info("User turn marker: \"{s}\" -> {d} tokens\n", .{ prefix, ids.len });
+        if (tok.special_tokens.get("<|endoftext|>")) |eot_id| {
+            if (!self.isEosToken(eot_id)) self.addEosToken(eot_id);
+        }
+        // Id 0 can be produced spuriously under long/confusing prompts.
+        if (tok.special_tokens.get("<pad>")) |pad_id| {
+            if (pad_id > 0 and !self.isEosToken(pad_id)) {
+                self.addEosToken(pad_id);
+                log.info("Added <pad> as stop token (id={d})\n", .{pad_id});
+            }
+        }
+        self.populateLfm2ImageTokens(tok);
     }
 
     /// LFM2-VL wraps its image-token run in `<|image_start|>`/`<|image_end|>`,
     /// labels every tile with `<|img_row_R_col_C|>` and marks the thumbnail
     /// with `<|img_thumbnail|>`. NONE of those ids appear in config.json — the
     /// tokenizer is the only place they exist — so they are resolved by STRING
-    /// at load, like the user-turn marker. A missing marker leaves its id 0,
+    /// at load. A missing marker leaves its id 0,
     /// which every consumer reads as "this checkpoint has no such token".
     pub fn populateLfm2ImageTokens(self: *ModelConfig, tok: *const tokenizer_mod.Tokenizer) void {
         if (!self.lfm2_vision) return;
@@ -1306,29 +1310,6 @@ pub const ModelConfig = struct {
         self.ngram_table_path = null;
     }
 };
-
-/// Pick the user-turn prefix string for a model based on what its chat template
-/// emits at the start of a user turn. Order matters — the more specific Gemma 4
-/// `<|turn>` is checked before the older `<start_of_turn>` so a tokenizer that
-/// happens to register both still picks the one its template actually uses.
-pub fn pickUserTurnPrefix(chat_template: []const u8) ?[]const u8 {
-    if (std.mem.indexOf(u8, chat_template, "<|turn>") != null) {
-        return "<|turn>user\n"; // Gemma 4
-    }
-    if (std.mem.indexOf(u8, chat_template, "<start_of_turn>") != null) {
-        return "<start_of_turn>user\n"; // Gemma 3
-    }
-    if (std.mem.indexOf(u8, chat_template, "<|im_start|>") != null) {
-        return "<|im_start|>user\n"; // Qwen / generic ChatML
-    }
-    if (std.mem.indexOf(u8, chat_template, "<|start_header_id|>") != null) {
-        return "<|start_header_id|>user<|end_header_id|>\n\n"; // Llama 3
-    }
-    if (std.mem.indexOf(u8, chat_template, "<|start|>user<|message|>") != null) {
-        return "<|start|>user<|message|>"; // Muse-Glimmer (harmony channels)
-    }
-    return null;
-}
 
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
     const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
@@ -3389,6 +3370,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.rope_scaling_factor = 1.0;
         config.rope_local_base_freq = config.rope_theta;
         config.query_pre_attn_scalar = config.head_dim;
+        // NoPE: the reference attention never rotates q/k, whatever
+        // rope_theta the config carries. Covers the MTP head's layer too.
+        config.layer_no_rope = @splat(true);
         if (cfg_obj.get("rms_norm_eps")) |v| {
             config.rms_norm_eps = jsonFloat(v);
         } else if (cfg_obj.get("layer_norm_epsilon")) |v| {
@@ -3449,6 +3433,46 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                     };
                 }
             }
+        }
+        // Nemotron 3.5 configs spell the same pattern as a list of names; the
+        // string wins when both are present (mlx-lm's order).
+        if (cfg_obj.get("layers_block_type")) |v| {
+            if (v == .array and cfg_obj.get("hybrid_override_pattern") == null) {
+                for (v.array.items, 0..) |item, i| {
+                    if (i >= 128) break;
+                    if (item != .string) continue;
+                    const name = item.string;
+                    config.layer_block_types[i] = if (std.mem.eql(u8, name, "mamba"))
+                        .mamba2
+                    else if (std.mem.eql(u8, name, "mlp"))
+                        .mlp
+                    else if (std.mem.eql(u8, name, "moe"))
+                        .moe
+                    else
+                        .attention;
+                }
+            }
+        }
+        // MoE blocks ('E' / "moe"): sigmoid router with a selection-only
+        // score-correction bias, ReLU^2 routed experts, one shared expert.
+        if (cfg_obj.get("n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = @intCast(v.integer);
+        }
+        if (cfg_obj.get("moe_shared_expert_intermediate_size")) |v| {
+            if (v == .integer) config.shared_expert_intermediate_size = @intCast(v.integer);
+        }
+        if (cfg_obj.get("n_group")) |v| {
+            if (v == .integer) config.moe_n_group = @intCast(v.integer);
+        }
+        if (cfg_obj.get("topk_group")) |v| {
+            if (v == .integer) config.moe_topk_group = @intCast(v.integer);
+        }
+        if (cfg_obj.get("norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
+        if (cfg_obj.get("moe_latent_size")) |v| {
+            if (v == .integer) return error.UnsupportedNemotronLatentMoe;
         }
         if (config.num_eos_tokens == 0) {
             if (cfg_obj.get("eos_token_id")) |v| {
@@ -4400,46 +4424,6 @@ test "ModelConfig eosTokenSlice" {
     try testing.expectEqual(@as(usize, 2), slice.len);
     try testing.expectEqual(@as(u32, 10), slice[0]);
     try testing.expectEqual(@as(u32, 20), slice[1]);
-}
-
-test "pickUserTurnPrefix Gemma 4 wins over older patterns" {
-    // Gemma 4 templates also contain "<start_of_turn>" inside fallback comments
-    // in some checkpoints — make sure we still pick the Gemma 4 marker first.
-    const tmpl = "{{- '<|turn>' + role + '\n' }} {# legacy: <start_of_turn> #}";
-    try testing.expectEqualStrings("<|turn>user\n", pickUserTurnPrefix(tmpl).?);
-}
-
-test "pickUserTurnPrefix Gemma 3" {
-    const tmpl = "<start_of_turn>user\n{{ message['content'] }}<end_of_turn>";
-    try testing.expectEqualStrings("<start_of_turn>user\n", pickUserTurnPrefix(tmpl).?);
-}
-
-test "pickUserTurnPrefix Qwen ChatML" {
-    const tmpl = "<|im_start|>user\n{{ message['content'] }}<|im_end|>";
-    try testing.expectEqualStrings("<|im_start|>user\n", pickUserTurnPrefix(tmpl).?);
-}
-
-test "pickUserTurnPrefix Llama 3" {
-    const tmpl = "<|start_header_id|>user<|end_header_id|>\n\n{{ content }}<|eot_id|>";
-    try testing.expectEqualStrings("<|start_header_id|>user<|end_header_id|>\n\n", pickUserTurnPrefix(tmpl).?);
-}
-
-test "pickUserTurnPrefix unknown template returns null" {
-    try testing.expect(pickUserTurnPrefix("[INST] {{ content }} [/INST]") == null);
-    try testing.expect(pickUserTurnPrefix("") == null);
-}
-
-test "ModelConfig userTurnMarkerSlice respects length" {
-    var config = ModelConfig{};
-    config.user_turn_marker_ids[0] = 105;
-    config.user_turn_marker_ids[1] = 2364;
-    config.user_turn_marker_ids[2] = 107;
-    config.user_turn_marker_len = 3;
-    const slice = config.userTurnMarkerSlice();
-    try testing.expectEqual(@as(usize, 3), slice.len);
-    try testing.expectEqual(@as(u32, 105), slice[0]);
-    try testing.expectEqual(@as(u32, 2364), slice[1]);
-    try testing.expectEqual(@as(u32, 107), slice[2]);
 }
 
 test "ModelConfig isGlobalLayer with sliding window" {
@@ -6791,6 +6775,83 @@ test "attnCacheLayerCount: a layer_block_types hybrid counts only its ATTENTION 
     bare.head_dim = 128;
     bare.has_hybrid_layers = true;
     try testing.expectEqual(@as(u32, 16), bare.attnCacheLayerCount());
+}
+
+test "nemotron_h: a layers_block_type LIST sets the per-layer blocks like hybrid_override_pattern" {
+    // Nemotron 3.5 configs ship `layers_block_type` as a list of names and no
+    // pattern string; unread, every layer keeps the `.attention` default.
+    const json =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 2688, "num_hidden_layers": 7,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072,
+        \\  "layers_block_type": ["mamba", "moe", "mamba", "attention", "mlp", "mamba", "moe"],
+        \\  "mtp_layers_block_type": ["attention", "moe"]
+        \\}
+    ;
+    const cfg = try parseConfigFromJson(testing.allocator, json);
+    const want = [_]LayerBlockType{ .mamba2, .moe, .mamba2, .attention, .mlp, .mamba2, .moe };
+    for (want, 0..) |b, i| try testing.expectEqual(b, cfg.layer_block_types[i]);
+    try testing.expectEqual(@as(u32, 1), cfg.attnCacheLayerCount());
+}
+
+test "nemotron_h: attention is NoPE in every trunk layer and the MTP head" {
+    // The config ships rope_theta/partial_rotary_factor, but the reference
+    // attention (HF NemotronHAttention, mlx-lm) never rotates q or k.
+    const json =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 2688, "num_hidden_layers": 4,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072, "rope_theta": 10000, "partial_rotary_factor": 1.0,
+        \\  "layers_block_type": ["mamba", "attention", "moe", "attention"]
+        \\}
+    ;
+    const cfg = try parseConfigFromJson(testing.allocator, json);
+    // Index num_hidden_layers is the MTP head's attention layer.
+    for (0..cfg.num_hidden_layers + 1) |i| try testing.expect(cfg.layerSkipsRope(@intCast(i)));
+}
+
+test "nemotron_h: MoE routing fields parse; a latent MoE is refused by name" {
+    // Nemotron-3.5-Lightning-30B-A3B's shipped values.
+    const json =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 2688, "num_hidden_layers": 2,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072, "layers_block_type": ["mamba", "moe"],
+        \\  "n_routed_experts": 128, "num_experts_per_tok": 6,
+        \\  "moe_intermediate_size": 1856, "moe_shared_expert_intermediate_size": 3712,
+        \\  "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+        \\  "routed_scaling_factor": 2.5, "moe_latent_size": null
+        \\}
+    ;
+    const cfg = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 128), cfg.num_experts);
+    try testing.expectEqual(@as(u32, 6), cfg.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 1856), cfg.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 3712), cfg.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(u32, 1), cfg.moe_n_group);
+    try testing.expectEqual(@as(u32, 1), cfg.moe_topk_group);
+    try testing.expect(cfg.moe_route_norm);
+    try testing.expectEqual(@as(f32, 2.5), cfg.router_scaling_factor);
+    // MoE bills and gates key on this; batching still declines on has_hybrid_layers first.
+    try testing.expect(cfg.isMoe());
+    try testing.expect(cfg.has_hybrid_layers);
+
+    // The latent variant projects into a smaller expert space
+    // (fc1/fc2_latent_proj) that the hybrid MoE op does not carry.
+    const latent =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 4096, "num_hidden_layers": 2,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072, "layers_block_type": ["mamba", "moe"],
+        \\  "n_routed_experts": 512, "num_experts_per_tok": 22, "moe_latent_size": 1024
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedNemotronLatentMoe, parseConfigFromJson(testing.allocator, latent));
 }
 
 test "bailing_hybrid: a null q_lora_rank is the direct-q_proj arm, not a refusal" {

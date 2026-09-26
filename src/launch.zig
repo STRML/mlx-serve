@@ -157,6 +157,12 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
     return out.toOwnedSlice(allocator);
 }
 
+/// opencode sends `reasoning_effort` only when the model declares it; without
+/// it every turn ran thinking-off. Variants are its in-session effort picker.
+const opencode_reasoning =
+    \\"options": {"reasoningEffort": "medium"}, "variants": {"none": {"reasoningEffort": "none"}, "low": {"reasoningEffort": "low"}, "medium": {"reasoningEffort": "medium"}, "high": {"reasoningEffort": "high"}}
+;
+
 /// opencode config — carried inline via OPENCODE_CONFIG_CONTENT (merges over
 /// the user's own config, no file writes). Single-quoted in the script, so
 /// the JSON must stay single-quote-free.
@@ -186,13 +192,14 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\"provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
     , .{base_url});
     for (entries, 0..) |e, i| {
-        try out.print(allocator, "{s}\"{s}\": {{\"name\": \"{s} (mlx-serve)\",{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}}}", .{
+        try out.print(allocator, "{s}\"{s}\": {{\"name\": \"{s} (mlx-serve)\",{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}, {s}}}", .{
             if (i == 0) "" else ", ",
             e.id,
             e.id,
             if (e.vision) " \"attachment\": true," else "",
             e.budget.context,
             compactionReserve(e.budget.context),
+            opencode_reasoning,
         });
     }
     try out.appendSlice(allocator, "}}}}");
@@ -561,8 +568,6 @@ fn serverUp(allocator: std.mem.Allocator, io: std.Io, base_url: []const u8) bool
     return true;
 }
 
-/// `open -g -a "MLX Core"` — nonzero exit = the app isn't installed, which is
-/// the detection: no probing of /Applications by hand.
 /// HTTP status of `GET <base_url>/metrics.json`, or null when curl could not
 /// reach the server at all.
 fn metricsStatus(allocator: std.mem.Allocator, io: std.Io, base_url: []const u8) ?u16 {
@@ -577,9 +582,11 @@ fn metricsStatus(allocator: std.mem.Allocator, io: std.Io, base_url: []const u8)
     return std.fmt.parseInt(u16, std.mem.trim(u8, result.stdout, " \r\n"), 10) catch null;
 }
 
+/// `open -g -b <bundle id>` finds the app under any bundle name; nonzero exit =
+/// the app isn't installed, which is the detection.
 fn tryStartApp(allocator: std.mem.Allocator, io: std.Io) bool {
     const result = std.process.run(allocator, io, .{
-        .argv = &.{ "open", "-g", "-a", "MLX Core" },
+        .argv = &.{ "open", "-g", "-b", "com.dalcu.mlx-core" },
     }) catch return false;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -1055,6 +1062,11 @@ test "opencode config: limit.output is the compaction reserve, opencode2 gets a 
     const limit = p1.value.object.get("provider").?.object.get("mlx").?.object.get("models").?.object.get("m1").?.object.get("limit").?.object;
     try t.expectEqual(@as(i64, 6144), limit.get("output").?.integer);
     try t.expect(p1.value.object.get("compaction") == null);
+    // opencode sends no reasoning_effort unless the model declares one: thinking stayed off.
+    const m1 = p1.value.object.get("provider").?.object.get("mlx").?.object.get("models").?.object.get("m1").?.object;
+    try t.expectEqualStrings("medium", m1.get("options").?.object.get("reasoningEffort").?.string);
+    try t.expectEqualStrings("none", m1.get("variants").?.object.get("none").?.object.get("reasoningEffort").?.string);
+    try t.expectEqualStrings("high", m1.get("variants").?.object.get("high").?.object.get("reasoningEffort").?.string);
 
     const v2 = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1", true);
     defer t.allocator.free(v2);

@@ -73,7 +73,7 @@ enum AgentBudget {
     static func contextWarning(agentId: String, context: Int) -> String? {
         let floor = contextFloor(agentId: agentId)
         guard context > 0, context < floor else { return nil }
-        return "The model advertises a \(context)-token context; \(agentId) needs \(floor)+ to work well. Raise Context size in Settings > Server, or expect compaction and truncated turns."
+        return L10n.formatUngrouped("The model advertises a %lld-token context; %@ needs %lld+ to work well. Raise Context size in Settings ▸ Server, or expect compaction and truncated turns.", context, agentId, floor)
     }
 }
 
@@ -284,6 +284,10 @@ enum AgentConfigs {
     /// cap. `compaction` (opencode2) scales its global buffer/keep to the
     /// pinned model's window: the defaults compact a 24k window before its
     /// first reply.
+    /// opencode sends `reasoning_effort` only when the model declares it;
+    /// without it every turn ran thinking-off. Variants are its effort picker.
+    static let opencodeReasoning = #""options": { "reasoningEffort": "medium" }, "variants": { "none": { "reasoningEffort": "none" }, "low": { "reasoningEffort": "low" }, "medium": { "reasoningEffort": "medium" }, "high": { "reasoningEffort": "high" } }"#
+
     static func opencodeJSON(baseURL: String, defaultModel: String,
                              entries: [AgentModelEntry], pinModel: Bool = false,
                              compaction: Bool = false) -> String {
@@ -295,7 +299,8 @@ enum AgentConfigs {
         let models = list.map { e -> String in
             let attachment = e.vision ? " \"attachment\": true," : ""
             return "\"\(e.id)\": { \"name\": \"\(e.id) (mlx-serve)\",\(attachment) "
-                + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(AgentBudget.compactionReserve(e.budget.context)) } }"
+                + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(AgentBudget.compactionReserve(e.budget.context)) }, "
+                + opencodeReasoning + " }"
         }.joined(separator: ",\n        ")
         let pinned = pinModel ? "\n  \"model\": \"mlx/\(defaultModel)\"," : ""
         var compactionBlock = ""

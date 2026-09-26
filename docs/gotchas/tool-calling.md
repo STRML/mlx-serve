@@ -812,3 +812,39 @@ the document only when both agree. An identical repeat carries no ambiguity; a
 conflicting one stays a string rather than picking a value. A failed container
 coercion now logs at debug. Guard: the identical-vs-conflicting duplicate test
 beside `coerceToolArgsToSchema`.
+
+## Thinking loops at long context were the model re-reading its own reasoning (2026-09-22)
+
+A pi session on Qwen3.8 hit `[loop-stop] near_repeat` on every long turn past
+~100k tokens ("OK I'm going in circles"), on every quant and on the 27B.
+Spec decode, the prefix cache and the sampler were each ruled out by replaying
+the captured request with them off.
+
+Cause: pi round-trips `reasoning_content` for every assistant turn, and the
+Qwen3.8 template renders `<think>` for ALL of them when `preserve_thinking` is
+undefined. Half the rendered prompt was prior reasoning, including the
+previous turn's loop.
+
+Fix: `serializeExtraContext` passes `preserve_thinking:false` to any template
+that reads it, so only turns after the last user query keep their reasoning.
+Qwen's default is deliberate (3.6+ is trained to reuse prior thinking), so the
+model's `chat_template_kwargs` in `model-settings.json`, or the request's own,
+can turn it back on. Precedence: request, model settings, generation_config, arch.
+Guard: the `preserve_thinking` test beside `serializeExtraContext`,
+`resolveChatThinking` in `server.zig`.
+
+## A no-tools reply was scrubbed to nothing, but only when not streaming (LFM2.5, 2026-09-24)
+
+A system prompt that listed a tool in LFM's own format, with no `tools` field,
+made LFM2.5 answer `<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>`.
+Streaming sent it raw; non-stream returned `content: ""` with `finish_reason: stop`
+on chat, messages and responses.
+
+Cause: `splitThinkBlock` runs `trimLeakedToolMarkup` on every non-stream reply,
+and `"<|tool_call"` is a prefix of LFM's opener. The stream gate only runs with
+tools. vLLM, SGLang, llama.cpp and Ollama parse tool calls only when the request
+has tools and otherwise pass the text through.
+
+Fix: the non-stream split keeps markup when the request has no tools (chat,
+messages, responses), matching the stream and the other engines.
+Guard: `tests/test_no_tools_markup_passthrough.sh`.
