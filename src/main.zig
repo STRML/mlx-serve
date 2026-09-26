@@ -274,6 +274,11 @@ fn printUsage(io: std.Io) void {
         \\                        so one layer's attention scores stay within
         \\                        budget; this flag is the ceiling, not a floor.
         \\                        Lower it if a long prompt spikes memory.
+        \\  --prefill-decode-share <s>
+        \\                      Target fraction of wall time (0..0.9) the
+        \\                        decoding streams keep while another request
+        \\                        prefills; also narrows that prefill's chunks.
+        \\                        Default 0 (env MLX_SERVE_PREFILL_DECODE_SHARE).
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables the cache — which also
@@ -882,6 +887,9 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--llama-kv-quant: expected off|q8|q4 (or 8/4), got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, args[i], "--prefill-decode-share") and i + 1 < args.len) {
+            i += 1;
+            scheduler_mod.prefill_decode_share = scheduler_mod.parseDecodeShare(args[i]);
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
             i += 1;
             server_mod.max_concurrent = std.fmt.parseInt(u32, args[i], 10) catch 1;

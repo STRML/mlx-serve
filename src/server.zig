@@ -7243,6 +7243,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .max_concurrent = max_concurrent,
         .prefix_cache_mem_bytes = prefix_cache_mem_bytes,
         .prefix_cache_disk_bytes = prefix_cache_disk_bytes,
+        .prefill_decode_share = scheduler_mod.prefillDecodeShare(),
     };
 }
 
@@ -7254,7 +7255,7 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefix_cache\":{{\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                @tagName(st.kv_attn_mode),
         st.decode_attn_quant,                       st.prefill_chunk,
@@ -7264,7 +7265,8 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         st.max_mtp_ctx,                             st.drafter,
         st.pld.enable,                              st.pld.draft_len,
         st.pld.key_len,                             st.max_concurrent,
-        st.prefix_cache_mem_bytes,                  st.prefix_cache_disk_bytes,
+        st.prefill_decode_share,                    st.prefix_cache_mem_bytes,
+        st.prefix_cache_disk_bytes,
     });
 }
 

@@ -1729,6 +1729,18 @@ pub const Scheduler = struct {
     }
 
     /// Another request is queued, prefilling or decoding right now.
+    /// Decoders a tick would advance now; finished slots linger in `decoding` until the cull.
+    fn liveDecodingCount(self: *Scheduler) usize {
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        var n: usize = 0;
+        for (self.decoding.items) |s| {
+            if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+            n += 1;
+        }
+        return n;
+    }
+
     fn decodingCount(self: *Scheduler) usize {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
@@ -5952,7 +5964,12 @@ pub fn prefillInterleaveEnabled() bool {
 /// MLX_SERVE_PREFILL_INTERLEAVE=0 kill switch: no hook, nothing to share.
 pub var prefill_decode_share: ?f32 = null;
 pub fn prefillDecodeShare() f32 {
-    return 0;
+    if (!prefillInterleaveEnabled()) return 0;
+    if (prefill_decode_share) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PREFILL_DECODE_SHARE");
+    const v = parseDecodeShare(if (raw) |r| std.mem.sliceTo(r, 0) else null);
+    prefill_decode_share = v;
+    return v;
 }
 
 const InterleaveCtx = struct {
@@ -5989,9 +6006,9 @@ fn dflashYieldTick(active: []const *Slot) void {
 const COMPANY_PREFILL_CHUNK: u32 = 2048;
 
 pub fn companyPrefillChunk(chunk: u32, decoding: usize, share: f32) u32 {
-    _ = share;
     if (decoding == 0) return chunk;
-    return if (chunk == 0) COMPANY_PREFILL_CHUNK else @min(chunk, COMPANY_PREFILL_CHUNK);
+    const cap = if (share > 0) DECODE_SHARE_PREFILL_CHUNK else COMPANY_PREFILL_CHUNK;
+    return if (chunk == 0) cap else @min(chunk, cap);
 }
 
 /// Largest accepted decode share: at 0.9 the decoders own nine times each chunk's time.
@@ -6001,30 +6018,30 @@ pub const DECODE_SHARE_PREFILL_CHUNK: u32 = 1024;
 
 /// `--prefill-decode-share` / MLX_SERVE_PREFILL_DECODE_SHARE text to a share in [0, 0.9].
 pub fn parseDecodeShare(raw: ?[]const u8) f32 {
-    _ = raw;
-    return 0;
+    const text = raw orelse return 0;
+    const v = std.fmt.parseFloat(f32, text) catch return 0;
+    if (std.math.isNan(v) or v <= 0) return 0;
+    return @min(v, PREFILL_DECODE_SHARE_MAX);
 }
 
 /// Decode wall time owed after a prefill chunk of `chunk_ns`: chunk * S / (1 - S).
 pub fn decodeShareBudgetNs(chunk_ns: u64, share: f32) u64 {
-    _ = chunk_ns;
-    _ = share;
-    return 0;
+    if (share <= 0) return 0;
+    const s: f64 = @min(share, PREFILL_DECODE_SHARE_MAX);
+    return @intFromFloat(@as(f64, @floatFromInt(chunk_ns)) * s / (1 - s));
 }
 
 /// Is another decode tick owed at this boundary? Never fewer than `interleaveTicksFor`.
 pub fn interleaveTickOwed(share: f32, chunk_ns: u64, first_ns: u64, ticks: u32, decode_ns: u64) bool {
-    _ = share;
-    _ = decode_ns;
     if (first_ns == 0) return false;
-    return ticks < interleaveTicksFor(chunk_ns, first_ns);
+    if (ticks < interleaveTicksFor(chunk_ns, first_ns)) return true;
+    return decode_ns < decodeShareBudgetNs(chunk_ns, share);
 }
 
 /// The adaptive width hook's pick, capped while a decode share is live and someone decodes.
 pub fn decodeShareWidthCap(width: u32, decoding: usize, share: f32) u32 {
-    _ = decoding;
-    _ = share;
-    return width;
+    if (decoding == 0 or share <= 0) return width;
+    return @min(width, DECODE_SHARE_PREFILL_CHUNK);
 }
 
 const INTERLEAVE_MAX_TICKS: u32 = 8;
@@ -6128,6 +6145,7 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
 
 /// Context for `Generator.InitOptions.chunk_width_hook`. `cfg` is optional (embedded engines).
 const ChunkWidthCtx = struct {
+    sch: *Scheduler,
     cfg: ?*const model_mod.ModelConfig,
     kv_bits: u64,
     /// This slot's own per-model cache, never `sch.hot_prefix_cache`; only `stagedHostBytes`
@@ -6158,7 +6176,10 @@ fn chunkWidthCb(
     const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
     const cfg = wc.cfg orelse return cur;
     const pick = prefill_chunk_adapt orelse return cur;
-    return pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
+    const next = pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
+    // Only a live adaptive width may move; elsewhere the admitted width stands.
+    if (!adaptiveChunkWidthFor(cfg)) return next;
+    return decodeShareWidthCap(next, wc.sch.liveDecodingCount(), prefillDecodeShare());
 }
 
 fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
@@ -6167,16 +6188,18 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
         log.debug("[interleave] engaged: decode ticks between prefill chunks\n", .{});
     }
     const chunk_ns = ic.chunk_sw.read();
+    const share = prefillDecodeShare();
     const first_ns = interleaveDecodeTick(ic.sch);
-    ic.ticks += 1;
-    ic.decode_ns +|= first_ns;
-    var left = if (first_ns == 0) 0 else interleaveTicksFor(chunk_ns, first_ns) - 1;
-    while (left > 0) : (left -= 1) {
+    var ticks: u32 = 1;
+    var spent: u64 = first_ns;
+    while (interleaveTickOwed(share, chunk_ns, first_ns, ticks, spent)) {
         const ns = interleaveDecodeTick(ic.sch);
         if (ns == 0) break;
-        ic.ticks += 1;
-        ic.decode_ns +|= ns;
+        ticks += 1;
+        spent +|= ns;
     }
+    ic.ticks += ticks;
+    ic.decode_ns +|= spent;
     ic.chunk_sw.reset();
 }
 
@@ -6534,6 +6557,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
     // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
     var width_ctx = ChunkWidthCtx{
+        .sch = sch,
         .cfg = slot.model.config,
         .kv_bits = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits,
         .hc = if (slot.model.prefix_cache) |*p| p else null,
