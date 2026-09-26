@@ -28568,7 +28568,8 @@ pub const Transformer = struct {
             !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and gdnDecodeRecurEnabled())
         fast: {
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
-            const r = (try gdn_decode.recurSeq(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, seq_len, .{
+            const geo = gdn_decode.Geometry{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv };
+            const ins = gdn_decode.Inputs{
                 .qkv = qkv,
                 .z = z_proj,
                 .a = a_proj,
@@ -28583,7 +28584,26 @@ pub const Transformer = struct {
                 .norm_w = la.norm_w,
                 .eps = self.gdn_eps.?,
                 .signs = .{ .ctx = null },
-            }, self.s)) orelse break :fast;
+            };
+            // One dispatch: recurrence, norm-gate and the rollback conv input.
+            if (gdnVerifyFoldEnabled()) fold: {
+                const f = (try gdn_decode.recurSeqFold(geo, seq_len, ins, !cfg.kda_sigmoid_out_gate, self.s)) orelse break :fold;
+                defer _ = mlx.mlx_array_free(f.gated);
+                if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
+                ssm.spec_conv_input = f.conv_input;
+                if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
+                ssm.spec_state_seq = f.state_seq;
+                _ = mlx.mlx_array_free(ssm.conv_state);
+                ssm.conv_state = f.conv_state;
+                _ = mlx.mlx_array_free(ssm.ssm_state);
+                ssm.ssm_state = f.ssm_state;
+                if (!gdn_verify_fold_engaged) {
+                    gdn_verify_fold_engaged = true;
+                    log.info("[gdn] verify fold engaged: S={d} Hk={d} Hv={d}\n", .{ seq_len, num_k_heads, num_v_heads });
+                }
+                return if (skip_output) standinRef(f.gated) else self.qmatmul(f.gated, la.out_w, la.out_s, la.out_b);
+            }
+            const r = (try gdn_decode.recurSeq(geo, seq_len, ins, self.s)) orelse break :fast;
             defer _ = mlx.mlx_array_free(r.y);
             const flat = (try gdnNormGateFused(self.s, r.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse {
                 inline for (.{ r.conv_state, r.ssm_state, r.state_seq }) |a| _ = mlx.mlx_array_free(a);
@@ -35409,6 +35429,20 @@ pub fn gdnDecodeFusedEnabled() bool {
 var gdn_decode_recur_env: ?bool = null;
 var gdn_decode_recur_engaged: bool = false;
 var gdn_verify_recur_engaged: bool = false;
+var gdn_verify_fold_env: ?bool = null;
+var gdn_verify_fold_engaged: bool = false;
+
+/// MTP verify rows: gdn_decode.recurSeqFold (recurrence + norm-gate + conv
+/// input in one dispatch). MLX_SERVE_GDN_VERIFY_FOLD=0 restores recurSeq ->
+/// norm-gate -> concat.
+fn gdnVerifyFoldEnabled() bool {
+    return gdn_verify_fold_env orelse blk: {
+        const raw = std.c.getenv("MLX_SERVE_GDN_VERIFY_FOLD");
+        const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+        gdn_verify_fold_env = enabled;
+        break :blk enabled;
+    };
+}
 
 /// S=1 decode on packs without a Hadamard rotation: gdn_decode.recur then the
 /// norm-gate. MLX_SERVE_GDN_DECODE_RECUR=0 restores prework -> recurrence -> norm-gate.
