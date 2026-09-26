@@ -1,0 +1,68 @@
+{
+ "title": "Qwen3.8-Flash-Next mixed-4-8bit, S=4 verify forward at kv 1500 (fwd-ubench)",
+ "hardware": "Apple M5 Ultra, 256 GB, 64 GPU cores",
+ "method": "20 forwards per run, 6 runs per arm in alternating then reversed order, idle-gated; off = MLX_SERVE_SDPA_SPLIT=0 (today's single SDPA call)",
+ "x_label": "run",
+ "x_order": [
+  "run 1",
+  "run 2",
+  "run 3",
+  "run 4",
+  "run 5",
+  "run 6"
+ ],
+ "arms": {
+  "causal split (this PR)": {
+   "run 1": {
+    "gpu_ms": 16.7,
+    "total_ms": 18.328
+   },
+   "run 2": {
+    "gpu_ms": 16.719,
+    "total_ms": 18.363
+   },
+   "run 3": {
+    "gpu_ms": 16.937,
+    "total_ms": 21.622
+   },
+   "run 4": {
+    "gpu_ms": 16.692,
+    "total_ms": 18.246
+   },
+   "run 5": {
+    "gpu_ms": 16.717,
+    "total_ms": 18.237
+   },
+   "run 6": {
+    "gpu_ms": 16.694,
+    "total_ms": 18.427
+   }
+  },
+  "single SDPA call (base)": {
+   "run 1": {
+    "gpu_ms": 17.066,
+    "total_ms": 18.722
+   },
+   "run 2": {
+    "gpu_ms": 17.193,
+    "total_ms": 19.05
+   },
+   "run 3": {
+    "gpu_ms": 17.411,
+    "total_ms": 19.373
+   },
+   "run 4": {
+    "gpu_ms": 17.023,
+    "total_ms": 18.587
+   },
+   "run 5": {
+    "gpu_ms": 17.396,
+    "total_ms": 19.363
+   },
+   "run 6": {
+    "gpu_ms": 17.012,
+    "total_ms": 18.545
+   }
+  }
+ }
+}
