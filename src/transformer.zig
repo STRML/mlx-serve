@@ -10699,6 +10699,176 @@ pub fn qsaTestAppendPool(xfm: *Transformer, entry: *SSMCacheEntry, chunk: mlx.ml
     try xfm.qsaAppendKeys(entry, chunk, offset);
 }
 
+/// Elements whose f32 bit patterns differ (bf16 → f32 is exact, so this is bf16 bit identity, ±0 and NaN included).
+fn qsaIdxBitMismatches(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !usize {
+    var a_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a_c);
+    var b_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b_c);
+    try mlx.check(mlx.mlx_contiguous(&a_c, a, false, s));
+    try mlx.check(mlx.mlx_contiguous(&b_c, b, false, s));
+    var a32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a32);
+    var b32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b32);
+    try mlx.check(mlx.mlx_astype(&a32, a_c, .float32, s));
+    try mlx.check(mlx.mlx_astype(&b32, b_c, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(a32));
+    try mlx.check(mlx.mlx_array_eval(b32));
+    const n = mlx.mlx_array_size(a32);
+    if (n != mlx.mlx_array_size(b32)) return error.ShapeMismatch;
+    const ad = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
+    const bd = mlx.mlx_array_data_float32(b32) orelse return error.InvalidDtype;
+    var bad: usize = 0;
+    for (0..n) |i| {
+        if (@as(u32, @bitCast(ad[i])) != @as(u32, @bitCast(bd[i]))) bad += 1;
+    }
+    return bad;
+}
+
+/// Raw index keys `[B, nb, 4, 128]` bf16 with magnitudes spread over 10^-lo_exp..10^hi_exp.
+fn qsaIdxTestKeys(rnd: std.Random, b: c_int, nb: c_int, lo_exp: f32, hi_exp: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = [_]c_int{ b, nb, 4, 128 };
+    const n: usize = @intCast(b * nb * 4 * 128);
+    const data = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(data);
+    for (data) |*x| {
+        const mag = std.math.pow(f32, 10.0, lo_exp + (hi_exp - lo_exp) * rnd.float(f32));
+        x.* = if (rnd.boolean()) mag else -mag;
+    }
+    const f = mlx.mlx_array_new_data(data.ptr, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(f);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
+    return out;
+}
+
+/// Fused vs composed pooled keys for one case; returns the bit-mismatch count (fails if the kernel declines).
+fn qsaIdxRopeCase(xfm: *Transformer, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, base: c_int, table_scale: ?f32) !usize {
+    const s = xfm.s;
+    const rope_dims: c_int = 64;
+    const nb = mlx.getShape(kb4)[1];
+    var cs = try xfm.ropeCosSinFromFreqs(rope_dims, try xfm.ropeInvFreq(rope_dims, xfm.config.rope_theta), @floatFromInt(base), 4, nb, .bfloat16);
+    defer _ = mlx.mlx_array_free(cs.cos);
+    defer _ = mlx.mlx_array_free(cs.sin);
+    if (table_scale) |m| {
+        // YaRN tables arrive pre-multiplied by mscale in bf16; the kernel must read them as-is.
+        const ms = try scalarOf(m, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(ms);
+        var c2 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&c2, cs.cos, ms, s));
+        _ = mlx.mlx_array_free(cs.cos);
+        cs.cos = c2;
+        var s2 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&s2, cs.sin, ms, s));
+        _ = mlx.mlx_array_free(cs.sin);
+        cs.sin = s2;
+    }
+    const pn = try xfm.qsaPoolNorm(kb4, norm_w);
+    defer _ = mlx.mlx_array_free(pn);
+    const want = try xfm.qsaPooledRopeComposed(pn, rope_dims, cs.cos, cs.sin);
+    defer _ = mlx.mlx_array_free(want);
+    const got = (try qsaPoolNormRopeFused(s, kb4, norm_w, xfm.config.rms_norm_eps, cs.cos, cs.sin, rope_dims)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(got);
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    return qsaIdxBitMismatches(want, got, s);
+}
+
+fn qsaIdxRopeTestXfm(s: mlx.mlx_stream) Transformer {
+    var xfm: Transformer = undefined;
+    xfm.rht = null;
+    xfm.s = s;
+    xfm.allocator = std.testing.allocator;
+    xfm.config = .{};
+    xfm.config.rms_norm_eps = 1e-6;
+    xfm.config.rope_theta = 10_000_000.0;
+    return xfm;
+}
+
+// Bar: the fused pooled-key kernel is bit-identical to the composed chain at every
+// block count, position, table scale and key dynamic range the indexer can hand it.
+test "qsa pooled keys: fused mean+norm+rope kernel is bit-identical to the composed chain" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm = qsaIdxRopeTestXfm(s);
+    var prng = std.Random.DefaultPrng.init(0x1D8_0BE5);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    // { batch, blocks, base position, lo exp, hi exp }
+    const cases = [_][5]f32{
+        .{ 1, 1, 0, -1, 0.5 }, // first block: cos 1, sin 0
+        .{ 1, 1, 2052, -1, 0.5 }, // verify S=4 just past the budget
+        .{ 1, 1, 32772, -1, 0.5 }, // past 32k
+        .{ 1, 1, 131080, -1, 0.5 }, // past 128k
+        .{ 1, 1, 1_000_000, -1, 0.5 }, // 1M context
+        .{ 1, 2, 16000, -1, 0.5 }, // S=8 verify: two blocks
+        .{ 1, 512, 0, -1, 0.5 }, // 2048-token prefill chunk
+        .{ 1, 37, 8196, -3, 4 }, // wide range: f32 block sums round
+        .{ 2, 5, 4096, -1, 0.5 }, // batch 2
+    };
+    for (cases) |c| {
+        const kb4 = try qsaIdxTestKeys(rnd, @intFromFloat(c[0]), @intFromFloat(c[1]), c[3], c[4], s);
+        defer _ = mlx.mlx_array_free(kb4);
+        const bad = try qsaIdxRopeCase(&xfm, kb4, norm_w, @intFromFloat(c[2]), null);
+        if (bad != 0) std.debug.print("qsa idx rope case {any}: {d} mismatches\n", .{ c, bad });
+        try std.testing.expectEqual(@as(usize, 0), bad);
+    }
+    // YaRN-scaled table.
+    const kb4 = try qsaIdxTestKeys(rnd, 1, 3, -1, 0.5, s);
+    defer _ = mlx.mlx_array_free(kb4);
+    try std.testing.expectEqual(@as(usize, 0), try qsaIdxRopeCase(&xfm, kb4, norm_w, 65540, 1.2071));
+}
+
+// Bar: a strided kb4 view (the live k_raw slice of the [S, (n+1)*128] indexer
+// projection, and the leftover+chunk concat) gives the same bits as a packed one.
+test "qsa pooled keys: fused kernel reads a strided raw-key view bit-identically" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm = qsaIdxRopeTestXfm(s);
+    var prng = std.Random.DefaultPrng.init(0x5171_DE);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    const qk = try attn256RandBf16(rnd, &[_]c_int{ 1, 12, 5 * 128 }, s);
+    defer _ = mlx.mlx_array_free(qk);
+    var k_raw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_raw);
+    try mlx.check(mlx.mlx_slice(&k_raw, qk, &[_]c_int{ 0, 0, 4 * 128 }, 3, &[_]c_int{ 1, 12, 5 * 128 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    var kb4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kb4);
+    try mlx.check(mlx.mlx_reshape(&kb4, k_raw, &[_]c_int{ 1, 3, 4, 128 }, 4, s));
+    try std.testing.expectEqual(@as(usize, 0), try qsaIdxRopeCase(&xfm, kb4, norm_w, 2048, null));
+}
+
+// Bar: shapes the kernel does not mirror decline (null) so the caller keeps the chain.
+test "qsa pooled keys: fused kernel declines non-bf16 weights and non-128 heads" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm = qsaIdxRopeTestXfm(s);
+    var prng = std.Random.DefaultPrng.init(0xDEC1);
+    const rnd = prng.random();
+    const cs = try xfm.ropeCosSinFromFreqs(64, try xfm.ropeInvFreq(64, xfm.config.rope_theta), 0, 4, 1, .bfloat16);
+    defer _ = mlx.mlx_array_free(cs.cos);
+    defer _ = mlx.mlx_array_free(cs.sin);
+    const kb4 = try qsaIdxTestKeys(rnd, 1, 1, -1, 0.5, s);
+    defer _ = mlx.mlx_array_free(kb4);
+    const w_bf = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(w_bf);
+    var w32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w32);
+    try mlx.check(mlx.mlx_astype(&w32, w_bf, .float32, s));
+    try std.testing.expect((try qsaPoolNormRopeFused(s, kb4, w32, 1e-6, cs.cos, cs.sin, 64)) == null);
+    const kb64 = try attn256RandBf16(rnd, &[_]c_int{ 1, 1, 4, 64 }, s);
+    defer _ = mlx.mlx_array_free(kb64);
+    const w64 = try testRandUniformBf16(rnd, &[_]c_int{64}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(w64);
+    try std.testing.expect((try qsaPoolNormRopeFused(s, kb64, w64, 1e-6, cs.cos, cs.sin, 64)) == null);
+    // Sanity: the supported shape does engage.
+    const got = (try qsaPoolNormRopeFused(s, kb4, w_bf, 1e-6, cs.cos, cs.sin, 64)) orelse return error.FusedDeclined;
+    _ = mlx.mlx_array_free(got);
+}
+
 test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identically to a full bank" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
@@ -21553,6 +21723,63 @@ pub const Transformer = struct {
         return cs;
     }
 
+    /// Pooled block keys `[B, nb, D]` from raw index keys `kb4 [B, nb, ratio, D]`:
+    /// f32 block mean → bf16 → idx_k_norm → partial RoPE at the block-start
+    /// positions `base + i*ratio`. One fused kernel on text turns, bit-identical
+    /// to the composed chain; M-RoPE and odd shapes keep the chain.
+    fn qsaPooledKeys(self: *Transformer, ctx: *ForwardCtx, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, rope_dims: c_int, base: c_int) !mlx.mlx_array {
+        const sh = mlx.getShape(kb4);
+        if (ctx.mrope_pos == null and qsaIdxRopeFusedEnabled() and mlx.mlx_array_dtype(norm_w) == .bfloat16) {
+            const cs = try self.qsaPooledCosSin(ctx, rope_dims, base, sh[2], sh[1], .bfloat16);
+            if (try qsaPoolNormRopeFused(self.s, kb4, norm_w, self.config.rms_norm_eps, cs.cos, cs.sin, rope_dims)) |out| return out;
+        }
+        return self.qsaPooledKeysComposed(ctx, kb4, norm_w, rope_dims, base);
+    }
+
+    /// The composed reference for `qsaPooledKeys` (and its M-RoPE arm).
+    fn qsaPooledKeysComposed(self: *Transformer, ctx: *ForwardCtx, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, rope_dims: c_int, base: c_int) !mlx.mlx_array {
+        const sh = mlx.getShape(kb4);
+        const pn = try self.qsaPoolNorm(kb4, norm_w);
+        defer _ = mlx.mlx_array_free(pn);
+        const cs = try self.qsaPooledCosSin(ctx, rope_dims, base, sh[2], sh[1], mlx.mlx_array_dtype(pn));
+        if (ctx.mrope_pos == null) return self.qsaPooledRopeComposed(pn, rope_dims, cs.cos, cs.sin);
+        var pn4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pn4);
+        try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s));
+        const new_rope = try self.applyMrope(pn4, cs.cos, cs.sin, rope_dims);
+        defer _ = mlx.mlx_array_free(new_rope);
+        var new3 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&new3, new_rope, &[_]c_int{ sh[0], sh[1], sh[3] }, 3, self.s));
+        return new3;
+    }
+
+    /// `rms_norm(bf16(mean_f32(kb4, axis 2)), w)` → `[B, nb, D]`.
+    fn qsaPoolNorm(self: *Transformer, kb4: mlx.mlx_array, norm_w: mlx.mlx_array) !mlx.mlx_array {
+        var kb_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kb_f32);
+        try mlx.check(mlx.mlx_astype(&kb_f32, kb4, .float32, self.s));
+        var pooled_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pooled_f32);
+        try mlx.check(mlx.mlx_mean_axis(&pooled_f32, kb_f32, 2, false, self.s));
+        var pooled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pooled);
+        try mlx.check(mlx.mlx_astype(&pooled, pooled_f32, .bfloat16, self.s));
+        return self.rmsNorm(pooled, norm_w);
+    }
+
+    /// Scalar partial RoPE of normed pooled keys `pn [B, nb, D]` with row-i cos/sin `[nb, rope_dims]`.
+    fn qsaPooledRopeComposed(self: *Transformer, pn: mlx.mlx_array, rope_dims: c_int, cosv: mlx.mlx_array, sinv: mlx.mlx_array) !mlx.mlx_array {
+        const sh = mlx.getShape(pn);
+        var pn4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pn4);
+        try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s));
+        const roped = try self.ropeApplyCosSin(pn4, rope_dims, cosv, sinv);
+        defer _ = mlx.mlx_array_free(roped);
+        var new3 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&new3, roped, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, self.s));
+        return new3;
+    }
+
     /// QSA: append this chunk's raw index keys to the layer's history and,
     /// past the token budget, build the block-selection mask. Returns the
     /// bool `[B,1,S,kv]` mask or null-ctx for dense attention.
@@ -21717,29 +21944,8 @@ pub const Transformer = struct {
             var kb4 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(kb4);
             try mlx.check(mlx.mlx_reshape(&kb4, kb_flat, &kb_shape, 4, self.s));
-            var kb_f32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(kb_f32);
-            try mlx.check(mlx.mlx_astype(&kb_f32, kb4, .float32, self.s));
-            var pooled_f32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(pooled_f32);
-            try mlx.check(mlx.mlx_mean_axis(&pooled_f32, kb_f32, 2, false, self.s));
-            var pooled = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(pooled);
-            try mlx.check(mlx.mlx_astype(&pooled, pooled_f32, .bfloat16, self.s));
-            const pn = try self.rmsNorm(pooled, fa.idx_k_norm);
-            defer _ = mlx.mlx_array_free(pn);
-            var pn4 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(pn4);
-            try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s));
-            const cs = try self.qsaPooledCosSin(ctx, rope_dims, pos_base + nb_cached * ratio, ratio, n_new, mlx.mlx_array_dtype(pn4));
-            const new_rope = if (ctx.mrope_pos != null)
-                try self.applyMrope(pn4, cs.cos, cs.sin, rope_dims)
-            else
-                try self.ropeApplyCosSin(pn4, rope_dims, cs.cos, cs.sin);
-            defer _ = mlx.mlx_array_free(new_rope);
-            var new3 = mlx.mlx_array_new();
+            const new3 = try self.qsaPooledKeys(ctx, kb4, fa.idx_k_norm, rope_dims, pos_base + nb_cached * ratio);
             defer _ = mlx.mlx_array_free(new3);
-            try mlx.check(mlx.mlx_reshape(&new3, new_rope, &[_]c_int{ batch, n_new, idx_hd }, 3, self.s));
             try self.qsaAppendPooled(entry, new3, nb_cached);
         }
 
@@ -34166,6 +34372,38 @@ pub fn gdnNormGateFused(
         log.info("[gdn] fused norm-gate engaged: Hv={d} S={d} gate={s}\n", .{ hv, seq, if (swish) "swish" else "sigmoid" });
     }
     return out;
+}
+
+// ── Fused QSA pooled-key upkeep ──
+pub var qsa_idx_rope_fused_override: ?bool = null;
+var qsa_idx_rope_fused_env: ?bool = null;
+
+/// `MLX_SERVE_QSA_IDX_ROPE_FUSED=0` restores the composed pooled-key chain.
+pub fn qsaIdxRopeFusedEnabled() bool {
+    if (qsa_idx_rope_fused_override) |v| return v;
+    if (qsa_idx_rope_fused_env) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_IDX_ROPE_FUSED") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    qsa_idx_rope_fused_env = v;
+    return v;
+}
+
+/// Pooled block keys in one launch: f32 block mean → bf16 → rms_norm(w) →
+/// partial RoPE with the bf16 cos/sin table `[nb, rope_dims]`. Null → the
+/// caller runs the composed chain (`qsaPoolNorm` + `qsaPooledRopeComposed`).
+pub fn qsaPoolNormRopeFused(
+    s: mlx.mlx_stream,
+    kb4: mlx.mlx_array, // [B, nb, R, D] bf16
+    norm_w: mlx.mlx_array, // [D] bf16
+    eps: f32,
+    cosv: mlx.mlx_array, // [nb, rope_dims] bf16
+    sinv: mlx.mlx_array,
+    rope_dims: c_int,
+) !?mlx.mlx_array {
+    _ = .{ s, kb4, norm_w, eps, cosv, sinv, rope_dims };
+    return null;
 }
 
 /// `arr[:, :, start..stop]` as a lazy view.
