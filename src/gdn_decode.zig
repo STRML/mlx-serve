@@ -428,3 +428,11 @@ pub fn recurSeq(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?Recu
     for (&out, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, o1, i));
     return .{ .y = out[0], .conv_state = out[1], .ssm_state = out[2], .state_seq = out[3] };
 }
+
+pub const RecurSeqFold = struct { gated: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array, conv_input: mlx.mlx_array };
+
+/// Not implemented yet: the parity test pins the contract first.
+pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.mlx_stream) !?RecurSeqFold {
+    _ = .{ g, t_len, in, swish, s };
+    return null;
+}
