@@ -308,6 +308,28 @@ pub const Inputs = struct {
     signs: mlx.mlx_array, // [Hv*Dv] f32, out_proj's
 };
 
+fn rowsAre(a: mlx.mlx_array, t_len: c_int, width: c_int) bool {
+    const sh = mlx.getShape(a);
+    return sh.len == 3 and sh[0] == 1 and sh[1] == t_len and sh[2] == width;
+}
+
+fn sizeIs(a: mlx.mlx_array, n: c_int) bool {
+    return mlx.mlx_array_size(a) == @as(usize, @intCast(n));
+}
+
+/// The kernels index every input as a row-major block of a fixed size, so a
+/// wrong width would read a neighbour's row. Per-token rows must be exactly
+/// [1,T,width]; weights and states must hold exactly the elements indexed.
+/// `gate`: z, norm_w and eps are read too.
+fn inputsFit(g: Geometry, t_len: c_int, in: Inputs, gate: bool) bool {
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    const base = rowsAre(in.qkv, t_len, c) and rowsAre(in.a, t_len, g.hv) and rowsAre(in.b, t_len, g.hv) and
+        sizeIs(in.conv_state, 3 * c) and sizeIs(in.ssm_state, g.hv * g.dv * g.dk) and sizeIs(in.conv_w, 4 * c) and
+        sizeIs(in.A_log, g.hv) and sizeIs(in.dt_bias, g.hv) and sizeIs(in.q_scale, 1) and sizeIs(in.k_scale, 1);
+    if (!gate) return base;
+    return base and rowsAre(in.z, t_len, g.hv * g.dv) and sizeIs(in.norm_w, g.dv) and sizeIs(in.eps, 1);
+}
+
 pub const Outputs = struct { rot: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array };
 
 const CfgKey = struct { g: Geometry, dt: mlx.mlx_dtype, st: mlx.mlx_dtype };
@@ -359,6 +381,7 @@ pub fn recur(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Recur {
         if (mlx.mlx_array_dtype(arr) != dt) return null;
     const st = mlx.mlx_array_dtype(in.ssm_state);
     if (st != dt and st != .float32) return null;
+    if (!inputsFit(g, 1, in, false)) return null;
     if (k1_cache == null) k1_cache = try makeKernel("msv_gdn_decode_recur", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale" }, &.{ "y", "conv_out", "state_out" }, K1_SOURCE, HEADER);
     const key = CfgKey{ .g = g, .dt = dt, .st = st };
     if (cfg_key == null or !std.meta.eql(cfg_key.?, key)) try buildConfigs(g, dt, st);
@@ -385,6 +408,7 @@ pub fn recur(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Recur {
 pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
     for ([_]mlx.mlx_array{ in.z, in.norm_w }) |arr|
         if (mlx.mlx_array_dtype(arr) != mlx.mlx_array_dtype(in.qkv)) return null;
+    if (!inputsFit(g, 1, in, true) or !sizeIs(in.signs, g.hv * g.dv)) return null;
     const r = (try recur(g, in, s)) orelse return null;
     defer _ = mlx.mlx_array_free(r.y);
     errdefer _ = mlx.mlx_array_free(r.conv_state);
@@ -439,6 +463,7 @@ pub fn recurSeq(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?Recu
         if (mlx.mlx_array_dtype(arr) != dt) return null;
     const st = mlx.mlx_array_dtype(in.ssm_state);
     if (st != dt and st != .float32) return null;
+    if (!inputsFit(g, t_len, in, false)) return null;
     if (k1s_cache == null) k1s_cache = try makeKernel("msv_gdn_decode_recur_seq", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale" }, &.{ "y", "conv_out", "state_out", "state_seq" }, K1S_SOURCE, HEADER);
     const key = CfgKey{ .g = g, .dt = dt, .st = st };
     if (seq_cfg_key == null or !std.meta.eql(seq_cfg_key.?, key)) {
@@ -507,6 +532,7 @@ pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.m
     if (mlx.mlx_array_dtype(in.eps) != .float32) return null;
     const st = mlx.mlx_array_dtype(in.ssm_state);
     if (st != dt and st != .float32) return null;
+    if (!inputsFit(g, t_len, in, true)) return null;
     if (k1f_cache == null) k1f_cache = try makeKernel("msv_gdn_decode_recur_seq_fold", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "z", "norm_w", "eps" }, &.{ "gated", "conv_out", "state_out", "state_seq", "conv_in" }, K1S_FOLD_SOURCE, HEADER);
     const key = FoldKey{ .k = .{ .g = g, .dt = dt, .st = st }, .swish = swish };
     if (fold_cfg_key == null or !std.meta.eql(fold_cfg_key.?, key)) {

@@ -58551,6 +58551,67 @@ test "gdn_decode.recurSeqFold: bit-identical to recurSeq -> norm-gate -> conv-in
             };
 }
 
+test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kernel would misread" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xDEC1);
+    const rnd = prng.random();
+    const dt: mlx.mlx_dtype = .bfloat16;
+    const hk: c_int = 2;
+    const hv: c_int = 8;
+    const t_len: c_int = 2;
+    const c_dim: c_int = hk * 128 * 2 + hv * 128;
+    const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 };
+    var arrs: [14]mlx.mlx_array = undefined;
+    const shapes = [_][]const c_int{
+        &.{ 1, t_len, c_dim }, &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim }, &.{ 1, hv, 128, 128 },
+        &.{ c_dim, 4, 1 },     &.{hv},                   &.{hv},              &.{128},             &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
+        &.{ 1, t_len + 1, c_dim }, &.{ 1, 3, c_dim + 1 },
+    };
+    for (&arrs, shapes) |*a, sh| a.* = try gdnParityRand(rnd, sh, 1.0, dt, s);
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const q_scale = try scalarOf(1.0 / 128.0, dt, s);
+    defer _ = mlx.mlx_array_free(q_scale);
+    const eps_arr = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps_arr);
+    const good = gdn_decode.Inputs{
+        .qkv = arrs[0],
+        .z = arrs[1],
+        .a = arrs[2],
+        .b = arrs[3],
+        .conv_state = arrs[4],
+        .ssm_state = arrs[5],
+        .conv_w = arrs[6],
+        .A_log = arrs[7],
+        .dt_bias = arrs[8],
+        .q_scale = q_scale,
+        .k_scale = q_scale,
+        .norm_w = arrs[9],
+        .eps = eps_arr,
+        .signs = .{ .ctx = null },
+    };
+    // Control: the well-formed inputs engage the fold.
+    const ok = (try gdn_decode.recurSeqFold(g, t_len, good, false, s)) orelse return error.FoldDeclined;
+    inline for (.{ ok.gated, ok.conv_state, ok.ssm_state, ok.state_seq, ok.conv_input }) |a| _ = mlx.mlx_array_free(a);
+
+    // z one column wide ([1,2,1025]): row 1 would start at row 0's extra column.
+    var bad = good;
+    bad.z = arrs[10];
+    try std.testing.expect((try gdn_decode.recurSeqFold(g, t_len, bad, false, s)) == null);
+    // The same class on every other per-token row and state the kernels index.
+    for ([_]struct { field: enum { a, qkv, conv }, arr: mlx.mlx_array }{ .{ .field = .a, .arr = arrs[11] }, .{ .field = .qkv, .arr = arrs[12] }, .{ .field = .conv, .arr = arrs[13] } }) |case| {
+        bad = good;
+        switch (case.field) {
+            .a => bad.a = case.arr,
+            .qkv => bad.qkv = case.arr,
+            .conv => bad.conv_state = case.arr,
+        }
+        try std.testing.expect((try gdn_decode.recurSeqFold(g, t_len, bad, false, s)) == null);
+        try std.testing.expect((try gdn_decode.recurSeq(g, t_len, bad, s)) == null);
+    }
+}
+
 fn gdnDecodeFoldParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, hk: c_int, hv: c_int, t_len: c_int, swish: bool) !void {
     var prng = std.Random.DefaultPrng.init(0xF01D + @as(u64, @intCast(t_len * 131 + hv)));
     const rnd = prng.random();
