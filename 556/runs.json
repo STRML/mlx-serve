@@ -1,0 +1,49 @@
+{
+ "title": "Qwen3.8-Flash-Next mixed-4-8bit, S=4 verify forward at kv 16k (fwd-ubench)",
+ "hardware": "Apple M5 Ultra, 256 GB, 64 GPU cores",
+ "method": "20 forwards per run, 2 idle-gated windows, alternating order; one ~30 ms outlier per window (in both arms) excluded; off = MLX_SERVE_QSA_IDX_ROPE_FUSED=0",
+ "x_label": "run",
+ "x_order": [
+  "run 1",
+  "run 2",
+  "run 3",
+  "run 4",
+  "run 5"
+ ],
+ "arms": {
+  "fused pooled-key kernel (this PR)": {
+   "run 1": {
+    "ms": 20.267
+   },
+   "run 2": {
+    "ms": 20.253
+   },
+   "run 3": {
+    "ms": 20.183
+   },
+   "run 4": {
+    "ms": 20.281
+   },
+   "run 5": {
+    "ms": 20.254
+   }
+  },
+  "composed chain (base)": {
+   "run 1": {
+    "ms": 20.541
+   },
+   "run 2": {
+    "ms": 20.663
+   },
+   "run 3": {
+    "ms": 20.601
+   },
+   "run 4": {
+    "ms": 21.116
+   },
+   "run 5": {
+    "ms": 20.627
+   }
+  }
+ }
+}
