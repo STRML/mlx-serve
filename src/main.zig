@@ -573,6 +573,7 @@ pub fn main(init: std.process.Init) !void {
     // file inspection); set explicitly via --engine to force ds4 or llama.
     var engine_override: ?gguf_meta.Engine = null;
     var log_level_explicit = false;
+    var decode_share_flag: ?[]const u8 = null;
     var i: usize = arg_start;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -889,7 +890,7 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, args[i], "--prefill-decode-share") and i + 1 < args.len) {
             i += 1;
-            scheduler_mod.prefill_decode_share = scheduler_mod.parseDecodeShare(args[i]);
+            decode_share_flag = args[i];
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
             i += 1;
             server_mod.max_concurrent = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -994,6 +995,12 @@ pub fn main(init: std.process.Init) !void {
     // server config in reach); the env stays the benching override.
     if (ane_media.share == null) ane_media.share = ane_mod.explicitShareEnv();
     ane_mod.media_offload = ane_media;
+
+    const decode_share_env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_PREFILL_DECODE_SHARE")) |r| std.mem.sliceTo(r, 0) else null;
+    scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag, decode_share_env) catch {
+        log.err("--prefill-decode-share / MLX_SERVE_PREFILL_DECODE_SHARE: expected a number >= 0 (above 0.9 clamps to 0.9), got '{s}'\n", .{decode_share_flag orelse decode_share_env.?});
+        std.process.exit(1);
+    };
 
     transformer_mod.Transformer.mtp_head_kv_quant_flag = mtp_head_kv_quant;
     generate_mod.mtp_acceptance_default = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {

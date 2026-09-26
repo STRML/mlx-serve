@@ -221,6 +221,33 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
     return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
+/// A prefill width under the decode share's cap (0 = no cap).
+pub fn decodeShareCapped(width: usize, cap: usize) usize {
+    return if (cap == 0) width else @min(width, cap);
+}
+
+test "decodeShareCapped: the share cap narrows an explicit and an env width" {
+    const saved_override = prefill_chunk_override;
+    const saved_explicit = prefill_chunk_explicit;
+    defer {
+        prefill_chunk_override = saved_override;
+        prefill_chunk_explicit = saved_explicit;
+    }
+    prefill_chunk_override = 8192;
+    prefill_chunk_explicit = true;
+    const explicit = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
+    try std.testing.expectEqual(@as(usize, 8192), explicit);
+    try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(explicit, 1024));
+    try std.testing.expectEqual(@as(usize, 8192), decodeShareCapped(explicit, 0));
+
+    _ = setenv("MLX_SERVE_PREFILL_CHUNK", "8192", 1);
+    defer _ = unsetenv("MLX_SERVE_PREFILL_CHUNK");
+    prefill_chunk_explicit = false;
+    const env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
+    try std.testing.expectEqual(@as(usize, 8192), env);
+    try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(env, 1024));
+}
+
 /// Read an unsigned integer from an environment variable, falling back to
 /// `default` when unset, empty, or unparseable. Uses libc getenv to stay
 /// allocator-free at call sites.
@@ -2027,6 +2054,10 @@ pub const Generator = struct {
         /// object the admission guard bills against, so bill and forward cannot
         /// disagree. (Live 2026-08-14: pinned 4096, prefilled at 8192.)
         pinned_prefill_chunk: usize = 0,
+        /// `--prefill-decode-share` width while someone decodes, 0 = none. Applied after
+        /// `effectivePrefillChunk`, so it narrows an explicit or env width too: the
+        /// operator asked for the share as well.
+        decode_share_width_cap: usize = 0,
         /// Enable Gemma 4 assistant drafter. When set, `drafter` must be
         /// non-null and already `bind()`-ed to `xfm`. Init's prefill final-token
         /// forward captures the post-final-norm hidden state into
@@ -2378,7 +2409,7 @@ pub const Generator = struct {
         // start at ssm_checkpoint_pos_offset, so the final KV length is that
         // offset plus everything we're about to forward.
         const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-        const PREFILL_CHUNK: usize = effectivePrefillChunk(
+        const PREFILL_CHUNK: usize = decodeShareCapped(effectivePrefillChunk(
             xfm.config.prefillScoreHeadDim(),
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,
@@ -2386,7 +2417,7 @@ pub const Generator = struct {
             xfm.config.isMoe(),
             xfm.config.longCtxGated(),
             options.pinned_prefill_chunk,
-        );
+        ), options.decode_share_width_cap);
         // Phase-level prefill instrumentation. Enabled at debug level OR via
         // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).
         // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
