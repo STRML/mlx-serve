@@ -8976,6 +8976,11 @@ test "batchKvLenOf bills raw when any gather switch is off or the slot is vision
     transformer_mod.qsa_decode_gather_override = true;
     transformer_mod.qsa_verify_gather_override = false;
     try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 1, false));
+    // The fused verify kernel still serves S=4 on blocks; with it off too, the mask bills raw kv.
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+    const prev_k = transformer_mod.qsa_attn_kernel_override;
+    defer transformer_mod.qsa_attn_kernel_override = prev_k;
+    transformer_mod.qsa_attn_kernel_override = false;
     try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 4, false));
 }
 
@@ -9022,7 +9027,7 @@ test "grouping a 300k text slot beside a 1k vision slot is not admitted on the s
     try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&per_slot));
 }
 
-test "S>=2 pad-waste floor is max of gather and verify mins" {
+test "S>=2 pad-waste floor: none under the fused verify kernel, else max of gather and verify mins" {
     const prev_b = transformer_mod.qsa_batched_gather_override;
     const prev_g = transformer_mod.qsa_gather_override;
     const prev_v = transformer_mod.qsa_verify_gather_override;
@@ -9048,7 +9053,14 @@ test "S>=2 pad-waste floor is max of gather and verify mins" {
     var cache = try KVCache.init(testing.allocator, 32);
     defer cache.deinit();
     cache.entries[3].initialized = true;
+    // The fused verify kernel reads O(budget) keys per row at any kv: no floor at S=4.
+    const prev_k = transformer_mod.qsa_attn_kernel_override;
+    defer transformer_mod.qsa_attn_kernel_override = prev_k;
+    transformer_mod.qsa_attn_kernel_override = null;
     cache.entries[3].offset = 18_000;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+    // Its kill switch restores the union gather's floor: max of the gather and verify mins.
+    transformer_mod.qsa_attn_kernel_override = false;
     try testing.expectEqual(@as(u32, 18_000), batchKvLenOfWith(&cache, &q4, 4, false));
     cache.entries[3].offset = 162_000;
     try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
