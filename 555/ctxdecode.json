@@ -1,0 +1,36 @@
+{
+ "title": "Qwen3.8-Flash-Next mixed-4-8bit, bf16 KV, --mtp --mtp-typical 0.2, lookup on",
+ "hardware": "Apple M5 Ultra, 256 GB, 64 GPU cores",
+ "method": "decode tok/s after an N-token prompt, 400 generated tokens, 3 rounds alternating arms, median; one binary (e0c3e1e)",
+ "x_label": "prompt tokens before decode",
+ "arms": {
+  "fused split-K kernel (this PR)": {
+   "8000": {
+    "decode_tps": 108.8
+   },
+   "16000": {
+    "decode_tps": 102.2
+   },
+   "32000": {
+    "decode_tps": 106.3
+   },
+   "64000": {
+    "decode_tps": 103.6
+   }
+  },
+  "MLX_SERVE_QSA_ATTN_DENSE=0 (today)": {
+   "8000": {
+    "decode_tps": 110.7
+   },
+   "16000": {
+    "decode_tps": 100.1
+   },
+   "32000": {
+    "decode_tps": 95.1
+   },
+   "64000": {
+    "decode_tps": 92.1
+   }
+  }
+ }
+}
