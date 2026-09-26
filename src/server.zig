@@ -876,17 +876,19 @@ pub var prefix_cache_capacity: u32 = 32;
 /// default (2 GB) is generous for one or two long conversations on a Gemma 4
 /// E4B-sized model and tiny relative to total wired-limit budget; tune via
 /// `--prefix-cache-mem <N>{GB,MB}`. 0 disables the byte budget (count cap
-/// from `--prefix-cache-entries` still applies).
+/// from `--prefix-cache-entries` still applies). On qwen4_exp's RAM-first arm an
+/// unset budget grows to one session at the working context (`defaultPrefixCacheAsk`).
 pub var prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT;
 pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 /// Set by `--prefix-cache-mem`: an operator's number is used as given, even when it equals the default.
 pub var prefix_cache_mem_explicit = false;
 
-/// The hot-cache ask when nobody named one. Stub: today's default.
+/// The hot-cache ask when nobody named one: one session at the working context, never under
+/// 2 GB. Below one session the cache keeps only a prefix of the longest conversations, the
+/// ones whose reuse saves the most prefill. Any other ask (an operator's, an embedder's) stands.
 pub fn defaultPrefixCacheAsk(requested: u64, explicit: bool, session_kv: u64) u64 {
-    _ = explicit;
-    _ = session_kv;
-    return requested;
+    if (explicit or requested != PREFIX_CACHE_MEM_DEFAULT) return requested;
+    return @max(requested, session_kv);
 }
 
 /// What the hot cache was actually given for the loaded model, after `clampedPrefixCacheMem`.
@@ -3960,16 +3962,18 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, ssd_clamp_reserve, idle_out, revise.quiet)) |b| return b;
     // Pin first, then hand the pinned width in as the override.
     const pinned: u32 = pinPrefillChunk(config);
+    // Not `getEffectiveContextLength`: still a placeholder on an auto boot.
+    const ctx_tokens = ramFirstContextForLoad(config, kv_bits, active_mem, pinned);
+    const ask = defaultPrefixCacheAsk(requested, prefix_cache_mem_explicit, sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes());
     // Static ceiling, not the live one: the budget must be reproducible boot to boot.
     const plan = planHotCache(
         config,
         kv_bits,
         staticGpuMemoryCeiling(),
         active_mem,
-        // Not `getEffectiveContextLength`: still a placeholder on an auto boot.
-        ramFirstContextForLoad(config, kv_bits, active_mem, pinned),
+        ctx_tokens,
         sizerCtxKvBytes(config, kv_bits),
-        requested,
+        ask,
         pinned,
     );
     publishResolvedPrefixCacheMem(plan.budget);
@@ -3980,8 +3984,11 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         const free_gb = @as(f64, @floatFromInt(live_ceiling -| active_mem)) / (1024.0 * 1024.0 * 1024.0);
         log.info("[hot-cache] budget {d} MB (static ceiling); free at load {d:.1} GB — live admission will evict as needed\n", .{ plan.budget >> 20, free_gb });
     }
-    if (requested > 0 and plan.budget < requested) {
-        log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ requested >> 20, plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
+    if (ask != requested) {
+        log.info("[hot-cache] budget {d} MB = one session at the working context (no --prefix-cache-mem)\n", .{ask >> 20});
+    }
+    if (ask > 0 and plan.budget < ask) {
+        log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ ask >> 20, plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     } else if (requested == 0) {
         log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     }
