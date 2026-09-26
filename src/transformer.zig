@@ -58627,6 +58627,12 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
         try std.testing.expect((try gdn_decode.recurSeqFold(g, t_len, bad, false, s)) == null);
         try std.testing.expect((try gdn_decode.recurSeq(g, t_len, bad, s)) == null);
     }
+    // The same well-formed inputs on a CPU stream: the Metal kernels decline, nothing latches.
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try std.testing.expect((try gdn_decode.recurSeqFold(g, t_len, good, false, cpu)) == null);
+    try std.testing.expect((try gdn_decode.recurSeq(g, t_len, good, cpu)) == null);
+    try std.testing.expect(!mlx.errorPending());
 }
 
 fn gdnDecodeFoldParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, hk: c_int, hv: c_int, t_len: c_int, swish: bool) !void {

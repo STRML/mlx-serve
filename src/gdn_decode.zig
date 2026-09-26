@@ -375,6 +375,7 @@ pub const Recur = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_stat
 /// K1 alone: prework + recurrence, y as [1,1,Hv,Dv]; z, norm_w, eps and signs
 /// are not read. Null when the geometry or dtypes are outside the kernel.
 pub fn recur(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Recur {
+    if (!mlx.streamIsGpu(s)) return null;
     if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0 or @rem(g.hv * g.dv, 1024) != 0) return null;
     const dt = mlx.mlx_array_dtype(in.qkv);
     if (dt != .bfloat16 and dt != .float16) return null;
@@ -407,6 +408,7 @@ pub fn recur(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Recur {
 
 /// Null when the geometry or dtypes are outside the kernels (caller keeps the chain).
 pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
+    if (!mlx.streamIsGpu(s)) return null;
     for ([_]mlx.mlx_array{ in.z, in.norm_w }) |arr|
         if (mlx.mlx_array_dtype(arr) != mlx.mlx_array_dtype(in.qkv)) return null;
     if (!inputsFit(g, 1, in, true) or !sizeIs(in.signs, g.hv * g.dv)) return null;
@@ -456,6 +458,7 @@ fn buildSeqConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtyp
 /// [1,T,Hv,Dv], the next conv state, the final state and state_seq
 /// ([T,1,Hv,Dv,Dk], row T-1 unwritten). Null outside the kernel's geometry.
 pub fn recurSeq(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?RecurSeq {
+    if (!mlx.streamIsGpu(s)) return null;
     if (t_len < 2 or t_len > MAX_SEQ) return null;
     if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
     const dt = mlx.mlx_array_dtype(in.qkv);
@@ -536,6 +539,7 @@ fn buildFoldConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dty
 /// [1,3+T,C]. Bit-identical to recurSeq -> gdnNormGateFused -> concat. Null
 /// outside the kernel's geometry or dtypes (caller keeps the unfolded path).
 pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.mlx_stream) !?RecurSeqFold {
+    if (!mlx.streamIsGpu(s)) return null;
     if (t_len < 2 or t_len > MAX_SEQ) return null;
     if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
     const dt = mlx.mlx_array_dtype(in.qkv);
@@ -582,7 +586,8 @@ pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.m
             for (out) |a| _ = mlx.mlx_array_free(a);
             return null;
         }
-        fold_ok[idx] = true;
+        // Only a clean eval says the pipeline runs; any other error stays latched and decides nothing.
+        if (!mlx.errorPending()) fold_ok[idx] = true;
     }
     return .{ .gated = out[0], .conv_state = out[1], .ssm_state = out[2], .state_seq = out[3], .conv_input = out[4] };
 }
