@@ -4736,16 +4736,30 @@ fn qsaSelectComposedOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_
 // of the S rows' selections under a mask (6x the MACs at S=6, plus a 12.6 MB slab). This is
 // one dispatch: `msv_attn_qsa256` verbatim with the device K/V reads replaced by an in-kernel
 // affine unpack (`qkv_attn_dec`'s dense packing). Each row sees its own blocks then its own
-// ragged tail, so causality is automatic and the INT_MAX sentinels are never read.
-const QSA_ATTN_Q_SOURCE =
+// ragged tail, so causality is automatic and the INT_MAX sentinels are never read. A bf16
+// cache runs the same split pass with `msv_attn_qsa256`'s plain uint4 loads: the source is
+// built from shared pieces, and only the K/V loads and their bases differ per variant.
+/// Shared by both variants of the split pass: tile constants.
+const QSA_ATTN_CONSTS =
     \\constexpr int BD = 256;
     \\constexpr int LDK = BK + 8;
     \\constexpr int LDV = BD + 8;
     \\constexpr int NT = 32 * NSG;
     \\constexpr int KT = BK / 8;
+    \\
+;
+
+/// Quantized variant: unpack constants (BITS is its template).
+const QSA_ATTN_Q_CONSTS =
     \\constexpr int VPW = 32 / BITS;
     \\constexpr int NW = 8 / VPW;
     \\constexpr uint MASKB = (1u << BITS) - 1u;
+    \\
+;
+
+/// Shared: the row's visible range, its split and its block list. Both variants name
+/// their K/V inputs `kq`/`vq`, so `kq_shape` is the key count in either.
+const QSA_ATTN_ROW =
     \\
     \\const int qL = q_shape[2];
     \\const int kL = kq_shape[2];
@@ -4804,12 +4818,29 @@ const QSA_ATTN_Q_SOURCE =
     \\}
     \\
     \\const device int* blk = blocks + (long)bb * blocks_strides[0] + (long)s * blocks_strides[1];
+    \\
+;
+
+/// Quantized variant: per-head bases of the six packed arrays.
+const QSA_ATTN_Q_BASES =
     \\const long kq_base  = (long)bb * kq_strides[0]  + (long)hk * kq_strides[1];
     \\const long ksc_base = (long)bb * ksc_strides[0] + (long)hk * ksc_strides[1];
     \\const long kbi_base = (long)bb * kbi_strides[0] + (long)hk * kbi_strides[1];
     \\const long vq_base  = (long)bb * vq_strides[0]  + (long)hk * vq_strides[1];
     \\const long vsc_base = (long)bb * vsc_strides[0] + (long)hk * vsc_strides[1];
     \\const long vbi_base = (long)bb * vbi_strides[0] + (long)hk * vbi_strides[1];
+    \\
+;
+
+/// Dense variant: per-head bases of the bf16 K and V.
+const QSA_ATTN_D_BASES =
+    \\const long kq_base = (long)bb * kq_strides[0] + (long)hk * kq_strides[1];
+    \\const long vq_base = (long)bb * vq_strides[0] + (long)hk * vq_strides[1];
+    \\
+;
+
+/// Shared: staging, Q fragments, and the head of the key-tile loop.
+const QSA_ATTN_TILE_OPEN =
     \\
     \\threadgroup T KVs[LDK * BD];
     \\threadgroup T* Ks = KVs;
@@ -4842,6 +4873,11 @@ const QSA_ATTN_Q_SOURCE =
     \\for (int t0 = t_lo; t0 < t_hi; t0 += BK) {
     \\  const int rows_k = metal::min(BK, t_hi - t0);
     \\
+    \\
+;
+
+/// Quantized variant: K tile, unpacked in-kernel.
+const QSA_ATTN_Q_KLOAD =
     \\  // K tile: dequantize into the SAME transposed staging the dense
     \\  // kernel fills, so the fragment math below is untouched. The 8 dims of
     \\  // one chunk share a quant group (GS is a multiple of 8), so the
@@ -4867,6 +4903,31 @@ const QSA_ATTN_Q_SOURCE =
     \\    }
     \\    for (int j = 0; j < 8; ++j) Ks[(cb + j) * LDK + r] = ev[j];
     \\  }
+    \\
+;
+
+/// Dense variant: K tile, read straight from the bf16 cache.
+const QSA_ATTN_D_KLOAD =
+    \\  // K tile: `msv_attn_qsa256`'s load, eight elements per uint4, into
+    \\  // the transposed staging the fragment math reads.
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
+    \\    const int r = i >> 5;
+    \\    const int c8 = i & 31;
+    \\    uint4 w = uint4(0);
+    \\    if (r < rows_k) {
+    \\      const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
+    \\      w = *((const device uint4*)(kq + kq_base + (long)pos * kq_strides[2]) + c8);
+    \\    }
+    \\    thread T* e = (thread T*)&w;
+    \\    const int cb = c8 * 8;
+    \\    for (int j = 0; j < 8; ++j) Ks[(cb + j) * LDK + r] = e[j];
+    \\  }
+    \\
+;
+
+/// Shared: scores and the ragged-tile mask.
+const QSA_ATTN_SCORES =
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\
     \\  float2 Sfrag[KT];
@@ -4887,6 +4948,11 @@ const QSA_ATTN_Q_SOURCE =
     \\    }
     \\  }
     \\
+    \\
+;
+
+/// Quantized variant: V tile, unpacked in-kernel.
+const QSA_ATTN_Q_VLOAD =
     \\  // V tile: dequantize straight into the row-major staging.
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
@@ -4909,6 +4975,28 @@ const QSA_ATTN_Q_SOURCE =
     \\    }
     \\    for (int j = 0; j < 8; ++j) Vs[r * LDV + cb + j] = ev[j];
     \\  }
+    \\
+;
+
+/// Dense variant: V tile, read straight from the bf16 cache.
+const QSA_ATTN_D_VLOAD =
+    \\  // V tile: uint4 copies straight into the row-major staging.
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
+    \\    const int r = i >> 5;
+    \\    const int c8 = i & 31;
+    \\    uint4 w = uint4(0);
+    \\    if (r < rows_k) {
+    \\      const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
+    \\      w = *((const device uint4*)(vq + vq_base + (long)pos * vq_strides[2]) + c8);
+    \\    }
+    \\    *((threadgroup uint4*)(Vs + r * LDV) + c8) = w;
+    \\  }
+    \\
+;
+
+/// Shared: online softmax, P@V, and the partials for the merge.
+const QSA_ATTN_TILE_CLOSE =
     \\
     \\  float new_max = max_score;
     \\  for (int kt = 0; kt < KT; ++kt) new_max = metal::max(new_max, msv_row_max(Sfrag[kt]));
@@ -4957,6 +5045,14 @@ const QSA_ATTN_Q_SOURCE =
     \\  }
     \\}
 ;
+
+const QSA_ATTN_Q_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_Q_CONSTS ++ QSA_ATTN_ROW ++ QSA_ATTN_Q_BASES ++
+    QSA_ATTN_TILE_OPEN ++ QSA_ATTN_Q_KLOAD ++ QSA_ATTN_SCORES ++ QSA_ATTN_Q_VLOAD ++ QSA_ATTN_TILE_CLOSE;
+
+/// The dense (bf16 KV) variant: the same split pass with plain device loads, so a dense
+/// cache keeps the verify kernel's split-K grid (never `gatherQsa256`'s prefill grid).
+const QSA_ATTN_D_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_ROW ++ QSA_ATTN_D_BASES ++
+    QSA_ATTN_TILE_OPEN ++ QSA_ATTN_D_KLOAD ++ QSA_ATTN_SCORES ++ QSA_ATTN_D_VLOAD ++ QSA_ATTN_TILE_CLOSE;
 
 /// msv_attn_qsa256_qmerge: the split-K reduction, one threadgroup per (q head, query row).
 /// Standard flash-decoding merge in the log2 domain; `l_j == 0` marks an empty split and is
@@ -5034,6 +5130,7 @@ pub fn warmQsaEnvCaches() void {
     _ = qsaSelectSplitEnabled();
     _ = qsaSelectTg();
     _ = qsaAttnKernelEnabled();
+    _ = qsaAttnDenseEnabled();
     _ = qsaAttnNSplit();
     _ = qsaAttnMinS();
     _ = qsaAttnBk();
@@ -5061,12 +5158,13 @@ pub fn qsaAttnMinS() c_int {
     return @max(1, @min(v, FUSED256_MIN_Q_LEN - 1));
 }
 
-/// Does the fused sparse-attention kernel serve this call? There is no fused dense arm:
-/// `--kv-quant off` used to fall into `gatherQsa256`, the prefill kernel, whose grid starves
-/// at a verify width (16k fp16: 77.7 vs 93.6 tok/s). Dense KV takes `qsaVerifyGatherAttn`.
+/// Does the fused sparse-attention kernel serve this call? Dense KV takes the kernel's bf16
+/// variant (same split-K grid). It must never fall into `gatherQsa256`, the prefill kernel,
+/// whose grid starves at a verify width (16k fp16: 77.7 vs 93.6 tok/s).
+/// `MLX_SERVE_QSA_ATTN_DENSE=0` hands dense KV back to the mask arm / `qsaVerifyGatherAttn`.
 pub fn qsaSparseAttnServes(has_quant_triple: bool, seq_len: c_int, min_s: c_int) bool {
     if (seq_len < min_s or seq_len >= FUSED256_MIN_Q_LEN) return false;
-    return has_quant_triple;
+    return has_quant_triple or qsaAttnDenseEnabled();
 }
 
 var qsa_attn_merge_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
@@ -5122,6 +5220,29 @@ pub fn qsaAttnBalanced() bool {
 }
 
 var qsa_attn_q_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+var qsa_attn_d_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getQsaAttnDKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_attn_d_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "q", "scl", "blocks", "kq", "vq" };
+    const output_names = [_][*:0]const u8{ "pacc", "pml" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_attn_qsa256_dsplit",
+        in_vec,
+        out_vec,
+        QSA_ATTN_D_SOURCE,
+        ATTN_QSA256_KERNEL_HEADER,
+        false, // K/V are cache views (see msv_attn_qsa256)
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_attn_d_kernel_cached = kernel;
+    return kernel;
+}
 
 fn getQsaAttnQKernel() !mlx.mlx_fast_metal_kernel {
     if (qsa_attn_q_kernel_cached) |kk| return kk;
@@ -5257,9 +5378,78 @@ pub fn qsaAttnCfgBuilds() usize {
 }
 var qsa_attn_engaged_bits: OneShotBits = .{};
 
+/// The K/V inputs one variant of the split pass reads, validated. `bits == 16` is the dense
+/// (bf16) variant; its two arrays bind to `kq`/`vq`.
+const QsaAttnKvInputs = struct {
+    arrays: [6]mlx.mlx_array,
+    n: usize,
+    h_kv: c_int,
+    kv: c_int,
+    bits: u8,
+    gs: u32,
+};
+
+/// The packed affine triples, or null when the quantized variant cannot read them.
+fn qsaAttnQuantInputs(kv_view: *const DenseKVView) ?QsaAttnKvInputs {
+    if (kv_view.bits != 4 and kv_view.bits != 8) return null;
+    if (kv_view.group_size == 0 or @rem(@as(c_int, 256), @as(c_int, @intCast(kv_view.group_size))) != 0) return null;
+    // One quant group per 8-dim staging chunk.
+    if (kv_view.group_size % 8 != 0) return null;
+    // `has_quant_triple` promises all six handles; a null ctx would fault, so check.
+    const arrays = [6]mlx.mlx_array{
+        kv_view.k_triple_q, kv_view.k_triple_scales, kv_view.k_triple_biases,
+        kv_view.v_triple_q, kv_view.v_triple_scales, kv_view.v_triple_biases,
+    };
+    for (arrays) |a| {
+        if (a.ctx == null) return null;
+    }
+    if (mlx.mlx_array_ndim(kv_view.k_triple_q) != 4 or mlx.mlx_array_ndim(kv_view.v_triple_q) != 4) return null;
+    const ks = mlx.getShape(kv_view.k_triple_q);
+    const vs = mlx.getShape(kv_view.v_triple_q);
+    const vpw: c_int = @divExact(@as(c_int, 32), @as(c_int, kv_view.bits));
+    if (ks.len != 4 or vs.len != 4 or ks[0] != 1 or vs[0] != 1) return null;
+    if (ks[3] * vpw != 256 or vs[3] * vpw != 256) return null;
+    const h_kv = ks[1];
+    const kv = ks[2];
+    if (vs[1] != h_kv or vs[2] != kv) return null;
+    const groups: c_int = @divExact(@as(c_int, 256), @as(c_int, @intCast(kv_view.group_size)));
+    const ksc_sh = mlx.getShape(kv_view.k_triple_scales);
+    const vsc_sh = mlx.getShape(kv_view.v_triple_scales);
+    if (ksc_sh.len != 4 or vsc_sh.len != 4 or ksc_sh[3] != groups or vsc_sh[3] != groups) return null;
+    if (ksc_sh[2] != kv or vsc_sh[2] != kv) return null;
+    // `ensure_row_contiguous = false` (the packed triples are cache views), so the kernel
+    // indexes every innermost axis with unit stride; decline anything else.
+    for (arrays) |a| {
+        if (mlx.mlx_array_strides(a)[3] != 1) return null;
+    }
+    return .{ .arrays = arrays, .n = 6, .h_kv = h_kv, .kv = kv, .bits = kv_view.bits, .gs = kv_view.group_size };
+}
+
+/// The bf16 K/V views, or null when the dense variant cannot read them. Its tile loads are
+/// `uint4` (eight bf16), so every row must start 16-byte aligned: unit innermost stride and
+/// head/row strides that are multiples of 8 elements.
+fn qsaAttnDenseInputs(kv_view: *const DenseKVView) ?QsaAttnKvInputs {
+    const k = kv_view.k;
+    const v = kv_view.v;
+    if (k.ctx == null or v.ctx == null) return null;
+    if (mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
+    if (mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
+    const ks = mlx.getShape(k);
+    const vs = mlx.getShape(v);
+    if (ks[0] != 1 or ks[3] != 256 or !std.mem.eql(c_int, ks, vs)) return null;
+    for ([_]mlx.mlx_array{ k, v }) |a| {
+        const st = mlx.mlx_array_strides(a);
+        if (st[3] != 1 or st[2] % 8 != 0 or st[1] % 8 != 0) return null;
+    }
+    var arrays: [6]mlx.mlx_array = @splat(.{ .ctx = null });
+    arrays[0] = k;
+    arrays[1] = v;
+    return .{ .arrays = arrays, .n = 2, .h_kv = ks[1], .kv = ks[2], .bits = 16, .gs = 0 };
+}
+
 /// One fused sparse-attention dispatch for a verify-width block: each row indexes its own
-/// selected blocks plus its own tail, reading the packed KV triples in-kernel. Null =
-/// declined. Quantized KV only (`qsaSparseAttnServes`).
+/// selected blocks plus its own tail. Quantized KV unpacks its triples in-kernel; dense
+/// (bf16) KV takes the same split pass with plain loads. Null = declined.
 pub fn qsaSparseAttn(
     s: mlx.mlx_stream,
     q_rope: mlx.mlx_array, // [1, Hq, S, 256] bf16, post-RoPE
@@ -5274,7 +5464,7 @@ pub fn qsaSparseAttn(
     const qs = mlx.getShape(q_rope);
     const seq_len = qs[2];
     // Decode width keeps `qsaDecodeGatherAttn` (excluded by `qsaAttnMinS`, not a literal);
-    // prefill keeps `gatherQsa256`; a dense cache declines (`qsaSparseAttnServes`).
+    // prefill keeps `gatherQsa256`; a dense cache follows `MLX_SERVE_QSA_ATTN_DENSE`.
     if (!qsaSparseAttnServes(kv_view.has_quant_triple, seq_len, qsaAttnMinS())) return null;
     if (qs[0] != 1 or qs[3] != 256) return null;
     if (mlx.mlx_array_dtype(q_rope) != .bfloat16) return null;
@@ -5284,48 +5474,22 @@ pub fn qsaSparseAttn(
     // `kb` rides `blocks_shape[2]` into the kernel.
     _ = bs[2];
     if (ratio <= 0) return null;
+    // MLX binds an input under 8 elements in the `constant` address space, and the kernel's
+    // `const device int* blk` then fails to compile (a throw at eval, not a decline).
+    if (bs[1] * bs[2] < 8) return null;
+    if (mlx.mlx_array_strides(q_rope)[3] != 1) return null;
+    if (mlx.mlx_array_strides(blocks)[2] != 1) return null;
 
-    if (kv_view.bits != 4 and kv_view.bits != 8) return null;
-    if (kv_view.group_size == 0 or @rem(@as(c_int, 256), @as(c_int, @intCast(kv_view.group_size))) != 0) return null;
-    // One quant group per 8-dim staging chunk.
-    if (kv_view.group_size % 8 != 0) return null;
-    // `has_quant_triple` promises all six handles; a null ctx would fault, so check.
-    if (kv_view.k_triple_q.ctx == null or kv_view.k_triple_scales.ctx == null or kv_view.k_triple_biases.ctx == null or
-        kv_view.v_triple_q.ctx == null or kv_view.v_triple_scales.ctx == null or kv_view.v_triple_biases.ctx == null) return null;
-    if (mlx.mlx_array_ndim(kv_view.k_triple_q) != 4 or mlx.mlx_array_ndim(kv_view.v_triple_q) != 4) return null;
-    const ks = mlx.getShape(kv_view.k_triple_q);
-    const vs = mlx.getShape(kv_view.v_triple_q);
-    const vpw: c_int = @divExact(@as(c_int, 32), @as(c_int, kv_view.bits));
-    if (ks.len != 4 or vs.len != 4 or ks[0] != 1 or vs[0] != 1) return null;
-    if (ks[3] * vpw != 256 or vs[3] * vpw != 256) return null;
-    const h_kv = ks[1];
-    const kv = ks[2];
-    if (h_kv <= 0 or kv < seq_len or vs[1] != h_kv or vs[2] != kv) return null;
+    const kvin = (if (kv_view.has_quant_triple) qsaAttnQuantInputs(kv_view) else qsaAttnDenseInputs(kv_view)) orelse return null;
+    const dense = kvin.bits == 16;
+    const h_kv = kvin.h_kv;
+    const kv = kvin.kv;
+    if (h_kv <= 0 or kv < seq_len) return null;
     if (@rem(qs[1], h_kv) != 0) return null;
     const gqa = @divExact(qs[1], h_kv);
     if (gqa <= 0 or gqa > 64) return null;
-    const groups: c_int = @divExact(@as(c_int, 256), @as(c_int, @intCast(kv_view.group_size)));
-    const ksc_sh = mlx.getShape(kv_view.k_triple_scales);
-    const vsc_sh = mlx.getShape(kv_view.v_triple_scales);
-    if (ksc_sh.len != 4 or vsc_sh.len != 4 or ksc_sh[3] != groups or vsc_sh[3] != groups) return null;
-    if (ksc_sh[2] != kv or vsc_sh[2] != kv) return null;
 
-    // `ensure_row_contiguous = false` (the packed triples are cache views), so the kernel
-    // indexes every innermost axis with unit stride; decline anything else.
-    const innermost_unit = blk: {
-        if (mlx.mlx_array_strides(q_rope)[3] != 1) break :blk false;
-        if (mlx.mlx_array_strides(blocks)[2] != 1) break :blk false;
-        for ([_]mlx.mlx_array{
-            kv_view.k_triple_q, kv_view.k_triple_scales, kv_view.k_triple_biases,
-            kv_view.v_triple_q, kv_view.v_triple_scales, kv_view.v_triple_biases,
-        }) |a| {
-            if (mlx.mlx_array_strides(a)[3] != 1) break :blk false;
-        }
-        break :blk true;
-    };
-    if (!innermost_unit) return null;
-
-    const kernel = getQsaAttnQKernel() catch return null;
+    const kernel = (if (dense) getQsaAttnDKernel() else getQsaAttnQKernel()) catch return null;
     const merge_kernel = getQsaAttnMergeKernel() catch return null;
     const nsg: c_int = @divTrunc(gqa + 7, 8);
     const nsplit = qsaAttnNSplit();
@@ -5339,8 +5503,8 @@ pub fn qsaSparseAttn(
     const key = QsaAttnCfgKey{
         .q_shape = ShapeKey.from(qs),
         .h_kv = h_kv,
-        .bits = kv_view.bits,
-        .gs = kv_view.group_size,
+        .bits = kvin.bits,
+        .gs = kvin.gs,
         .nsg = nsg,
         .nsplit = nsplit,
         .bk = bk,
@@ -5362,8 +5526,10 @@ pub fn qsaSparseAttn(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSG", nsg));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BK", bk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", ratio));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(kv_view.bits)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(kv_view.group_size)));
+        if (!dense) {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(kvin.bits)));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(kvin.gs)));
+        }
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSPLIT", nsplit));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BALANCED", if (balanced) 1 else 0));
 
@@ -5380,18 +5546,12 @@ pub fn qsaSparseAttn(
         break :blk .{ config, mconfig };
     };
 
-    const inputs_arr = [_]mlx.mlx_array{
-        q_rope,
-        scl,
-        blocks,
-        kv_view.k_triple_q,
-        kv_view.k_triple_scales,
-        kv_view.k_triple_biases,
-        kv_view.v_triple_q,
-        kv_view.v_triple_scales,
-        kv_view.v_triple_biases,
-    };
-    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    var inputs_arr: [9]mlx.mlx_array = undefined;
+    inputs_arr[0] = q_rope;
+    inputs_arr[1] = scl;
+    inputs_arr[2] = blocks;
+    @memcpy(inputs_arr[3..][0..kvin.n], kvin.arrays[0..kvin.n]);
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, 3 + kvin.n);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var parts_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(parts_vec);
@@ -5413,10 +5573,10 @@ pub fn qsaSparseAttn(
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
-    if (qsa_attn_engaged_bits.take(qsaWidthBucket(seq_len))) {
+    if (qsa_attn_engaged_bits.take(qsaWidthBucket(seq_len) + @as(u5, if (dense) 4 else 0))) {
         log.info(
-            "[qsa-attn] engaged (S={d} kv={d} quant={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — MLX_SERVE_QSA_ATTN_KERNEL=0 restores the union gather\n",
-            .{ seq_len, kv, kv_view.bits, kv_view.group_size, gqa, bk, nsplit, seq_len * h_kv * nsplit },
+            "[qsa-attn] engaged (S={d} kv={d} kv-bits={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — MLX_SERVE_QSA_ATTN_KERNEL=0 restores the union gather, MLX_SERVE_QSA_ATTN_DENSE=0 the dense mask arm\n",
+            .{ seq_len, kv, kvin.bits, kvin.gs, gqa, bk, nsplit, seq_len * h_kv * nsplit },
         );
     }
     return out;
@@ -52783,6 +52943,9 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
     defer qsa_verify_gather_min_kv_override = null;
     qsa_batched_gather_override = true;
     defer qsa_batched_gather_override = null;
+    // Dense views: keep the fused kernel's bf16 variant out so the union gather is the arm under test.
+    qsa_attn_dense_override = false;
+    defer qsa_attn_dense_override = null;
     var prng = std.Random.DefaultPrng.init(0xc0de);
     const rnd = prng.random();
     const ratio: c_int = 4;
@@ -53670,7 +53833,7 @@ test "qsa sparse attn: gqa tile reuse is invariant — one kv head serving 12 q 
     defer _ = mlx.mlx_array_free(blocks);
     const scale: f32 = 1.0 / 16.0;
 
-    // Both fixtures must be real quantized caches (a dense view declines).
+    // Both fixtures must be real quantized caches (a dense view takes the bf16 variant).
     const qcfg = kv_quant.KVQuantConfig.affine(8);
     var cache_r = try KVCache.initWithConfig(ta, 1, qcfg);
     defer cache_r.deinit();
@@ -53888,12 +54051,28 @@ test "qsa sparse attn dense: non-unit innermost stride, S=1 and S=16 decline" {
     var kt = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(kt);
     try mlx.check(mlx.mlx_transpose_axes(&kt, kt_src, &[_]c_int{ 0, 1, 3, 2 }, 4, s));
+    // A lazy view reports row-contiguous strides until it is evaluated.
+    try mlx.check(mlx.mlx_array_eval(kt));
     try std.testing.expect(mlx.mlx_array_strides(kt)[3] != 1);
     var transposed = DenseKVView{ .k = kt, .v = vd, .owned = false };
     try std.testing.expect((try qsaSparseAttn(s, q6, &transposed, bl6, ratio, 1.0)) == null);
     // Control: the same call on the unit-stride view is served.
     const ok = (try qsaSparseAttn(s, q6, &dense, bl6, ratio, 1.0)) orelse return error.SparseAttnDeclined;
     _ = mlx.mlx_array_free(ok);
+
+    // Blocks under 8 elements bind as `constant` in MLX and would not compile: declined.
+    const q2 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 2, 256 }, s);
+    defer _ = mlx.mlx_array_free(q2);
+    const bh2 = try qsaVerifyBlocksHost(ta, rnd, 2, kv, 3, ratio);
+    defer ta.free(bh2);
+    const bl2 = mlx.mlx_array_new_data(bh2.ptr, &[_]c_int{ 1, 2, 3 }, 3, .int32);
+    defer _ = mlx.mlx_array_free(bl2);
+    try std.testing.expect((try qsaSparseAttn(s, q2, &dense, bl2, ratio, 1.0)) == null);
+    var qcache = try KVCache.initWithConfig(ta, 1, kv_quant.KVQuantConfig.affine(8));
+    defer qcache.deinit();
+    var qview = try qsaAttnCacheFixture(ta, s, kd, vd, kv, @divTrunc(kv, 2), kv_quant.KVQuantConfig.affine(8), &qcache);
+    defer qview.deinit();
+    try std.testing.expect((try qsaSparseAttn(s, q2, &qview, bl2, ratio, 1.0)) == null);
 }
 
 test "qsa sparse attn dense: one fused dispatch replaces the mask arm's op chain (12 layers, bf16 KV)" {
