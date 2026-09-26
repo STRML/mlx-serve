@@ -53062,37 +53062,133 @@ fn attn256FiniteMaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !
     return max_diff;
 }
 
-test "splitCausalSdpa: parity vs single causal sdpa at every verify width (q 6..9)" {
+const CausalSplitCase = struct { hq: c_int, hkv: c_int, ql: c_int, kv: c_int, hd: c_int };
+
+fn causalSplitCaseArrays(rnd: std.Random, c: CausalSplitCase, s: mlx.mlx_stream) ![3]mlx.mlx_array {
+    const kL = c.kv + c.ql;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, c.hq, c.ql, c.hd }, s);
+    errdefer _ = mlx.mlx_array_free(q);
+    const k = try attn256RandBf16(rnd, &[_]c_int{ 1, c.hkv, kL, c.hd }, s);
+    errdefer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &[_]c_int{ 1, c.hkv, kL, c.hd }, s);
+    return .{ q, k, v };
+}
+
+/// Row r of a bottom-right causal block sees keys 0 .. kL-qL+r. One qL=1
+/// vector call per row over exactly that prefix: an offset reference that
+/// does not go through MLX's causal fallback.
+fn causalPerRowReference(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(k);
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    const none = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(none);
+    var parts = std.ArrayList(mlx.mlx_array).empty;
+    defer {
+        for (parts.items) |a| _ = mlx.mlx_array_free(a);
+        parts.deinit(std.testing.allocator);
+    }
+    var r: c_int = 0;
+    while (r < qs[2]) : (r += 1) {
+        const kend = ks[2] - qs[2] + r + 1;
+        var q_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_r);
+        var k_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_r);
+        var v_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_r);
+        try mlx.check(mlx.mlx_slice(&q_r, q, &[_]c_int{ 0, 0, r, 0 }, 4, &[_]c_int{ 1, qs[1], r + 1, qs[3] }, 4, &strides, 4, s));
+        try mlx.check(mlx.mlx_slice(&k_r, k, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, ks[1], kend, ks[3] }, 4, &strides, 4, s));
+        try mlx.check(mlx.mlx_slice(&v_r, v, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, ks[1], kend, ks[3] }, 4, &strides, 4, s));
+        var o = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(o);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q_r, k_r, v_r, scale, "", none, .{ .ctx = null }, false, s));
+        try parts.append(std.testing.allocator, o);
+    }
+    const vec = mlx.mlx_vector_array_new_data(parts.items.ptr, parts.items.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
+    return out;
+}
+
+test "splitCausalSdpa: gqa-aware groups match one causal sdpa across widths, kv and head dims" {
     const s = mlx.gpuStream();
     sdpa_split_override = true;
     defer sdpa_split_override = null;
     var prng = std.Random.DefaultPrng.init(0x5D9A);
     const rnd = prng.random();
-
-    // Qwen3.6-27B verify geometry: gqa 6 (24/4 scaled to 6/2 hd 256), long-ish
-    // KV so the chunk-A window (kL - (qL-5)) differs measurably from full kL.
-    const kL: c_int = 193;
-    var qL: c_int = 6;
-    while (qL <= 9) : (qL += 1) {
-        const q_shape = [_]c_int{ 1, 6, qL, 256 };
-        const kv_shape = [_]c_int{ 1, 2, kL, 256 };
-        const q = try attn256RandBf16(rnd, &q_shape, s);
-        defer _ = mlx.mlx_array_free(q);
-        const k = try attn256RandBf16(rnd, &kv_shape, s);
-        defer _ = mlx.mlx_array_free(k);
-        const v = try attn256RandBf16(rnd, &kv_shape, s);
-        defer _ = mlx.mlx_array_free(v);
-        const scale: f32 = 1.0 / 16.0;
-
-        const split = (try splitCausalSdpa(s, q, k, v, scale)) orelse return error.SplitDeclined;
+    const cases = [_]CausalSplitCase{
+        // Qwen3.8-Flash-Next: gqa 12 (24/2), 2 rows per group.
+        .{ .hq = 24, .hkv = 2, .ql = 3, .kv = 1, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 1, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 100, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 6, .kv = 100, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 15, .kv = 100, .hd = 256 },
+        // kL >= 1024: MLX's 2-pass vector kernel on Max/Ultra.
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 2051, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 15, .kv = 2051, .hd = 256 },
+        // gqa 6 (27B geometry): 6..9 as before, 10..15 now split too.
+        .{ .hq = 6, .hkv = 2, .ql = 6, .kv = 187, .hd = 256 },
+        .{ .hq = 6, .hkv = 2, .ql = 9, .kv = 184, .hd = 256 },
+        .{ .hq = 6, .hkv = 2, .ql = 10, .kv = 100, .hd = 256 },
+        .{ .hq = 6, .hkv = 2, .ql = 15, .kv = 100, .hd = 256 },
+        // gqa 32: 1-row groups. gqa 3 at qL 11: an 8-row group + 3.
+        .{ .hq = 32, .hkv = 1, .ql = 3, .kv = 100, .hd = 256 },
+        .{ .hq = 6, .hkv = 2, .ql = 11, .kv = 100, .hd = 256 },
+        // Another head dim the vector kernel serves.
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 100, .hd = 128 },
+        .{ .hq = 16, .hkv = 2, .ql = 5, .kv = 1, .hd = 64 },
+    };
+    const scale: f32 = 1.0 / 16.0;
+    for (cases) |c| {
+        const arrs = try causalSplitCaseArrays(rnd, c, s);
+        defer for (arrs) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const split = (try splitCausalSdpa(s, arrs[0], arrs[1], arrs[2], scale)) orelse {
+            std.debug.print("split declined: {any}\n", .{c});
+            return error.SplitDeclined;
+        };
         defer _ = mlx.mlx_array_free(split);
-        const ref = try attn256Reference(q, k, v, scale, "causal", .{ .ctx = null }, s);
+        // Tolerance, not byte-identity: the single call is MLX's unfused
+        // fallback, a different reduction order (the verify-lane rule).
+        const ref = try attn256Reference(arrs[0], arrs[1], arrs[2], scale, "causal", .{ .ctx = null }, s);
         defer _ = mlx.mlx_array_free(ref);
-
-        // Tolerance, not byte-identity: the split changes which sdpa kernel
-        // runs and therefore the reduction order (the verify-lane rule).
         const max_diff = try attn256FiniteMaxDiff(split, ref, s);
+        if (max_diff >= 0.005) std.debug.print("case {any}: max diff {d}\n", .{ c, max_diff });
         try std.testing.expect(max_diff < 0.005);
+    }
+}
+
+test "splitCausalSdpa: every row sees exactly its causal window (bit-identical to per-row vector calls below kL 1024)" {
+    const s = mlx.gpuStream();
+    sdpa_split_override = true;
+    defer sdpa_split_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5DA1);
+    const rnd = prng.random();
+    // kL < 1024 keeps both sides on the 1-pass vector kernel, which skips
+    // masked keys, so each row's math depends only on its key set.
+    const cases = [_]CausalSplitCase{
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 100, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 15, .kv = 37, .hd = 256 },
+        .{ .hq = 6, .hkv = 2, .ql = 9, .kv = 100, .hd = 256 },
+        .{ .hq = 32, .hkv = 1, .ql = 3, .kv = 1, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 5, .kv = 100, .hd = 128 },
+    };
+    const scale: f32 = 1.0 / 16.0;
+    for (cases) |c| {
+        const arrs = try causalSplitCaseArrays(rnd, c, s);
+        defer for (arrs) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const split = (try splitCausalSdpa(s, arrs[0], arrs[1], arrs[2], scale)) orelse return error.SplitDeclined;
+        defer _ = mlx.mlx_array_free(split);
+        const ref = try causalPerRowReference(arrs[0], arrs[1], arrs[2], scale, s);
+        defer _ = mlx.mlx_array_free(ref);
+        const max_diff = try attn256FiniteMaxDiff(split, ref, s);
+        if (max_diff != 0) std.debug.print("case {any}: max diff {d}\n", .{ c, max_diff });
+        try std.testing.expect(max_diff == 0);
     }
 }
 
@@ -53102,49 +53198,48 @@ test "splitCausalSdpa: declines outside its envelope" {
     defer sdpa_split_override = null;
     var prng = std.Random.DefaultPrng.init(0x5DEC);
     const rnd = prng.random();
+    const declines = [_]CausalSplitCase{
+        // The vector kernel already serves qL*gqa <= 32.
+        .{ .hq = 24, .hkv = 2, .ql = 2, .kv = 64, .hd = 256 },
+        .{ .hq = 6, .hkv = 2, .ql = 5, .kv = 64, .hd = 256 },
+        .{ .hq = 6, .hkv = 2, .ql = 7, .kv = 64, .hd = 128 },
+        // qL > 8 below hd 256: MLX's fused full kernel serves it.
+        .{ .hq = 6, .hkv = 2, .ql = 10, .kv = 64, .hd = 128 },
+        // qL >= 16: fusedSdpa256Prefill's range.
+        .{ .hq = 24, .hkv = 2, .ql = 16, .kv = 64, .hd = 256 },
+        // hd 192: MLX prefers its unfused path there.
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 64, .hd = 192 },
+        // Decode width.
+        .{ .hq = 24, .hkv = 2, .ql = 1, .kv = 64, .hd = 256 },
+    };
+    for (declines) |c| {
+        const arrs = try causalSplitCaseArrays(rnd, c, s);
+        defer for (arrs) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        if ((try splitCausalSdpa(s, arrs[0], arrs[1], arrs[2], 1.0)) != null) {
+            std.debug.print("split engaged outside envelope: {any}\n", .{c});
+            return error.SplitEngaged;
+        }
+    }
 
-    const kv_shape = [_]c_int{ 1, 2, 64, 256 };
-    const k = try attn256RandBf16(rnd, &kv_shape, s);
-    defer _ = mlx.mlx_array_free(k);
-
-    // q_len 5 (vector path already serves it) and 10 (above the split window).
-    const q5_shape = [_]c_int{ 1, 6, 5, 256 };
-    const q5 = try attn256RandBf16(rnd, &q5_shape, s);
-    defer _ = mlx.mlx_array_free(q5);
-    try std.testing.expect((try splitCausalSdpa(s, q5, k, k, 1.0)) == null);
-    const q10_shape = [_]c_int{ 1, 6, 10, 256 };
-    const q10 = try attn256RandBf16(rnd, &q10_shape, s);
-    defer _ = mlx.mlx_array_free(q10);
-    try std.testing.expect((try splitCausalSdpa(s, q10, k, k, 1.0)) == null);
-
-    // Batch 2 -> null (their gate; the exactness argument is B==1 only).
-    const qb_shape = [_]c_int{ 2, 6, 7, 256 };
-    const qb = try attn256RandBf16(rnd, &qb_shape, s);
+    // Batch 2 -> null (the exactness argument is B==1 only).
+    const qb = try attn256RandBf16(rnd, &[_]c_int{ 2, 24, 4, 256 }, s);
     defer _ = mlx.mlx_array_free(qb);
-    const kb_shape = [_]c_int{ 2, 2, 64, 256 };
-    const kb = try attn256RandBf16(rnd, &kb_shape, s);
+    const kb = try attn256RandBf16(rnd, &[_]c_int{ 2, 2, 64, 256 }, s);
     defer _ = mlx.mlx_array_free(kb);
     try std.testing.expect((try splitCausalSdpa(s, qb, kb, kb, 1.0)) == null);
 
-    // head_dim 128 -> null (MLX's own full kernel already covers it).
-    const q128_shape = [_]c_int{ 1, 6, 7, 128 };
-    const q128 = try attn256RandBf16(rnd, &q128_shape, s);
-    defer _ = mlx.mlx_array_free(q128);
-    const k128_shape = [_]c_int{ 1, 2, 64, 128 };
-    const k128 = try attn256RandBf16(rnd, &k128_shape, s);
-    defer _ = mlx.mlx_array_free(k128);
-    try std.testing.expect((try splitCausalSdpa(s, q128, k128, k128, 1.0)) == null);
-
     // KV shorter than q -> null (no window to split).
-    const kshort_shape = [_]c_int{ 1, 2, 5, 256 };
-    const kshort = try attn256RandBf16(rnd, &kshort_shape, s);
-    defer _ = mlx.mlx_array_free(kshort);
-    const q7_shape = [_]c_int{ 1, 6, 7, 256 };
-    const q7 = try attn256RandBf16(rnd, &q7_shape, s);
+    const q7 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 7, 256 }, s);
     defer _ = mlx.mlx_array_free(q7);
+    const kshort = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 5, 256 }, s);
+    defer _ = mlx.mlx_array_free(kshort);
     try std.testing.expect((try splitCausalSdpa(s, q7, kshort, kshort, 1.0)) == null);
 
     // Kill switch -> null even for a conforming call.
+    const k = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 64, 256 }, s);
+    defer _ = mlx.mlx_array_free(k);
     sdpa_split_override = false;
     try std.testing.expect((try splitCausalSdpa(s, q7, k, k, 1.0)) == null);
 }
