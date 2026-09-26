@@ -10726,10 +10726,10 @@ fn qsaIdxBitMismatches(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !u
     return bad;
 }
 
-/// Raw index keys `[B, nb, 4, 128]` bf16 with magnitudes spread over 10^-lo_exp..10^hi_exp.
-fn qsaIdxTestKeys(rnd: std.Random, b: c_int, nb: c_int, lo_exp: f32, hi_exp: f32, s: mlx.mlx_stream) !mlx.mlx_array {
-    const shape = [_]c_int{ b, nb, 4, 128 };
-    const n: usize = @intCast(b * nb * 4 * 128);
+/// Raw index keys `[B, nb, ratio, 128]` bf16 with magnitudes spread over 10^lo_exp..10^hi_exp.
+fn qsaIdxTestKeys(rnd: std.Random, b: c_int, nb: c_int, ratio: c_int, lo_exp: f32, hi_exp: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = [_]c_int{ b, nb, ratio, 128 };
+    const n: usize = @intCast(b * nb * ratio * 128);
     const data = try std.testing.allocator.alloc(f32, n);
     defer std.testing.allocator.free(data);
     for (data) |*x| {
@@ -10748,7 +10748,8 @@ fn qsaIdxRopeCase(xfm: *Transformer, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, 
     const s = xfm.s;
     const rope_dims: c_int = 64;
     const nb = mlx.getShape(kb4)[1];
-    var cs = try xfm.ropeCosSinFromFreqs(rope_dims, try xfm.ropeInvFreq(rope_dims, xfm.config.rope_theta), @floatFromInt(base), 4, nb, .bfloat16);
+    const ratio: f32 = @floatFromInt(mlx.getShape(kb4)[2]);
+    var cs = try xfm.ropeCosSinFromFreqs(rope_dims, try xfm.ropeInvFreq(rope_dims, xfm.config.rope_theta), @floatFromInt(base), ratio, nb, .bfloat16);
     defer _ = mlx.mlx_array_free(cs.cos);
     defer _ = mlx.mlx_array_free(cs.sin);
     if (table_scale) |m| {
@@ -10808,14 +10809,14 @@ test "qsa pooled keys: fused mean+norm+rope kernel is bit-identical to the compo
         .{ 2, 5, 4096, -1, 0.5 }, // batch 2
     };
     for (cases) |c| {
-        const kb4 = try qsaIdxTestKeys(rnd, @intFromFloat(c[0]), @intFromFloat(c[1]), c[3], c[4], s);
+        const kb4 = try qsaIdxTestKeys(rnd, @intFromFloat(c[0]), @intFromFloat(c[1]), 4, c[3], c[4], s);
         defer _ = mlx.mlx_array_free(kb4);
         const bad = try qsaIdxRopeCase(&xfm, kb4, norm_w, @intFromFloat(c[2]), null);
         if (bad != 0) std.debug.print("qsa idx rope case {any}: {d} mismatches\n", .{ c, bad });
         try std.testing.expectEqual(@as(usize, 0), bad);
     }
     // YaRN-scaled table.
-    const kb4 = try qsaIdxTestKeys(rnd, 1, 3, -1, 0.5, s);
+    const kb4 = try qsaIdxTestKeys(rnd, 1, 3, 4, -1, 0.5, s);
     defer _ = mlx.mlx_array_free(kb4);
     try std.testing.expectEqual(@as(usize, 0), try qsaIdxRopeCase(&xfm, kb4, norm_w, 65540, 1.2071));
 }
@@ -10851,7 +10852,7 @@ test "qsa pooled keys: fused kernel declines non-bf16 weights and non-128 heads"
     const cs = try xfm.ropeCosSinFromFreqs(64, try xfm.ropeInvFreq(64, xfm.config.rope_theta), 0, 4, 1, .bfloat16);
     defer _ = mlx.mlx_array_free(cs.cos);
     defer _ = mlx.mlx_array_free(cs.sin);
-    const kb4 = try qsaIdxTestKeys(rnd, 1, 1, -1, 0.5, s);
+    const kb4 = try qsaIdxTestKeys(rnd, 1, 1, 4, -1, 0.5, s);
     defer _ = mlx.mlx_array_free(kb4);
     const w_bf = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
     defer _ = mlx.mlx_array_free(w_bf);
@@ -10867,6 +10868,73 @@ test "qsa pooled keys: fused kernel declines non-bf16 weights and non-128 heads"
     // Sanity: the supported shape does engage.
     const got = (try qsaPoolNormRopeFused(s, kb4, w_bf, 1e-6, cs.cos, cs.sin, 64)) orelse return error.FusedDeclined;
     _ = mlx.mlx_array_free(got);
+}
+
+/// Keys `[1, nb, ratio, 128]` whose f32 block sums depend on the add order: even
+/// columns hold 2^24, -2^24 (half a block later) and 1s, rotated per column and
+/// block, so row-order and tree-order sums disagree; odd columns are small noise.
+fn qsaIdxCancelKeys(rnd: std.Random, nb: c_int, ratio: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const r: usize = @intCast(ratio);
+    const n: usize = @as(usize, @intCast(nb)) * r * 128;
+    const data = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(data);
+    for (0..@intCast(nb)) |b| {
+        for (0..128) |c| {
+            for (0..r) |row| {
+                const at = (b * r + row) * 128 + c;
+                if (c % 2 == 1) {
+                    data[at] = rnd.float(f32) - 0.5;
+                    continue;
+                }
+                const p = (row + c / 2 + b) % r;
+                data[at] = if (r > 1 and p == 0) 16777216.0 else if (r > 1 and p == r / 2) -16777216.0 else 1.0;
+            }
+        }
+    }
+    const shape = [_]c_int{ 1, nb, ratio, 128 };
+    const f = mlx.mlx_array_new_data(data.ptr, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(f);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
+    return out;
+}
+
+// Bar: at every ratio the kernel serves (1..8), order-sensitive block sums still
+// match the composed mean bit for bit; past 8, MLX's reduce order differs, so
+// the kernel declines and the composed chain runs.
+test "qsa pooled keys: fused kernel matches order-sensitive sums at ratios 1..8, declines past 8" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm = qsaIdxRopeTestXfm(s);
+    var prng = std.Random.DefaultPrng.init(0xCA2CE1);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    for ([_]c_int{ 1, 2, 3, 4, 8 }) |ratio| {
+        const kb4 = try qsaIdxCancelKeys(rnd, 9, ratio, s);
+        defer _ = mlx.mlx_array_free(kb4);
+        const bad = try qsaIdxRopeCase(&xfm, kb4, norm_w, 4096, null);
+        if (bad != 0) std.debug.print("qsa idx cancel ratio {d}: {d} mismatches\n", .{ ratio, bad });
+        try std.testing.expectEqual(@as(usize, 0), bad);
+        const rk = try qsaIdxTestKeys(rnd, 1, 5, ratio, -3, 4, s);
+        defer _ = mlx.mlx_array_free(rk);
+        try std.testing.expectEqual(@as(usize, 0), try qsaIdxRopeCase(&xfm, rk, norm_w, 8192, null));
+    }
+    for ([_]c_int{ 9, 16, 32 }) |ratio| {
+        const kb4 = try qsaIdxCancelKeys(rnd, 3, ratio, s);
+        defer _ = mlx.mlx_array_free(kb4);
+        const cs = try xfm.ropeCosSinFromFreqs(64, try xfm.ropeInvFreq(64, xfm.config.rope_theta), 4096, @floatFromInt(ratio), 3, .bfloat16);
+        defer _ = mlx.mlx_array_free(cs.cos);
+        defer _ = mlx.mlx_array_free(cs.sin);
+        try std.testing.expect((try qsaPoolNormRopeFused(s, kb4, norm_w, 1e-6, cs.cos, cs.sin, 64)) == null);
+        // The composed chain the caller falls back to still serves the shape.
+        const pn = try xfm.qsaPoolNorm(kb4, norm_w);
+        defer _ = mlx.mlx_array_free(pn);
+        const want = try xfm.qsaPooledRopeComposed(pn, 64, cs.cos, cs.sin);
+        defer _ = mlx.mlx_array_free(want);
+        try std.testing.expect(qsaProbeAllFinite(s, want));
+        try std.testing.expectEqualSlices(c_int, &[_]c_int{ 1, 3, 128 }, mlx.getShape(want));
+    }
 }
 
 test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identically to a full bank" {
@@ -34391,8 +34459,9 @@ pub fn qsaIdxRopeFusedEnabled() bool {
 }
 
 // Mirrors each rounding of the composed chain it replaces, so it is bit-identical:
-//   mean  = col-reduce order r = 0..R-1 into an f32 zero, times f32(1/R) (MLX
-//           NumberOfElements), then bf16;
+//   mean  = f32 sum in row order r = 0..R-1, times f32(1/R) (MLX
+//           NumberOfElements), then bf16. That order is MLX's only while
+//           R <= QSA_POOL_SERIAL_MAX_R (see there);
 //   norm  = `rms_single_row` at D = 128 (32 lanes x 4 reads, simd_sum, precise
 //           rsqrt, `w * T(x * inv)`);
 //   rope  = the bf16 cos/sin table and bf16(bf16(x*cos) + bf16(rot*sin)), with
@@ -34432,6 +34501,15 @@ const QSA_POOL_ROPE_SOURCE =
     \\}
 ;
 
+/// Largest block ratio whose f32 block sum MLX folds in row order 0..R-1, the
+/// order the kernel uses. The mean over axis 2 of `[B, nb, R, 128]` is a strided
+/// reduce; below 32 rows `strided_reduce_general_dispatch` picks
+/// `col_reduce_small` with threadgroup_y = min(8, R). Up to 8 rows each y-thread
+/// owns ONE row and lid.y 0 folds them 0..R-1 (R == 1 is a copy). At 9..31 each
+/// thread sums rows y, y+8, ... first, and at 32+ the looped/2pass kernels
+/// reduce in simdgroup trees, so a sum that cancels can differ in f32.
+const QSA_POOL_SERIAL_MAX_R: c_int = 8;
+
 var qsa_pool_rope_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qsa_pool_rope_engaged: bool = false;
 const QsaPoolRopeCfgKey = struct { b: c_int, nb: c_int, r: c_int, rd: c_int };
@@ -34467,7 +34545,7 @@ pub fn qsaPoolNormRopeFused(
     const ksh = mlx.getShape(kb4);
     const wsh = mlx.getShape(norm_w);
     const csh = mlx.getShape(cosv);
-    if (ksh.len != 4 or ksh[3] != 128 or ksh[1] < 1 or ksh[2] < 1) return null;
+    if (ksh.len != 4 or ksh[3] != 128 or ksh[1] < 1 or ksh[2] < 1 or ksh[2] > QSA_POOL_SERIAL_MAX_R) return null;
     if (wsh.len != 1 or wsh[0] != 128) return null;
     // rotate_half's partner must sit whole lanes away: HALF a multiple of 4.
     if (rope_dims <= 0 or rope_dims > 128 or @mod(rope_dims, 8) != 0) return null;
