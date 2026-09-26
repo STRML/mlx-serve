@@ -886,10 +886,11 @@ pub var prefix_cache_mem_explicit = false;
 /// The hot-cache ask when nobody named one: one session at the working context, never under
 /// 2 GB. Below one session the cache keeps only a prefix of the longest conversations, the
 /// ones whose reuse saves the most prefill. Any other ask (an operator's, an embedder's) stands.
-/// Bytes one cached session at `ctx_tokens` holds. Stub.
+/// Bytes one cached session at `ctx_tokens` holds: its KV and state, plus the SSM checkpoints
+/// a cold prefill of that length retains, which the commit path bills to the entry.
 pub fn oneSessionEntryBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
-    _ = chunk;
-    return sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes();
+    return sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes() +|
+        retainedSsmCheckpointBytes(config, ctx_tokens, 0, chunk);
 }
 
 pub fn defaultPrefixCacheAsk(requested: u64, explicit: bool, session_kv: u64) u64 {
@@ -3970,7 +3971,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     const pinned: u32 = pinPrefillChunk(config);
     // Not `getEffectiveContextLength`: still a placeholder on an auto boot.
     const ctx_tokens = ramFirstContextForLoad(config, kv_bits, active_mem, pinned);
-    const ask = defaultPrefixCacheAsk(requested, prefix_cache_mem_explicit, sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes());
+    const ask = defaultPrefixCacheAsk(requested, prefix_cache_mem_explicit, oneSessionEntryBytes(config, kv_bits, ctx_tokens, pinned));
     // Static ceiling, not the live one: the budget must be reproducible boot to boot.
     const plan = planHotCache(
         config,

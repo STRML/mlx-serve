@@ -1936,7 +1936,7 @@ private struct PerformanceSectionContent: View {
                 explainer: m.explainer,
                 isDirty: dirty.dirty(\.prefixCacheMem)
             ) {
-                TextField("", text: opts.prefixCacheMem, prompt: Text("2GB"))
+                TextField("", text: opts.prefixCacheMem, prompt: Text("Auto"))
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 110)
             }

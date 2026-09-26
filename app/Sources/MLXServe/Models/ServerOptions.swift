@@ -173,8 +173,9 @@ struct ServerOptions: Codable, Equatable {
     /// 32 GB+; a 16 GB Mac caps to 1.
     var prefixCacheEntries: Int = 8
     /// Hot prefix cache memory budget. `2GB`, `512MB`, etc. `0` or `off`
-    /// disables the byte cap (count cap still applies). Empty = server default.
-    var prefixCacheMem: String = "2GB"
+    /// disables the byte cap (count cap still applies). Empty = server default
+    /// (2GB, or one session at the working context on qwen4_exp when larger).
+    var prefixCacheMem: String = ""
     /// SSD tier for the prefix cache. OFF by default because it can persist
     /// gigabytes of KV under ~/.mlx-serve/kv-cache. When on, seen prefixes
     /// survive restarts + RAM evictions (turns a cold 30-50 s long-context
@@ -704,7 +705,7 @@ struct ServerOptions: Codable, Equatable {
             args += [choice ? "--decode-attn-quant" : "--no-decode-attn-quant"]
         }
         // Performance: only emit non-default flags so the CLI tail stays
-        // readable in log lines and `ps`. Server defaults are 1 / off / 2GB.
+        // readable in log lines and `ps`. Server defaults are 1 / off / auto.
         if maxConcurrent > 1 {
             args += ["--max-concurrent", "\(maxConcurrent)"]
         }
@@ -716,8 +717,9 @@ struct ServerOptions: Codable, Equatable {
         // Macs. Emit the RAM-clamped value so the entry count stays bounded.
         let cappedEntries = Self.ramCappedPrefixCacheEntries(prefixCacheEntries, physicalMemoryBytes: physicalMemoryBytes)
         args += ["--prefix-cache-entries", "\(cappedEntries)"]
+        // Empty leaves the size to the server; any value, the old "2GB" default included, is sent.
         let trimmedPrefixMem = prefixCacheMem.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedPrefixMem.isEmpty && trimmedPrefixMem != "2GB" {
+        if !trimmedPrefixMem.isEmpty {
             args += ["--prefix-cache-mem", trimmedPrefixMem]
         }
         // ALWAYS emit — the SSD tier can persist gigabytes of KV, so the app is
@@ -1135,7 +1137,7 @@ extension ServerOptions {
             needsRestart: true),
         "prefixCacheMem": .init(
             title: "Prefix cache memory cap",
-            explainer: "Maximum RAM for the prefix cache. Accepts '2GB', '512MB', '0' (disable byte cap). Default 2GB.",
+            explainer: "Maximum RAM for the prefix cache. Accepts '2GB', '512MB', '0' (disable byte cap). Empty = Auto: 2GB, or enough for one full-length conversation on long-context hybrid models, so their longest chats restore instead of re-reading the tail.",
             needsRestart: true),
         "enablePrefixCacheDisk": .init(
             title: "SSD prefix cache",
