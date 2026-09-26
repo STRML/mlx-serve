@@ -53123,6 +53123,8 @@ test "splitCausalSdpa: gqa-aware groups match one causal sdpa across widths, kv 
     const s = mlx.gpuStream();
     sdpa_split_override = true;
     defer sdpa_split_override = null;
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x5D9A);
     const rnd = prng.random();
     const cases = [_]CausalSplitCase{
@@ -53172,6 +53174,8 @@ test "splitCausalSdpa: every row sees exactly its causal window (bit-identical t
     const s = mlx.gpuStream();
     sdpa_split_override = true;
     defer sdpa_split_override = null;
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x5DA1);
     const rnd = prng.random();
     // kL < 1024 keeps both sides on the 1-pass vector kernel, which skips
@@ -53203,6 +53207,8 @@ test "splitCausalSdpa: declines outside its envelope" {
     const s = mlx.gpuStream();
     sdpa_split_override = true;
     defer sdpa_split_override = null;
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x5DEC);
     const rnd = prng.random();
     const declines = [_]CausalSplitCase{
@@ -53249,6 +53255,38 @@ test "splitCausalSdpa: declines outside its envelope" {
     defer _ = mlx.mlx_array_free(k);
     sdpa_split_override = false;
     try std.testing.expect((try splitCausalSdpa(s, q7, k, k, 1.0)) == null);
+}
+
+test "splitCausalSdpa: yields to the fused NAX sdpa at hd 256 past 8 rows, still splits below" {
+    const s = mlx.gpuStream();
+    sdpa_split_override = true;
+    defer sdpa_split_override = null;
+    nax_sdpa_override = true;
+    defer nax_sdpa_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5DAA);
+    const rnd = prng.random();
+    // qL > 8 at hd 256 with NAX preferred: the caller's single call runs
+    // MLX's fused NAX kernel (sdpaForceFused), so the split must decline.
+    for ([_]CausalSplitCase{
+        .{ .hq = 12, .hkv = 2, .ql = 10, .kv = 100, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 15, .kv = 100, .hd = 256 },
+    }) |c| {
+        const arrs = try causalSplitCaseArrays(rnd, c, s);
+        defer for (arrs) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        if ((try splitCausalSdpa(s, arrs[0], arrs[1], arrs[2], 1.0)) != null) {
+            std.debug.print("split pre-empted NAX: {any}\n", .{c});
+            return error.SplitEngaged;
+        }
+    }
+    // qL <= 8 never force-fuses (the vector wall would throw): split engages.
+    const arrs = try causalSplitCaseArrays(rnd, .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 100, .hd = 256 }, s);
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const split = (try splitCausalSdpa(s, arrs[0], arrs[1], arrs[2], 1.0)) orelse return error.SplitDeclined;
+    _ = mlx.mlx_array_free(split);
 }
 
 // ── KV cache growth policy (issue #110) ──────────────────────────────────────
