@@ -877,7 +877,17 @@ pub var prefix_cache_capacity: u32 = 32;
 /// E4B-sized model and tiny relative to total wired-limit budget; tune via
 /// `--prefix-cache-mem <N>{GB,MB}`. 0 disables the byte budget (count cap
 /// from `--prefix-cache-entries` still applies).
-pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
+pub var prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT;
+pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
+/// Set by `--prefix-cache-mem`: an operator's number is used as given, even when it equals the default.
+pub var prefix_cache_mem_explicit = false;
+
+/// The hot-cache ask when nobody named one. Stub: today's default.
+pub fn defaultPrefixCacheAsk(requested: u64, explicit: bool, session_kv: u64) u64 {
+    _ = explicit;
+    _ = session_kv;
+    return requested;
+}
 
 /// What the hot cache was actually given for the loaded model, after `clampedPrefixCacheMem`.
 /// Every post-load reserve reads it through `resolvedPrefixCacheMem()`. Atomic: written on the
@@ -23807,4 +23817,30 @@ test "generated think tags require an unambiguous literal template opener" {
     try std.testing.expect(templateThinkOpener("<think> <think:opensource>") == null);
     try std.testing.expect(templateThinkOpener("<think:{{ suffix }}>") == null);
     try std.testing.expect(templateThinkOpener("assistant") == null);
+}
+
+test "defaultPrefixCacheAsk: an unnamed budget holds one session at the working context, never under 2 GB" {
+    const t = std.testing;
+    const gb: u64 = 1024 * 1024 * 1024;
+    const session: u64 = 262144 * 24576; // 262k-token qwen4_exp session, ~6 GB
+    try t.expectEqual(session, defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, session));
+    // A short working context keeps the old floor.
+    try t.expectEqual(PREFIX_CACHE_MEM_DEFAULT, defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, gb));
+    // An operator's number stands, even one equal to the default.
+    try t.expectEqual(PREFIX_CACHE_MEM_DEFAULT, defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, true, session));
+    try t.expectEqual(32 * gb, defaultPrefixCacheAsk(32 * gb, true, session));
+    try t.expectEqual(@as(u64, 0), defaultPrefixCacheAsk(0, true, session));
+    // An embedder's own ask (ios_lib passes 256 MB) is not the default and stands.
+    try t.expectEqual(256 * 1024 * 1024, defaultPrefixCacheAsk(256 * 1024 * 1024, false, session));
+}
+
+test "defaultPrefixCacheAsk: the machine's headroom still caps the defaulted ask" {
+    const t = std.testing;
+    const gb: u64 = 1024 * 1024 * 1024;
+    const session: u64 = 262144 * 24576;
+    const ask = defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, session);
+    // 16 GB ceiling, 11 GB weights, 1 GB live context, 1.5 GB prefill reserve: 2.5 GB left.
+    try t.expectEqual(gb * 5 / 2, clampedPrefixCacheMem(ask, 16 * gb, 11 * gb, gb, gb * 3 / 2));
+    // A big machine gets the whole session.
+    try t.expectEqual(session, clampedPrefixCacheMem(ask, 200 * gb, 80 * gb, gb, 2 * gb));
 }
