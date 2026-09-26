@@ -28568,7 +28568,8 @@ pub const Transformer = struct {
             !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and gdnDecodeRecurEnabled())
         fast: {
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
-            const r = (try gdn_decode.recurSeq(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, seq_len, .{
+            const geo = gdn_decode.Geometry{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv };
+            const ins = gdn_decode.Inputs{
                 .qkv = qkv,
                 .z = z_proj,
                 .a = a_proj,
@@ -28583,7 +28584,26 @@ pub const Transformer = struct {
                 .norm_w = la.norm_w,
                 .eps = self.gdn_eps.?,
                 .signs = .{ .ctx = null },
-            }, self.s)) orelse break :fast;
+            };
+            // One dispatch: recurrence, norm-gate and the rollback conv input.
+            if (gdnVerifyFoldEnabled()) fold: {
+                const f = (try gdn_decode.recurSeqFold(geo, seq_len, ins, !cfg.kda_sigmoid_out_gate, self.s)) orelse break :fold;
+                defer _ = mlx.mlx_array_free(f.gated);
+                if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
+                ssm.spec_conv_input = f.conv_input;
+                if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
+                ssm.spec_state_seq = f.state_seq;
+                _ = mlx.mlx_array_free(ssm.conv_state);
+                ssm.conv_state = f.conv_state;
+                _ = mlx.mlx_array_free(ssm.ssm_state);
+                ssm.ssm_state = f.ssm_state;
+                if (!gdn_verify_fold_engaged) {
+                    gdn_verify_fold_engaged = true;
+                    log.info("[gdn] verify fold engaged: S={d} Hk={d} Hv={d}\n", .{ seq_len, num_k_heads, num_v_heads });
+                }
+                return if (skip_output) standinRef(f.gated) else self.qmatmul(f.gated, la.out_w, la.out_s, la.out_b);
+            }
+            const r = (try gdn_decode.recurSeq(geo, seq_len, ins, self.s)) orelse break :fast;
             defer _ = mlx.mlx_array_free(r.y);
             const flat = (try gdnNormGateFused(self.s, r.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse {
                 inline for (.{ r.conv_state, r.ssm_state, r.state_seq }) |a| _ = mlx.mlx_array_free(a);
@@ -35409,6 +35429,20 @@ pub fn gdnDecodeFusedEnabled() bool {
 var gdn_decode_recur_env: ?bool = null;
 var gdn_decode_recur_engaged: bool = false;
 var gdn_verify_recur_engaged: bool = false;
+var gdn_verify_fold_env: ?bool = null;
+var gdn_verify_fold_engaged: bool = false;
+
+/// MTP verify rows: gdn_decode.recurSeqFold (recurrence + norm-gate + conv
+/// input in one dispatch). MLX_SERVE_GDN_VERIFY_FOLD=0 restores recurSeq ->
+/// norm-gate -> concat.
+fn gdnVerifyFoldEnabled() bool {
+    return gdn_verify_fold_env orelse blk: {
+        const raw = std.c.getenv("MLX_SERVE_GDN_VERIFY_FOLD");
+        const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+        gdn_verify_fold_env = enabled;
+        break :blk enabled;
+    };
+}
 
 /// S=1 decode on packs without a Hadamard rotation: gdn_decode.recur then the
 /// norm-gate. MLX_SERVE_GDN_DECODE_RECUR=0 restores prework -> recurrence -> norm-gate.
@@ -58502,6 +58536,195 @@ test "gdn_decode.recurSeq: bit-identical to prework -> capture recurrence at ver
         var t: c_int = 2;
         while (t <= 8) : (t += 1) try gdnDecodeSeqParityCase(s, dts[0], dts[1], t);
     }
+}
+
+test "gdn_decode.recurSeqFold: bit-identical to recurSeq -> norm-gate -> conv-input concat" {
+    mlx.installErrorHandler();
+    const s = mlx.gpuStream();
+    gdn_decode_fused_override = true;
+    defer gdn_decode_fused_override = null;
+    // Test geometry, then Flash Next's (Hk=16, Hv=48: 3 value heads per key head).
+    for ([_][2]c_int{ .{ 2, 8 }, .{ 16, 48 } }) |geo|
+        for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 } }) |dts|
+            for ([_]bool{ false, true }) |swish| {
+                var t: c_int = 2;
+                while (t <= gdn_decode.MAX_SEQ) : (t += 1) try gdnDecodeFoldParityCase(s, dts[0], dts[1], geo[0], geo[1], t, swish);
+            };
+}
+
+test "gdn_decode.recurSeqFold: a threadgroup the GPU refuses declines cleanly, and MLX keeps working" {
+    mlx.installErrorHandler();
+    const s = mlx.gpuStream();
+    gdn_decode_fused_override = true;
+    defer gdn_decode_fused_override = null;
+    // 2048 threads exceed every Apple GPU's per-threadgroup limit, the way 1024 exceeds some.
+    gdn_decode.fold_nt_override = 2048;
+    try gdnDecodeFoldParityCase(s, .bfloat16, .bfloat16, 2, 8, 2, false);
+    try std.testing.expect(gdn_decode.foldDeclined(2));
+    try std.testing.expect(!mlx.errorPending());
+    // Back at 1024 the fold runs and is still bit-identical after the refused dispatch.
+    gdn_decode.fold_nt_override = null;
+    try gdnDecodeFoldParityCase(s, .bfloat16, .bfloat16, 2, 8, 2, false);
+    try std.testing.expect(!gdn_decode.foldDeclined(2));
+}
+
+test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kernel would misread" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xDEC1);
+    const rnd = prng.random();
+    const dt: mlx.mlx_dtype = .bfloat16;
+    const hk: c_int = 2;
+    const hv: c_int = 8;
+    const t_len: c_int = 2;
+    const c_dim: c_int = hk * 128 * 2 + hv * 128;
+    const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 };
+    var arrs: [14]mlx.mlx_array = undefined;
+    const shapes = [_][]const c_int{
+        &.{ 1, t_len, c_dim }, &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim }, &.{ 1, hv, 128, 128 },
+        &.{ c_dim, 4, 1 },     &.{hv},                   &.{hv},              &.{128},             &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
+        &.{ 1, t_len + 1, c_dim }, &.{ 1, 3, c_dim + 1 },
+    };
+    for (&arrs, shapes) |*a, sh| a.* = try gdnParityRand(rnd, sh, 1.0, dt, s);
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const q_scale = try scalarOf(1.0 / 128.0, dt, s);
+    defer _ = mlx.mlx_array_free(q_scale);
+    const eps_arr = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps_arr);
+    const good = gdn_decode.Inputs{
+        .qkv = arrs[0],
+        .z = arrs[1],
+        .a = arrs[2],
+        .b = arrs[3],
+        .conv_state = arrs[4],
+        .ssm_state = arrs[5],
+        .conv_w = arrs[6],
+        .A_log = arrs[7],
+        .dt_bias = arrs[8],
+        .q_scale = q_scale,
+        .k_scale = q_scale,
+        .norm_w = arrs[9],
+        .eps = eps_arr,
+        .signs = .{ .ctx = null },
+    };
+    // Control: the well-formed inputs engage the fold.
+    const ok = (try gdn_decode.recurSeqFold(g, t_len, good, false, s)) orelse return error.FoldDeclined;
+    inline for (.{ ok.gated, ok.conv_state, ok.ssm_state, ok.state_seq, ok.conv_input }) |a| _ = mlx.mlx_array_free(a);
+
+    // z one column wide ([1,2,1025]): row 1 would start at row 0's extra column.
+    var bad = good;
+    bad.z = arrs[10];
+    try std.testing.expect((try gdn_decode.recurSeqFold(g, t_len, bad, false, s)) == null);
+    // The same class on every other per-token row and state the kernels index.
+    for ([_]struct { field: enum { a, qkv, conv }, arr: mlx.mlx_array }{ .{ .field = .a, .arr = arrs[11] }, .{ .field = .qkv, .arr = arrs[12] }, .{ .field = .conv, .arr = arrs[13] } }) |case| {
+        bad = good;
+        switch (case.field) {
+            .a => bad.a = case.arr,
+            .qkv => bad.qkv = case.arr,
+            .conv => bad.conv_state = case.arr,
+        }
+        try std.testing.expect((try gdn_decode.recurSeqFold(g, t_len, bad, false, s)) == null);
+        try std.testing.expect((try gdn_decode.recurSeq(g, t_len, bad, s)) == null);
+    }
+    // The same well-formed inputs on a CPU stream: the Metal kernels decline, nothing latches.
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try std.testing.expect((try gdn_decode.recurSeqFold(g, t_len, good, false, cpu)) == null);
+    try std.testing.expect((try gdn_decode.recurSeq(g, t_len, good, cpu)) == null);
+    try std.testing.expect(!mlx.errorPending());
+}
+
+fn gdnDecodeFoldParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, hk: c_int, hv: c_int, t_len: c_int, swish: bool) !void {
+    var prng = std.Random.DefaultPrng.init(0xF01D + @as(u64, @intCast(t_len * 131 + hv)));
+    const rnd = prng.random();
+    const dk: c_int = 128;
+    const dv: c_int = 128;
+    const c_dim: c_int = hk * dk * 2 + hv * dv;
+    const value_dim: c_int = hv * dv;
+    const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = dk, .dv = dv };
+
+    const q_scale = try scalarOf(1.0 / 128.0, dt, s);
+    defer _ = mlx.mlx_array_free(q_scale);
+    const k_scale = try scalarOf(@sqrt(1.0 / 128.0), dt, s);
+    defer _ = mlx.mlx_array_free(k_scale);
+    const A_log = try gdnParityRand(rnd, &[_]c_int{hv}, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(A_log);
+    const dt_bias = try gdnParityRand(rnd, &[_]c_int{hv}, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(dt_bias);
+    const qkv = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, c_dim }, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(qkv);
+    const z = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, value_dim }, 4.0, dt, s);
+    defer _ = mlx.mlx_array_free(z);
+    const b_in = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, hv }, 16.0, dt, s);
+    defer _ = mlx.mlx_array_free(b_in);
+    const a_in = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, hv }, 16.0, dt, s);
+    defer _ = mlx.mlx_array_free(a_in);
+    const conv_state = try gdnParityRand(rnd, &[_]c_int{ 1, 3, c_dim }, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(conv_state);
+    const ssm_state = try gdnParityRand(rnd, &[_]c_int{ 1, hv, dv, dk }, 1.0, st, s);
+    defer _ = mlx.mlx_array_free(ssm_state);
+    const conv_w = try gdnParityRand(rnd, &[_]c_int{ c_dim, 4, 1 }, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(conv_w);
+    const norm_w = try gdnParityRand(rnd, &[_]c_int{dv}, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    const eps_arr = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps_arr);
+    const in = gdn_decode.Inputs{
+        .qkv = qkv,
+        .z = z,
+        .a = a_in,
+        .b = b_in,
+        .conv_state = conv_state,
+        .ssm_state = ssm_state,
+        .conv_w = conv_w,
+        .A_log = A_log,
+        .dt_bias = dt_bias,
+        .q_scale = q_scale,
+        .k_scale = k_scale,
+        .norm_w = norm_w,
+        .eps = eps_arr,
+        .signs = .{ .ctx = null },
+    };
+
+    // Today's verify path: recurSeq, the norm-gate kernel, the conv-input concat.
+    const ref = (try gdn_decode.recurSeq(g, t_len, in, s)) orelse return error.FusedDeclined;
+    defer {
+        inline for (.{ ref.y, ref.conv_state, ref.ssm_state, ref.state_seq }) |a| _ = mlx.mlx_array_free(a);
+    }
+    const ref_gated = (try gdnNormGateFused(s, ref.y, z, 0, value_dim, norm_w, eps_arr, swish, hv, dv, 1, t_len)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(ref_gated);
+    var ref_ci = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref_ci);
+    {
+        const arr = [_]mlx.mlx_array{ conv_state, qkv };
+        const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&ref_ci, vec, 1, s));
+    }
+
+    const got = (try gdn_decode.recurSeqFold(g, t_len, in, swish, s)) orelse {
+        if (gdn_decode.foldDeclined(t_len)) return;
+        return error.FoldDeclined;
+    };
+    defer {
+        inline for (.{ got.gated, got.conv_state, got.ssm_state, got.state_seq, got.conv_input }) |a| _ = mlx.mlx_array_free(a);
+    }
+
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(ref_gated, got.gated, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(ref.conv_state, got.conv_state, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(ref.ssm_state, got.ssm_state, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(ref_ci, got.conv_input, s));
+    var ref_head = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref_head);
+    var got_head = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got_head);
+    const start = [_]c_int{ 0, 0, 0, 0, 0 };
+    const stop = [_]c_int{ t_len - 1, 1, hv, dv, dk };
+    const strides = [_]c_int{ 1, 1, 1, 1, 1 };
+    try mlx.check(mlx.mlx_slice(&ref_head, ref.state_seq, &start, 5, &stop, 5, &strides, 5, s));
+    try mlx.check(mlx.mlx_slice(&got_head, got.state_seq, &start, 5, &stop, 5, &strides, 5, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(ref_head, got_head, s));
 }
 
 fn gdnDecodeSeqParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, t_len: c_int) !void {
