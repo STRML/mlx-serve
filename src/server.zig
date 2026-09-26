@@ -886,6 +886,12 @@ pub var prefix_cache_mem_explicit = false;
 /// The hot-cache ask when nobody named one: one session at the working context, never under
 /// 2 GB. Below one session the cache keeps only a prefix of the longest conversations, the
 /// ones whose reuse saves the most prefill. Any other ask (an operator's, an embedder's) stands.
+/// Bytes one cached session at `ctx_tokens` holds. Stub.
+pub fn oneSessionEntryBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
+    _ = chunk;
+    return sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes();
+}
+
 pub fn defaultPrefixCacheAsk(requested: u64, explicit: bool, session_kv: u64) u64 {
     if (explicit or requested != PREFIX_CACHE_MEM_DEFAULT) return requested;
     return @max(requested, session_kv);
@@ -23850,4 +23856,17 @@ test "defaultPrefixCacheAsk: the machine's headroom still caps the defaulted ask
     try t.expectEqual(gb * 5 / 2, clampedPrefixCacheMem(ask, 16 * gb, 11 * gb, gb, gb * 3 / 2));
     // A big machine gets the whole session.
     try t.expectEqual(session, clampedPrefixCacheMem(ask, 200 * gb, 80 * gb, gb, 2 * gb));
+}
+
+test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints" {
+    const t = std.testing;
+    var cfg = qwen4DeployedTestConfig();
+    const ctx: u64 = 262_144;
+    const chunk: u64 = 8192;
+    const kv_only = sessionBytesPerToken(&cfg, 16) *| ctx +| cfg.qsaRingBytes();
+    const entry = oneSessionEntryBytes(&cfg, 16, ctx, chunk);
+    try t.expect(cfg.ssmCheckpointBytes() > 0);
+    try t.expectEqual(kv_only + retainedSsmCheckpointBytes(&cfg, ctx, 0, chunk), entry);
+    // The defaulted ask covers the whole entry, so the commit path never trims it.
+    try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
 }
