@@ -7195,6 +7195,8 @@ const PropsSettings = struct {
     max_concurrent: u32,
     prefix_cache_mem_bytes: u64,
     prefix_cache_disk_bytes: u64,
+    /// `--prefill-decode-share`: decode's target wall-time fraction during another slot's prefill.
+    prefill_decode_share: f32 = 0,
 };
 
 const PropsEngine = enum { mlx, llama, ds4 };
@@ -20044,6 +20046,15 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     var ep = try std.json.parseFromSlice(std.json.Value, testing.allocator, exact[",\"settings\":".len..], .{});
     defer ep.deinit();
     try testing.expect(ep.value.object.get("mtp").?.object.get("acceptance_param").? == .null);
+}
+
+test "settingsPropsJson: /props reports the prefill decode share" {
+    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "off", .kv_attn_mode = .auto, .decode_attn_quant = false, .prefill_chunk = 8192, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 8, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .prefill_decode_share = 0.5 });
+    defer testing.allocator.free(frag);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
+    defer parsed.deinit();
+    const v = parsed.value.object.get("prefill_decode_share") orelse return error.MissingShare;
+    try testing.expectApproxEqAbs(@as(f64, 0.5), v.float, 1e-6);
 }
 
 test "embeddedEngineSettings: an engine-backed model reports only the levers its engine runs" {

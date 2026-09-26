@@ -5946,6 +5946,15 @@ pub fn prefillInterleaveEnabled() bool {
     return on;
 }
 
+/// Target fraction of wall time the decoding streams get while another slot prefills
+/// (`--prefill-decode-share`, else MLX_SERVE_PREFILL_DECODE_SHARE). 0 = one boundary's
+/// `interleaveTicksFor` ticks and the company width, as before. Reads 0 under the
+/// MLX_SERVE_PREFILL_INTERLEAVE=0 kill switch: no hook, nothing to share.
+pub var prefill_decode_share: ?f32 = null;
+pub fn prefillDecodeShare() f32 {
+    return 0;
+}
+
 const InterleaveCtx = struct {
     sch: *Scheduler,
     decode_ns: u64 = 0,
@@ -5979,9 +5988,43 @@ fn dflashYieldTick(active: []const *Slot) void {
 /// Prefill width while other streams decode: a chunk boundary is their only yield point.
 const COMPANY_PREFILL_CHUNK: u32 = 2048;
 
-pub fn companyPrefillChunk(chunk: u32, decoding: usize) u32 {
+pub fn companyPrefillChunk(chunk: u32, decoding: usize, share: f32) u32 {
+    _ = share;
     if (decoding == 0) return chunk;
     return if (chunk == 0) COMPANY_PREFILL_CHUNK else @min(chunk, COMPANY_PREFILL_CHUNK);
+}
+
+/// Largest accepted decode share: at 0.9 the decoders own nine times each chunk's time.
+pub const PREFILL_DECODE_SHARE_MAX: f32 = 0.9;
+/// Prefill width while a decode share is live and someone decodes.
+pub const DECODE_SHARE_PREFILL_CHUNK: u32 = 1024;
+
+/// `--prefill-decode-share` / MLX_SERVE_PREFILL_DECODE_SHARE text to a share in [0, 0.9].
+pub fn parseDecodeShare(raw: ?[]const u8) f32 {
+    _ = raw;
+    return 0;
+}
+
+/// Decode wall time owed after a prefill chunk of `chunk_ns`: chunk * S / (1 - S).
+pub fn decodeShareBudgetNs(chunk_ns: u64, share: f32) u64 {
+    _ = chunk_ns;
+    _ = share;
+    return 0;
+}
+
+/// Is another decode tick owed at this boundary? Never fewer than `interleaveTicksFor`.
+pub fn interleaveTickOwed(share: f32, chunk_ns: u64, first_ns: u64, ticks: u32, decode_ns: u64) bool {
+    _ = share;
+    _ = decode_ns;
+    if (first_ns == 0) return false;
+    return ticks < interleaveTicksFor(chunk_ns, first_ns);
+}
+
+/// The adaptive width hook's pick, capped while a decode share is live and someone decodes.
+pub fn decodeShareWidthCap(width: u32, decoding: usize, share: f32) u32 {
+    _ = decoding;
+    _ = share;
+    return width;
 }
 
 const INTERLEAVE_MAX_TICKS: u32 = 8;
@@ -6558,7 +6601,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             else
                 0,
             // The width the admission guard billed for this request; the forward can never run wider.
-            .pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk, sch.decodingCount()),
+            .pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk, sch.decodingCount(), prefillDecodeShare()),
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
@@ -10160,10 +10203,73 @@ test "companyStreak: only consecutive ticks with company count" {
 }
 
 test "companyPrefillChunk: a prefill narrows only while someone decodes" {
-    try testing.expectEqual(@as(u32, 8192), companyPrefillChunk(8192, 0));
-    try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(8192, 1));
-    try testing.expectEqual(@as(u32, 1024), companyPrefillChunk(1024, 3));
-    try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(0, 1));
+    try testing.expectEqual(@as(u32, 8192), companyPrefillChunk(8192, 0, 0));
+    try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(8192, 1, 0));
+    try testing.expectEqual(@as(u32, 1024), companyPrefillChunk(1024, 3, 0));
+    try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(0, 1, 0));
+}
+
+test "decode share: a live share narrows the company width further, only while someone decodes" {
+    const w = DECODE_SHARE_PREFILL_CHUNK;
+    try testing.expectEqual(@as(u32, 8192), companyPrefillChunk(8192, 0, 0.5));
+    try testing.expectEqual(w, companyPrefillChunk(8192, 1, 0.5));
+    try testing.expectEqual(w, companyPrefillChunk(0, 2, 0.3));
+    // Never widens what the admission guard billed.
+    try testing.expectEqual(@as(u32, 512), companyPrefillChunk(512, 1, 0.5));
+    // The adaptive hook's pick: capped with company and a share, untouched otherwise.
+    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 1, 0));
+    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 0, 0.5));
+    try testing.expectEqual(w, decodeShareWidthCap(8192, 1, 0.5));
+    try testing.expectEqual(@as(u32, 512), decodeShareWidthCap(512, 1, 0.5));
+}
+
+test "decode share: parse clamps to [0, 0.9], junk and absence read as off" {
+    try testing.expectEqual(@as(f32, 0), parseDecodeShare(null));
+    try testing.expectEqual(@as(f32, 0), parseDecodeShare(""));
+    try testing.expectEqual(@as(f32, 0), parseDecodeShare("abc"));
+    try testing.expectEqual(@as(f32, 0), parseDecodeShare("nan"));
+    try testing.expectEqual(@as(f32, 0), parseDecodeShare("-0.3"));
+    try testing.expectEqual(@as(f32, 0.5), parseDecodeShare("0.5"));
+    try testing.expectEqual(PREFILL_DECODE_SHARE_MAX, parseDecodeShare("0.95"));
+    try testing.expectEqual(PREFILL_DECODE_SHARE_MAX, parseDecodeShare("inf"));
+}
+
+test "decode share: the budget is chunk * S / (1 - S), zero when off" {
+    const ms = std.time.ns_per_ms;
+    try testing.expectEqual(@as(u64, 0), decodeShareBudgetNs(400 * ms, 0));
+    try testing.expectApproxEqAbs(@as(f64, 400 * ms), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.5))), 1e3);
+    try testing.expectApproxEqAbs(@as(f64, 3600 * ms), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.9))), 1e4);
+    try testing.expectApproxEqAbs(@as(f64, 400 * ms * 3 / 7), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.3))), 1e4);
+}
+
+test "decode share: ticks owed keep today's count at S=0 and run to the budget above it" {
+    const ms = std.time.ns_per_ms;
+    // S=0 is exactly interleaveTicksFor: 8 ticks at most, whatever the chunk cost.
+    for ([_]u64{ 100, 300, 2300, 8000 }) |c| {
+        const legacy = interleaveTicksFor(c * ms, 8 * ms);
+        var t: u32 = 1;
+        while (interleaveTickOwed(0, c * ms, 8 * ms, t, t * 8 * ms)) t += 1;
+        try testing.expectEqual(legacy, t);
+    }
+    // Nobody decoding: the first tick measured 0 and nothing more is owed.
+    try testing.expect(!interleaveTickOwed(0.5, 2300 * ms, 0, 1, 0));
+    // S=0.5 on a 400 ms chunk with 8 ms ticks: 50 ticks (400 ms of decode).
+    var t: u32 = 1;
+    while (interleaveTickOwed(0.5, 400 * ms, 8 * ms, t, t * 8 * ms)) t += 1;
+    try testing.expectEqual(@as(u32, 50), t);
+    // A cheap chunk still gets today's floor.
+    try testing.expect(interleaveTickOwed(0.1, 30 * ms, 8 * ms, 1, 8 * ms) == (interleaveTicksFor(30 * ms, 8 * ms) > 1));
+}
+
+test "decode share: the interleave callback loops on the policy and exits when decoders run out" {
+    const src = @embedFile("scheduler.zig");
+    const loop = "while (interleaveTickOwed(" ++ "share, chunk_ns, first_ns, ticks, spent)) {";
+    try testing.expect(std.mem.indexOf(u8, src, loop) != null);
+    const exit = "if (ns == 0) " ++ "break;";
+    try testing.expect(std.mem.indexOf(u8, src, exit) != null);
+    // The width hook caps its pick against LIVE decoders, so a finished stream lifts the cap.
+    const cap = "decodeShareWidthCap(next, wc.sch.live" ++ "DecodingCount(), prefillDecodeShare())";
+    try testing.expect(std.mem.indexOf(u8, src, cap) != null);
 }
 
 test "interleaveTicksFor: decode keeps a quarter of wall time across a slow chunk, capped" {
