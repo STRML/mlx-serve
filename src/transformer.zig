@@ -6814,7 +6814,7 @@ var sdpa_split_logged: [16]bool = @splat(false);
 /// null when one call already takes the fast path (or no split can help).
 /// The vector kernel serves q_len <= 8 with q_len * gqa <= 32 at hd
 /// {64, 96, 128, 256}; q_len > 8 runs MLX's fused full kernel except at hd
-/// 256, where MLX always takes its unfused fallback.
+/// 256, where MLX takes its unfused fallback unless NAX force-fuses it.
 fn causalSplitGroupRows(q_len: c_int, gqa: c_int, head_dim: c_int) ?c_int {
     const vector_hd = head_dim == 64 or head_dim == 96 or head_dim == 128 or head_dim == 256;
     if (!vector_hd or gqa < 1) return null;
@@ -6856,6 +6856,9 @@ pub fn splitCausalSdpa(
     const kL = ks[2];
     const gqa = @divTrunc(qs[1], ks[1]);
     const group = causalSplitGroupRows(qL, gqa, hd) orelse return null;
+    // Fallback-only: where the caller's single call force-fuses onto MLX's
+    // NAX kernel (hd 256, qL > 8), that one dispatch beats any split.
+    if (sdpaForceFusedFor(naxSdpaPreferred(), qL, kL, hd)) return null;
 
     const strides = [_]c_int{ 1, 1, 1, 1 };
     const none_mask = mlx.mlx_array_new();
