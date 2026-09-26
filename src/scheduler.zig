@@ -6026,7 +6026,9 @@ pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDeco
     return parseDecodeShare(text);
 }
 
-/// The width a prefill admitted beside live decoders may run at, 0 = no cap.
+/// The width a prefill admitted beside live decoders may run at, 0 = no cap. Decided when
+/// the prefill starts, so admission bills the uncapped width: a decoder that finishes in
+/// between lifts the cap.
 pub fn decodeShareAdmissionCap(decoding: usize, share: f32) u32 {
     if (decoding == 0 or share <= 0) return 0;
     return DECODE_SHARE_PREFILL_CHUNK;
