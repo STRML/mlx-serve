@@ -40437,10 +40437,8 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
     }
 }
 
-/// MLX 0.32.2's NAX sorted gather_qmm takes a tail tile's height as
-/// `short(max(0, M - (y_row + tm)))` (quantized_nax.h:1547). Past 32767 rows that wraps, and
-/// when M is not a multiple of the 64-row tile whole tiles come back unwritten. Aligned calls
-/// never take that branch. Fixed upstream after v0.32.2 (ml-explore/mlx#3922).
+/// MLX 0.32.2's NAX sorted gather_qmm stores a tail tile's height in a `short`, so past 32767
+/// rows an unaligned call leaves whole 64-row tiles unwritten. Aligned calls never hit it.
 const SORTED_GATHER_TILE: c_int = 64;
 
 fn sortedGatherNeedsPad(rhs_idx: mlx.mlx_array) bool {
@@ -40449,13 +40447,10 @@ fn sortedGatherNeedsPad(rhs_idx: mlx.mlx_array) bool {
     return sh[0] > std.math.maxInt(i16) and @mod(sh[0], SORTED_GATHER_TILE) != 0;
 }
 
-/// Sorted gather_qmm with the row count padded to the tile by repeating the last row, which
-/// keeps the indices sorted, then sliced back. Real rows see the same kernel, tiles and K
-/// order as an aligned call.
+/// Pads the rows to the tile by repeating the last one (indices stay sorted), then slices back.
 fn gatherQmmSortedPadded(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !void {
     const m = mlx.getShape(rhs_idx)[0];
-    // Without a row index, x must hold one row per index to be padded alongside it. A broadcast
-    // x takes the unsorted kernel instead, which is always correct.
+    // A broadcast x has no per-row slot to pad; the unsorted kernel is always correct.
     if (lhs_idx.ctx == null and mlx.getShape(x)[0] != m) {
         try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), false, s));
         return;
@@ -49852,11 +49847,8 @@ test "gatherQmv nvfp4 is no worse than stock gather_qmm vs fp32 dequant ground t
 }
 
 test "gatherExpertMm sorted 4-bit prefill writes every row past 32767 rows" {
-    // A Flash Next prefill chunk of T tokens gathers 10*T rows. MLX 0.32.2's NAX sorted
-    // gather_qmm computes a tail tile's height as `short(max(0, M - (y_row + tm)))`, which
-    // wraps past 32767 rows, and when M % 64 != 0 whole tiles come back unwritten (zeros).
-    // Measured on an M5 Max: 4001 tokens (40010 rows) lost 7264 rows. The unsorted gather is
-    // a different kernel and stays correct, so it is the reference here.
+    // A Flash Next prefill chunk of T tokens gathers 10*T rows; on M5 an unaligned call past
+    // 32767 rows lost whole tiles. The unsorted gather is a different kernel, so it is the reference.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x6A7E);
@@ -49878,7 +49870,7 @@ test "gatherExpertMm sorted 4-bit prefill writes every row past 32767 rows" {
     try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
     try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
     const no_idx = mlx.mlx_array{ .ctx = null };
-    // 40000 is the aligned control; 40010 and 65530 are the 4001- and 6553-token chunks.
+    // 40000 is aligned; 40010 and 65530 are 4001- and 6553-token chunks.
     for ([_]c_int{ 40000, 40010, 65530 }) |rows| {
         const x = try attn256RandBf16(prng.random(), &.{ rows, 1, D }, s);
         defer _ = mlx.mlx_array_free(x);
@@ -49895,8 +49887,7 @@ test "gatherExpertMm sorted 4-bit prefill writes every row past 32767 rows" {
         defer _ = mlx.mlx_array_free(ref);
         try gatherExpertMm(&ref, x, w, sc, bi, no_idx, idx, 4, 64, .affine, false, s);
         try std.testing.expectEqualSlices(c_int, mlx.getShape(ref), mlx.getShape(got));
-        // Worst row error relative to the reference's scale: bf16 rounding sits near 0.02,
-        // an unwritten row reads ~1.0.
+        // bf16 rounding sits near 0.02 of scale; an unwritten row reads ~1.0.
         var diff = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(diff);
         try mlx.check(mlx.mlx_subtract(&diff, got, ref, s));

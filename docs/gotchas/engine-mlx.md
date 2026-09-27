@@ -5277,3 +5277,17 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
   handles (a copy would stay resident beside the joined buffer) and reports
   `[load] row-joined projection groups: N`; a Hadamard/2-bit pack logs none.
 
+
+## Sorted gather_qmm dropped expert rows on 3277-8191-token MoE prefill chunks (2026-09-27)
+
+- Defect: on M5 (NAX), MLX 0.32.2's sorted `gather_qmm` returns whole 64-row tiles of zeros
+  when a call has more than 32767 rows and the row count is not a multiple of 64. MoE prefill
+  gathers top-k rows per token (10 for Flash Next), so every chunk of 3277-8191 tokens that
+  is not a multiple of 32 tokens lost 15-50% of its expert rows. Full 8192-token chunks are
+  aligned and were fine.
+- Cause: the NAX kernel keeps a tail tile's height in a `short`
+  (`quantized_nax.h`, `short(max(0, M - (y_row + tm)))`), which wraps past 32767.
+- Fix: `gatherExpertMm` pads such calls to the tile by repeating the last row (the indices
+  stay sorted) and slices the result back. Every other call is unchanged.
+- Guard: `gatherExpertMm sorted 4-bit prefill writes every row past 32767 rows` (red on M5
+  without the pad: 40010 rows, worst row error 0.978 of scale).
