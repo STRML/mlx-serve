@@ -49784,6 +49784,84 @@ test "gatherQmv nvfp4 is no worse than stock gather_qmm vs fp32 dequant ground t
     }
 }
 
+test "gatherExpertMm sorted 4-bit prefill writes every row past 32767 rows" {
+    // A Flash Next prefill chunk of T tokens gathers 10*T rows. MLX 0.32.2's NAX sorted
+    // gather_qmm computes a tail tile's height as `short(max(0, M - (y_row + tm)))`, which
+    // wraps past 32767 rows, and when M % 64 != 0 whole tiles come back unwritten (zeros).
+    // Measured on an M5 Max: 4001 tokens (40010 rows) lost 7264 rows. The unsorted gather is
+    // a different kernel and stays correct, so it is the reference here.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x6A7E);
+    const E = 64;
+    const N = 640;
+    const D = 2560;
+    const weight = try attn256RandBf16(prng.random(), &.{ E, N, D }, s);
+    defer _ = mlx.mlx_array_free(weight);
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, weight, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_vector_array_get(&w, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
+    const no_idx = mlx.mlx_array{ .ctx = null };
+    // 40000 is the aligned control; 40010 and 65530 are the 4001- and 6553-token chunks.
+    for ([_]c_int{ 40000, 40010, 65530 }) |rows| {
+        const x = try attn256RandBf16(prng.random(), &.{ rows, 1, D }, s);
+        defer _ = mlx.mlx_array_free(x);
+        const idx_host = try std.testing.allocator.alloc(u32, @intCast(rows));
+        defer std.testing.allocator.free(idx_host);
+        for (idx_host, 0..) |*v, i| v.* = @intCast(i * E / @as(usize, @intCast(rows)));
+        const idx_shape = [_]c_int{rows};
+        const idx = mlx.mlx_array_new_data(idx_host.ptr, &idx_shape, 1, .uint32);
+        defer _ = mlx.mlx_array_free(idx);
+        var got = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(got);
+        try gatherExpertMm(&got, x, w, sc, bi, no_idx, idx, 4, 64, .affine, true, s);
+        var ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref);
+        try gatherExpertMm(&ref, x, w, sc, bi, no_idx, idx, 4, 64, .affine, false, s);
+        try std.testing.expectEqualSlices(c_int, mlx.getShape(ref), mlx.getShape(got));
+        // Worst row error relative to the reference's scale: bf16 rounding sits near 0.02,
+        // an unwritten row reads ~1.0.
+        var diff = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(diff);
+        try mlx.check(mlx.mlx_subtract(&diff, got, ref, s));
+        var mag = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mag);
+        try mlx.check(mlx.mlx_abs(&mag, diff, s));
+        var worst = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(worst);
+        try mlx.check(mlx.mlx_max(&worst, mag, false, s));
+        var ref_abs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref_abs);
+        try mlx.check(mlx.mlx_abs(&ref_abs, ref, s));
+        var scale = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(scale);
+        try mlx.check(mlx.mlx_max(&scale, ref_abs, false, s));
+        var worst32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(worst32);
+        try mlx.check(mlx.mlx_astype(&worst32, worst, .float32, s));
+        var scale32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(scale32);
+        try mlx.check(mlx.mlx_astype(&scale32, scale, .float32, s));
+        var worst_v: f32 = 0;
+        var scale_v: f32 = 0;
+        try mlx.check(mlx.mlx_array_item_float32(&worst_v, worst32));
+        try mlx.check(mlx.mlx_array_item_float32(&scale_v, scale32));
+        if (worst_v / scale_v > 0.05) {
+            std.debug.print("sorted gather_qmm rows={d}: worst row error {d:.3} of scale\n", .{ rows, worst_v / scale_v });
+            return error.SortedGatherLostRows;
+        }
+    }
+}
+
 test "gatherExpertMm nvfp4 matches per-expert dequantized reference" {
     // MoE expert dispatch on an nvfp4 checkpoint: gather_qmm must receive
     // mode="nvfp4" + null biases (decode AND prefill shapes, same calling
