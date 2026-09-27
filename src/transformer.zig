@@ -40430,9 +40430,76 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
         // still honored by the quantized branch below, where gather_qmm handles it
         // correctly.
         try mlx.check(mlx.mlx_gather_mm(res, x, w, lhs_idx, rhs_idx, false, s));
+    } else if (sorted and sortedGatherNeedsPad(rhs_idx)) {
+        try gatherQmmSortedPadded(res, x, w, sc, bi, lhs_idx, rhs_idx, bits, group_size, mode, s);
     } else {
         try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), sorted, s));
     }
+}
+
+/// MLX 0.32.2's NAX sorted gather_qmm takes a tail tile's height as
+/// `short(max(0, M - (y_row + tm)))` (quantized_nax.h:1547). Past 32767 rows that wraps, and
+/// when M is not a multiple of the 64-row tile whole tiles come back unwritten. Aligned calls
+/// never take that branch. Fixed upstream after v0.32.2 (ml-explore/mlx#3922).
+const SORTED_GATHER_TILE: c_int = 64;
+
+fn sortedGatherNeedsPad(rhs_idx: mlx.mlx_array) bool {
+    const sh = mlx.getShape(rhs_idx);
+    if (sh.len != 1) return false;
+    return sh[0] > std.math.maxInt(i16) and @mod(sh[0], SORTED_GATHER_TILE) != 0;
+}
+
+/// Sorted gather_qmm with the row count padded to the tile by repeating the last row, which
+/// keeps the indices sorted, then sliced back. Real rows see the same kernel, tiles and K
+/// order as an aligned call.
+fn gatherQmmSortedPadded(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !void {
+    const m = mlx.getShape(rhs_idx)[0];
+    // Without a row index, x must hold one row per index to be padded alongside it. A broadcast
+    // x takes the unsorted kernel instead, which is always correct.
+    if (lhs_idx.ctx == null and mlx.getShape(x)[0] != m) {
+        try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), false, s));
+        return;
+    }
+    const padded = @divTrunc(m + SORTED_GATHER_TILE - 1, SORTED_GATHER_TILE) * SORTED_GATHER_TILE;
+    // Row map 0, 1, ..., m-1, m-1, ..., m-1 (padded entries).
+    var ramp = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ramp);
+    try mlx.check(mlx.mlx_arange(&ramp, 0, @floatFromInt(padded), 1, .int32, s));
+    const last = mlx.mlx_array_new_int(m - 1);
+    defer _ = mlx.mlx_array_free(last);
+    var row_map = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row_map);
+    try mlx.check(mlx.mlx_minimum(&row_map, ramp, last, s));
+
+    var rhs_pad = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rhs_pad);
+    try mlx.check(mlx.mlx_take_axis(&rhs_pad, rhs_idx, row_map, 0, s));
+    var lhs_pad = mlx.mlx_array{ .ctx = null };
+    defer if (lhs_pad.ctx != null) {
+        _ = mlx.mlx_array_free(lhs_pad);
+    };
+    var x_pad = mlx.mlx_array{ .ctx = null };
+    defer if (x_pad.ctx != null) {
+        _ = mlx.mlx_array_free(x_pad);
+    };
+    if (lhs_idx.ctx != null) {
+        lhs_pad = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_take_axis(&lhs_pad, lhs_idx, row_map, 0, s));
+    } else {
+        x_pad = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_take_axis(&x_pad, x, row_map, 0, s));
+    }
+    var y_pad = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_pad);
+    try mlx.check(mlx.mlx_gather_qmm(&y_pad, if (x_pad.ctx != null) x_pad else x, w, sc, bi, lhs_pad, rhs_pad, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), true, s));
+
+    const ysh = mlx.getShape(y_pad);
+    var start: [8]c_int = @splat(0);
+    var stop: [8]c_int = undefined;
+    const strides: [8]c_int = @splat(1);
+    for (ysh, 0..) |d, i| stop[i] = d;
+    stop[0] = m;
+    try mlx.check(mlx.mlx_slice(res, y_pad, &start, ysh.len, &stop, ysh.len, &strides, ysh.len, s));
 }
 
 /// DiffusionGemma packs each expert's gate and up projections in one tensor
