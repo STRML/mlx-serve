@@ -19,7 +19,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-test:
+  # The Zig graph and the Swift app share nothing on disk (app/ never reads
+  # zig-out), so they run as two jobs on two runners instead of one after the
+  # other (#639).
+  zig:
     runs-on: macos-26
     timeout-minutes: 90
     steps:
@@ -102,8 +105,24 @@ jobs:
       - name: Verify staged mlx (NAX kernels + minos)
         run: bash tests/test_mlx_staged_nax.sh
 
+      # PRs skip the slow corpus replay and benchmarks; pushes to main run them.
       - name: Run Zig tests
-        run: zig build test --summary all
+        run: zig build test --summary all ${{ github.event_name == 'push' && '-Dslow-tests' || '' }}
+
+  swift-app:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode (Swift 6.1+ required by MCP swift-sdk)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Compute Xcode cache key
+        id: xcode
+        run: echo "xcode=$(xcodebuild -version | tr ' \n' '--')" >> "$GITHUB_OUTPUT"
 
       # Dependencies (NIO, MCP, SwiftTerm, SwaTex) are most of a cold Swift
       # build and only change with Package.resolved. Our own sources get fresh
@@ -112,7 +131,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: app/.build
-          key: swiftpm-ci-${{ hashFiles('app/Package.resolved', 'scripts/patch-swatex-font-lookup.sh') }}-${{ steps.mlxpin.outputs.xcode }}
+          key: swiftpm-ci-${{ hashFiles('app/Package.resolved', 'scripts/patch-swatex-font-lookup.sh') }}-${{ steps.xcode.outputs.xcode }}
 
       # Do not force one Swift language mode through the dependency graph.
       # Each package's manifest owns its mode (SwaTex requires Swift 6.1).
