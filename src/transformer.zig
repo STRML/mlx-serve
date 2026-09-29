@@ -31383,7 +31383,7 @@ pub const Transformer = struct {
             const gate_experts = mlx.getShape(mw.switch_gate_w)[0];
             const row_block = total_inds >= 16 and gate_experts > 0 and @divTrunc(total_inds, gate_experts) >= 4;
             if (input_view == null and !self.verifyFeatureEnabled(.routing, skip_shared, B, S) and
-                row_block and nax_available and gather_qmm_nax.enabled() and gate_qp.mode == .affine and up_qp.mode == .affine)
+                row_block and nax_available and gate_qp.mode == .affine and up_qp.mode == .affine)
             {
                 var x_tok = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(x_tok);
