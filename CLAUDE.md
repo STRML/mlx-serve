@@ -14,7 +14,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` d73eb752e = v0.32.2 + the sorted gather_qmm NAX 32K-row fix #3922, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF). `lib/mlx-serve-gguf` (own repo, pure Zig + Metal) serves the GGUFs it knows on MLX itself. `lib/sushi` (our fork of beamivalice/sushi, module `sushi_exl3`, `-Dsushi-dir`) serves Sushi packs' EXL3 routed experts on qwen4_exp (`ModelConfig.exl3`).
+Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` 9c3d35571 = v0.32.3-18, `lib/mlxc-src` 56b2d39 = PR #127 plus `patches/mlxc-gather-qmm-global-scale.patch`, which `build-mlx.sh` applies) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF). `lib/mlx-serve-gguf` (own repo, pure Zig + Metal) serves the GGUFs it knows on MLX itself. `lib/sushi` (our fork of beamivalice/sushi, module `sushi_exl3`, `-Dsushi-dir`) serves Sushi packs' EXL3 routed experts on qwen4_exp (`ModelConfig.exl3`).
 
 ## Layout (`src/`)
 

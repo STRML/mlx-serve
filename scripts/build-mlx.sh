@@ -78,6 +78,12 @@ cmake --build "$BUILD_ROOT/mlx" -j "$NCPU"
 cmake --install "$BUILD_ROOT/mlx" >/dev/null
 
 # ── mlx-c against the staged mlx (same pairing brew uses: USE_SYSTEM_MLX) ────
+# MLX >= 0.32.3 inserted global_scale into gather_qmm ahead of sorted_indices;
+# the pinned mlx-c still passes sorted_indices in that slot.
+if awk '/gather_qmm\(/,/\);/' "$MLX_SRC/mlx/ops.h" | grep -q global_scale \
+   && ! grep -q 'global_scale: no C ABI surface yet' "$MLXC_SRC/mlx/c/ops.cpp"; then
+  git -C "$MLXC_SRC" apply -p1 "$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch"
+fi
 cmake -S "$MLXC_SRC" -B "$BUILD_ROOT/mlxc" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
