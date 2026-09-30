@@ -34,6 +34,8 @@ from textual.widgets import DataTable, Static
 DEFAULT_URL = "http://127.0.0.1:11234"
 WINDOWS = {"1": (300, "5m"), "2": (900, "15m"), "3": (3600, "1h")}
 SAMPLE_INTERVAL_MS = 2000
+DEFAULT_REFRESH_S = 1.0
+MIN_REFRESH_S = 0.2
 LIVE_RATE_S = 10
 REQUEST_ROWS = 100
 BLOCKS = " ▁▂▃▄▅▆▇█"
@@ -301,9 +303,9 @@ class MlxTop(App):
     BINDINGS = [("q", "quit", "Quit"), ("1", "window('1')", "5m"),
                 ("2", "window('2')", "15m"), ("3", "window('3')", "1h")]
 
-    def __init__(self, url: str, key: str | None, fetch=fetch_metrics):
+    def __init__(self, url: str, key: str | None, fetch=fetch_metrics, interval: float = DEFAULT_REFRESH_S):
         super().__init__()
-        self.url, self.key, self.fetch = url, key, fetch
+        self.url, self.key, self.fetch, self.interval = url, key, fetch, interval
         self.window_key = "1"
 
     def compose(self) -> ComposeResult:
@@ -320,7 +322,7 @@ class MlxTop(App):
         self.query_one("#requests", DataTable).add_columns(
             "time", "prompt+out", "cached", "hit", "forwarded", "prefill ms", "prefill/s",
             "decode/s", "outcome", "client")
-        self.set_interval(1.0, self.refresh_view)
+        self.set_interval(self.interval, self.refresh_view)
         self.call_after_refresh(self.refresh_view)
 
     def action_window(self, key: str) -> None:
@@ -355,12 +357,25 @@ class MlxTop(App):
         self.fill("requests", view["requests"])
 
 
+def refresh_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of seconds")
+    if value < MIN_REFRESH_S:
+        raise argparse.ArgumentTypeError(f"must be at least {MIN_REFRESH_S} seconds")
+    return value
+
+
 def main(argv: list | None = None) -> None:
     parser = argparse.ArgumentParser(description="Terminal dashboard for mlx-serve (/metrics.json).")
     parser.add_argument("--url", default=DEFAULT_URL, help=f"server base URL (default {DEFAULT_URL})")
     parser.add_argument("--api-key", default=None, help="API key (default $MLX_SERVE_API_KEY)")
+    parser.add_argument("--interval", type=refresh_seconds, default=DEFAULT_REFRESH_S, metavar="SECONDS",
+                        help=f"screen refresh period (default {DEFAULT_REFRESH_S:g}, minimum {MIN_REFRESH_S:g}); "
+                             f"the server samples every {SAMPLE_INTERVAL_MS // 1000} s, so history only moves that often")
     args = parser.parse_args(argv)
-    MlxTop(args.url, args.api_key or os.environ.get("MLX_SERVE_API_KEY")).run()
+    MlxTop(args.url, args.api_key or os.environ.get("MLX_SERVE_API_KEY"), interval=args.interval).run()
 
 
 if __name__ == "__main__":

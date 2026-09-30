@@ -205,3 +205,34 @@ def test_key_comes_from_the_flag_then_the_environment(monkeypatch):
     mlxtop.main([])
     mlxtop.main(["--api-key", "from-flag"])
     assert seen == ["from-env", "from-flag"]
+
+
+def test_refresh_interval_defaults_to_one_second_and_takes_the_flag(monkeypatch):
+    seen = []
+    monkeypatch.setattr(mlxtop.MlxTop, "run", lambda self: seen.append(self.interval))
+    mlxtop.main([])
+    mlxtop.main(["--interval", "0.5"])
+    assert seen == [1.0, 0.5]
+
+
+@pytest.mark.parametrize("bad", ["0", "0.1", "-2", "fast"])
+def test_refresh_interval_rejects_values_below_the_floor_or_not_numbers(bad, capsys):
+    with pytest.raises(SystemExit):
+        mlxtop.main(["--interval", bad])
+    assert "--interval" in capsys.readouterr().err
+
+
+def test_screen_refreshes_at_the_requested_interval():
+    calls = []
+
+    def fetch(url, key):
+        calls.append(1)
+        raise mlxtop.FetchError("unreachable")
+
+    async def run():
+        app = mlxtop.MlxTop("http://x:1", None, fetch=fetch, interval=0.2)
+        async with app.run_test() as pilot:
+            await pilot.pause(1.1)
+
+    asyncio.run(run())
+    assert len(calls) >= 4
