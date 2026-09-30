@@ -22827,7 +22827,12 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 1, self.s));
         var conv = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(conv);
-        try mlx.check(mlx.mlx_conv1d(&conv, cat, pw.conv_w, 1, 0, dilation, hc * hidden, self.s));
+        if (try pleConvDirect(self.s, cat, pw.conv_w, dilation)) |direct| {
+            _ = mlx.mlx_array_free(conv);
+            conv = direct;
+        } else {
+            try mlx.check(mlx.mlx_conv1d(&conv, cat, pw.conv_w, 1, 0, dilation, hc * hidden, self.s));
+        }
         const conv_act = try self.silu(conv);
         defer _ = mlx.mlx_array_free(conv_act);
         // New state = the last state_len rows of the concat (materialized —
@@ -38719,6 +38724,86 @@ pub fn fusedGatedConvStep(s: mlx.mlx_stream, proj: mlx.mlx_array, state: mlx.mlx
         log.info("[conv] fused gated conv step engaged: hidden={d} kernel={d}\n", .{ hidden, kernel });
     }
     return .{ .gated = y, .state = ns };
+}
+
+/// Depthwise causal conv over a pre-padded `x` [B, S + (KS-1)*DIL, C]:
+/// y[b,t,c] = sum_k w[c,k] * x[b, t + k*DIL, c], float accumulate in tap order.
+/// `x_shape` is injected by MLX because the source names it.
+const PLE_CONV_SOURCE =
+    \\uint c = thread_position_in_grid.x;
+    \\uint t = thread_position_in_grid.y;
+    \\uint b = thread_position_in_grid.z;
+    \\uint C = x_shape[2];
+    \\uint S = x_shape[1] - (KS - 1) * DIL;
+    \\if (c >= C || t >= S) return;
+    \\size_t xi = ((size_t)b * x_shape[1] + t) * C + c;
+    \\float acc = 0.0;
+    \\for (int k = 0; k < KS; k++) {
+    \\  acc += static_cast<float>(x[xi + (size_t)k * DIL * C]) * static_cast<float>(w[c * KS + k]);
+    \\}
+    \\y[((size_t)b * S + t) * C + c] = static_cast<T>(acc);
+;
+
+var ple_conv_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var ple_conv_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+const PleConvCfgKey = struct { shape: ShapeKey, kernel: c_int, dilation: c_int, dtype: mlx.mlx_dtype };
+var ple_conv_cfg_key: PleConvCfgKey = std.mem.zeroes(PleConvCfgKey);
+var ple_conv_engaged: bool = false;
+/// Same values as `mlx_conv1d(x, w, 1, 0, dilation, C)` on a [C, K, 1] weight
+/// (pinned by the `ple conv direct` test). MLX sends dilation > 1 through a
+/// grouped GEMM; this is one dispatch. Null -> caller keeps the conv.
+fn pleConvDirect(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, dilation: c_int) !?mlx.mlx_array {
+    const dt = mlx.mlx_array_dtype(x);
+    if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(w) != dt) return null;
+    const xsh = mlx.getShape(x);
+    const wsh = mlx.getShape(w);
+    if (xsh.len != 3 or wsh.len != 3 or wsh[2] != 1 or wsh[0] != xsh[2] or dilation < 1) return null;
+    const kernel = wsh[1];
+    const seq = xsh[1] - (kernel - 1) * dilation;
+    if (kernel < 1 or seq < 1) return null;
+    const ch = xsh[2];
+
+    const key = PleConvCfgKey{ .shape = ShapeKey.from(xsh), .kernel = kernel, .dilation = dilation, .dtype = dt };
+    if (ple_conv_cfg == null or !std.meta.eql(ple_conv_cfg_key, key)) {
+        if (ple_conv_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        const ysh = [_]c_int{ xsh[0], seq, ch };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ysh, 3, dt));
+        const tg: c_int = 256;
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(ch + tg - 1, tg) * tg, seq, xsh[0]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KS", kernel));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DIL", dilation));
+        ple_conv_cfg = config;
+        ple_conv_cfg_key = key;
+    }
+    if (ple_conv_kernel == null) {
+        const input_names = [_][*:0]const u8{ "x", "w" };
+        const output_names = [_][*:0]const u8{"y"};
+        const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const k = mlx.mlx_fast_metal_kernel_new("mlxserve_ple_conv", in_vec, out_vec, PLE_CONV_SOURCE, "", true, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        ple_conv_kernel = k;
+    }
+    const inputs_arr = [_]mlx.mlx_array{ x, w };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, ple_conv_kernel.?, inputs_vec, ple_conv_cfg.?, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
+    if (!ple_conv_engaged) {
+        ple_conv_engaged = true;
+        log.info("[ple] direct dilated conv engaged: channels={d} kernel={d} dilation={d}\n", .{ ch, kernel, dilation });
+    }
+    return y;
 }
 
 /// `x * sigmoid(g)`: the sigmoid from the per-dtype table (mlx_sigmoid's own
@@ -69773,5 +69858,48 @@ test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits a
                 for (a.entries, b.entries) |*ea, *eb| try expectPleHistoryEqual(ea, eb);
             }
         }
+    }
+}
+
+test "ple conv direct is bit-identical to mlx_conv1d at Flash Next's dilation and width" {
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x91E);
+    const rnd = prng.random();
+    const ch: c_int = 4 * 2560; // hc_count * hidden_size
+    const ks: c_int = 4; // ple_conv_kernel_size
+    const dil: c_int = 3; // ngram_size
+    const state_len = (ks - 1) * dil;
+    const mk = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, shape: []const c_int, scale: f32) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try a.alloc(f32, n);
+            defer a.free(buf);
+            for (buf) |*v| v.* = (r.float(f32) - 0.5) * scale;
+            const a32 = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(a32);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st));
+            return out;
+        }
+    }.f;
+    for ([_]c_int{ 1, 2048, 2601 }) |seq| {
+        const x = try mk(allocator, rnd, s, &.{ 1, seq + state_len, ch }, 8.0);
+        defer _ = mlx.mlx_array_free(x);
+        const w = try mk(allocator, rnd, s, &.{ ch, ks, 1 }, 2.0);
+        defer _ = mlx.mlx_array_free(w);
+        var ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref);
+        try mlx.check(mlx.mlx_conv1d(&ref, x, w, 1, 0, dil, ch, s));
+        const got = (try pleConvDirect(s, x, w, dil)) orelse return error.PleConvDirectDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, ref, got, true, s));
+        try mlx.check(mlx.mlx_array_eval(eq));
+        var eq_v: bool = false;
+        try mlx.check(mlx.mlx_array_item_bool(&eq_v, eq));
+        try testing.expect(eq_v);
     }
 }
