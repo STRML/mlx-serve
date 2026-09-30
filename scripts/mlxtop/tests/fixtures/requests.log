@@ -1,0 +1,11 @@
+[mtp] regime gate: two-chunk 14.02 ms/tok vs single 5.92 ms/tok -> two-chunk throttled (period 128)
+  [hot-cache] resident=23468.15 / 32768.00 MB (3/32 entries)
+  <- 27+3 tokens (520ms) [prefill: 55.9 tok/s, decode: 187.3 tok/s] [stop]
+  <- 216+25 tokens streamed [prefill: 699.5 tok/s, decode: 44.2 tok/s] [stop]
+  <- 396482+561 tokens streamed [prefill: 4288.4 tok/s, decode: 114.5 tok/s] [tool_calls]
+  <- 397144+312 tokens streamed [prefill: 1378.6 tok/s (396451 cached / 397144 total), decode: 126.8 tok/s] [tool_calls]
+  <- 0+0 tokens streamed [prefill: 0.0 tok/s, decode: 0.0 tok/s] [client_disconnect]
+  <- 29128+5 tokens streamed [prefill: 1327.6 tok/s (24576 cached / 29128 total), decode: 145.9 tok/s] [client_disconnect]
+  <- 4497+2048 tokens streamed [prefill: 3041.0 tok/s, decode: 114.4 tok/s] [length]
+  pld=enabled (draft_len=5, key_len=3)
+  <- some future format we do not know
