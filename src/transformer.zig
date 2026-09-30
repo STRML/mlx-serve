@@ -14254,6 +14254,9 @@ const LinearAttnWeights = struct {
     out_w: mlx.mlx_array,
     out_s: mlx.mlx_array,
     out_b: mlx.mlx_array,
+    /// Row-joined [a | b] for prefill width (`gdnStackedAb`); a/b are views
+    /// of it once built.
+    ab: FusedRows = .{},
 };
 
 /// DiffusionGemma self-conditioning module: a GeGLU FFN over the previous
@@ -29115,6 +29118,11 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(z_proj);
         defer _ = mlx.mlx_array_free(a_proj);
         defer _ = mlx.mlx_array_free(b_proj);
+        // The joined [a | b] output when it served; a_proj/b_proj are views of it.
+        var ab_joined = mlx.mlx_array{ .ctx = null };
+        defer if (ab_joined.ctx != null) {
+            _ = mlx.mlx_array_free(ab_joined);
+        };
         if (projected) |values| {
             qkv = values.qkv;
             z_proj = values.z;
@@ -29202,8 +29210,16 @@ pub const Transformer = struct {
             const proj = try self.gdnProjMaybeAne(x, la, layer_idx, is_prefill, seq_len);
             qkv = proj.qkv;
             z_proj = proj.z;
-            a_proj = try self.qmatmul(x, la.a_w, la.a_s, la.a_b);
-            b_proj = try self.qmatmul(x, la.b_w, la.b_s, la.b_b);
+            if (try self.gdnStackedAb(x, la, batch * seq_len)) |ab| {
+                ab_joined = ab;
+                a_proj = mlx.mlx_array_new();
+                b_proj = mlx.mlx_array_new();
+                try la.ab.part(&a_proj, ab, 0, self.s);
+                try la.ab.part(&b_proj, ab, 1, self.s);
+            } else {
+                a_proj = try self.qmatmul(x, la.a_w, la.a_s, la.a_b);
+                b_proj = try self.qmatmul(x, la.b_w, la.b_s, la.b_b);
+            }
         }
         // Scale scalars + the parameter-free rms_norm ones-weight (mlx-c
         // requires a non-empty weight) are cached on the Transformer — they
@@ -29395,16 +29411,17 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_zeros(&zero_conv, &[_]c_int{ batch, 3, conv_dim }, 3, mlx.mlx_array_dtype(qkv), self.s));
             }
             const incoming_conv = if (cold) zero_conv else ssm.conv_state;
+            const ab_rd = gdnAbRead(&la.ab, ab_joined, a_proj, b_proj, num_v_heads);
             const pre = (gdnPreworkFused(self.s, .{
                 .qkv = qkv,
                 .qkv_off = 0,
                 .qkv_stride = conv_dim,
-                .b = b_proj,
-                .b_off = 0,
-                .b_stride = num_v_heads,
-                .a = a_proj,
-                .a_off = 0,
-                .a_stride = num_v_heads,
+                .b = ab_rd.b,
+                .b_off = ab_rd.b_off,
+                .b_stride = ab_rd.stride,
+                .a = ab_rd.a,
+                .a_off = ab_rd.a_off,
+                .a_stride = ab_rd.stride,
                 .A_log = la.A_log,
                 .dt_bias = la.dt_bias,
                 .conv_state = incoming_conv,
@@ -30163,6 +30180,21 @@ pub const Transformer = struct {
 
     fn anePackUnitPlanes(self: *Transformer, eng: *ane_offload.AnePrefill, x: mlx.mlx_array) !void {
         return ane_offload.packUnitPlanes(self.s, eng, x);
+    }
+
+    /// The joined [a | b] projection of a prefill chunk, or null where the
+    /// separate matmuls must run (group not built, a rotated or ternary pack,
+    /// or a width `gdnStackedRowsFor` declines).
+    fn gdnStackedAb(self: *Transformer, x: mlx.mlx_array, la: *const LinearAttnWeights, rows: c_int) !?mlx.mlx_array {
+        if (la.ab.w.ctx == null or self.rht != null or self.ternary_2bit) return null;
+        const qp = self.quantParamsHinted(la.ab.w, la.ab.s, lastDim(x));
+        if (qp.mode != .affine or !gdnStackedRowsFor(rows, qp.bits)) return null;
+        const y = try self.qmatmul(x, la.ab.w, la.ab.s, la.ab.b);
+        if (!gdn_stacked_proj_engaged) {
+            gdn_stacked_proj_engaged = true;
+            log.info("[gdn] stacked a/b in_proj engaged: rows={d} width={d}\n", .{ rows, la.ab.widths[0] + la.ab.widths[1] });
+        }
+        return y;
     }
 
     /// GDN projections through explicit weight arrays (the channel rest
@@ -32713,6 +32745,13 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 try maybeTransposeForBf16(&la.a_w, la.a_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&la.b_w, la.b_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
+                // Measured on Flash Next only; [qkv | z] stays two matmuls
+                // (joined, the dequant+GEMM route gained nothing).
+                if (config.isQwen4() and gdnStackedProjEnabled()) {
+                    var parts = [_][3]*mlx.mlx_array{ .{ &la.a_w, &la.a_s, &la.a_b }, .{ &la.b_w, &la.b_s, &la.b_b } };
+                    const names = [_][]const u8{ "linear_attn.in_proj_a", "linear_attn.in_proj_b" };
+                    la.ab = try fuseRowsInPlace(&parts, 0, &names, weights, name_buf, prefix, li, &owned_bf16, allocator, s);
+                }
             }
         } else if (is_bailing) {
             // MLA. There are no q/k/v projections at all — the low-rank Q and
@@ -36543,6 +36582,16 @@ fn gdnPrefillFusedFor(seq: c_int, batch: c_int) bool {
     return on;
 }
 
+/// Where the packed prework reads a and b: in place from the joined [a | b]
+/// output (`joined`, null ctx when the separate matmuls ran) or from the
+/// separate `[.., hv]` projections.
+const GdnAbRead = struct { a: mlx.mlx_array, a_off: c_int, b: mlx.mlx_array, b_off: c_int, stride: c_int };
+
+fn gdnAbRead(ab: *const FusedRows, joined: mlx.mlx_array, a: mlx.mlx_array, b: mlx.mlx_array, hv: c_int) GdnAbRead {
+    if (joined.ctx == null) return .{ .a = a, .a_off = 0, .b = b, .b_off = 0, .stride = hv };
+    return .{ .a = joined, .a_off = 0, .b = joined, .b_off = ab.widths[0], .stride = ab.widths[0] + ab.widths[1] };
+}
+
 /// Inputs of the packed prework. `qkv`/`b`/`a` are read at `(off, stride)`
 /// per row, so they may all alias one folded in_proj output.
 pub const GdnPreworkArgs = struct {
@@ -37665,6 +37714,30 @@ const FUSED_ROWS_MAX_M: c_int = 1;
 
 /// Groups joined by the loader in flight (reported once per load).
 var fused_row_groups: usize = 0;
+
+/// Test seam for `MLX_SERVE_GDN_STACKED_PROJ` (0 = separate GDN a/b matmuls).
+pub var gdn_stacked_proj_override: ?bool = null;
+var gdn_stacked_proj_env: ?bool = null;
+var gdn_stacked_proj_engaged = false;
+
+fn gdnStackedProjEnabled() bool {
+    if (gdn_stacked_proj_override) |v| return v;
+    if (gdn_stacked_proj_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_GDN_STACKED_PROJ");
+    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    gdn_stacked_proj_env = on;
+    return on;
+}
+
+/// Whether a GDN prefill of `rows` tokens projects a and b through their
+/// row-joined group. Only on the dequant+GEMM route, whose GEMM reduces K in
+/// one order for any N; stock qmm's split-K count moves with N (48 rows alone
+/// split K another way than 96 joined), so narrower widths keep two matmuls.
+/// Pinned by the `stacked GDN a/b` test.
+fn gdnStackedRowsFor(rows: c_int, bits: u32) bool {
+    if (!gdnStackedProjEnabled() or !prefillDqGemmEnabled() or !prefillDqGemmBits(bits)) return false;
+    return rows >= @as(c_int, @intCast(PREFILL_DQ_GEMM_MIN_M));
+}
 
 /// Join up to four quantized `{w, s, b}` triples along axis 0 into one
 /// evaluated buffer and rewrite each triple to a zero-copy row VIEW of it,
@@ -42209,14 +42282,17 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     return result;
 }
 
+fn prefillDqGemmBits(bits: u32) bool {
+    return switch (bits) {
+        2, 3, 4, 5, 6, 8 => true,
+        else => false,
+    };
+}
+
 /// The dequant+GEMM prefill route (see the block comment above
 /// prefillDqGemmEnabled). Returns null when the call must stay on stock qmm.
 fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!prefillDqGemmEnabled()) return null;
-    switch (bits) {
-        2, 3, 4, 5, 6, 8 => {},
-        else => return null,
-    }
+    if (!prefillDqGemmEnabled() or !prefillDqGemmBits(bits)) return null;
     const last = lastDim(x) orelse return null;
     if (last == 0) return null;
     const rows = mlx.mlx_array_size(x) / @as(usize, @intCast(last));
@@ -47961,6 +48037,335 @@ test "fused row projections are bit-identical to the separate matmuls at decode 
                     try testing.expectEqualSlices(f32, h1, h2);
                 }
             }
+        }
+    }
+}
+
+const GdnStackTestQ = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array };
+
+fn gdnStackTestQuant(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, rows: c_int, cols: c_int, bits: c_int) !GdnStackTestQ {
+    const buf = try a.alloc(f32, @intCast(rows * cols));
+    defer a.free(buf);
+    for (buf) |*v| v.* = (r.float(f32) - 0.5) * 0.2;
+    const sh = [_]c_int{ rows, cols };
+    const w32 = mlx.mlx_array_new_data(buf.ptr, &sh, 2, .float32);
+    defer _ = mlx.mlx_array_free(w32);
+    var wb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wb);
+    try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, st));
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(bits), "affine", .{}, st));
+    var q: GdnStackTestQ = undefined;
+    q.w = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&q.w, triple, 0));
+    q.sc = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&q.sc, triple, 1));
+    q.bi = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&q.bi, triple, 2));
+    for ([_]mlx.mlx_array{ q.w, q.sc, q.bi }) |arr| try mlx.check(mlx.mlx_array_eval(arr));
+    return q;
+}
+
+fn gdnStackTestX(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, batch: c_int, rows: c_int, k: c_int) !mlx.mlx_array {
+    const xb = try a.alloc(f32, @intCast(batch * rows * k));
+    defer a.free(xb);
+    for (xb) |*v| v.* = (r.float(f32) - 0.5) * 2.0;
+    const xsh = [_]c_int{ batch, rows, k };
+    const x32 = mlx.mlx_array_new_data(xb.ptr, &xsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(x32);
+    var x = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, st));
+    try mlx.check(mlx.mlx_array_eval(x));
+    return x;
+}
+
+// Flash Next GDN in_proj geometry: hidden 2560; qkv 10240 and z 6144 rows at
+// 4-bit g64, a and b 48 rows at 8-bit g64.
+const GDN_STACK_TEST_K: c_int = 2560;
+const GDN_STACK_TEST_PAIRS = [_]struct { widths: [2]c_int, bits: c_int }{
+    .{ .widths = .{ 10240, 6144 }, .bits = 4 },
+    .{ .widths = .{ 48, 48 }, .bits = 8 },
+};
+
+test "stacked GDN a/b in_proj is bit-identical to the separate matmuls at every width it engages" {
+    // Bar: wherever gdnStackedRowsFor admits the row count, each slice of the
+    // joined [a | b] matmul equals its separate matmul byte for byte.
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6D57AC);
+    const rnd = prng.random();
+    prefill_dq_gemm_override = true;
+    defer prefill_dq_gemm_override = null;
+    gdn_stacked_proj_override = true;
+    defer gdn_stacked_proj_override = null;
+    try testing.expect(!gdnStackedRowsFor(PREFILL_DQ_GEMM_MIN_M - 1, 8));
+    const shapes = [_][2]c_int{ .{ 1, 2048 }, .{ 1, 3001 }, .{ 1, 8192 }, .{ 1, 8211 }, .{ 2, 2048 } };
+    {
+        const pair = GDN_STACK_TEST_PAIRS[1];
+        var orig: [2]GdnStackTestQ = undefined;
+        var live: [2]GdnStackTestQ = undefined;
+        for (pair.widths, 0..) |n, i| {
+            orig[i] = try gdnStackTestQuant(allocator, rnd, s, n, GDN_STACK_TEST_K, pair.bits);
+            live[i] = orig[i];
+        }
+        defer for (orig) |q| {
+            _ = mlx.mlx_array_free(q.w);
+            _ = mlx.mlx_array_free(q.sc);
+            _ = mlx.mlx_array_free(q.bi);
+        };
+        var parts = [_][3]*mlx.mlx_array{ .{ &live[0].w, &live[0].sc, &live[0].bi }, .{ &live[1].w, &live[1].sc, &live[1].bi } };
+        const fused = (try fuseRowGroup(&parts, s)) orelse return error.FusedRowsDeclined;
+        defer {
+            _ = mlx.mlx_array_free(fused.w);
+            _ = mlx.mlx_array_free(fused.s);
+            _ = mlx.mlx_array_free(fused.b);
+            for (live) |q| {
+                _ = mlx.mlx_array_free(q.w);
+                _ = mlx.mlx_array_free(q.sc);
+                _ = mlx.mlx_array_free(q.bi);
+            }
+        }
+        for (shapes) |shp| {
+            try testing.expect(gdnStackedRowsFor(shp[0] * shp[1], @intCast(pair.bits)));
+            const x = try gdnStackTestX(allocator, rnd, s, shp[0], shp[1], GDN_STACK_TEST_K);
+            defer _ = mlx.mlx_array_free(x);
+            const y_all = try qmatmulBits(x, fused.w, fused.s, fused.b, @intCast(pair.bits), 64, .affine, s);
+            defer _ = mlx.mlx_array_free(y_all);
+            for (0..2) |i| {
+                const ref = try qmatmulBits(x, orig[i].w, orig[i].sc, orig[i].bi, @intCast(pair.bits), 64, .affine, s);
+                defer _ = mlx.mlx_array_free(ref);
+                var got = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(got);
+                try fused.part(&got, y_all, i, s);
+                if (shp[0] * shp[1] <= 3001) {
+                    // Readback as bits: array_equal would let -0 pass for +0.
+                    const cnt: usize = @intCast(shp[0] * shp[1] * pair.widths[i]);
+                    const h1 = try allocator.alloc(f32, cnt);
+                    defer allocator.free(h1);
+                    const h2 = try allocator.alloc(f32, cnt);
+                    defer allocator.free(h2);
+                    try testReadF32(ref, h1, s);
+                    try testReadF32(got, h2, s);
+                    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(h1), std.mem.sliceAsBytes(h2));
+                } else {
+                    var eq = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(eq);
+                    try mlx.check(mlx.mlx_array_equal(&eq, ref, got, false, s));
+                    try mlx.check(mlx.mlx_array_eval(eq));
+                    var eq_v: bool = false;
+                    try mlx.check(mlx.mlx_array_item_bool(&eq_v, eq));
+                    try testing.expect(eq_v);
+                }
+            }
+        }
+    }
+}
+
+test "GDN prework over the stacked a/b output matches the separate projections at a Flash Next prefill chunk" {
+    // Bar: the prework reading a/b in place from the joined [a | b] output
+    // (gdnAbRead) returns the same q/k/v/state/gate/beta as over separate a and b.
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    prefill_dq_gemm_override = true;
+    defer prefill_dq_gemm_override = null;
+    gdn_prefill_fused_override = true;
+    defer gdn_prefill_fused_override = null;
+    gdn_prework_override = true;
+    defer gdn_prework_override = null;
+    var prng = std.Random.DefaultPrng.init(0xAB5);
+    const rnd = prng.random();
+    const hk: c_int = 16;
+    const hv: c_int = 48;
+    const dk: c_int = 128;
+    const seq: c_int = 2048;
+    const c_dim: c_int = hk * dk * 2 + hv * dk;
+    const pair = GDN_STACK_TEST_PAIRS[1];
+    var orig: [2]GdnStackTestQ = undefined;
+    var live: [2]GdnStackTestQ = undefined;
+    for (pair.widths, 0..) |n, i| {
+        orig[i] = try gdnStackTestQuant(allocator, rnd, s, n, GDN_STACK_TEST_K, pair.bits);
+        live[i] = orig[i];
+    }
+    defer for (orig) |q| {
+        _ = mlx.mlx_array_free(q.w);
+        _ = mlx.mlx_array_free(q.sc);
+        _ = mlx.mlx_array_free(q.bi);
+    };
+    var parts = [_][3]*mlx.mlx_array{ .{ &live[0].w, &live[0].sc, &live[0].bi }, .{ &live[1].w, &live[1].sc, &live[1].bi } };
+    const fused = (try fuseRowGroup(&parts, s)) orelse return error.FusedRowsDeclined;
+    defer {
+        _ = mlx.mlx_array_free(fused.w);
+        _ = mlx.mlx_array_free(fused.s);
+        _ = mlx.mlx_array_free(fused.b);
+        for (live) |q| {
+            _ = mlx.mlx_array_free(q.w);
+            _ = mlx.mlx_array_free(q.sc);
+            _ = mlx.mlx_array_free(q.bi);
+        }
+    }
+    const x = try gdnStackTestX(allocator, rnd, s, 1, seq, GDN_STACK_TEST_K);
+    defer _ = mlx.mlx_array_free(x);
+    const joined = try qmatmulBits(x, fused.w, fused.s, fused.b, 8, 64, .affine, s);
+    defer _ = mlx.mlx_array_free(joined);
+    const a_sep = try qmatmulBits(x, orig[0].w, orig[0].sc, orig[0].bi, 8, 64, .affine, s);
+    defer _ = mlx.mlx_array_free(a_sep);
+    const b_sep = try qmatmulBits(x, orig[1].w, orig[1].sc, orig[1].bi, 8, 64, .affine, s);
+    defer _ = mlx.mlx_array_free(b_sep);
+
+    const q_scale = bf16Scalar(1.0 / 128.0, s);
+    defer _ = mlx.mlx_array_free(q_scale);
+    const k_scale = bf16Scalar(@sqrt(1.0 / 128.0), s);
+    defer _ = mlx.mlx_array_free(k_scale);
+    const hv_shape = [_]c_int{hv};
+    const A_log = try attn256RandBf16(rnd, &hv_shape, s);
+    defer _ = mlx.mlx_array_free(A_log);
+    const dt_bias = try attn256RandBf16(rnd, &hv_shape, s);
+    defer _ = mlx.mlx_array_free(dt_bias);
+    const qkv = try attn256RandBf16(rnd, &[_]c_int{ 1, seq, c_dim }, s);
+    defer _ = mlx.mlx_array_free(qkv);
+    const conv_state = try attn256RandBf16(rnd, &[_]c_int{ 1, 3, c_dim }, s);
+    defer _ = mlx.mlx_array_free(conv_state);
+    const conv_w = try attn256RandBf16(rnd, &[_]c_int{ c_dim, 4, 1 }, s);
+    defer _ = mlx.mlx_array_free(conv_w);
+
+    var outs: [2]GdnPrework = undefined;
+    for ([_]mlx.mlx_array{ .{ .ctx = null }, joined }, 0..) |j, i| {
+        const rd = gdnAbRead(&fused, j, a_sep, b_sep, hv);
+        outs[i] = (try gdnPreworkFused(s, .{
+            .qkv = qkv,
+            .qkv_off = 0,
+            .qkv_stride = c_dim,
+            .b = rd.b,
+            .b_off = rd.b_off,
+            .b_stride = rd.stride,
+            .a = rd.a,
+            .a_off = rd.a_off,
+            .a_stride = rd.stride,
+            .A_log = A_log,
+            .dt_bias = dt_bias,
+            .conv_state = conv_state,
+            .conv_w = conv_w,
+            .q_scale = q_scale,
+            .k_scale = k_scale,
+            .hk = hk,
+            .hv = hv,
+            .dk = dk,
+            .dv = dk,
+            .seq = seq,
+        })) orelse return error.FusedDeclined;
+    }
+    defer for (outs) |o| {
+        inline for (.{ o.q, o.k, o.v, o.conv_state, o.g, o.beta }) |a| _ = mlx.mlx_array_free(a);
+    };
+    inline for (.{ "q", "k", "v", "conv_state", "g", "beta" }) |f| {
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(@field(outs[0], f), @field(outs[1], f), s));
+    }
+}
+
+test "GDN stacked in_proj µbench: four separate vs two stacked matmuls at Flash Next shapes (MLX_SERVE_GDN_STACK_UBENCH=1)" {
+    if (std.c.getenv("MLX_SERVE_GDN_STACK_UBENCH") == null) return error.SkipZigTest;
+    const io_util = @import("io_util.zig");
+    const tio = testing.io;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xB3AC);
+    const rnd = prng.random();
+    const LAYERS_LO = 4;
+    const LAYERS_HI = 20;
+    const REPS = 15;
+    var qs: [4]GdnStackTestQ = undefined;
+    var bits: [4]c_int = undefined;
+    for (GDN_STACK_TEST_PAIRS, 0..) |pair, p| {
+        for (pair.widths, 0..) |n, i| {
+            qs[p * 2 + i] = try gdnStackTestQuant(allocator, rnd, s, n, GDN_STACK_TEST_K, pair.bits);
+            bits[p * 2 + i] = pair.bits;
+        }
+    }
+    defer for (qs) |q| {
+        _ = mlx.mlx_array_free(q.w);
+        _ = mlx.mlx_array_free(q.sc);
+        _ = mlx.mlx_array_free(q.bi);
+    };
+    // Stacked copies built beside the originals, so both arms read the same bits.
+    var copies: [4]GdnStackTestQ = qs;
+    var fused: [2]FusedRows = undefined;
+    for (0..2) |p| {
+        var parts = [_][3]*mlx.mlx_array{ .{ &copies[p * 2].w, &copies[p * 2].sc, &copies[p * 2].bi }, .{ &copies[p * 2 + 1].w, &copies[p * 2 + 1].sc, &copies[p * 2 + 1].bi } };
+        fused[p] = (try fuseRowGroup(&parts, s)) orelse return error.FusedRowsDeclined;
+    }
+    defer for (fused, 0..) |f, p| {
+        _ = mlx.mlx_array_free(f.w);
+        _ = mlx.mlx_array_free(f.s);
+        _ = mlx.mlx_array_free(f.b);
+        for (copies[p * 2 .. p * 2 + 2]) |q| {
+            _ = mlx.mlx_array_free(q.w);
+            _ = mlx.mlx_array_free(q.sc);
+            _ = mlx.mlx_array_free(q.bi);
+        }
+    };
+    // Arms: all four in_proj matmuls, then each pair alone, separate vs stacked.
+    const Arm = enum { separate, stacked, sep_qkvz, stk_qkvz, sep_ab, stk_ab };
+    const runChain = struct {
+        fn one(vec: mlx.mlx_vector_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, nb: c_int, st: mlx.mlx_stream) !void {
+            const y = try qmatmulBits(x, w, sc, bi, @intCast(nb), 64, .affine, st);
+            _ = mlx.mlx_vector_array_append_value(vec, y);
+            _ = mlx.mlx_array_free(y);
+        }
+        fn f(arm: Arm, x: mlx.mlx_array, layers: usize, q: *const [4]GdnStackTestQ, b: *const [4]c_int, fr: *const [2]FusedRows, st: mlx.mlx_stream, io: std.Io) !f64 {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            const sep: []const usize = switch (arm) {
+                .separate => &.{ 0, 1, 2, 3 },
+                .sep_qkvz => &.{ 0, 1 },
+                .sep_ab => &.{ 2, 3 },
+                else => &.{},
+            };
+            const stk: []const usize = switch (arm) {
+                .stacked => &.{ 0, 1 },
+                .stk_qkvz => &.{0},
+                .stk_ab => &.{1},
+                else => &.{},
+            };
+            for (0..layers) |_| {
+                for (sep) |i| try one(vec, x, q[i].w, q[i].sc, q[i].bi, b[i], st);
+                for (stk) |p| try one(vec, x, fr[p].w, fr[p].s, fr[p].b, b[p * 2], st);
+            }
+            // The graph is lazy: only the GPU work is inside the clock.
+            var sw = io_util.Stopwatch.init(io);
+            try mlx.check(mlx.mlx_eval(vec));
+            return @as(f64, @floatFromInt(sw.read())) / 1e6;
+        }
+    }.f;
+    prefill_dq_gemm_override = true;
+    defer prefill_dq_gemm_override = null;
+    const n_arms = std.enums.values(Arm).len;
+    std.debug.print("\n[gdn-stack-ubench] {s:>5} {s:>9} {s:>12} {s:>11} {s:>8}\n", .{ "M", "arm", "ms/layer", "chain20_ms", "vs_sep" });
+    for ([_]c_int{ 2048, 8192 }) |m| {
+        const x = try gdnStackTestX(allocator, rnd, s, 1, m, GDN_STACK_TEST_K);
+        defer _ = mlx.mlx_array_free(x);
+        var lo_min: [n_arms]f64 = @splat(std.math.inf(f64));
+        var hi_min: [n_arms]f64 = @splat(std.math.inf(f64));
+        for (0..REPS + 1) |rep| {
+            // Interleaved, order rotating per rep; rep 0 warms every arm and
+            // the allocator cache, as a serving process would have it.
+            for (0..n_arms) |j| {
+                const k = (rep + j) % n_arms;
+                const arm: Arm = @enumFromInt(k);
+                const lo = try runChain(arm, x, LAYERS_LO, &qs, &bits, &fused, s, tio);
+                const hi = try runChain(arm, x, LAYERS_HI, &qs, &bits, &fused, s, tio);
+                if (rep == 0) continue;
+                lo_min[k] = @min(lo_min[k], lo);
+                hi_min[k] = @min(hi_min[k], hi);
+            }
+        }
+        _ = mlx.mlx_clear_cache();
+        var marg: [n_arms]f64 = undefined;
+        for (0..n_arms) |k| marg[k] = (hi_min[k] - lo_min[k]) / @as(f64, LAYERS_HI - LAYERS_LO);
+        for (0..n_arms) |k| {
+            const base = marg[k - k % 2];
+            std.debug.print("[gdn-stack-ubench] {d:>5} {s:>9} {d:>12.4} {d:>11.2} {d:>7.2}%\n", .{ m, @tagName(@as(Arm, @enumFromInt(k))), marg[k], hi_min[k], (marg[k] / base - 1.0) * 100.0 });
         }
     }
 }
