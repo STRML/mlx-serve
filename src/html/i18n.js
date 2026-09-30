@@ -145,6 +145,7 @@
     "Process": "进程",
     "global": "全局",
     "Request": "请求",
+    "Client": "客户端",
     "Elapsed": "已用时间",
     "Queue wait": "排队时间",
     "Prompt / cached / output": "输入 / 缓存 / 输出",

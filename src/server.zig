@@ -347,10 +347,15 @@ pub const Conn = struct {
     monitor_inference_request: bool = false,
     monitor_slot_started: bool = false,
     monitor_rejection_recorded: bool = false,
+    /// TCP peer (set at accept) plus the current request's User-Agent.
+    client: instr.Client = .{},
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
         c.io = io;
+        c.client = .{};
+        var peer_buf: [64]u8 = undefined;
+        c.client.setPeer(std.fmt.bufPrint(&peer_buf, "{f}", .{stream.socket.address}) catch "");
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
@@ -360,6 +365,11 @@ pub const Conn = struct {
         c.monitor_slot_started = false;
         c.monitor_rejection_recorded = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
+    }
+
+    /// Replaces the previous request's User-Agent, so a request without one never inherits it.
+    pub fn noteRequestHeaders(c: *Conn, headers: []const u8) void {
+        c.client.setUserAgent(findHeaderValue(headers, "user-agent") orelse "");
     }
 
     /// True when the connection has been silent long enough that a streaming
@@ -2220,6 +2230,7 @@ fn handleConnection(
     // boundary lets us find (`parseModelFromRequest`).
     const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
     logHttpRequest(method, raw_path, request_body);
+    stream.noteRequestHeaders(request[0..header_end_pos]);
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
     //    requires the key (the OpenAI/Anthropic/Ollama APIs AND the index page
@@ -2305,7 +2316,8 @@ fn handleConnection(
             var sessions: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
             const extra = try monitorExtrasJson(allocator, stream.io, registry, m);
             defer allocator.free(extra);
-            try instr.renderJsonWithExtras(m, liveSessions(registry, &sessions), &out.writer, extra);
+            const show_clients = clientFieldsVisible(g_api_key != null, peerIsLoopback(stream));
+            try instr.renderJsonWithExtras(m, liveSessions(registry, &sessions), &out.writer, extra, show_clients);
             // Quiet: the index panel polls this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
@@ -9631,6 +9643,7 @@ fn handleStreamingCompletion(
         .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, null),
         .logprobs_n = logprobs_n,
         .cache_key = cache_key,
+        .client = stream.client,
     });
     stream.monitor_slot_started = true;
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
@@ -9896,6 +9909,7 @@ fn nonStreamingViaScheduler(
         .vision_embeddings = vision_embeddings,
         .media = media,
         .cache_key = cache_key,
+        .client = if (conn) |c| c.client else .{},
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -10864,6 +10878,7 @@ fn handleStreamingGeneration(
         .vision_embeddings = slot_ve_s,
         .media = media,
         .cache_key = cache_key,
+        .client = stream.client,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -12374,6 +12389,12 @@ test "apiKeyGateApplies: strict removes exactly the loopback exemption" {
 
 fn peerIsLoopback(conn: *const Conn) bool {
     return ipIsLoopback(conn.stream.socket.address);
+}
+
+/// `/metrics.json` names each request's client only to a local reader or when an API key
+/// guards the feed; a keyless server on a LAN would otherwise hand every peer's address out.
+fn clientFieldsVisible(key_set: bool, reader_loopback: bool) bool {
+    return key_set or reader_loopback;
 }
 
 /// True when the LAN-share gate governs this request: sharing on, keyless
@@ -16008,6 +16029,7 @@ fn handleAnthropicStreaming(
         .vision_embeddings = slot_ve_anth,
         .media = media,
         .cache_key = cache_key,
+        .client = stream.client,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -17586,6 +17608,7 @@ fn handleResponsesInner(
             .vision_embeddings = slot_ve_resp,
             .media = mm.media,
             .cache_key = cache_key,
+            .client = stream.client,
             .mrope_pos = slot_mrope.pos,
             .mrope_total = slot_mrope.total,
             .mrope_delta = slot_mrope.delta,
@@ -24330,4 +24353,25 @@ test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints"
     try t.expectEqual(kv_only + retainedSsmCheckpointBytes(&cfg, ctx, 0, chunk), entry);
     // The defaulted ask covers the whole entry, so the commit path never trims it.
     try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
+}
+
+test "Conn names its peer at setup and each request replaces the User-Agent" {
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 9 }, .port = 4242 } };
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = -1, .address = peer } }, std.Io.Threaded.global_single_threaded.io());
+    try std.testing.expectEqualStrings("10.0.0.9:4242", conn.client.peer());
+    try std.testing.expectEqualStrings("", conn.client.userAgent());
+
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nUser-Agent: claude-cli/2.1\r\n\r\n");
+    try std.testing.expectEqualStrings("claude-cli/2.1", conn.client.userAgent());
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n");
+    try std.testing.expectEqualStrings("", conn.client.userAgent());
+    try std.testing.expectEqualStrings("10.0.0.9:4242", conn.client.peer());
+}
+
+test "clientFieldsVisible: loopback readers and keyed servers only" {
+    try std.testing.expect(clientFieldsVisible(false, true));
+    try std.testing.expect(clientFieldsVisible(true, false));
+    try std.testing.expect(clientFieldsVisible(true, true));
+    try std.testing.expect(!clientFieldsVisible(false, false));
 }

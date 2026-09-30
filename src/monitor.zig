@@ -33,6 +33,48 @@ const Name = struct {
     }
 };
 
+/// Who sent a request: TCP peer and User-Agent, fixed buffers so the publish path never allocates.
+pub const Client = struct {
+    peer_buf: [64]u8 = undefined,
+    peer_len: u8 = 0,
+    user_agent_buf: [96]u8 = undefined,
+    user_agent_len: u8 = 0,
+
+    pub fn setPeer(self: *Client, text: []const u8) void {
+        const n = @min(text.len, self.peer_buf.len);
+        @memcpy(self.peer_buf[0..n], text[0..n]);
+        self.peer_len = @intCast(n);
+    }
+
+    /// Truncates on a UTF-8 boundary so the JSON stays valid.
+    pub fn setUserAgent(self: *Client, text: []const u8) void {
+        var n = @min(text.len, self.user_agent_buf.len);
+        while (n > 0 and n < text.len and text[n] & 0xC0 == 0x80) n -= 1;
+        @memcpy(self.user_agent_buf[0..n], text[0..n]);
+        self.user_agent_len = @intCast(n);
+    }
+
+    pub fn peer(self: *const Client) []const u8 {
+        return self.peer_buf[0..self.peer_len];
+    }
+
+    pub fn userAgent(self: *const Client) []const u8 {
+        return self.user_agent_buf[0..self.user_agent_len];
+    }
+};
+
+/// Appends `,"peer":..,"user_agent":..` for the fields that are known.
+pub fn writeClient(w: *std.Io.Writer, client: *const Client) !void {
+    if (client.peer_len > 0) {
+        try w.writeAll(",\"peer\":");
+        try std.json.Stringify.encodeJsonString(client.peer(), .{}, w);
+    }
+    if (client.user_agent_len > 0) {
+        try w.writeAll(",\"user_agent\":");
+        try std.json.Stringify.encodeJsonString(client.userAgent(), .{}, w);
+    }
+}
+
 pub const Phase = enum { queued, prefill, decode };
 pub const Outcome = enum { success, cancelled, failed, rejected };
 
@@ -46,6 +88,7 @@ pub const ActiveRequest = struct {
     prompt_tokens: ?u32 = null,
     cached_tokens: ?u32 = null,
     output_tokens: ?u32 = null,
+    client: Client = .{},
 };
 
 pub const Request = struct {
@@ -63,6 +106,7 @@ pub const Request = struct {
     prompt_tokens: u32 = 0,
     output_tokens: u32 = 0,
     cached_tokens: u32 = 0,
+    client: Client = .{},
 };
 
 pub const CompletionInput = struct {
@@ -337,15 +381,27 @@ pub const Monitor = struct {
         }
     }
 
+    pub fn updateRequestClient(self: *Monitor, id: u64, client: Client) void {
+        self.lock();
+        defer self.unlock();
+        for (self.active[0..self.active_len]) |*request| {
+            if (request.id != id) continue;
+            request.client = client;
+            break;
+        }
+    }
+
     pub fn completeRequest(self: *Monitor, input: CompletionInput) void {
         self.lock();
         defer self.unlock();
+        var client: Client = .{};
         if (input.outcome == .success) if (input.ttft_ns) |ns| {
             self.ttft_ns_sum += ns;
             self.ttft_count += 1;
         };
         for (self.active[0..self.active_len], 0..) |request, i| {
             if (request.id != input.id) continue;
+            client = request.client;
             self.active_len -= 1;
             self.active[i] = self.active[self.active_len];
             break;
@@ -366,6 +422,7 @@ pub const Monitor = struct {
             .prompt_tokens = input.prompt_tokens,
             .output_tokens = input.output_tokens,
             .cached_tokens = input.cached_tokens,
+            .client = client,
         };
         self.request_next = (self.request_next + 1) % request_capacity;
         var total: ?*ModelTotal = null;
@@ -484,7 +541,7 @@ pub const Monitor = struct {
         return result;
     }
 
-    pub fn renderJson(self: *Monitor, w: *std.Io.Writer, extra_fields: []const u8) !void {
+    pub fn renderJson(self: *Monitor, w: *std.Io.Writer, extra_fields: []const u8, show_clients: bool) !void {
         const snapshot_value = self.snapshot();
         try w.print("{{\"schema_version\":1,\"retention\":{{\"history_seconds\":3600,\"archive_capacity\":{d},\"archive_compacted\":{},\"archive_sample_interval_ms\":{d},\"request_capacity\":256,\"event_capacity\":128,\"model_capacity\":64,\"requests_dropped\":{d},\"events_dropped\":{d},\"active_dropped\":{d},\"model_untracked_requests\":{d}}},\"active_requests\":[", .{ archive_capacity, snapshot_value.archive_compacted, snapshot_value.archive_sample_interval_ms, snapshot_value.requests_dropped, snapshot_value.events_dropped, snapshot_value.active_dropped, snapshot_value.model_untracked_requests });
         for (snapshot_value.active[0..snapshot_value.active_len], 0..) |request, i| {
@@ -499,6 +556,7 @@ pub const Monitor = struct {
             try writeOptional(w, request.cached_tokens);
             try w.writeAll(",\"output_tokens\":");
             try writeOptional(w, request.output_tokens);
+            if (show_clients) try writeClient(w, &request.client);
             try w.writeAll("}");
         }
         try w.writeAll("],\"recent_requests\":[");
@@ -516,7 +574,9 @@ pub const Monitor = struct {
             try writeOptional(w, request.decode_ms);
             try w.writeAll(",\"ttft_ms\":");
             try writeOptional(w, request.ttft_ms);
-            try w.print(",\"e2e_ms\":{d},\"prompt_tokens\":{d},\"output_tokens\":{d},\"cached_tokens\":{d}}}", .{ request.e2e_ms, request.prompt_tokens, request.output_tokens, request.cached_tokens });
+            try w.print(",\"e2e_ms\":{d},\"prompt_tokens\":{d},\"output_tokens\":{d},\"cached_tokens\":{d}", .{ request.e2e_ms, request.prompt_tokens, request.output_tokens, request.cached_tokens });
+            if (show_clients) try writeClient(w, &request.client);
+            try w.writeAll("}");
         }
         try w.writeAll("],\"history\":[");
         for (snapshot_value.history[0..snapshot_value.history_len], 0..) |sample, i| {
@@ -726,7 +786,7 @@ test "JSON escapes metadata and keeps unavailable measurements null" {
     monitor.appendSample(.{ .at_ms = 105 });
     var output = std.Io.Writer.Allocating.init(testing.allocator);
     defer output.deinit();
-    try monitor.renderJson(&output.writer, "");
+    try monitor.renderJson(&output.writer, "", false);
     const json = try std.json.parseFromSlice(std.json.Value, testing.allocator, output.written(), .{});
     defer json.deinit();
     const requests = json.value.object.get("recent_requests").?.array.items;
@@ -751,7 +811,7 @@ test "JSON history preserves sampled cache and TTFT totals" {
     monitor.appendSample(.{ .at_ms = 100, .cache_queries_total = 12, .cache_hits_total = 7, .ttft_ns_sum = 123_000_000, .ttft_count = 3, .prefill_active_ns_total = 1_200, .decode_active_ns_total = 800 });
     var output = std.Io.Writer.Allocating.init(testing.allocator);
     defer output.deinit();
-    try monitor.renderJson(&output.writer, "");
+    try monitor.renderJson(&output.writer, "", false);
     const json = try std.json.parseFromSlice(std.json.Value, testing.allocator, output.written(), .{});
     defer json.deinit();
     const sample = json.value.object.get("history").?.array.items[0].object;
@@ -772,7 +832,7 @@ test "JSON archive and lifetime totals preserve compacted samples" {
     });
     var output = std.Io.Writer.Allocating.init(testing.allocator);
     defer output.deinit();
-    try monitor.renderJson(&output.writer, "");
+    try monitor.renderJson(&output.writer, "", false);
     const json = try std.json.parseFromSlice(std.json.Value, testing.allocator, output.written(), .{});
     defer json.deinit();
     const root = json.value.object;
@@ -878,10 +938,52 @@ test "processing clock reports unavailable if a write cannot finish" {
     monitor.appendSample(.{ .at_ms = 1_000, .prefill_active_ns_total = null, .decode_active_ns_total = null });
     var output = std.Io.Writer.Allocating.init(testing.allocator);
     defer output.deinit();
-    try monitor.renderJson(&output.writer, "");
+    try monitor.renderJson(&output.writer, "", false);
     const json = try std.json.parseFromSlice(std.json.Value, testing.allocator, output.written(), .{});
     defer json.deinit();
     const sample = json.value.object.get("history").?.array.items[0].object;
     try testing.expect(sample.get("prefill_active_ns_total").? == .null);
     try testing.expect(sample.get("decode_active_ns_total").? == .null);
+}
+
+test "monitor rows name their client only when the reader may see it" {
+    const testing = std.testing;
+    var monitor = Monitor.init();
+    var client: Client = .{};
+    client.setPeer("192.168.1.7:51234");
+    client.setUserAgent("claude-cli/2.1 \"x\"");
+    const done = monitor.beginRequest("m", 1);
+    monitor.updateRequestClient(done, client);
+    monitor.completeRequest(.{ .id = done, .model = "m", .outcome = .success, .started_at_ms = 1, .finished_at_ms = 2 });
+    const live = monitor.beginRequest("m", 3);
+    monitor.updateRequestClient(live, client);
+    _ = monitor.beginRequest("m", 4);
+
+    for ([_]bool{ true, false }) |show| {
+        var output = std.Io.Writer.Allocating.init(testing.allocator);
+        defer output.deinit();
+        try monitor.renderJson(&output.writer, "", show);
+        const json = try std.json.parseFromSlice(std.json.Value, testing.allocator, output.written(), .{});
+        defer json.deinit();
+        const active = json.value.object.get("active_requests").?.array.items;
+        const recent = json.value.object.get("recent_requests").?.array.items;
+        for ([_]std.json.ObjectMap{ active[0].object, recent[0].object }) |row| {
+            try testing.expectEqual(show, row.get("peer") != null);
+            try testing.expectEqual(show, row.get("user_agent") != null);
+            if (show) {
+                try testing.expectEqualStrings("192.168.1.7:51234", row.get("peer").?.string);
+                try testing.expectEqualStrings("claude-cli/2.1 \"x\"", row.get("user_agent").?.string);
+            }
+        }
+        try testing.expect(active[1].object.get("peer") == null);
+    }
+}
+
+test "Client truncates a long User-Agent on a UTF-8 boundary" {
+    var c: Client = .{};
+    var ua: [100]u8 = @splat('a');
+    ua[95] = 0xc3;
+    ua[96] = 0xa9;
+    c.setUserAgent(&ua);
+    try std.testing.expectEqual(@as(usize, 95), c.userAgent().len);
 }

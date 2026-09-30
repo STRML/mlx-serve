@@ -195,6 +195,11 @@ function monitorNearestPoint(series, start, end, x, y, max) {
   return distance <= 28 ? best : null;
 }
 function monitorEscape(v) { return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+// The server sends peer/user_agent only to a local reader or when an API key is set.
+function monitorClientCell(r) {
+  const caption = r.user_agent ? '<div class="monitor-caption">' + monitorEscape(r.user_agent) + '</div>' : '';
+  return r.peer || caption ? monitorEscape(r.peer) + caption : '—';
+}
 function monitorFormatTTFT(valueMs) {
   if (!Number.isFinite(valueMs)) return '—';
   return valueMs>=1000?(valueMs/1000).toLocaleString(undefined,{maximumFractionDigits:1})+' s':valueMs.toLocaleString(undefined,{maximumFractionDigits:1})+' ms';
@@ -207,7 +212,7 @@ function monitorChartTimeLabel(at, start, end, tooltip=false) {
   if(tooltip)options.second='2-digit';
   return new Date(at).toLocaleString(undefined,options);
 }
-if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = { computeRates, panelAt, monitorWindow, monitorHistory, monitorValidPair, monitorWindowCounters, monitorWindowActiveRate, monitorWindowGauge, monitorWindowMemory, monitorLifetime, monitorWindowTTFT, monitorIntervalMeans, monitorGaugeSeries, monitorSeries, monitorNearestPoint, monitorEscape, monitorFormatTTFT, monitorChartTimeLabel };
+if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = { computeRates, panelAt, monitorWindow, monitorHistory, monitorValidPair, monitorWindowCounters, monitorWindowActiveRate, monitorWindowGauge, monitorWindowMemory, monitorLifetime, monitorWindowTTFT, monitorIntervalMeans, monitorGaugeSeries, monitorSeries, monitorNearestPoint, monitorEscape, monitorClientCell, monitorFormatTTFT, monitorChartTimeLabel };
 
 if (typeof document !== 'undefined') (function () {
   const mount = document.getElementById('mlx-metrics');
@@ -343,8 +348,8 @@ if (typeof document !== 'undefined') (function () {
     chart('memory',[{name:'Process',points:monitorGaugeSeries(w.history,'process_bytes',interval).map(p=>({...p,value:p.value==null?null:p.value/1073741824}))}],start,now,'GiB · '+t('global'));
     chart('latency',[{name:'End-to-end',points:w.requests.map(r=>({t:r.finished_at_ms,value:r.e2e_ms}))},{name:'Queue wait',points:w.requests.map(r=>({t:r.finished_at_ms,value:r.queue_ms}))}],start,now,'ms');
     chart('queue',[{name:'Active',points:monitorSeries(w.history,'running')},{name:'Queued',points:monitorSeries(w.history,'queued')}],start,now,t('global'));
-    table('m-active',['Request','Model','Phase','Elapsed','Queue wait','Prompt / cached / output'],active.map(r=>[`<button class="monitor-request" data-request="${esc(r.id)}">${esc(r.id)}</button>`,esc(r.model),label(r.phase),ms(now-r.started_at_ms),ms(r.queue_ms),[r.prompt_tokens,r.cached_tokens,r.output_tokens].map(v=>fmt(v,0)).join(' / ')]),'No active requests');
-    table('m-recent',['Request','Model','Outcome','TTFT','End-to-end','Prompt / cached / output'],w.requests.slice().reverse().map(r=>[`<button class="monitor-request" data-request="${esc(r.id)}">${esc(r.id)}</button>`,esc(r.model),`<span class="monitor-outcome ${r.outcome==='success'?'ok':'other'}">${esc(r.outcome)}</span>${r.error_code?'<div class="monitor-caption">'+esc(r.error_code)+'</div>':''}`,ms(r.ttft_ms),ms(r.e2e_ms),[r.prompt_tokens,r.cached_tokens,r.output_tokens].map(v=>fmt(v,0)).join(' / ')]),'No completed requests in this period');
+    table('m-active',['Request','Model','Client','Phase','Elapsed','Queue wait','Prompt / cached / output'],active.map(r=>[`<button class="monitor-request" data-request="${esc(r.id)}">${esc(r.id)}</button>`,esc(r.model),monitorClientCell(r),label(r.phase),ms(now-r.started_at_ms),ms(r.queue_ms),[r.prompt_tokens,r.cached_tokens,r.output_tokens].map(v=>fmt(v,0)).join(' / ')]),'No active requests');
+    table('m-recent',['Request','Model','Client','Outcome','TTFT','End-to-end','Prompt / cached / output'],w.requests.slice().reverse().map(r=>[`<button class="monitor-request" data-request="${esc(r.id)}">${esc(r.id)}</button>`,esc(r.model),monitorClientCell(r),`<span class="monitor-outcome ${r.outcome==='success'?'ok':'other'}">${esc(r.outcome)}</span>${r.error_code?'<div class="monitor-caption">'+esc(r.error_code)+'</div>':''}`,ms(r.ttft_ms),ms(r.e2e_ms),[r.prompt_tokens,r.cached_tokens,r.output_tokens].map(v=>fmt(v,0)).join(' / ')]),'No completed requests in this period');
     table('m-inventory',['Model','State','Backend','Quantization','Context','Disk','RAM'],inventory.filter(r=>!selected||r.id===selected).map(r=>[esc(r.id),label(r.state||'unknown'),esc(r.backend??r.engine??'—'),esc(r.quantization??(r.quantization_bits!=null?r.quantization_bits+' bit':'—')),fmt(r.context_length,0),bytes(r.bytes_on_disk),bytes(r.bytes_resident)+(r.estimate&&r.estimated_resident_bytes!=null?'<div class="monitor-caption">'+bytes(r.estimated_resident_bytes)+' '+label('(estimate)')+'</div>':'')]),'No models discovered');
     facts('m-resources',[['CPU',res.cpu_pct==null?null:fmt(res.cpu_pct)+'%'],['GPU',res.gpu_pct==null?null:fmt(res.gpu_pct)+'%'],['Process footprint',bytes(res.process_bytes)],['MLX active',bytes(res.mlx_active_bytes)],['MLX reusable pool',bytes(res.mlx_cache_bytes)],['System available / total',bytes(res.system_available_bytes)+' / '+bytes(res.system_total_bytes)],['Memory pressure',res.memory_pressure_pct==null?null:fmt(res.memory_pressure_pct)+'%'],['Swap used',bytes(res.swap_used_bytes)]]);
     facts('m-cache',[['Request hit rate',cache.queries>0?fmt(100*cache.hits/cache.queries)+'%':'—'],['Hits / queries',fmt(cache.hits,0)+' / '+fmt(cache.queries,0)],['Reused tokens',fmt(cache.reused_tokens,0)],['Token reuse',c.prompt_tokens_total>0?fmt(100*c.prefix_cache_tokens_total/c.prompt_tokens_total)+'%':null],['Hot cache / capacity',bytes(cache.hot_bytes)+' / '+bytes(cache.capacity_bytes)],['Entries',cache.entries],['Evictions',cache.evictions]]);

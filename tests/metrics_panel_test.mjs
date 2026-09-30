@@ -544,5 +544,57 @@ test('compacted memory uses observed area and time, excluding missing intervals'
   assert.equal(monitorWindowMemory(h,10000,40000).average,4000);
 });
 
+test('client cell shows the escaped peer over its User-Agent, and a dash when the server withholds them', () => {
+  const cell = globalThis.__mlxPanel.monitorClientCell;
+  assert.equal(cell({}), '—');
+  assert.equal(cell({ peer: '10.0.0.9:4242' }), '10.0.0.9:4242');
+  assert.equal(cell({ peer: '10.0.0.9:4242', user_agent: '<b>curl</b>' }),
+    '10.0.0.9:4242<div class="monitor-caption">&lt;b&gt;curl&lt;/b&gt;</div>');
+  assert.equal(cell({ user_agent: 'curl/8' }), '<div class="monitor-caption">curl/8</div>');
+});
+
+async function renderFeed(feed) {
+  const elements = new Map();
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, {
+      dataset: {}, innerHTML: '', textContent: '', value: id === 'm-window' ? '300000' : '', hidden: false,
+      selectedOptions: [{ textContent: '5m' }],
+      addEventListener() {}, setAttribute() {}, querySelector: () => ({ innerHTML: '' }),
+      getBoundingClientRect: () => ({ width: 0 }), parentElement: { getBoundingClientRect: () => ({}) },
+    });
+    return elements.get(id);
+  };
+  runInNewContext(src, {
+    document: { hidden: false, getElementById: element, addEventListener() {}, createTreeWalker: () => ({ nextNode: () => false }) },
+    NodeFilter: { SHOW_TEXT: 4 }, location: { search: '', hash: '#monitor' },
+    window: { addEventListener() {}, mlxI18n: { t: (key, args = []) => key.replace(/%@/g, () => args.shift()), onChange() {} } },
+    fetch: async () => ({ status: 200, ok: true, json: async () => feed }),
+    setTimeout: () => 0, AbortSignal, URLSearchParams, Date,
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  return element;
+}
+
+const feedWith = fields => {
+  const now = Date.now();
+  const row = { model: 'm', phase: 'decode', outcome: 'success', started_at_ms: now - 2000, finished_at_ms: now - 1000, prompt_tokens: 5, cached_tokens: 1, output_tokens: 2, ...fields };
+  return { counters: {}, gauges: {}, monitor: { server: { sampled_at_ms: now }, active_requests: [{ ...row, id: 1 }], recent_requests: [{ ...row, id: 2 }], history: [], history_archive: [], events: [] } };
+};
+
+for (const [name, fields, shown] of [
+  ['console names the client of active and recent requests', { peer: '192.168.1.7:51234', user_agent: 'claude-cli/2.1' }, true],
+  ['console shows a dash in the client column when the server withholds the fields', {}, false],
+]) {
+  try {
+    const element = await renderFeed(feedWith(fields));
+    for (const id of ['m-active', 'm-recent']) {
+      const html = element(id).innerHTML;
+      assert.match(html, /<th scope="col">Client<\/th>/);
+      assert.equal(html.includes('192.168.1.7:51234') && html.includes('claude-cli/2.1'), shown);
+    }
+    console.log(`  PASS ${name}`);
+  } catch (e) { failures++; console.log(`  FAIL ${name}\n       ${e.message}`); }
+}
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

@@ -303,6 +303,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
 
 pub const MAX_SESSIONS = 32;
 
+pub const Client = monitor_mod.Client;
+
 /// One live request's context occupancy, published by the inference thread.
 /// `context_length` is the model's effective limit, filled at render time by the server.
 pub const Session = struct {
@@ -319,6 +321,9 @@ pub const Session = struct {
     context_length: u32 = 0,
     /// Hot-cache entry id: the entry a live row restored from, or a cached row's own; 0 = none.
     entry_id: u64 = 0,
+    /// Requester of a live row; empty on cached rows. `cache_key` 0 = anonymous.
+    client: Client = .{},
+    cache_key: u64 = 0,
 
     pub fn init(model_id: []const u8, phase: Phase, context_tokens: u32, cached_tokens: u32, generated_tokens: u32, state_bytes: u64) Session {
         var s: Session = .{
@@ -342,10 +347,10 @@ pub const Session = struct {
 /// Write all metrics as a JSON object to `w`.
 /// Called only on the scrape connection thread.
 pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Writer) !void {
-    try renderJsonWithExtras(m, sessions, w, "");
+    try renderJsonWithExtras(m, sessions, w, "", false);
 }
 
-pub fn renderJsonWithExtras(m: *const Metrics, sessions: []const Session, w: *std.Io.Writer, extra_monitor_fields: []const u8) !void {
+pub fn renderJsonWithExtras(m: *const Metrics, sessions: []const Session, w: *std.Io.Writer, extra_monitor_fields: []const u8, show_clients: bool) !void {
     const ns_to_s = 1.0 / 1_000_000_000.0;
 
     try w.print(
@@ -430,12 +435,17 @@ pub fn renderJsonWithExtras(m: *const Metrics, sessions: []const Session, w: *st
         if (i > 0) try w.print(",", .{});
         try w.print("{{\"model\":", .{});
         try std.json.Stringify.encodeJsonString(s.model(), .{}, w);
-        try w.print(",\"phase\":\"{s}\",\"context_tokens\":{d},\"context_length\":{d},\"cached_tokens\":{d},\"generated_tokens\":{d},\"state_bytes\":{d}}}", .{
+        try w.print(",\"phase\":\"{s}\",\"context_tokens\":{d},\"context_length\":{d},\"cached_tokens\":{d},\"generated_tokens\":{d},\"state_bytes\":{d}", .{
             @tagName(s.phase), s.context_tokens, s.context_length, s.cached_tokens, s.generated_tokens, s.state_bytes,
         });
+        if (show_clients) {
+            try monitor_mod.writeClient(w, &s.client);
+            if (s.cache_key != 0) try w.print(",\"cache_key\":\"{x:0>16}\"", .{s.cache_key});
+        }
+        try w.writeAll("}");
     }
     try w.writeAll("],\"monitor\":");
-    try @constCast(&m.monitor).renderJson(w, extra_monitor_fields);
+    try @constCast(&m.monitor).renderJson(w, extra_monitor_fields, show_clients);
     try w.writeAll("}");
 }
 
@@ -979,4 +989,33 @@ test "renderJson lists each live session's context against its model's limit" {
     try testing.expectEqual(@as(i64, 1200), row.get("cached_tokens").?.integer);
     try testing.expectEqual(@as(i64, 200), row.get("generated_tokens").?.integer);
     try testing.expectEqual(@as(i64, 4096), row.get("state_bytes").?.integer);
+}
+
+test "renderJson tags a live session with its client only when clients are shown" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    var live = Session.init("m", .decode, 10, 0, 1, 0);
+    live.client.setPeer("192.168.1.7:51234");
+    live.client.setUserAgent("claude-cli/2.1 \"x\"");
+    live.cache_key = 0xabc;
+    const cached = Session.init("m", .cached, 10, 10, 0, 0);
+
+    for ([_]bool{ true, false }) |show| {
+        var buf: [64 * 1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try renderJsonWithExtras(&m, &.{ live, cached }, &w, "", show);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf[0..w.end], .{});
+        defer parsed.deinit();
+        const rows = parsed.value.object.get("sessions").?.array.items;
+        try testing.expectEqual(show, rows[0].object.get("peer") != null);
+        try testing.expectEqual(show, rows[0].object.get("user_agent") != null);
+        try testing.expectEqual(show, rows[0].object.get("cache_key") != null);
+        if (show) {
+            try testing.expectEqualStrings("192.168.1.7:51234", rows[0].object.get("peer").?.string);
+            try testing.expectEqualStrings("claude-cli/2.1 \"x\"", rows[0].object.get("user_agent").?.string);
+            try testing.expectEqualStrings("0000000000000abc", rows[0].object.get("cache_key").?.string);
+        }
+        try testing.expect(rows[1].object.get("peer") == null);
+        try testing.expect(rows[1].object.get("cache_key") == null);
+    }
 }

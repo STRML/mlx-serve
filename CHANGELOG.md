@@ -33,6 +33,7 @@
 - DFlash2 refuses to load a drafter with an unsupported quantized selector instead of misbehaving (#624). Thanks @brandondyal.
 
 ### Changes
+- `/metrics.json` and the console Monitor name each request's client (peer and User-Agent) for loopback readers and whenever an API key is set; `scripts/mlxtop.py` is a terminal dashboard over the same feed.
 - A model can have a short alias (Model Settings, or `"alias"` in model-settings.json) that works wherever a request names a model, including Ollama, load and unload; `/v1/models` lists it beside the full id (#520, #612). Thanks @lborloz.
 - DFlash on Nemotron-H and dense Qwen3.5/3.8 emits exactly what serial decoding would, sampled requests included, on 4, 6 and 8-bit packs; seeded output with a DFlash drafter differs from earlier versions.
 - A seeded request gives the same text whether or not its prompt hit the prefix cache.
