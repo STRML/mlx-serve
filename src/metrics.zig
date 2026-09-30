@@ -43,7 +43,7 @@ const TOKEN_BOUNDS: [8]u64 = .{ 32, 128, 256, 512, 1024, 2048, 4096, 8192 };
 // ---------------------------------------------------------------------------
 
 /// All instrumented metrics for one mlx-serve instance.
-/// Zero-allocation after init; every field is a lock-free primitive.
+/// Zero-allocation after init; counters use atomics and dashboard records use mutexes.
 pub const Metrics = struct {
     // Latency histograms (observe in nanoseconds; rendered as seconds)
     ttft_ns: Histogram(10), // time to first token
@@ -168,16 +168,13 @@ pub const Metrics = struct {
     }
 
     /// Record per-request metrics at slot completion.
-    /// Called exactly once per request from the `finishSlot` funnel.
+    /// Called once per request from a claim-guarded scheduler completion path.
     ///
-    /// On success ("stop" | "length" | "tool_calls"): updates all latency
-    /// histograms, token histograms, and counters.
+    /// Every outcome records prefix-cache query and hit counts. Success also
+    /// updates latency histograms and token counters.
     ///
-    /// On cancel ("cancelled"): only increments `requests_cancelled_total`.
-    /// Latency histograms are NOT touched — a cancelled slot's decode_ns is
-    /// zero or garbage and would poison the distribution.
-    ///
-    /// Other reasons increment `requests_failed_total`.
+    /// Cancellation and failure increment their outcome counters, but skip
+    /// latency histograms and successful token accounting.
     ///
     /// Parameters:
     ///   - `real_ttft_ns`: time from request arrival (Slot.init, pre-queue-wait)
@@ -190,7 +187,7 @@ pub const Metrics = struct {
     ///   - e2e latency = real_ttft_ns + decode_ns (= queue_wait + prefill + decode).
     pub fn recordRequest(
         self: *Metrics,
-        finish_reason: []const u8,
+        outcome: monitor_mod.Outcome,
         real_ttft_ns: u64,
         prefill_ns: u64,
         decode_ns: u64,
@@ -202,17 +199,17 @@ pub const Metrics = struct {
         self.prefix_cache_queries_total.inc();
         if (cached_tokens > 0) self.prefix_cache_hits_total.inc();
 
-        const is_success = std.mem.eql(u8, finish_reason, "stop") or
-            std.mem.eql(u8, finish_reason, "length") or
-            std.mem.eql(u8, finish_reason, "tool_calls");
-
-        if (!is_success) {
-            if (std.mem.eql(u8, finish_reason, "cancelled")) {
+        switch (outcome) {
+            .success => {},
+            .cancelled => {
                 self.requests_cancelled_total.inc();
-            } else {
+                return;
+            },
+            .failed => {
                 self.requests_failed_total.inc();
-            }
-            return;
+                return;
+            },
+            .rejected => unreachable,
         }
 
         // Success path — record all instrumented metrics.
@@ -637,7 +634,7 @@ test "prefill throughput must exclude cache-restored tokens" {
     // a 91% token-level cache hit rate reported 9.8K tok/s where the server's
     // own log line said ~220-1100. The panel needs the FORWARDED token count.
     var m = Metrics.init();
-    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 1000, 50, 900);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 1000, 50, 900);
 
     // vLLM semantics preserved: every prompt token is billed.
     try testing.expectEqual(@as(u64, 1000), m.prompt_tokens_total.load());
@@ -652,12 +649,12 @@ test "prefill throughput must exclude cache-restored tokens" {
     );
 
     // A cold request (no cache hit) forwards everything.
-    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 400, 10, 0);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 400, 10, 0);
     try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
     try testing.expectEqual(@as(u64, 900), m.prefix_cache_tokens_total.load());
 
     // Degenerate: cached >= prompt must saturate (restore 10, not 99) and never wrap.
-    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 10, 1, 99);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 10, 1, 99);
     try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
     try testing.expectEqual(@as(u64, 910), m.prefix_cache_tokens_total.load());
     // Invariant survives the saturation.
@@ -785,7 +782,7 @@ test "Metrics.recordRequest increments correct fields on success" {
     const testing = std.testing;
     var m = Metrics.init();
     // real_ttft=60ms (includes 10ms queue wait + 50ms prefill), prefill=50ms, decode=200ms
-    m.recordRequest("stop", 60_000_000, 50_000_000, 200_000_000, 128, 64, 20);
+    m.recordRequest(.success, 60_000_000, 50_000_000, 200_000_000, 128, 64, 20);
 
     try testing.expectEqual(@as(u64, 1), m.requests_success_total.load());
     try testing.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
@@ -812,7 +809,7 @@ test "Metrics.recordRequest increments correct fields on success" {
 test "Metrics.recordRequest skips histograms on cancelled request" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.recordRequest("cancelled", 50_000_000, 50_000_000, 0, 128, 0, 0);
+    m.recordRequest(.cancelled, 50_000_000, 50_000_000, 0, 128, 0, 0);
 
     try testing.expectEqual(@as(u64, 0), m.requests_success_total.load());
     try testing.expectEqual(@as(u64, 1), m.requests_cancelled_total.load());
@@ -826,6 +823,20 @@ test "Metrics.recordRequest skips histograms on cancelled request" {
     try testing.expectEqual(@as(u64, 1), m.prefix_cache_queries_total.load());
     // cached_tokens=0 → no hit
     try testing.expectEqual(@as(u64, 0), m.prefix_cache_hits_total.load());
+}
+
+test "Metrics.recordRequest counts failed requests without success observations" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.recordRequest(.failed, 50_000_000, 40_000_000, 10_000_000, 128, 2, 32);
+
+    try testing.expectEqual(@as(u64, 1), m.requests_failed_total.load());
+    try testing.expectEqual(@as(u64, 0), m.requests_success_total.load());
+    try testing.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
+    try testing.expectEqual(@as(u64, 0), m.ttft_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
+    try testing.expectEqual(@as(u64, 1), m.prefix_cache_queries_total.load());
+    try testing.expectEqual(@as(u64, 1), m.prefix_cache_hits_total.load());
 }
 
 test "Histogram.observe places values in the correct bucket" {

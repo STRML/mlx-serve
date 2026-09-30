@@ -1888,8 +1888,7 @@ pub const Scheduler = struct {
         }
 
         if (self.metrics) |m| {
-            const reason: []const u8 = if (slot.finished) slot.finish_reason else if (slot.error_code != null) "error" else "cancelled";
-            recordSlotCompletion(self, m, slot, reason, slot.error_code);
+            recordSlotCompletion(self, m, slot, null);
         }
 
         self.cleanup_queue.append(self.allocator, slot) catch {
@@ -5645,12 +5644,19 @@ fn nsToMs(ns: u64) u64 {
     return ns / std.time.ns_per_ms;
 }
 
-fn recordSlotCompletion(sch: *Scheduler, m: *metrics_mod.Metrics, slot: *Slot, reason: []const u8, error_code: ?[]const u8) void {
+fn slotCompletionOutcome(slot: anytype, latched: ?[]const u8) metrics_mod.monitor_mod.Outcome {
+    if (slot.error_code != null or slot.state == .errored or latched != null) return .failed;
+    if (slot.finished) return .success;
+    if (slot.cancelled.load(.acquire)) return .cancelled;
+    return .success;
+}
+
+fn recordSlotCompletion(sch: *Scheduler, m: *metrics_mod.Metrics, slot: *Slot, latched: ?[]const u8) void {
     if (!metrics_mod.monitor_mod.claimCompletion(&slot.monitor_recorded)) return;
     publishDecodeTokens(m, slot);
-    m.recordRequest(reason, slot.first_token_ns, slot.prefill_ns, slot.decode_ns, slot.prompt_tokens, slot.completion_tokens, slot.cached_tokens);
-    const outcome: metrics_mod.monitor_mod.Outcome = if (std.mem.eql(u8, reason, "cancelled")) .cancelled else if (std.mem.eql(u8, reason, "stop") or std.mem.eql(u8, reason, "length") or std.mem.eql(u8, reason, "tool_calls")) .success else .failed;
-    const code = if (outcome == .failed) error_code orelse reason else "";
+    const outcome = slotCompletionOutcome(slot, latched);
+    m.recordRequest(outcome, slot.first_token_ns, slot.prefill_ns, slot.decode_ns, slot.prompt_tokens, slot.completion_tokens, slot.cached_tokens);
+    const code = if (outcome == .failed) slot.error_code orelse latched orelse "error" else "";
     m.monitor.completeRequest(.{
         .id = slot.monitor_id,
         .model = slot.model.id,
@@ -5707,7 +5713,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
     if (sch.metrics) |m| {
-        recordSlotCompletion(sch, m, slot, if (latched != null) "error" else reason, latched);
+        recordSlotCompletion(sch, m, slot, latched);
     }
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
@@ -9797,6 +9803,33 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
 }
 
+test "slot completion outcome follows slot state, not finish reason" {
+    const StubSlot = struct {
+        state: SlotState = .decoding,
+        finished: bool = false,
+        finish_reason: []const u8 = "future_finish_reason",
+        error_code: ?[]const u8 = null,
+        cancelled: std.atomic.Value(bool) = .init(false),
+    };
+    var slot = StubSlot{};
+    try testing.expectEqual(metrics_mod.monitor_mod.Outcome.success, slotCompletionOutcome(&slot, null));
+
+    slot.cancelled.store(true, .release);
+    try testing.expectEqual(metrics_mod.monitor_mod.Outcome.cancelled, slotCompletionOutcome(&slot, null));
+
+    slot.finished = true;
+    slot.state = .finished;
+    try testing.expectEqual(metrics_mod.monitor_mod.Outcome.success, slotCompletionOutcome(&slot, null));
+
+    slot.error_code = "OutOfMemory";
+    try testing.expectEqual(metrics_mod.monitor_mod.Outcome.failed, slotCompletionOutcome(&slot, null));
+    slot.error_code = null;
+    slot.state = .errored;
+    try testing.expectEqual(metrics_mod.monitor_mod.Outcome.failed, slotCompletionOutcome(&slot, null));
+    slot.state = .finished;
+    try testing.expectEqual(metrics_mod.monitor_mod.Outcome.failed, slotCompletionOutcome(&slot, "MetalFailure"));
+}
+
 test "emitted decode counter survives completion and cancellation without double counting" {
     const StubSlot = struct {
         completion_tokens: u32 = 0,
@@ -9811,20 +9844,20 @@ test "emitted decode counter survives completion and cancellation without double
 
     success.completion_tokens = 5;
     publishDecodeTokens(&m, &success);
-    m.recordRequest("stop", 0, 0, 0, 0, success.completion_tokens, 0);
+    m.recordRequest(.success, 0, 0, 0, 0, success.completion_tokens, 0);
     publishDecodeTokens(&m, &success);
     try testing.expectEqual(@as(u64, 5), m.generation_tokens_emitted_total.load());
 
     var cancelled = StubSlot{ .completion_tokens = 2 };
     publishDecodeTokens(&m, &cancelled);
     cancelled.completion_tokens = 4;
-    m.recordRequest("cancelled", 0, 0, 0, 0, cancelled.completion_tokens, 0);
+    m.recordRequest(.cancelled, 0, 0, 0, 0, cancelled.completion_tokens, 0);
     publishDecodeTokens(&m, &cancelled);
     publishDecodeTokens(&m, &cancelled);
     try testing.expectEqual(@as(u64, 9), m.generation_tokens_emitted_total.load());
 
     var failed = StubSlot{ .completion_tokens = 1 };
-    m.recordRequest("error", 0, 0, 0, 0, failed.completion_tokens, 0);
+    m.recordRequest(.failed, 0, 0, 0, 0, failed.completion_tokens, 0);
     publishDecodeTokens(&m, &failed);
     try testing.expectEqual(@as(u64, 10), m.generation_tokens_emitted_total.load());
 }

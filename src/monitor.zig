@@ -231,6 +231,7 @@ pub const ProcessingClock = struct {
 
 pub const Monitor = struct {
     mutex: std.c.pthread_mutex_t = .{},
+    history_mutex: std.c.pthread_mutex_t = .{},
     next_id: std.atomic.Value(u64) = .init(1),
     active: [active_capacity]ActiveRequest = undefined,
     active_len: usize = 0,
@@ -268,6 +269,14 @@ pub const Monitor = struct {
 
     fn unlock(self: *Monitor) void {
         _ = std.c.pthread_mutex_unlock(&self.mutex);
+    }
+
+    fn lockHistory(self: *Monitor) void {
+        _ = std.c.pthread_mutex_lock(&self.history_mutex);
+    }
+
+    fn unlockHistory(self: *Monitor) void {
+        _ = std.c.pthread_mutex_unlock(&self.history_mutex);
     }
 
     pub fn beginProcessing(self: *Monitor, phase: ProcessingPhase, now_ns: u64) ?ProcessingPhase {
@@ -392,8 +401,8 @@ pub const Monitor = struct {
     }
 
     pub fn appendSample(self: *Monitor, input: Sample) void {
-        self.lock();
-        defer self.unlock();
+        self.lockHistory();
+        defer self.unlockHistory();
         var sample = input;
         if (self.history_len > 0) {
             const previous = self.history[(self.history_next + history_capacity - 1) % history_capacity];
@@ -449,18 +458,10 @@ pub const Monitor = struct {
     pub fn snapshot(self: *Monitor) Snapshot {
         var result: Snapshot = .{};
         self.lock();
-        defer self.unlock();
         result.active_len = self.active_len;
         @memcpy(result.active[0..result.active_len], self.active[0..result.active_len]);
         result.request_len = self.request_len;
         for (0..result.request_len) |i| result.requests[i] = self.requests[(self.request_next + request_capacity - result.request_len + i) % request_capacity];
-        result.history_len = self.history_len;
-        for (0..result.history_len) |i| result.history[i] = self.history[(self.history_next + history_capacity - result.history_len + i) % history_capacity];
-        result.history_archive_len = self.history_archive_len;
-        @memcpy(result.history_archive[0..result.history_archive_len], self.history_archive[0..result.history_archive_len]);
-        result.archive_compacted = self.archive_compacted;
-        result.archive_sample_interval_ms = self.archive_stride * sample_interval_ms;
-        if (result.history_len > 0) result.lifetime_totals = result.history[result.history_len - 1];
         result.event_len = self.event_len;
         for (0..result.event_len) |i| result.events[i] = self.events[(self.event_next + event_capacity - result.event_len + i) % event_capacity];
         result.requests_dropped = self.requests_dropped;
@@ -469,6 +470,17 @@ pub const Monitor = struct {
         result.model_len = self.model_len;
         @memcpy(result.model_totals[0..result.model_len], self.model_totals[0..result.model_len]);
         result.model_untracked_requests = self.model_untracked_requests;
+        self.unlock();
+
+        self.lockHistory();
+        result.history_len = self.history_len;
+        for (0..result.history_len) |i| result.history[i] = self.history[(self.history_next + history_capacity - result.history_len + i) % history_capacity];
+        result.history_archive_len = self.history_archive_len;
+        @memcpy(result.history_archive[0..result.history_archive_len], self.history_archive[0..result.history_archive_len]);
+        result.archive_compacted = self.archive_compacted;
+        result.archive_sample_interval_ms = self.archive_stride * sample_interval_ms;
+        if (result.history_len > 0) result.lifetime_totals = result.history[result.history_len - 1];
+        self.unlockHistory();
         return result;
     }
 
@@ -614,6 +626,50 @@ test "bounded rings retain chronological order and outcome metadata" {
     try testing.expectEqual(@as(u64, 2), snap.events[0].at_ms);
     try testing.expectEqual(@as(u64, 2), snap.events_dropped);
     try testing.expectEqual(@as(usize, 0), snap.active_len);
+}
+
+test "request updates finish while sampled history is locked" {
+    const testing = std.testing;
+    var monitor = Monitor.init();
+    monitor.appendSample(.{ .at_ms = 1000 });
+    const Ctx = struct {
+        monitor: *Monitor,
+        done: *std.atomic.Value(bool),
+
+        fn run(ctx: *@This()) void {
+            const id = ctx.monitor.beginRequest("model", 1000);
+            ctx.monitor.updateRequestPhase(id, .decode, 1010, 10);
+            ctx.monitor.updateRequestTokens(id, 4, 2);
+            ctx.monitor.updateRequestOutput(id, 3);
+            ctx.monitor.completeRequest(.{ .id = id, .model = "model", .outcome = .success, .started_at_ms = 1000, .finished_at_ms = 1020, .ttft_ns = 5_000_000, .output_tokens = 3 });
+            ctx.monitor.recordEvent(.{ .at_ms = 1020, .kind = "completed" });
+            ctx.done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    var ctx = Ctx{ .monitor = &monitor, .done = &done };
+    monitor.lockHistory();
+    const thread = std.Thread.spawn(.{}, Ctx.run, .{&ctx}) catch |err| {
+        monitor.unlockHistory();
+        return err;
+    };
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for (0..500) |_| {
+        if (done.load(.acquire)) break;
+        std.Io.sleep(io, .fromMilliseconds(1), .real) catch {};
+    }
+    const completed_while_history_locked = done.load(.acquire);
+    monitor.unlockHistory();
+    thread.join();
+    try testing.expect(completed_while_history_locked);
+    try testing.expectEqual(@as(u64, 1), monitor.ttftTotals().count);
+    const snap = monitor.snapshot();
+    try testing.expectEqual(@as(usize, 0), snap.active_len);
+    try testing.expectEqual(@as(usize, 1), snap.request_len);
+    try testing.expectEqual(@as(u32, 3), snap.requests[0].output_tokens);
+    try testing.expectEqual(@as(usize, 1), snap.event_len);
+    try testing.expectEqual(@as(usize, 1), snap.history_len);
+    try testing.expectEqual(@as(u64, 1000), snap.lifetime_totals.?.at_ms);
 }
 
 test "archive compacts while retaining start and ordered cumulative samples" {
