@@ -12192,13 +12192,13 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
 test "gauge sampler publishes active output and live prefill history" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var m = instr.Metrics.init();
-    const id = m.monitor.beginRequest("model", @intCast(@max(0, nowMs(io))));
+    const id = m.monitor.beginRequest("model", @intCast(@max(0, nowMs(io))), .{});
     m.prefill_forwarded_live_total.add(11);
     m.prefix_cache_queries_total.add(4);
     m.prefix_cache_hits_total.add(2);
     m.generation_tokens_emitted_total.add(9);
     m.ttft_ns.observe(99_000_000);
-    const finished_id = m.monitor.beginRequest("model", 0);
+    const finished_id = m.monitor.beginRequest("model", 0, .{});
     m.monitor.completeRequest(.{ .id = finished_id, .model = "model", .outcome = .success, .started_at_ms = 0, .finished_at_ms = 50, .ttft_ns = 42_000_000 });
     var scheduler: scheduler_mod.Scheduler = undefined;
     scheduler.io = io;

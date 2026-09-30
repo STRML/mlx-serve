@@ -1832,8 +1832,7 @@ pub const Scheduler = struct {
         };
         self.in_flight += 1;
         if (self.metrics) |m| {
-            slot.monitor_id = m.monitor.beginRequest(slot.model.id, slot.request_start_ms);
-            m.monitor.updateRequestClient(slot.monitor_id, slot.client);
+            slot.monitor_id = m.monitor.beginRequest(slot.model.id, slot.request_start_ms, slot.client);
         }
         self.queue_cond.broadcast(self.io);
         return slot;

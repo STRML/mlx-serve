@@ -335,12 +335,12 @@ pub const Monitor = struct {
         return self.processing_clock.snapshot(now_ns);
     }
 
-    pub fn beginRequest(self: *Monitor, model: []const u8, started_at_ms: u64) u64 {
+    pub fn beginRequest(self: *Monitor, model: []const u8, started_at_ms: u64, client: Client) u64 {
         const id = self.next_id.fetchAdd(1, .monotonic);
         self.lock();
         defer self.unlock();
         if (self.active_len < active_capacity) {
-            self.active[self.active_len] = .{ .id = id, .model = Name.from(model), .started_at_ms = started_at_ms, .phase_started_at_ms = started_at_ms };
+            self.active[self.active_len] = .{ .id = id, .model = Name.from(model), .started_at_ms = started_at_ms, .phase_started_at_ms = started_at_ms, .client = client };
             self.active_len += 1;
         } else {
             self.active_dropped += 1;
@@ -377,16 +377,6 @@ pub const Monitor = struct {
         for (self.active[0..self.active_len]) |*request| {
             if (request.id != id) continue;
             request.output_tokens = output_tokens;
-            break;
-        }
-    }
-
-    pub fn updateRequestClient(self: *Monitor, id: u64, client: Client) void {
-        self.lock();
-        defer self.unlock();
-        for (self.active[0..self.active_len]) |*request| {
-            if (request.id != id) continue;
-            request.client = client;
             break;
         }
     }
@@ -670,7 +660,7 @@ test "bounded rings retain chronological order and outcome metadata" {
     const testing = std.testing;
     var monitor = Monitor.init();
     for (0..request_capacity + 3) |i| {
-        const id = monitor.beginRequest("m", @intCast(i));
+        const id = monitor.beginRequest("m", @intCast(i), .{});
         monitor.completeRequest(.{ .id = id, .model = "m", .outcome = if (i % 2 == 0) .success else .failed, .started_at_ms = @intCast(i), .finished_at_ms = @intCast(i + 1) });
     }
     for (0..history_capacity + 2) |i| monitor.appendSample(.{ .at_ms = @intCast(i) });
@@ -697,7 +687,7 @@ test "request updates finish while sampled history is locked" {
         done: *std.atomic.Value(bool),
 
         fn run(ctx: *@This()) void {
-            const id = ctx.monitor.beginRequest("model", 1000);
+            const id = ctx.monitor.beginRequest("model", 1000, .{});
             ctx.monitor.updateRequestPhase(id, .decode, 1010, 10);
             ctx.monitor.updateRequestTokens(id, 4, 2);
             ctx.monitor.updateRequestOutput(id, 3);
@@ -781,7 +771,7 @@ test "memory integral skips missing and gapped pairs and continuity marks counte
 test "JSON escapes metadata and keeps unavailable measurements null" {
     const testing = std.testing;
     var monitor = Monitor.init();
-    const id = monitor.beginRequest("model\"\\", 100);
+    const id = monitor.beginRequest("model\"\\", 100, .{});
     monitor.completeRequest(.{ .id = id, .model = "model\"\\", .outcome = .failed, .error_code = "bad\ncode", .started_at_ms = 100, .finished_at_ms = 105 });
     monitor.appendSample(.{ .at_ms = 105 });
     var output = std.Io.Writer.Allocating.init(testing.allocator);
@@ -848,20 +838,20 @@ test "TTFT totals update as one successful completion pair" {
     const testing = std.testing;
     var monitor = Monitor.init();
     var recorded = std.atomic.Value(bool).init(false);
-    const first = monitor.beginRequest("model", 0);
+    const first = monitor.beginRequest("model", 0, .{});
     if (claimCompletion(&recorded)) monitor.completeRequest(.{ .id = first, .model = "model", .outcome = .success, .started_at_ms = 0, .finished_at_ms = 1, .ttft_ns = 100_000_000 });
     if (claimCompletion(&recorded)) monitor.completeRequest(.{ .id = first, .model = "model", .outcome = .success, .started_at_ms = 0, .finished_at_ms = 1, .ttft_ns = 100_000_000 });
     try testing.expectEqualDeep(TtftTotals{ .ns_sum = 100_000_000, .count = 1 }, monitor.ttftTotals());
 
-    const cancelled = monitor.beginRequest("model", 2);
+    const cancelled = monitor.beginRequest("model", 2, .{});
     monitor.completeRequest(.{ .id = cancelled, .model = "model", .outcome = .cancelled, .started_at_ms = 2, .finished_at_ms = 3, .ttft_ns = 200_000_000 });
-    const failed = monitor.beginRequest("model", 4);
+    const failed = monitor.beginRequest("model", 4, .{});
     monitor.completeRequest(.{ .id = failed, .model = "model", .outcome = .failed, .started_at_ms = 4, .finished_at_ms = 5, .ttft_ns = 300_000_000 });
-    const unknown = monitor.beginRequest("model", 6);
+    const unknown = monitor.beginRequest("model", 6, .{});
     monitor.completeRequest(.{ .id = unknown, .model = "model", .outcome = .success, .started_at_ms = 6, .finished_at_ms = 7 });
     try testing.expectEqualDeep(TtftTotals{ .ns_sum = 100_000_000, .count = 1 }, monitor.ttftTotals());
 
-    const second = monitor.beginRequest("model", 8);
+    const second = monitor.beginRequest("model", 8, .{});
     monitor.completeRequest(.{ .id = second, .model = "model", .outcome = .success, .started_at_ms = 8, .finished_at_ms = 9, .ttft_ns = 250_000_000 });
     try testing.expectEqualDeep(TtftTotals{ .ns_sum = 350_000_000, .count = 2 }, monitor.ttftTotals());
 }
@@ -869,7 +859,7 @@ test "TTFT totals update as one successful completion pair" {
 test "request phases keep queue duration and model totals count each outcome" {
     const testing = std.testing;
     var monitor = Monitor.init();
-    const first = monitor.beginRequest("model-a", 100);
+    const first = monitor.beginRequest("model-a", 100, .{});
     monitor.updateRequestPhase(first, .prefill, 130, 30);
     monitor.updateRequestTokens(first, 80, 20);
     monitor.updateRequestOutput(first, 3);
@@ -880,9 +870,9 @@ test "request phases keep queue duration and model totals count each outcome" {
     try testing.expectEqual(@as(?u32, 80), active.active[0].prompt_tokens);
     try testing.expectEqual(@as(?u32, 3), active.active[0].output_tokens);
     monitor.completeRequest(.{ .id = first, .model = "model-a", .outcome = .success, .started_at_ms = 100, .finished_at_ms = 210, .queue_ms = 30, .prefill_ms = 50, .decode_ms = 30, .ttft_ms = 80, .prompt_tokens = 80, .output_tokens = 10 });
-    const second = monitor.beginRequest("model-a", 220);
+    const second = monitor.beginRequest("model-a", 220, .{});
     monitor.completeRequest(.{ .id = second, .model = "model-a", .outcome = .cancelled, .started_at_ms = 220, .finished_at_ms = 230 });
-    const third = monitor.beginRequest("model-b", 240);
+    const third = monitor.beginRequest("model-b", 240, .{});
     monitor.completeRequest(.{ .id = third, .model = "model-b", .outcome = .failed, .started_at_ms = 240, .finished_at_ms = 250 });
     active = monitor.snapshot();
     try testing.expectEqual(@as(usize, 0), active.active_len);
@@ -952,12 +942,10 @@ test "monitor rows name their client only when the reader may see it" {
     var client: Client = .{};
     client.setPeer("192.168.1.7:51234");
     client.setUserAgent("claude-cli/2.1 \"x\"");
-    const done = monitor.beginRequest("m", 1);
-    monitor.updateRequestClient(done, client);
+    const done = monitor.beginRequest("m", 1, client);
     monitor.completeRequest(.{ .id = done, .model = "m", .outcome = .success, .started_at_ms = 1, .finished_at_ms = 2 });
-    const live = monitor.beginRequest("m", 3);
-    monitor.updateRequestClient(live, client);
-    _ = monitor.beginRequest("m", 4);
+    _ = monitor.beginRequest("m", 3, client);
+    _ = monitor.beginRequest("m", 4, .{});
 
     for ([_]bool{ true, false }) |show| {
         var output = std.Io.Writer.Allocating.init(testing.allocator);
