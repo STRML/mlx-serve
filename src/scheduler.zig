@@ -284,6 +284,8 @@ pub const SubmitParams = struct {
     media: []const prefix_cache_mod.MediaSpan = &.{},
     /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
     cache_key: u64 = 0,
+    /// Requester, published on the live `/metrics.json` row.
+    client: metrics_mod.Client = .{},
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.
@@ -454,6 +456,7 @@ pub const Slot = struct {
     /// Media items in `full_prompt` (owned): the prefix-cache key of their rows.
     media: []prefix_cache_mod.MediaSpan,
     cache_key: u64 = 0,
+    client: metrics_mod.Client = .{},
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
     restored_entry: u64 = 0,
     skip_prefix_cache: bool = false,
@@ -685,6 +688,7 @@ pub const Slot = struct {
             .vision_embeddings = params.vision_embeddings,
             .media = media_owned,
             .cache_key = params.cache_key,
+            .client = params.client,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
             .mrope_delta = params.mrope_delta,
@@ -4940,6 +4944,8 @@ fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session
     const prompt: u32 = if (phase == .prefill) @intCast(s.full_prompt.len) else s.prompt_tokens;
     sch.live_sessions[sch.live_session_count] = .init(s.model.id, phase, prompt + s.completion_tokens, s.cached_tokens, s.completion_tokens, state_bytes);
     sch.live_sessions[sch.live_session_count].entry_id = s.restored_entry;
+    sch.live_sessions[sch.live_session_count].client = s.client;
+    sch.live_sessions[sch.live_session_count].cache_key = s.cache_key;
     sch.live_session_count += 1;
 }
 

@@ -294,6 +294,36 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
 
 pub const MAX_SESSIONS = 32;
 
+/// Who sent a request: TCP peer and User-Agent, fixed buffers so the publish path never allocates.
+pub const Client = struct {
+    peer_buf: [64]u8 = undefined,
+    peer_len: u8 = 0,
+    user_agent_buf: [96]u8 = undefined,
+    user_agent_len: u8 = 0,
+
+    pub fn setPeer(self: *Client, text: []const u8) void {
+        const n = @min(text.len, self.peer_buf.len);
+        @memcpy(self.peer_buf[0..n], text[0..n]);
+        self.peer_len = @intCast(n);
+    }
+
+    /// Truncates on a UTF-8 boundary so the JSON stays valid.
+    pub fn setUserAgent(self: *Client, text: []const u8) void {
+        var n = @min(text.len, self.user_agent_buf.len);
+        while (n > 0 and n < text.len and text[n] & 0xC0 == 0x80) n -= 1;
+        @memcpy(self.user_agent_buf[0..n], text[0..n]);
+        self.user_agent_len = @intCast(n);
+    }
+
+    pub fn peer(self: *const Client) []const u8 {
+        return self.peer_buf[0..self.peer_len];
+    }
+
+    pub fn userAgent(self: *const Client) []const u8 {
+        return self.user_agent_buf[0..self.user_agent_len];
+    }
+};
+
 /// One live request's context occupancy, published by the inference thread.
 /// `context_length` is the model's effective limit, filled at render time by the server.
 pub const Session = struct {
@@ -309,6 +339,9 @@ pub const Session = struct {
     context_length: u32 = 0,
     /// Hot-cache entry id: the entry a live row restored from, or a cached row's own; 0 = none.
     entry_id: u64 = 0,
+    /// Requester of a live row; empty on cached rows. `cache_key` 0 = anonymous.
+    client: Client = .{},
+    cache_key: u64 = 0,
 
     pub fn init(model_id: []const u8, phase: Phase, context_tokens: u32, cached_tokens: u32, generated_tokens: u32, state_bytes: u64) Session {
         var s: Session = .{
@@ -410,9 +443,19 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
         if (i > 0) try w.print(",", .{});
         try w.print("{{\"model\":", .{});
         try std.json.Stringify.encodeJsonString(s.model(), .{}, w);
-        try w.print(",\"phase\":\"{s}\",\"context_tokens\":{d},\"context_length\":{d},\"cached_tokens\":{d},\"generated_tokens\":{d},\"state_bytes\":{d}}}", .{
+        try w.print(",\"phase\":\"{s}\",\"context_tokens\":{d},\"context_length\":{d},\"cached_tokens\":{d},\"generated_tokens\":{d},\"state_bytes\":{d}", .{
             @tagName(s.phase), s.context_tokens, s.context_length, s.cached_tokens, s.generated_tokens, s.state_bytes,
         });
+        if (s.client.peer_len > 0) {
+            try w.print(",\"peer\":", .{});
+            try std.json.Stringify.encodeJsonString(s.client.peer(), .{}, w);
+        }
+        if (s.client.user_agent_len > 0) {
+            try w.print(",\"user_agent\":", .{});
+            try std.json.Stringify.encodeJsonString(s.client.userAgent(), .{}, w);
+        }
+        if (s.cache_key != 0) try w.print(",\"cache_key\":\"{x:0>16}\"", .{s.cache_key});
+        try w.print("}}", .{});
     }
     try w.print("]}}", .{});
 }
@@ -943,4 +986,36 @@ test "renderJson lists each live session's context against its model's limit" {
     try testing.expectEqual(@as(i64, 1200), row.get("cached_tokens").?.integer);
     try testing.expectEqual(@as(i64, 200), row.get("generated_tokens").?.integer);
     try testing.expectEqual(@as(i64, 4096), row.get("state_bytes").?.integer);
+}
+
+test "renderJson tags a live session with its client and omits the fields when unknown" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    var live = Session.init("m", .decode, 10, 0, 1, 0);
+    live.client.setPeer("192.168.1.7:51234");
+    live.client.setUserAgent("claude-cli/2.1 \"x\"");
+    live.cache_key = 0xabc;
+    const cached = Session.init("m", .cached, 10, 10, 0, 0);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &.{ live, cached }, &w);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf[0..w.end], .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("sessions").?.array.items;
+    try testing.expectEqualStrings("192.168.1.7:51234", rows[0].object.get("peer").?.string);
+    try testing.expectEqualStrings("claude-cli/2.1 \"x\"", rows[0].object.get("user_agent").?.string);
+    try testing.expectEqualStrings("0000000000000abc", rows[0].object.get("cache_key").?.string);
+    try testing.expect(rows[1].object.get("peer") == null);
+    try testing.expect(rows[1].object.get("user_agent") == null);
+    try testing.expect(rows[1].object.get("cache_key") == null);
+}
+
+test "Client truncates a long User-Agent on a UTF-8 boundary" {
+    var c: Client = .{};
+    var ua: [100]u8 = @splat('a');
+    ua[95] = 0xc3;
+    ua[96] = 0xa9;
+    c.setUserAgent(&ua);
+    try std.testing.expectEqual(@as(usize, 95), c.userAgent().len);
 }

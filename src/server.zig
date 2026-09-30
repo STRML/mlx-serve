@@ -324,10 +324,15 @@ pub const Conn = struct {
     /// output through `writer()` directly, bypassing this hook — same
     /// interception pattern as `ws_mode`. See src/ollama.zig.
     ollama_sink: ?*ollama_mod.Sink = null,
+    /// TCP peer plus the current request's User-Agent (`handleConnection`).
+    client: instr.Client = .{},
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
         c.io = io;
+        c.client = .{};
+        var peer_buf: [64]u8 = undefined;
+        c.client.setPeer(std.fmt.bufPrint(&peer_buf, "{f}", .{stream.socket.address}) catch "");
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
@@ -2179,6 +2184,7 @@ fn handleConnection(
     // boundary lets us find (`parseModelFromRequest`).
     const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
     logHttpRequest(method, raw_path, request_body);
+    stream.client.setUserAgent(findHeaderValue(request[0..header_end_pos], "user-agent") orelse "");
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
     //    requires the key (the OpenAI/Anthropic/Ollama APIs AND the index page
@@ -9474,6 +9480,7 @@ fn handleStreamingCompletion(
         .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, null),
         .logprobs_n = logprobs_n,
         .cache_key = cache_key,
+        .client = stream.client,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
 
@@ -9738,6 +9745,7 @@ fn nonStreamingViaScheduler(
         .vision_embeddings = vision_embeddings,
         .media = media,
         .cache_key = cache_key,
+        .client = if (conn) |c| c.client else .{},
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -10705,6 +10713,7 @@ fn handleStreamingGeneration(
         .vision_embeddings = slot_ve_s,
         .media = media,
         .cache_key = cache_key,
+        .client = stream.client,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -15736,6 +15745,7 @@ fn handleAnthropicStreaming(
         .vision_embeddings = slot_ve_anth,
         .media = media,
         .cache_key = cache_key,
+        .client = stream.client,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -17313,6 +17323,7 @@ fn handleResponsesInner(
             .vision_embeddings = slot_ve_resp,
             .media = mm.media,
             .cache_key = cache_key,
+            .client = stream.client,
             .mrope_pos = slot_mrope.pos,
             .mrope_total = slot_mrope.total,
             .mrope_delta = slot_mrope.delta,
@@ -24042,4 +24053,14 @@ test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints"
     try t.expectEqual(kv_only + retainedSsmCheckpointBytes(&cfg, ctx, 0, chunk), entry);
     // The defaulted ask covers the whole entry, so the commit path never trims it.
     try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
+}
+
+test "client identity: peer text and User-Agent header land in Client" {
+    var c: instr.Client = .{};
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 9 }, .port = 4242 } };
+    var peer_buf: [64]u8 = undefined;
+    c.setPeer(try std.fmt.bufPrint(&peer_buf, "{f}", .{addr}));
+    c.setUserAgent(findHeaderValue("POST /v1/messages HTTP/1.1\r\nHost: x\r\nUser-Agent: claude-cli/2.1\r\n", "user-agent").?);
+    try std.testing.expectEqualStrings("10.0.0.9:4242", c.peer());
+    try std.testing.expectEqualStrings("claude-cli/2.1", c.userAgent());
 }
