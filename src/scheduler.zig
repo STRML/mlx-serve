@@ -614,6 +614,10 @@ pub const Slot = struct {
     /// caller doesn't consume, `Slot.deinit` frees the contents.
     logprobs_buf: std.ArrayList(generate_mod.LogprobResult),
 
+    fn accountPrefillTime(self: *Slot, elapsed_ns: u64) void {
+        self.prefill_ns = elapsed_ns -| self.prefill_interleaved_ns;
+    }
+
     /// Initialize but do NOT take ownership of caches — those are allocated
     /// inside `init` from the slot's allocator.
     fn init(
@@ -4857,7 +4861,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
                 if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
                 publishPrefillForwardedTo(sch, slot, @as(u64, slot.prompt_tokens) -| slot.cached_tokens);
-                slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
+                slot.accountPrefillTime(prefill_sw.read());
                 if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
                     slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
                 });
@@ -9065,18 +9069,49 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
 
 const testing = std.testing;
 
-test "runPrefill wires the interleave hook and bills its decode ticks out of prefill_ns" {
-    const src = @embedFile("scheduler.zig");
-    // The hook is wired at the ONE Generator construction site, env-gated.
-    const wire = ".interleave" ++ "_hook = if (interleave_ctx.interleave_enabled or observe)";
-    try testing.expect(std.mem.indexOf(u8, src, wire) != null);
-    try testing.expect(std.mem.indexOf(u8, src, ".call = prefillProgressCb") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "if (ic.interleave_enabled) interleaveDecodeTickCb(opaque_ctx);") != null);
-    // Interleaved decode time is charged to the DECODING slots (they got the
-    // tokens), so the prefilling slot's prefill_ns must exclude it or
-    // prefill_tps under-reports on every interleaved prefill.
-    const bill = "slot.prefill_ns = prefill_sw.read() -| slot.prefill_" ++ "interleaved_ns;";
-    try testing.expect(std.mem.indexOf(u8, src, bill) != null);
+test "prefill progress observes without decoding and interleave time is excluded" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var metrics = metrics_mod.Metrics.init();
+    var sch: Scheduler = undefined;
+    sch.io = io;
+    sch.metrics = &metrics;
+    sch.inflight_prefill_tokens = .init(7);
+
+    var slot: Slot = undefined;
+    slot.prefill_accounted_tokens = 0;
+    var ic = InterleaveCtx{
+        .sch = &sch,
+        .slot = &slot,
+        .chunk_sw = io_util.Stopwatch.init(io),
+    };
+    prefillProgressCb(&ic);
+    prefillProgressCb(&ic);
+    try testing.expectEqual(@as(u64, 7), metrics.prefill_forwarded_live_total.load());
+    try testing.expectEqual(@as(u64, 7), slot.prefill_accounted_tokens);
+    try testing.expectEqual(@as(u32, 0), ic.ticks);
+
+    sch.inflight_prefill_tokens.store(12, .monotonic);
+    prefillProgressCb(&ic);
+    try testing.expectEqual(@as(u64, 12), metrics.prefill_forwarded_live_total.load());
+
+    sch.metrics = null;
+    sch.queue_mu = .init;
+    sch.decoding = .empty;
+    sch.resident_live_kv_bytes = .init(0);
+    const cache = try KVCache.init(testing.allocator, 0);
+    slot.cache = cache;
+    defer slot.cache.deinit();
+    slot.ssm_entries = null;
+    ic.interleave_enabled = true;
+    prefillProgressCb(&ic);
+    try testing.expectEqual(@as(u32, 1), ic.ticks);
+    try testing.expectEqual(@as(u64, 0), ic.decode_ns);
+
+    slot.prefill_interleaved_ns = 30;
+    slot.accountPrefillTime(100);
+    try testing.expectEqual(@as(u64, 70), slot.prefill_ns);
+    slot.accountPrefillTime(20);
+    try testing.expectEqual(@as(u64, 0), slot.prefill_ns);
 }
 
 test "modelBatchable rejects MoE / hybrid / encoder / sliding-window" {
