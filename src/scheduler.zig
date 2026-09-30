@@ -576,6 +576,12 @@ pub const Slot = struct {
     /// Monotonic timestamp captured in `Slot.init`, BEFORE the queue wait.
     /// Anchors the exact time-to-first-token measurement.
     request_start_ts: std.Io.Timestamp,
+    request_start_ms: u64 = 0,
+    monitor_id: u64 = 0,
+    monitor_recorded: std.atomic.Value(bool) = .init(false),
+    queue_wait_ns: ?u64 = null,
+    prefill_accounted_tokens: u64 = 0,
+    decode_accounted_tokens: u64 = 0,
     /// Wall-clock nanoseconds from `request_start_ts` (request arrival) to
     /// prefill completion = queue_wait + prefill = real time-to-first-token.
     /// Captured directly when prefill finishes (never derived by subtracting
@@ -746,6 +752,7 @@ pub const Slot = struct {
             .prefill_tps = 0.0,
             .decode_tps = 0.0,
             .request_start_ts = std.Io.Timestamp.now(io, .boot),
+            .request_start_ms = monitorNowMs(io),
             .first_token_ns = 0,
             .prefill_ns = 0,
             .prefill_interleaved_ns = 0,
@@ -1816,6 +1823,7 @@ pub const Scheduler = struct {
             return err;
         };
         self.in_flight += 1;
+        if (self.metrics) |m| slot.monitor_id = m.monitor.beginRequest(slot.model.id, slot.request_start_ms);
         self.queue_cond.broadcast(self.io);
         return slot;
     }
@@ -1873,6 +1881,11 @@ pub const Scheduler = struct {
             self.queue_mu.unlock(self.io);
             while (slot.in_pass.load(.acquire) != 0) std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
             self.queue_mu.lockUncancelable(self.io);
+        }
+
+        if (self.metrics) |m| {
+            const reason: []const u8 = if (slot.finished) slot.finish_reason else if (slot.error_code != null) "error" else "cancelled";
+            recordSlotCompletion(self, m, slot, reason, slot.error_code);
         }
 
         self.cleanup_queue.append(self.allocator, slot) catch {
@@ -4807,6 +4820,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     break;
                 }
                 var prefill_sw = io_util.Stopwatch.init(sch.io);
+                slot.queue_wait_ns = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
+                if (sch.metrics) |m| m.monitor.updateRequestPhase(slot.monitor_id, .prefill, monitorNowMs(sch.io), nsToMs(slot.queue_wait_ns.?));
                 var qsa_gap_retried = false;
                 prefill: while (true) {
                     runPrefill(sch, slot) catch |err| {
@@ -4841,6 +4856,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     break :prefill;
                 }
                 if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
+                publishPrefillForwardedTo(sch, slot, @as(u64, slot.prompt_tokens) -| slot.cached_tokens);
                 slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
                 if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
                     slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
@@ -4850,6 +4866,10 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 // here rather than derived by subtraction in finishSlot, so a
                 // slot that finishes mid-tick can't skew it (metrics TTFT fix).
                 slot.first_token_ns = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
+                if (sch.metrics) |m| {
+                    m.monitor.updateRequestTokens(slot.monitor_id, slot.prompt_tokens, slot.cached_tokens);
+                    m.monitor.updateRequestPhase(slot.monitor_id, .decode, monitorNowMs(sch.io), null);
+                }
                 sch.queue_mu.lockUncancelable(sch.io);
                 sch.decoding.append(sch.allocator, slot) catch |err| {
                     sch.queue_mu.unlock(sch.io);
@@ -4939,6 +4959,7 @@ fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session
     if (sch.live_session_count == sch.live_sessions.len) return;
     const prompt: u32 = if (phase == .prefill) @intCast(s.full_prompt.len) else s.prompt_tokens;
     sch.live_sessions[sch.live_session_count] = .init(s.model.id, phase, prompt + s.completion_tokens, s.cached_tokens, s.completion_tokens, state_bytes);
+    sch.live_sessions[sch.live_session_count].request_id = s.monitor_id;
     sch.live_sessions[sch.live_session_count].entry_id = s.restored_entry;
     sch.live_session_count += 1;
 }
@@ -5612,6 +5633,39 @@ fn logShortGen(slot: *Slot, reason: []const u8) void {
     )});
 }
 
+fn monitorNowMs(io: std.Io) u64 {
+    return @intCast(@max(0, std.Io.Timestamp.now(io, .real).toMilliseconds()));
+}
+
+fn nsToMs(ns: u64) u64 {
+    return ns / std.time.ns_per_ms;
+}
+
+fn recordSlotCompletion(sch: *Scheduler, m: *metrics_mod.Metrics, slot: *Slot, reason: []const u8, error_code: ?[]const u8) void {
+    if (!metrics_mod.monitor_mod.claimCompletion(&slot.monitor_recorded)) return;
+    publishDecodeTokens(m, slot);
+    m.recordRequest(reason, slot.first_token_ns, slot.prefill_ns, slot.decode_ns, slot.prompt_tokens, slot.completion_tokens, slot.cached_tokens);
+    const outcome: metrics_mod.monitor_mod.Outcome = if (std.mem.eql(u8, reason, "cancelled")) .cancelled else if (std.mem.eql(u8, reason, "stop") or std.mem.eql(u8, reason, "length") or std.mem.eql(u8, reason, "tool_calls")) .success else .failed;
+    const code = if (outcome == .failed) error_code orelse reason else "";
+    m.monitor.completeRequest(.{
+        .id = slot.monitor_id,
+        .model = slot.model.id,
+        .outcome = outcome,
+        .error_code = code,
+        .started_at_ms = slot.request_start_ms,
+        .finished_at_ms = monitorNowMs(sch.io),
+        .queue_ms = if (slot.queue_wait_ns) |ns| nsToMs(ns) else null,
+        .prefill_ms = if (slot.first_token_ns != 0) nsToMs(slot.prefill_ns) else null,
+        .decode_ms = if (slot.first_token_ns != 0) nsToMs(slot.decode_ns) else null,
+        .ttft_ms = if (slot.first_token_ns != 0) nsToMs(slot.first_token_ns) else null,
+        .ttft_ns = if (outcome == .success and slot.first_token_ns != 0) slot.first_token_ns else null,
+        .prompt_tokens = slot.prompt_tokens,
+        .output_tokens = slot.completion_tokens,
+        .cached_tokens = slot.cached_tokens,
+    });
+    if (outcome == .failed) m.monitor.recordEvent(.{ .at_ms = monitorNowMs(sch.io), .kind = "request_failed", .model = slot.model.id, .request_id = slot.monitor_id, .code = code });
+}
+
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -5649,15 +5703,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
     if (sch.metrics) |m| {
-        m.recordRequest(
-            if (latched != null) "error" else reason,
-            slot.first_token_ns,
-            slot.prefill_ns,
-            slot.decode_ns,
-            slot.prompt_tokens,
-            slot.completion_tokens,
-            slot.cached_tokens,
-        );
+        recordSlotCompletion(sch, m, slot, if (latched != null) "error" else reason, latched);
     }
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
@@ -5825,6 +5871,8 @@ fn runPrefillLlama(sch: *Scheduler, slot: *Slot, engine: *arch_llama.LlamaEngine
 /// `eval(token)` to extend the session, and stop on max_tokens. Each call
 /// emits exactly one token (unlike PLD/drafter which can emit several).
 fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session) !void {
+    const previous_processing = beginDecodeProcessing(sch);
+    defer endDecodeProcessing(sch, previous_processing);
     const engine = slot.model.ds4_engine.?;
     const next_id: i32 = if (slot.sampling.temperature <= 0.0)
         session.argmax()
@@ -5930,6 +5978,8 @@ test "ds4MtpShouldEngage: >1 draft tokens + greedy (legacy MTP and DSpark)" {
 /// threshold) or sample, check EOS, push token, `eval(token)` to extend the
 /// session, and stop on max_tokens. One token per call.
 fn runLlamaDecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_llama.LlamaSession) !void {
+    const previous_processing = beginDecodeProcessing(sch);
+    defer endDecodeProcessing(sch, previous_processing);
     const engine = slot.model.llama_engine.?;
     const next_id: i32 = if (slot.sampling.temperature < 0.01)
         session.argmax()
@@ -6010,6 +6060,8 @@ fn runPrefillDiffusion(sch: *Scheduler, slot: *Slot) !void {
 /// canvas remainder after EOS is discarded. The runner checks
 /// `slot.cancelled` once per denoising step.
 fn runDiffusionDecodeTick(sch: *Scheduler, slot: *Slot, runner: *diffusion_mod.Runner) !void {
+    const previous_processing = beginDecodeProcessing(sch);
+    defer endDecodeProcessing(sch, previous_processing);
     const result = runner.nextCanvas(slot.allocator) catch |err| switch (err) {
         error.Cancelled => return,
         else => return err,
@@ -6099,6 +6151,7 @@ const InterleaveCtx = struct {
     ticks: u32 = 0,
     /// Wall clock since the previous boundary's ticks ended: the chunk just forwarded.
     chunk_sw: io_util.Stopwatch,
+    interleave_enabled: bool = false,
 };
 
 /// Ticks a DFlash slot must see company before it gives up speculation for the batch.
@@ -6354,6 +6407,27 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     ic.chunk_sw.reset();
 }
 
+fn publishPrefillForwardedTo(sch: *Scheduler, slot: *Slot, forwarded: u64) void {
+    const m = sch.metrics orelse return;
+    const delta = metrics_mod.monitor_mod.forwardedDelta(slot.prefill_accounted_tokens, forwarded);
+    if (delta == 0) return;
+    slot.prefill_accounted_tokens += delta;
+    m.prefill_forwarded_live_total.add(delta);
+}
+
+fn publishDecodeTokens(m: *metrics_mod.Metrics, slot: anytype) void {
+    const delta = metrics_mod.monitor_mod.forwardedDelta(slot.decode_accounted_tokens, slot.completion_tokens);
+    if (delta == 0) return;
+    slot.decode_accounted_tokens += delta;
+    m.generation_tokens_emitted_total.add(delta);
+}
+
+fn prefillProgressCb(opaque_ctx: *anyopaque) void {
+    const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
+    publishPrefillForwardedTo(ic.sch, ic.slot, ic.sch.inflight_prefill_tokens.load(.monotonic));
+    if (ic.interleave_enabled) interleaveDecodeTickCb(opaque_ctx);
+}
+
 /// One decode tick for the streams currently decoding, run from INSIDE a
 /// prefill (between chunks, and between the slots of one admitted batch).
 /// Returns the tick's wall-clock ns (0 when no stream is active). The
@@ -6394,6 +6468,8 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
 }
 
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+    const previous_processing = if (sch.metrics) |m| m.monitor.beginProcessing(.prefill, @intCast(std.Io.Timestamp.now(sch.io, .boot).nanoseconds)) else null;
+    defer if (sch.metrics) |m| m.monitor.endProcessing(previous_processing, @intCast(std.Io.Timestamp.now(sch.io, .boot).nanoseconds));
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
     // so the panel isn't blind until the first chunk lands; the chunk loop in
@@ -6403,6 +6479,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // prefill path executes NO extra instruction at all (the chunk loop's hook
     // is null too — see the `prefill_progress` option below).
     const observe = sch.metrics != null;
+    if (observe) slot.prefill_accounted_tokens = 0;
     if (observe) {
         _ = sch.requests_prefilling.fetchAdd(1, .monotonic);
         sch.queue_mu.lockUncancelable(sch.io);
@@ -6410,6 +6487,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         publishLiveKvResidency(sch, slot);
     }
     defer if (observe) {
+        publishPrefillForwardedTo(sch, slot, sch.inflight_prefill_tokens.load(.monotonic));
         _ = sch.requests_prefilling.fetchSub(1, .monotonic);
         sch.inflight_prefill_tokens.store(0, .monotonic);
         sch.inflight_prefill_expected.store(0, .monotonic);
@@ -6710,7 +6788,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Chunk-boundary decode yields: the hook advances already-decoding
     // streams between this prefill's chunks. Ticks hosted here are billed
     // out of prefill_ns below (the decoding slots got the time).
-    var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .chunk_sw = io_util.Stopwatch.init(sch.io) };
+    var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .chunk_sw = io_util.Stopwatch.init(sch.io), .interleave_enabled = prefillInterleaveEnabled() };
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
     // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
     var width_ctx = ChunkWidthCtx{
@@ -6798,8 +6876,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .cancelled_checkpoint_sink = &slot.cancelled_prefill,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
             .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
-            .interleave_hook = if (prefillInterleaveEnabled())
-                .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
+            .interleave_hook = if (interleave_ctx.interleave_enabled or observe)
+                .{ .ctx = &interleave_ctx, .call = prefillProgressCb }
             else
                 null,
             .write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))
@@ -6871,7 +6949,10 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // every return path — race-free (inference thread owns these slots' fields)
     // and O(active), never per token. Finished slots are excluded, so the last
     // slot's completion drives this to 0 (live == total at rest).
-    defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
+    defer {
+        if (sch.metrics) |m| for (active) |slot| publishDecodeTokens(m, slot);
+        sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
+    }
 
     // Contention discipline for the spec cost model's kv term: it learns
     // from realized round times, and contention only ever ADDS time. Rather
@@ -7048,6 +7129,14 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         }
         start = end;
     }
+}
+
+fn beginDecodeProcessing(sch: *Scheduler) ?metrics_mod.monitor_mod.ProcessingPhase {
+    return if (sch.metrics) |m| m.monitor.beginProcessing(.decode, @intCast(std.Io.Timestamp.now(sch.io, .boot).nanoseconds)) else null;
+}
+
+fn endDecodeProcessing(sch: *Scheduler, previous: ?metrics_mod.monitor_mod.ProcessingPhase) void {
+    if (sch.metrics) |m| m.monitor.endProcessing(previous, @intCast(std.Io.Timestamp.now(sch.io, .boot).nanoseconds));
 }
 
 /// What `runPrefill` arms in a slot's Generator init options.
@@ -7341,6 +7430,8 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     };
 
     if (try loopGuardTick(sch, slot, gen)) return;
+    const previous_processing = beginDecodeProcessing(sch);
+    defer endDecodeProcessing(sch, previous_processing);
     if (Planner.enabled() and slot.planner_force_plain) {
         gen.mtp_hidden_stale = true;
     }
@@ -8210,6 +8301,9 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     var live: [MAX_BATCH_GROUP]*Slot = undefined;
     var n: usize = 0;
     var n_chain: usize = 0;
+    var processing_started = false;
+    var previous_processing: ?metrics_mod.monitor_mod.ProcessingPhase = null;
+    defer if (processing_started) endDecodeProcessing(sch, previous_processing);
     defer for (opens[0..n]) |*o| {
         if (o.chain.drafts.len != 0) o.chain.deinit(live[0].allocator);
     };
@@ -8218,6 +8312,10 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     for (group) |slot| {
         const gen = &slot.legacy_gen.?;
         if (try loopGuardTick(sch, slot, gen)) continue;
+        if (!processing_started) {
+            previous_processing = beginDecodeProcessing(sch);
+            processing_started = true;
+        }
         gen.mtp_batch_head = true;
         const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
             gen.mtp_batch_head = false;
@@ -8464,6 +8562,9 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
     var opens: [MAX_BATCH_GROUP]Generator.MtpRoundOpen = undefined;
     var open_slots: [MAX_BATCH_GROUP]*Slot = undefined;
     var open_n: usize = 0;
+    var processing_started = false;
+    var previous_processing: ?metrics_mod.monitor_mod.ProcessingPhase = null;
+    defer if (processing_started) endDecodeProcessing(sch, previous_processing);
     defer for (opens[0..open_n], open_slots[0..open_n]) |*o, slot| {
         o.chain.deinit(slot.allocator);
     };
@@ -8476,6 +8577,10 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
     for (group) |slot| {
         const gen = &slot.legacy_gen.?;
         if (try loopGuardTick(sch, slot, gen)) continue;
+        if (!processing_started) {
+            previous_processing = beginDecodeProcessing(sch);
+            processing_started = true;
+        }
         gen.mtp_batch_head = true;
         const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
             slot.markError(@errorName(e));
@@ -8831,6 +8936,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         for (batch) |s| try runSingleDecodeTick(sch, s);
         return;
     }
+    const previous_processing = beginDecodeProcessing(sch);
+    defer endDecodeProcessing(sch, previous_processing);
     var want_hidden = false;
     for (batch) |slot| {
         want_hidden = want_hidden or slot.mtp_plain_tick;
@@ -8961,8 +9068,10 @@ const testing = std.testing;
 test "runPrefill wires the interleave hook and bills its decode ticks out of prefill_ns" {
     const src = @embedFile("scheduler.zig");
     // The hook is wired at the ONE Generator construction site, env-gated.
-    const wire = ".interleave" ++ "_hook = if (prefillInterleaveEnabled())";
+    const wire = ".interleave" ++ "_hook = if (interleave_ctx.interleave_enabled or observe)";
     try testing.expect(std.mem.indexOf(u8, src, wire) != null);
+    try testing.expect(std.mem.indexOf(u8, src, ".call = prefillProgressCb") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "if (ic.interleave_enabled) interleaveDecodeTickCb(opaque_ctx);") != null);
     // Interleaved decode time is charged to the DECODING slots (they got the
     // tokens), so the prefilling slot's prefill_ns must exclude it or
     // prefill_tps under-reports on every interleaved prefill.
@@ -9653,6 +9762,38 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
 }
 
+test "emitted decode counter survives completion and cancellation without double counting" {
+    const StubSlot = struct {
+        completion_tokens: u32 = 0,
+        decode_accounted_tokens: u64 = 0,
+    };
+    var m = metrics_mod.Metrics.init();
+    var success = StubSlot{};
+    success.completion_tokens = 3;
+    publishDecodeTokens(&m, &success);
+    publishDecodeTokens(&m, &success);
+    try testing.expectEqual(@as(u64, 3), m.generation_tokens_emitted_total.load());
+
+    success.completion_tokens = 5;
+    publishDecodeTokens(&m, &success);
+    m.recordRequest("stop", 0, 0, 0, 0, success.completion_tokens, 0);
+    publishDecodeTokens(&m, &success);
+    try testing.expectEqual(@as(u64, 5), m.generation_tokens_emitted_total.load());
+
+    var cancelled = StubSlot{ .completion_tokens = 2 };
+    publishDecodeTokens(&m, &cancelled);
+    cancelled.completion_tokens = 4;
+    m.recordRequest("cancelled", 0, 0, 0, 0, cancelled.completion_tokens, 0);
+    publishDecodeTokens(&m, &cancelled);
+    publishDecodeTokens(&m, &cancelled);
+    try testing.expectEqual(@as(u64, 9), m.generation_tokens_emitted_total.load());
+
+    var failed = StubSlot{ .completion_tokens = 1 };
+    m.recordRequest("error", 0, 0, 0, 0, failed.completion_tokens, 0);
+    publishDecodeTokens(&m, &failed);
+    try testing.expectEqual(@as(u64, 10), m.generation_tokens_emitted_total.load());
+}
+
 test "loopStopReason: a degenerate tail cut reports stop, a healthy tail is not cut" {
     // A loop guard is an intentional server stop, not exhaustion of the
     // requested output budget. Reporting "length" makes clients such as pi
@@ -10193,6 +10334,8 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     slot.cancelled = std.atomic.Value(bool).init(false);
     slot.completion_tokens = 0;
     var sch: Scheduler = undefined;
+    sch.io = std.Io.Threaded.global_single_threaded.io();
+    sch.metrics = null;
     sch.force_batched = false;
     sch.inflight_generated_tokens = std.atomic.Value(u64).init(0);
     var active = [_]*Slot{&slot};

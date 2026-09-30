@@ -5,18 +5,16 @@
 //!
 //!   * OFF  — a single `?*Metrics` null-check per REQUEST (never per token).
 //!            No allocation, no atomics, no work. Unmeasurable.
-//!   * ON   — a handful of RELAXED atomic adds per request, recorded at the
-//!            `finishSlot` funnel which is already off the per-token decode
-//!            path. The inference thread never locks, waits, or blocks on the
-//!            metrics subsystem. Gauges are sampled on a separate thread;
-//!            `/metrics` renders on the scrape connection thread.
+//!   * ON   — atomic counters at request completion. Bounded dashboard records
+//!            use a short mutex at request boundaries and sampler ticks, never
+//!            in the per-token decode path. `/metrics` renders on the scrape
+//!            connection thread.
 //!
-//! Thread-safety: every write is `std.atomic.Value(u64)` with `.monotonic`
-//! (relaxed) ordering. Writers are N connection threads + the inference
-//! thread; readers (render) tolerate a slightly inconsistent cross-counter
-//! snapshot — fine for metrics. No mutex anywhere on the write path.
+//! Thread-safety: counters and gauges use atomics. Dashboard rings copy a
+//! coherent snapshot under their own mutex before rendering.
 
 const std = @import("std");
+pub const monitor_mod = @import("monitor.zig");
 
 // ---------------------------------------------------------------------------
 // Histogram bounds (comptime constants shared by Metrics.init)
@@ -67,13 +65,17 @@ pub const Metrics = struct {
     /// multi-turn 35B MoE session). `vllm:prompt_tokens_total` keeps the vLLM
     /// meaning (all billed prompt tokens) for dashboard compatibility.
     prefill_tokens_total: Counter,
+    prefill_forwarded_live_total: Counter,
     /// Prompt tokens served straight from the hot prefix cache. Token-level
     /// companion to `prefix_cache_hits_total`, which counts REQUESTS that hit.
     /// Invariant: prefill_tokens_total + prefix_cache_tokens_total == prompt_tokens_total.
     prefix_cache_tokens_total: Counter,
     generation_tokens_total: Counter,
+    generation_tokens_emitted_total: Counter,
     requests_success_total: Counter,
     requests_cancelled_total: Counter,
+    requests_failed_total: Counter,
+    requests_rejected_total: Counter,
     prefix_cache_queries_total: Counter,
     prefix_cache_hits_total: Counter,
 
@@ -124,6 +126,7 @@ pub const Metrics = struct {
     batched_group_size: Gauge,
     // Slot-ticks that decoded serial beside live company, per `BatchVerdict` reason.
     decode_serial_total: [SERIAL_REASONS.len]Counter,
+    monitor: monitor_mod.Monitor,
 
     pub fn init() Metrics {
         return .{
@@ -135,10 +138,14 @@ pub const Metrics = struct {
             .output_tokens_hist = Histogram(8).init(TOKEN_BOUNDS),
             .prompt_tokens_total = Counter.init(),
             .prefill_tokens_total = Counter.init(),
+            .prefill_forwarded_live_total = Counter.init(),
             .prefix_cache_tokens_total = Counter.init(),
             .generation_tokens_total = Counter.init(),
+            .generation_tokens_emitted_total = Counter.init(),
             .requests_success_total = Counter.init(),
             .requests_cancelled_total = Counter.init(),
+            .requests_failed_total = Counter.init(),
+            .requests_rejected_total = Counter.init(),
             .prefix_cache_queries_total = Counter.init(),
             .prefix_cache_hits_total = Counter.init(),
             .requests_running = Gauge.init(),
@@ -156,6 +163,7 @@ pub const Metrics = struct {
             .ngram_warm_bytes = Gauge.init(),
             .batched_group_size = Gauge.init(),
             .decode_serial_total = @splat(Counter.init()),
+            .monitor = monitor_mod.Monitor.init(),
         };
     }
 
@@ -169,8 +177,7 @@ pub const Metrics = struct {
     /// Latency histograms are NOT touched — a cancelled slot's decode_ns is
     /// zero or garbage and would poison the distribution.
     ///
-    /// Other reasons (Zig error names from markError): silently ignored for
-    /// now; these are rare and already visible in --log-level warn output.
+    /// Other reasons increment `requests_failed_total`.
     ///
     /// Parameters:
     ///   - `real_ttft_ns`: time from request arrival (Slot.init, pre-queue-wait)
@@ -200,9 +207,11 @@ pub const Metrics = struct {
             std.mem.eql(u8, finish_reason, "tool_calls");
 
         if (!is_success) {
-            if (std.mem.eql(u8, finish_reason, "cancelled"))
+            if (std.mem.eql(u8, finish_reason, "cancelled")) {
                 self.requests_cancelled_total.inc();
-            // Error reasons (OOM, etc.) are rare; logged by the scheduler.
+            } else {
+                self.requests_failed_total.inc();
+            }
             return;
         }
 
@@ -249,10 +258,13 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     // --- Counters ---
     try writeCounter(w, "vllm:prompt_tokens_total", "Total prompt tokens processed", m.prompt_tokens_total.load());
     try writeCounter(w, "mlx_serve:prefill_tokens_total", "Prompt tokens actually forwarded through prefill (excludes prefix-cache restores) — the correct numerator for prefill tok/s", m.prefill_tokens_total.load());
+    try writeCounter(w, "mlx_serve:prefill_forwarded_live_total", "Cumulative prefill tokens forwarded at chunk boundaries, including in-flight requests", m.prefill_forwarded_live_total.load());
     try writeCounter(w, "mlx_serve:prefix_cache_tokens_total", "Prompt tokens restored from the hot prefix cache instead of being computed", m.prefix_cache_tokens_total.load());
     try writeCounter(w, "vllm:generation_tokens_total", "Total generated tokens", m.generation_tokens_total.load());
     try writeCounter(w, "vllm:request_success_total", "Completed requests", m.requests_success_total.load());
     try writeCounter(w, "vllm:request_cancelled_total", "Requests cancelled by client disconnect", m.requests_cancelled_total.load());
+    try writeCounter(w, "mlx_serve:request_failed_total", "Requests failed after scheduler submission", m.requests_failed_total.load());
+    try writeCounter(w, "mlx_serve:request_rejected_total", "Requests rejected before scheduler submission", m.requests_rejected_total.load());
     try writeCounter(w, "vllm:prefix_cache_queries_total", "Prefix cache lookup count", m.prefix_cache_queries_total.load());
     try writeCounter(w, "vllm:prefix_cache_hits_total", "Prefix cache hit count", m.prefix_cache_hits_total.load());
 
@@ -305,6 +317,7 @@ pub const Session = struct {
     context_tokens: u32,
     cached_tokens: u32,
     generated_tokens: u32,
+    request_id: u64 = 0,
     state_bytes: u64,
     context_length: u32 = 0,
     /// Hot-cache entry id: the entry a live row restored from, or a cached row's own; 0 = none.
@@ -332,16 +345,23 @@ pub const Session = struct {
 /// Write all metrics as a JSON object to `w`.
 /// Called only on the scrape connection thread.
 pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Writer) !void {
+    try renderJsonWithExtras(m, sessions, w, "");
+}
+
+pub fn renderJsonWithExtras(m: *const Metrics, sessions: []const Session, w: *std.Io.Writer, extra_monitor_fields: []const u8) !void {
     const ns_to_s = 1.0 / 1_000_000_000.0;
 
     try w.print(
         "{{\"counters\":{{" ++
             "\"prompt_tokens_total\":{d}," ++
             "\"prefill_tokens_total\":{d}," ++
+            "\"prefill_forwarded_live_total\":{d}," ++
             "\"prefix_cache_tokens_total\":{d}," ++
             "\"generation_tokens_total\":{d}," ++
             "\"requests_success_total\":{d}," ++
             "\"requests_cancelled_total\":{d}," ++
+            "\"requests_failed_total\":{d}," ++
+            "\"requests_rejected_total\":{d}," ++
             "\"prefix_cache_queries_total\":{d}," ++
             "\"prefix_cache_hits_total\":{d}" ++
             "}},\"gauges\":{{" ++
@@ -363,10 +383,13 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
         .{
             m.prompt_tokens_total.load(),
             m.prefill_tokens_total.load(),
+            m.prefill_forwarded_live_total.load(),
             m.prefix_cache_tokens_total.load(),
             m.generation_tokens_total.load(),
             m.requests_success_total.load(),
             m.requests_cancelled_total.load(),
+            m.requests_failed_total.load(),
+            m.requests_rejected_total.load(),
             m.prefix_cache_queries_total.load(),
             m.prefix_cache_hits_total.load(),
             m.requests_running.load(),
@@ -414,7 +437,9 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             @tagName(s.phase), s.context_tokens, s.context_length, s.cached_tokens, s.generated_tokens, s.state_bytes,
         });
     }
-    try w.print("]}}", .{});
+    try w.writeAll("],\"monitor\":");
+    try @constCast(&m.monitor).renderJson(w, extra_monitor_fields);
+    try w.writeAll("}");
 }
 
 // ---------------------------------------------------------------------------
@@ -903,7 +928,7 @@ test "ngram_warm_bytes is a zero-when-off gauge on both surfaces" {
 test "decode_serial_total carries one labelled series per serial reason, never ok" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.decode_serial_total[@intFromEnum(@import("scheduler.zig").BatchVerdict.spec_active)].add(3);
+    m.decode_serial_total[@backingInt(@import("scheduler.zig").BatchVerdict.spec_active)].add(3);
     m.batched_group_size.set(2);
 
     var buf: [64 * 1024]u8 = undefined;
