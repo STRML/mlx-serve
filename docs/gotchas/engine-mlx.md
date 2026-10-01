@@ -5380,3 +5380,15 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
 - Guard: `round_cost: a round measured cheaper per token than a serial step beats it,
   unmeasured is unknown`.
 
+## Three or more streams with an image anywhere in their transcript decoded at a fifth of the speed (2026-10-01)
+
+- Defect: Flash-Next behind an agent that attaches screenshots held ~100 tok/s at one or two streams and ~22 tok/s total at
+  three or four, with 30-70 s per 300-token reply. The same transcripts with the image parts removed held 91-110 tok/s.
+- Cause: an M-RoPE slot (`mrope_pos`) makes the batched decode setup drop the QSA gather arm for the WHOLE group
+  (`any_mrope`), so every plain tick ran the dense mask over the full KV (profiled: 161 ms of attention per step at 141k
+  tokens, against 24 ms on the MTP verify path). One or two MTP slots verify per row and never reach it; the MTP crowd path
+  (`mtpCrowdThresholdFor`, three slots) folds the group into one plain batched tick, which does.
+- Fix: a slot with `mrope_pos` and KV at or past `qsaGatherMinKv()` is not batched (`BatchVerdict.mrope_long`) and the crowd
+  path leaves it in its MTP group, so it ticks on the single-slot gather arm.
+- Guard: `mropeSerialAt`. Replaying 4 captured agent transcripts at N=3/4 moved 21/24 -> 106/114 tok/s total and the mean
+  reply from 38-42 s to 9 s. The real fix is a batched gather arm that carries per-slot M-RoPE offsets.

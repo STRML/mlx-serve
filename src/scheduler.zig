@@ -2366,6 +2366,7 @@ pub const Scheduler = struct {
         if (slotReleasePending(slot)) return .head_release_pending;
         if (slot.sampling.constraint != null) return .grammar;
         if (slot.logprobs_n > 0) return .logprobs;
+        if (slotMropeLong(slot)) return .mrope_long;
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
         // always fall through to the per-slot decode path (which dispatches
         // into the engine).
@@ -2392,7 +2393,19 @@ pub const BatchVerdict = enum {
     embedded_engine,
     arch,
     pad_waste,
+    mrope_long,
 };
+
+/// A slot with M-RoPE positions (an image or video anywhere in its transcript) turns the QSA gather arm
+/// off for the WHOLE batched decode group, so every plain tick runs the O(kv) dense mask. From the gather's
+/// own kv floor up it decodes faster serial, where the single-slot gather arm still serves it.
+pub fn mropeSerialAt(has_mrope: bool, kv_len: usize, gather_floor: usize) bool {
+    return has_mrope and kv_len >= gather_floor;
+}
+
+fn slotMropeLong(slot: *const Slot) bool {
+    return mropeSerialAt(slot.mrope_pos != null, @as(usize, slot.prompt_tokens) + @as(usize, slot.completion_tokens), @intCast(transformer_mod.qsaGatherMinKv()));
+}
 
 /// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
 /// shared with `/props`, `/v1/models` and the serve-mode startup line.
@@ -7029,6 +7042,11 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             while (j < mtp_n and mtp_buf[j].model == mtp_buf[i].model) j += 1;
             if (j - i >= mtpCrowdThresholdFor(mtp_buf[i]) and batchable_n + (j - i) <= batchable_buf.len) {
                 for (mtp_buf[i..j]) |slot| {
+                    if (slotMropeLong(slot)) {
+                        mtp_buf[mtp_group_n] = slot;
+                        mtp_group_n += 1;
+                        continue;
+                    }
                     const gen = &slot.legacy_gen.?;
                     gen.mtpDetachHead(slot.allocator, true) catch |e| {
                         slot.markError(@errorName(e));
@@ -10651,4 +10669,12 @@ test "applyModelSettings: --no-mtp stamps the head off unless the model's own se
         applyModelSettings(&cfg, &cc, &o, c.flag);
         try testing.expectEqual(c.want, cfg.mtp_override);
     }
+}
+
+test "mropeSerialAt: an M-RoPE slot decodes serial from the gather floor up, others never" {
+    const floor: usize = 8192;
+    try testing.expect(!mropeSerialAt(true, floor - 1, floor));
+    try testing.expect(mropeSerialAt(true, floor, floor));
+    try testing.expect(mropeSerialAt(true, 300_000, floor));
+    try testing.expect(!mropeSerialAt(false, 300_000, floor));
 }
