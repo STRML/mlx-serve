@@ -2432,6 +2432,12 @@ fn noteSerial(sch: *Scheduler, slot: *Slot, why: BatchVerdict) void {
 /// the worst case for N=2 and the pathological pair this cap exists for.
 pub const MAX_PAD_WASTE: f64 = 1.5;
 
+/// A group whose longest billed slot is at most this long is never vetoed: the tensor it pads is small in
+/// absolute terms, and the veto would send a slot through a whole serial forward instead. Under the qwen4
+/// gather arm the sparse bill tops out at the indexer budget (2052 rows), so a 443-token sub-agent beside
+/// two long streams was split off at 2.08x.
+pub const PAD_FREE_KV: u32 = 4096;
+
 var kv_skew_split_logged: bool = false; // one-shot log guard
 
 pub fn batchedKvKeepCount(kv_lens_asc: []const u32) usize {
@@ -2441,6 +2447,7 @@ pub fn batchedKvKeepCount(kv_lens_asc: []const u32) usize {
         var sum: u64 = 0;
         for (kv_lens_asc[0..k]) |l| sum += l;
         if (sum == 0) return k; // nothing prefilled yet: no padding to waste
+        if (kv_lens_asc[k - 1] <= PAD_FREE_KV) return k;
         const padded: f64 = @floatFromInt(@as(u64, k) * kv_lens_asc[k - 1]);
         if (padded <= MAX_PAD_WASTE * @as(f64, @floatFromInt(sum))) return k;
     }
@@ -9173,6 +9180,12 @@ test "batchedKvKeepCount: padding waste caps the group, and the long slots are t
     // WASTE the padding creates, not about any slot being an outlier.
     try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 10, 100_000, 100_000 }));
 
+    // A group that is short in absolute terms keeps everyone however skewed: 443 beside two 2052-row
+    // sparse bills was 2.08x and split a slot off; at the bound it still batches, one row past it the cap holds.
+    try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&[_]u32{ 443, 2052, 2052 }));
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&[_]u32{ 1, PAD_FREE_KV }));
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{ 1, PAD_FREE_KV + 1 }));
+
     // One slot never "batches", and neither does an empty group.
     try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{1000}));
     try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&[_]u32{}));
@@ -9205,8 +9218,8 @@ test "groupKeepCount: a group that attends per slot pads nothing, so the cap is 
     const skew = [_]u32{ 1000, 1000, 1000, 100_000 };
     try testing.expectEqual(@as(usize, 3), groupKeepCount(&skew, false));
     try testing.expectEqual(@as(usize, 4), groupKeepCount(&skew, true));
-    // Below the per-slot floor the stacked arm runs and its cap holds.
-    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{ 10, 900 }, true));
+    // Below the per-slot floor the stacked arm runs, and a pad this small is not worth a serial tick.
+    try testing.expectEqual(@as(usize, 2), groupKeepCount(&[_]u32{ 10, 900 }, true));
 }
 
 test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.step" {
