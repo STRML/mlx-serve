@@ -5388,7 +5388,10 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
   (`any_mrope`), so every plain tick ran the dense mask over the full KV (profiled: 161 ms of attention per step at 141k
   tokens, against 24 ms on the MTP verify path). One or two MTP slots verify per row and never reach it; the MTP crowd path
   (`mtpCrowdThresholdFor`, three slots) folds the group into one plain batched tick, which does.
-- Fix: a slot with `mrope_pos` and KV at or past `qsaGatherMinKv()` is not batched (`BatchVerdict.mrope_long`) and the crowd
-  path leaves it in its MTP group, so it ticks on the single-slot gather arm.
-- Guard: `mropeSerialAt`. Replaying 4 captured agent transcripts at N=3/4 moved 21/24 -> 106/114 tok/s total and the mean
-  reply from 38-42 s to 9 s. The real fix is a batched gather arm that carries per-slot M-RoPE offsets.
+- Fix: the batched gather arm serves M-RoPE slots. Nothing in it reads the rope tables: the queries are rotated before
+  it and each slot's cached keys already carry their positions; the per-slot M-RoPE delta was already in the batched
+  forward's rope offsets. The `any_mrope` refusals (`qsaBatchedGatherOn`, the block-keeping branch of `qsaMask`, the
+  gather's early return) and the pad-waste raw bill for such slots are gone.
+- Guard: replaying four captured agent transcripts (cached 120k-300k tokens) on the Studio, serial rule vs batched gather:
+  N=4 111 vs 125 tok/s total, N=6 89-97 vs 145, N=8 78-88 vs 99-141; N=3 unchanged (106-112). Greedy outputs of three
+  identical concurrent copies diverge from the solo text no earlier than the same requests without their images do.

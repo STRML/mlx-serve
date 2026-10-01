@@ -2950,8 +2950,7 @@ pub fn qsaBatchedGatherEnabled() bool {
     return v;
 }
 
-pub fn qsaBatchedGatherOn(seq_len: c_int, any_mrope: bool) bool {
-    if (any_mrope) return false;
+pub fn qsaBatchedGatherOn(seq_len: c_int) bool {
     const st = qwen4Standin();
     if (st.attn_qsa or st.attn_sdpa) return false;
     if (!qsaBatchedGatherEnabled()) return false;
@@ -23383,11 +23382,9 @@ pub const Transformer = struct {
         defer self.allocator.free(kv_lens);
         var kv_max: c_int = 0;
         var any = false;
-        var any_mrope = false;
         var any_blocks = false;
         const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
         for (slots, 0..) |sc, i| {
-            if (sc.mrope_pos != null) any_mrope = true;
             const e = qsaSlotEntry(sc, layer);
             const cache_len: c_int = @intCast(sc.moe_seq_offset.*);
             const i_c: c_int = @intCast(i);
@@ -23400,7 +23397,7 @@ pub const Transformer = struct {
             if (masks[i].ctx != null) any = true;
             if (sc.qsa_blocks.ctx != null) any_blocks = true;
         }
-        const keep_blocks = qsaBatchedGatherEnabled() and self.qwen4 != null and !any_mrope and any_blocks;
+        const keep_blocks = qsaBatchedGatherEnabled() and self.qwen4 != null and any_blocks;
         if (keep_blocks) {
             for (slots, 0..) |sc, i| {
                 if (sc.qsa_blocks.ctx == null and masks[i].ctx != null) {
@@ -27363,7 +27360,6 @@ pub const Transformer = struct {
         if (!qsaBatchedGatherEnabled()) return null;
         if (self.qwen4 == null) return null;
         if (ctx.qsa_mask.ctx != null) return null;
-        for (slots) |sc| if (sc.mrope_pos != null) return null;
         var any_blocks = false;
         for (slots) |sc| if (sc.qsa_blocks.ctx != null) {
             any_blocks = true;
@@ -57756,7 +57752,7 @@ test "qsaBatchedAttn: kill switch and mrope refuse the gather arm" {
     try std.testing.expect((try xfm.qsaBatchedAttn(&ctx, &slots, dummy, 0, 4, 1.0)) == null);
 }
 
-test "qsaBatchedGatherOn matches the arm's switches and vision refusal" {
+test "qsaBatchedGatherOn matches the arm's switches" {
     const prev_b = qsa_batched_gather_override;
     const prev_g = qsa_gather_override;
     const prev_d = qsa_decode_gather_override;
@@ -57771,39 +57767,37 @@ test "qsaBatchedGatherOn matches the arm's switches and vision refusal" {
     qsa_gather_override = true;
     qsa_decode_gather_override = true;
     qsa_verify_gather_override = true;
-    try std.testing.expect(qsaBatchedGatherOn(1, false));
-    try std.testing.expect(qsaBatchedGatherOn(4, false));
-    try std.testing.expect(!qsaBatchedGatherOn(1, true));
-    try std.testing.expect(!qsaBatchedGatherOn(4, true));
+    try std.testing.expect(qsaBatchedGatherOn(1));
+    try std.testing.expect(qsaBatchedGatherOn(4));
     qsa_batched_gather_override = false;
-    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    try std.testing.expect(!qsaBatchedGatherOn(1));
     qsa_batched_gather_override = true;
     qsa_gather_override = false;
-    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    try std.testing.expect(!qsaBatchedGatherOn(1));
     qsa_gather_override = true;
     qsa_decode_gather_override = false;
-    try std.testing.expect(!qsaBatchedGatherOn(1, false));
-    try std.testing.expect(qsaBatchedGatherOn(4, false));
+    try std.testing.expect(!qsaBatchedGatherOn(1));
+    try std.testing.expect(qsaBatchedGatherOn(4));
     qsa_decode_gather_override = true;
     qsa_verify_gather_override = false;
-    try std.testing.expect(qsaBatchedGatherOn(1, false));
+    try std.testing.expect(qsaBatchedGatherOn(1));
     // The fused verify kernel still takes blocks at verify widths; its switch too turns them off.
-    try std.testing.expect(qsaBatchedGatherOn(4, false));
+    try std.testing.expect(qsaBatchedGatherOn(4));
     {
         const prev_k = qsa_attn_kernel_override;
         defer qsa_attn_kernel_override = prev_k;
         qsa_attn_kernel_override = false;
-        try std.testing.expect(!qsaBatchedGatherOn(4, false));
+        try std.testing.expect(!qsaBatchedGatherOn(4));
     }
     qsa_verify_gather_override = true;
     const prev_st = qwen4_standin_override;
     defer qwen4_standin_override = prev_st;
     qwen4_standin_override = .{ .attn_qsa = true };
-    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    try std.testing.expect(!qsaBatchedGatherOn(1));
     qwen4_standin_override = .{ .attn_sdpa = true };
-    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    try std.testing.expect(!qsaBatchedGatherOn(1));
     qwen4_standin_override = .{};
-    try std.testing.expect(qsaBatchedGatherOn(1, false));
+    try std.testing.expect(qsaBatchedGatherOn(1));
 }
 
 // ── Verify-width QSA gather (S = 2 .. FUSED256_MIN_Q_LEN-1) ──
