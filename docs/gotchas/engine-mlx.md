@@ -5480,3 +5480,16 @@ Guard: `glm5 an output tied to a cache update evaluates the update with it`. Tel
 ## GLM-5.3's long-prompt output moved with the prefill chunk width, and it was not a bug
 
 Defect suspected: on a cold 9.5k-token prompt, token 0's top-2 swapped and one token moved 4+ nats between prefill widths (single pass, 8192, 4096, 2048), and the prefix cache's 30-token tail split flipped the greedy answer against cache-off; Qwen3.6-35B-A3B moved at most 0.25 nats on the same sweep. Cause: rounding order, not carried state. Swapping the KDA recurrence for an equivalent kernel in ONE pass moved the token as far as chunking did (1.16 vs 1.35 nats with the indexer forced dense), a confident next token agreed at every width (-0.06), the per-core KDA kernel matches f64 from a nonzero state with a partial tail block, and the tiny fixture's chunked prefill matches the reference past its indexer budget. DSA's top-k pool choice is discontinuous, so small differences pick other pools. Bar for "chunking bug": a width swing larger than a same-math kernel swap at one pass, or a confident token that moves.
+
+## An oMLX oQ Flash-Next pack loaded clean and decoded noise (2026-09-30)
+
+- Defect: Swift1.5-Qwen3.8-Flash-Next-oQ4e-mtp (oMLX oQ, `qwen4_exp`) booted, loaded the MTP head and the n-gram table, then
+  answered with repeated junk tokens and 0 accepted drafts. Switching off every fused kernel changed nothing.
+- Cause: the oQ layout stores the `(1 + w)` RMSNorms zero-centered; this loader expects the `+1` folded in, so every norm in
+  `NORM_FOLD_SUFFIXES` was off by exactly 1.0 (`q_norm` mean 0.28 where the folded pack reads 1.28). The mixed per-path
+  bits and group sizes were not the problem: `computeQuantParams` solves them from tensor shapes.
+- Fix: `tests/convert_oq_flash_next.py` renames `mtp.*` and `vision_tower.*`, folds the `+1`, concatenates the 128 in-trunk
+  n-gram shards into `ngram_table.bin` and adds the `ngram_table` config block. It refuses a pack whose `q_norm` already reads
+  as folded.
+- Guard: `tests/test_convert_oq_flash_next.py` on a synthetic pack. Dequantized weights of a correct conversion match the
+  reference pack at cosine 0.98-1.0, while plain norms differ by 1.000; that comparison finds this class in minutes.
