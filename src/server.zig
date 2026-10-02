@@ -6264,6 +6264,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         // is evictable here by construction (the withheld case took the deferral arm).
         const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill);
         defer allocator.free(msg);
+        countRejected();
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
@@ -9054,6 +9055,7 @@ fn handleChatCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -9324,6 +9326,7 @@ fn handleCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -13164,6 +13167,11 @@ fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *s
     try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
 }
 
+/// A request refused before it owned a slot. A null sink (metrics off) is one branch.
+fn countRejected() void {
+    if (g_metrics) |m| m.recordRejected();
+}
+
 fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
     return std.fmt.bufPrint(
         buf,
@@ -15547,6 +15555,7 @@ fn handleAnthropicMessages(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/messages -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendAnthropicError(allocator, stream, "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -17312,6 +17321,7 @@ fn handleResponsesInner(
     // ── context limit ──
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -24513,4 +24523,20 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
     try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
     try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
+}
+
+test "outcome row 7/9: countRejected moves the rejected counter, and does nothing with metrics off" {
+    const t = std.testing;
+    const saved = g_metrics;
+    defer g_metrics = saved;
+
+    g_metrics = null;
+    countRejected();
+
+    var m = instr.Metrics.init();
+    g_metrics = &m;
+    countRejected();
+    try t.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
+    try t.expectEqual(@as(u64, 0), m.requests_failed_total.load());
+    try t.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
 }

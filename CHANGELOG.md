@@ -24,6 +24,7 @@
 - A speech request whose client disconnects now stops instead of finishing audio nobody will receive.
 - The model browser lists GLM-5.3-Flash and MiMo-V2.6-Flash packs as supported.
 - `mlx-serve launch pi` offers pi's `xhigh` and `max` thinking levels, so a model's maximum effort (GLM-5.3's default) is reachable from pi.
+- `/metrics` and `/metrics.json` now count every request outcome exactly once: a client that disconnects mid-decode shows in `request_cancelled_total`, errors in the new `mlx_serve:request_failed_total`, and requests refused before they start in `mlx_serve:request_rejected_total`.
 
 ---
 
