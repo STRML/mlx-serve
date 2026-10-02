@@ -2,7 +2,7 @@
 
 ## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
-### Added
+### Features
 - `scripts/mlxtop.py` is a terminal dashboard over `/metrics.json` that keeps its own 24 h history on the client (windowed p50/p95 TTFT, error rates, per-model view), so the server stays a plain counter endpoint.
 
 ### Fixes
