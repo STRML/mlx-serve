@@ -10816,6 +10816,46 @@ test "persistent group: join leave cancel capture snapshot rollback restore matc
     }
 }
 
+test "persistent group: a member released from a full 16-row group owns a single-row state" {
+    // The bar: after `ssmGroupReleaseCtx` the leaving slot's conv/ssm state has batch 1 and
+    // equals its row of the merged group, so its own verify never sees the [N, ...] arrays.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(alloc, 1);
+    defer cache.deinit();
+    const kinds = try ssmTickKinds(alloc, 2);
+    defer alloc.free(kinds);
+    const n = 16;
+    var slots: [n]SsmTickSlot = undefined;
+    var ctxs: [n]*ForwardCtx = undefined;
+    for (0..n) |i| {
+        slots[i] = try SsmTickSlot.init(alloc, s, kinds, &cache, @as(f32, @floatFromInt(i + 1)));
+        slots[i].bind();
+        ctxs[i] = &slots[i].ctx;
+    }
+    defer for (&slots) |*sl| sl.deinit(alloc);
+    var group: PersistentSsmGroup = .{ .allocator = alloc };
+    defer group.deinit();
+    try ssmTickBind(alloc, s, &group, &ctxs, kinds, true);
+    try ssmTickBumpMerged(s, group.layers, kinds);
+    try ssmTickBind(alloc, s, &group, &ctxs, kinds, true);
+    try ssmTickBumpMerged(s, group.layers, kinds);
+    // Row 5 leaves for a serial round of its own, the way the scheduler releases a speculating slot.
+    const leaver = 5;
+    const expect_conv = try ssmRowView(s, group.layers[0].conv_state, leaver);
+    defer _ = mlx.mlx_array_free(expect_conv);
+    const expect_ssm = try ssmRowView(s, group.layers[0].ssm_state, leaver);
+    defer _ = mlx.mlx_array_free(expect_ssm);
+    try ssmGroupReleaseCtx(&group, s, ctxs[leaver]);
+    const e = &slots[leaver].entries[0];
+    try std.testing.expectEqual(@as(c_int, 1), mlx.getShape(e.conv_state)[0]);
+    try std.testing.expectEqual(@as(c_int, 1), mlx.getShape(e.ssm_state)[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(e.conv_state, expect_conv, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(e.ssm_state, expect_ssm, s));
+    try std.testing.expectEqual(@as(usize, n - 1), group.n);
+}
+
 test "persistent group: merge/split op counts at N=2/4/8 after the first tick are zero" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -57725,7 +57765,7 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
     }
 }
 
-test "qsaBatchedAttn: kill switch and mrope refuse the gather arm" {
+test "qsaBatchedAttn: the kill switch refuses the gather arm" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
     const xfm: *Transformer = @ptrCast(&xfm_bytes);
@@ -57745,11 +57785,71 @@ test "qsaBatchedAttn: kill switch and mrope refuse the gather arm" {
     defer qsa_batched_gather_override = prev_g;
     qsa_batched_gather_override = false;
     try std.testing.expect((try xfm.qsaBatchedAttn(&ctx, &slots, dummy, 0, 4, 1.0)) == null);
+}
 
+test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    qsa_decode_gather_override = true;
+    defer qsa_decode_gather_override = null;
     qsa_batched_gather_override = true;
+    defer qsa_batched_gather_override = null;
+    var prng = std.Random.DefaultPrng.init(0x3b0e);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const kb: c_int = 3;
+    const hq: c_int = 4;
+    const hkv: c_int = 2;
+    const hd: c_int = 64;
+    const kls = [_]c_int{ 50, 36 };
+
+    var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
+    const xfm: *Transformer = @ptrCast(&xfm_bytes);
+    xfm.allocator = ta;
+    xfm.s = s;
+    xfm.config.indexer_compress_ratio = @intCast(ratio);
+    var q4_bytes: [@sizeOf(qwen4_mod.Qwen4State)]u8 align(@alignOf(qwen4_mod.Qwen4State)) = @splat(0);
+    xfm.qwen4 = @ptrCast(&q4_bytes);
+
+    var caches: [2]KVCache = undefined;
+    var fxs: [2]QsaBlockFixture = undefined;
+    var offs: [2]usize = undefined;
+    var ctxs: [2]ForwardCtx = undefined;
+    var qs: [2]mlx.mlx_array = undefined;
+    for (0..2) |i| {
+        caches[i] = try KVCache.init(ta, 1);
+        const k = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kls[i], hd }, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kls[i], hd }, s);
+        defer _ = mlx.mlx_array_free(v);
+        var view = try caches[i].update(0, k, v, s, 128);
+        view.deinit();
+        fxs[i] = try QsaBlockFixture.build(rnd, 1, kls[i], kb, ratio);
+        offs[i] = @intCast(kls[i]);
+        ctxs[i] = .{ .cache = &caches[i], .moe_seq_offset = &offs[i], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+        ctxs[i].qsa_blocks = fxs[i].blocks;
+        qs[i] = try attn256RandBf16(rnd, &[_]c_int{ 1, hq, 1, hd }, s);
+    }
+    defer for (0..2) |i| {
+        caches[i].deinit();
+        fxs[i].deinit();
+        _ = mlx.mlx_array_free(qs[i]);
+    };
+    var q_n2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_n2);
+    const qvec = mlx.mlx_vector_array_new_data(&qs, 2);
+    defer _ = mlx.mlx_vector_array_free(qvec);
+    try mlx.check(mlx.mlx_concatenate_axis(&q_n2, qvec, 0, s));
+
+    const slots = [_]*ForwardCtx{ &ctxs[0], &ctxs[1] };
+    const plain = (try xfm.qsaBatchedAttn(&ctxs[0], &slots, q_n2, 0, 1, 0.125)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(plain);
     const pos = [_]i32{ 0, 1, 2 };
-    slot.mrope_pos = &pos;
-    try std.testing.expect((try xfm.qsaBatchedAttn(&ctx, &slots, dummy, 0, 4, 1.0)) == null);
+    ctxs[1].mrope_pos = &pos;
+    const with_pos = (try xfm.qsaBatchedAttn(&ctxs[0], &slots, q_n2, 0, 1, 0.125)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(with_pos);
+    try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(with_pos, plain, s));
 }
 
 test "qsaBatchedGatherOn matches the arm's switches" {

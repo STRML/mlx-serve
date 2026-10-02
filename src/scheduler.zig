@@ -3491,6 +3491,45 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     return avail_bytes < loadRequirementBytes(weights_bytes);
 }
 
+/// Bytes of the MTP head sidecar the loader will read beside `model_dir`'s shards
+/// (`mtp.sidecar_rel_paths`; a sidecar ships at its serving width): 0 when the head is
+/// in the checkpoint (its shards are billed already), absent, or not going to load.
+fn mtpSidecarDiskBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, mtp_enabled: bool) u64 {
+    if (!mtp_enabled) return 0;
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return 0;
+    defer dir.close(io);
+    const rel = mtp_mod.resolveMtpSidecarInDir(io, allocator, dir) orelse return 0;
+    const st = dir.statFile(io, rel, .{}) catch return 0;
+    return @intCast(st.size);
+}
+
+test "the preflight bills an MTP sidecar the index never names, never an in-checkpoint head twice" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // A minimal safetensors file whose header carries one MTP key: 8-byte LE header length + JSON + data.
+    const header = "{\"mtp.fc.weight\":{\"dtype\":\"BF16\",\"shape\":[2],\"data_offsets\":[0,4]}}";
+    var buf: [8 + header.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], header.len, .little);
+    @memcpy(buf[8 .. 8 + header.len], header);
+    @memset(buf[8 + header.len ..], 0);
+    try tmp.dir.createDirPath(io, "mtp");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mtp/weights.safetensors", .data = &buf });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"a\":\"model.safetensors\"}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "0123456789" });
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(dir);
+    // The shard sum sees only what the index names; the sidecar is its own bill, and only when the head loads.
+    try std.testing.expectEqual(@as(u64, 10), modelDiskBytes(io, dir));
+    try std.testing.expectEqual(@as(u64, buf.len), mtpSidecarDiskBytes(io, std.testing.allocator, dir, true));
+    try std.testing.expectEqual(@as(u64, 0), mtpSidecarDiskBytes(io, std.testing.allocator, dir, false));
+    try tmp.dir.deleteFile(io, "mtp/weights.safetensors");
+    try std.testing.expectEqual(@as(u64, 0), mtpSidecarDiskBytes(io, std.testing.allocator, dir, true));
+}
+
 /// Resident bytes a sidecar takes once loaded: `bits` per weight plus a bf16
 /// (scale, bias) pair per group of 64 for a dense DFlash assistant quantized
 /// at load; its file size otherwise (`bits == 0`).
@@ -3759,13 +3798,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const model_bytes = modelDiskBytes(sch.io, params.model_dir);
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
-        const weights_bytes = model_bytes + drafter_bytes;
+        const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
+        const weights_bytes = model_bytes + drafter_bytes + mtp_bytes;
         const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(model_bytes)) / gb,
             @as(f64, @floatFromInt(avail_bytes)) / gb,
         });
         if (drafter_bytes > 0) log.info("[preflight] drafter ~{d:.2} GB at {s}\n", .{ @as(f64, @floatFromInt(drafter_bytes)) / gb, sidecar });
+        if (mtp_bytes > 0) log.info("[preflight] mtp sidecar ~{d:.2} GB\n", .{@as(f64, @floatFromInt(mtp_bytes)) / gb});
         switch (preflightVerdict(model_bytes, drafter_bytes, avail_bytes, in_dir_drafter != null)) {
             .fits => {},
             .drop_drafter => {

@@ -5380,18 +5380,36 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
 - Guard: `round_cost: a round measured cheaper per token than a serial step beats it,
   unmeasured is unknown`.
 
-## Three or more streams with an image anywhere in their transcript decoded at a fifth of the speed (2026-10-01)
+## A kernel config cached by ROW COUNT handed a 16-slot tick a 16-wide verify's shape (2026-10-01)
 
-- Defect: Flash-Next behind an agent that attaches screenshots held ~100 tok/s at one or two streams and ~22 tok/s total at
-  three or four, with 30-70 s per 300-token reply. The same transcripts with the image parts removed held 91-110 tok/s.
-- Cause: an M-RoPE slot (`mrope_pos`) makes the batched decode setup drop the QSA gather arm for the WHOLE group
-  (`any_mrope`), so every plain tick ran the dense mask over the full KV (profiled: 161 ms of attention per step at 141k
-  tokens, against 24 ms on the MTP verify path). One or two MTP slots verify per row and never reach it; the MTP crowd path
-  (`mtpCrowdThresholdFor`, three slots) folds the group into one plain batched tick, which does.
-- Fix: the batched gather arm serves M-RoPE slots. Nothing in it reads the rope tables: the queries are rotated before
-  it and each slot's cached keys already carry their positions; the per-slot M-RoPE delta was already in the batched
-  forward's rope offsets. The `any_mrope` refusals (`qsaBatchedGatherOn`, the block-keeping branch of `qsaMask`, the
-  gather's early return) and the pad-waste raw bill for such slots are gone.
-- Guard: replaying four captured agent transcripts (cached 120k-300k tokens) on the Studio, serial rule vs batched gather:
-  N=4 111 vs 125 tok/s total, N=6 89-97 vs 145, N=8 78-88 vs 99-141; N=3 unchanged (106-112). Greedy outputs of three
-  identical concurrent copies diverge from the solo text no earlier than the same requests without their images do.
+- Defect: the 27B 4-bit with its drafter served 16 concurrent streams and failed every stream
+  past that: `[concatenate] ... (16,3,10240), (1,16,10240)` in the GDN conv path, then
+  `batched decode aborted ... failing all 16 slots`. Never seen in a single-stream sweep.
+- Cause: `add_norm` keyed its Metal config on `rows = B*S`, and the config carries the output
+  SHAPE. A speculating slot's 16-token verify ran as `[1,16,D]`; the next 16-slot batched tick,
+  `[16,1,D]`, had the same row count, reused the config and got its hidden state back as
+  `[1,16,D]`. The GDN layer's fused step then declined (`qsh[0] != batch`) and the fallback
+  concatenated the merged `[16,3,C]` state with a `[1,16,C]` input. Three new things met:
+  the NAX-wide block of 16, 16 slots batching, and both on one server.
+- Fix: `CfgKey` carries `b` and `s`, the rule every `metal_kernel` config cache already states.
+- Guard: `addNorm returns each call's own [B,S,D] layout at one row count` (hermetic) and
+  `tests/test_batched_past_block_width.sh` (20 streams on a drafter-bound GDN pack).
+
+## Raw BF16 n-gram tables have no quantization groups
+
+Sushi Flash Next packs ship a raw BF16 n-gram table with `bits=16, group_size=0`;
+the group-size range check ran before the BF16 branch and failed the load with
+`NgramTableBits`. It now runs only in the quantized branch. Guard: `ngram table
+raw BF16 rows do not depend on quantization group size`.
+
+## An image in any stream dropped the whole batched group to the dense mask
+
+- Defect: Flash-Next behind an agent that attaches screenshots lost most of its aggregate decode speed at three or more
+  streams; the same transcripts without the images did not.
+- Cause: an M-RoPE slot (`mrope_pos`) made the batched decode setup refuse the QSA gather arm for the WHOLE group
+  (`any_mrope`), so every plain tick ran the dense mask over the full KV. One or two MTP slots verify per row and never
+  reach it; the MTP crowd path folds three or more into one plain batched tick, which does.
+- Fix: the batched gather arm serves M-RoPE slots. It reads no rope tables: queries are rotated before it and each
+  slot's cached keys already carry their positions. The `any_mrope` refusals (`qsaBatchedGatherOn`, the block-keeping
+  branch of `qsaMask`, the gather's early return) and the raw pad-waste bill for such slots are gone.
+- Guard: `qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions`.

@@ -67,7 +67,9 @@ const MOE_SOURCE = source(true);
 
 var plain_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var moe_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const CfgKey = struct { rows: c_int, d: c_int, k: c_int, shared: bool, dt: mlx.mlx_dtype, tn: c_int };
+// Keyed by the FULL [B,S] layout, not the row count: the config carries the output
+// shape, and a 16-row verify ([1,16,D]) and a 16-slot batched tick ([16,1,D]) share a row count.
+const CfgKey = struct { b: c_int, s: c_int, d: c_int, k: c_int, shared: bool, dt: mlx.mlx_dtype, tn: c_int };
 var plain_key: ?CfgKey = null;
 var plain_cfg: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
 var moe_key: ?CfgKey = null;
@@ -113,7 +115,7 @@ fn buildConfig(key: CfgKey, shape: []const c_int) !mlx.mlx_fast_metal_kernel_con
     const tn = key.tn;
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, shape.ptr, shape.len, key.dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, shape.ptr, shape.len, key.dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, tn * key.rows, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, tn * key.b * key.s, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, tn, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", key.dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "D", key.d));
@@ -164,7 +166,7 @@ pub fn addNorm(h: mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, eps: mlx.ml
     if (!eligible(sh[2], dt, s)) return null;
     if (mlx.mlx_array_dtype(x) != dt or mlx.mlx_array_dtype(w) != dt) return null;
     if (plain_kernel == null) plain_kernel = try makeKernel("msv_add_norm", &[_][*:0]const u8{ "H", "X", "W", "eps" }, PLAIN_SOURCE);
-    const key = CfgKey{ .rows = sh[0] * sh[1], .d = sh[2], .k = 0, .shared = false, .dt = dt, .tn = threadsFor(sh[2]).? };
+    const key = CfgKey{ .b = sh[0], .s = sh[1], .d = sh[2], .k = 0, .shared = false, .dt = dt, .tn = threadsFor(sh[2]).? };
     if (plain_key == null or !std.meta.eql(plain_key.?, key)) {
         const c = try buildConfig(key, sh);
         if (plain_cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(plain_cfg);
@@ -193,7 +195,7 @@ pub fn moeCombineAddNorm(h: mlx.mlx_array, y: mlx.mlx_array, wt: mlx.mlx_array, 
         if (xsh.len != 2 or xsh[0] != rows or xsh[1] != sh[2] or mlx.mlx_array_dtype(xs) != dt) return null;
     }
     if (moe_kernel == null) moe_kernel = try makeKernel("msv_moe_combine_add_norm", &[_][*:0]const u8{ "H", "Y", "WT", "XS", "W", "eps" }, MOE_SOURCE);
-    const key = CfgKey{ .rows = rows, .d = sh[2], .k = wsh[1], .shared = shared != null, .dt = dt, .tn = threadsFor(sh[2]).? };
+    const key = CfgKey{ .b = sh[0], .s = sh[1], .d = sh[2], .k = wsh[1], .shared = shared != null, .dt = dt, .tn = threadsFor(sh[2]).? };
     if (moe_key == null or !std.meta.eql(moe_key.?, key)) {
         const c = try buildConfig(key, sh);
         if (moe_cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(moe_cfg);
@@ -243,6 +245,34 @@ test "addNorm declines, and stays declined, when the GPU refuses the looped widt
     try std.testing.expect(!eligible(5120, .bfloat16, s));
     try std.testing.expect(eligible(4096, .bfloat16, s));
     try std.testing.expect(!mlx.errorPending());
+}
+
+test "addNorm returns each call's own [B,S,D] layout at one row count" {
+    // The bar: a 16-row verify ([1,16,D]) followed by a 16-slot batched tick ([16,1,D]) each get
+    // outputs in their input's shape; a config cached by row count alone hands the second the first's.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const eps = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps);
+    const d: c_int = 5120;
+    for ([_][2]c_int{ .{ 1, 16 }, .{ 16, 1 }, .{ 1, 16 } }) |bs| {
+        const arrs = try randTriple(16, d, s);
+        defer for (arrs) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const shape = [_]c_int{ bs[0], bs[1], d };
+        var h = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h);
+        try mlx.check(mlx.mlx_reshape(&h, arrs[0], &shape, 3, s));
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_reshape(&x, arrs[1], &shape, 3, s));
+        const got = (try addNorm(h, x, arrs[2], eps, s)) orelse return error.Declined;
+        defer _ = mlx.mlx_array_free(got.h);
+        defer _ = mlx.mlx_array_free(got.normed);
+        try std.testing.expectEqualSlices(c_int, &shape, mlx.getShape(got.h));
+        try std.testing.expectEqualSlices(c_int, &shape, mlx.getShape(got.normed));
+    }
 }
 
 test "addNorm is bit-equal to add -> fast::rms_norm on both sides of MLX's looped limit" {

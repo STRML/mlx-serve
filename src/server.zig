@@ -8592,14 +8592,14 @@ fn handleChatCompletions(
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
-    // Parse logprobs: "logprobs": true, "top_logprobs": N (0-20)
+    // Parse logprobs: "logprobs": true, "top_logprobs": N (0..MAX_TOP_LOGPROBS)
     const logprobs_n: u32 = blk: {
         const lp = root.get("logprobs") orelse break :blk 0;
         if (lp != .bool or !lp.bool) break :blk 0;
         // logprobs=true without top_logprobs defaults to 0 (just the chosen token's logprob)
         const tlp = root.get("top_logprobs") orelse break :blk 1;
         break :blk switch (tlp) {
-            .integer => |i| @intCast(@min(@max(i, 0), 20)),
+            .integer => |i| @intCast(@min(@max(i, 0), generate_mod.MAX_TOP_LOGPROBS)),
             else => 1,
         };
     };
@@ -9146,7 +9146,7 @@ fn handleCompletions(
     // silently ignored field, which reads to a client as "this model has no
     // opinion" rather than "this server never asked".
     const logprobs_n: u32 = if (root.get("logprobs")) |v| switch (v) {
-        .integer => |i| @intCast(@min(@max(i, 0), 20)),
+        .integer => |i| @intCast(@min(@max(i, 0), generate_mod.MAX_TOP_LOGPROBS)),
         else => 0,
     } else 0;
 

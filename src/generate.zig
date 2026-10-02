@@ -14264,6 +14264,10 @@ fn firstTokenLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chose
 /// this did — is ambiguous the moment two logits tie, which under the
 /// saturation above is everywhere: rank 1 was measured to be the chosen token
 /// in 0 of 5 positions on a trivial greedy prompt.
+/// Widest `top_logprobs` / `logprobs` a request may ask for. OpenAI stops at 20; a
+/// fidelity probe (KL against a reference distribution) needs the pack's tail too.
+pub const MAX_TOP_LOGPROBS: u32 = 1024;
+
 fn computeLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_token: u32, top_n: u32, s: mlx.mlx_stream) !LogprobResult {
     // log_softmax in f32: `log(softmax(x))` in the logits dtype rounds every
     // probability to bf16/f16 before the log, and f16 underflows to -inf.
@@ -14280,7 +14284,7 @@ fn computeLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_t
     const lp_shape = mlx.getShape(log_probs);
     const rank = lp_shape.len;
     const vocab_size: usize = @intCast(lp_shape[rank - 1]);
-    const k: usize = @min(@as(usize, @min(top_n, 20)), vocab_size);
+    const k: usize = @min(@as(usize, @min(top_n, MAX_TOP_LOGPROBS)), vocab_size);
 
     // Top-k INDICES, carried alongside their values. Negating turns "k largest"
     // into the "k smallest" that argpartition puts in the leading slots.

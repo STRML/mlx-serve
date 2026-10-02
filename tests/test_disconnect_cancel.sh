@@ -54,7 +54,11 @@ fi
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 1
 # --no-pld for predictable prefill timing; big ctx for the long prompt.
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size 32768 --no-pld --metrics --log-level debug > "$LOG" 2>&1 &
+# A prefill shorter than the 5 s keepalive period observes nothing: on a chip that
+# prefills E4B past 8k tok/s (M5 Ultra, 3.2 s for the default prompt) raise the word count.
+WORDS="${DISCONNECT_PROMPT_WORDS:-9000}"
+CTX=$(( (WORDS * 3 + 8191) / 8192 * 8192 + 8192 ))
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size "$CTX" --no-pld --metrics --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null' EXIT
 
@@ -69,12 +73,13 @@ curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not come up"
 # seeds per check: a shared prompt would let check 2's ghost ride check 1's
 # hot-prefix-cache entry and skip the cold prefill entirely.
 big_body() { # $1 = seed -> JSON on stdout
-    python3 - "$1" <<'EOF'
+    python3 - "$1" "$WORDS" <<'EOF'
 import json, random, sys
 random.seed(int(sys.argv[1]))
+n_words = int(sys.argv[2])
 words = ["alpha","bridge","cobalt","delta","ember","fjord","glacier","harbor",
          "isotope","jasper","kelvin","lumen","meridian","nectar","onyx","prism"]
-text = " ".join(random.choice(words) + str(i % 97) for i in range(9000))
+text = " ".join(random.choice(words) + str(i % 97) for i in range(n_words))
 print(json.dumps({
     "model": "m", "max_tokens": 40, "stream": True,
     "messages": [{"role": "user", "content": "Summarize this in one word: " + text}],

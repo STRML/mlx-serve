@@ -98,6 +98,7 @@ probe() { # logical host model_id
 drafter_for() { # logical
     case "$1" in
         qwen38-27b) find_model z-lab/Qwen3.8-27B-DFlash2 ;;
+        *) return 1 ;;
     esac
 }
 
