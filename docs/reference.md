@@ -293,6 +293,7 @@ Opt-in, performance-safe. Design contract: **zero cost when off** (a single `?*M
 - **SSE parsing**: accumulates tool-call deltas; emits `.toolCalls` on `finish_reason: "tool_calls"`; fallback if stream drops without `finish_reason`.
 - **Storage**: `SerializedToolCall` (id, name, args as JSON string) on `ChatMessage.toolCalls`; Codable-persisted; backwards-compat (optional field).
 - **Error recovery**: tool errors include sent args + retry hint → enables self-correction.
+- **mlxtop** (`scripts/mlxtop.py`, `tests/test_mlxtop.py`): terminal dashboard that reads only `/metrics.json` and keeps its own history, as a Prometheus scraper does: raw samples for 1 h then one per minute to 24 h, snapshotted to `~/.cache/mlxtop/<host>-<port>.json` (ignored when corrupt, from another server or unwritable). Every figure is a counter delta (tok/s from histogram sums, windowed p50/p95 TTFT and e2e from bucket deltas, cache hit, failed/rejected/cancelled per minute, live tok/s per `sessions[].request_id`); a counter decrease or a new `process_start_time_seconds` draws a gap. Missing fields (`request_id`, `client`, failed/rejected counters) degrade to blank or zero; a `monitor` block is ignored.
 
 ## Prompt-based Skills
 

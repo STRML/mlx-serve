@@ -2,6 +2,9 @@
 
 ## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
+### Added
+- `scripts/mlxtop.py` is a terminal dashboard over `/metrics.json` that keeps its own 24 h history on the client (windowed p50/p95 TTFT, error rates, per-model view), so the server stays a plain counter endpoint.
+
 ### Fixes
 - Serving more than 16 simultaneous chats on Qwen3.8 27B with its drafter could fail a whole batch of streams mid-answer; every stream now completes (measured to 32 at once on an M5 Ultra).
 - Sushi Flash Next packs with unquantized BF16 n-gram tables now load when their table metadata declares no quantization groups.
