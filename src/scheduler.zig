@@ -2449,12 +2449,38 @@ pub fn batchedKvKeepCount(kv_lens_asc: []const u32) usize {
     return 0;
 }
 
+/// A group whose longest billed slot is at most this long pads a tensor that is small in absolute
+/// terms, and splitting it sends a slot through a whole serial forward instead. Under the qwen4
+/// gather arm every long slot bills at the indexer budget (2052 rows), so a short sub-agent beside
+/// long streams reads as a 2x pad and was split off.
+pub const PAD_FREE_KV: u32 = 4096;
+
+/// The floor above only engages once some slot in the group holds at least this much context:
+/// below it the serial forward it saves is cheap and keeping the group whole does not pay.
+pub const PAD_FREE_MIN_CTX: u32 = 131072;
+
+/// Does the small-pad floor keep this group whole? `billed_max` is the longest billed length,
+/// `ctx_max` the longest true context.
+pub fn padFreeFloorApplies(billed_max: u32, ctx_max: u32) bool {
+    return ctx_max >= PAD_FREE_MIN_CTX and billed_max <= PAD_FREE_KV;
+}
+
 /// `batchedKvKeepCount` for a group whose forward may attend per slot: past the per-slot
-/// floor nothing is padded, so every slot batches.
-pub fn groupKeepCount(kv_lens_asc: []const u32, per_slot_capable: bool) usize {
-    if (per_slot_capable and kv_lens_asc.len >= 2 and
-        kv_lens_asc[kv_lens_asc.len - 1] >= transformer_mod.Transformer.BATCHED_PER_SLOT_ATTN_MIN_KV) return kv_lens_asc.len;
+/// floor nothing is padded, so every slot batches. `ctx_max` is the group's longest true context.
+pub fn groupKeepCount(kv_lens_asc: []const u32, per_slot_capable: bool, ctx_max: u32) usize {
+    if (kv_lens_asc.len >= 2) {
+        const billed_max = kv_lens_asc[kv_lens_asc.len - 1];
+        if (per_slot_capable and billed_max >= transformer_mod.Transformer.BATCHED_PER_SLOT_ATTN_MIN_KV) return kv_lens_asc.len;
+        if (padFreeFloorApplies(billed_max, ctx_max)) return kv_lens_asc.len;
+    }
     return batchedKvKeepCount(kv_lens_asc);
+}
+
+/// The longest true context (not the billed length) among the group's caches.
+fn groupCtxMax(caches: []const *const KVCache) u32 {
+    var m: usize = 0;
+    for (caches) |c| m = @max(m, c.kvLenForBatching());
+    return @intCast(@min(m, std.math.maxInt(u32)));
 }
 
 /// The per-slot attention arm serves every batched trunk but qwen4's QSA reads.
@@ -7113,12 +7139,14 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // how many still fit; the tail decodes serially this tick.
         if (group.len >= 2) {
             var kv_lens: [32]u32 = undefined;
+            var ctx_max: u32 = 0;
             {
                 var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
                 for (group, 0..) |g, i| {
                     caches_buf[i] = &g.cache;
                 }
                 fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 1, kv_lens[0..group.len]);
+                ctx_max = groupCtxMax(caches_buf[0..group.len]);
                 // Stable insertion sort, ascending, slots and lengths moving together.
                 var i: usize = 1;
                 while (i < group.len) : (i += 1) {
@@ -7133,7 +7161,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
                     kv_lens[j] = len_i;
                 }
             }
-            const keep = groupKeepCount(kv_lens[0..group.len], groupAttendsPerSlot(group[0]));
+            const keep = groupKeepCount(kv_lens[0..group.len], groupAttendsPerSlot(group[0]), ctx_max);
             if (keep < group.len) {
                 if (!kv_skew_split_logged) {
                     kv_skew_split_logged = true;
@@ -8473,6 +8501,7 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
                 caches_buf[i] = &g.cache;
             }
             fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 2, kv_lens[0..group.len]);
+            const ctx_max = groupCtxMax(caches_buf[0..group.len]);
             var i: usize = 1;
             while (i < group.len) : (i += 1) {
                 const slot_i = group[i];
@@ -8485,7 +8514,7 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
                 group[j] = slot_i;
                 kv_lens[j] = len_i;
             }
-            const keep = groupKeepCount(kv_lens[0..group.len], groupAttendsPerSlot(group[0]));
+            const keep = groupKeepCount(kv_lens[0..group.len], groupAttendsPerSlot(group[0]), ctx_max);
             for (group[keep..]) |s| {
                 noteSerial(sch, s, .pad_waste);
                 try runSingleDecodeTick(sch, s);
@@ -9196,10 +9225,20 @@ test "the batched group is capped by padding waste before it is dispatched" {
 
 test "groupKeepCount: a group that attends per slot pads nothing, so the cap is the stacked arm's" {
     const skew = [_]u32{ 1000, 1000, 1000, 100_000 };
-    try testing.expectEqual(@as(usize, 3), groupKeepCount(&skew, false));
-    try testing.expectEqual(@as(usize, 4), groupKeepCount(&skew, true));
+    try testing.expectEqual(@as(usize, 3), groupKeepCount(&skew, false, 0));
+    try testing.expectEqual(@as(usize, 4), groupKeepCount(&skew, true, 0));
     // Below the per-slot floor the stacked arm runs and its cap holds.
-    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{ 10, 900 }, true));
+    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{ 10, 900 }, true, 0));
+}
+
+test "groupKeepCount: the small-pad floor keeps a group whole only at long context" {
+    // A long stream billed at the gather arm's 2052-row cap beside two short sub-agents: 3x pad.
+    const billed = [_]u32{ 10, 10, 2052 };
+    try testing.expectEqual(@as(usize, 2), groupKeepCount(&billed, false, PAD_FREE_MIN_CTX - 1));
+    try testing.expectEqual(@as(usize, 3), groupKeepCount(&billed, false, PAD_FREE_MIN_CTX));
+    // Past the floor's billed bound the cap holds at any context.
+    try testing.expectEqual(@as(usize, 0), groupKeepCount(&[_]u32{ 1, PAD_FREE_KV + 1 }, false, 300_000));
+    try testing.expectEqual(@as(usize, 2), groupKeepCount(&[_]u32{ 1, PAD_FREE_KV }, false, 300_000));
 }
 
 test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.step" {
