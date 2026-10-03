@@ -8678,9 +8678,7 @@ test "SSD-first: a write failure inside the SAME pass still keeps the entry resi
 }
 
 test "SSD-first: a spill pass probes the volume only for a store, never for a copy already on disk" {
-    // The probe asks macOS for the purgeable-space figure (~18 ms) and the spill runs on the
-    // inference thread at every finish, once per idle entry: 13 idle 77k sessions cost every
-    // decoding slot ~235 ms per finished request. A copy the tier already holds writes nothing.
+    // A spill pass probes the volume only for an entry it will write.
     const io = std.testing.io;
     const s = mlx.gpuStream();
 

@@ -166,7 +166,7 @@ var test_space: ?VolumeSpace = null;
 var test_qsa_overlay_mismatch = false;
 var test_ssm_write_qsa_aux = false;
 
-/// How many free-space probes the test hook answered: the live probe costs ~18 ms on macOS.
+/// How many free-space probes the test hook answered.
 pub var test_space_probes: usize = 0;
 
 fn testSpaceProbe(path: []const u8) ?VolumeSpace {
@@ -1247,9 +1247,8 @@ pub const DiskTier = struct {
                 extend_idx = i;
             }
         }
-        // Re-derive the budget from free space before every store. Only a store: the probe asks
-        // macOS for the purgeable-space figure (~18 ms), and the idle spill reaches this point once
-        // per idle entry at every finish, almost always for a copy the tier already holds (above).
+        // Re-derive the budget from free space before every store, and only a store: the
+        // purgeable-space query is slow and the idle spill reaches this point once per idle entry.
         if (self.ssd_first) self.refreshDiskBudget();
         // The refresh gates THIS store, not merely the next one.
         if (self.store_declined) return .skipped;
