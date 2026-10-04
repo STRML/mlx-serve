@@ -2784,6 +2784,18 @@ pub fn fusedSinkAttnPrefill(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_arra
     return fusedSdpa256Impl(s, q, k, v, scale, window, null, sinks);
 }
 
+/// True when a bf16 view's bound address is 16-byte aligned — the bar every
+/// `uint4` staging load in `msv_attn_p256` / `msv_attn_qsa256` needs. A lazy
+/// array has no base yet (the kernel binds its buffer at dispatch, like the
+/// stride checks in `gatherQsa256` see); an available one returns the address
+/// the kernel really reads. Same base test `hcUvEligible` runs for its weights.
+fn attn256Base16Aligned(a: mlx.mlx_array) bool {
+    var avail = false;
+    if (mlx._mlx_array_is_available(&avail, a) != 0 or !avail) return true;
+    const p = mlx.mlx_array_data_uint32(a) orelse return true;
+    return @intFromPtr(p) % 16 == 0;
+}
+
 var qsa_fused_env_cached: ?bool = null;
 pub var qsa_fused_override: ?bool = null;
 
@@ -3561,6 +3573,11 @@ pub fn gatherQsa256(
     if (bs[0] != qs[0] or bs[1] != qs[2] or bs[2] <= 0) return null;
     if (ratio <= 0) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
+
+    // K/V stage through `uint4` loads in the stock kernel: an unaligned
+    // materialized view base reads wrong values; decline and the caller's
+    // mask arm runs the same shape (same bar as `fusedSdpa256Impl`).
+    if (!attn256Base16Aligned(k) or !attn256Base16Aligned(v)) return null;
 
     qsaNaxArm();
     const qst = mlx.mlx_array_strides(q);
@@ -7372,6 +7389,11 @@ fn fusedSdpa256Impl(
     if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1] or ks[0] != qs[0] or vs[0] != qs[0]) return null;
     const attn_dt = mlx.mlx_array_dtype(q);
     if ((attn_dt != .bfloat16 and attn_dt != .float16) or mlx.mlx_array_dtype(k) != attn_dt or mlx.mlx_array_dtype(v) != attn_dt) return null;
+
+    // K/V stage through `uint4` loads: an unaligned materialized view base
+    // (e.g. the [3,259) slice of a padded cache) reads wrong values; decline
+    // and the caller's fallback runs the same shape.
+    if (!attn256Base16Aligned(k) or !attn256Base16Aligned(v)) return null;
 
     const kernel = getAttn256Kernel() catch return null;
 
@@ -57897,6 +57919,75 @@ test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ra
     try std.testing.expect((try fusedSdpa256Masked(s, q, k, v, scale, mask)) == null);
 }
 
+/// Materialized `[B,H,T,264]` padded cache sliced on the last axis to
+/// `[lo, lo+256)`: a 256-wide view whose row stride is divisible by 8 elements
+/// (16 bytes) while its base sits `lo*2` bytes into the buffer — the shape the
+/// `uint4` staging loads of the two old kernels must not read.
+fn attn256SliceLastDim(
+    parent: mlx.mlx_array,
+    lo: c_int,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    const ps = mlx.getShape(parent);
+    const one = [_]c_int{ 1, 1, 1, 1 };
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const stop = [_]c_int{ ps[0], ps[1], ps[2], lo + 256 };
+    try mlx.check(mlx.mlx_slice(&out, parent, &[_]c_int{ 0, 0, 0, lo }, 4, &stop, 4, &one, 4, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+test "fusedSdpa256Masked: a last-axis slice with an unaligned base declines and the fallback reads exactly" {
+    // `[3,259)` has a 6-byte base: the row stride (264) is divisible by 8 so the
+    // existing stride checks pass, but `msv_attn_p256`'s `uint4` K/V staging
+    // reads wrong values. The gate must decline it and the caller's fallback
+    // (`qsaMaskArm`, the same arm production takes) must serve the shape.
+    // `[0,256)` is the aligned twin: it keeps the fused kernel.
+    const s = mlx.gpuStream();
+    fused256_override = true;
+    defer fused256_override = null;
+    qsa_fused_override = true;
+    defer qsa_fused_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5E7_5E7);
+    const rnd = prng.random();
+
+    const q_shape = [_]c_int{ 1, 6, 70, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 193, 264 }, s);
+    defer _ = mlx.mlx_array_free(k_pad);
+    const v_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 193, 264 }, s);
+    defer _ = mlx.mlx_array_free(v_pad);
+    try mlx.check(mlx.mlx_array_eval(k_pad));
+    try mlx.check(mlx.mlx_array_eval(v_pad));
+    const mask = try attn256QsaMask(rnd, 70, 193);
+    defer _ = mlx.mlx_array_free(mask);
+    const scale: f32 = 1.0 / 16.0;
+
+    const k = try attn256SliceLastDim(k_pad, 3, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256SliceLastDim(v_pad, 3, s);
+    defer _ = mlx.mlx_array_free(v);
+    try std.testing.expect((try fusedSdpa256Masked(s, q, k, v, scale, mask)) == null);
+    const arm = try qsaMaskArm(s, q, k, v, scale, mask);
+    defer _ = mlx.mlx_array_free(arm);
+    const ref = try attn256Reference(q, k, v, scale, "array", mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    try std.testing.expect(try attn256MaxDiff(arm, ref, s) < 0.005);
+
+    // An aligned twin keeps the fast path.
+    const k_al = try attn256SliceLastDim(k_pad, 0, s);
+    defer _ = mlx.mlx_array_free(k_al);
+    const v_al = try attn256SliceLastDim(v_pad, 0, s);
+    defer _ = mlx.mlx_array_free(v_al);
+    const fast = (try fusedSdpa256Masked(s, q, k_al, v_al, scale, mask)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(fast);
+    const ref_al = try attn256Reference(q, k_al, v_al, scale, "array", mask, s);
+    defer _ = mlx.mlx_array_free(ref_al);
+    try std.testing.expect(try attn256MaxDiff(fast, ref_al, s) < 0.005);
+}
+
 /// A sorted qwen4 block selection [1,qL,kb] int32 for rows straddling the
 /// "every block fits" boundary (INT_MAX past each row's count), plus the
 /// equivalent dense [1,1,qL,kL] mask the composed reference consumes.
@@ -58264,6 +58355,65 @@ test "gatherQsa256 NAX: precise sparse attention and stock fallback" {
     const fallback = (try gatherQsa256(s, q, k, v, scale, smaller.blocks, 4)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(fallback);
     try std.testing.expect(!qsa_gather_used_nax);
+}
+
+test "gatherQsa256: a last-axis slice with an unaligned base declines and reads the same shape as the fallback" {
+    // The stock `msv_attn_qsa256` kernel stages K/V in `uint4` loads. A
+    // `[3,259)` slice of a padded `[1,2,101,264]` cache has a 16-byte row
+    // stride (264) but a 6-byte base, so the loads read wrong values. The
+    // gate must decline it and the caller's fallback (`qsaMaskArm`) must
+    // serve the same shape. `[0,256)` is the aligned twin: it keeps the
+    // stock kernel.
+    const s = mlx.gpuStream();
+    qsa_gather_override = true;
+    defer qsa_gather_override = null;
+    qsa_nax_override = false;
+    defer qsa_nax_override = null;
+    defer qsa_gather_bk_override = null;
+    var prng = std.Random.DefaultPrng.init(0x0FF_5E7);
+    const rnd = prng.random();
+
+    const qL: c_int = 40;
+    const kL: c_int = 101;
+    const kb: c_int = 512;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, qL, 256 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kL, 264 }, s);
+    defer _ = mlx.mlx_array_free(k_pad);
+    const v_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kL, 264 }, s);
+    defer _ = mlx.mlx_array_free(v_pad);
+    try mlx.check(mlx.mlx_array_eval(k_pad));
+    try mlx.check(mlx.mlx_array_eval(v_pad));
+    var fx = try QsaBlockFixture.build(rnd, qL, kL, kb, 4);
+    defer fx.deinit();
+    const scale: f32 = 1.0 / 16.0;
+
+    const k = try attn256SliceLastDim(k_pad, 3, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256SliceLastDim(v_pad, 3, s);
+    defer _ = mlx.mlx_array_free(v);
+
+    // The unaligned view must not reach the kernel; the fallback arm reads
+    // the same shape and matches the composed reference within the
+    // neighboring tests' bar.
+    try std.testing.expect((try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) == null);
+    const ref = try attn256Reference(q, k, v, scale, "array", fx.mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    const arm = try qsaMaskArm(s, q, k, v, scale, fx.mask);
+    defer _ = mlx.mlx_array_free(arm);
+    try std.testing.expect(try attn256MaxDiff(arm, ref, s) < 0.005);
+
+    // An aligned twin keeps the stock (non-NAX) fast path.
+    const k_al = try attn256SliceLastDim(k_pad, 0, s);
+    defer _ = mlx.mlx_array_free(k_al);
+    const v_al = try attn256SliceLastDim(v_pad, 0, s);
+    defer _ = mlx.mlx_array_free(v_al);
+    const fast = (try gatherQsa256(s, q, k_al, v_al, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(fast);
+    try std.testing.expect(!qsa_gather_used_nax);
+    const ref_al = try attn256Reference(q, k_al, v_al, scale, "array", fx.mask, s);
+    defer _ = mlx.mlx_array_free(ref_al);
+    try std.testing.expect(try attn256MaxDiff(fast, ref_al, s) < 0.005);
 }
 
 test "gatherQsa256 NAX: max error vs f32 gather-softmax is at most 1.5x stock" {
