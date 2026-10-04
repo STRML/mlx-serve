@@ -7625,10 +7625,17 @@ pub const Generator = struct {
         self.mtp_pre_draft = chain;
     }
 
+    /// Whether the eager pre-draft may build the next round's head chain. A
+    /// chain is only worth its cost when a later round reads it: a request
+    /// whose budget is spent or whose pending token ends it keeps no reader.
+    fn mtpPreDraftOpenAllows(completion_tokens: u32, max_tokens: u32, pending_is_eos: bool) bool {
+        return completion_tokens < max_tokens and !pending_is_eos;
+    }
+
     /// The next round's empty chain, or null when this request must not pre-draft.
     /// `allow_lookup`: false for group pre-drafts, which build every chain batched.
     fn mtpPreDraftOpen(self: *Generator, allocator: std.mem.Allocator, allow_lookup: bool) !?MtpPreDraft {
-        if (self.mtp_planner_owned and (self.completion_tokens >= self.max_tokens or isEosId(self.next_token_id, self.eos_token_ids))) return null;
+        if (!mtpPreDraftOpenAllows(self.completion_tokens, self.max_tokens, isEosId(self.next_token_id, self.eos_token_ids))) return null;
         if (!mtpPredraftEnabled() or self.spec_disabled_runtime or self.mtp_planner_pending) return null;
         std.debug.assert(self.mtp_pre_draft == null);
         const plan = self.mtpRoundPlan();
@@ -20066,6 +20073,18 @@ test "mtpSerialCaptureReady: the capture step's entry invariant is a RUNTIME che
     try testing.expect(!G.mtpSerialCaptureReady(true, false));
     try testing.expect(!G.mtpSerialCaptureReady(false, true));
     try testing.expect(!G.mtpSerialCaptureReady(true, true));
+}
+
+test "mtpPreDraftOpenAllows: an eager pre-draft needs a reader, planner-owned or not" {
+    const G = Generator;
+    // One token under budget: the next round reads the chain, so open.
+    try testing.expect(G.mtpPreDraftOpenAllows(9, 10, false));
+    // Exactly at budget: the request ends on length, no later round reads it.
+    try testing.expect(!G.mtpPreDraftOpenAllows(10, 10, false));
+    // Over budget: same.
+    try testing.expect(!G.mtpPreDraftOpenAllows(11, 10, false));
+    // A pending EOS ends the request even with budget left, so no reader.
+    try testing.expect(!G.mtpPreDraftOpenAllows(5, 10, true));
 }
 
 test "MTP head persistence kill switch: only a literal 0 turns it off" {
