@@ -42355,9 +42355,12 @@ fn getGatherQmvDownReduceKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-/// Lanes per output row in the down+reduce kernels; 32/LPR rows per simdgroup.
-/// 4 spills its hoisted packs, 16 measured the same as 8 on the shipped shapes.
-const DOWNRED_LPR: c_int = 8;
+/// Lanes per output row in the down+reduce kernels; 32/LPR rows per simdgroup. The solo and the rows
+/// kernel share it so a row's sum keeps one accumulation order on both paths. 4 spills its hoisted packs.
+/// 16 is the same as 8 for the one-token kernel and 12 to 17% faster for the verify-width rows kernel
+/// when the calls are chained as a forward chains them (S=6, M5 Ultra, 4-bit g64, hidden 2560 / inter
+/// 640: down alone 85.6 -> 71.1 us, pair 200 -> 177 us; 32 lanes is 88 us, 4 lanes 128 us).
+const DOWNRED_LPR: c_int = 16;
 const DownRedCfgKey = struct { topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
 var downred_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var downred_cfg_key: DownRedCfgKey = std.mem.zeroes(DownRedCfgKey);
