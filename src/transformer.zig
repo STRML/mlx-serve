@@ -1687,6 +1687,24 @@ pub fn naxArchGeneration(arch: []const u8) struct { gen: u32, phone: bool } {
     };
 }
 
+pub const DeviceGen = struct { gen: u32, phone: bool };
+
+/// Test seam: pin the GPU generation every generation-keyed plan reads (null = the device's).
+pub var device_gen_override: ?DeviceGen = null;
+var device_gen_cache: ?DeviceGen = null;
+
+/// The device's GPU generation, parsed once. Kernel plans keyed on generation (`qmv2.planFor`, the
+/// down+reduce lane count) read this one cache.
+pub fn deviceGeneration() DeviceGen {
+    if (device_gen_override) |g| return g;
+    if (device_gen_cache) |g| return g;
+    var buf: [128]u8 = undefined;
+    const parsed = naxArchGeneration(gpuArchitecture(&buf) orelse "");
+    const g: DeviceGen = .{ .gen = parsed.gen, .phone = parsed.phone };
+    device_gen_cache = g;
+    return g;
+}
+
 pub fn naxArchSupportedFrom(arch: []const u8) bool {
     const parsed = naxArchGeneration(arch);
     const floor: u32 = if (parsed.phone) 18 else 17;
@@ -42362,17 +42380,9 @@ fn downredLanesFor(gen: u32, phone: bool) c_int {
     return if (gen == 17 and !phone) 16 else 8;
 }
 
-/// Test seam: pin the generation the lane count reads (null = the device's).
-pub var downred_gen_override: ?struct { gen: u32, phone: bool } = null;
-var downred_gen_cache: ?struct { gen: u32, phone: bool } = null;
-
 fn downredLpr() c_int {
-    if (downred_gen_override) |g| return downredLanesFor(g.gen, g.phone);
-    if (downred_gen_cache) |g| return downredLanesFor(g.gen, g.phone);
-    var buf: [128]u8 = undefined;
-    const parsed = naxArchGeneration(gpuArchitecture(&buf) orelse "");
-    downred_gen_cache = .{ .gen = parsed.gen, .phone = parsed.phone };
-    return downredLanesFor(parsed.gen, parsed.phone);
+    const g = deviceGeneration();
+    return downredLanesFor(g.gen, g.phone);
 }
 
 const DownRedCfgKey = struct { topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int };
@@ -44547,8 +44557,8 @@ test "qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it sta
     defer _ = mlx.mlx_array_free(x);
     try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
-    qmv2.gen_override = .{ .gen = 13, .phone = false };
-    defer qmv2.gen_override = null;
+    device_gen_override = .{ .gen = 13, .phone = false };
+    defer device_gen_override = null;
     var xfm: Transformer = undefined;
     xfm.s = s;
     xfm.rht = null;
@@ -51636,9 +51646,9 @@ test "moe rows fused: rows match solo calls at 8 and at 16 lanes per down row" {
     defer gqmv_gateup_override = null;
     downred_override = true;
     defer downred_override = null;
-    defer downred_gen_override = null;
+    defer device_gen_override = null;
     for ([_]u32{ 16, 17 }) |gen| {
-        downred_gen_override = .{ .gen = gen, .phone = false };
+        device_gen_override = .{ .gen = gen, .phone = false };
         try moeRowsFusedCase(s, rnd, 512, 2560, 640, 10, 8, 4, 64, 4, 64);
     }
 }
