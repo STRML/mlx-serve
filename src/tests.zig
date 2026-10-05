@@ -27,6 +27,7 @@ test {
     _ = @import("rht.zig");
     _ = @import("qmv2.zig");
     _ = @import("moe_gather_ubench.zig");
+    _ = @import("hc_chained_ubench.zig");
     _ = @import("moe_affine4.zig");
     _ = @import("hc_decode2.zig");
     _ = @import("qsa_mask.zig");

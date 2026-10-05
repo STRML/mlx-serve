@@ -14424,7 +14424,7 @@ const MhcWeights = struct {
 /// qwen4_exp gated residual ("hyper connection"). `norm_w` is the grouped
 /// hc_norm weight viewed as [hc, hidden]; `inject_*` is absent on the final
 /// mixer (`use_combine=False`).
-const HcWeights = struct {
+pub const HcWeights = struct {
     norm_w: mlx.mlx_array,
     down_w: mlx.mlx_array,
     down_s: mlx.mlx_array,
@@ -41673,11 +41673,11 @@ const HcPrepared = struct {
 var hc_prepared_entries: [32]HcPrepared = @splat(.{});
 var hc_prepared_clock: u64 = 0;
 
-fn hcReadPrepared(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, bits: u32, gs: u32, pending: ?HcPending) !?HcFusedOut {
+pub fn hcReadPrepared(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, bits: u32, gs: u32, pending: ?HcPending) !?HcFusedOut {
     return hcReadPreparedWidth(s, x, w, width, eps, bits, gs, pending, 6);
 }
 
-fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, bits: u32, gs: u32, pending: ?HcPending, max_width: c_int) !?HcFusedOut {
+pub fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, bits: u32, gs: u32, pending: ?HcPending, max_width: c_int) !?HcFusedOut {
     if (!hcFusedEnabled() or !mlx.streamIsGpu(s) or !verifySharedHardware() or width < 2 or width > max_width) return null;
     if (x.ctx == null or mlx.mlx_array_dtype(x) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(x), &.{ 1, width, 10240 })) return null;
     const arrays = [_]mlx.mlx_array{ x, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, if (pending) |pd| pd.out else x, if (pending) |pd| pd.inj else x };
@@ -41883,7 +41883,7 @@ pub fn hcReadFused(
     }
 
     if (rows == 1 and hcDiagSkip() == 0) {
-        if (try hc_decode2.read(s, x, nw, dw, ds, db, uw, us, ub, iw, try hcEpsArray(eps), hc, hidden, bits, group_size, if (pend) |pd| .{ .out = pd.out, .inj = pd.inj } else null)) |two| {
+        if (try hc_decode2.read(s, x, nw, dw, ds, db, uw, us, ub, iw, try hcEpsArray(eps), 1, hc, hidden, bits, group_size, if (pend) |pd| .{ .out = pd.out, .inj = pd.inj } else null)) |two| {
             defer inline for (.{ "mixed", "inj", "stream" }) |name| {
                 if (@field(two, name).ctx != null) _ = mlx.mlx_array_free(@field(two, name));
             };
