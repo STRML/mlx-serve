@@ -42357,11 +42357,25 @@ fn getGatherQmvDownReduceKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
 
 /// Lanes per output row in the down+reduce kernels; 32/LPR rows per simdgroup. The solo and the rows
 /// kernel share it so a row's sum keeps one accumulation order on both paths. 4 spills its hoisted packs.
-/// 16 is the same as 8 for the one-token kernel and 12 to 17% faster for the verify-width rows kernel
-/// when the calls are chained as a forward chains them (S=6, M5 Ultra, 4-bit g64, hidden 2560 / inter
-/// 640: down alone 85.6 -> 71.1 us, pair 200 -> 177 us; 32 lanes is 88 us, 4 lanes 128 us).
-const DOWNRED_LPR: c_int = 16;
-const DownRedCfgKey = struct { topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
+/// A generation nobody measured keeps 8; 16 is measured on G17 (M5).
+fn downredLanesFor(gen: u32, phone: bool) c_int {
+    return if (gen == 17 and !phone) 16 else 8;
+}
+
+/// Test seam: pin the generation the lane count reads (null = the device's).
+pub var downred_gen_override: ?struct { gen: u32, phone: bool } = null;
+var downred_gen_cache: ?struct { gen: u32, phone: bool } = null;
+
+fn downredLpr() c_int {
+    if (downred_gen_override) |g| return downredLanesFor(g.gen, g.phone);
+    if (downred_gen_cache) |g| return downredLanesFor(g.gen, g.phone);
+    var buf: [128]u8 = undefined;
+    const parsed = naxArchGeneration(gpuArchitecture(&buf) orelse "");
+    downred_gen_cache = .{ .gen = parsed.gen, .phone = parsed.phone };
+    return downredLanesFor(parsed.gen, parsed.phone);
+}
+
+const DownRedCfgKey = struct { topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int };
 var downred_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var downred_cfg_key: DownRedCfgKey = std.mem.zeroes(DownRedCfgKey);
 var downred_engaged: bool = false;
@@ -42433,10 +42447,10 @@ pub fn gatherQmvDownReduce(
     var xelems: i64 = 1;
     for (xsh) |d| xelems *= d;
     if (xelems != @as(i64, topk) * K) return null;
-    const rows: c_int = @divExact(32, DOWNRED_LPR);
+    const rows: c_int = @divExact(32, downredLpr());
     if (@rem(N, rows) != 0) return null;
 
-    const key = DownRedCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd };
+    const key = DownRedCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .lpr = downredLpr() };
     if (downred_cfg == null or !std.meta.eql(downred_cfg_key, key)) {
         if (downred_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -42449,7 +42463,7 @@ pub fn gatherQmvDownReduce(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TOPK", topk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", DOWNRED_LPR));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", downredLpr()));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
         downred_cfg = cfg;
         downred_cfg_key = key;
@@ -42563,7 +42577,7 @@ fn getGatherQmvDownReduceRowsKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const DownRedRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
+const DownRedRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int };
 var downred_rows_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var downred_rows_cfg_key: DownRedRowsCfgKey = std.mem.zeroes(DownRedRowsCfgKey);
 var downred_rows_engaged: bool = false;
@@ -42643,10 +42657,10 @@ pub fn gatherQmvDownReduceRows(
     var xelems: i64 = 1;
     for (xsh) |d| xelems *= d;
     if (xelems != @as(i64, nrows) * topk * K) return null;
-    const rows: c_int = @divExact(32, DOWNRED_LPR);
+    const rows: c_int = @divExact(32, downredLpr());
     if (@rem(N, rows) != 0) return null;
 
-    const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd };
+    const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .lpr = downredLpr() };
     if (downred_rows_cfg == null or !std.meta.eql(downred_rows_cfg_key, key)) {
         if (downred_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -42659,7 +42673,7 @@ pub fn gatherQmvDownReduceRows(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TOPK", topk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", DOWNRED_LPR));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", downredLpr()));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
         downred_rows_cfg = cfg;
         downred_rows_cfg_key = key;
@@ -51603,6 +51617,29 @@ fn moeRowsFusedCase(s: mlx.mlx_stream, rnd: std.Random, E: c_int, hid: c_int, in
         const fused_dr = try moeRowsSliceRow(s, fused_dn, r);
         defer _ = mlx.mlx_array_free(fused_dr);
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(fused_dr, solo_dn, s));
+    }
+}
+
+test "down+reduce lanes per row: 16 on G17, 8 on every other generation and on phones" {
+    try std.testing.expectEqual(@as(c_int, 16), downredLanesFor(17, false));
+    try std.testing.expectEqual(@as(c_int, 8), downredLanesFor(17, true));
+    for ([_]u32{ 0, 13, 14, 15, 16, 18, 19 }) |g| try std.testing.expectEqual(@as(c_int, 8), downredLanesFor(g, false));
+}
+
+test "moe rows fused: rows match solo calls at 8 and at 16 lanes per down row" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x1A4E);
+    const rnd = prng.random();
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gqmv_gateup_override = true;
+    defer gqmv_gateup_override = null;
+    downred_override = true;
+    defer downred_override = null;
+    defer downred_gen_override = null;
+    for ([_]u32{ 16, 17 }) |gen| {
+        downred_gen_override = .{ .gen = gen, .phone = false };
+        try moeRowsFusedCase(s, rnd, 512, 2560, 640, 10, 8, 4, 64, 4, 64);
     }
 }
 
