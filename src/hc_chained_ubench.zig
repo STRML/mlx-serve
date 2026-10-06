@@ -69,7 +69,7 @@ const Arm = enum { graph, two_launch };
 
 const Inputs = struct {
     s: mlx.mlx_stream,
-    weights: xfm.HcWeights,
+    sets: []xfm.HcWeights, // one per read of a forward; HC_UBENCH_SETS=1 keeps one set cache-hot
     eps: mlx.mlx_array,
     x0: [MAX_W + 1]mlx.mlx_array, // [1, w, K] per width
     wo: [MAX_W + 1]mlx.mlx_array, // [1, w, H]
@@ -96,12 +96,12 @@ fn chain(in: *const Inputs, arm: Arm, w: c_int) !Timing {
         _ = mlx.mlx_array_free(out);
         _ = mlx.mlx_array_free(inj);
     }
-    for (0..CHAIN) |_| {
+    for (0..CHAIN) |ci| {
         const pend: xfm.HcPending = .{ .out = out, .inj = inj };
         const r = switch (arm) {
-            .graph => (try xfm.hcReadPreparedWidth(in.s, x, in.weights, w, 1e-6, BITS, GS, pend, MAX_W)) orelse return error.GraphDeclined,
+            .graph => (try xfm.hcReadPreparedWidth(in.s, x, in.sets[ci % in.sets.len], w, 1e-6, BITS, GS, pend, MAX_W)) orelse return error.GraphDeclined,
             .two_launch => blk: {
-                const wt = in.weights;
+                const wt = in.sets[ci % in.sets.len];
                 const o = (try hc2.read(in.s, x, wt.norm_w, wt.down_w, wt.down_s, wt.down_b, wt.up_w, wt.up_s, wt.up_b, wt.inject_flat, in.eps, w, HC, H, BITS, GS, .{ .out = pend.out, .inj = pend.inj })) orelse return error.TwoLaunchDeclined;
                 break :blk xfm.HcFusedOut{ .mixed = o.mixed, .inj = o.inj, .stream = o.stream };
             },
@@ -144,15 +144,19 @@ test "hc chained read: compiled graph against two launches at verify widths (HC_
 
     var prng = std.Random.DefaultPrng.init(0x4C0DEB);
     const rnd = prng.random();
-    const down = try quantRandom(rnd, R, K, s);
-    defer down.deinit();
-    const up = try quantRandom(rnd, K, R, s);
-    defer up.deinit();
-    const nw = try randBf16(rnd, &.{ HC, H }, 1.0, 1.0, s);
-    defer _ = mlx.mlx_array_free(nw);
-    const iw = try randBf16(rnd, &.{ K, HC }, 0.1, 0.0, s);
-    defer _ = mlx.mlx_array_free(iw);
-    for ([_]mlx.mlx_array{ nw, iw }) |a| try mlx.check(mlx.mlx_array_eval(a));
+    var n_sets: usize = CHAIN;
+    if (std.c.getenv("HC_UBENCH_SETS")) |raw| n_sets = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch CHAIN;
+    const sets = try std.testing.allocator.alloc(xfm.HcWeights, n_sets);
+    defer std.testing.allocator.free(sets);
+    for (sets) |*set| {
+        const down = try quantRandom(rnd, R, K, s);
+        const up = try quantRandom(rnd, K, R, s);
+        const nw = try randBf16(rnd, &.{ HC, H }, 1.0, 1.0, s);
+        const iw = try randBf16(rnd, &.{ K, HC }, 0.1, 0.0, s);
+        for ([_]mlx.mlx_array{ nw, iw }) |a| try mlx.check(mlx.mlx_array_eval(a));
+        set.* = .{ .norm_w = nw, .down_w = down.w, .down_s = down.s, .down_b = down.b, .up_w = up.w, .up_s = up.s, .up_b = up.b, .inject_flat = iw };
+    }
+    std.debug.print("[hc-ubench] {d} distinct weight sets ({d:.0} MB)\n", .{ n_sets, @as(f64, @floatFromInt(n_sets)) * 6.6 });
     const epsv = [_]f32{1e-6};
     const eps = mlx.mlx_array_new_data(&epsv, &.{1}, 1, .float32);
     defer _ = mlx.mlx_array_free(eps);
@@ -160,7 +164,7 @@ test "hc chained read: compiled graph against two launches at verify widths (HC_
     var in: Inputs = undefined;
     in.s = s;
     in.eps = eps;
-    in.weights = .{ .norm_w = nw, .down_w = down.w, .down_s = down.s, .down_b = down.b, .up_w = up.w, .up_s = up.s, .up_b = up.b, .inject_flat = iw };
+    in.sets = sets;
     var made: usize = 0;
     defer for (MIN_W..MIN_W + made) |i| {
         _ = mlx.mlx_array_free(in.x0[i]);
