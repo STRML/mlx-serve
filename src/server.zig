@@ -1242,14 +1242,20 @@ fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *cons
 /// closer is committed and the answer follows.
 const THINK_BOUND_EARLY_STOP = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n";
 
-/// Arm a decode-time thinking bound for this request, or null when nothing
-/// bounds it (no budget, thinking off, markers not atomic). `forced` is
+/// No budget (< 0) still arms the bound at an unreachable limit: it exists to
+/// close a thought the loop guard convicts (`scheduler.loopRecoveryAction`).
+fn thinkBoundBudget(budget: i32) u32 {
+    return if (budget < 0) std.math.maxInt(u32) else @intCast(budget);
+}
+
+/// Arm a decode-time thinking bound for this request, or null when it cannot
+/// close a thought (thinking off, markers not atomic). `forced` is
 /// allocated; the caller frees it after generation.
 fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: i32) ?generate_mod.ThinkBound {
-    if (budget < 0 or !enable_thinking or lm.transformer == null) return null;
+    if (!enable_thinking or lm.transformer == null) return null;
     const closer = promptOpenerMarkerCloser(allocator, lm, tok, prompt_ids) orelse
         atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) orelse {
-        log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
+        if (budget >= 0) log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
         return null;
     };
     const opener = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER);
@@ -1264,8 +1270,8 @@ fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tok
     @memcpy(forced[0..stop_ids.len], stop_ids);
     forced[stop_ids.len] = closer;
     @memcpy(forced[stop_ids.len + 1 ..], sep_ids);
-    log.info("  reasoning budget {d}: enforced in-stream\n", .{budget});
-    return .{ .budget = @intCast(budget), .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
+    if (budget >= 0) log.info("  reasoning budget {d}: enforced in-stream\n", .{budget});
+    return .{ .budget = thinkBoundBudget(budget), .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
 }
 
 /// Arm the forced tool-call opener for a `tool_choice` that obliges a call, or
@@ -25558,4 +25564,10 @@ test "outcome row 7/9: countRejected moves the rejected counter, and does nothin
     try t.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
     try t.expectEqual(@as(u64, 0), m.requests_failed_total.load());
     try t.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
+}
+
+test "an absent reasoning budget arms an unreachable bound, a set one keeps its value" {
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), thinkBoundBudget(-1));
+    try std.testing.expectEqual(@as(u32, 0), thinkBoundBudget(0));
+    try std.testing.expectEqual(@as(u32, 2048), thinkBoundBudget(2048));
 }

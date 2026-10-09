@@ -6074,6 +6074,19 @@ pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
     return .{ .tier = d.tier, .trim_start = d.start };
 }
 
+const LoopAction = enum { cut, close_thought };
+
+/// A loop convicted INSIDE an open think block is recoverable once per request:
+/// commit the bound's early-stop line + closer and let the model answer. Anything
+/// else (answer-side loop, second loop, no room, no bound) keeps the ordinary cut.
+fn loopRecoveryAction(tb: ?*generate_mod.ThinkBound, ids: []const u32, completion_tokens: u32, max_tokens: u32) LoopAction {
+    const b = tb orelse return .cut;
+    b.observe(ids);
+    if (b.fired or !b.in_think) return .cut;
+    if (!generate_mod.forcedBoundaryCanContinue(completion_tokens, max_tokens, b.forced.len + 1)) return .cut;
+    return .close_thought;
+}
+
 var loop_trim_env: ?bool = null;
 /// `MLX_SERVE_LOOP_TRIM=0` keeps the whole degenerate tail in the response —
 /// the A/B arm, and the escape hatch for anyone who needs to see exactly what
@@ -7983,6 +7996,13 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
                 .refused => {},
             }
         }
+        if (loopRecoveryAction(gen.sampling.think_bound, gen.generated_ids.items, gen.completion_tokens, gen.max_tokens) == .close_thought) {
+            log.warn("[loop-recover] repetition loop inside the thought at {d} generated tokens; closing it\n", .{gen.generated_ids.items.len});
+            const tb = gen.sampling.think_bound.?;
+            tb.fired = true;
+            _ = try commitForcedTick(sch, slot, gen, tb.forced, .think_bound);
+            return true;
+        }
         var stop = relative_stop;
         stop.trim_start += loop_guard_start;
         // Never cut silently: the 2026-07-14 php.html post-mortem took log
@@ -8009,11 +8029,12 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const tb = gen.sampling.think_bound orelse return false;
     tb.observe(gen.generated_ids.items);
     if (!tb.due()) return false;
-    tb.fired = true;
     if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, tb.forced.len + 1)) {
+        tb.fired = true;
         log.warn("[think-bound] budget {d} reached with no room to close the thought (max_tokens {d})\n", .{ tb.budget, gen.max_tokens });
         return false;
     }
+    tb.fired = true;
     if (try commitForcedTick(sch, slot, gen, tb.forced, .think_bound)) {
         log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
     }
@@ -11508,4 +11529,32 @@ test "availForLoad: only a load that would be refused makes media residency let 
     try std.testing.expectEqual(@as(u64, 1000), held.bytes);
     _ = availForLoad(1 << 50); // can never fit: the cache is released before the refusal
     try std.testing.expectEqual(@as(u64, 0), held.bytes);
+}
+
+test "loop recovery: a loop inside an open think block closes the thought once" {
+    const OPEN: u32 = 10;
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ 30, 31, CLOSE, 32 };
+    var tb = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    try ids.appendSlice(testing.allocator, &[_]u32{ 5, 6 });
+    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 });
+
+    try testing.expectEqual(LoopAction.close_thought, loopRecoveryAction(&tb, ids.items, 400, 4096));
+    // No room to close the thought: the ordinary cut.
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, ids.items, 4095, 4096));
+    // Once fired, a second loop is cut.
+    tb.fired = true;
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, ids.items, 400, 4096));
+}
+
+test "loop recovery: an answer-side loop and an unarmed request are still cut" {
+    const OPEN: u32 = 10;
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ 30, CLOSE, 32 };
+    var tb = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    const closed = [_]u32{ 5, 6, CLOSE, 7, 8 };
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096));
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(null, &closed, 5, 4096));
 }

@@ -2533,3 +2533,20 @@ turns it on) bill the request before any stage loads. The same term prices the r
 `h3ResidentFor`, so a warm engine yields to a canvas it cannot hold, and `handleVideoH3` refuses
 the staged plan by name, quoting the need and the free memory. Guards: `h3 request rows`,
 `h3 request bill`, `h3 residency is priced on the request's activations`.
+
+## A loop-stop inside the thought ended the agent's turn (2026-10-09)
+
+Defect: Qwen3.8-Flash-Next sometimes fell into `?!?!?!` while thinking. The `exact_cycle` guard cut
+the request 138-807 tokens in with `finish_reason "stop"`, so omp saw a finished turn with no tool
+call and the agent stopped after garbage.
+
+Cause: the loop guard treated a loop in reasoning like a loop in the answer. The turn had produced
+no answer, and the cut was its end.
+
+Fix: when the convicted loop sits in an open think block and the request has not recovered yet,
+`loopRecoveryAction` commits the bound's early-stop line and closer (`commitForcedTick`, shared
+with the reasoning budget) and decoding continues. Requests without a budget now arm the bound at
+an unreachable limit (`thinkBoundBudget`). A second loop, an answer-side loop, or no room before
+`max_tokens` keeps the ordinary cut.
+Guard: `loop recovery:` tests in `scheduler.zig`, `thinkBoundBudget` test in `server.zig`.
+
