@@ -6989,10 +6989,12 @@ pub fn companyStreak(streak: u8, has_company: bool) u8 {
     return if (has_company) streak +| 1 else 0;
 }
 
-/// Spec modes that give way to the batched group once a slot has company: the DFlash
-/// family everywhere, PLD on CUDA, where a batched tick costs about one plain step.
-pub fn yieldsToCompany(mode: SpecTickMode, cuda: bool) bool {
-    return mode == .dflash or mode == .dspark or (mode == .pld and cuda);
+/// Spec modes that give way to the batched group once a slot has company: DSpark, DFlash on a
+/// sparse target (its wide verify reads every expert the block routes to), PLD on CUDA. A dense
+/// DFlash slot yields only to a crowd (`crowd` others): below it the yielded slot ticks plain
+/// beside the MTP verify group instead of inside it, which costs everyone a forward.
+pub fn yieldsToCompany(mode: SpecTickMode, cuda: bool, sparse_target: bool, others: usize, crowd: usize) bool {
+    return mode == .dspark or (mode == .dflash and (sparse_target or others >= crowd)) or (mode == .pld and cuda);
 }
 
 /// The first request of a burst was admitted alone, so it armed speculation and ticks
@@ -7002,12 +7004,15 @@ fn specYieldTick(active: []const *Slot) void {
         const gen = if (s.legacy_gen) |*g| g else continue;
         if (gen.spec_disabled_runtime) continue;
         const mode = slotSpecMode(s, gen);
-        if (!yieldsToCompany(mode, mlx.cudaAvailable())) continue;
-        var company = false;
+        var others: usize = 0;
         for (active) |o| {
-            if (o != s and o.model == s.model) company = true;
+            if (o != s and o.model == s.model) others += 1;
         }
-        s.company_ticks = companyStreak(s.company_ticks, company);
+        if (!yieldsToCompany(mode, mlx.cudaAvailable(), s.model.config.?.isMoe(), others, mtpCrowdThresholdFor(s))) {
+            s.company_ticks = 0;
+            continue;
+        }
+        s.company_ticks = companyStreak(s.company_ticks, others > 0);
         if (s.company_ticks >= COMPANY_YIELD_TICKS) gen.yieldSpecToCompany(@tagName(mode));
     }
 }
@@ -11560,14 +11565,21 @@ test "companyStreak: only consecutive ticks with company count" {
     try testing.expectEqual(@as(u8, 0), companyStreak(1, false));
 }
 
-test "yieldsToCompany: the DFlash family everywhere, PLD only on CUDA" {
-    for ([_]SpecTickMode{ .dflash, .dspark }) |m| {
-        try testing.expect(yieldsToCompany(m, false));
-        try testing.expect(yieldsToCompany(m, true));
-    }
-    try testing.expect(yieldsToCompany(.pld, true));
-    try testing.expect(!yieldsToCompany(.pld, false));
-    for ([_]SpecTickMode{ .mtp, .drafter, .regular }) |m| try testing.expect(!yieldsToCompany(m, true));
+test "yieldsToCompany: DSpark and sparse-target DFlash everywhere, PLD only on CUDA" {
+    try testing.expect(yieldsToCompany(.dspark, false, false, 1, 5));
+    try testing.expect(yieldsToCompany(.dspark, true, true, 1, 5));
+    try testing.expect(yieldsToCompany(.dflash, false, true, 1, 5));
+    try testing.expect(yieldsToCompany(.dflash, true, true, 1, 5));
+    try testing.expect(yieldsToCompany(.pld, true, false, 1, 5));
+    try testing.expect(!yieldsToCompany(.pld, false, false, 1, 5));
+    for ([_]SpecTickMode{ .mtp, .drafter, .regular }) |m| try testing.expect(!yieldsToCompany(m, true, true, 9, 5));
+}
+
+test "yieldsToCompany: a dense DFlash slot keeps speculating until the others are a crowd" {
+    try testing.expect(!yieldsToCompany(.dflash, false, false, 1, 5));
+    try testing.expect(!yieldsToCompany(.dflash, true, false, 4, 5));
+    try testing.expect(yieldsToCompany(.dflash, false, false, 5, 5));
+    try testing.expect(yieldsToCompany(.dflash, false, false, 7, 5));
 }
 
 test "companyPrefillChunk: a prefill narrows only while someone decodes" {
