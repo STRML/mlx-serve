@@ -7127,6 +7127,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
         slot.cache.config,
         slot.full_prompt[0..abs_kv_pos],
         slot.has_tools,
+        &.{},
         if (cps.len > 0) cps else null,
         s,
         if (hc.ram_enabled) WRITE_THROUGH_FLUSH_BOUND_BYTES else std.math.maxInt(u64),

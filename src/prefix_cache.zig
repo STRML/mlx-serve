@@ -46,29 +46,9 @@ const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 /// commit time instead of claim time.
 pub const MIN_CANCELLED_COMMIT_TOKENS: usize = 256;
 
-/// One media item's rows in a prompt: its first placeholder row and its
-/// pixel/PCM hash. Placeholder ids are identical across items, so state at and
-/// after `start` is keyed on `key`.
-pub const MediaSpan = struct { start: u32, key: u64 };
-
-/// First position where state under two span lists can differ; maxInt when
-/// they agree. Rows before the first span that differs are text.
-pub fn mediaSharedBound(a: []const MediaSpan, b: []const MediaSpan) usize {
-    const n = @min(a.len, b.len);
-    for (a[0..n], b[0..n]) |x, y| {
-        if (x.start != y.start or x.key != y.key) return @min(x.start, y.start);
-    }
-    if (a.len > n) return a[n].start;
-    if (b.len > n) return b[n].start;
-    return std.math.maxInt(usize);
-}
-
-/// The spans whose rows lie inside `[0, len)`.
-fn spansBelow(spans: []const MediaSpan, len: usize) []const MediaSpan {
-    var n: usize = 0;
-    while (n < spans.len and spans[n].start < len) n += 1;
-    return spans[0..n];
-}
+pub const MediaSpan = kv_disk_cache.MediaSpan;
+pub const mediaSharedBound = kv_disk_cache.mediaSharedBound;
+pub const spansBelow = kv_disk_cache.spansBelow;
 
 fn firstSpanStart(spans: []const MediaSpan) ?usize {
     return if (spans.len > 0) spans[0].start else null;
@@ -1197,7 +1177,7 @@ pub const HotPrefixCache = struct {
             // load-bearing even when tokens match past it: a restored row at a
             // placeholder must come from the vision splice, never from disk.
             const disk_limit: u32 = @intCast(@min(firstSpanStart(media) orelse prompt_ids.len, prompt_ids.len));
-            const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config) orelse {
+            const dm = d.bestMatch(prompt_ids, has_tools, &.{}, target_cache.config) orelse {
                 // Silent no-entry misses are why a 40 GB disk tier looked
                 // dead in a live post-mortem (2026-09-07): nothing in the
                 // log ever said the tier was consulted and found nothing.
@@ -1222,7 +1202,7 @@ pub const HotPrefixCache = struct {
                     break :blk cp.pos;
                 } else 0;
                 // A stored entry can carry a checkpoint at exactly this prompt's length; restoring it leaves nothing to forward.
-                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @min(disk_limit, @as(u32, @intCast(prompt_ids.len -| 1)))) orelse break :disk;
+                const hm = d.bestHybridMatch(prompt_ids, has_tools, &.{}, target_cache.config, @min(disk_limit, @as(u32, @intCast(prompt_ids.len -| 1)))) orelse break :disk;
                 const disk_cp = hm.cp;
                 if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
                 const sw = io_util.Stopwatch.init(d.io);
@@ -2275,6 +2255,7 @@ pub const HotPrefixCache = struct {
                 e.snapshot.config,
                 e.tokens,
                 e.has_tools,
+                &.{},
                 e.ssm_checkpoints,
                 specs.dflash,
                 specs.mtp,
@@ -2286,7 +2267,7 @@ pub const HotPrefixCache = struct {
             // Only `.persisted`: a silent skip or a `.partial` copy is not a copy.
             if (outcome != .persisted) continue;
             // `.persisted` is the write path's claim; the index has to agree.
-            const disk_id = d.fullPrefixEntryId(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config) orelse {
+            const disk_id = d.fullPrefixEntryId(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, &.{}, e.snapshot.config) orelse {
                 log.warn("  [hot-cache] idle spill: the tier does not hold the full prefix â€” entry stays resident\n", .{});
                 continue;
             };
@@ -2381,7 +2362,7 @@ pub const HotPrefixCache = struct {
             .head_pos_base = mm.head_pos_base,
             .head_marks = mm.head_marks.slice(),
         } else null;
-        return d.appendCommitWithSpec(pending.snapshot.entries, pending.snapshot.step, pending.snapshot.config, pending.tokens, pending.has_tools, pending.ssm_cps, p_dflash, p_mtp, s) catch |err| {
+        return d.appendCommitWithSpec(pending.snapshot.entries, pending.snapshot.step, pending.snapshot.config, pending.tokens, pending.has_tools, &.{}, pending.ssm_cps, p_dflash, p_mtp, s) catch |err| {
             log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
             return null;
         };
@@ -2440,6 +2421,7 @@ pub const HotPrefixCache = struct {
             newest.snapshot.config,
             self.diskTokens(newest.tokens, newest.media, newest.ssm_checkpoints),
             newest.has_tools,
+            &.{},
             newest.ssm_checkpoints,
             dflash_spec,
             mtp_spec,
@@ -8163,24 +8145,24 @@ test "DiskTier.holdsFullPrefix: the INDEX must agree before a RAM copy is discar
     var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-holds", 0, 128);
     defer tier.deinit();
 
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, &.{}, cache.config));
 
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     tier.drainWriter();
-    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, true, cache.config));
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, .{ .scheme = .affine, .bits = 4, .group_size = 64 }));
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, &.{}, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, true, &.{}, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, &.{}, .{ .scheme = .affine, .bits = 4, .group_size = 64 }));
 
     // A truncated tail chunk, the shape `scan` records after a kill -9.
     const cb = tier.entries.items[0].chunk_bytes;
     const keep = cb[cb.len - 1];
     cb[cb.len - 1] = 0;
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, &.{}, cache.config));
     cb[cb.len - 1] = keep;
-    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, &.{}, cache.config));
 
     tier.entries.items[0].kv_len = 400;
-    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, &.{}, cache.config));
 }
 
 test "SSD-first: one resident session makes reclaimableBytes truthfully ZERO" {
@@ -8603,7 +8585,7 @@ test "HotPrefixCache: a bounded disk flush leaves disk_dirty set and later flush
         const kv = d.entries.items[0].kv_len;
         try testing.expect(kv >= last_kv);
         if (hc.disk_dirty) try testing.expectEqual(@as(u32, 0), kv % 128);
-        const m = d.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+        const m = d.bestMatch(&tokens, false, &.{}, kv_quant.KVQuantConfig.dense).?;
         try testing.expectEqual(kv, m.usable);
         last_kv = kv;
     }
@@ -9060,8 +9042,8 @@ test "SSD-first: a chunk write that fails AFTER the pass invalidates the entry â
     // The failure names its entry, so a restore from it misses.
     try testing.expectEqual(@as(usize, 1), hc.disk.?.harvestWriteFailures());
     try testing.expect(hc.disk.?.entries.items[0].poisoned);
-    try testing.expect(hc.disk.?.bestMatch(&tok_a, false, cache.config) == null);
-    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config));
+    try testing.expect(hc.disk.?.bestMatch(&tok_a, false, &.{}, cache.config) == null);
+    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, &.{}, cache.config));
 
     // Pass N+1: A is not durable; the dead directory is reclaimed and the rebuild is staged.
     hc.disk.?.writer.?.setPaused(true);
@@ -9128,7 +9110,7 @@ test "SSD-first: a write failure inside the SAME pass still keeps the entry resi
     try testing.expect(hc.disk.?.writeErrors() > 0);
     try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);
     try testing.expectEqual(@as(usize, 2), hc.entryCount());
-    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config));
+    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, &.{}, cache.config));
 }
 
 test "SSD-first: a spill pass probes the volume only for a store, never for a copy already on disk" {
@@ -9380,22 +9362,23 @@ test "a restore names its entry, and a commit that extends it in place keeps the
     try testing.expectEqual(id, hc.entries.items[0].id);
 }
 
-test "an image turn persists the text before its first item to the SSD tier" {
+test "an image turn persists past its first item to the SSD tier; a restore stops at the first image that differs" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tokens: [3072]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     const media = [_]MediaSpan{.{ .start = 2600, .key = 0xABCD }};
-    // `want` = the rows on disk; a hybrid's record stops at its last checkpoint below the item.
-    const Arm = struct { ssd_first: bool = false, mem: u64 = 0, cps: ?[]const usize = null, want: u32 };
+    const other = [_]MediaSpan{.{ .start = 2600, .key = 0xBEEF }};
+    // `same` = rows restored under the same image; `diff` = under another image or none.
+    const Arm = struct { ssd_first: bool = false, mem: u64 = 0, cps: ?[]const usize = null, same: u32, diff: u32 };
     const arms = [_]Arm{
-        .{ .ssd_first = true, .want = 2600 },
-        .{ .want = 2600 },
-        .{ .mem = 16 * 1024, .want = 2600 }, // a RAM decline that spills
-        .{ .cps = &.{ 1024, 2048, 3000 }, .want = 2048 },
-        .{ .ssd_first = true, .cps = &.{ 2048, 3000 }, .want = 2048 },
-        .{ .cps = &.{3000}, .want = 0 },
+        .{ .ssd_first = true, .same = 3071, .diff = 2600 },
+        .{ .same = 3071, .diff = 2600 },
+        .{ .mem = 16 * 1024, .same = 3071, .diff = 2600 }, // a RAM decline that spills
+        .{ .cps = &.{ 1024, 2048, 3000 }, .same = 3000, .diff = 2048 },
+        .{ .ssd_first = true, .cps = &.{ 2048, 3000 }, .same = 3000, .diff = 2048 },
+        .{ .cps = &.{3000}, .same = 3000, .diff = 0 },
     };
     for (arms) |arm| {
         var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -9421,24 +9404,67 @@ test "an image turn persists the text before its first item to the SSD tier" {
             _ = try hc.commitWithMediaState(&cache, &tokens, false, &media, 0, cps, null, null, tokens.len);
             hc.flushPendingDisk(s);
         }
-        // A cold RAM tier (idle unload, restart) restores the text; the disk holds no image row
-        // even for a prompt whose spans would not cap the match.
-        for ([_][]const MediaSpan{ &media, &.{} }) |lookup_media| {
+        // A cold RAM tier (idle unload, restart): the disk holds the whole turn under its image.
+        const Lookup = struct { media: []const MediaSpan, want: u32 };
+        for ([_]Lookup{ .{ .media = &media, .want = arm.same }, .{ .media = &other, .want = arm.diff }, .{ .media = &.{}, .want = arm.diff } }) |lk| {
             var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
             hc2.ssd_first = arm.ssd_first;
             hc2.hybrid = arm.cps != null;
             hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media", 0, 1024);
             defer hc2.deinit();
-            try testing.expectEqual(@as(usize, @intFromBool(arm.want > 0)), hc2.disk.?.entryCount());
-            if (arm.want > 0) try testing.expectEqual(arm.want, hc2.disk.?.entries.items[0].kv_len);
+            try testing.expectEqual(@as(usize, 1), hc2.disk.?.entryCount());
+            try testing.expectEqual(@as(u32, tokens.len), hc2.disk.?.entries.items[0].kv_len);
+            try testing.expectEqualSlices(MediaSpan, &media, hc2.disk.?.entries.items[0].media);
             var dst = try KVCache.init(testing.allocator, 3);
             defer dst.deinit();
             var ssm = pcEmptySsm();
             defer pcFreeHybrid(&ssm);
             var moe: usize = 0;
-            const res = try hc2.lookupAndRestoreWithMedia(&dst, &moe, if (arm.cps != null) &ssm else null, s, &tokens, false, lookup_media, null, null, null, false);
-            try testing.expectEqual(@as(usize, arm.want), res.matched);
-            if (arm.cps != null and arm.want > 0) try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm[0].conv_state, 0, s));
+            const res = try hc2.lookupAndRestoreWithMedia(&dst, &moe, if (arm.cps != null) &ssm else null, s, &tokens, false, lk.media, null, null, null, false);
+            try testing.expectEqual(@as(usize, lk.want), res.matched);
+            if (arm.cps != null and lk.want > 0) try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm[0].conv_state, 0, s));
         }
     }
+}
+
+test "SSD-first: an idle image session spills to disk with its spans and leaves RAM" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    var tokens_a: [600]u32 = undefined;
+    for (&tokens_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+    const img = [_]MediaSpan{.{ .start = 300, .key = 0xF00D }};
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media-spill", 0, 128);
+    defer hc.deinit();
+    _ = try hc.commitWithMediaState(&cache, &tokens_a, false, &img, 0, null, null, null, tokens_a.len);
+    testDropPending(&hc); // the spill path: the image session only in RAM
+    _ = try hc.commit(&cache, &tokens_b, false);
+    hc.flushPendingDisk(s);
+
+    hc.spillIdleEntries(s);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqualSlices(u32, &tokens_b, hc.entries.items[0].tokens);
+    try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
+
+    var back = try KVCache.init(testing.allocator, 1);
+    defer back.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestoreWithMedia(&back, &moe_off, null, s, &tokens_a, false, &img, null, null, null, false);
+    try testing.expectEqual(@as(usize, 599), res.matched);
+    var back2 = try KVCache.init(testing.allocator, 1);
+    defer back2.deinit();
+    const res2 = try hc.lookupAndRestoreWithMedia(&back2, &moe_off, null, s, &tokens_a, false, &.{.{ .start = 300, .key = 0xBAD }}, null, null, null, false);
+    try testing.expectEqual(@as(usize, 300), res2.matched);
 }
