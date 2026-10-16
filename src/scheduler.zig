@@ -1556,7 +1556,9 @@ pub const Scheduler = struct {
     shutdown_deadline_ms: std.atomic.Value(i64) = .init(0),
     /// The batch the inference thread took out of `pending` and is prefilling (`queue_mu`): in
     /// neither queue, so `cancelAllInFlight` reads it here or SIGTERM waits out the whole prefill.
+    /// Live entries are `[prefilling_from, n_prefilling)`; each holds `in_pass` while listed.
     prefilling: [16]*Slot = undefined,
+    prefilling_from: usize = 0,
     n_prefilling: usize = 0,
     started: std.atomic.Value(bool),
     started_mu: std.Io.Mutex,
@@ -1958,7 +1960,9 @@ pub const Scheduler = struct {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
         for (self.pending.items) |slot| slot.cancel();
-        for (self.prefilling[0..self.n_prefilling]) |slot| slot.cancel();
+        if (self.prefilling_from < self.n_prefilling) {
+            for (self.prefilling[self.prefilling_from..self.n_prefilling]) |slot| slot.cancel();
+        }
         for (self.decoding.items) |slot| slot.cancel();
     }
 
@@ -5411,6 +5415,7 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             _ = sch.pending.orderedRemove(admit_idx[r]);
         }
         @memcpy(sch.prefilling[0..n_prefill], to_prefill[0..n_prefill]);
+        sch.prefilling_from = 0;
         sch.n_prefilling = n_prefill;
     }
 
@@ -5423,14 +5428,21 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     //    The inference thread is the sole mlx caller post-cleanup, so
     //    no per-tick stream rebind / mutex coexistence is needed.
     if (n_prefill > 0) {
-        // The batch stays cancellable until it leaves this block; only this thread frees slots.
         defer {
             sch.queue_mu.lockUncancelable(sch.io);
+            sch.prefilling_from = 0;
             sch.n_prefilling = 0;
             sch.queue_mu.unlock(sch.io);
         }
         for (to_prefill[0..n_prefill], 0..) |slot, pi| {
             defer _ = slot.in_pass.fetchSub(1, .acq_rel);
+            // Unlisted BEFORE its pass ends: `complete()` (which may free the slot) waits on
+            // `in_pass`, so a listed slot is always alive for `cancelAllInFlight`.
+            defer {
+                sch.queue_mu.lockUncancelable(sch.io);
+                sch.prefilling_from = @max(sch.prefilling_from, pi + 1);
+                sch.queue_mu.unlock(sch.io);
+            }
             // Between the slots of one admitted batch, tick the streams
             // that just started decoding — a single-chunk prefill exposes
             // no chunk-boundary yield, so without this every slot's first
@@ -5449,6 +5461,7 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                 // Back to the head of `pending`, in order; the decode tick below runs first.
                 sch.queue_mu.lockUncancelable(sch.io);
                 defer sch.queue_mu.unlock(sch.io);
+                sch.n_prefilling = pi; // back in `pending`, which `cancelAllInFlight` walks
                 var r = n_prefill;
                 while (r > pi) {
                     r -= 1;
