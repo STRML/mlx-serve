@@ -365,6 +365,97 @@ fi
 chmod -R u+rw "$FD_HOME" 2>/dev/null; rm -rf "$FD_HOME"
 
 echo
+echo "== 9. an image session persists and restores past its first image =="
+# Turn 1 is ~3k tokens of text, then a message with an image and ~6k more. The server is stopped the
+# way launchd stops it (TERM, 5 s, KILL), rebooted, and turn 2 is sent. The restore
+# must land past the image's first row (logged as `media: item 0 at row N`) and
+# within one chunk of turn 2's prompt. Turn 2 with ANOTHER image in turn 1's place
+# must stop at or before that row: its rows are keyed on the pixels.
+# Arms: default (RAM-first), --no-prefix-cache-ram (SSD-first + write-through), and
+# the swapped image. Needs a vision model; SKIPs otherwise.
+VISION_MODEL="${VISION_DISK_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
+IMG_A="tests/fixtures/street-name-signs.jpg"
+IMG_B="tests/fixtures/house.jpeg"
+if [ ! -f "$VISION_MODEL/config.json" ] || ! grep -q vision_config "$VISION_MODEL/config.json" || [ ! -f "$IMG_A" ] || [ ! -f "$IMG_B" ]; then
+    echo -e "${YELLOW}SKIP${NC} image section: no vision model at $VISION_MODEL (set VISION_DISK_MODEL) or a fixture is missing."
+else
+    MODEL="$VISION_MODEL"
+
+    image_turn() { # $1 turn (1|2), $2 image for turn 1's slot -> "content"
+        python3 - "$BASE" "$1" "$2" <<'PY'
+import base64, json, sys, urllib.request
+base, turn, img = sys.argv[1], sys.argv[2], sys.argv[3]
+def log(n0, n1):
+    return '\n'.join(f'Log entry {i}: subsystem {i%17} reported state change {i*31%997} with latency {i*7%131} ms and checksum {i*i%9973}.' for i in range(n0, n1))
+mime = 'image/png' if img.endswith('.png') else 'image/jpeg'
+url = f'data:{mime};base64,' + base64.b64encode(open(img, 'rb').read()).decode()
+# A template may render a message's images before its text, so the leading text is its own turn.
+msgs = [{'role': 'user', 'content': 'Read this project log; a photo and the rest follow.\n' + log(1, 100)},
+        {'role': 'assistant', 'content': 'Understood. Send the photo and the rest of the log.'},
+        {'role': 'user', 'content': [
+            {'type': 'image_url', 'image_url': {'url': url}},
+            {'type': 'text', 'text': log(100, 300) + '\nQuestion: which subsystem appears in log entry 42? One short sentence.'},
+        ]}]
+if turn == '2':
+    msgs += [{'role': 'assistant', 'content': 'Log entry 42 names subsystem 8.'},
+             {'role': 'user', 'content': 'Now the same question for log entry 43.'}]
+body = json.dumps({'model': 'mlx-serve', 'messages': msgs, 'max_tokens': 24, 'temperature': 0.0,
+                   'enable_thinking': False, 'stream': False}).encode()
+req = urllib.request.Request(base + '/v1/chat/completions', data=body, headers={'Content-Type': 'application/json'})
+resp = json.load(urllib.request.urlopen(req, timeout=900))
+print(resp['choices'][0]['message']['content'].replace('\n', ' '))
+PY
+    }
+
+    launchd_stop() { # TERM, 5 s grace, then KILL: what `exit timeout = 5` does
+        kill -TERM "$SERVER_PID" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 1; done
+        kill -KILL "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+        SERVER_PID=""
+        sleep 1
+    }
+
+    image_arm() { # $1 label, $2 turn-2 image for turn 1's slot, $3 same|other, extra server args...
+        local label="$1" img2="$2" want="$3"
+        shift 3
+        SCRATCH_HOME=$(mktemp -d "$HOME/claude-tmp/prefix-disk-image.XXXXXX")
+        KV_DIR="$SCRATCH_HOME/.mlx-serve/kv-cache"
+        echo "  -- $label --"
+        start_server --ctx-size 32768 --log-level debug "$@" || { echo -e "${RED}FAIL${NC} $label: server failed to start"; FAIL=1; return; }
+        image_turn 1 "$IMG_A" > /dev/null || { echo -e "${RED}FAIL${NC} $label: turn 1 failed"; FAIL=1; launchd_stop; return; }
+        local start_row
+        start_row=$(grep -oE 'media: item 0 at row [0-9]+' "$LOGFILE" | head -1 | grep -oE '[0-9]+$')
+        sleep 2 # the finish-path flush runs after the response
+        launchd_stop
+        start_server --ctx-size 32768 --log-level debug "$@" || { echo -e "${RED}FAIL${NC} $label: reboot failed"; FAIL=1; return; }
+        local reply
+        reply=$(image_turn 2 "$img2") || { echo -e "${RED}FAIL${NC} $label: turn 2 failed"; FAIL=1; stop_server; return; }
+        local line restored total
+        line=$(grep -oE '\[disk-cache\] restored [0-9]+/[0-9]+ tokens' "$LOGFILE" | head -1)
+        restored=$(echo "$line" | grep -oE '[0-9]+/' | tr -d /)
+        total=$(echo "$line" | grep -oE '/[0-9]+' | tr -d /)
+        echo "  image row ${start_row:-?}, ${line:-no restore line}, reply '${reply:0:50}'"
+        if [ -z "$start_row" ]; then
+            echo -e "${RED}FAIL${NC} $label: no 'media: item 0 at row' line"; FAIL=1
+        elif [ "$want" = same ] && [ -n "$restored" ] && [ "$restored" -gt "$start_row" ] && [ "$restored" -ge $((total - 1024)) ]; then
+            echo -e "${GREEN}PASS${NC} $label: restored $restored/$total, past the image at row $start_row"
+        elif [ "$want" = other ] && { [ -z "$restored" ] || [ "$restored" -le "$start_row" ]; }; then
+            echo -e "${GREEN}PASS${NC} $label: another image stopped the restore at ${restored:-0} (image row $start_row)"
+        else
+            echo -e "${RED}FAIL${NC} $label: restored '${restored:-none}' of '${total:-?}' against image row $start_row (want $want)"
+            grep -E '\[disk-cache\]|\[hot-cache\]' "$LOGFILE" | tail -12; FAIL=1
+        fi
+        stop_server
+        rm -rf "$SCRATCH_HOME"
+    }
+
+    image_arm "RAM-first" "$IMG_A" same
+    image_arm "SSD-first (--no-prefix-cache-ram)" "$IMG_A" same --no-prefix-cache-ram
+    image_arm "another image in turn 1's slot" "$IMG_B" other
+fi
+
+echo
 if [ "$FAIL" = "0" ]; then
     echo -e "${GREEN}ALL PASS${NC} test_prefix_cache_disk"
 else
