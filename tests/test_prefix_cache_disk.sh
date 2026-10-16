@@ -86,6 +86,15 @@ stop_server() {
     sleep 1
 }
 
+launchd_stop() { # TERM, 5 s grace, then KILL: what `exit timeout = 5` does
+    kill -TERM "$SERVER_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 1; done
+    kill -KILL "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+    sleep 1
+}
+
 # Deterministic ~2.5k-token prompt (well above the 512-token persist floor).
 LONG_PROMPT=$(python3 -c "
 lines = ['You are reviewing a project log. Read it fully, then answer.']
@@ -407,15 +416,6 @@ print(resp['choices'][0]['message']['content'].replace('\n', ' '))
 PY
     }
 
-    launchd_stop() { # TERM, 5 s grace, then KILL: what `exit timeout = 5` does
-        kill -TERM "$SERVER_PID" 2>/dev/null || true
-        for _ in 1 2 3 4 5; do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 1; done
-        kill -KILL "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-        SERVER_PID=""
-        sleep 1
-    }
-
     image_arm() { # $1 label, $2 turn-2 image for turn 1's slot, $3 same|other, extra server args...
         local label="$1" img2="$2" want="$3"
         shift 3
@@ -453,6 +453,82 @@ PY
     image_arm "RAM-first" "$IMG_A" same
     image_arm "SSD-first (--no-prefix-cache-ram)" "$IMG_A" same --no-prefix-cache-ram
     image_arm "another image in turn 1's slot" "$IMG_B" other
+fi
+
+echo
+echo "== 10. every finished session lands on disk while idle, not only the newest =="
+# Two ~24k-token sessions run together, so no idle gap separates their finishes, and each is
+# several 512 MB slices. The idle loop must then land both whole (it used to finish only the
+# newest), the RAM-first boot must arm the background writer, and after a launchd-style stop both
+# must restore within one chunk of their prompts. Needs a hybrid qwen3_5 model; SKIPs otherwise.
+IDLE_MODEL="${IDLE_FLUSH_MODEL:-$VISION_MODEL}"
+if [ ! -f "$IDLE_MODEL/config.json" ] || ! grep -q '"qwen3_5' "$IDLE_MODEL/config.json"; then
+    echo -e "${YELLOW}SKIP${NC} idle-flush section: no qwen3_5 model at $IDLE_MODEL (set IDLE_FLUSH_MODEL)."
+else
+    MODEL="$IDLE_MODEL"
+    SCRATCH_HOME=$(mktemp -d "$HOME/claude-tmp/prefix-disk-idle.XXXXXX")
+    KV_DIR="$SCRATCH_HOME/.mlx-serve/kv-cache"
+
+    session_turn() { # $1 session label (A|B) -> "content"
+        python3 - "$BASE" "$1" <<'PY'
+import json, sys, urllib.request
+base, who = sys.argv[1], sys.argv[2]
+k = 1 if who == 'A' else 7
+lines = [f'Session {who}: read this project log fully, then answer.']
+lines += [f'Log entry {i}: subsystem {(i*k)%17} reported state change {i*31*k%997} with latency {i*7%131} ms and checksum {i*i*k%9973}.' for i in range(1, 801)]
+lines.append('Question: which subsystem appears in log entry 42? One short sentence.')
+body = json.dumps({'model': 'mlx-serve', 'messages': [{'role': 'user', 'content': '\n'.join(lines)}],
+                   'max_tokens': 24, 'temperature': 0.0, 'enable_thinking': False, 'stream': False}).encode()
+req = urllib.request.Request(base + '/v1/chat/completions', data=body, headers={'Content-Type': 'application/json'})
+resp = json.load(urllib.request.urlopen(req, timeout=1200))
+print(resp['choices'][0]['message']['content'].replace('\n', ' '))
+PY
+    }
+
+    start_server --ctx-size 65536 --no-mtp || { echo -e "${RED}FAIL${NC} idle-flush server failed to start"; FAIL=1; }
+    if [ -n "$SERVER_PID" ]; then
+        if grep -q '\[disk-cache\] background writer armed' "$LOGFILE"; then
+            echo -e "${GREEN}PASS${NC} RAM-first boot armed the background writer"
+        else
+            echo -e "${RED}FAIL${NC} RAM-first boot did not arm the background writer"; FAIL=1
+        fi
+        session_turn A > /dev/null &
+        PID_A=$!
+        sleep 2
+        session_turn B > /dev/null &
+        PID_B=$!
+        wait "$PID_A" || { echo -e "${RED}FAIL${NC} session A failed"; FAIL=1; }
+        wait "$PID_B" || { echo -e "${RED}FAIL${NC} session B failed"; FAIL=1; }
+        # Both whole: two distinct entries logged complete at 20k+ tokens. Red waits out the timeout.
+        WHOLE=0
+        for _ in $(seq 1 240); do
+            WHOLE=$(grep -oE '\[disk-cache\] e[0-9]+ complete on disk: [0-9]+ tokens' "$LOGFILE" |
+                awk '$6 >= 20000 {print $2}' | sort -u | wc -l | tr -d ' ')
+            [ "$WHOLE" -ge 2 ] && break
+            sleep 1
+        done
+        echo "  sessions whole on disk before the stop: $WHOLE of 2"
+        grep -E '\[disk-cache\] (persisted|e[0-9]+ complete)' "$LOGFILE" | sed 's/^/    /' | tail -14
+        launchd_stop
+        if start_server --ctx-size 65536 --no-mtp; then
+            for who in A B; do
+                seen=$(grep -cE '\[disk-cache\] restored [0-9]+/[0-9]+ tokens' "$LOGFILE" || true)
+                session_turn "$who" > /dev/null || { echo -e "${RED}FAIL${NC} session $who after reboot failed"; FAIL=1; }
+                line=$(grep -oE '\[disk-cache\] restored [0-9]+/[0-9]+ tokens' "$LOGFILE" | sed -n "$((seen + 1))p")
+                restored=$(echo "$line" | grep -oE '[0-9]+/' | tr -d /)
+                total=$(echo "$line" | grep -oE '/[0-9]+' | tr -d /)
+                if [ -n "$restored" ] && [ "$restored" -ge $((total - 1024)) ]; then
+                    echo -e "${GREEN}PASS${NC} session $who restored $restored/$total after the reboot"
+                else
+                    echo -e "${RED}FAIL${NC} session $who restored '${restored:-none}' of '${total:-?}' (want within 1024 of the prompt)"; FAIL=1
+                fi
+            done
+            stop_server
+        else
+            echo -e "${RED}FAIL${NC} idle-flush reboot failed"; FAIL=1
+        fi
+    fi
+    rm -rf "$SCRATCH_HOME"
 fi
 
 echo

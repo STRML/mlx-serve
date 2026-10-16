@@ -191,6 +191,8 @@ const Entry = struct {
     quant_config: kv_quant.KVQuantConfig,
     /// Transient, one `spillIdleEntries` pass only: did this pass leave a durable copy on the SSD tier?
     spill_durable: bool = false,
+    /// The SSD tier does not hold this entry whole yet; the idle flush owes it slices.
+    disk_dirty: bool = false,
     /// KV-resident bytes for this entry, computed at commit time (Wave 1.B).
     /// Used for `--prefix-cache-mem` memory-budget enforcement; sum across
     /// all entries == `current_kv_bytes`.
@@ -2425,6 +2427,23 @@ pub const HotPrefixCache = struct {
         // Byte-capped flush: a large entry persists incrementally — keep the
         // dirty flag set so the next finished request continues the write.
         if (!complete.nothingPending()) self.disk_dirty = true;
+    }
+
+    /// The idle loop's flush: one bounded slice; true while anything is still owed.
+    pub fn flushOwedSlice(self: *HotPrefixCache, s: mlx.mlx_stream) bool {
+        self.flushPendingDisk(s);
+        return self.disk_dirty;
+    }
+
+    /// Arm the attached disk tier for this model: SSD-first per `ssdFirstActive`.
+    pub fn armDiskTier(self: *HotPrefixCache, config: *const model_mod.ModelConfig) void {
+        self.ssd_first = ssdFirstActive(config, self.disk != null, self.ram_enabled);
+        if (!self.ssd_first) return;
+        const d = &self.disk.?;
+        d.ssd_first = true;
+        d.enableBackgroundWriter();
+        // Startup sweep of strays + root-wide LRU across sibling fingerprints.
+        d.sweepSiblings();
     }
 
     /// #330 adjacent: when the byte budget is exceeded with the just-updated
@@ -8584,6 +8603,208 @@ test "HotPrefixCache: a bounded disk flush leaves disk_dirty set and later flush
     try testing.expect(!hc.disk_dirty);
     try testing.expectEqual(@as(usize, 5), flushes);
     try testing.expectEqual(@as(u32, 600), hc.disk.?.entries.items[0].kv_len);
+}
+
+/// Persisted rows of the disk entry whose token record is exactly `toks`; 0 = none.
+fn testDiskKvLen(d: *const kv_disk_cache.DiskTier, toks: []const u32) u32 {
+    for (d.entries.items) |*e| {
+        if (std.mem.eql(u32, e.tokens, toks)) return e.kv_len;
+    }
+    return 0;
+}
+
+/// Three distinct 600-token sessions over one filled cache (5 chunks of 128 each).
+fn testThreeSessions() [3][600]u32 {
+    var toks: [3][600]u32 = undefined;
+    for (&toks, 0..) |*row, k| {
+        for (row, 0..) |*t, i| t.* = @intCast(i + 7 + k * 100_000);
+    }
+    return toks;
+}
+
+/// Is `toks` whole on the tier, by the index and by the files?
+fn testWholeOnDisk(d: *kv_disk_cache.DiskTier, cache: *const KVCache, toks: []const u32) bool {
+    const id = d.fullPrefixEntryId(cache.entries, cache.step, toks, false, &.{}, cache.config) orelse return false;
+    return d.entryWholeOnDisk(id);
+}
+
+test "HotPrefixCache: idle flushes land every finished session whole, oldest owed first" {
+    // Sessions that finish back to back each land one slice. The idle loop must then finish all of
+    // them, starting with the oldest; finishing only the newest restored the others short on restart.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    const toks = testThreeSessions();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-idle-all", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.max_flush_bytes = 1; // one chunk per slice
+    const d = &hc.disk.?;
+
+    for (&toks) |*t| {
+        _ = try hc.commit(&cache, t, false);
+        hc.flushPendingDisk(s); // the finish path
+    }
+    for (&toks) |*t| try testing.expectEqual(@as(u32, 128), testDiskKvLen(d, t));
+
+    try testing.expect(hc.flushOwedSlice(s));
+    try testing.expectEqual(@as(u32, 256), testDiskKvLen(d, &toks[0]));
+    try testing.expectEqual(@as(u32, 128), testDiskKvLen(d, &toks[1]));
+    try testing.expectEqual(@as(u32, 128), testDiskKvLen(d, &toks[2]));
+
+    var calls: usize = 1;
+    while (calls < 50 and hc.flushOwedSlice(s)) calls += 1;
+    try testing.expect(calls < 50);
+    try testing.expect(!hc.disk_dirty);
+    for (&toks) |*t| try testing.expect(testWholeOnDisk(d, &cache, t));
+}
+
+test "HotPrefixCache: the idle flush skips a checked-out entry and never reports an unwritable one owed" {
+    // A checked-out entry's bytes are the slot's; an entry under the persist floor never lands.
+    // Neither may keep the idle loop spinning, and a returned checkout is owed again.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    const toks = testThreeSessions();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-idle-skip", 0, 128);
+    defer hc.deinit();
+    const d = &hc.disk.?;
+
+    _ = try hc.commit(&cache, toks[1][0..100], false); // under MIN_PERSIST_TOKENS
+    _ = try hc.commit(&cache, &toks[0], false);
+    (try testEntryFor(&hc, &toks[0])).checked_out_by = 1;
+
+    var calls: usize = 0;
+    while (calls < 5 and hc.flushOwedSlice(s)) calls += 1;
+    try testing.expect(calls < 5);
+    try testing.expectEqual(@as(usize, 0), d.entryCount());
+
+    hc.releaseCheckout(1, "test");
+    calls = 0;
+    while (calls < 5 and hc.flushOwedSlice(s)) calls += 1;
+    try testing.expect(calls < 5);
+    try testing.expect(testWholeOnDisk(d, &cache, &toks[0]));
+}
+
+test "HotPrefixCache: a failed background write costs only its own session; the idle flush moves on" {
+    // Failure matrix row 1: the writer loses one of the oldest session's chunks. The others still
+    // land whole and the idle loop ends.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    const toks = testThreeSessions();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-idle-fail", 0, 128);
+    defer hc.deinit();
+    const d = &hc.disk.?;
+    d.enableBackgroundWriter();
+    try testing.expect(d.writer != null);
+    d.max_flush_bytes = 1;
+
+    for (&toks) |*t| {
+        _ = try hc.commit(&cache, t, false);
+        hc.flushPendingDisk(s);
+    }
+    d.writer.?.injectFailure("/e1/c000002", .write);
+
+    var calls: usize = 0;
+    while (calls < 50 and hc.flushOwedSlice(s)) {
+        d.drainWriter(); // let each failure land before the next slice reads the index
+        calls += 1;
+    }
+    try testing.expect(calls < 50);
+    d.drainWriter();
+    _ = d.harvestWriteFailures();
+    try testing.expect(d.writeErrors() >= 1);
+    try testing.expect(testWholeOnDisk(d, &cache, &toks[1]));
+    try testing.expect(testWholeOnDisk(d, &cache, &toks[2]));
+}
+
+test "HotPrefixCache: a qwen3_5 RAM-first cache arms the background writer and chunk share" {
+    // RAM-first used to write synchronously and rewrite every chunk of a turn that diverged
+    // inside the generated span. SSD-first stays as it was.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    const orig_ssd = ssd_first_override;
+    defer ssd_first_override = orig_ssd;
+    ssd_first_override = true; // the env switch is not on trial
+    kv_disk_cache.chunk_share_override = true;
+    defer kv_disk_cache.chunk_share_override = null;
+    const config = model_mod.ModelConfig{ .model_type = "qwen3_5", .has_hybrid_layers = true };
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+    var tok_a: [600]u32 = undefined;
+    var tok_b: [600]u32 = undefined;
+    for (&tok_a, &tok_b, 0..) |*a, *b, i| {
+        a.* = @intCast(i + 7);
+        b.* = if (i < 520) @intCast(i + 7) else @intCast(9000 + i); // 4 whole chunks shared
+    }
+
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-arm-ram", 0, 128);
+        defer hc.deinit();
+        hc.armDiskTier(&config);
+        const d = &hc.disk.?;
+        try testing.expect(!hc.ssd_first);
+        try testing.expect(!d.ssd_first);
+        try testing.expect(d.writer != null);
+        try testing.expectEqual(@as(u64, 512 * 1024 * 1024), d.max_flush_bytes);
+
+        _ = try hc.commit(&cache, &tok_a, false);
+        while (hc.flushOwedSlice(s)) {}
+        d.drainWriter();
+        _ = try hc.commit(&cache, &tok_b, false);
+        while (hc.flushOwedSlice(s)) {}
+        d.drainWriter();
+        try testing.expectEqual(@as(usize, 2), d.entryCount());
+        var inherited: u32 = 0;
+        for (d.entries.items) |*e| inherited = @max(inherited, e.inherited_chunks);
+        try testing.expectEqual(@as(u32, 4), inherited);
+        try testing.expect(testWholeOnDisk(d, &cache, &tok_b));
+    }
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0); // --no-prefix-cache-ram
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-arm-ssd", 0, 128);
+        defer hc.deinit();
+        hc.disk.?.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+        hc.armDiskTier(&config);
+        try testing.expect(hc.ssd_first);
+        try testing.expect(hc.disk.?.ssd_first);
+        try testing.expect(hc.disk.?.writer != null);
+    }
 }
 
 // ── Restore by move (checkout) ──
