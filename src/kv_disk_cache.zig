@@ -199,6 +199,18 @@ pub fn spansBelow(spans: []const MediaSpan, len: usize) []const MediaSpan {
     return spans[0..n];
 }
 
+/// Do two span lists name the same items in `[0, len)`? Rows past `len` are not compared.
+fn spansAgree(a: []const MediaSpan, b: []const MediaSpan, len: usize) bool {
+    return mediaSharedBound(a, b) >= len;
+}
+
+/// Rows of `e` a request may reuse: the shared token prefix, cut at `kv_len` and at the first
+/// media item the two disagree on (its rows are keyed on pixels the tokens do not carry).
+fn usableShare(e: *const IndexEntry, prompt_ids: []const u32, media: []const MediaSpan) u32 {
+    const shared = commonPrefixLen(e.tokens, prompt_ids);
+    return @intCast(@min(@min(shared, e.kv_len), mediaSharedBound(e.media, media)));
+}
+
 pub const IndexEntry = struct {
     /// Directory id — the `e<id>` component.
     id: u64,
@@ -642,6 +654,7 @@ pub const DiskTier = struct {
         self.allocator.free(e.chunk_bytes);
         self.allocator.free(e.ssm_positions);
         self.allocator.free(e.ssm_bytes);
+        self.allocator.free(e.media);
     }
 
     /// Re-derive `max_bytes` from the volume. A failed probe keeps the operator cap; a budget
@@ -685,7 +698,8 @@ pub const DiskTier = struct {
 
     /// Longest usable shared prefix across persisted entries with a matching
     /// (has_tools, quant) key. Same filter semantics as the RAM cache: a
-    /// cross-config restore would hand SDPA a wrong buffer layout.
+    /// cross-config restore would hand SDPA a wrong buffer layout. `media` is the
+    /// request's spans; a match stops at the first item that differs.
     pub fn bestMatch(
         self: *const DiskTier,
         prompt_ids: []const u32,
@@ -693,17 +707,13 @@ pub const DiskTier = struct {
         media: []const MediaSpan,
         quant: kv_quant.KVQuantConfig,
     ) ?Match {
-        _ = media;
         var best_idx: ?usize = null;
         var best_usable: u32 = 0;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // a failed write killed it: this is a MISS
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, quant)) continue;
-            const max_shared = @min(e.tokens.len, prompt_ids.len);
-            var shared: usize = 0;
-            while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
-            const usable: u32 = @intCast(@min(shared, e.kv_len));
+            const usable = usableShare(e, prompt_ids, media);
             if (usable > best_usable) {
                 best_usable = usable;
                 best_idx = i;
@@ -727,16 +737,12 @@ pub const DiskTier = struct {
         quant: kv_quant.KVQuantConfig,
         limit: u32,
     ) ?HybridMatch {
-        _ = media;
         var best: ?HybridMatch = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // a failed write killed it: this is a MISS
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, quant)) continue;
-            const max_shared = @min(e.tokens.len, prompt_ids.len);
-            var shared: usize = 0;
-            while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
-            const usable: u32 = @intCast(@min(@min(shared, e.kv_len), @as(usize, limit)));
+            const usable: u32 = @min(usableShare(e, prompt_ids, media), limit);
             const cp = self.highestSsmPosAtOrBelow(i, usable) orelse continue;
             if (best == null or cp > best.?.cp) best = .{ .idx = i, .usable = usable, .cp = cp };
         }
@@ -1238,7 +1244,6 @@ pub const DiskTier = struct {
         s: mlx.mlx_stream,
         flush_bound: u64,
     ) !PersistOutcome {
-        _ = media;
         // Every production caller swallows our error (the disk tier is best-effort end to
         // end), and three writers inside can raise: persistSsmCheckpoints, writeChunkFile,
         // appendSsmOnly. Drop the latch THIS call raised at the one funnel they all pass
@@ -1263,6 +1268,8 @@ pub const DiskTier = struct {
         const kv_target_u: usize = persistTargetLen(kv_entries, step, tokens.len);
         if (kv_target_u < MIN_PERSIST_TOKENS) return .skipped;
         const kv_target: u32 = @intCast(kv_target_u);
+        // The items this record covers; rows at and after each are keyed on its pixels.
+        const media_in = spansBelow(media, tokens.len);
         // Every initialized layer must cover the persisted range with B == 1
         // — anything else (mid-spec-decode state, batched cache) is not a
         // persistable snapshot.
@@ -1296,6 +1303,8 @@ pub const DiskTier = struct {
             if (e.poisoned) continue; // dead: never superseded, never extended
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
+            // The same tokens under another image are another prefix: never covered, never extended.
+            if (!spansAgree(e.media, media_in, @min(e.tokens.len, tokens.len))) continue;
             if (e.tokens.len >= tokens.len) {
                 if (std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) {
                     if (e.kv_len >= kv_target) {
@@ -1346,7 +1355,7 @@ pub const DiskTier = struct {
         // prefix, by hard link: a persisted entry's tokens are `prompt ++ generated`, so the next
         // turn diverges inside the generated span and used to rewrite every chunk. SSD-first only.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
-        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config) else null;
+        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, media_in, kv_target, has_tools, config) else null;
         var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
         var keep: u32 = if (extend_idx != null) old_kv / self.chunk_tokens else inherited;
         const n_chunks: u32 = @intCast((@as(u64, kv_target) + self.chunk_tokens - 1) / self.chunk_tokens);
@@ -1428,7 +1437,7 @@ pub const DiskTier = struct {
         }
 
         const prefix_rows: u32 = if (donor) |d|
-            @intCast(@min(commonPrefixLen(self.entries.items[d.idx].tokens, tokens), @as(usize, kv_len)))
+            @min(usableShare(&self.entries.items[d.idx], tokens, media_in), kv_len)
         else
             kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
@@ -1452,6 +1461,8 @@ pub const DiskTier = struct {
             const et = self.entries.items[i].tokens;
             break :blk if (et.len >= tokens.len) et else tokens;
         } else tokens;
+        // The spans travel with the record they index.
+        const record_media: []const MediaSpan = if (extend_idx != null and record.ptr != tokens.ptr) self.entries.items[extend_idx.?].media else media_in;
         if (extend_idx == null or record.ptr == tokens.ptr) {
             const tpath = try std.fmt.allocPrint(self.allocator, "{s}/tokens.bin", .{dir_rel});
             defer self.allocator.free(tpath);
@@ -1475,6 +1486,7 @@ pub const DiskTier = struct {
             .tokens = try self.allocator.dupe(u32, record),
             .kv_len = kv_len,
             .has_tools = has_tools,
+            .media = try self.allocator.dupe(MediaSpan, record_media),
             .quant = config,
             .bytes = bytes,
             .chunk_bytes = try chunk_sizes.toOwnedSlice(self.allocator),
@@ -1492,6 +1504,7 @@ pub const DiskTier = struct {
         errdefer {
             self.allocator.free(new_entry.tokens);
             self.allocator.free(new_entry.chunk_bytes);
+            self.allocator.free(new_entry.media);
         }
 
         if (extend_idx) |i| {
@@ -1511,6 +1524,7 @@ pub const DiskTier = struct {
             self.allocator.free(e.chunk_bytes);
             self.allocator.free(e.ssm_positions);
             self.allocator.free(e.ssm_bytes);
+            self.allocator.free(e.media);
             e.* = new_entry;
         } else {
             // meta.json is the commit point: written last, atomically.
@@ -1566,7 +1580,6 @@ pub const DiskTier = struct {
         media: []const MediaSpan,
         config: kv_quant.KVQuantConfig,
     ) ?u64 {
-        _ = media;
         const target = persistTargetLen(kv_entries, step, tokens.len);
         if (target == 0) return null;
         for (self.entries.items) |*e| {
@@ -1575,6 +1588,7 @@ pub const DiskTier = struct {
             if (!std.meta.eql(e.quant, config)) continue;
             if (e.tokens.len < tokens.len) continue;
             if (!std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) continue;
+            if (!spansAgree(e.media, spansBelow(media, tokens.len), tokens.len)) continue;
             if (e.kv_len < target) continue;
             const want: usize = (@as(usize, e.kv_len) + self.chunk_tokens - 1) / self.chunk_tokens;
             if (e.chunk_bytes.len < want) continue;
@@ -2680,16 +2694,18 @@ pub const DiskTier = struct {
     }
 
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
-    /// same tool flag and kv-quant config, most whole chunks below the common prefix. Null on
+    /// same tool flag and kv-quant config, most whole chunks below the common prefix and the
+    /// first media item the two disagree on. Null on
     /// the legacy arm or under `MLX_SERVE_SSD_CHUNK_SHARE=0`.
-    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig) ?ChunkDonor {
+    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, media: []const MediaSpan, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig) ?ChunkDonor {
         if (!self.ssd_first or !chunkShareEnabled()) return null;
         var best: ?ChunkDonor = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // never inherit from a dead entry
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
-            const shared: u64 = @min(@min(@as(u64, commonPrefixLen(e.tokens, tokens)), @as(u64, kv_target)), @as(u64, e.kv_len));
+            // Rows past the first item the two disagree on hold another image's state.
+            const shared: u64 = @min(usableShare(e, tokens, media), kv_target);
             const whole: u32 = @intCast(shared / self.chunk_tokens);
             const usable: u32 = @min(whole, @as(u32, @intCast(e.chunk_bytes.len)));
             if (usable == 0) continue;
@@ -2833,7 +2849,9 @@ pub const DiskTier = struct {
     /// The lowest manifest version that describes this entry. The version is a compatibility
     /// claim: an older reader accepts only 2..4, so stamping v6 unconditionally made a binary
     /// downgrade discard the whole tier. v6 = inherited chunks, v5 = the MTP head's QSA half.
+    /// v9 = media spans: an older reader must DROP such an entry, never match its tokens as text.
     fn metaVersionFor(e: IndexEntry) u8 {
+        if (e.media.len > 0) return 9;
         if (e.qsa_history_rows > 0 or e.qsa_history_bytes > 0) return 8;
         if (e.inherited_chunks > 0) return 6;
         if (e.spec_mtp) |m| if (m.head) |h| return if (h.mark_count > 0) 8 else 5;
@@ -2870,6 +2888,15 @@ pub const DiskTier = struct {
             try out.print(a, "{{\"pos\":{d},\"bytes\":{d}}}", .{ pos, sz });
         }
         try out.appendSlice(a, "]");
+        // v9: media spans; the key is hex text because a JSON integer is an i64.
+        if (e.media.len > 0) {
+            try out.appendSlice(a, ",\"media\":[");
+            for (e.media, 0..) |m, i| {
+                if (i > 0) try out.appendSlice(a, ",");
+                try out.print(a, "{{\"start\":{d},\"key\":\"{x:0>16}\"}}", .{ m.start, m.key });
+            }
+            try out.appendSlice(a, "]");
+        }
         if (e.qsa_history_rows > 0 or e.qsa_history_bytes > 0) {
             try out.print(a, ",\"qsa_history\":{{\"bytes\":{d},\"rows\":{d},\"inherited\":{}}}", .{
                 e.qsa_history_bytes,
@@ -3010,8 +3037,8 @@ pub const DiskTier = struct {
         const version = jsonU64(obj, "v") orelse return null;
         // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints; v4
         // adds optional spec snapshots; v5 the qwen4_exp MTP head's QSA half; v6 inherited
-        // chunks. All restore; a lower-version entry just carries none of the newer state.
-        if (version < 2 or version > 8) return null;
+        // chunks; v9 media spans. All restore; a lower-version entry just carries none of the newer state.
+        if (version < 2 or version > 9) return null;
         // v6: the leading `inherited_chunks` chunk files are hard links into a donor's.
         const inherited_rec: u64 = jsonU64(obj, "inherited_chunks") orelse 0;
         var kv_len = jsonU64(obj, "kv_len") orelse return null;
@@ -3208,12 +3235,24 @@ pub const DiskTier = struct {
             total += rec_bytes;
         }
 
+        // v9 media spans. A list that does not parse drops the entry: read as text, its image
+        // rows would match any request with the same tokens.
+        const media = parseMediaList(self.allocator, obj, version, tokens.len) catch {
+            log.info("  [disk-cache] e{d}: invalid media list — dropping entry\n", .{id});
+            self.allocator.free(tokens);
+            self.allocator.free(chunk_bytes);
+            self.allocator.free(ssm_positions);
+            self.allocator.free(ssm_bytes);
+            return null;
+        };
+
         return .{
             .e = .{
                 .id = id,
                 .tokens = tokens,
                 .kv_len = @intCast(kv_len),
                 .has_tools = has_tools_v.bool,
+                .media = media,
                 .quant = quant,
                 .bytes = total,
                 .inherited_chunks = inherited,
@@ -3477,6 +3516,31 @@ fn readFileAlloc(allocator: std.mem.Allocator, io: std.Io, abs_path: []const u8,
     var rb: [8192]u8 = undefined;
     var rs = f.reader(io, &rb);
     return rs.interface.allocRemaining(allocator, .limited(limit)) catch null;
+}
+
+/// The manifest's media list: empty before v9, required (strictly ascending, inside the token
+/// record, hex keys) from v9 on.
+fn parseMediaList(allocator: std.mem.Allocator, obj: std.json.ObjectMap, version: u64, n_tokens: usize) ![]MediaSpan {
+    if (version < 9) return &.{};
+    const v = obj.get("media") orelse return error.BadMedia;
+    if (v != .array) return error.BadMedia;
+    const out = try allocator.alloc(MediaSpan, v.array.items.len);
+    errdefer allocator.free(out);
+    for (v.array.items, out, 0..) |item, *m, i| {
+        m.* = parseMediaSpan(item) orelse return error.BadMedia;
+        if (m.start >= n_tokens) return error.BadMedia;
+        if (i > 0 and m.start <= out[i - 1].start) return error.BadMedia;
+    }
+    return out;
+}
+
+fn parseMediaSpan(v: std.json.Value) ?MediaSpan {
+    if (v != .object) return null;
+    const start = jsonInt(u32, v.object, "start") orelse return null;
+    const key_v = v.object.get("key") orelse return null;
+    if (key_v != .string) return null;
+    const key = std.fmt.parseInt(u64, key_v.string, 16) catch return null;
+    return .{ .start = start, .key = key };
 }
 
 fn jsonU64(obj: std.json.ObjectMap, key: []const u8) ?u64 {
@@ -7882,23 +7946,20 @@ test "DiskTier v9: a manifest without media loads text-only; a bad media list dr
         ",\"media\":{}", // not a list
         "", // v9 with no media list at all
     };
+    // `loadEntry` reads one manifest without the scan's cleanup, which deletes a dropped dir.
+    var reader = try DiskTier.init(testing.allocator, io, base, "fp-media-compat", 0, 128);
+    defer reader.deinit();
     for (bad_lists) |bad| {
         const doc = try std.mem.concat(testing.allocator, u8, &.{ good[0..media_at], bad, good[media_end..] });
         defer testing.allocator.free(doc);
         try writeMetaJson(io, base, "fp-media-compat", 2, doc);
-        var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-compat", 0, 128);
-        defer tier.deinit();
-        try testing.expect(tier.loadEntry(2) == null);
+        try testing.expect(reader.loadEntry(2) == null);
     }
-    {
-        // A version past the reader's is refused outright.
-        const doc = try std.mem.replaceOwned(u8, testing.allocator, good, "\"v\":9,", "\"v\":10,");
-        defer testing.allocator.free(doc);
-        try writeMetaJson(io, base, "fp-media-compat", 2, doc);
-        var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-compat", 0, 128);
-        defer tier.deinit();
-        try testing.expect(tier.loadEntry(2) == null);
-    }
+    // A version past the reader's is refused outright.
+    const v10 = try std.mem.replaceOwned(u8, testing.allocator, good, "\"v\":9,", "\"v\":10,");
+    defer testing.allocator.free(v10);
+    try writeMetaJson(io, base, "fp-media-compat", 2, v10);
+    try testing.expect(reader.loadEntry(2) == null);
     var tier3 = try DiskTier.init(testing.allocator, io, base, "fp-media-compat", 0, 128);
     defer tier3.deinit();
     try testing.expectEqual(@as(usize, 1), tier3.entryCount());

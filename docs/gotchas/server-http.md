@@ -2474,7 +2474,15 @@ extent follows `tokens.len`, checkpoints past it are skipped). No spec snapshot 
 turn, since it covers rows past the cut. The disk key stays token-only and never holds an image row.
 A hybrid restores only from an SSM checkpoint, so its record stops at the last checkpoint below
 the item (`HotPrefixCache.hybrid`, set at load) and nothing is written when there is none.
-Guard: `an image turn persists the text before its first item to the SSD tier`.
+Superseded: the cut still lost most of each image session. 81 of 85 requests in one live run
+carried images, and every session restored only up to its first image (38,796 of 131,914 tokens),
+because later turns were the same truncated prefix and the supersede check skipped them. Disk
+entries now carry their spans (`IndexEntry.media`, meta.json v9) and match like RAM
+(`mediaSharedBound`); supersede, extend and chunk share also require the spans to agree. A media
+entry must be stamped v9 or above: v8 readers ignore unknown fields and would serve its image rows
+to any request with the same tokens. Guard: `an image turn persists past its first item to the SSD
+tier; a restore stops at the first image that differs`, the `DiskTier v9` tests, and section 9 of
+`tests/test_prefix_cache_disk.sh`.
 
 ## A streamed Responses turn reported no prompt-cache hit
 

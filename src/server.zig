@@ -15293,6 +15293,8 @@ fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config
     out.embeddings = try encodeMediaItems(allocator, lm, items, mp, item_tokens);
     const expanded = try expandMediaPlaceholders(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, config);
     out.media = expanded.media;
+    // The rows the prefix-cache tiers key on this item's pixels; a restore past one needs the same key.
+    for (out.media, 0..) |m, k| log.debug("  media: item {d} at row {d} (key {x:0>16})\n", .{ k, m.start, m.key });
     var soft = std.enums.EnumArray(std.meta.Tag(MediaItem), usize).initFill(0);
     for (items, item_tokens) |item, n| {
         soft.getPtr(std.meta.activeTag(item)).* += n;

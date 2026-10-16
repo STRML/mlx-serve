@@ -7115,7 +7115,6 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
     if (!hc.ssd_first) return;
     const d = if (hc.disk) |*dd| dd else return;
     if (d.writer == null) return;
-    if (slot.media.len != 0) return;
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
     const s = if (slot.model.transformer) |x| x.s else return;
     wc.chunks += 1;
@@ -7127,7 +7126,8 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
         slot.cache.config,
         slot.full_prompt[0..abs_kv_pos],
         slot.has_tools,
-        &.{},
+        // The items whose rows this chunk boundary covers; their keys travel with the rows.
+        prefix_cache_mod.spansBelow(slot.media, abs_kv_pos),
         if (cps.len > 0) cps else null,
         s,
         if (hc.ram_enabled) WRITE_THROUGH_FLUSH_BOUND_BYTES else std.math.maxInt(u64),
@@ -7187,7 +7187,7 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     if (!hc.ssd_first) return false;
     const d = if (hc.disk) |*dd| dd else return false;
     const writer_up = d.writer != null;
-    if (!writer_up or slot.media.len != 0) return false;
+    if (!writer_up) return false;
     if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
         if (!write_through_span_declined_logged.swap(true, .monotonic)) {
             log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) — the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
