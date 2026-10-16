@@ -83,6 +83,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--prefix-cache-entries N` | auto | Shared-prefix KV cache entry cap |
 | `--prefix-cache-mem N{KB,MB,GB}` | `2 GB`, or one session at the working context on hybrid (Qwen3.5+, GLM-5.3, Nemotron-H, LFM2, Ling), sliding-ring (MiMo) and qwen4_exp models when larger | Shared-prefix KV cache memory cap |
 | `--prefix-cache-disk N{MB,GB}` | off | SSD tier: prefixes survive restarts (11K-token restart TTFT 5.9 s → 0.7 s) |
+| `--shutdown-persist-secs N` | `45` | On SIGTERM, finish writing the SSD-tier slices not yet on disk for at most N seconds, then exit; 0 disables. Under launchd, set `ExitTimeOut` above it |
 | `--metrics` | off | Prometheus `/metrics` + live dashboard panel on `/` |
 | `--api-key KEY` | none | Require a key for non-localhost requests (localhost stays open) |
 | `--lan-share <all\|id,...>` | off | Share the listed models (or all) with your local network over Bonjour — only inference is exposed, model management stays host-local |
