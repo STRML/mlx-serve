@@ -1535,6 +1535,7 @@ pub const HotPrefixCache = struct {
             if (!e.checkout_donated) {
                 // Nothing was handed over; only the mark is undone (no LRU bump for a request that never ran).
                 e.checked_out_by = null;
+                if (e.disk_dirty) self.disk_dirty = true;
                 log.info("  [hot-cache] checked-out entry returned intact: {s} ({d} tokens; the append never ran)\n", .{ reason, tokens_len });
                 continue;
             }
@@ -2000,6 +2001,7 @@ pub const HotPrefixCache = struct {
             e.checked_out_by = null;
             e.checkout_donated = false;
             e.last_used = self.bumpCounter();
+            e.disk_dirty = self.disk != null;
             self.current_kv_bytes += e.kv_bytes;
             // Inherited SSM checkpoints can make a replacement larger than
             // `new_bytes`, so enforce the cap again on the final entry — but
@@ -2060,6 +2062,7 @@ pub const HotPrefixCache = struct {
             .dflash_bytes = new_dflash_bytes,
             .mtp = new_mtp,
             .mtp_bytes = new_mtp_bytes,
+            .disk_dirty = self.disk != null,
         }) catch |err| {
             self.allocator.free(tokens_owned);
             self.allocator.free(media_owned);
@@ -2340,110 +2343,120 @@ pub const HotPrefixCache = struct {
         return "partial copy";
     }
 
-    /// One bounded append of a pending snapshot; null when it failed (logged).
-    fn appendPending(d: *kv_disk_cache.DiskTier, pending: *PendingDiskFlush, s: mlx.mlx_stream) ?kv_disk_cache.PersistOutcome {
-        const p_dflash: ?kv_disk_cache.SpecCommit = if (pending.dflash) |*df| .{
-            .entries = df.snapshot.entries,
-            .step = df.snapshot.step,
-            .config = df.snapshot.config,
-            .base_pos = df.base_pos,
-        } else null;
-        const p_mtp: ?kv_disk_cache.SpecCommit = if (pending.mtp) |*mm| .{
-            .entries = mm.snapshot.entries,
-            .step = mm.snapshot.step,
-            .config = mm.snapshot.config,
-            .base_pos = mm.base_pos,
-            .head_aux = if (mm.head_aux) |*ha| ha else null,
-            .head_pos_base = mm.head_pos_base,
-            .head_marks = mm.head_marks.slice(),
-        } else null;
-        return d.appendCommitWithSpec(pending.snapshot.entries, pending.snapshot.step, pending.snapshot.config, pending.tokens, pending.has_tools, pending.media, pending.ssm_cps, p_dflash, p_mtp, s) catch |err| {
-            log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
-            return null;
+    /// One bounded append of a record; true while the tier still owes it more. A record whose
+    /// earlier write failed (the tier poisoned it), or a slice that landed nothing, is given up
+    /// until its next commit: retrying either would spin the idle loop.
+    fn appendSlice(
+        d: *kv_disk_cache.DiskTier,
+        snap: *const KVCacheSnapshot,
+        tokens: []const u32,
+        has_tools: bool,
+        media: []const MediaSpan,
+        cps: ?[]const SSMCheckpoint,
+        specs: EntrySpecs,
+        s: mlx.mlx_stream,
+    ) bool {
+        if (d.resumesPoisoned(tokens, has_tools, media, snap.config)) {
+            log.warn("  [disk-cache] a write for this {d}-token session failed; it waits for its next commit\n", .{tokens.len});
+            return false;
+        }
+        const landed_before = d.counter;
+        const out = d.appendCommitWithSpec(snap.entries, snap.step, snap.config, tokens, has_tools, media, cps, specs.dflash, specs.mtp, s) catch |err| {
+            log.warn("  [disk-cache] persist failed: {s}; the {d}-token session waits for its next commit\n", .{ @errorName(err), tokens.len });
+            return false;
         };
+        return out == .partial and d.counter != landed_before;
     }
 
-    /// Flush the most recent commit to the SSD tier. Called by the scheduler
-    /// AFTER `markFinished` (the client already has its response) — the
-    /// chunk-append is bounded (partial tail + new chunks) but synchronous on
-    /// the inference thread. Snapshot arrays are refcount-shared with the RAM
-    /// entry, so slicing them here reads the same buffers the commit captured.
-    pub fn flushPendingDisk(self: *HotPrefixCache, s: mlx.mlx_stream) void {
+    /// One slice of a parked snapshot; dropped once whole or given up.
+    fn slicePending(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, slot: *?PendingDiskFlush, s: mlx.mlx_stream) void {
+        const p = if (slot.*) |*pp| pp else return;
+        const specs: EntrySpecs = .{
+            .dflash = if (p.dflash) |*df| .{
+                .entries = df.snapshot.entries,
+                .step = df.snapshot.step,
+                .config = df.snapshot.config,
+                .base_pos = df.base_pos,
+            } else null,
+            .mtp = if (p.mtp) |*mm| .{
+                .entries = mm.snapshot.entries,
+                .step = mm.snapshot.step,
+                .config = mm.snapshot.config,
+                .base_pos = mm.base_pos,
+                .head_aux = if (mm.head_aux) |*ha| ha else null,
+                .head_pos_base = mm.head_pos_base,
+                .head_marks = mm.head_marks.slice(),
+            } else null,
+        };
+        if (appendSlice(d, &p.snapshot, p.tokens, p.has_tools, p.media, p.ssm_cps, specs, s)) return;
+        p.deinit(self.allocator);
+        slot.* = null;
+    }
+
+    /// One slice of a RAM entry; its flag stays set only while the tier owes it more.
+    fn sliceEntry(d: *kv_disk_cache.DiskTier, e: *Entry, s: mlx.mlx_stream) void {
+        e.disk_dirty = appendSlice(d, &e.snapshot, e.tokens, e.has_tools, e.media, e.ssm_checkpoints, entrySpecCommits(e), s);
+    }
+
+    /// The owed entry the next slice goes to, newest or oldest; never one checked out (its
+    /// bytes are the slot's until the commit that replaces it).
+    fn owedEntryIndex(self: *const HotPrefixCache, newest: bool) ?usize {
+        var best: ?usize = null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (!e.disk_dirty or e.checked_out_by != null) continue;
+            const b = best orelse {
+                best = i;
+                continue;
+            };
+            if ((e.last_used > self.entries.items[b].last_used) == newest) best = i;
+        }
+        return best;
+    }
+
+    /// Does the tier still owe a slice anything it can write?
+    fn diskOwed(self: *const HotPrefixCache) bool {
+        if (self.disk == null) return false;
+        if (self.finishing_disk != null or self.pending_disk != null) return true;
+        return self.owedEntryIndex(false) != null;
+    }
+
+    const SliceOrder = enum { newest_first, oldest_first };
+
+    /// One bounded slice, then `disk_dirty` says whether anything is still owed. A parked
+    /// snapshot goes first: it is an earlier session's, and RAM holds at most a trimmed copy.
+    fn flushSlice(self: *HotPrefixCache, s: mlx.mlx_stream, order: SliceOrder) void {
         if (!self.disk_dirty) return;
-        self.disk_dirty = false;
+        defer self.disk_dirty = self.diskOwed();
         const d = if (self.disk) |*dd| dd else return;
-        // A parked snapshot first; the commit that displaced it is still owed, so stay dirty.
-        if (self.finishing_disk) |*f| {
-            self.disk_dirty = true;
-            const out = appendPending(d, f, s);
-            if (out == null or out.? != .partial) {
-                f.deinit(self.allocator);
-                self.finishing_disk = null;
-            }
-            return;
-        }
-        // Flush the live state captured at commit, not what the RAM entry retained after its trim:
-        // one bounded slice per flush, the snapshot kept until it lands whole.
-        if (self.pending_disk) |*pending| {
-            const out = appendPending(d, pending, s);
-            if (out != null and out.? == .partial) {
-                self.disk_dirty = true;
-            } else {
-                pending.deinit(self.allocator);
-                self.pending_disk = null;
-            }
-            return;
-        }
-        if (self.entries.items.len == 0) return;
-        var newest: *Entry = &self.entries.items[0];
-        for (self.entries.items[1..]) |*e| {
-            if (e.last_used > newest.last_used) newest = e;
-        }
-        // Phase 3: hybrid entries persist their SSM checkpoints alongside the
-        // KV chunks (immutable per-position s*.safetensors). The snapshot
-        // arrays are refcount-shared with the RAM entry, so `appendCommit`
-        // reads the same buffers the commit captured.
-        // v4: the spec snapshots (dflash context / MTP history) ride along —
-        // eligibility was enforced at commitWithState, so the disk tier
-        // persists exactly what the RAM entry holds, media spans included.
-        const specs = entrySpecCommits(newest);
-        const dflash_spec = specs.dflash;
-        const mtp_spec = specs.mtp;
-        const complete = d.appendCommitWithSpec(
-            newest.snapshot.entries,
-            newest.snapshot.step,
-            newest.snapshot.config,
-            newest.tokens,
-            newest.has_tools,
-            newest.media,
-            newest.ssm_checkpoints,
-            dflash_spec,
-            mtp_spec,
-            s,
-        ) catch |err| {
-            log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
-            return;
-        };
-        // Byte-capped flush: a large entry persists incrementally — keep the
-        // dirty flag set so the next finished request continues the write.
-        if (!complete.nothingPending()) self.disk_dirty = true;
+        if (self.finishing_disk != null) return self.slicePending(d, &self.finishing_disk, s);
+        // The live state captured at commit, not what the RAM entry kept after its trim.
+        if (order == .newest_first and self.pending_disk != null) return self.slicePending(d, &self.pending_disk, s);
+        if (self.owedEntryIndex(order == .newest_first)) |i| return sliceEntry(d, &self.entries.items[i], s);
+        self.slicePending(d, &self.pending_disk, s);
     }
 
-    /// The idle loop's flush: one bounded slice; true while anything is still owed.
+    /// The finish path: one slice of the turn that just committed. Called AFTER `markFinished`,
+    /// on the inference thread; snapshot arrays are refcount-shared with the RAM entry.
+    pub fn flushPendingDisk(self: *HotPrefixCache, s: mlx.mlx_stream) void {
+        self.flushSlice(s, .newest_first);
+    }
+
+    /// The idle loop's flush: one bounded slice to the OLDEST owed session (the next the LRU
+    /// drops), so every finished session lands whole, not only the newest. True while owed.
     pub fn flushOwedSlice(self: *HotPrefixCache, s: mlx.mlx_stream) bool {
-        self.flushPendingDisk(s);
+        self.flushSlice(s, .oldest_first);
         return self.disk_dirty;
     }
 
-    /// Arm the attached disk tier for this model: SSD-first per `ssdFirstActive`.
+    /// Arm the attached disk tier for this model: SSD-first per `ssdFirstActive`, and on both
+    /// arms the background writer, which chunk share rides (it lands files by rename).
     pub fn armDiskTier(self: *HotPrefixCache, config: *const model_mod.ModelConfig) void {
         self.ssd_first = ssdFirstActive(config, self.disk != null, self.ram_enabled);
-        if (!self.ssd_first) return;
-        const d = &self.disk.?;
-        d.ssd_first = true;
+        const d = if (self.disk) |*dd| dd else return;
+        d.ssd_first = self.ssd_first;
         d.enableBackgroundWriter();
         // Startup sweep of strays + root-wide LRU across sibling fingerprints.
-        d.sweepSiblings();
+        if (self.ssd_first) d.sweepSiblings();
     }
 
     /// #330 adjacent: when the byte budget is exceeded with the just-updated
@@ -3000,8 +3013,8 @@ pub const HotPrefixCache = struct {
     /// requests remain untouched (improvement over the legacy nuke-everything).
     pub fn invalidateLatest(self: *HotPrefixCache, reason: []const u8) void {
         if (self.disk) |*d| d.invalidateNewest();
-        // The parked snapshot is an earlier, healthy session's: it still lands.
-        self.disk_dirty = self.finishing_disk != null;
+        // The parked snapshot and older entries are earlier, healthy sessions': they still land.
+        defer self.disk_dirty = self.diskOwed();
         if (self.pending_disk) |*p| {
             p.deinit(self.allocator);
             self.pending_disk = null;

@@ -4952,17 +4952,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         // SSD-first: arch + env switch + a live disk tier. Below the attach because the tier
         // is part of the answer; without `--prefix-cache-disk` qwen4_exp takes the RAM arm.
-        entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
-            params.config,
-            entry.prefix_cache.?.disk != null,
-            ram_prefix_cache,
-        );
-        if (entry.prefix_cache.?.ssd_first) {
-            entry.prefix_cache.?.disk.?.ssd_first = true;
-            entry.prefix_cache.?.disk.?.enableBackgroundWriter();
-            // Startup sweep of strays + root-wide LRU across sibling fingerprints.
-            entry.prefix_cache.?.disk.?.sweepSiblings();
-        }
+        entry.prefix_cache.?.armDiskTier(params.config);
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
         // The cache re-applies the cap after a replace-path merge; without this
@@ -5105,7 +5095,8 @@ pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) 
 }
 
 /// Caller holds `queue_mu`. Shared with the wait condition below.
-/// One bounded SSD flush per resident model that still owes one; returns whether any still does.
+/// One bounded SSD slice per resident model that still owes one (its oldest owed session first);
+/// returns whether any still does. The caller re-checks for work between calls.
 /// Inference thread only: unloads run here too, so the collected pointers stay valid.
 fn flushOwedDiskSlices(sch: *Scheduler) bool {
     var owed: [16]struct { hc: *prefix_cache_mod.HotPrefixCache, s: mlx.mlx_stream } = undefined;
@@ -5125,8 +5116,7 @@ fn flushOwedDiskSlices(sch: *Scheduler) bool {
     sch.registry.mutex.unlock(sch.io);
     var still = false;
     for (owed[0..n]) |o| {
-        o.hc.flushPendingDisk(o.s);
-        still = still or o.hc.disk_dirty;
+        if (o.hc.flushOwedSlice(o.s)) still = true;
     }
     return still;
 }

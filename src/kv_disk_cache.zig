@@ -469,7 +469,8 @@ pub const DiskTier = struct {
         self.space_probe = testSpaceProbe;
     }
 
-    /// Arm the background writer (SSD-first only). A spawn failure keeps the synchronous path.
+    /// Arm the background writer (both arms; set `ssd_first` first). A spawn failure keeps the
+    /// synchronous path.
     pub fn enableBackgroundWriter(self: *DiskTier) void {
         if (self.writer != null) return;
         const w = self.allocator.create(disk_writer.Writer) catch return;
@@ -481,8 +482,9 @@ pub const DiskTier = struct {
         };
         self.writer = w;
         // With the write off-thread the only inference-thread cost is the readback, and the
-        // bound is no longer a correctness cliff (checkpoints ride outside it).
-        self.max_flush_bytes = SSD_FIRST_READBACK_BYTES;
+        // bound is no longer a correctness cliff (checkpoints ride outside it). RAM-first keeps
+        // its bound: an idle slice is what a request arriving mid-flush waits for.
+        if (self.ssd_first) self.max_flush_bytes = SSD_FIRST_READBACK_BYTES;
         log.info("[disk-cache] background writer armed (permit {d} MB, readback bound {d} MB/flush)\n", .{
             w.permit_bytes / (1024 * 1024),
             self.max_flush_bytes / (1024 * 1024),
@@ -557,6 +559,19 @@ pub const DiskTier = struct {
             if (e.id != id) continue;
             if (!e.poisoned) self.poisonEntry(e, err_name);
             return true;
+        }
+        return false;
+    }
+
+    /// Would a commit of this record resume an entry a failed write invalidated? Attributes the
+    /// writer's failures first. A flush gives such a record up instead of rewriting it in a loop.
+    pub fn resumesPoisoned(self: *DiskTier, tokens: []const u32, has_tools: bool, media: []const MediaSpan, config: kv_quant.KVQuantConfig) bool {
+        _ = self.harvestWriteFailures();
+        const media_in = spansBelow(media, tokens.len);
+        for (self.entries.items) |*e| {
+            if (!e.poisoned or e.has_tools != has_tools or !std.meta.eql(e.quant, config)) continue;
+            const n = @min(e.tokens.len, tokens.len);
+            if (spansAgree(e.media, media_in, n) and std.mem.eql(u32, e.tokens[0..n], tokens[0..n])) return true;
         }
         return false;
     }
@@ -1353,7 +1368,7 @@ pub const DiskTier = struct {
         //
         // A fresh entry may inherit its leading whole chunks from a resident entry that shares a
         // prefix, by hard link: a persisted entry's tokens are `prompt ++ generated`, so the next
-        // turn diverges inside the generated span and used to rewrite every chunk. SSD-first only.
+        // turn diverges inside the generated span and used to rewrite every chunk. Off on a synchronous RAM-first tier.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
         const donor = if (extend_idx == null) self.chunkShareDonor(tokens, media_in, kv_target, has_tools, config) else null;
         var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
@@ -2696,9 +2711,9 @@ pub const DiskTier = struct {
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
     /// same tool flag and kv-quant config, most whole chunks below the common prefix and the
     /// first media item the two disagree on. Null on
-    /// the legacy arm or under `MLX_SERVE_SSD_CHUNK_SHARE=0`.
+    /// a synchronous RAM-first tier or under `MLX_SERVE_SSD_CHUNK_SHARE=0`.
     fn chunkShareDonor(self: *DiskTier, tokens: []const u32, media: []const MediaSpan, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig) ?ChunkDonor {
-        if (!self.ssd_first or !chunkShareEnabled()) return null;
+        if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
         var best: ?ChunkDonor = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // never inherit from a dead entry

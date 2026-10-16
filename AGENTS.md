@@ -63,7 +63,7 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`
 | `responses.zig` | Responses API pure data: parser, envelope, `ResponseStore`, compaction |
 | `ws.zig` | RFC 6455 framing (server-side) |
 | `pld_index.zig` | PLD n-gram index (`findMatch`, `ngramRepeatScore`) |
-| `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` | Hot prefix cache + SSD tier (`--prefix-cache-disk`, default OFF); SSD-first mode (qwen4_exp or RAM disabled) + its background writer thread |
+| `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` | Hot prefix cache + SSD tier (`--prefix-cache-disk`, default OFF); SSD-first mode (qwen4_exp or RAM disabled); a background writer thread on both arms |
 | `drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode) |
 | `dflash.zig` | DFlash block-drafter: config-contract detection (root OR nested `dflash_config`), per-request context cache, block forward; DFlash2 adds `selectPath` + 2-tap grouped convs; trunk seam = `ForwardCtx.capture_layers` + `rawEmbedding` |
 | `mtp.zig` | Qwen 3.5/3.6/3.8 native MTP head (sidecar OR in-checkpoint `mtp.*` via `resolveMtpSource`; per-weight quant re-solve; committed-history cache) |
@@ -341,6 +341,7 @@ Prefix cache (RAM + SSD):
 - **Eviction is WORKLOAD-fair** (#378, `cache_key` via `requestCacheKey`, `lruIndexExcluding`). Guard: `tests/test_prefix_cache_workloads.sh`.
 - **State AT/AFTER media is keyed per ITEM on its PIXELS** (`Entry.media: []MediaSpan`; a match stops at the first item differing in position or pixels, `mediaSharedBound`; an entry keeps only the items it covers); inheritance + thinning obey the first item (`bestCheckpointDonor`, `boundaryCheckpointIndex`). Guard: `tests/test_vision_prefix_cache.sh`.
 - **SSD tier**: entries carry their media spans (meta.json v9 `media`, hex keys), so image sessions persist whole and a restore stops at the first differing item, as in RAM; a media entry is never stamped below v9 (an older reader would match it as text); checkpoints come off the TOP of the flush budget; hybrid arm ranks by restorable checkpoint (`bestHybridMatch`); a RAM decline spills (`spillDeclinedToDisk`, 4 GB floor).
+- **The idle loop lands EVERY owed session, oldest first** (`Entry.disk_dirty`, `flushOwedSlice`, one bounded slice per call): flushing only the newest left an older session partial until it was newest again. A failed write or a slice that lands nothing gives the session up until its next commit; a checked-out entry is never owed.
 - **A change to what stored K/V MEAN gets a fresh SSD root** (`ModelConfig.cacheLayoutNamespace` → `modelFingerprintWithLayout`; null keeps the old root): the fingerprint hashes only the dir, the config's stat and the overrides, so a fixed model would restore its buggy keys (Nemotron-H NoPE).
 - **A disk restore evals each chunk before loading the next** (a lazy `mlx_load_safetensors` holds its fd until eval: 256 files = ~250k tokens); restore entry points drop their own latch, or the cold fallback fails.
 - **SSD-first** (qwen4 + disk tier, or `--no-prefix-cache-ram` + disk): SSD-only retains no idle RAM KV; writes ride `kv_disk_writer.zig`; a checkout is a PROMISE until append donates (`donateCheckout`/`releaseCheckout`).
