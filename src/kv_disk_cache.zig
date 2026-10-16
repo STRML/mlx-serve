@@ -424,6 +424,8 @@ pub const DiskTier = struct {
     next_id: u64,
     total_bytes: u64,
     counter: u64,
+    /// Bytes every commit so far wrote (staged, on the writer arm). Diagnostics; not persisted.
+    bytes_persisted: u64 = 0,
     /// Chunk count read by the most recent restore. Diagnostics + a
     /// red-on-revert guard that a short-prefix restore reads only the chunks
     /// covering the usable prefix, not the whole stored entry. Not persisted.
@@ -494,6 +496,16 @@ pub const DiskTier = struct {
     /// Wait for every staged file to land.
     pub fn drainWriter(self: *DiskTier) void {
         if (self.writer) |w| w.drain();
+    }
+
+    /// `drainWriter` bounded by `deadline_ms` on `clock` (any type with `nowMs() i64`). At the
+    /// deadline whatever is still queued is fenced, so neither this call nor `deinit` writes it;
+    /// each entry keeps its last landed manifest. Returns the bytes dropped.
+    pub fn drainWriterUntil(self: *DiskTier, clock: anytype, deadline_ms: i64) u64 {
+        _ = self;
+        _ = clock;
+        _ = deadline_ms;
+        return 0;
     }
 
     /// Host bytes staged for the writer and not yet written. Zero when the writer is not armed.
@@ -6603,6 +6615,42 @@ test "DiskTier: SSD-first declines to store when the VOLUME is short, and says s
     try testing.expect(!tier.store_declined);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(@as(u32, 640), tier.entries.items[0].kv_len);
+}
+
+test "DiskTier: the shutdown drain fences what is still queued at its deadline, and deinit writes none of it" {
+    // Exit never waits on staged bytes past the deadline; the entry keeps its last landed manifest
+    // (here none), so a restart scans nothing half-written.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const PastClock = struct {
+        pub fn nowMs(_: @This()) i64 {
+            return 1_000;
+        }
+    };
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-deadline", 0, 128);
+        defer tier.deinit();
+        tier.ssd_first = true;
+        tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+        tier.enableBackgroundWriter();
+        try testing.expect(tier.writer != null);
+        tier.writer.?.setPaused(true);
+        _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+        try testing.expect(tier.drainWriterUntil(PastClock{}, 1_000) > 0);
+    }
+    var rescanned = try DiskTier.init(testing.allocator, io, base, "fp-deadline", 0, 128);
+    defer rescanned.deinit();
+    try testing.expectEqual(@as(usize, 0), rescanned.entryCount());
 }
 
 test "DiskTier: entries cross the SSD-first boundary in BOTH directions (SSD-first itself bumps no manifest)" {

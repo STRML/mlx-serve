@@ -1036,6 +1036,10 @@ pub fn clearResolvedPrefixCacheMem() void {
 /// value). The Swift app exposes this as a Settings toggle, default off.
 pub var prefix_cache_disk_bytes: u64 = 0;
 
+/// `--shutdown-persist-secs`: on SIGTERM, finish the SSD slices the idle flush has not landed,
+/// for at most this long after the signal. 0 turns it off.
+pub var shutdown_persist_secs: u32 = 45;
+
 /// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
 /// in tokens. Non-zero values enable multi-turn warm reuse on hybrid SSM
 /// architectures (Qwen3.5/3.6 GatedDeltaNet, Nemotron-H Mamba2, LFM2.5

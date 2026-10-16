@@ -95,6 +95,56 @@ launchd_stop() { # TERM, 5 s grace, then KILL: what `exit timeout = 5` does
     sleep 1
 }
 
+term_stop() { # $1 seconds to wait before KILL. TERM twice, 0.5 s apart; sets STOP_SECS and KILLED
+    local t0 now
+    t0=$(python3 -c 'import time; print(time.monotonic())')
+    kill -TERM "$SERVER_PID" 2>/dev/null || true
+    sleep 0.5
+    kill -TERM "$SERVER_PID" 2>/dev/null || true
+    KILLED=0
+    while kill -0 "$SERVER_PID" 2>/dev/null; do
+        now=$(python3 -c "import time; print(int(time.monotonic() - $t0 >= $1))")
+        if [ "$now" = 1 ]; then kill -KILL "$SERVER_PID" 2>/dev/null || true; KILLED=1; break; fi
+        sleep 0.2
+    done
+    wait "$SERVER_PID" 2>/dev/null || true
+    STOP_SECS=$(python3 -c "import time; print(f'{time.monotonic() - $t0:.1f}')")
+    SERVER_PID=""
+    sleep 1
+}
+
+session_turn() { # $1 session label (A|B), ~25.8k tokens on a qwen3_5 tokenizer -> "content"
+    python3 - "$BASE" "$1" <<'PY'
+import json, sys, urllib.request
+base, who = sys.argv[1], sys.argv[2]
+k = 1 if who == 'A' else 7
+lines = [f'Session {who}: read this project log fully, then answer.']
+lines += [f'Log entry {i}: subsystem {(i*k)%17} reported state change {i*31*k%997} with latency {i*7%131} ms and checksum {i*i*k%9973}.' for i in range(1, 801)]
+lines.append('Question: which subsystem appears in log entry 42? One short sentence.')
+body = json.dumps({'model': 'mlx-serve', 'messages': [{'role': 'user', 'content': '\n'.join(lines)}],
+                   'max_tokens': 24, 'temperature': 0.0, 'enable_thinking': False, 'stream': False}).encode()
+req = urllib.request.Request(base + '/v1/chat/completions', data=body, headers={'Content-Type': 'application/json'})
+resp = json.load(urllib.request.urlopen(req, timeout=1200))
+print(resp['choices'][0]['message']['content'].replace('\n', ' '))
+PY
+}
+
+sessions_restore() { # resend sessions A and B; each must restore within one chunk of its prompt
+    local who seen line restored total
+    for who in A B; do
+        seen=$(grep -cE '\[disk-cache\] restored [0-9]+/[0-9]+ tokens' "$LOGFILE" || true)
+        session_turn "$who" > /dev/null || { echo -e "${RED}FAIL${NC} session $who after reboot failed"; FAIL=1; }
+        line=$(grep -oE '\[disk-cache\] restored [0-9]+/[0-9]+ tokens' "$LOGFILE" | sed -n "$((seen + 1))p")
+        restored=$(echo "$line" | grep -oE '[0-9]+/' | tr -d /)
+        total=$(echo "$line" | grep -oE '/[0-9]+' | tr -d /)
+        if [ -n "$restored" ] && [ "$restored" -ge $((total - 1024)) ]; then
+            echo -e "${GREEN}PASS${NC} session $who restored $restored/$total after the reboot"
+        else
+            echo -e "${RED}FAIL${NC} session $who restored '${restored:-none}' of '${total:-?}' (want within 1024 of the prompt)"; FAIL=1
+        fi
+    done
+}
+
 # Deterministic ~2.5k-token prompt (well above the 512-token persist floor).
 LONG_PROMPT=$(python3 -c "
 lines = ['You are reviewing a project log. Read it fully, then answer.']
@@ -469,22 +519,6 @@ else
     SCRATCH_HOME=$(mktemp -d "$HOME/claude-tmp/prefix-disk-idle.XXXXXX")
     KV_DIR="$SCRATCH_HOME/.mlx-serve/kv-cache"
 
-    session_turn() { # $1 session label (A|B) -> "content"
-        python3 - "$BASE" "$1" <<'PY'
-import json, sys, urllib.request
-base, who = sys.argv[1], sys.argv[2]
-k = 1 if who == 'A' else 7
-lines = [f'Session {who}: read this project log fully, then answer.']
-lines += [f'Log entry {i}: subsystem {(i*k)%17} reported state change {i*31*k%997} with latency {i*7%131} ms and checksum {i*i*k%9973}.' for i in range(1, 801)]
-lines.append('Question: which subsystem appears in log entry 42? One short sentence.')
-body = json.dumps({'model': 'mlx-serve', 'messages': [{'role': 'user', 'content': '\n'.join(lines)}],
-                   'max_tokens': 24, 'temperature': 0.0, 'enable_thinking': False, 'stream': False}).encode()
-req = urllib.request.Request(base + '/v1/chat/completions', data=body, headers={'Content-Type': 'application/json'})
-resp = json.load(urllib.request.urlopen(req, timeout=1200))
-print(resp['choices'][0]['message']['content'].replace('\n', ' '))
-PY
-    }
-
     start_server --ctx-size 65536 --no-mtp || { echo -e "${RED}FAIL${NC} idle-flush server failed to start"; FAIL=1; }
     if [ -n "$SERVER_PID" ]; then
         if grep -q '\[disk-cache\] background writer armed' "$LOGFILE"; then
@@ -511,24 +545,71 @@ PY
         grep -E '\[disk-cache\] (persisted|e[0-9]+ complete)' "$LOGFILE" | sed 's/^/    /' | tail -14
         launchd_stop
         if start_server --ctx-size 65536 --no-mtp; then
-            for who in A B; do
-                seen=$(grep -cE '\[disk-cache\] restored [0-9]+/[0-9]+ tokens' "$LOGFILE" || true)
-                session_turn "$who" > /dev/null || { echo -e "${RED}FAIL${NC} session $who after reboot failed"; FAIL=1; }
-                line=$(grep -oE '\[disk-cache\] restored [0-9]+/[0-9]+ tokens' "$LOGFILE" | sed -n "$((seen + 1))p")
-                restored=$(echo "$line" | grep -oE '[0-9]+/' | tr -d /)
-                total=$(echo "$line" | grep -oE '/[0-9]+' | tr -d /)
-                if [ -n "$restored" ] && [ "$restored" -ge $((total - 1024)) ]; then
-                    echo -e "${GREEN}PASS${NC} session $who restored $restored/$total after the reboot"
-                else
-                    echo -e "${RED}FAIL${NC} session $who restored '${restored:-none}' of '${total:-?}' (want within 1024 of the prompt)"; FAIL=1
-                fi
-            done
+            sessions_restore
             stop_server
         else
             echo -e "${RED}FAIL${NC} idle-flush reboot failed"; FAIL=1
         fi
     fi
     rm -rf "$SCRATCH_HOME"
+fi
+
+echo
+echo "== 11. SIGTERM lands the slices the idle flush has not, then exits by its deadline =="
+# Two ~25.8k-token sessions finish together and SIGTERM (twice, 0.5 s apart) follows the second
+# reply at once, so both still owe several 512 MB slices. The server must log one `shutdown
+# persist:` summary and exit before the KILL; at the default deadline both must restore within one
+# chunk after the reboot. At --shutdown-persist-secs 1 the exit stays prompt and the reboot scan
+# finds no half-written entry. Needs a hybrid qwen3_5 model; SKIPs otherwise.
+if [ ! -f "$IDLE_MODEL/config.json" ] || ! grep -q '"qwen3_5' "$IDLE_MODEL/config.json"; then
+    echo -e "${YELLOW}SKIP${NC} shutdown-flush section: no qwen3_5 model at $IDLE_MODEL (set IDLE_FLUSH_MODEL)."
+else
+    MODEL="$IDLE_MODEL"
+    shutdown_arm() { # $1 label, $2 --shutdown-persist-secs, $3 seconds before KILL, $4 restore|scan
+        SCRATCH_HOME=$(mktemp -d "$HOME/claude-tmp/prefix-disk-term.XXXXXX")
+        KV_DIR="$SCRATCH_HOME/.mlx-serve/kv-cache"
+        echo "  -- $1"
+        if ! start_server --ctx-size 65536 --no-mtp --shutdown-persist-secs "$2"; then
+            echo -e "${RED}FAIL${NC} $1: server failed to start"; FAIL=1; rm -rf "$SCRATCH_HOME"; return
+        fi
+        session_turn A > /dev/null &
+        local pid_a=$!
+        sleep 2
+        session_turn B > /dev/null || { echo -e "${RED}FAIL${NC} $1: session B failed"; FAIL=1; }
+        wait "$pid_a" || { echo -e "${RED}FAIL${NC} $1: session A failed"; FAIL=1; }
+        term_stop "$3"
+        grep -E '\[disk-cache\] (persisted|e[0-9]+ complete)' "$LOGFILE" | sed 's/^/    /' | tail -8
+        local summary
+        summary=$(grep -E '\[disk-cache\] shutdown persist:' "$LOGFILE" || true)
+        if [ -n "$summary" ]; then
+            echo -e "${GREEN}PASS${NC} $1: summary logged:$(echo "$summary" | sed 's/.*shutdown persist://')"
+        else
+            echo -e "${RED}FAIL${NC} $1: no 'shutdown persist:' summary line"; FAIL=1
+        fi
+        if [ "$KILLED" = 0 ]; then
+            echo -e "${GREEN}PASS${NC} $1: exited ${STOP_SECS}s after SIGTERM"
+        else
+            echo -e "${RED}FAIL${NC} $1: still running ${STOP_SECS}s after SIGTERM, killed"; FAIL=1
+        fi
+        if ! start_server --ctx-size 65536 --no-mtp --shutdown-persist-secs "$2"; then
+            echo -e "${RED}FAIL${NC} $1: reboot failed"; FAIL=1; rm -rf "$SCRATCH_HOME"; return
+        fi
+        if [ "$4" = restore ]; then
+            sessions_restore
+        else
+            local scanned
+            scanned=$(grep -oE '\[disk-cache\] scanned [0-9]+ persisted entries' "$LOGFILE" | grep -oE '[0-9]+' || true)
+            if [ "${scanned:-0}" -ge 1 ] && ! grep -q '\[disk-cache\] dropping incomplete entry' "$LOGFILE"; then
+                echo -e "${GREEN}PASS${NC} $1: the reboot scanned $scanned entries, none half-written"
+            else
+                echo -e "${RED}FAIL${NC} $1: reboot scan found '${scanned:-none}' entries or dropped an incomplete one"; FAIL=1
+            fi
+        fi
+        stop_server
+        rm -rf "$SCRATCH_HOME"
+    }
+    shutdown_arm "default deadline" 45 60 restore
+    shutdown_arm "1 s deadline" 1 8 scan
 fi
 
 echo

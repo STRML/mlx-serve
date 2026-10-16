@@ -1552,6 +1552,8 @@ pub const Scheduler = struct {
 
     inference_thread: ?std.Thread,
     shutdown: std.atomic.Value(bool),
+    /// The shutdown flush's deadline on the `nowMsMonotonic` clock; 0 = off. Set before `shutdown`.
+    shutdown_deadline_ms: std.atomic.Value(i64) = .init(0),
     started: std.atomic.Value(bool),
     started_mu: std.Io.Mutex,
     started_cond: std.Io.Condition,
@@ -5121,6 +5123,12 @@ fn flushOwedDiskSlices(sch: *Scheduler) bool {
     return still;
 }
 
+/// Arm the shutdown flush's deadline `secs` after the first call; a later call (a second
+/// SIGTERM) never moves it. 0 seconds leaves it unarmed, which turns the flush off.
+pub fn armShutdownDeadline(slot: *std.atomic.Value(i64), now_ms: i64, secs: u32) void {
+    slot.store(now_ms + @as(i64, secs) * 1000, .release);
+}
+
 fn hasWorkPendingLocked(sch: *const Scheduler) bool {
     return sch.pending.items.len > 0 or
         sch.decoding.items.len > 0 or
@@ -8540,6 +8548,17 @@ test "the cleanup drain commits a cancelled slot before deinit" {
     // The SSD tier has no finishSlot flush on this path — the drain must
     // flush what it just committed itself.
     try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
+}
+
+test "armShutdownDeadline: the first SIGTERM sets the deadline and a second never moves it" {
+    var slot = std.atomic.Value(i64).init(0);
+    armShutdownDeadline(&slot, 5_000, 45);
+    try testing.expectEqual(@as(i64, 50_000), slot.load(.acquire));
+    armShutdownDeadline(&slot, 9_000, 45);
+    try testing.expectEqual(@as(i64, 50_000), slot.load(.acquire));
+    var off = std.atomic.Value(i64).init(0);
+    armShutdownDeadline(&off, 5_000, 0);
+    try testing.expectEqual(@as(i64, 0), off.load(.acquire));
 }
 
 test "idleEvictTickMs: sweeps well inside the window without spinning" {

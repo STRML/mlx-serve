@@ -204,6 +204,21 @@ pub const Writer = struct {
         }
     }
 
+    /// `drain` bounded by `timeout`; true once everything staged has landed. Lifts a pause first,
+    /// or a paused writer would hold the caller to the timeout for nothing.
+    pub fn drainUntil(self: *Writer, timeout: std.Io.Timeout) bool {
+        _ = self;
+        _ = timeout;
+        return false;
+    }
+
+    /// Bytes queued and not yet picked up by the writer thread (the in-flight file excluded).
+    pub fn queuedBytes(self: *Writer) u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.pending_bytes;
+    }
+
     /// Epoch fence: staged bytes for `path_prefix` (null = everything) are discarded rather than
     /// written, and anything in flight is waited out, so the caller can remove the directory.
     pub fn fence(self: *Writer, path_prefix: ?[]const u8) void {
@@ -513,4 +528,26 @@ test "kv_disk_writer: a PAUSED writer deinits without blocking" {
     w.deinit();
     try testing.expect(w.thread == null);
     w.deinit();
+}
+
+test "kv_disk_writer: drainUntil lifts a pause and reports the queue landed" {
+    // The shutdown flush drains under a deadline; a paused writer must not eat it.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+
+    var w = Writer.init(testing.allocator, std.testing.io);
+    try w.start();
+    defer w.deinit();
+    w.setPaused(true);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/held.bin", .{root});
+    const bytes = try testing.allocator.alloc(u8, 4096);
+    @memset(bytes, 5);
+    w.submit(path, bytes);
+
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .boot } };
+    try testing.expect(w.drainUntil(timeout));
+    try testing.expectEqual(@as(u64, 1), w.filesWritten());
+    _ = try tmp.dir.statFile(std.testing.io, "held.bin", .{});
 }

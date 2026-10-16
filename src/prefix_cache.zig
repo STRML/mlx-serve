@@ -308,6 +308,38 @@ pub fn restoreMoveEnabled() bool {
     return v;
 }
 
+/// What the shutdown flush did, for its one summary line.
+pub const ShutdownTally = struct {
+    /// Records a shutdown slice brought whole (a record already covered on disk is not counted).
+    written: u32 = 0,
+    /// Bytes the shutdown slices wrote (staged, on the writer arm).
+    bytes: u64 = 0,
+    /// Records still owed when the deadline stopped the flush.
+    left_deadline: u32 = 0,
+    /// Records the tier refused because the volume is under its reserve.
+    left_declined: u32 = 0,
+    /// Owed entries an in-flight request still held.
+    checked_out: u32 = 0,
+    /// Writes that failed during the flush (the entry is poisoned; the flush moved on).
+    failures: u64 = 0,
+    /// Staged bytes still queued at the deadline, dropped instead of written.
+    dropped_bytes: u64 = 0,
+};
+
+/// One resident model's hot cache and its stream: what a disk flush runs on.
+pub const FlushTarget = struct { hc: *HotPrefixCache, s: mlx.mlx_stream };
+
+/// SIGTERM: finish what the idle flush has not landed, oldest owed first, one slice per model in
+/// turn, then let the staged writes land, all before `deadline_ms` on `clock` (`nowMs() i64`).
+/// A slice that the longest one so far says would overrun the deadline is not started.
+/// Inference thread only.
+pub fn shutdownPersist(targets: []const FlushTarget, clock: anytype, deadline_ms: i64) ShutdownTally {
+    _ = targets;
+    _ = clock;
+    _ = deadline_ms;
+    return .{};
+}
+
 /// The SSD-first predicate: arch, env switch, AND a disk tier. Without the tier the mode used
 /// to arm with nowhere to spill and a budget floor sized for a tier that did not exist. The
 /// budget resolver asks `--prefix-cache-disk > 0`, the arming asks `disk != null`.
@@ -2446,6 +2478,13 @@ pub const HotPrefixCache = struct {
     pub fn flushOwedSlice(self: *HotPrefixCache, s: mlx.mlx_stream) bool {
         self.flushSlice(s, .oldest_first);
         return self.disk_dirty;
+    }
+
+    /// One shutdown slice (the idle loop's order) for `shutdownPersist`, tallied.
+    fn shutdownSlice(self: *HotPrefixCache, s: mlx.mlx_stream, t: *ShutdownTally) void {
+        _ = self;
+        _ = s;
+        _ = t;
     }
 
     /// Arm the attached disk tier for this model: SSD-first per `ssdFirstActive`, and on both
@@ -8818,6 +8857,175 @@ test "HotPrefixCache: a qwen3_5 RAM-first cache arms the background writer and c
         try testing.expect(hc.disk.?.ssd_first);
         try testing.expect(hc.disk.?.writer != null);
     }
+}
+
+/// Advances `step` ms on every read, so a deadline cuts after a known number of slices.
+const TestStepClock = struct {
+    now: *i64,
+    step: i64,
+    pub fn nowMs(self: TestStepClock) i64 {
+        self.now.* += self.step;
+        return self.now.*;
+    }
+};
+
+/// Three sessions committed back to back, each with one finish-path slice landed (128 of 600).
+fn testOwedSessions(hc: *HotPrefixCache, cache: *const KVCache, toks: *const [3][600]u32, s: mlx.mlx_stream) !void {
+    hc.disk.?.max_flush_bytes = 1; // one chunk per slice
+    for (toks) |*t| {
+        _ = try hc.commit(cache, t, false);
+        hc.flushPendingDisk(s);
+    }
+}
+
+test "HotPrefixCache: the shutdown flush lands every owed session whole and tallies it" {
+    // SIGTERM with sessions still owed slices: before the deadline, each lands whole.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    const toks = testThreeSessions();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-sd-all", 0, 128);
+    defer hc.deinit();
+    try testOwedSessions(&hc, &cache, &toks, s);
+
+    var now: i64 = 0;
+    const t = shutdownPersist(&.{.{ .hc = &hc, .s = s }}, TestStepClock{ .now = &now, .step = 1 }, 1_000_000);
+    for (&toks) |*k| try testing.expect(testWholeOnDisk(&hc.disk.?, &cache, k));
+    try testing.expectEqual(@as(u32, 3), t.written);
+    try testing.expectEqual(@as(u32, 0), t.left_deadline);
+    try testing.expectEqual(@as(u64, 0), t.failures);
+    try testing.expect(t.bytes > 0);
+    try testing.expect(!hc.disk_dirty);
+}
+
+test "HotPrefixCache: a shutdown deadline stops between slices, oldest first, and leaves valid shorter entries" {
+    // The clock reads 10 before slice 1 and 20 after it; the next start (30) plus the longest
+    // slice (10) passes 35, so exactly one slice runs. A restart must read what landed.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    const toks = testThreeSessions();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-sd-cut", 0, 128);
+    defer hc.deinit();
+    try testOwedSessions(&hc, &cache, &toks, s);
+
+    var now: i64 = 0;
+    const t = shutdownPersist(&.{.{ .hc = &hc, .s = s }}, TestStepClock{ .now = &now, .step = 10 }, 35);
+    try testing.expectEqual(@as(u32, 3), t.left_deadline);
+    try testing.expectEqual(@as(u32, 0), t.written);
+    try testing.expectEqual(@as(u32, 256), testDiskKvLen(&hc.disk.?, &toks[0]));
+    try testing.expectEqual(@as(u32, 128), testDiskKvLen(&hc.disk.?, &toks[1]));
+    try testing.expectEqual(@as(u32, 128), testDiskKvLen(&hc.disk.?, &toks[2]));
+
+    var again = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-sd-cut", 0, 128);
+    defer again.deinit();
+    try testing.expectEqual(@as(usize, 3), again.entryCount());
+    try testing.expectEqual(@as(u32, 256), testDiskKvLen(&again, &toks[0]));
+    try testing.expectEqual(@as(u32, 128), testDiskKvLen(&again, &toks[2]));
+}
+
+test "HotPrefixCache: the shutdown flush skips a checked-out entry and counts it" {
+    // Its bytes are the in-flight slot's; the flush writes the others and reports the skip.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    const toks = testThreeSessions();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-sd-out", 0, 128);
+    defer hc.deinit();
+    try testOwedSessions(&hc, &cache, &toks, s);
+    (try testEntryFor(&hc, &toks[0])).checked_out_by = 1;
+    defer hc.releaseCheckout(1, "test");
+
+    var now: i64 = 0;
+    const t = shutdownPersist(&.{.{ .hc = &hc, .s = s }}, TestStepClock{ .now = &now, .step = 1 }, 1_000_000);
+    try testing.expectEqual(@as(u32, 1), t.checked_out);
+    try testing.expectEqual(@as(u32, 2), t.written);
+    try testing.expectEqual(@as(u32, 128), testDiskKvLen(&hc.disk.?, &toks[0]));
+    try testing.expect(testWholeOnDisk(&hc.disk.?, &cache, &toks[1]));
+}
+
+test "HotPrefixCache: a failed write during the shutdown flush is counted and the flush moves on" {
+    // Failure matrix row 1 at SIGTERM: the writer loses one of the oldest session's chunks.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    const toks = testThreeSessions();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-sd-fail", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.enableBackgroundWriter();
+    try testing.expect(hc.disk.?.writer != null);
+    try testOwedSessions(&hc, &cache, &toks, s);
+    hc.disk.?.drainWriter();
+    hc.disk.?.writer.?.injectFailure("/e1/c000002", .write);
+
+    var now: i64 = 0;
+    const t = shutdownPersist(&.{.{ .hc = &hc, .s = s }}, TestStepClock{ .now = &now, .step = 1 }, 1_000_000);
+    try testing.expect(t.failures >= 1);
+    try testing.expectEqual(@as(u32, 0), t.left_deadline);
+    try testing.expect(testWholeOnDisk(&hc.disk.?, &cache, &toks[1]));
+    try testing.expect(testWholeOnDisk(&hc.disk.?, &cache, &toks[2]));
+}
+
+test "HotPrefixCache: the shutdown flush reports a volume under its reserve as declined, not written" {
+    // A declined store writes nothing; the summary must say why the sessions were left.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    const toks = testThreeSessions();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 2, 600);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-sd-declined", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.armTestSpace(10 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+    _ = try hc.commit(&cache, &toks[0], false);
+    _ = try hc.commit(&cache, &toks[1], false);
+
+    var now: i64 = 0;
+    const t = shutdownPersist(&.{.{ .hc = &hc, .s = s }}, TestStepClock{ .now = &now, .step = 1 }, 1_000_000);
+    try testing.expect(t.left_declined >= 2);
+    try testing.expectEqual(@as(u32, 0), t.written);
+    try testing.expectEqual(@as(u32, 0), t.left_deadline);
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
 }
 
 // ── Restore by move (checkout) ──

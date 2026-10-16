@@ -326,6 +326,11 @@ fn printUsage(io: std.Io) void {
         \\                        evictions instead of recomputed. Can use many
         \\                        GB of disk, so it's opt-in; e.g. 10GB. 0/off
         \\                        disables.
+        \\  --shutdown-persist-secs <n>
+        \\                      On SIGTERM, finish writing the SSD-tier slices not
+        \\                        yet on disk, for at most <n> seconds, then exit
+        \\                        (default: 45; 0 disables). A launchd job needs
+        \\                        ExitTimeOut above it, or the flush is killed.
         \\  --ssm-checkpoint-stride <n>
         \\                      Hybrid SSM architectures only (e.g. Qwen3.5/3.6
         \\                        GDN): capture an SSM/conv state checkpoint every
@@ -896,6 +901,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             server_mod.prefix_cache_disk_bytes = parseSizeArg(args[i]) catch {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--shutdown-persist-secs") and i + 1 < args.len) {
+            i += 1;
+            server_mod.shutdown_persist_secs = std.fmt.parseInt(u32, args[i], 10) catch {
+                log.err("--shutdown-persist-secs: expected whole seconds (0 = off); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--tokenize-cache-entries") and i + 1 < args.len) {
