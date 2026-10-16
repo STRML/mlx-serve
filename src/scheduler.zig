@@ -5101,32 +5101,65 @@ pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) 
 /// returns whether any still does. The caller re-checks for work between calls.
 /// Inference thread only: unloads run here too, so the collected pointers stay valid.
 fn flushOwedDiskSlices(sch: *Scheduler) bool {
-    var owed: [16]struct { hc: *prefix_cache_mod.HotPrefixCache, s: mlx.mlx_stream } = undefined;
-    var n: usize = 0;
-    sch.registry.mutex.lockUncancelable(sch.io);
-    var it = sch.registry.entries.valueIterator();
-    while (it.next()) |entry_ptr| {
-        if (n == owed.len) break;
-        const entry = entry_ptr.*;
-        if (entry.state != .ready) continue;
-        const hc = if (entry.prefix_cache) |*h| h else continue;
-        if (!hc.disk_dirty or hc.disk == null) continue;
-        const xf = entry.transformer orelse continue;
-        owed[n] = .{ .hc = hc, .s = xf.s };
-        n += 1;
-    }
-    sch.registry.mutex.unlock(sch.io);
+    var owed: [16]prefix_cache_mod.FlushTarget = undefined;
     var still = false;
-    for (owed[0..n]) |o| {
+    for (owed[0..diskCaches(sch, &owed, true)]) |o| {
         if (o.hc.flushOwedSlice(o.s)) still = true;
     }
     return still;
 }
 
+/// The hot caches of ready models with a disk tier (only those owing a slice when `owed_only`).
+/// Inference thread only: unloads run here too, so the collected pointers stay valid.
+fn diskCaches(sch: *Scheduler, out: []prefix_cache_mod.FlushTarget, owed_only: bool) usize {
+    var n: usize = 0;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        if (n == out.len) break;
+        const entry = entry_ptr.*;
+        if (entry.state != .ready) continue;
+        const hc = if (entry.prefix_cache) |*h| h else continue;
+        if (hc.disk == null or (owed_only and !hc.disk_dirty)) continue;
+        const xf = entry.transformer orelse continue;
+        out[n] = .{ .hc = hc, .s = xf.s };
+        n += 1;
+    }
+    return n;
+}
+
+/// SIGTERM's bounded SSD flush (`--shutdown-persist-secs`), on this thread once the loop has
+/// stopped: what the idle flush has not landed, until the deadline `serve` armed. Off when unarmed.
+fn persistAtShutdown(sch: *Scheduler) void {
+    const deadline_ms = sch.shutdown_deadline_ms.load(.acquire);
+    if (deadline_ms == 0) return;
+    // A slot cancelled as `shutdown` flipped can still sit in the cleanup queue: commit it and
+    // return its checkout, or its session reads as checked out.
+    _ = drainSideQueues(sch);
+    var targets: [16]prefix_cache_mod.FlushTarget = undefined;
+    const n = diskCaches(sch, &targets, false);
+    if (n == 0) return;
+    const sw = io_util.Stopwatch.init(sch.io);
+    const t = prefix_cache_mod.shutdownPersist(targets[0..n], io_util.MonotonicClock{ .io = sch.io }, deadline_ms);
+    const mb = 1024.0 * 1024.0;
+    log.info("[disk-cache] shutdown persist: {d} written ({d:.1} MB), {d} left (deadline), {d} left (store declined), {d} skipped checked-out, {d} failures, {d:.1} MB dropped at the deadline, {d:.1} s\n", .{
+        t.written,
+        @as(f64, @floatFromInt(t.bytes)) / mb,
+        t.left_deadline,
+        t.left_declined,
+        t.checked_out,
+        t.failures,
+        @as(f64, @floatFromInt(t.dropped_bytes)) / mb,
+        @as(f64, @floatFromInt(sw.read())) / std.time.ns_per_s,
+    });
+}
+
 /// Arm the shutdown flush's deadline `secs` after the first call; a later call (a second
 /// SIGTERM) never moves it. 0 seconds leaves it unarmed, which turns the flush off.
 pub fn armShutdownDeadline(slot: *std.atomic.Value(i64), now_ms: i64, secs: u32) void {
-    slot.store(now_ms + @as(i64, secs) * 1000, .release);
+    if (secs == 0) return;
+    _ = slot.cmpxchgStrong(0, now_ms + @as(i64, secs) * 1000, .acq_rel, .acquire);
 }
 
 fn hasWorkPendingLocked(sch: *const Scheduler) bool {
@@ -5231,6 +5264,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
         if (chatPass(sch, .main) == .shutdown) break;
     }
+    persistAtShutdown(sch);
 }
 
 /// Cleanup, vision and embed work, drained on the inference thread. Returns

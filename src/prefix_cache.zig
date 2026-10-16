@@ -334,10 +334,38 @@ pub const FlushTarget = struct { hc: *HotPrefixCache, s: mlx.mlx_stream };
 /// A slice that the longest one so far says would overrun the deadline is not started.
 /// Inference thread only.
 pub fn shutdownPersist(targets: []const FlushTarget, clock: anytype, deadline_ms: i64) ShutdownTally {
-    _ = targets;
-    _ = clock;
-    _ = deadline_ms;
-    return .{};
+    var t: ShutdownTally = .{};
+    var errors_before: u64 = 0;
+    for (targets) |x| {
+        if (x.hc.disk) |*d| errors_before += d.writeErrors();
+    }
+    var longest: i64 = 0;
+    var cut = false;
+    while (!cut) {
+        var sliced = false;
+        for (targets) |x| {
+            if (!x.hc.diskOwed()) continue;
+            const start = clock.nowMs();
+            if (start >= deadline_ms or start + longest > deadline_ms) {
+                cut = true;
+                break;
+            }
+            x.hc.shutdownSlice(x.s, &t);
+            longest = @max(longest, clock.nowMs() - start);
+            sliced = true;
+        }
+        if (!sliced) break;
+    }
+    var errors_after: u64 = 0;
+    for (targets) |x| {
+        const d = if (x.hc.disk) |*dd| dd else continue;
+        if (cut) t.left_deadline += x.hc.owedCount();
+        t.checked_out += x.hc.checkedOutOwed();
+        t.dropped_bytes += d.drainWriterUntil(clock, deadline_ms);
+        errors_after += d.writeErrors();
+    }
+    t.failures += errors_after -| errors_before;
+    return t;
 }
 
 /// The SSD-first predicate: arch, env switch, AND a disk tier. Without the tier the mode used
@@ -2375,9 +2403,22 @@ pub const HotPrefixCache = struct {
         return "partial copy";
     }
 
-    /// One bounded append of a record; true while the tier still owes it more. A record whose
-    /// earlier write failed (the tier poisoned it), or a slice that landed nothing, is given up
-    /// until its next commit: retrying either would spin the idle loop.
+    /// What one slice did to its record. Every result but `owed` gives the record up until its
+    /// next commit: retrying a failed or empty slice would spin the idle loop.
+    const SliceResult = enum {
+        /// Bytes landed and the tier owes the record more.
+        owed,
+        /// The tier holds the record whole.
+        whole,
+        /// Nothing to write: under the floor, unpersistable, the store declined, or nothing landed.
+        skipped,
+        /// The write raised.
+        failed,
+        /// An earlier write for the record failed and the tier poisoned it.
+        poisoned,
+    };
+
+    /// One bounded append of a record.
     fn appendSlice(
         d: *kv_disk_cache.DiskTier,
         snap: *const KVCacheSnapshot,
@@ -2387,22 +2428,26 @@ pub const HotPrefixCache = struct {
         cps: ?[]const SSMCheckpoint,
         specs: EntrySpecs,
         s: mlx.mlx_stream,
-    ) bool {
+    ) SliceResult {
         if (d.resumesPoisoned(tokens, has_tools, media, snap.config)) {
             log.warn("  [disk-cache] a write for this {d}-token session failed; it waits for its next commit\n", .{tokens.len});
-            return false;
+            return .poisoned;
         }
         const landed_before = d.counter;
         const out = d.appendCommitWithSpec(snap.entries, snap.step, snap.config, tokens, has_tools, media, cps, specs.dflash, specs.mtp, s) catch |err| {
             log.warn("  [disk-cache] persist failed: {s}; the {d}-token session waits for its next commit\n", .{ @errorName(err), tokens.len });
-            return false;
+            return .failed;
         };
-        return out == .partial and d.counter != landed_before;
+        return switch (out) {
+            .persisted => .whole,
+            .skipped => .skipped,
+            .partial => if (d.counter != landed_before) .owed else .skipped,
+        };
     }
 
     /// One slice of a parked snapshot; dropped once whole or given up.
-    fn slicePending(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, slot: *?PendingDiskFlush, s: mlx.mlx_stream) void {
-        const p = if (slot.*) |*pp| pp else return;
+    fn slicePending(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, slot: *?PendingDiskFlush, s: mlx.mlx_stream) ?SliceResult {
+        const p = if (slot.*) |*pp| pp else return null;
         const specs: EntrySpecs = .{
             .dflash = if (p.dflash) |*df| .{
                 .entries = df.snapshot.entries,
@@ -2420,14 +2465,18 @@ pub const HotPrefixCache = struct {
                 .head_marks = mm.head_marks.slice(),
             } else null,
         };
-        if (appendSlice(d, &p.snapshot, p.tokens, p.has_tools, p.media, p.ssm_cps, specs, s)) return;
+        const r = appendSlice(d, &p.snapshot, p.tokens, p.has_tools, p.media, p.ssm_cps, specs, s);
+        if (r == .owed) return r;
         p.deinit(self.allocator);
         slot.* = null;
+        return r;
     }
 
     /// One slice of a RAM entry; its flag stays set only while the tier owes it more.
-    fn sliceEntry(d: *kv_disk_cache.DiskTier, e: *Entry, s: mlx.mlx_stream) void {
-        e.disk_dirty = appendSlice(d, &e.snapshot, e.tokens, e.has_tools, e.media, e.ssm_checkpoints, entrySpecCommits(e), s);
+    fn sliceEntry(d: *kv_disk_cache.DiskTier, e: *Entry, s: mlx.mlx_stream) SliceResult {
+        const r = appendSlice(d, &e.snapshot, e.tokens, e.has_tools, e.media, e.ssm_checkpoints, entrySpecCommits(e), s);
+        e.disk_dirty = r == .owed;
+        return r;
     }
 
     /// The owed entry the next slice goes to, newest or oldest; never one checked out (its
@@ -2456,35 +2505,60 @@ pub const HotPrefixCache = struct {
 
     /// One bounded slice, then `disk_dirty` says whether anything is still owed. A parked
     /// snapshot goes first: it is an earlier session's, and RAM holds at most a trimmed copy.
-    fn flushSlice(self: *HotPrefixCache, s: mlx.mlx_stream, order: SliceOrder) void {
-        if (!self.disk_dirty) return;
+    fn flushSlice(self: *HotPrefixCache, s: mlx.mlx_stream, order: SliceOrder) ?SliceResult {
+        if (!self.disk_dirty) return null;
         defer self.disk_dirty = self.diskOwed();
-        const d = if (self.disk) |*dd| dd else return;
+        const d = if (self.disk) |*dd| dd else return null;
         if (self.finishing_disk != null) return self.slicePending(d, &self.finishing_disk, s);
         // The live state captured at commit, not what the RAM entry kept after its trim.
         if (order == .newest_first and self.pending_disk != null) return self.slicePending(d, &self.pending_disk, s);
         if (self.owedEntryIndex(order == .newest_first)) |i| return sliceEntry(d, &self.entries.items[i], s);
-        self.slicePending(d, &self.pending_disk, s);
+        return self.slicePending(d, &self.pending_disk, s);
     }
 
     /// The finish path: one slice of the turn that just committed. Called AFTER `markFinished`,
     /// on the inference thread; snapshot arrays are refcount-shared with the RAM entry.
     pub fn flushPendingDisk(self: *HotPrefixCache, s: mlx.mlx_stream) void {
-        self.flushSlice(s, .newest_first);
+        _ = self.flushSlice(s, .newest_first);
     }
 
     /// The idle loop's flush: one bounded slice to the OLDEST owed session (the next the LRU
     /// drops), so every finished session lands whole, not only the newest. True while owed.
     pub fn flushOwedSlice(self: *HotPrefixCache, s: mlx.mlx_stream) bool {
-        self.flushSlice(s, .oldest_first);
+        _ = self.flushSlice(s, .oldest_first);
         return self.disk_dirty;
     }
 
-    /// One shutdown slice (the idle loop's order) for `shutdownPersist`, tallied.
+    /// One shutdown slice in the idle loop's order, tallied. The caller saw `diskOwed()`.
     fn shutdownSlice(self: *HotPrefixCache, s: mlx.mlx_stream, t: *ShutdownTally) void {
-        _ = self;
-        _ = s;
-        _ = t;
+        const d = if (self.disk) |*dd| dd else return;
+        self.disk_dirty = true;
+        const before = d.bytes_persisted;
+        const r = self.flushSlice(s, .oldest_first) orelse return;
+        const landed = d.bytes_persisted - before;
+        t.bytes += landed;
+        switch (r) {
+            // A record already covered on disk (a parked snapshot's RAM twin) writes nothing.
+            .whole => t.written += @intFromBool(landed > 0),
+            .skipped => t.left_declined += @intFromBool(d.store_declined),
+            .failed => t.failures += 1,
+            // The writer's failure that poisoned it is counted from the writer.
+            .owed, .poisoned => {},
+        }
+    }
+
+    /// How many records the tier still owes and a slice could write.
+    fn owedCount(self: *const HotPrefixCache) u32 {
+        var n: u32 = @intFromBool(self.finishing_disk != null) + @intFromBool(self.pending_disk != null);
+        for (self.entries.items) |*e| n += @intFromBool(e.disk_dirty and e.checked_out_by == null);
+        return n;
+    }
+
+    /// Owed entries an in-flight request holds.
+    fn checkedOutOwed(self: *const HotPrefixCache) u32 {
+        var n: u32 = 0;
+        for (self.entries.items) |*e| n += @intFromBool(e.disk_dirty and e.checked_out_by != null);
+        return n;
     }
 
     /// Arm the attached disk tier for this model: SSD-first per `ssdFirstActive`, and on both

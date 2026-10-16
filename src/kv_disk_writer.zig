@@ -207,9 +207,15 @@ pub const Writer = struct {
     /// `drain` bounded by `timeout`; true once everything staged has landed. Lifts a pause first,
     /// or a paused writer would hold the caller to the timeout for nothing.
     pub fn drainUntil(self: *Writer, timeout: std.Io.Timeout) bool {
-        _ = self;
-        _ = timeout;
-        return false;
+        const deadline = timeout.toDeadline(self.io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.paused = false;
+        self.work.broadcast(self.io);
+        while (self.running and (self.queue.items.len > 0 or self.inflight_bytes > 0)) {
+            self.done.waitTimeout(self.io, &self.mutex, deadline) catch return false;
+        }
+        return true;
     }
 
     /// Bytes queued and not yet picked up by the writer thread (the in-flight file excluded).

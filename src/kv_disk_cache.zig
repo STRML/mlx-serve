@@ -424,7 +424,8 @@ pub const DiskTier = struct {
     next_id: u64,
     total_bytes: u64,
     counter: u64,
-    /// Bytes every commit so far wrote (staged, on the writer arm). Diagnostics; not persisted.
+    /// KV chunk and SSM checkpoint bytes the commits so far wrote (staged, on the writer arm).
+    /// Diagnostics; not persisted.
     bytes_persisted: u64 = 0,
     /// Chunk count read by the most recent restore. Diagnostics + a
     /// red-on-revert guard that a short-prefix restore reads only the chunks
@@ -502,10 +503,17 @@ pub const DiskTier = struct {
     /// deadline whatever is still queued is fenced, so neither this call nor `deinit` writes it;
     /// each entry keeps its last landed manifest. Returns the bytes dropped.
     pub fn drainWriterUntil(self: *DiskTier, clock: anytype, deadline_ms: i64) u64 {
-        _ = self;
-        _ = clock;
-        _ = deadline_ms;
-        return 0;
+        const w = self.writer orelse return 0;
+        while (true) {
+            const left_ms = deadline_ms - clock.nowMs();
+            if (left_ms <= 0) break;
+            // Short waits, so the deadline is read on the caller's clock.
+            const wait: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(@min(left_ms, 50)), .clock = .boot } };
+            if (w.drainUntil(wait)) return 0;
+        }
+        const dropped = w.queuedBytes();
+        w.fence(null);
+        return dropped;
     }
 
     /// Host bytes staged for the writer and not yet written. Zero when the writer is not armed.
@@ -1559,6 +1567,7 @@ pub const DiskTier = struct {
             try self.entries.append(self.allocator, new_entry);
             self.total_bytes += new_entry.bytes;
         }
+        self.bytes_persisted += written_bytes;
         self.gcToBudget();
 
         const wrote_mb = @as(f64, @floatFromInt(written_bytes)) / (1024.0 * 1024.0);
@@ -1680,6 +1689,7 @@ pub const DiskTier = struct {
         self.total_bytes = clampAdd(self.total_bytes, delta);
         e.last_used = self.bump();
         try self.writeMeta(e.*);
+        self.bytes_persisted += written_bytes;
         self.gcToBudget();
         return if (ssm_res.complete) .persisted else .partial;
     }
