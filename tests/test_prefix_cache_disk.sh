@@ -570,7 +570,10 @@ else
         SCRATCH_HOME=$(mktemp -d "$HOME/claude-tmp/prefix-disk-term.XXXXXX")
         KV_DIR="$SCRATCH_HOME/.mlx-serve/kv-cache"
         echo "  -- $1"
-        if ! start_server --ctx-size 65536 --no-mtp --shutdown-persist-secs "$2"; then
+        # 2048-token chunks: a cancelled prefill stops at the next chunk, and exit waits for it.
+        # RAM and disk hold all three sessions, so no eviction stands in for the flush.
+        local flags=(--ctx-size 65536 --no-mtp --prefill-chunk 2048 --prefix-cache-mem 16GB --prefix-cache-disk 16GB --shutdown-persist-secs "$2")
+        if ! start_server "${flags[@]}"; then
             echo -e "${RED}FAIL${NC} $1: server failed to start"; FAIL=1; rm -rf "$SCRATCH_HOME"; return
         fi
         session_turn A > /dev/null &
@@ -601,7 +604,7 @@ else
         else
             echo -e "${RED}FAIL${NC} $1: still running ${STOP_SECS}s after SIGTERM, killed"; FAIL=1
         fi
-        if ! start_server --ctx-size 65536 --no-mtp --shutdown-persist-secs "$2"; then
+        if ! start_server "${flags[@]}"; then
             echo -e "${RED}FAIL${NC} $1: reboot failed"; FAIL=1; rm -rf "$SCRATCH_HOME"; return
         fi
         if [ "$4" = restore ]; then
@@ -619,7 +622,7 @@ else
         rm -rf "$SCRATCH_HOME"
     }
     shutdown_arm "default deadline" 45 60 restore
-    shutdown_arm "1 s deadline" 1 8 scan
+    shutdown_arm "1 s deadline" 1 15 scan
 fi
 
 echo
