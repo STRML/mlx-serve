@@ -96,30 +96,30 @@ launchd_stop() { # TERM, 5 s grace, then KILL: what `exit timeout = 5` does
 }
 
 term_stop() { # $1 seconds to wait before KILL. TERM twice, 0.5 s apart; sets STOP_SECS and KILLED
-    local t0 now
-    t0=$(python3 -c 'import time; print(time.monotonic())')
+    local t0 now # wall clock: python's monotonic clock is per process on macOS
+    t0=$(python3 -c 'import time; print(time.time())')
     kill -TERM "$SERVER_PID" 2>/dev/null || true
     sleep 0.5
     kill -TERM "$SERVER_PID" 2>/dev/null || true
     KILLED=0
     while kill -0 "$SERVER_PID" 2>/dev/null; do
-        now=$(python3 -c "import time; print(int(time.monotonic() - $t0 >= $1))")
+        now=$(python3 -c "import time; print(int(time.time() - $t0 >= $1))")
         if [ "$now" = 1 ]; then kill -KILL "$SERVER_PID" 2>/dev/null || true; KILLED=1; break; fi
         sleep 0.2
     done
     wait "$SERVER_PID" 2>/dev/null || true
-    STOP_SECS=$(python3 -c "import time; print(f'{time.monotonic() - $t0:.1f}')")
+    STOP_SECS=$(python3 -c "import time; print(f'{time.time() - $t0:.1f}')")
     SERVER_PID=""
     sleep 1
 }
 
-session_turn() { # $1 session label (A|B), ~25.8k tokens on a qwen3_5 tokenizer -> "content"
-    python3 - "$BASE" "$1" <<'PY'
+session_turn() { # $1 session label (A|B|C), $2 log lines (default 800, ~25.8k qwen3_5 tokens) -> "content"
+    python3 - "$BASE" "$1" "${2:-800}" <<'PY'
 import json, sys, urllib.request
-base, who = sys.argv[1], sys.argv[2]
-k = 1 if who == 'A' else 7
+base, who, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+k = {'A': 1, 'B': 7, 'C': 13}[who]
 lines = [f'Session {who}: read this project log fully, then answer.']
-lines += [f'Log entry {i}: subsystem {(i*k)%17} reported state change {i*31*k%997} with latency {i*7%131} ms and checksum {i*i*k%9973}.' for i in range(1, 801)]
+lines += [f'Log entry {i}: subsystem {(i*k)%17} reported state change {i*31*k%997} with latency {i*7%131} ms and checksum {i*i*k%9973}.' for i in range(1, n + 1)]
 lines.append('Question: which subsystem appears in log entry 42? One short sentence.')
 body = json.dumps({'model': 'mlx-serve', 'messages': [{'role': 'user', 'content': '\n'.join(lines)}],
                    'max_tokens': 24, 'temperature': 0.0, 'enable_thinking': False, 'stream': False}).encode()
@@ -556,11 +556,12 @@ fi
 
 echo
 echo "== 11. SIGTERM lands the slices the idle flush has not, then exits by its deadline =="
-# Two ~25.8k-token sessions finish together and SIGTERM (twice, 0.5 s apart) follows the second
-# reply at once, so both still owe several 512 MB slices. The server must log one `shutdown
-# persist:` summary and exit before the KILL; at the default deadline both must restore within one
-# chunk after the reboot. At --shutdown-persist-secs 1 the exit stays prompt and the reboot scan
-# finds no half-written entry. Needs a hybrid qwen3_5 model; SKIPs otherwise.
+# Two ~25.8k-token sessions finish while a third, longer one is still prefilling, so the idle
+# flush never runs and both still owe several 512 MB slices when SIGTERM (twice, 0.5 s apart)
+# follows the second reply. The server must log one `shutdown persist:` summary and exit before
+# the KILL; at the default deadline both must restore within one chunk after the reboot. At
+# --shutdown-persist-secs 1 the exit stays prompt and the reboot scan finds no half-written entry.
+# Needs a hybrid qwen3_5 model; SKIPs otherwise.
 if [ ! -f "$IDLE_MODEL/config.json" ] || ! grep -q '"qwen3_5' "$IDLE_MODEL/config.json"; then
     echo -e "${YELLOW}SKIP${NC} shutdown-flush section: no qwen3_5 model at $IDLE_MODEL (set IDLE_FLUSH_MODEL)."
 else
@@ -575,9 +576,18 @@ else
         session_turn A > /dev/null &
         local pid_a=$!
         sleep 2
-        session_turn B > /dev/null || { echo -e "${RED}FAIL${NC} $1: session B failed"; FAIL=1; }
+        session_turn B > /dev/null &
+        local pid_b=$!
+        sleep 2
+        session_turn C 1500 > /dev/null 2>&1 & # ~48k tokens: still prefilling when B ends
+        local pid_c=$!
         wait "$pid_a" || { echo -e "${RED}FAIL${NC} $1: session A failed"; FAIL=1; }
+        wait "$pid_b" || { echo -e "${RED}FAIL${NC} $1: session B failed"; FAIL=1; }
+        local whole
+        whole=$(grep -oE '\[disk-cache\] e[0-9]+ complete on disk: [0-9]+ tokens' "$LOGFILE" | awk '$6 >= 20000' | wc -l | tr -d ' ')
+        echo "  sessions whole on disk at SIGTERM: $whole of 2"
         term_stop "$3"
+        wait "$pid_c" 2>/dev/null || true
         grep -E '\[disk-cache\] (persisted|e[0-9]+ complete)' "$LOGFILE" | sed 's/^/    /' | tail -8
         local summary
         summary=$(grep -E '\[disk-cache\] shutdown persist:' "$LOGFILE" || true)
