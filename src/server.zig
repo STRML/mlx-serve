@@ -2222,18 +2222,17 @@ pub fn serve(
     // in-flight `complete()` is still touching. The inference thread is still
     // alive here (deinit joins it only after we return), so cancelled slots
     // settle promptly. Bounded so a wedged thread can't hang shutdown forever.
-    // The SSD flush's deadline starts here, once; the drain shares it.
-    var drain_cap_ms: i64 = 30_000;
+    // The SSD flush's deadline starts here, once. The drain keeps its own bound: cutting it short
+    // saves nothing (the join below waits out the inference thread's current chunk anyway) and
+    // lets a late `complete()` race the queues `deinit` frees.
     if (global_scheduler) |sch| {
         scheduler_mod.armShutdownDeadline(&sch.shutdown_deadline_ms, nowMsMonotonic(io), shutdown_persist_secs);
-        const deadline_ms = sch.shutdown_deadline_ms.load(.acquire);
-        if (deadline_ms != 0) drain_cap_ms = @min(drain_cap_ms, @max(0, deadline_ms - nowMsMonotonic(io)));
         sch.cancelAllInFlight();
     }
     {
-        var waited_ms: i64 = 0;
+        var waited_ms: u64 = 0;
         var idle_fds = [_]std.posix.pollfd{};
-        while (active_conn_threads.load(.acquire) > 0 and waited_ms < drain_cap_ms) {
+        while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
             _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
             waited_ms += 20;
         }

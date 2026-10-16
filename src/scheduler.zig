@@ -1554,6 +1554,10 @@ pub const Scheduler = struct {
     shutdown: std.atomic.Value(bool),
     /// The shutdown flush's deadline on the `nowMsMonotonic` clock; 0 = off. Set before `shutdown`.
     shutdown_deadline_ms: std.atomic.Value(i64) = .init(0),
+    /// The batch the inference thread took out of `pending` and is prefilling (`queue_mu`): in
+    /// neither queue, so `cancelAllInFlight` reads it here or SIGTERM waits out the whole prefill.
+    prefilling: [16]*Slot = undefined,
+    n_prefilling: usize = 0,
     started: std.atomic.Value(bool),
     started_mu: std.Io.Mutex,
     started_cond: std.Io.Condition,
@@ -1954,6 +1958,7 @@ pub const Scheduler = struct {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
         for (self.pending.items) |slot| slot.cancel();
+        for (self.prefilling[0..self.n_prefilling]) |slot| slot.cancel();
         for (self.decoding.items) |slot| slot.cancel();
     }
 
@@ -5405,6 +5410,8 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             r -= 1;
             _ = sch.pending.orderedRemove(admit_idx[r]);
         }
+        @memcpy(sch.prefilling[0..n_prefill], to_prefill[0..n_prefill]);
+        sch.n_prefilling = n_prefill;
     }
 
     if (sch.budget_revise_sw) |sw| {
@@ -5416,6 +5423,12 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     //    The inference thread is the sole mlx caller post-cleanup, so
     //    no per-tick stream rebind / mutex coexistence is needed.
     if (n_prefill > 0) {
+        // The batch stays cancellable until it leaves this block; only this thread frees slots.
+        defer {
+            sch.queue_mu.lockUncancelable(sch.io);
+            sch.n_prefilling = 0;
+            sch.queue_mu.unlock(sch.io);
+        }
         for (to_prefill[0..n_prefill], 0..) |slot, pi| {
             defer _ = slot.in_pass.fetchSub(1, .acq_rel);
             // Between the slots of one admitted batch, tick the streams
