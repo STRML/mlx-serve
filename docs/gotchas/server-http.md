@@ -2737,7 +2737,7 @@ Guard: `renderModelEntry: a Windows path id stays valid JSON`, `lan: rewriteMode
 
 ## AGENTS.md rule detail
 
-Why this exists: an agent that skips the story behind a rule "fixes" it back into the bug it was written for.
+Why this exists: each bullet below is the full text of a rule whose stub in AGENTS.md was shortened. The story behind a rule sits elsewhere in this file; read both before changing the rule, or you fix it back into the bug it was written for.
 
 - **Latest-turn user media on a tower-less model is refused by NAME** (`mediaRejectReason`), older/tool media replaced by a note the agent can read (`dropMedia`); non-text model on a text surface 400s BEFORE prefill (`textGenRejectReason`; new surface → `isTextGenRoute`, new modality → `modalityFromType`).
 - **Media atoms come from media parts, never rewriting user/tool text** (`chat.appendMediaContentParts`); item k expands to run k (`expandMediaPlaceholders`), count/kind mismatch = named 400. Encoder cache keys pixels; text parts JOIN in order. Guards: format corpus, `tests/test_nemotron_bolt.py`.
@@ -2761,4 +2761,9 @@ Why this exists: an agent that skips the story behind a rule "fixes" it back int
 - **State AT/AFTER media is keyed per ITEM on its PIXELS** (`Entry.media: []MediaSpan`; a match stops at the first item differing in position or pixels, `mediaSharedBound`; an entry keeps only the items it covers); inheritance + thinning obey the first item (`bestCheckpointDonor`, `boundaryCheckpointIndex`). Guard: `tests/test_vision_prefix_cache.sh`.
 - **A resident H3 DiT must skip the AdaLN precompute and keep its adapters in the cache** (`minimax_h3.Resident`): precompute frees the modulation weights and bakes tables for ONE schedule, and a LoRA stack's refs point into the stack that bound them. Residency is all-or-nothing against LIVE memory and every other load releases it before refusing (`availForLoad`).
 - **The idle loop lands EVERY owed session, oldest first** (`Entry.disk_dirty`, `flushOwedSlice`, one bounded slice per call): flushing only the newest left an older session partial until it was newest again. A failed write or a slice that lands nothing gives the session up until its next commit; a checked-out entry is never owed.
+
+- **A request's model NAME resolves in ONE place** (`resolveRequestModelId`: id, path, Model Settings `alias`, Ollama tag): dispatch, the keyless LAN gate, load, unload and `/api/show` all read it; a gate that resolves less than dispatch lets an alias reach an unshared model. Guard: `tests/test_model_alias.sh` [2].
+- **A launch flag that shapes a LOAD is retained on the Scheduler** (`ensureLoaded`'s cold-load `LoadRequest` is a second site; `--drafter` via `coldLoadDrafterDir`). Guard: `tests/test_cold_load_launch_flags.sh`. An arg loop needs an else branch (`classifyUnparsedArg`); guard `tests/test_headless_spec_flags.sh`.
+- **A reasoning budget is enforced at DECODE** (`armThinkBound` → `think_bound`, `thinkBoundTick`): early-stop line + atomic closer committed as ONE forward (`commitForcedTokens`); bare-`<think>` family only; all three surfaces (`reasoning_budget_tokens`). Guard: `tests/test_reasoning_budget_stream.sh`.
+- **The prefill working set includes the arch's OWN streams** (`prefillStreamBytesPerToken`: GDN q/k/v across cadence layers, MoE `top_k` replication) plus a RUNTIME floor (`PREFILL_RUNTIME_FLOOR_BYTES`); a lazily copied side-channel state must be NAMED in the cadence eval (`evalCadencePoint`, #366).
 

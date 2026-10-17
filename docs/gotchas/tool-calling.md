@@ -924,7 +924,7 @@ Guard: `tests/dsv41_template_ab.py` (byte-exact vs the encoder) dumps the cases 
 
 ## AGENTS.md rule detail
 
-Why this exists: an agent that skips the story behind a rule "fixes" it back into the bug it was written for.
+Why this exists: each bullet below is the full text of a rule whose stub in AGENTS.md was shortened. The story behind a rule sits elsewhere in this file; read both before changing the rule, or you fix it back into the bug it was written for.
 
 - **A late `system` turn stays in place only where the template renders it there** (`templatePreservesMidSystem`, probed with the request's tools/kwargs); else `chat.foldSystemMessages` folds it into the leading system at RENDER. Parse sites (`/v1/messages`, `/v1/responses`) join only the leading run: every other served template raises on a non-first system turn, and the raise is the SILENT generic fallback.
 - **A `<parameter>` VALUE may spell the dialect's own close tags** (`hermesValueEnd` = LAST `</parameter>` before the next opener; `hermesParamSpanEnclosing` skips values when scanning for `</function>`/`</tool_call>`). The TRUNCATED-call branch reads `<function=` first too; `isJsonNumber` (JSON grammar, not `parseFloat`) decides literal vs string.
@@ -937,4 +937,8 @@ Why this exists: an agent that skips the story behind a rule "fixes" it back int
 - **An error echo teaches the model the error** (Inkling name salvage): NAME = trailing identifier run; body = BALANCED JSON; a parsed NAME never contains `<|` (corpus invariant); bare-JSON inference never runs on invoke-marker text; `applyFamilySamplingDefaults` fills top_p 0.95 when no generation_config.
 - **`preserve_thinking` keeps the TEMPLATE's default** (Qwen3.8: every turn's `<think>` stays): forcing it false re-prefilled the history every turn; `chat_template_kwargs` `preserve_thinking:false` turns it off. Kwargs layer request > model settings > generation_config > arch (`resolveChatThinking`, `mergeTemplateKwargs`); `messages`/`tools` are never kwargs.
 - **`tool_choice` that obliges a call is ENFORCED, not asked** (`ToolForce`, `toolForceTick`): after `</think>` (or closing a thought that reaches 3/4 of `max_tokens`) the dialect's opener (`chat.forcedToolOpener`, XML only) is committed, decoding plain, ending before `=` (a lone `=` steers the name) and never repeating the model's pending token; every template gets the instruction line too. Guard: `tests/test_tool_choice_required.sh`.
+
+- **A model can open its OWN think block when the template did not** (Gemma 4 `<|channel>thought`, a bare `<think>` on LFM2.5-8B-A1B, muse's ` to=self<|message|>`): the plain arm latches via `chat.modelThinkOpener` (BEFORE the marker skip) and `promptOpensMuseHeader`. Bar = the stream/non-stream split invariant per arch (`tests/test_smoke_matrix.sh`).
+
+- **A loop convicted INSIDE an open think block closes the thought instead of ending the turn** (`scheduler.loopRecoveryAction`, once per request, `[loop-recover]`): the cut left agents a thinking-only `stop` with no tool call. Every thinking request arms the bound (`thinkBoundBudget`); answer-side loops still cut.
 

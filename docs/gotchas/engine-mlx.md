@@ -5701,7 +5701,7 @@ Guards: `gdn_decode.step and recur` runs every block bit for bit against prework
 
 ## AGENTS.md rule detail
 
-Why this exists: an agent that skips the story behind a rule "fixes" it back into the bug it was written for.
+Why this exists: each bullet below is the full text of a rule whose stub in AGENTS.md was shortened. The story behind a rule sits elsewhere in this file; read both before changing the rule, or you fix it back into the bug it was written for.
 
 - **Prefill-chunk cap AND eval cadence read the SCORE width** (`prefillScoreHeadDim`, 0 = none, `prefillEvalCadenceFor`); hd-256 branches key on 256 EXACTLY. Every qwen3.5/3.6/3.8 checkpoint is hd 256 — read the CHECKPOINT before porting an hd-128 kernel.
 - **MLX sdpa has a WIDTH WALL** (`q_len*gqa <= 32`): at hd 256 only, causal qL 2..15 ride `splitCausalSdpa` in groups of min(8, 32/gqa) rows, yielding to NAX force-fuse past 8 rows; array masks ride `splitMaskedSdpa256` (`MLX_SERVE_SDPA_SPLIT=0` turns both off). `--mtp-max-depth` is a CAP — force verify width via PLD draft-len in A/Bs.
@@ -5745,6 +5745,9 @@ Why this exists: an agent that skips the story behind a rule "fixes" it back int
 - **A committed turn also snapshots where decode stopped** (`appendDecodeEndCheckpoint`, image turns too), so the next round resumes after the generated tail; a plain pipelined step forwarded its stop and a lookahead, so it rolls back to its lagged state first (`rollbackSsmTo`). Guards: `tests/test_cache_reuses_generated_tokens.sh`, `tests/test_decode_end_media_reuse.sh`.
 - **Row-exact archs make drafted output byte-identical to serial ONLY while a DFlash drafter is bound** (`rowExactDecode`: nemotron_h + dense qwen3_5; MTP/serial stay stock): a sampled verify row draws `keyed_sample` at the ABSOLUTE position. Serial reference = the SAME server with `"enable_drafter": false`, never a `--no-drafter` boot.
 - **A fast path keyed on one pack's quant layout is SILENT on another's** (oMLX Flash Next oQ4e ran half speed, no error): tiny dense-only tensors dequantize at load (`dequantizeSmall`), kernels unpack every affine width, config caches key per width, gates are measured per shape. New pack layout ⇒ `tests/qwen4_engagement.sh` first.
+
+- **Metal caps threads per threadgroup PER COMPILED KERNEL, by register use** (M1/M2 can be below 1024): a kernel above 256 threads probes on its first eval and shrinks simdgroups in the same summation order (`mma_sg`); under test a latched MLX error is invisible and poisons the next tests, so a kernel test drops its own latch.
+- **A decode-width residual add and the NEXT block's norm are one dispatch** (`add_norm.zig`, BIT-EQUAL to `add -> fast::rms_norm`; the MoE arm folds the K-sum AND the shared expert): a fused path that replaces a chain must carry EVERY term of it. Bar: `hybrid decode: the fused add+norm path equals the unfused blocks`.
 
 ## GLM's KDA layers came out 1.8% short: an epsilon on the mean, where the reference has it on the sum (2026-10-17)
 

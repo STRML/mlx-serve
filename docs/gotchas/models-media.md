@@ -2149,7 +2149,7 @@ Every boot of `beamster/MiMo-V2.6-Flash-Sushi-*` logged `[mimo-mtp] missing mode
 
 ## AGENTS.md rule detail
 
-Why this exists: an agent that skips the story behind a rule "fixes" it back into the bug it was written for.
+Why this exists: each bullet below is the full text of a rule whose stub in AGENTS.md was shortened. The story behind a rule sits elsewhere in this file; read both before changing the rule, or you fix it back into the bug it was written for.
 
 - **Config JSON is untrusted**: use the checked readers in `model.zig`; optional nulls retain defaults, explicit disable sentinels and guarded skips remain valid, and unsafe narrowing or dimensions return named errors.
 - **`generation_config.json` `eos_token_id` joins the stop set** (`mergeEosTokens`, additive); Gemma terminators merge additively (`ensureGemmaTerminators`). jinja.cpp: `is sameas true` / `is divisibleby 3` parse a BARE test argument.
@@ -2165,6 +2165,8 @@ Why this exists: an agent that skips the story behind a rule "fixes" it back int
 - **LTX DiffVAE**: constructor args are not its config (`Sampler`: 1-step x0 at t×1000); tile budget is a per-REQUEST memory decision (`tileTokensForMemory`). 4-bit affine on a video DiT is a QUALITY setting (8-bit mirror).
 - **Canvas**: `recommendedResolution(totalGB:)` per Mac, capped by `autoCanvasCapPixels`; two-stage denoises at HALF; `maxFramePayloadBytes` is a TRANSPORT limit. A tiled decoder whose positions normalize over the EXTENT refuses (`error.TilingUnsupported`).
 - **Cosine cannot see SCALE** — concatenated tensors assert `rms_ratio`; a permutation-invariant checksum cannot see a permutation (`pos_weighted`); an oracle that cannot execute the reference must say so; a faithful port can make the checkpoint WORSE (H3 splice default-off).
+
+- **PLE read-path selection is measured before and after warming**, on the inference thread (`NgramTable.calibrateArm`), with the gather's OWN arms (read + dequant) and the MEDIAN of 5 trials: one sample put warm tables on the slower pool (#821). Explicit overrides win; the long-KV pool gate remains. Guard: `ngram prefill` tests.
 
 ## A ModelOpt GLM answered with its own prompt: the `up` scale landed after the clamp (2026-10-17)
 

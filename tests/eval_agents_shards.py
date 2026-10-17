@@ -10,10 +10,13 @@ Gate: the new arm's correct rate is at least the old arm's, and its shard-read r
 probes is at least 90%.
 
 Usage: eval_agents_shards.py [--old REF] [--new REF] [--reps N] [--jobs N] [--case ID ...]
-Needs the sandbox off (claude-sigint refreshes OAuth). Writes results/<ts>/ and prints a table.
+Needs an authenticated `claude` CLI (CLAUDE_BIN names another binary, e.g. a profile wrapper). Each run
+makes about 60 paid model calls at the default --reps 3. Writes <tmp>/shard-eval-results/<ts>/ and
+prints a table.
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -28,8 +31,7 @@ EXPORT = ["AGENTS.md", "CLAUDE.md", "docs", "src"]
 
 def export_arm(ref):
     """Tree of `ref` in a temp dir: CLAUDE.md loads from every ancestor, so keep it outside the repo."""
-    Path("/private/tmp/claude").mkdir(parents=True, exist_ok=True)
-    dest = Path(tempfile.mkdtemp(prefix="shard-eval-", dir="/private/tmp/claude"))
+    dest = Path(tempfile.mkdtemp(prefix="shard-eval-"))
     arc = subprocess.run(["git", "archive", ref, *EXPORT], capture_output=True, check=True)
     subprocess.run(["tar", "-x", "-C", str(dest)], input=arc.stdout, check=True)
     return dest
@@ -37,7 +39,7 @@ def export_arm(ref):
 
 def claude_cmd(prompt, model):
     return [
-        "claude-sigint", "-p", prompt,
+        os.environ.get("CLAUDE_BIN", "claude"), "-p", prompt,
         "--model", model, "--effort", "medium",
         "--output-format", "stream-json", "--verbose",
         "--no-session-persistence",
@@ -161,7 +163,7 @@ def main():
     ap.add_argument("--model", default="claude-sonnet-5-5")
     ap.add_argument("--cases", type=Path, default=HERE / "agents_shard_cases.json")
     ap.add_argument("--case", nargs="*")
-    ap.add_argument("--out", type=Path, default=Path("/private/tmp/claude/shard-eval-results"))
+    ap.add_argument("--out", type=Path, default=Path(tempfile.gettempdir()) / "shard-eval-results")
     args = ap.parse_args()
 
     cases = json.loads(args.cases.read_text())
