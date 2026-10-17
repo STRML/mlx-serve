@@ -21723,7 +21723,10 @@ pub const Transformer = struct {
             if (kv_fused_done) {
                 // packed kernel handled this layer
             } else if (std.mem.eql(u8, sel_mode, "causal")) {
-                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                if (try @import("nax_attention.zig").attention256Int8(self.s, q_rope, full_k, full_v, attn_scale)) |q8| {
+                    _ = mlx.mlx_array_free(attn_out);
+                    attn_out = q8;
+                } else if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
