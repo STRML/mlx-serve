@@ -40,9 +40,10 @@ const QUANT_SOURCE =
     \\  const int nr = ROWS == 1 ? 1 : min(L - r0, ROWS);
     \\  const device T* base = CONTIG ? x + (bh * L + r0) * D + lane * 4 * C4
     \\      : x + (bh / Hx) * x_strides[0] + (bh % Hx) * x_strides[1] + r0 * x_strides[2] + lane * 4 * C4 * x_strides[3];
-    \\  #define LD(t, u) (CONTIG ? float4(*(const device vec<T, 4>*)(base + (t) * D + 4 * (u))) : float4( \
-    \\      base[(t) * x_strides[2] + (4 * (u)) * x_strides[3]], base[(t) * x_strides[2] + (4 * (u) + 1) * x_strides[3]], \
-    \\      base[(t) * x_strides[2] + (4 * (u) + 2) * x_strides[3]], base[(t) * x_strides[2] + (4 * (u) + 3) * x_strides[3]]))
+    \\  const int64_t rs = x_strides[2], cs = x_strides[3];
+    \\  #define LD(t, u) (CONTIG ? float4(*(const device vec<T, 4>*)(base + (t) * D + 4 * (u))) \
+    \\      : cs == 1 ? float4(base[(t) * rs + 4 * (u)], base[(t) * rs + 4 * (u) + 1], base[(t) * rs + 4 * (u) + 2], base[(t) * rs + 4 * (u) + 3]) \
+    \\      : float4(base[(t) * rs + (4 * (u)) * cs], base[(t) * rs + (4 * (u) + 1) * cs], base[(t) * rs + (4 * (u) + 2) * cs], base[(t) * rs + (4 * (u) + 3) * cs]))
     \\  float4 m[C4];
     \\  for (int u = 0; u < C4; u++)
     \\    for (int e = 0; e < 4; e++) m[u][e] = HAS_MEAN ? float(mean[bh * D + lane * 4 * C4 + 4 * u + e]) : 0.0f;
@@ -188,7 +189,8 @@ const ATTN_SOURCE =
     \\}
 ;
 
-/// Blocks (one simdgroup each) per threadgroup of `QUANT_SOURCE`.
+/// Blocks (one simdgroup each) per threadgroup of `QUANT_SOURCE` when CONTIG; the strided arm
+/// keeps one, its long-K prep ran slower in wide threadgroups.
 const QUANT_SG: c_int = 8;
 var quant_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var vprep_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -252,9 +254,10 @@ pub fn quantRows(x: mlx.mlx_array, rows: c_int, mean: ?mlx.mlx_array, eps: f32, 
     defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, 4, .int8));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{blocks}, 1, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divTrunc(blocks + QUANT_SG - 1, QUANT_SG) * 32 * QUANT_SG, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32 * QUANT_SG, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "SG", QUANT_SG));
+    const sg: c_int = if (contig) QUANT_SG else 1;
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divTrunc(blocks + sg - 1, sg) * 32 * sg, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32 * sg, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "SG", sg));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", mlx.mlx_array_dtype(x)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "D", sh[3]));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ROWS", rows));
