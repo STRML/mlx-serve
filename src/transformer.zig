@@ -3165,6 +3165,8 @@ pub fn fusedSdpa256Prefill(
     if (window > 0) {
         if (!fused256Enabled()) return null;
     } else {
+        // Opt-in int8 Q/K causal arm on NAX (lossy); null when off or ineligible.
+        if (try @import("nax_attention.zig").attention256Int8(s, q, k, v, scale)) |q8| return q8;
         if (fused256CausalMode() == .off) return null;
         // The band arm stays ours (mlx's NAX kernel takes no band); the
         // causal arm yields to the stock fused kernel on NAX.
@@ -21723,10 +21725,7 @@ pub const Transformer = struct {
             if (kv_fused_done) {
                 // packed kernel handled this layer
             } else if (std.mem.eql(u8, sel_mode, "causal")) {
-                if (try @import("nax_attention.zig").attention256Int8(self.s, q_rope, full_k, full_v, attn_scale)) |q8| {
-                    _ = mlx.mlx_array_free(attn_out);
-                    attn_out = q8;
-                } else if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
