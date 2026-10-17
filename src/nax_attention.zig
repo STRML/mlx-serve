@@ -299,74 +299,13 @@ fn attention256Int8Impl(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v
 
 const Quantized = struct { vals: mlx.mlx_array, scales: mlx.mlx_array };
 
-/// One pass over a (strided) [B, H, L, 256] view: int8 codes, row-contiguous,
-/// and one fp32 scale (absmax / 127) per ROWS-row block, less `mean` when given.
-/// One simdgroup per block; each lane owns 8 of the 256 columns.
-const QUANT_SOURCE =
-    \\  const uint blk = threadgroup_position_in_grid.x;
-    \\  const uint h = threadgroup_position_in_grid.y;
-    \\  const uint b = threadgroup_position_in_grid.z;
-    \\  const uint lane = thread_index_in_simdgroup;
-    \\  const int L = x_shape[2];
-    \\  const int Hx = x_shape[1];
-    \\  const int nb = (L + ROWS - 1) / ROWS;
-    \\  const device T* base = x + b * x_strides[0] + h * x_strides[1] + lane * 8;
-    \\  const int64_t rs = x_strides[2];
-    \\  float m[8];
-    \\  for (int j = 0; j < 8; j++) m[j] = HAS_MEAN ? float(mean[(int64_t(b) * Hx + h) * 256 + lane * 8 + j]) : 0.0f;
-    \\  const int r0 = blk * ROWS;
-    \\  const int r1 = min(L, r0 + ROWS);
-    \\  float amax = 0.0f;
-    \\  for (int r = r0; r < r1; r++)
-    \\    for (int j = 0; j < 8; j++) amax = max(amax, fabs(float(base[r * rs + j]) - m[j]));
-    \\  amax = simd_max(amax);
-    \\  const float sc = max(amax, 1e-6f) / 127.0f;
-    \\  const float inv = 1.0f / sc;
-    \\  device int8_t* ob = q + (int64_t(b) * Hx + h) * int64_t(L) * 256 + lane * 8;
-    \\  for (int r = r0; r < r1; r++)
-    \\    for (int j = 0; j < 8; j++) ob[r * 256 + j] = int8_t(rint((float(base[r * rs + j]) - m[j]) * inv));
-    \\  if (lane == 0) scales[(int64_t(b) * Hx + h) * nb + blk] = sc;
-;
-
-var quant_kernel: ?mlx.mlx_fast_metal_kernel = null;
-
-fn getQuantKernel() !mlx.mlx_fast_metal_kernel {
-    if (quant_kernel) |k| return k;
-    const ins = [_][*:0]const u8{ "x", "mean" };
-    const outs = [_][*:0]const u8{ "q", "scales" };
-    const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
-    defer _ = mlx.mlx_vector_string_free(in_vec);
-    const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
-    defer _ = mlx.mlx_vector_string_free(out_vec);
-    const k = mlx.mlx_fast_metal_kernel_new("msv_quant_rows_256", in_vec, out_vec, QUANT_SOURCE, "", false, false);
-    if (k.ctx == null) return error.MetalKernelCompileFailed;
-    quant_kernel = k;
-    return k;
-}
-
 fn quantRows(sc: *Scope, x: mlx.mlx_array, rows: c_int, mean: ?mlx.mlx_array) !Quantized {
-    const sh = mlx.getShape(x);
-    const nb = @divTrunc(sh[2] + rows - 1, rows);
-    const c = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, 4, .int8));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{sh[0] * sh[1] * nb}, 1, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, nb * 32, sh[1], sh[0]));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", mlx.mlx_array_dtype(x)));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ROWS", rows));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(c, "HAS_MEAN", mean != null));
-    const ins = [_]mlx.mlx_array{ x, mean orelse x };
-    const in_vec = mlx.mlx_vector_array_new_data(&ins, ins.len);
-    defer _ = mlx.mlx_vector_array_free(in_vec);
-    var outs = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, try getQuantKernel(), in_vec, c, sc.s));
-    var v = mlx.mlx_array_new();
-    const vals = try sc.res(mlx.mlx_vector_array_get(&v, outs, 0), &v);
-    var w = mlx.mlx_array_new();
-    const scales = try sc.res(mlx.mlx_vector_array_get(&w, outs, 1), &w);
-    return .{ .vals = vals, .scales = scales };
+    const p = try @import("int8_attn.zig").quantRows(x, rows, mean, 1e-6, false, sc.s);
+    const vals = sc.keep(p[0]) catch |e| {
+        _ = mlx.mlx_array_free(p[1]);
+        return e;
+    };
+    return .{ .vals = vals, .scales = try sc.keep(p[1]) };
 }
 
 const testing = std.testing;
@@ -581,4 +520,107 @@ test "nax attention 256 int8 QK: --int8-qk turns it on beside the env gate" {
     try testing.expect(int8QkOn(false, "1"));
     try testing.expect(int8QkOn(true, null));
     try testing.expect(int8QkOn(true, "0"));
+}
+
+/// Host [H, L, D] values as a bf16 [1, H, L, D] array, a transposed [1, L, H, D] buffer when `strided`.
+fn hostBf16(vals: []const f32, h: c_int, l: c_int, d: c_int, strided: bool, s: mlx.mlx_stream) !mlx.mlx_array {
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const f = try sc.keep(mlx.mlx_array_new_data(vals.ptr, &[_]c_int{ 1, h, l, d }, 4, .float32));
+    if (!strided) return sc.out(try sc.astype(f, .bfloat16));
+    var t = mlx.mlx_array_new();
+    const lh = try sc.res(mlx.mlx_contiguous(&t, try sc.astype(try sc.transpose(f, &.{ 0, 2, 1, 3 }), .bfloat16), false, s), &t);
+    return sc.out(try sc.transpose(lh, &.{ 0, 2, 1, 3 }));
+}
+
+/// Blocks of `block` values whose int8 codes differ between `x / sc` and `x * (1 / sc)`
+/// (absmax `a` first), then one block below the 1e-6 scale floor.
+fn tieBlocks(rnd: std.Random, v: []f32, block: usize) void {
+    const n = v.len / block;
+    for (0..n - 1) |bi| {
+        const a: f32 = 1.0 + @as(f32, @floatFromInt(rnd.uintLessThan(u32, 64))) / 64.0;
+        const sc = a / 127.0;
+        const inv = 1.0 / sc;
+        const blk = v[bi * block ..][0..block];
+        @memset(blk, 0);
+        blk[0] = a;
+        var at: usize = 1;
+        // bf16 values from 2^-6: multiples of 2^-13, so f32 sums of them are exact.
+        var bits: u32 = 0x3c80_0000;
+        while (at < block and bits < @as(u32, @bitCast(a))) : (bits += 0x1_0000) {
+            const x: f32 = @bitCast(bits);
+            if (@round(x / sc) == @round(x * inv)) continue;
+            blk[at] = if (at % 2 == 0) x else -x;
+            at += 1;
+        }
+    }
+    for (v[(n - 1) * block ..][0..block]) |*x| x.* = rnd.floatNorm(f32) * 1e-8;
+}
+
+/// Logical [H, L, D] input. Queries: tie blocks in every head. Keys: head 0 carries a per-channel
+/// offset (the mean removal at work), head 1 is tie blocks mirrored (row r + L/2 = -row r), so its
+/// mean is ~0 and `x - mean` stays close to exact, head 2 is all below the scale floor.
+fn quantPinInput(rnd: std.Random, h: usize, l: usize, d: usize, rows: usize, key: bool) ![]f32 {
+    const v = try testing.allocator.alloc(f32, h * l * d);
+    for (v) |*x| x.* = rnd.floatNorm(f32) * 0.4;
+    const head = l * d;
+    if (!key) {
+        for (0..h) |hh| tieBlocks(rnd, v[hh * head ..][0 .. l / rows * rows * d], rows * d);
+        return v;
+    }
+    for (v[0..head], 0..) |*x, i| x.* += 2.0 * @as(f32, @floatFromInt(i % d)) / @as(f32, @floatFromInt(d)) - 1.0;
+    const half = v[head..][0 .. l / 2 * d];
+    tieBlocks(rnd, half[0 .. half.len / (rows * d) * rows * d], rows * d);
+    for (v[head + half.len ..][0..half.len], half) |*m, x| m.* = -x;
+    for (v[2 * head ..][0..head]) |*x| x.* = rnd.floatNorm(f32) * 1e-8;
+    return v;
+}
+
+fn quantHash(p: [2]mlx.mlx_array, s: mlx.mlx_stream) !u64 {
+    var codes = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(codes);
+    try mlx.check(mlx.mlx_astype(&codes, p[0], .int32, s));
+    try mlx.check(mlx.mlx_array_eval(codes));
+    try mlx.check(mlx.mlx_array_eval(p[1]));
+    var hs = std.hash.Fnv1a_64.init();
+    hs.update(std.mem.sliceAsBytes(mlx.mlx_array_data_int32(codes).?[0..mlx.mlx_array_size(codes)]));
+    hs.update(std.mem.sliceAsBytes(mlx.mlx_array_data_float32(p[1]).?[0..mlx.mlx_array_size(p[1])]));
+    return hs.final();
+}
+
+test "int8 Q/K quantizers: codes and scales of both attention kernels are pinned bit for bit" {
+    if (mlx.noGpuBackend() or !@import("transformer.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const int8_attn = @import("int8_attn.zig");
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(8128256);
+    const rnd = prng.random();
+    // (head dim, heads, length, block rows, key mean, strided view): ragged tails in every arm.
+    const arms = [_]struct { d: c_int, h: c_int, l: c_int, rows: c_int, key: bool, strided: bool }{
+        .{ .d = 128, .h = 4, .l = 96, .rows = 1, .key = false, .strided = false },
+        .{ .d = 128, .h = 3, .l = 600, .rows = BK, .key = true, .strided = false },
+        .{ .d = 256, .h = 4, .l = 200, .rows = Q8_BQ, .key = false, .strided = true },
+        .{ .d = 256, .h = 3, .l = 600, .rows = BK, .key = true, .strided = true },
+    };
+    var got: [arms.len]u64 = undefined;
+    for (arms, &got) |a, *g| {
+        const vals = try quantPinInput(rnd, @intCast(a.h), @intCast(a.l), @intCast(a.d), @intCast(a.rows), a.key);
+        defer testing.allocator.free(vals);
+        const x = try hostBf16(vals, a.h, a.l, a.d, a.strided, s);
+        defer _ = mlx.mlx_array_free(x);
+        if (a.d == 128) {
+            const p = if (a.key) try int8_attn.prepK(x, s) else try int8_attn.prepQ(x, s);
+            defer for (p) |y| {
+                _ = mlx.mlx_array_free(y);
+            };
+            g.* = try quantHash(p, s);
+            continue;
+        }
+        var sc = Scope.init(testing.allocator, s);
+        defer sc.deinit();
+        var mean = mlx.mlx_array_new();
+        const mk: ?mlx.mlx_array = if (a.key) try sc.res(mlx.mlx_mean_axes(&mean, x, &[_]c_int{2}, 1, true, s), &mean) else null;
+        const q = try quantRows(&sc, x, a.rows, mk);
+        g.* = try quantHash(.{ q.vals, q.scales }, s);
+    }
+    try testing.expectEqualSlices(u64, &.{ 4227379021708612929, 1397979178671988668, 17875194357197419973, 12256422364308871583 }, &got);
 }
