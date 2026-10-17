@@ -200,8 +200,15 @@ pub fn int8QkEnabledFrom(raw: ?[*:0]const u8) bool {
     return v[0] != 0 and v[0] != '0';
 }
 
+/// Set by `--int8-qk`.
+pub var int8_qk_cli: bool = false;
+
+pub fn int8QkOn(cli: bool, raw: ?[*:0]const u8) bool {
+    return cli or int8QkEnabledFrom(raw);
+}
+
 fn int8QkEnabled() bool {
-    if (int8_qk_env == null) int8_qk_env = int8QkEnabledFrom(std.c.getenv("MLX_SERVE_INT8_QK"));
+    if (int8_qk_env == null) int8_qk_env = int8QkOn(int8_qk_cli, std.c.getenv("MLX_SERVE_INT8_QK"));
     return int8_qk_env.?;
 }
 
@@ -566,4 +573,12 @@ test "nax attention 256 int8 QK: off unless MLX_SERVE_INT8_QK is set and not 0; 
     const k = try randBf16(rnd, &.{ 1, 1, 400, 256 }, s);
     defer _ = mlx.mlx_array_free(k);
     try testing.expect((try attention256Int8Impl(s, q, k, k, 0.0625)) == null);
+}
+
+test "nax attention 256 int8 QK: --int8-qk turns it on beside the env gate" {
+    try testing.expect(!int8QkOn(false, null));
+    try testing.expect(!int8QkOn(false, "0"));
+    try testing.expect(int8QkOn(false, "1"));
+    try testing.expect(int8QkOn(true, null));
+    try testing.expect(int8QkOn(true, "0"));
 }

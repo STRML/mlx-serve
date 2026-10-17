@@ -229,6 +229,9 @@ fn printUsage(io: std.Io) void {
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
         \\                        MLX_SERVE_ANE_SPLIT tunes the share (0.40).
+        \\  --int8-qk           Run the hd-256 prefill attention of dense Qwen
+        \\                        models with int8 Q/K (NAX GPUs, lossy, wins
+        \\                        from ~32k tokens). Also MLX_SERVE_INT8_QK=1.
         \\  --ane               Serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine
         \\                        instead of the GPU (a model's "ane" setting in
         \\                        model-settings.json wins). The first load on a
@@ -850,6 +853,8 @@ pub fn main(init: std.process.Init) !void {
             @import("w8a8.zig").enabled = true;
         } else if (std.mem.eql(u8, args[i], "--no-w8a8")) {
             @import("w8a8.zig").enabled = false;
+        } else if (std.mem.eql(u8, args[i], "--int8-qk")) {
+            @import("nax_attention.zig").int8_qk_cli = true;
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {

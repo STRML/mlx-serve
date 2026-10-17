@@ -33,11 +33,11 @@ The gain grows with the conversation; below roughly 8k there is nothing to trim 
 
 ## Int8 Q/K prefill attention (NAX GPUs)
 
-Set `MLX_SERVE_INT8_QK=1` to run the causal prefill attention of dense Qwen 3.5/3.6/3.8 models with int8 Q and K. The option is **off by default** and **lossy**. It needs a GPU with neural accelerators (M5-class and later).
+Pass `--int8-qk` (or set `MLX_SERVE_INT8_QK=1`) to run the causal prefill attention of dense Qwen 3.5/3.6/3.8 models with int8 Q and K. The option is **off by default** and **lossy**. It needs a GPU with neural accelerators (M5-class and later).
 
 The route quantizes Q per 64 rows and K per 32 keys, after it removes each head's mean key, and multiplies them in int8. P and V stay in half precision. Decode and prompt widths under 64 rows keep the stock kernels. A model whose prefill does not use the head-dim-256 causal path does not take the route: Flash-Next (`qwen4_exp`) switches to its own sparse attention past 2,048 tokens. Gemma and Spark take it when the variable is set, but quality was measured on the Qwen3.8 27B only.
 
-Qwen3.8-27B 4-bit on an M5 Ultra, one request per cell, `--no-mtp --max-concurrent 1`, prefill tok/s, two boots per arm (A B B A):
+Qwen3.8-27B 4-bit on an M5 Ultra (256 GB), one request per cell, `--no-mtp --max-concurrent 1`, prefill tok/s, two boots per arm (A B B A):
 
 | Keys | Off | On | Gain |
 |---|---|---|---|
@@ -48,7 +48,7 @@ Qwen3.8-27B 4-bit on an M5 Ultra, one request per cell, `--no-mtp --max-concurre
 
 Attention is a larger share of a longer prefill, so the gain grows with context and is nil at 8k.
 
-Against the route off, a 23,311-token echo NLL moves by +0.001 nats and teacher-forced top-1 agreement is 98.3%. On a 113,784-token text the NLL moves by +0.0003 nats with no drift from 0 to 114k tokens. Greedy 64-token continuations after three prompts of 10k to 17k tokens match the stock path on two and diverge at token 48 on the third.
+Against the route off, a 23,311-token echo NLL (measured on an M5 Max, 128 GB) moves by +0.001 nats and teacher-forced top-1 agreement is 98.3%. On a 113,784-token text the NLL moves by +0.0003 nats with no drift from 0 to 114k tokens. Greedy 64-token continuations after three prompts of 10k to 17k tokens match the stock path on two and diverge at token 48 on the third.
 
 When the route runs, the server logs `[attn] int8 QK hd-256 prefill attention engaged (MLX_SERVE_INT8_QK; lossy)` once.
 
