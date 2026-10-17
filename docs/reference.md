@@ -639,7 +639,7 @@ GLM-5-Next as mlx-vlm's `glm5_next` layout; oMLX 0.7.0 serves the same packs. 45
 
 **Decode.** Per sublayer the critical path is one `hcPre` dispatch: 16 threadgroups each take a K-slice of all 24 mixes, the last to arrive reduces them, collapses, applies the sublayer's RMSNorm and writes post/comb; the expand is deferred and the next `hcPre` rebuilds each stream element as `expand` would (same fma order and rounding). KDA layers run oMLX's one-token step (conv, l2 norms, low-rank gates, gated delta rule, gated norm in one dispatch per layer); MoE layers oMLX's gate/up and down + combine kernels with the shared expert inside. Ubench (M5 Max, short context): 18.99 -> 17.2 ms per forward; marginals KDA 5.3 ms (34 layers, near the 8-bit weights' bandwidth floor), MoE 7.2 ms (floor ~5.3), DSA 1.95 ms, mHC 1.25 ms.
 
-**Indexer cache.** Each token's indexer row is key | gate; the row that completes a pool (position % 4 == 3) stores the pool's key in its gate half (`glm5.withPooledKeys`, from the up-to-3 cached rows before the forward), so selection reads pooled keys as a strided view instead of re-pooling the whole cache every token (`cacheLayoutNamespace` = `glm5-pooled-keys-v1`). Below the indexer budget nothing reads that cache, so the attention output depends on it explicitly (`glm5.withDependency` over `mlx_depends`); without that, the rows stayed one lazy chain across tokens until the first read past 2051. Decode projections `embed_q`/`unembed` run oMLX's per-head qmv (`glm5.headQmv`), the attention scale folded into `embed_q`'s rounding.
+**Indexer cache.** Each token's indexer row is key | gate; the row that completes a pool (position % 4 == 3) stores the pool's key in its gate half (`glm5.withPooledKeys`, from the up-to-3 cached rows before the forward), so selection reads pooled keys as a strided view instead of re-pooling the whole cache every token (`cacheLayoutNamespace` = `glm5-pooled-keys-v2`). Below the indexer budget nothing reads that cache, so the attention output depends on it explicitly (`glm5.withDependency` over `mlx_depends`); without that, the rows stayed one lazy chain across tokens until the first read past 2051. Decode projections `embed_q`/`unembed` run oMLX's per-head qmv (`glm5.headQmv`), the attention scale folded into `embed_q`'s rounding.
 
 Parity: `tests/dump_glm5_next_fixtures.py` builds a tiny random pack and runs mlx-vlm's `glm5_next` in bf16, recording each row's selection gap; `glm5_next fixture` in transformer.zig compares one-shot and chunked prefill + 6 decode steps over the prefix before the first near-tie selection (a flipped pick propagates through the KDA state). Kernel tests in glm5_next.zig and kda_recurrence.zig compare each fused piece with its op chain or a host reference. Live: `tests/test_glm5_next.sh`.
 
@@ -895,6 +895,12 @@ Why this exists: without it an agent edits this file blind to the contracts, kil
 Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
 
 | `sushi_pack.zig` | Sushi GLM/MiMo packs (`expert_quant`, EXL3 experts through `sushi_exl3`) in their source layout: GLM hyper-connection names + `kv_b_proj` split into `embed_q`/`unembed_out` (dense bf16); MiMo QKV kept e4m3 with one scale row per code row (`fp8Linear`: an e4m3 GEMV up to 8 rows, wider inputs decoded per projection inside `qmatmul`), layer-0 MLP decoded to bf16; the resident bill (`residentBytes`) reads shard headers, skipping unserved tensors and shards the index does not own |
+
+### `modelopt_pack.zig`
+
+Why this exists: without it an agent edits this file blind to the contracts, kill switches and failure stories the AGENTS.md row dropped.
+
+| `modelopt_pack.zig` / `mxfp8_qmv.zig` | NVIDIA ModelOpt packs as published (`quant_method: modelopt`, NVIDIA's Flash Next FP4): names mapped to mlx-lm's, MXFP8 bytes reinterpreted in place, NVFP4 routed experts read off disk into banks (csf scales decoded) with each expert's `weight_scale_2` as a gate scale (before the SiLU) and an up x down scale (on the routing weight); MXFP8 GEMV for 1..8 rows |
 
 ### `embedding_gemma2` (arch)
 

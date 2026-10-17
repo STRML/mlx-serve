@@ -5741,3 +5741,22 @@ Why this exists: an agent that skips the story behind a rule "fixes" it back int
 - **Prefill perf kernels A/B PER ARCH before default-on** (`gdnBlockedEligible`, `prefillDqGemm`). dsv4 decode glue is FUSED (`dsv4_emit_win`, `dsv4_dec_chain`). A sparse-attention PATTERN cannot be tuned into correctness (H3, DEAD).
 - **Memory**: RSS is blind to Metal (`/props` `active_bytes`); a live handle pins its buffer through the eval, so free a step's intermediates BEFORE evaluating it; a weights MAP outliving the model pins every buffer; `iterator_next` hands a +1; `mlx_array_new_data` COPIES shape-worth of bytes; Metal at the working-set edge returns ZEROS before it aborts.
 - **Kokoro**: safetensors READ on CPU stream; depthwise `ConvTranspose1d` transposes `{0,2,1}`; `AdaIN1d` is pure instance norm; `Vocab.encode` DROPS unknowns; reproducing an upstream NO-OP means NOT doing it (SineGen).
+
+- **A committed turn also snapshots where decode stopped** (`appendDecodeEndCheckpoint`, image turns too), so the next round resumes after the generated tail; a plain pipelined step forwarded its stop and a lookahead, so it rolls back to its lagged state first (`rollbackSsmTo`). Guards: `tests/test_cache_reuses_generated_tokens.sh`, `tests/test_decode_end_media_reuse.sh`.
+- **Row-exact archs make drafted output byte-identical to serial ONLY while a DFlash drafter is bound** (`rowExactDecode`: nemotron_h + dense qwen3_5; MTP/serial stay stock): a sampled verify row draws `keyed_sample` at the ABSOLUTE position. Serial reference = the SAME server with `"enable_drafter": false`, never a `--no-drafter` boot.
+- **A fast path keyed on one pack's quant layout is SILENT on another's** (oMLX Flash Next oQ4e ran half speed, no error): tiny dense-only tensors dequantize at load (`dequantizeSmall`), kernels unpack every affine width, config caches key per width, gates are measured per shape. New pack layout ⇒ `tests/qwen4_engagement.sh` first.
+
+## GLM's KDA layers came out 1.8% short: an epsilon on the mean, where the reference has it on the sum (2026-10-17)
+
+Defect: on NVIDIA's GLM-5.3-Flash-FP4-Local, every KDA layer's output was ~1.8% smaller than transformers' (layer-0 tap min cos 0.9985, rms 1.012 vs an f32 reference), while the dense MLP matched to 1.000000.
+Cause: the q/k prework normalized with `rms_norm(x, 1e-6)`, epsilon on the MEAN of squares, which is mlx-lm's Qwen GDN form. GLM's reference (fla's `l2norm`, and mlx-vlm's `1e-6 / head_dim`) puts it on the SUM. GLM's post-conv keys have a mean square near 3e-5, so a 128x larger epsilon shrank them. The tiny random-weight fixture has large keys and never saw it. Found by feeding the engine's own layer inputs to transformers' modules one at a time.
+Fix: `ModelConfig.gdnQkNormEps` (GLM 1e-6/dk, else 1e-6), read by the op chain and passed to the packed prework kernel as `qk_eps`. The one-token KDA decode kernel already added it to the sum.
+Guards: `glm5_next KDA q/k norm equals fla's l2norm on keys as small as the checkpoint's`; `glm5_next DFlash capture` on a real pack.
+
+## NVIDIA's Flash Next FP4 pack prefilled 14% slower than ours: its experts and linears sat off the tuned kernels (2026-10-17)
+
+Defect: `Qwen3.8-Flash-Next-FP4-Local` prefilled 4600 tok/s against 5390 for iQ-MLX-4.7bpw on the same Mac, with decode equal.
+Cause: the tuned sorted expert kernel (`gather_qmm_nax`, the oMLX port) took affine and MXFP4 only, and the dequant+GEMM prefill route took affine only, so NVFP4 experts ran stock `gather_qmm` behind a per-expert copy of the activations and MXFP8 linears ran stock `quantized_matmul`. A `QWEN4_STANDIN` ablation of GDN and attention pointed at the dense layers instead: stubbing a block changes the router's input and with it the expert load, so those costs read twice their size.
+Fix: `Fp4Q` decodes e4m3 scales at group 16 (`QuantMode.isFp4` at the three call sites), the paired SwiGLU kernel declines when per-expert scales exist (it ignores them), and `prefillDqGemm` takes the mode and serves MXFP8. 4600 -> 5340 tok/s.
+Guards: `segmented NAX sorted gather matches stock bit for bit on FP4 banks` (Flash Next shapes), the paired row-map case at group 16, `qmatmulBits: prefill-width MXFP8 calls take the dequant+GEMM route`. The expert kernel is exact (323 of 323 scored rows bit-identical); the MXFP8 route reorders sums, so judge it by `MLX_SERVE_PREFILL_DQ_GEMM=0` A/Bs.
+

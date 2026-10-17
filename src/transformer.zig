@@ -8133,6 +8133,7 @@ const ModelConfig = model_mod.ModelConfig;
 const QuantMode = model_mod.QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
 const hc_decode2 = @import("hc_decode2.zig");
+const mxfp8_qmv = @import("mxfp8_qmv.zig");
 const qsa_row_mask = @import("qsa_mask.zig");
 const qsa_decode = @import("qsa_decode.zig");
 const moe_affine4 = @import("moe_affine4.zig");
@@ -13084,13 +13085,13 @@ test "MTP head row widths pick the verify lane, the MoE arm and the QSA score ke
 
     moe_rows_fused_override = true;
     defer moe_rows_fused_override = null;
-    try t.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, 10, false));
-    try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(2, 1, 10, false));
-    try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(4, 1, 10, false));
+    try t.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, 10, false, false));
+    try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(2, 1, 10, false, false));
+    try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(4, 1, 10, false, false));
     moe_rows_fused_override = false;
-    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, 10, false));
-    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, 10, false));
-    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(4, 2, 10, false));
+    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, 10, false, false));
+    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, 10, false, false));
+    try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(4, 2, 10, false, false));
 
     try t.expect(!qsaScoreFusedActiveFor(2, 4, 128));
     try t.expect(!qsaScoreFusedActiveFor(4, 4, 128));
@@ -14829,6 +14830,10 @@ const HcWeights = struct {
     /// Dense inject weight materialized row-major `[hc*hidden, hc]` for the
     /// fused decode kernel (the qmatmul path reads the lazy transpose view).
     inject_flat: mlx.mlx_array = .{ .ctx = null },
+    /// Dense bf16 down/up as the fused read binds them: u32 words of the row-major `[out, in]`
+    /// buffers the chain reads through transposed views.
+    down_rows: mlx.mlx_array = .{ .ctx = null },
+    up_rows: mlx.mlx_array = .{ .ctx = null },
 };
 
 /// qwen4_exp PLE: n-gram embedding → per-stream keys + one value, gated by
@@ -15044,6 +15049,10 @@ pub const MoeMlpWeights = struct {
     // Sigma-MoE routing (Gemma 4; null for Qwen3.5)
     router_scale: ?mlx.mlx_array = null,
     per_expert_scale: ?mlx.mlx_array = null,
+    /// ModelOpt NVFP4 banks: each expert's gate global scale [E], applied before the activation.
+    gate_expert_scale: mlx.mlx_array = .{ .ctx = null },
+    /// The same for `up` when the activation clamps it (GLM): the scale must land before the clamp.
+    up_expert_scale: mlx.mlx_array = .{ .ctx = null },
     // Hy3 (hy_v3) sigmoid routing: f32 [num_experts] bias added to the sigmoid
     // scores for top-k SELECTION only (weights come from the unbiased scores).
     // Non-null expert_bias routes moeMLP2 through hy3RoutingChain.
@@ -20195,6 +20204,20 @@ pub const Transformer = struct {
     /// `sel` MUST be the same index vector the matmul used, in the same order:
     /// on the sorted path that is `sorted_inds`, and the result is still in
     /// sorted order until the inverse permutation runs.
+    fn scaleExperts(self: *const Transformer, out: *mlx.mlx_array, scale: mlx.mlx_array, sel: mlx.mlx_array) !void {
+        if (scale.ctx == null) return;
+        var picked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(picked);
+        try mlx.check(mlx.mlx_take_axis(&picked, scale, sel, 0, self.s));
+        var col = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(col);
+        try mlx.check(mlx.mlx_expand_dims(&col, picked, -1, self.s));
+        var scaled = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&scaled, out.*, col, self.s));
+        _ = mlx.mlx_array_free(out.*);
+        out.* = scaled;
+    }
+
     fn addExpertBias(self: *const Transformer, out: *mlx.mlx_array, bias: mlx.mlx_array, sel: mlx.mlx_array) !void {
         if (bias.ctx == null) return;
         var rows = mlx.mlx_array_new();
@@ -23031,7 +23054,9 @@ pub const Transformer = struct {
                 return .{ .stream = try standinRef(n.stream), .mixed = read.mixed, .inj = read.inj };
             }
         }
-        if (batch * seq_len > HC_FUSED_MAX_ROWS or w.down_s.ctx == null or w.up_s.ctx == null or (w.inject_w.ctx != null and w.inject_flat.ctx == null)) return null;
+        if (batch * seq_len > HC_FUSED_MAX_ROWS or (w.inject_w.ctx != null and w.inject_flat.ctx == null)) return null;
+        if (w.down_rows.ctx != null) return hcReadFused(self.s, stream, batch, seq_len, w.norm_w, w.down_rows, .{ .ctx = null }, .{ .ctx = null }, w.up_rows, .{ .ctx = null }, .{ .ctx = null }, w.inject_flat, self.config.rms_norm_eps, hc, hidden, 16, 16, pend);
+        if (w.down_s.ctx == null or w.up_s.ctx == null) return null;
         const dqp = self.quantParamsHinted(w.down_w, w.down_s, @intCast(hc * hidden));
         const uqp = self.quantParamsFor(w.up_w, w.up_s);
         if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
@@ -23063,8 +23088,9 @@ pub const Transformer = struct {
             inputs[i] = row.h;
             if (row.pending) |p| pending[i] = p;
         }
-        const dqp = self.quantParamsHinted(w.down_w, w.down_s, 10240);
-        const uqp = self.quantParamsFor(w.up_w, w.up_s);
+        const dense = w.down_rows.ctx != null;
+        const dqp: QuantParams = if (dense) .{ .bits = 16, .group_size = 16 } else self.quantParamsHinted(w.down_w, w.down_s, 10240);
+        const uqp: QuantParams = if (dense) dqp else self.quantParamsFor(w.up_w, w.up_s);
         if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
         const joined = (try hcReadJoined(self.allocator, self.s, inputs[0..rows.len], w.*, width, self.config.rms_norm_eps, dqp.bits, dqp.group_size, if (has_pending) pending[0..rows.len] else null)) orelse return null;
         defer self.allocator.free(joined);
@@ -31310,6 +31336,7 @@ pub const Transformer = struct {
                 .conv_w = la.conv1d_w,
                 .q_scale = inv_scale_sq,
                 .k_scale = inv_sqrt_sc,
+                .qk_eps = cfg.gdnQkNormEps(),
                 .hk = num_k_heads,
                 .hv = num_v_heads,
                 .dk = dk,
@@ -31421,12 +31448,12 @@ pub const Transformer = struct {
 
             var q_norm = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_norm);
-            try mlx.check(mlx.mlx_fast_rms_norm(&q_norm, q_heads, ones_w, 1e-6, self.s));
+            try mlx.check(mlx.mlx_fast_rms_norm(&q_norm, q_heads, ones_w, cfg.gdnQkNormEps(), self.s));
             try mlx.check(mlx.mlx_multiply(&q_scaled, q_norm, inv_scale_sq, self.s));
 
             var k_norm = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(k_norm);
-            try mlx.check(mlx.mlx_fast_rms_norm(&k_norm, k_heads, ones_w, 1e-6, self.s));
+            try mlx.check(mlx.mlx_fast_rms_norm(&k_norm, k_heads, ones_w, cfg.gdnQkNormEps(), self.s));
             try mlx.check(mlx.mlx_multiply(&k_scaled, k_norm, inv_sqrt_sc, self.s));
         }
 
@@ -31704,7 +31731,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_reshape(&heads, flat, &[_]c_int{ batch, seq, hk, dk }, 4, s));
             var nrm = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(nrm);
-            try mlx.check(mlx.mlx_fast_rms_norm(&nrm, heads, self.gdn_ones_w.?, 1e-6, s));
+            try mlx.check(mlx.mlx_fast_rms_norm(&nrm, heads, self.gdn_ones_w.?, self.config.gdnQkNormEps(), s));
             var scaled = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(scaled);
             try mlx.check(mlx.mlx_multiply(&scaled, nrm, case[2], s));
@@ -33291,10 +33318,10 @@ pub const Transformer = struct {
         return true;
     }
 
-    /// MXFP4 banks at decode and verify widths: `moe_fp4`'s two dispatches over
+    /// fp4 banks at decode and verify widths: `moe_fp4`'s two dispatches over
     /// every token's own experts. Writes the weighted sum [B,S,D] into `out`;
     /// false when the kernels decline.
-    fn moeFp4Decode(self: *Transformer, out: *mlx.mlx_array, expert_x: mlx.mlx_array, inds: mlx.mlx_array, norm_scores: mlx.mlx_array, mw: *const MoeMlpWeights, group_size: u32) !bool {
+    fn moeFp4Decode(self: *Transformer, out: *mlx.mlx_array, expert_x: mlx.mlx_array, inds: mlx.mlx_array, norm_scores: mlx.mlx_array, mw: *const MoeMlpWeights, mode: QuantMode, group_size: u32, shared: ?moe_affine4.Shared) !bool {
         const xs = mlx.getShape(expert_x);
         const rows = xs[0] * xs[1];
         const ks = mlx.getShape(inds);
@@ -33313,7 +33340,12 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_reshape(&sc2, norm_scores, &.{ rows, k }, 2, self.s));
         const sigtab = try swigluSigTable(self.s, mlx.mlx_array_dtype(expert_x), std.heap.c_allocator);
         const Bank = moe_fp4.Bank;
-        const y = (try moe_fp4.decode(self.s, x2, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s }, ind_u, sc2, sigtab, .mxfp4, group_size)) orelse return false;
+        const scales: moe_fp4.Scales = .{
+            .gate = if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null,
+            .up = if (mw.up_expert_scale.ctx != null) mw.up_expert_scale else null,
+            .clamp = swigluClampLimit(&self.config) orelse return false,
+        };
+        const y = (try moe_fp4.decode(self.s, x2, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s }, mw.bank_views, scales, shared, ind_u, sc2, sigtab, mode, group_size)) orelse return false;
         defer _ = mlx.mlx_array_free(y);
         try mlx.check(mlx.mlx_reshape(out, y, &.{ xs[0], xs[1], xs[2] }, 3, self.s));
         return true;
@@ -33397,6 +33429,7 @@ pub const Transformer = struct {
             gate_qp.bits,
             gate_qp.group_size,
             gate_qp.mode,
+            if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null,
         )) orelse return false;
         defer _ = mlx.mlx_array_free(act_3d);
         var scores_2d = mlx.mlx_array_new();
@@ -33626,7 +33659,8 @@ pub const Transformer = struct {
         const has_expert_bias = mw.switch_gate_bias.ctx != null or
             mw.switch_up_bias.ctx != null or
             mw.switch_down_bias.ctx != null;
-        const do_sort = B * S > 1 or total_inds >= 64 or has_expert_bias;
+        const has_gate_scale = mw.gate_expert_scale.ctx != null;
+        const do_sort = B * S > 1 or total_inds >= 64 or has_expert_bias or has_gate_scale;
         const no_idx = mlx.mlx_array{ .ctx = null };
 
         var down_out = mlx.mlx_array_new();
@@ -33639,10 +33673,12 @@ pub const Transformer = struct {
         var shared_fused = false;
         var cost_arm: u8 = 4;
 
-        if (moeFp4DecodeEligible(B * S, has_expert_bias, swigluClampLimit(&self.config), gate_qp.mode, up_qp.mode, down_qp.mode) and
-            try self.moeFp4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size))
+        const fp4_shared: ?moe_affine4.Shared = if (B * S == 1) if (shared_down) |sd| .{ .down = sd, .logit = routed.gate_logit } else null else null;
+        if (moeFp4DecodeEligible(B * S, has_expert_bias, swigluClampLimit(&self.config), mlx.mlx_array_dtype(expert_x), gate_qp.mode, up_qp.mode, down_qp.mode) and
+            try self.moeFp4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.mode, gate_qp.group_size, fp4_shared))
         {
             moe_reduced = true;
+            shared_fused = fp4_shared != null;
             cost_arm = 1;
         } else if (B * S == 1 and !has_expert_bias and (swigluClampLimit(&self.config) orelse 1) == 0 and cfg.hidden_act == .silu and
             gate_qp.mode == .affine and up_qp.mode == .affine and down_qp.mode == .affine and
@@ -33652,7 +33688,7 @@ pub const Transformer = struct {
             moe_reduced = true;
             shared_fused = shared_down != null;
             cost_arm = 1;
-        } else if (moeDecodeDispatchArm(B, S, K, has_expert_bias) == .rows and
+        } else if (moeDecodeDispatchArm(B, S, K, has_expert_bias, (swigluClampLimit(&self.config) orelse 1) != 0) == .rows and
             useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
             try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
         {
@@ -33734,7 +33770,7 @@ pub const Transformer = struct {
             const gate_experts = mlx.getShape(mw.switch_gate_w)[0];
             const row_block = total_inds >= 16 and gate_experts > 0 and @divTrunc(total_inds, gate_experts) >= 4;
             if (input_view == null and !self.verifyFeatureEnabled(.routing, skip_shared, B, S) and
-                row_block and nax_available and gate_qp.mode == up_qp.mode and (gate_qp.mode == .affine or gate_qp.mode == .mxfp4))
+                row_block and nax_available and gate_qp.mode == up_qp.mode and (gate_qp.mode == .affine or gate_qp.mode.isFp4()))
             {
                 var x_tok = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(x_tok);
@@ -33745,10 +33781,11 @@ pub const Transformer = struct {
                 const clamp = swigluClampLimit(cfg);
                 if (self.compiled_geglu == null and swigluFusedEnabled() and cfg.hidden_act == .silu and clamp != null and
                     mw.switch_gate_bias.ctx == null and mw.switch_up_bias.ctx == null and
+                    mw.gate_expert_scale.ctx == null and mw.up_expert_scale.ctx == null and
                     gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size)
                 {
                     const sigtab = try @import("hc_prefill.zig").sigmoidTable(self.s);
-                    if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, clamp.?, gate_qp.bits, gate_qp.group_size, gate_qp.mode == .mxfp4, nax_available, self.s)) |act3| {
+                    if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, clamp.?, gate_qp.bits, gate_qp.group_size, gate_qp.mode.isFp4(), nax_available, self.s)) |act3| {
                         // The kernel writes [M, 1, n]; the down gather below takes [M, n] like the squeezed stock path.
                         defer _ = mlx.mlx_array_free(act3);
                         var act = mlx.mlx_array_new();
@@ -33759,8 +33796,8 @@ pub const Transformer = struct {
                     }
                 }
                 if (fused_act == null) {
-                    mapped_gate = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode == .mxfp4, nax_available, self.s);
-                    mapped_up = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode == .mxfp4, nax_available, self.s);
+                    mapped_gate = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode.isFp4(), nax_available, self.s);
+                    mapped_up = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode.isFp4(), nax_available, self.s);
                     if (mapped_gate == null or mapped_up == null) {
                         if (mapped_gate) |value| _ = mlx.mlx_array_free(value);
                         if (mapped_up) |value| _ = mlx.mlx_array_free(value);
@@ -33787,7 +33824,7 @@ pub const Transformer = struct {
                 }
             }
 
-            const expert_act = if (fused_act) |act| act else if (self.verify_paired_gu_installed and B == 1 and S == 4 and
+            const expert_act = if (fused_act) |act| act else if (!has_gate_scale and self.verify_paired_gu_installed and B == 1 and S == 4 and
                 self.verifyFeatureEnabled(.routing, skip_shared, B, S))
                 try verifyPairedGateUp(self.s, x_flat, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, lhs_idx, sorted_inds)
             else blk: {
@@ -33800,6 +33837,7 @@ pub const Transformer = struct {
                 defer _ = mlx.mlx_array_free(gate_out);
                 try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
                 try self.addExpertBias(&gate_out, mw.switch_gate_bias, sorted_inds);
+                try self.scaleExperts(&gate_out, mw.gate_expert_scale, sorted_inds);
 
                 const use_mapped_up = mapped_up != null;
                 var up_out_3d = mapped_up orelse mlx.mlx_array_new();
@@ -33810,6 +33848,7 @@ pub const Transformer = struct {
                 defer _ = mlx.mlx_array_free(up_out);
                 try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
                 try self.addExpertBias(&up_out, mw.switch_up_bias, sorted_inds);
+                try self.scaleExperts(&up_out, mw.up_expert_scale, sorted_inds);
 
                 // gpt_oss swaps the activation itself, not just its inputs.
                 break :blk if (cfg.swiglu_limit > 0.0)
@@ -34518,7 +34557,32 @@ fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: bool, h
     // fold that into the (de)quantization affine or the dense weight.
     const inv_hc = mlx.mlx_array_new_float(1.0 / @as(f32, @floatFromInt(hc)));
     defer _ = mlx.mlx_array_free(inv_hc);
-    try scaleTriple(&out.down_w, &out.down_s, &out.down_b, inv_hc, owned_bf16, allocator, s);
+    if (out.down_s.ctx == null and out.up_s.ctx == null) {
+        const rows = struct {
+            fn view(a: mlx.mlx_array, o: *std.ArrayList(mlx.mlx_array), al: std.mem.Allocator, st: mlx.mlx_stream) !mlx.mlx_array {
+                var v = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_view(&v, a, .uint32, st));
+                try mlx.check(mlx.mlx_array_eval(v));
+                try o.append(al, v);
+                return v;
+            }
+        };
+        const down_src = weights.get(std.fmt.bufPrint(&nb, "{s}.input_mix_weight_down.weight", .{base}) catch unreachable).?;
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        try mlx.check(mlx.mlx_astype(&k, inv_hc, mlx.mlx_array_dtype(down_src), s));
+        var scaled = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&scaled, down_src, k, s));
+        try mlx.check(mlx.mlx_array_eval(scaled));
+        try owned_bf16.append(allocator, scaled);
+        out.down_w = try transposeBf16Weight(scaled, s);
+        try owned_bf16.append(allocator, out.down_w);
+        const up_src = weights.get(std.fmt.bufPrint(&nb, "{s}.input_mix_weight_up.weight", .{base}) catch unreachable).?;
+        if (mlx.mlx_array_dtype(down_src) == .bfloat16 and mlx.mlx_array_dtype(up_src) == .bfloat16) {
+            out.down_rows = try rows.view(scaled, owned_bf16, allocator, s);
+            out.up_rows = try rows.view(up_src, owned_bf16, allocator, s);
+        }
+    } else try scaleTriple(&out.down_w, &out.down_s, &out.down_b, inv_hc, owned_bf16, allocator, s);
     if (with_inject) {
         const inj = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.block_inject_weight", .{base}) catch unreachable, hc * hidden, owned_bf16, allocator, s);
         out.inject_w = inj.w;
@@ -34610,7 +34674,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const is_mimo = config.isMimo();
     const is_glm = config.isGlm5();
     // Attention projections that may ship dense bf16 beside quantized experts.
-    const probe_attn_scales = is_laguna or is_mimo or is_kolibri;
+    const probe_attn_scales = is_laguna or is_mimo or is_kolibri or config.modelopt;
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -35672,6 +35736,9 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 .shared_expert_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.weight"),
                 .shared_expert_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.scales") orelse mlx.mlx_array_new(),
                 .shared_expert_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.biases") orelse mlx.mlx_array_new(),
+                .per_expert_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.expert_scale"),
+                .gate_expert_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.expert_scale") orelse .{ .ctx = null },
+                .up_expert_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.expert_scale") orelse .{ .ctx = null },
             } };
             if (config.exl3) |spec| try checkExl3Bank(&lw.mlp.moe, config, spec);
             {
@@ -36908,6 +36975,11 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
             // it exactly; solve, exactly as the affine arm below does.
             if (in_dim) |in| {
                 if (fpParamsFromGeometry(config, w_cols, s_cols, in)) |qp| return qp;
+            } else if (s_cols > 0 and (w_cols * 32) % s_cols == 0) {
+                const per_group = (w_cols * 32) / s_cols;
+                const bits: u32 = if (per_group == 256) 8 else 4;
+                const gs = per_group / bits;
+                if (fpQuantModeFor(bits, gs)) |mode| return .{ .bits = bits, .group_size = gs, .mode = mode };
             }
             return .{ .bits = config.quant_bits, .group_size = config.quant_group_size, .mode = config.quant_mode };
         }
@@ -39011,7 +39083,7 @@ const GDN_PREWORK_SOURCE =
     \\}
     \\if (is_q || is_k) {
     \\    sumsq = simd_sum(sumsq);
-    \\    float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
+    \\    float inv = metal::precise::rsqrt(sumsq / float(DK) + qk_eps);
     \\    const T scale = is_q ? q_scale : k_scale;
     \\    uint out_base = (row * uint(HK) + head) * uint(DK) + lane * 4;
     \\    for (uint i = 0; i < 4; ++i) {
@@ -39129,7 +39201,7 @@ fn gdnDecodeRecurEnabled() bool {
 
 fn getGdnPreworkKernel() !mlx.mlx_fast_metal_kernel {
     if (gdn_prework_kernel) |k| return k;
-    const input_names = [_][*:0]const u8{ "qkv", "conv_state", "conv_w", "q_scale", "k_scale", "b_in", "a_in", "A_log", "dt_bias", "sigtab", "seq" };
+    const input_names = [_][*:0]const u8{ "qkv", "conv_state", "conv_w", "q_scale", "k_scale", "b_in", "a_in", "A_log", "dt_bias", "sigtab", "seq", "qk_eps" };
     const output_names = [_][*:0]const u8{ "q_out", "k_out", "v_out", "conv_out", "g_out", "beta_out" };
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -39196,6 +39268,7 @@ pub const GdnPreworkArgs = struct {
     conv_w: mlx.mlx_array, // [C, 4, 1] bf16
     q_scale: mlx.mlx_array, // 0-dim bf16 (1/dk)
     k_scale: mlx.mlx_array, // 0-dim bf16 (1/sqrt(dk))
+    qk_eps: f32 = 1e-6, // `ModelConfig.gdnQkNormEps`
     hk: c_int,
     hv: c_int,
     dk: c_int,
@@ -39264,7 +39337,9 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
     const kernel = try getGdnPreworkKernel();
     const seq_arr = mlx.mlx_array_new_int(in.seq);
     defer _ = mlx.mlx_array_free(seq_arr);
-    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias, if (in.seq >= 17) try sigmoidTableFor(s, dt) else in.qkv, seq_arr };
+    const eps_arr = mlx.mlx_array_new_float(in.qk_eps);
+    defer _ = mlx.mlx_array_free(eps_arr);
+    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias, if (in.seq >= 17) try sigmoidTableFor(s, dt) else in.qkv, seq_arr, eps_arr };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
@@ -41387,15 +41462,13 @@ const GQMV_BODY_AFFINE =
 // applied once per word rather than once per value.
 const GQMV_BODY_NVFP4 =
     \\  float sj = mlxserve_e4m3(uint(scales[gbase + (size_t)gi]));
-    \\  float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
-    \\  for (int ki = 0; ki < VPW; ki += 4) {
-    \\    size_t xi = xoff + (size_t)(k_base + ki);
-    \\    uint32_t q = packed >> (ki * BITS);
-    \\    d0 += float(x[xi + 0]) * mlxserve_e2m1((q >> (0 * BITS)) & mask);
-    \\    d1 += float(x[xi + 1]) * mlxserve_e2m1((q >> (1 * BITS)) & mask);
-    \\    d2 += float(x[xi + 2]) * mlxserve_e2m1((q >> (2 * BITS)) & mask);
-    \\    d3 += float(x[xi + 3]) * mlxserve_e2m1((q >> (3 * BITS)) & mask);
-    \\  }
+    \\  size_t xi = xoff + (size_t)k_base;
+    \\  float2 p0 = mlxserve_e2m1x2(packed, 0), p1 = mlxserve_e2m1x2(packed, 1);
+    \\  float2 p2 = mlxserve_e2m1x2(packed, 2), p3 = mlxserve_e2m1x2(packed, 3);
+    \\  float d0 = float(x[xi + 0]) * p0.x + float(x[xi + 4]) * p0.y;
+    \\  float d1 = float(x[xi + 1]) * p1.x + float(x[xi + 5]) * p1.y;
+    \\  float d2 = float(x[xi + 2]) * p2.x + float(x[xi + 6]) * p2.y;
+    \\  float d3 = float(x[xi + 3]) * p3.x + float(x[xi + 7]) * p3.y;
     \\  a0 += d0 * sj; a1 += d1 * sj; a2 += d2 * sj; a3 += d3 * sj;
 ;
 
@@ -41421,7 +41494,7 @@ const GQMV_AFFINE_HEADER =
     \\}
 ;
 
-const GQMV_NVFP4_HEADER = GQMV_AFFINE_HEADER ++ moe_fp4.E2M1_HEADER ++
+const GQMV_NVFP4_HEADER = GQMV_AFFINE_HEADER ++ moe_fp4.E2M1_HEADER ++ moe_fp4.E2M1X2_HEADER ++
     \\inline float mlxserve_e4m3(uint b) {
     \\  return float(as_type<half>(ushort(((b & 0x7Fu) << 7) | ((b & 0x80u) << 8))));
     \\}
@@ -41533,25 +41606,18 @@ const GQMV_GATEUP_BODY_AFFINE =
 const GQMV_GATEUP_BODY_NVFP4 =
     \\  float sjg = mlxserve_e4m3(uint(g_scales[gbase + (size_t)gi]));
     \\  float sju = mlxserve_e4m3(uint(u_scales[gbase + (size_t)gi]));
-    \\  float dg0 = 0.0f, dg1 = 0.0f, dg2 = 0.0f, dg3 = 0.0f;
-    \\  float du0 = 0.0f, du1 = 0.0f, du2 = 0.0f, du3 = 0.0f;
-    \\  for (int ki = 0; ki < VPW; ki += 4) {
-    \\    size_t xi = xrow + (size_t)(k_base + ki);
-    \\    uint32_t qg = packed_g >> (ki * BITS);
-    \\    uint32_t qu = packed_u >> (ki * BITS);
-    \\    float x0 = float(x[xi + 0]);
-    \\    float x1 = float(x[xi + 1]);
-    \\    float x2 = float(x[xi + 2]);
-    \\    float x3 = float(x[xi + 3]);
-    \\    dg0 += x0 * mlxserve_e2m1((qg >> (0 * BITS)) & mask);
-    \\    dg1 += x1 * mlxserve_e2m1((qg >> (1 * BITS)) & mask);
-    \\    dg2 += x2 * mlxserve_e2m1((qg >> (2 * BITS)) & mask);
-    \\    dg3 += x3 * mlxserve_e2m1((qg >> (3 * BITS)) & mask);
-    \\    du0 += x0 * mlxserve_e2m1((qu >> (0 * BITS)) & mask);
-    \\    du1 += x1 * mlxserve_e2m1((qu >> (1 * BITS)) & mask);
-    \\    du2 += x2 * mlxserve_e2m1((qu >> (2 * BITS)) & mask);
-    \\    du3 += x3 * mlxserve_e2m1((qu >> (3 * BITS)) & mask);
+    \\  float dg[4], du[4];
+    \\  size_t xi = xrow + (size_t)k_base;
+    \\  for (int j = 0; j < 4; ++j) {
+    \\    const float xa = float(x[xi + j]);
+    \\    const float xb = float(x[xi + j + 4]);
+    \\    const float2 pg2 = mlxserve_e2m1x2(packed_g, j);
+    \\    const float2 pu2 = mlxserve_e2m1x2(packed_u, j);
+    \\    dg[j] = xa * pg2.x + xb * pg2.y;
+    \\    du[j] = xa * pu2.x + xb * pu2.y;
     \\  }
+    \\  float dg0 = dg[0], dg1 = dg[1], dg2 = dg[2], dg3 = dg[3];
+    \\  float du0 = du[0], du1 = du[1], du2 = du[2], du3 = du[3];
     \\  g0 += dg0 * sjg; g1 += dg1 * sjg; g2 += dg2 * sjg; g3 += dg3 * sjg;
     \\  u0 += du0 * sju; u1 += du1 * sju; u2 += du2 * sju; u3 += du3 * sju;
 ;
@@ -41667,7 +41733,8 @@ fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx
         errdefer _ = mlx.mlx_array_free(out);
         joined_pending = .{ .out = out, .inj = try Join.array(s, injs[0..values.len]) };
     }
-    const full = (try hcReadFused(s, joined, 1, total, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, eps, 4, 2560, bits, gs, joined_pending)) orelse return null;
+    const dense = w.down_rows.ctx != null;
+    const full = (try hcReadFused(s, joined, 1, total, w.norm_w, if (dense) w.down_rows else w.down_w, w.down_s, w.down_b, if (dense) w.up_rows else w.up_w, w.up_s, w.up_b, w.inject_flat, eps, 4, 2560, bits, gs, joined_pending)) orelse return null;
     defer inline for (.{ "mixed", "inj", "stream" }) |name| {
         if (@field(full, name).ctx != null) _ = mlx.mlx_array_free(@field(full, name));
     };
@@ -41733,7 +41800,7 @@ pub fn hcReadFused(
     const rows = batch * seq;
     if (rows < 1 or rows > HC_FUSED_MAX_ROWS) return null;
     if (@rem(@as(c_int, @intCast(group_size)), vpw) != 0) return null;
-    if (ds.ctx == null or db.ctx == null or us.ctx == null or ub.ctx == null) return null;
+    if (bits != 16 and (ds.ctx == null or db.ctx == null or us.ctx == null or ub.ctx == null)) return null;
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16) return null;
     if (mlx.mlx_array_dtype(nw) != xd) return null;
@@ -41960,7 +42027,7 @@ fn gatherQmvGateUpRowsSource(comptime nvfp4: bool) [:0]const u8 {
         \\float acc_g = simd_sum((g0 + g1) + (g2 + g3)){s};
         \\float acc_u = simd_sum((u0 + u1) + (u2 + u3)){s};
         \\if (lane == 0) {{
-        \\  T gt = T(acc_g);
+        \\  T gt = {s};
         \\  T ut = T(acc_u);
         \\  T sig = sigtab[as_type<ushort>(gt)];
         \\  y[(((size_t)row * (size_t)TOPK) + e) * (size_t)N + (size_t)n] = (gt * sig) * ut;
@@ -41969,6 +42036,8 @@ fn gatherQmvGateUpRowsSource(comptime nvfp4: bool) [:0]const u8 {
         if (nvfp4) GQMV_GATEUP_BODY_NVFP4 else GQMV_GATEUP_BODY_AFFINE,
         if (nvfp4) " * 4194304.0f" else "",
         if (nvfp4) " * 4194304.0f" else "",
+        // ModelOpt banks: each expert's gate scale lands before the SiLU, rounded as the chain does.
+        if (nvfp4) "GSCALE != 0 ? T(T(acc_g) * gsc[eid]) : T(acc_g)" else "T(acc_g)",
     });
 }
 
@@ -41980,7 +42049,7 @@ fn getGatherQmvGateUpRowsKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
     const mi: usize = @intFromBool(nvfp4);
     if (gqmv_gateup_rows_kernels[mi]) |k| return k;
     const affine_inputs = [_][*:0]const u8{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab", "K_size", "N_size" };
-    const nvfp4_inputs = [_][*:0]const u8{ "x", "wg_q", "g_scales", "wu_q", "u_scales", "inds", "sigtab", "K_size", "N_size" };
+    const nvfp4_inputs = [_][*:0]const u8{ "x", "wg_q", "g_scales", "wu_q", "u_scales", "inds", "sigtab", "K_size", "N_size", "gsc" };
     const input_names: []const [*:0]const u8 = if (nvfp4) &nvfp4_inputs else &affine_inputs;
     const output_names = [_][*:0]const u8{"y"};
     const in_vec = mlx.mlx_vector_string_new_data(input_names.ptr, input_names.len);
@@ -42001,7 +42070,7 @@ fn getGatherQmvGateUpRowsKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const GateUpRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
+const GateUpRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, gscale: bool = false };
 var gateup_rows_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gateup_rows_cfg_key: GateUpRowsCfgKey = std.mem.zeroes(GateUpRowsCfgKey);
 var gqmv_gateup_rows_engaged: bool = false;
@@ -42042,13 +42111,15 @@ fn moeVerifyRowsFor(env: ?[]const u8) bool {
 const MoeDecodeDispatchArm = enum { rows, sorted, gather_qmv };
 
 /// ONE place decides the decode MoE arm: fused rows for S == 1 and
-/// 2 <= B <= 8, or B == 1 and 2 <= S <= 8 (verify), without expert bias; the
+/// 2 <= B <= 8, or B == 1 and 2 <= S <= 8 (verify), without expert bias or a clamp; the
 /// single-row gatherQmv at B == 1; the sorted chain otherwise, and whenever a
 /// stand-in diagnostic wants the stock path.
-fn moeDecodeDispatchArm(B: c_int, S: c_int, K: c_int, has_expert_bias: bool) MoeDecodeDispatchArm {
+fn moeDecodeDispatchArm(B: c_int, S: c_int, K: c_int, has_expert_bias: bool, clamped: bool) MoeDecodeDispatchArm {
+    // A per-expert bias or a clamped SwiGLU: the fused rows kernels apply neither, only the composed chain does.
+    const composed = has_expert_bias or clamped;
     const total_inds: c_int = B * S * K;
-    const do_sort = B * S > 1 or total_inds >= 64 or has_expert_bias;
-    const stock = has_expert_bias or qwen4Standin().moe_gateup or qwen4Standin().moe_down;
+    const do_sort = B * S > 1 or total_inds >= 64 or composed;
+    const stock = composed or qwen4Standin().moe_gateup or qwen4Standin().moe_down;
     if (S == 1 and B >= 2 and B <= 8 and moeRowsFusedEnabled() and !stock) return .rows;
     if (B == 1 and S >= 2 and S <= 8 and moeVerifyRowsEnabled() and !stock) return .rows;
     if (do_sort) return .sorted;
@@ -42072,9 +42143,11 @@ pub fn gatherQmvGateUpRows(
     bits: u32,
     group_size: u32,
     mode: QuantMode,
+    gate_scale: ?mlx.mlx_array,
 ) !?mlx.mlx_array {
     if (!gatherQmvGateUpEnabled()) return null;
     if (!moeRowsFusedEnabled()) return null;
+    if (gate_scale != null and mode != .nvfp4) return null;
     if (!mlx.streamIsGpu(s) or envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
@@ -42111,7 +42184,8 @@ pub fn gatherQmvGateUpRows(
     const sgs_per_tg: c_int = 8;
     if (@rem(N, sgs_per_tg) != 0) return null;
 
-    const key = GateUpRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd };
+    if (gate_scale) |g| if (mlx.mlx_array_dtype(g) != xd) return null;
+    const key = GateUpRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .gscale = gate_scale != null };
     if (gateup_rows_cfg == null or !std.meta.eql(gateup_rows_cfg_key, key)) {
         if (gateup_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -42124,6 +42198,7 @@ pub fn gatherQmvGateUpRows(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", affineQmvPackUnits(K, bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TOPK", topk));
+        if (nvfp4) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GSCALE", @intFromBool(gate_scale != null)));
         gateup_rows_cfg = config;
         gateup_rows_cfg_key = key;
     }
@@ -42132,7 +42207,8 @@ pub fn gatherQmvGateUpRows(
     const K_arr = cachedScalarInt(K);
     const N_arr = cachedScalarInt(N);
     const affine_inputs = [_]mlx.mlx_array{ x, gw, gs_arr, gb, uw, us_arr, ub, inds, sigtab, K_arr, N_arr };
-    const nvfp4_inputs = [_]mlx.mlx_array{ x, gw, gs_arr, uw, us_arr, inds, sigtab, K_arr, N_arr };
+    // Without a gate scale the kernel never reads `gsc`; any array binds.
+    const nvfp4_inputs = [_]mlx.mlx_array{ x, gw, gs_arr, uw, us_arr, inds, sigtab, K_arr, N_arr, gate_scale orelse sigtab };
     const inputs_arr: []const mlx.mlx_array = if (nvfp4) &nvfp4_inputs else &affine_inputs;
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs_arr.ptr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -43073,8 +43149,8 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
         // correctly.
         try mlx.check(mlx.mlx_gather_mm(res, x, w, lhs_idx, rhs_idx, false, s));
     } else {
-        if (sorted and lhs_idx.ctx == null and (mode == .affine or mode == .mxfp4)) {
-            if (try gather_qmm_nax.sortedGather(x, w, sc, bi, rhs_idx, bits, group_size, mode == .mxfp4, verifyQmmNaxAvailable(), s)) |out| {
+        if (sorted and lhs_idx.ctx == null and (mode == .affine or mode.isFp4())) {
+            if (try gather_qmm_nax.sortedGather(x, w, sc, bi, rhs_idx, bits, group_size, mode.isFp4(), verifyQmmNaxAvailable(), s)) |out| {
                 _ = mlx.mlx_array_free(res.*);
                 res.* = out;
                 return;
@@ -44273,6 +44349,10 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     // affine. Checked BEFORE the legacy null-bias heuristic below, which
     // would misroute e.g. an nvfp4 weight to mxfp8.
     if (mode != .affine) {
+        if (mode == .mxfp8) {
+            if (try mxfp8_qmv.linear(x, w, sc, s)) |y| return y;
+            if (try prefillDqGemm(x, w, sc, bi, bits, group_size, mode, s)) |py| return py;
+        }
         var result = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(result);
         try mlx.check(mlx.mlx_quantized_matmul(
@@ -44337,7 +44417,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
 
     // Prefill-width fast path: M >= 2048 dequantizes + runs the steel bf16
     // GEMM (see prefillDqGemm) — stock qmm_t's 32x32x32 tile dead zone.
-    if (try prefillDqGemm(x, w, sc, bi, bits, group_size, s)) |py| return py;
+    if (try prefillDqGemm(x, w, sc, bi, bits, group_size, .affine, s)) |py| return py;
 
     var result = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(result);
@@ -44358,7 +44438,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
 
 /// The dequant+GEMM prefill route (see the block comment above
 /// prefillDqGemmEnabled). Returns null when the call must stay on stock qmm.
-fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!prefillDqGemmEnabled()) return null;
     switch (bits) {
         2, 3, 4, 5, 6, 8 => {},
@@ -44374,7 +44454,7 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
 
     var dq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dq);
-    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = xd, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = xd, .has_value = true }, s));
     var dq_t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dq_t);
     try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
@@ -44654,6 +44734,27 @@ test "a quantized block_inject_weight loads as the dense checkpoint holding its 
         }
         try std.testing.expectEqual(@as(f32, 0), try maxAbsDiffF32(flats[0], flats[1], s));
     };
+}
+
+test "dense hc weights read as packed bf16 rows only when both are bf16" {
+    const s = mlx.gpuStream();
+    const alloc = std.testing.allocator;
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |a| _ = mlx.mlx_array_free(a);
+        owned.deinit(alloc);
+    }
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float16 }) |dt| {
+        var w = Weights.init(alloc);
+        defer w.deinit();
+        for ([_][]const u8{ "hc.input_mix_weight_down.weight", "hc.input_mix_weight_up.weight", "hc.hc_norm.weight" }, [_][2]c_int{ .{ 8, 256 }, .{ 256, 8 }, .{ 256, 1 } }) |name, sh| {
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_ones(&a, &sh, if (sh[1] == 1) 1 else 2, dt, s));
+            try w.map.put(try alloc.dupe(u8, name), a);
+        }
+        const hw = try loadHcWeights(&w, "hc", false, 4, 64, &owned, alloc, s);
+        try std.testing.expectEqual(dt == .bfloat16, hw.down_rows.ctx != null and hw.up_rows.ctx != null);
+    }
 }
 
 test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row kernels, 3-bit is not; vision and mtp never count" {
@@ -44964,6 +45065,10 @@ pub fn loadRoutedMoeAt(weights: *const Weights, name_buf: *[256]u8, base: []cons
         .route_norm = config.moe_route_norm,
         .route_scale = config.router_scaling_factor,
         .shared_ungated = true,
+        // ModelOpt NVFP4 banks: each expert's gate scale and its up x down product.
+        .per_expert_scale = getWeightAtOpt(weights, name_buf, base, "mlp.switch_mlp.expert_scale"),
+        .gate_expert_scale = getWeightAtOpt(weights, name_buf, base, "mlp.switch_mlp.gate_proj.expert_scale") orelse .{ .ctx = null },
+        .up_expert_scale = getWeightAtOpt(weights, name_buf, base, "mlp.switch_mlp.up_proj.expert_scale") orelse .{ .ctx = null },
     };
     try maybeTransposeForBf16(&mw.router_w, mw.router_s, owned_bf16, allocator, s);
     // GLM-5-Next routes in f32 (`moe_router_dtype`).
@@ -49546,11 +49651,15 @@ test "computeQuantParams resolves an fp override INSIDE the fp family (mxfp8 emb
     try testing.expectEqual(@as(u32, 4), qp_odd.bits);
     try testing.expectEqual(@as(u32, 32), qp_odd.group_size);
 
-    // No inner-dim hint ⇒ nothing to solve against; config stands (every
-    // non-hinted fp call site keeps its pre-fix behavior).
+    // No inner-dim hint: bits x group_size (256 / 128 / 64) still names one fp format.
     const qp_nohint = computeQuantParams(&cfg, we, se, null);
-    try testing.expectEqual(QuantMode.mxfp4, qp_nohint.mode);
-    try testing.expectEqual(@as(u32, 4), qp_nohint.bits);
+    try testing.expectEqual(QuantMode.mxfp8, qp_nohint.mode);
+    try testing.expectEqual(@as(u32, 8), qp_nohint.bits);
+    const qp_nohint_nv = computeQuantParams(&cfg, wl, s_nv, null);
+    try testing.expectEqual(QuantMode.nvfp4, qp_nohint_nv.mode);
+    try testing.expectEqual(@as(u32, 16), qp_nohint_nv.group_size);
+    const qp_nohint_odd = computeQuantParams(&cfg, wl, s_odd, null);
+    try testing.expectEqual(QuantMode.mxfp4, qp_nohint_odd.mode);
 }
 
 test "computeQuantParams resolves mixed nvfp4 + affine-override weights" {
@@ -51341,8 +51450,9 @@ test "fused residual+RMSNorm declines what it cannot reproduce" {
     try testing.expect((try fusedAddRmsNorm(s, a, small, w, eps)) == null);
 }
 
-test "fused hyper-connection read matches the op chain per element, at every packed width" {
+test "fused hyper-connection read matches the op chain per element, at every packed width and dense bf16" {
     for ([_]u32{ 4, 5, 6, 8 }) |bits| for ([_]u32{ 64, 128 }) |gs| try hcFusedReadParity(bits, gs);
+    try hcFusedReadParity(16, 64);
 }
 
 fn hcFusedReadParity(bits: u32, gs: u32) !void {
@@ -51375,6 +51485,13 @@ fn hcFusedReadParity(bits: u32, gs: u32) !void {
             var wb = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(wb);
             try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, st));
+            if (qbits == 16) {
+                // Dense: the kernel reads the bf16 [rows, cols] bytes as words; the chain multiplies wb^T.
+                var q: Q = .{ .w = mlx.mlx_array_new(), .sc = .{ .ctx = null }, .bi = mlx.mlx_array_new() };
+                try mlx.check(mlx.mlx_view(&q.w, wb, .uint32, st));
+                try mlx.check(mlx.mlx_transpose(&q.bi, wb, st));
+                return q;
+            }
             var triple = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(triple);
             try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(@intCast(qgs)), mlx.mlx_optional_int.some(@intCast(qbits)), "affine", .{}, st));
@@ -51439,7 +51556,11 @@ fn hcFusedReadParity(bits: u32, gs: u32) !void {
     var n_flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(n_flat);
     try mlx.check(mlx.mlx_reshape(&n_flat, n4, &flat_shape, 3, s));
-    const d = try qmatmulBits(n_flat, down.w, down.sc, down.bi, bits, gs, .affine, s);
+    const d = if (bits == 16) blk: {
+        var m = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_matmul(&m, n_flat, down.bi, s));
+        break :blk m;
+    } else try qmatmulBits(n_flat, down.w, down.sc, down.bi, bits, gs, .affine, s);
     defer _ = mlx.mlx_array_free(d);
     var dsig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dsig);
@@ -51447,7 +51568,11 @@ fn hcFusedReadParity(bits: u32, gs: u32) !void {
     var act = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(act);
     try mlx.check(mlx.mlx_multiply(&act, d, dsig, s));
-    const u = try qmatmulBits(act, up.w, up.sc, up.bi, bits, gs, .affine, s);
+    const u = if (bits == 16) blk: {
+        var m = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_matmul(&m, act, up.bi, s));
+        break :blk m;
+    } else try qmatmulBits(act, up.w, up.sc, up.bi, bits, gs, .affine, s);
     defer _ = mlx.mlx_array_free(u);
     var uu4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(uu4);
@@ -51473,7 +51598,7 @@ fn hcFusedReadParity(bits: u32, gs: u32) !void {
     defer _ = mlx.mlx_array_free(ref_inj);
     try mlx.check(mlx.mlx_multiply(&ref_inj, isig, two, s));
 
-    const got = (try hcReadFused(s, x, 1, 1, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, null)) orelse return error.HcFusedDeclined;
+    const got = (try hcReadFused(s, x, 1, 1, nw, down.w, down.sc, if (bits == 16) .{ .ctx = null } else down.bi, up.w, up.sc, if (bits == 16) .{ .ctx = null } else up.bi, iw, eps, HC, H, bits, gs, null)) orelse return error.HcFusedDeclined;
     defer {
         _ = mlx.mlx_array_free(got.mixed);
         _ = mlx.mlx_array_free(got.inj);
@@ -51534,12 +51659,12 @@ fn hcFusedReadParity(bits: u32, gs: u32) !void {
     var ref_stream = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ref_stream);
     try mlx.check(mlx.mlx_reshape(&ref_stream, sum4, &flat_shape, 3, s));
-    const plain = (try hcReadFused(s, ref_stream, 1, 1, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, null)) orelse return error.HcFusedDeclined;
+    const plain = (try hcReadFused(s, ref_stream, 1, 1, nw, down.w, down.sc, if (bits == 16) .{ .ctx = null } else down.bi, up.w, up.sc, if (bits == 16) .{ .ctx = null } else up.bi, iw, eps, HC, H, bits, gs, null)) orelse return error.HcFusedDeclined;
     defer {
         _ = mlx.mlx_array_free(plain.mixed);
         _ = mlx.mlx_array_free(plain.inj);
     }
-    const pend = (try hcReadFused(s, x, 1, 1, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, .{ .out = wo, .inj = wi })) orelse return error.HcFusedDeclined;
+    const pend = (try hcReadFused(s, x, 1, 1, nw, down.w, down.sc, if (bits == 16) .{ .ctx = null } else down.bi, up.w, up.sc, if (bits == 16) .{ .ctx = null } else up.bi, iw, eps, HC, H, bits, gs, .{ .out = wo, .inj = wi })) orelse return error.HcFusedDeclined;
     defer {
         _ = mlx.mlx_array_free(pend.mixed);
         _ = mlx.mlx_array_free(pend.inj);
@@ -51559,7 +51684,7 @@ fn hcFusedReadParity(bits: u32, gs: u32) !void {
     defer _ = mlx.mlx_array_free(wo3);
     const wi3 = try bf16Random(allocator, rnd, s, &.{ 1, 3, HC, 1 }, 1.0, 1.0);
     defer _ = mlx.mlx_array_free(wi3);
-    const rows3 = (try hcReadFused(s, x3, 1, 3, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, .{ .out = wo3, .inj = wi3 })) orelse return error.HcFusedDeclined;
+    const rows3 = (try hcReadFused(s, x3, 1, 3, nw, down.w, down.sc, if (bits == 16) .{ .ctx = null } else down.bi, up.w, up.sc, if (bits == 16) .{ .ctx = null } else up.bi, iw, eps, HC, H, bits, gs, .{ .out = wo3, .inj = wi3 })) orelse return error.HcFusedDeclined;
     defer {
         _ = mlx.mlx_array_free(rows3.mixed);
         _ = mlx.mlx_array_free(rows3.inj);
@@ -51592,7 +51717,7 @@ fn hcFusedReadParity(bits: u32, gs: u32) !void {
         defer _ = mlx.mlx_array_free(wir);
         const st4 = [_]c_int{ 1, 1, 1, 1 };
         try mlx.check(mlx.mlx_slice(&wir, wi3, &[_]c_int{ 0, rc, 0, 0 }, 4, &[_]c_int{ 1, rc + 1, HC, 1 }, 4, &st4, 4, s));
-        const one = (try hcReadFused(s, xr, 1, 1, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, .{ .out = wor, .inj = wir })) orelse return error.HcFusedDeclined;
+        const one = (try hcReadFused(s, xr, 1, 1, nw, down.w, down.sc, if (bits == 16) .{ .ctx = null } else down.bi, up.w, up.sc, if (bits == 16) .{ .ctx = null } else up.bi, iw, eps, HC, H, bits, gs, .{ .out = wor, .inj = wir })) orelse return error.HcFusedDeclined;
         defer {
             _ = mlx.mlx_array_free(one.mixed);
             _ = mlx.mlx_array_free(one.inj);
@@ -51602,7 +51727,7 @@ fn hcFusedReadParity(bits: u32, gs: u32) !void {
         try expectRowsExact(allocator, s, rows3.inj, one.inj, r, @intCast(HC));
         try expectRowsExact(allocator, s, rows3.stream, one.stream, r, @intCast(K));
     }
-    try testing.expect((try hcReadFused(s, x3, 1, 17, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, null)) == null);
+    try testing.expect((try hcReadFused(s, x3, 1, 17, nw, down.w, down.sc, if (bits == 16) .{ .ctx = null } else down.bi, up.w, up.sc, if (bits == 16) .{ .ctx = null } else up.bi, iw, eps, HC, H, bits, gs, null)) == null);
 
     if (bits != 8 or gs != 64) return;
     // 8-bit rows take the vectorized up launch at every row count (an evaluated, aligned up weight; a lazy one has no data
@@ -51881,17 +52006,30 @@ test "moe decode dispatch: rows vs sorted vs gatherQmv" {
     const K: c_int = 10;
     var b: c_int = 2;
     while (b <= 8) : (b += 1) {
-        try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(b, 1, K, false));
+        try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(b, 1, K, false, false));
     }
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(9, 1, K, false));
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, K, false));
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, true));
-    try std.testing.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(9, 1, K, false, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, K, false, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, true, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, K, false, false));
     qwen4_standin_override = .{ .moe_gateup = true };
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false, false));
     qwen4_standin_override = .{ .moe_down = true };
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false, false));
     qwen4_standin_override = .{};
+}
+
+test "moe dispatch: a clamped SwiGLU declines the rows arm, at batched decode and at verify widths" {
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    qwen4_standin_override = .{};
+    defer qwen4_standin_override = null;
+    // The rows kernels apply no clamp (GLM-5.3's limit 10): the composed chain runs instead.
+    try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(4, 1, 10, false, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, 10, false, true));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(8, 1, 10, false, true));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(1, 4, 10, false, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, 10, false, true));
 }
 
 test "moe decode dispatch: single-slot verify widths take the rows arm when enabled" {
@@ -51902,16 +52040,16 @@ test "moe decode dispatch: single-slot verify widths take the rows arm when enab
     const K: c_int = 10;
     var s: c_int = 2;
     while (s <= 8) : (s += 1) {
-        try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(1, s, K, false));
+        try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(1, s, K, false, false));
     }
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 9, K, false));
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, true));
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 4, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 9, K, false, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, true, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 4, K, false, false));
     qwen4_standin_override = .{ .moe_gateup = true };
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false, false));
     qwen4_standin_override = .{};
     moe_verify_rows_override = false;
-    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false, false));
 
     try std.testing.expect(moeVerifyRowsFor(null));
     try std.testing.expect(!moeVerifyRowsFor("0"));
@@ -51959,7 +52097,7 @@ test "gatherQmvGateUpRows accepts N=8 K=10" {
     var ub = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ub);
     try mlx.check(mlx.mlx_zeros(&ub, &ssh, 3, .bfloat16, s));
-    const got = (try gatherQmvGateUpRows(s, x, gw, gscl, gb, uw, uscl, ub, inds, bits, gs, .affine)) orelse return error.FusedDeclined;
+    const got = (try gatherQmvGateUpRows(s, x, gw, gscl, gb, uw, uscl, ub, inds, bits, gs, .affine, null)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(got);
 }
 
@@ -52004,7 +52142,7 @@ test "moe rows fused: N=1 is byte-identical to the single-row kernel" {
     defer _ = mlx.mlx_array_free(inds2);
     const solo_gu = (try gatherQmvGateUp(s, x1, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds1, bits, gs, .affine, 0)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(solo_gu);
-    const rows_gu = (try gatherQmvGateUpRows(s, xrow, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds2, bits, gs, .affine)) orelse return error.FusedDeclined;
+    const rows_gu = (try gatherQmvGateUpRows(s, xrow, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds2, bits, gs, .affine, null)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(rows_gu);
     var rows_gu_2d = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(rows_gu_2d);
@@ -52072,7 +52210,7 @@ fn moeRowsFusedCase(s: mlx.mlx_stream, rnd: std.Random, E: c_int, hid: c_int, in
     defer _ = mlx.mlx_array_free(inds);
     const scores = try attn256RandBf16(rnd, &[_]c_int{ nrows, topk }, s);
     defer _ = mlx.mlx_array_free(scores);
-    const fused_gu = (try gatherQmvGateUpRows(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, bits, gs, .affine)) orelse return error.FusedDeclined;
+    const fused_gu = (try gatherQmvGateUpRows(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, inds, bits, gs, .affine, null)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(fused_gu);
     const fused_dn = (try gatherQmvDownReduceRows(s, fused_gu, down.w, down.sc, down.bi, inds, scores, dbits, dgs, .affine)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(fused_dn);
@@ -52095,6 +52233,147 @@ fn moeRowsFusedCase(s: mlx.mlx_stream, rnd: std.Random, E: c_int, hid: c_int, in
         defer _ = mlx.mlx_array_free(fused_dr);
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(fused_dr, solo_dn, s));
     }
+}
+
+test "moe rows fused nvfp4: verify rows with per-expert gate scales match fp32 truth" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x4E5F);
+    const rnd = prng.random();
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gqmv_gateup_override = true;
+    defer gqmv_gateup_override = null;
+    downred_override = true;
+    defer downred_override = null;
+    const E: c_int = 16;
+    const H: c_int = 2560;
+    const I: c_int = 640;
+    const R: c_int = 5;
+    const TOPK: c_int = 10;
+    var tr = std.ArrayList(mlx.mlx_array).empty;
+    defer {
+        for (tr.items) |a| _ = mlx.mlx_array_free(a);
+        tr.deinit(testing.allocator);
+    }
+    const P = struct {
+        fn keep(list: *std.ArrayList(mlx.mlx_array), a: mlx.mlx_array) !mlx.mlx_array {
+            try list.append(testing.allocator, a);
+            return a;
+        }
+    };
+    var banks: [3][2]mlx.mlx_array = undefined;
+    var deq: [3]mlx.mlx_array = undefined;
+    for (&banks, &deq, [3][3]c_int{ .{ E, I, H }, .{ E, I, H }, .{ E, H, I } }) |*b, *d, sh| {
+        const w = try P.keep(&tr, try attn256RandBf16(rnd, &sh, s));
+        var pair = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(pair);
+        try mlx.check(mlx.mlx_quantize(&pair, w, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{}, s));
+        for (b, 0..) |*x, i| {
+            x.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(x, pair, i));
+            _ = try P.keep(&tr, x.*);
+        }
+        var dq = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_dequantize(&dq, b[0], b[1], .{ .ctx = null }, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+        d.* = try P.keep(&tr, dq);
+    }
+    const gsc = try P.keep(&tr, try attn256RandBf16(rnd, &[_]c_int{E}, s));
+    const x = try P.keep(&tr, try attn256RandBf16(rnd, &[_]c_int{ R, H }, s));
+    const scores = try P.keep(&tr, try attn256RandBf16(rnd, &[_]c_int{ R, TOPK }, s));
+    var idata: [R * TOPK]u32 = undefined;
+    for (&idata, 0..) |*v, i| v.* = @intCast((i * 7 + i / 10) % 16);
+    const inds = try P.keep(&tr, mlx.mlx_array_new_data(&idata, &[_]c_int{ R, TOPK }, 2, .uint32));
+
+    const gu = (try gatherQmvGateUpRows(s, x, banks[0][0], banks[0][1], .{ .ctx = null }, banks[1][0], banks[1][1], .{ .ctx = null }, inds, 4, 16, .nvfp4, gsc)) orelse return error.FusedDeclined;
+    _ = try P.keep(&tr, gu);
+    const got = (try gatherQmvDownReduceRows(s, gu, banks[2][0], banks[2][1], .{ .ctx = null }, inds, scores, 4, 16, .nvfp4)) orelse return error.FusedDeclined;
+    _ = try P.keep(&tr, got);
+
+    // Truth in f32: per (row, slot) y += s * Wd (silu(gsc_e * Wg x) * Wu x).
+    var a = mlx.mlx_array_new();
+    const flat = blk: {
+        try mlx.check(mlx.mlx_reshape(&a, inds, &.{R * TOPK}, 1, s));
+        break :blk try P.keep(&tr, a);
+    };
+    var sel: [3]mlx.mlx_array = undefined;
+    for (&sel, deq) |*o, d| {
+        a = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_take_axis(&a, d, flat, 0, s));
+        o.* = try P.keep(&tr, a);
+    }
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&a, x, .float32, s));
+    const x32 = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&a, x32, &.{ R, 1, H, 1 }, 4, s));
+    const x4 = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_broadcast_to(&a, x4, &.{ R, TOPK, H, 1 }, 4, s));
+    const xb = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&a, xb, &.{ R * TOPK, H, 1 }, 3, s));
+    const xr = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_matmul(&a, sel[0], xr, s));
+    const g = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_take_axis(&a, gsc, flat, 0, s));
+    const ge = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&a, ge, .float32, s));
+    const ge32 = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&a, ge32, &.{ R * TOPK, 1, 1 }, 3, s));
+    const ge3 = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&a, g, ge3, s));
+    const gs = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_sigmoid(&a, gs, s));
+    const sg = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&a, gs, sg, s));
+    const silu = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_matmul(&a, sel[1], xr, s));
+    const u = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&a, silu, u, s));
+    const act = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_matmul(&a, sel[2], act, s));
+    const dn = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&a, scores, .float32, s));
+    const s32 = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&a, s32, &.{ R * TOPK, 1, 1 }, 3, s));
+    const s3 = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&a, dn, s3, s));
+    const wd = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&a, wd, &.{ R, TOPK, H }, 3, s));
+    const wd3 = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_sum_axis(&a, wd3, 1, false, s));
+    const truth = try P.keep(&tr, a);
+    a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&a, got, .float32, s));
+    const got32 = try P.keep(&tr, a);
+    try mlx.check(mlx.mlx_array_eval(truth));
+    try mlx.check(mlx.mlx_array_eval(got32));
+    const pt = mlx.mlx_array_data_float32(truth).?;
+    const pg = mlx.mlx_array_data_float32(got32).?;
+    var se: f64 = 0;
+    var st: f64 = 0;
+    for (0..@intCast(R * H)) |i| {
+        se += (pg[i] - pt[i]) * (pg[i] - pt[i]);
+        st += pt[i] * pt[i];
+    }
+    const rel = @sqrt(se / st);
+    std.debug.print("[moe-rows] nvfp4 R={d} gate-scaled rel rms vs fp32 truth {d:.5}\n", .{ R, rel });
+    try testing.expect(rel < 0.02);
 }
 
 test "down+reduce lanes per row: 16 on G17, 8 on every other generation and on phones" {
@@ -53173,7 +53452,7 @@ test "prefillDqGemm: 2-bit weights take the dequant route from 384 rows, other w
             defer _ = mlx.mlx_array_free(x);
             try mlx.check(mlx.mlx_zeros(&x, &[_]c_int{ 1, m, K }, 3, .float16, s));
             const before = prefill_dq_gemm_engaged;
-            const y = try prefillDqGemm(x, wq, sc, bi, bits, gs, s);
+            const y = try prefillDqGemm(x, wq, sc, bi, bits, gs, .affine, s);
             defer if (y) |a| {
                 _ = mlx.mlx_array_free(a);
             };
@@ -53183,7 +53462,7 @@ test "prefillDqGemm: 2-bit weights take the dequant route from 384 rows, other w
     }
 }
 
-test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engaged + no worse than stock)" {
+fn expectDqRoute(mode: QuantMode, bits: u32, gs: u32) !void {
     const s = mlx.gpuStream();
     const al = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xD0DE);
@@ -53192,7 +53471,7 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
     const N: c_int = 384;
     const M: c_int = @intCast(PREFILL_DQ_GEMM_MIN_M);
 
-    // Random bf16 weight quantized to affine q4 gs64 (the 27B trunk class).
+    // Random bf16 weight quantized in `mode` (affine q4 gs64 is the 27B trunk class).
     const wn: usize = @intCast(N * K);
     const wbuf = try al.alloc(f32, wn);
     for (wbuf) |*v| v.* = bf16Trunc(rnd.float(f32) - 0.5);
@@ -53205,7 +53484,7 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
     try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
     var triple = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(triple);
-    try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), .{}, s));
     var wq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wq);
     var wsc = mlx.mlx_array_new();
@@ -53214,7 +53493,7 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
     defer _ = mlx.mlx_array_free(wbi);
     try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
     try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
-    try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+    if (mode == .affine) try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
 
     const xn: usize = @intCast(M * K);
     const xbuf = try al.alloc(f32, xn);
@@ -53230,7 +53509,7 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
     // f32 ground truth: fp32 dequant + fp32 GEMM.
     var wdq32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wdq32);
-    try mlx.check(mlx.mlx_dequantize(&wdq32, wq, wsc, wbi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&wdq32, wq, wsc, wbi, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .float32, .has_value = true }, s));
     var wdq32_t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wdq32_t);
     try mlx.check(mlx.mlx_transpose(&wdq32_t, wdq32, s));
@@ -53243,7 +53522,7 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
 
     // Stock qmm (route forced off).
     prefill_dq_gemm_override = false;
-    const stock = try qmatmulBits(x, wq, wsc, wbi, 4, 64, .affine, s);
+    const stock = try qmatmulBits(x, wq, wsc, wbi, bits, gs, mode, s);
     defer _ = mlx.mlx_array_free(stock);
     const stock_f = try evalToF32(al, stock, on, s);
     defer al.free(stock_f);
@@ -53252,7 +53531,7 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
     prefill_dq_gemm_override = true;
     defer prefill_dq_gemm_override = null;
     const before = prefill_dq_gemm_engaged;
-    const routed = try qmatmulBits(x, wq, wsc, wbi, 4, 64, .affine, s);
+    const routed = try qmatmulBits(x, wq, wsc, wbi, bits, gs, mode, s);
     defer _ = mlx.mlx_array_free(routed);
     try testing.expectEqual(before + 1, prefill_dq_gemm_engaged);
     const routed_f = try evalToF32(al, routed, on, s);
@@ -53281,10 +53560,18 @@ test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engag
         try mlx.check(mlx.mlx_astype(&x8, x8_32, .bfloat16, s));
     }
     const small_before = prefill_dq_gemm_engaged;
-    const small = try qmatmulBits(x8, wq, wsc, wbi, 4, 64, .affine, s);
+    const small = try qmatmulBits(x8, wq, wsc, wbi, bits, gs, mode, s);
     defer _ = mlx.mlx_array_free(small);
     try mlx.check(mlx.mlx_array_eval(small));
     try testing.expectEqual(small_before, prefill_dq_gemm_engaged);
+}
+
+test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engaged + no worse than stock)" {
+    try expectDqRoute(.affine, 4, 64);
+}
+
+test "qmatmulBits: prefill-width MXFP8 calls take the dequant+GEMM route (engaged + no worse than stock)" {
+    try expectDqRoute(.mxfp8, 8, 32);
 }
 
 test "qmatmulBits nvfp4 matches dequantize+matmul reference" {
@@ -66385,7 +66672,7 @@ test "qwen4 fixture bf16: residual streams track a bf16 reference (QWEN4_FIXTURE
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
     defer if (config.ngram_table_path) |p| allocator.free(p);
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
@@ -73447,6 +73734,33 @@ test "mimo_v2 fixture: one-shot and chunked prefill + decode vs modeling_mimo_v2
     try testing.expect(worst > 0.995 and agree == @as(usize, @intCast(T - t_pre)));
 }
 
+test "glm5_next KDA q/k norm equals fla's l2norm on keys as small as the checkpoint's" {
+    // Bar: the prework's rms_norm(x, gdnQkNormEps) / sqrt(dk) is x / sqrt(sum(x^2) + 1e-6) within 1e-4.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const cfg: model_mod.ModelConfig = .{ .model_type = "glm5_next", .linear_key_head_dim = 128 };
+    const dk: usize = 128;
+    var prng = std.Random.DefaultPrng.init(7);
+    var xv: [4 * dk]f32 = undefined;
+    for (&xv) |*x| x.* = 0.005 * prng.random().floatNorm(f32);
+    const x = mlx.mlx_array_new_data(&xv, &[_]c_int{ 4, @intCast(dk) }, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    var ones = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones);
+    try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{@intCast(dk)}, 1, .float32, s));
+    var n = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(n);
+    try mlx.check(mlx.mlx_fast_rms_norm(&n, x, ones, cfg.gdnQkNormEps(), s));
+    const got = try qwen4ReadF32(testing.allocator, n, s);
+    defer testing.allocator.free(got);
+    for (0..4) |r| {
+        var sum: f64 = 0;
+        for (xv[r * dk ..][0..dk]) |v| sum += @as(f64, v) * v;
+        const inv = 1.0 / @sqrt(sum + 1e-6);
+        for (0..dk) |i| try testing.expectApproxEqRel(xv[r * dk + i] * inv, got[r * dk + i] / @sqrt(@as(f64, dk)), 1e-4);
+    }
+}
+
 test "glm5_next fixture: one-shot and chunked prefill + decode vs mlx-vlm glm5_next (GLM5_MODEL, GLM5_FIXTURE)" {
     // A tiny random GLM-5-Next in the published layout (tests/dump_glm5_next_fixtures.py);
     // logits from mlx-vlm's glm5_next in bf16. 40 tokens in 4-token pools against a
@@ -73462,7 +73776,7 @@ test "glm5_next fixture: one-shot and chunked prefill + decode vs mlx-vlm glm5_n
     const io = std.Io.Threaded.global_single_threaded.io();
 
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
@@ -73542,7 +73856,7 @@ test "glm5_next DFlash capture: the tapped layers' hyper-connection mean tracks 
     const io = std.Io.Threaded.global_single_threaded.io();
 
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
@@ -73738,7 +74052,7 @@ test "glm5_next batched decode: a three-slot tick tracks three serial decodes (G
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, allocator, config, &weights);
@@ -73955,14 +74269,14 @@ test "mimo decode copies: a short prompt chunk prefills dense, a verify window r
     try testing.expect(!mimoDecodeCopies(true, 2, false, false, 1));
 }
 
-/// The MXFP4 MoE decode kernels bake plain `silu(gate) * up` and read no expert biases:
-/// a pack with either keeps the composed chain, like the row kernels below it.
-/// `clamp` is `swigluClampLimit`: 0 = no clamp, null = a clamp no kernel serves.
-fn moeFp4DecodeEligible(rows: c_int, has_expert_bias: bool, clamp: ?u32, gate: model_mod.QuantMode, up: model_mod.QuantMode, down: model_mod.QuantMode) bool {
-    return rows <= moe_fp4.MAX_ROWS and !has_expert_bias and (clamp orelse 1) == 0 and gate == .mxfp4 and up == .mxfp4 and down == .mxfp4;
+/// The fp4 MoE decode kernels read no expert biases, and apply a SwiGLU clamp only as a whole-number
+/// limit: a pack with a bias, or `clamp` null (`swigluClampLimit`: a clamp no kernel serves), keeps the
+/// composed chain, as does an activation that is not 16-bit (the SwiGLU table covers 16-bit patterns).
+fn moeFp4DecodeEligible(rows: c_int, has_expert_bias: bool, clamp: ?u32, act: mlx.mlx_dtype, gate: model_mod.QuantMode, up: model_mod.QuantMode, down: model_mod.QuantMode) bool {
+    return rows <= moe_fp4.MAX_ROWS and !has_expert_bias and clamp != null and (act == .bfloat16 or act == .float16) and (gate == .mxfp4 or gate == .nvfp4) and up == gate and down == gate;
 }
 
-test "moe fp4 decode: expert biases or a clamped SwiGLU keep the composed chain" {
+test "moe fp4 decode: expert biases or a clamp no kernel serves keep the composed chain" {
     var cfg: ModelConfig = undefined;
     cfg.swiglu_limit = 0;
     cfg.swiglu_clamp = false;
@@ -73970,12 +74284,17 @@ test "moe fp4 decode: expert biases or a clamped SwiGLU keep the composed chain"
     cfg.swiglu_limit = 10;
     cfg.swiglu_clamp = true;
     try testing.expectEqual(@as(?u32, 10), swigluClampLimit(&cfg));
-    try testing.expect(moeFp4DecodeEligible(1, false, 0, .mxfp4, .mxfp4, .mxfp4));
-    try testing.expect(!moeFp4DecodeEligible(1, true, 0, .mxfp4, .mxfp4, .mxfp4));
-    try testing.expect(!moeFp4DecodeEligible(1, false, 10, .mxfp4, .mxfp4, .mxfp4));
-    try testing.expect(!moeFp4DecodeEligible(1, false, null, .mxfp4, .mxfp4, .mxfp4));
-    try testing.expect(!moeFp4DecodeEligible(1, false, 0, .affine, .mxfp4, .mxfp4));
-    try testing.expect(!moeFp4DecodeEligible(moe_fp4.MAX_ROWS + 1, false, 0, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(moeFp4DecodeEligible(1, false, 0, .bfloat16, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, true, 0, .bfloat16, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(moeFp4DecodeEligible(1, false, 10, .bfloat16, .nvfp4, .nvfp4, .nvfp4));
+    // An f32 stream (an f32 norm weight upstream) has no sigmoid table: decline, never throw.
+    try testing.expect(!moeFp4DecodeEligible(1, false, 0, .float32, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(moeFp4DecodeEligible(1, false, 0, .float16, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, false, null, .bfloat16, .mxfp4, .mxfp4, .mxfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, false, 0, .bfloat16, .affine, .mxfp4, .mxfp4));
+    try testing.expect(moeFp4DecodeEligible(1, false, 0, .bfloat16, .nvfp4, .nvfp4, .nvfp4));
+    try testing.expect(!moeFp4DecodeEligible(1, false, 0, .bfloat16, .nvfp4, .mxfp4, .nvfp4));
+    try testing.expect(!moeFp4DecodeEligible(moe_fp4.MAX_ROWS + 1, false, 0, .bfloat16, .mxfp4, .mxfp4, .mxfp4));
 }
 
 test "glm5_next: oMLX 0.7.1's layout (one fused conv1d, forget_gate.*) gives the published layout's logits bit for bit (GLM5_MODEL)" {
@@ -73989,7 +74308,7 @@ test "glm5_next: oMLX 0.7.1's layout (one fused conv1d, forget_gate.*) gives the
     const Logits = struct {
         fn of(io_: std.Io, alloc: std.mem.Allocator, cfg_in: model_mod.ModelConfig, dir: []const u8, omlx: bool, st: mlx.mlx_stream) ![]f32 {
             var cfg = cfg_in;
-            var w = try model_mod.loadWeights(io_, alloc, dir);
+            var w = try model_mod.loadModelWeights(io_, alloc, dir, &cfg, false);
             defer w.deinit();
             model_mod.resolveWeightPrefix(&cfg, &w);
             if (omlx) for (0..cfg.num_hidden_layers) |li| {

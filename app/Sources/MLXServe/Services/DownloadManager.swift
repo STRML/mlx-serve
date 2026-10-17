@@ -275,7 +275,7 @@ class DownloadManager: ObservableObject {
             // (`4bit/config.json`), never anything deeper. Chat default:
             // top-level files + the pack's `drafter/` + the MTP sidecar (native
             // `mtp/` dir, or OptiQ's single `optiq/mtp.safetensors`) + DeepSeek-V4.1's
-            // `engram/` tables (same list as `cli.shouldDownload`). Media (recursive): keep nested
+            // `engram/` tables + ModelOpt's `tensors/` shards (same list as `cli.shouldDownload`). Media (recursive): keep nested
             // weight subdirs (FLUX's transformer/vae/text_encoder, TTS's
             // speech_tokenizer).
             if let folder = selection.packFolder {
@@ -285,7 +285,7 @@ class DownloadManager: ObservableObject {
                 guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
             } else if !selection.recursive {
                 guard !path.contains("/") || path.hasPrefix("mtp/") || path.hasPrefix(DrafterGems.packFolder + "/")
-                    || path.hasPrefix("engram/") || path == "optiq/mtp.safetensors"
+                    || path.hasPrefix("engram/") || path.hasPrefix("tensors/") || path == "optiq/mtp.safetensors"
                     || indexedShards.contains(path) else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
