@@ -291,35 +291,74 @@ fn attention256Int8Impl(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v
 
 const Quantized = struct { vals: mlx.mlx_array, scales: mlx.mlx_array };
 
-/// [B, H, L, D] -> row-contiguous int8 [B, H, L, D] plus one fp32 scale per
-/// `rows`-row block (absmax / 127, the tail block zero-padded), less `mean`.
+/// One pass over a (strided) [B, H, L, 256] view: int8 codes, row-contiguous,
+/// and one fp32 scale (absmax / 127) per ROWS-row block, less `mean` when given.
+/// One simdgroup per block; each lane owns 8 of the 256 columns.
+const QUANT_SOURCE =
+    \\  const uint blk = threadgroup_position_in_grid.x;
+    \\  const uint h = threadgroup_position_in_grid.y;
+    \\  const uint b = threadgroup_position_in_grid.z;
+    \\  const uint lane = thread_index_in_simdgroup;
+    \\  const int L = x_shape[2];
+    \\  const int Hx = x_shape[1];
+    \\  const int nb = (L + ROWS - 1) / ROWS;
+    \\  const device T* base = x + b * x_strides[0] + h * x_strides[1] + lane * 8;
+    \\  const int64_t rs = x_strides[2];
+    \\  float m[8];
+    \\  for (int j = 0; j < 8; j++) m[j] = HAS_MEAN ? float(mean[(int64_t(b) * Hx + h) * 256 + lane * 8 + j]) : 0.0f;
+    \\  const int r0 = blk * ROWS;
+    \\  const int r1 = min(L, r0 + ROWS);
+    \\  float amax = 0.0f;
+    \\  for (int r = r0; r < r1; r++)
+    \\    for (int j = 0; j < 8; j++) amax = max(amax, fabs(float(base[r * rs + j]) - m[j]));
+    \\  amax = simd_max(amax);
+    \\  const float sc = max(amax, 1e-6f) / 127.0f;
+    \\  const float inv = 1.0f / sc;
+    \\  device int8_t* ob = q + (int64_t(b) * Hx + h) * int64_t(L) * 256 + lane * 8;
+    \\  for (int r = r0; r < r1; r++)
+    \\    for (int j = 0; j < 8; j++) ob[r * 256 + j] = int8_t(rint((float(base[r * rs + j]) - m[j]) * inv));
+    \\  if (lane == 0) scales[(int64_t(b) * Hx + h) * nb + blk] = sc;
+;
+
+var quant_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getQuantKernel() !mlx.mlx_fast_metal_kernel {
+    if (quant_kernel) |k| return k;
+    const ins = [_][*:0]const u8{ "x", "mean" };
+    const outs = [_][*:0]const u8{ "q", "scales" };
+    const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const k = mlx.mlx_fast_metal_kernel_new("msv_quant_rows_256", in_vec, out_vec, QUANT_SOURCE, "", false, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    quant_kernel = k;
+    return k;
+}
+
 fn quantRows(sc: *Scope, x: mlx.mlx_array, rows: c_int, mean: ?mlx.mlx_array) !Quantized {
     const sh = mlx.getShape(x);
-    const l = sh[2];
-    const lp = @divTrunc(l + rows - 1, rows) * rows;
-    var xc = try sc.astype(x, .float16);
-    if (mean) |m| xc = try sc.sub(xc, try sc.astype(m, .float16));
-    if (lp != l) {
-        var o = mlx.mlx_array_new();
-        const z = try sc.keep(mlx.mlx_array_new_float(0));
-        xc = try sc.res(mlx.mlx_pad(&o, xc, &[_]c_int{2}, 1, &[_]c_int{0}, 1, &[_]c_int{lp - l}, 1, z, "constant", sc.s), &o);
-    }
-    const blocks = try sc.reshape(xc, &.{ sh[0], sh[1], @divExact(lp, rows), rows * sh[3] });
-    var ab = mlx.mlx_array_new();
-    const absx = try sc.res(mlx.mlx_abs(&ab, blocks, sc.s), &ab);
-    var mx_ = mlx.mlx_array_new();
-    const amax = try sc.astype(try sc.res(mlx.mlx_max_axis(&mx_, absx, 3, true, sc.s), &mx_), .float32);
-    var fl = mlx.mlx_array_new();
-    const scale = try sc.mulS(try sc.res(mlx.mlx_maximum(&fl, amax, try sc.scalar(1e-6), sc.s), &fl), 1.0 / 127.0);
-    var dv = mlx.mlx_array_new();
-    const inv = try sc.res(mlx.mlx_divide(&dv, try sc.scalar(1.0), scale, sc.s), &dv);
-    const scaled = try sc.mul(blocks, try sc.astype(inv, .float16));
-    var rd = mlx.mlx_array_new();
-    const rounded = try sc.res(mlx.mlx_round(&rd, scaled, 0, sc.s), &rd);
-    const ints = try sc.reshape(try sc.astype(rounded, .int8), &.{ sh[0], sh[1], lp, sh[3] });
-    var ct = mlx.mlx_array_new();
-    const vals = try sc.res(mlx.mlx_contiguous(&ct, try sc.slice(ints, 2, 0, l), false, sc.s), &ct);
-    return .{ .vals = vals, .scales = try sc.reshape(scale, &.{-1}) };
+    const nb = @divTrunc(sh[2] + rows - 1, rows);
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, 4, .int8));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{sh[0] * sh[1] * nb}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, nb * 32, sh[1], sh[0]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", mlx.mlx_array_dtype(x)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ROWS", rows));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(c, "HAS_MEAN", mean != null));
+    const ins = [_]mlx.mlx_array{ x, mean orelse x };
+    const in_vec = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(in_vec);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, try getQuantKernel(), in_vec, c, sc.s));
+    var v = mlx.mlx_array_new();
+    const vals = try sc.res(mlx.mlx_vector_array_get(&v, outs, 0), &v);
+    var w = mlx.mlx_array_new();
+    const scales = try sc.res(mlx.mlx_vector_array_get(&w, outs, 1), &w);
+    return .{ .vals = vals, .scales = scales };
 }
 
 const testing = std.testing;
