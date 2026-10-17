@@ -1480,6 +1480,9 @@ pub const Scheduler = struct {
     boundary_depth: u8 = 0,
     /// The prefill whose chunk boundary is hosting a nested admission; counted as company for memory.
     boundary_outer: ?*Slot = null,
+    /// The request being prefilled at that boundary; in no queue, so `cancelAllInFlight` reads it here.
+    /// Guarded by `queue_mu`.
+    boundary_slot: ?*Slot = null,
     /// A running media job's estimated peak, kept off chat admitted between its steps.
     gen_reserve_bytes: u64 = 0,
 
@@ -2020,6 +2023,7 @@ pub const Scheduler = struct {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
         for (self.pending.items) |slot| slot.cancel();
+        if (self.boundary_slot) |slot| slot.cancel();
         if (self.prefilling_from < self.n_prefilling) {
             for (self.prefilling[self.prefilling_from..self.n_prefilling]) |slot| slot.cancel();
         }
@@ -2791,7 +2795,7 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
 }
 
 test "boundaryEligible: a small plain request is admitted only under a share, never nested, never beside an exclusive model" {
-    const base_cand: BoundaryCand = .{ .exclusive = false, .has_media = false, .prompt_logprobs = false, .generator_path = true, .tail = 31 };
+    const base_cand: BoundaryCand = .{ .exclusive = false, .has_media = false, .prompt_logprobs = false, .generator_path = true, .module_state = false, .tail = 31 };
     const base_ctx: BoundaryCtx = .{ .share = 0.5, .nested = false, .outer_exclusive = false, .decoding = 2, .max_concurrent = 8, .max_tail = BOUNDARY_MAX_TAIL };
     try testing.expect(boundaryEligible(base_cand, base_ctx));
 
@@ -2819,6 +2823,9 @@ test "boundaryEligible: a small plain request is admitted only under a share, ne
     try testing.expect(!boundaryEligible(c, base_ctx));
     c = base_cand;
     c.generator_path = false;
+    try testing.expect(!boundaryEligible(c, base_ctx));
+    c = base_cand;
+    c.module_state = true;
     try testing.expect(!boundaryEligible(c, base_ctx));
 
     // The limit is inclusive.
@@ -5818,18 +5825,11 @@ fn prefillAdmitted(sch: *Scheduler, slot: *Slot) AdmitOutcome {
             if (err == error.BoundaryTailTooLarge) return .tail_too_large;
             if (err == error.QsaHistoryGap and !qsa_gap_retried) {
                 if (slot.model.prefix_cache) |*hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
-                if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
-                if (slot.model.transformer) |xf| {
-                    slot.cache.truncate(0, xf.s) catch {};
-                    xf.resetQsaPooledRope();
-                    xf.qwen4MtpResetOwned(slot.enable_mtp);
-                }
+                emptySlotCache(slot);
                 if (slot.legacy_gen) |*g| {
                     g.deinit(slot.allocator);
                     slot.legacy_gen = null;
                 }
-                slot.moe_seq_offset = 0;
-                slot.cached_tokens = 0;
                 slot.skip_prefix_cache = true;
                 log.warn("[hot-cache] restored entry failed the QSA history check — dropped, cold prefill\n", .{});
                 qsa_gap_retried = true;
@@ -7788,6 +7788,8 @@ pub const BoundaryCand = struct {
     has_media: bool,
     prompt_logprobs: bool,
     generator_path: bool,
+    /// Module-side per-request state (qwen4_exp) that a declined restore would reset under the outer.
+    module_state: bool,
     /// Uncached tail, from `peekMatchedTokens`.
     tail: usize,
 };
@@ -7805,7 +7807,7 @@ pub const BoundaryCtx = struct {
 /// May this pending request be prefilled at the outer prefill's chunk boundary?
 pub fn boundaryEligible(c: BoundaryCand, x: BoundaryCtx) bool {
     if (x.share <= 0 or x.nested or x.outer_exclusive) return false;
-    if (c.exclusive or c.has_media or c.prompt_logprobs or !c.generator_path) return false;
+    if (c.exclusive or c.has_media or c.prompt_logprobs or !c.generator_path or c.module_state) return false;
     if (x.decoding >= x.max_concurrent) return false;
     return c.tail <= x.max_tail;
 }
@@ -7830,19 +7832,24 @@ pub const BoundaryBudget = struct {
 /// Stable ascending order of `tails` written to `order` as indices: smallest uncached tail first.
 pub fn orderByTail(tails: []const usize, order: []usize) void {
     for (order[0..tails.len], 0..) |*o, i| o.* = i;
-    var i: usize = 1;
-    while (i < tails.len) : (i += 1) {
-        const v = order[i];
-        var j = i;
-        while (j > 0 and tails[order[j - 1]] > tails[v]) : (j -= 1) order[j] = order[j - 1];
-        order[j] = v;
-    }
+    const by = struct {
+        fn lessThan(t: []const usize, a: usize, b: usize) bool {
+            return t[a] < t[b];
+        }
+    };
+    std.sort.insertion(usize, order[0..tails.len], tails, by.lessThan);
 }
 
 /// Undo a hot-cache restore the slot has not started on: hand the checkout back and empty the
 /// slot's cache, so the request can wait in `pending` and restore again when its turn comes.
 fn resetRestoredSlot(slot: *Slot) void {
     if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), "tail over the boundary limit");
+    emptySlotCache(slot);
+    slot.restored_entry = 0;
+}
+
+/// Back to a cold slot: no restored KV, SSM state or module-side qwen4 state.
+fn emptySlotCache(slot: *Slot) void {
     if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
     if (slot.model.transformer) |xf| {
         slot.cache.truncate(0, xf.s) catch {};
@@ -7851,7 +7858,6 @@ fn resetRestoredSlot(slot: *Slot) void {
     }
     slot.moe_seq_offset = 0;
     slot.cached_tokens = 0;
-    slot.restored_entry = 0;
 }
 
 /// The first pending request that passes the boundary gate, removed from `pending` with its
@@ -7880,11 +7886,13 @@ fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
             .has_media = s.vision_embeddings != null or s.media.len > 0,
             .prompt_logprobs = s.prompt_logprobs,
             .generator_path = s.model.transformer != null and s.model.ds4_engine == null and s.model.llama_engine == null,
+            .module_state = if (s.model.transformer) |xf| xf.config.isQwen4() else false,
             .tail = slotUncachedTail(s),
         };
         if (!boundaryEligible(c, x)) continue;
         _ = s.in_pass.fetchAdd(1, .acq_rel);
         _ = sch.pending.orderedRemove(i);
+        sch.boundary_slot = s;
         return s;
     }
     return null;
@@ -7916,11 +7924,10 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget)
         const wait = outcome == .held or outcome == .tail_too_large;
         // Back to the head of `pending` before `in_pass` drops, so `complete` never sees a slot that
         // is in no list.
-        if (wait) {
-            sch.queue_mu.lockUncancelable(sch.io);
-            sch.pending.insert(sch.allocator, 0, slot) catch slot.markError("OutOfMemory");
-            sch.queue_mu.unlock(sch.io);
-        }
+        sch.queue_mu.lockUncancelable(sch.io);
+        sch.boundary_slot = null;
+        if (wait) sch.pending.insert(sch.allocator, 0, slot) catch slot.markError("OutOfMemory");
+        sch.queue_mu.unlock(sch.io);
         _ = slot.in_pass.fetchSub(1, .acq_rel);
         if (wait) break;
         if (outcome == .decoding) log.info("[boundary] admitted a {d}-token request beside a {d}-token prefill\n", .{ slot.prompt_tokens, ic.slot.full_prompt.len });
@@ -12772,6 +12779,26 @@ test "company: a Neural Engine slot never batches, so it does not count" {
     try testing.expect(!sch.hasCompany());
     sch.in_flight = 2;
     try testing.expect(sch.hasCompany());
+}
+
+test "cancelAllInFlight: a request being prefilled at a chunk boundary is cancelled too" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.offloaded = .empty;
+    sch.prefilling_from = 0;
+    sch.n_prefilling = 0;
+    var slot: Slot = undefined;
+    slot.io = testing.io;
+    slot.cancelled = .init(false);
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    sch.boundary_slot = &slot;
+    sch.cancelAllInFlight();
+    try testing.expect(slot.cancelled.load(.acquire));
 }
 
 test "a parked inference thread keeps the Mac awake only while Neural Engine requests run" {
