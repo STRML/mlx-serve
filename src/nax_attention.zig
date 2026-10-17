@@ -300,7 +300,7 @@ fn attention256Int8Impl(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v
 const Quantized = struct { vals: mlx.mlx_array, scales: mlx.mlx_array };
 
 fn quantRows(sc: *Scope, x: mlx.mlx_array, rows: c_int, mean: ?mlx.mlx_array) !Quantized {
-    const p = try @import("int8_attn.zig").quantRows(x, rows, mean, 1e-6, false, sc.s);
+    const p = try @import("int8_attn.zig").quantRows(x, rows, mean, 1e-6, false, false, sc.s);
     const vals = sc.keep(p[0]) catch |e| {
         _ = mlx.mlx_array_free(p[1]);
         return e;
