@@ -225,6 +225,7 @@ fn getKernel256Q8() !mlx.mlx_fast_metal_kernel {
 pub fn attention256Int8(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
     if (!int8QkEnabled()) return null;
     const out = (try attention256Int8Impl(s, q, k, v, scale)) orelse return null;
+    @import("log.zig").debug("[attn] int8 QK call qL={d} kL={d}\n", .{ mlx.getShape(q)[2], mlx.getShape(k)[2] });
     if (!engaged_256q8) {
         engaged_256q8 = true;
         @import("log.zig").info("[attn] int8 QK hd-256 prefill attention engaged (MLX_SERVE_INT8_QK; lossy)\n", .{});
