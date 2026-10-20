@@ -10,6 +10,7 @@ const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transcription = @import("transcription.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
+const distributed = @import("distributed.zig");
 const qwen4_ple = @import("qwen4_ple.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
@@ -339,6 +340,12 @@ pub const ModelConfig = struct {
     // ragged tail after the last WHOLE group never gets linear attention.
     // 0 = no tail bound, which is every other hybrid arch (qwen3_next, lfm2).
     linear_attn_tail_from: u32 = 0,
+    /// Pipeline-parallel rank: the trunk layers this process holds (`applyLayerSpan`).
+    dist_span: ?distributed.LayerSpan = null,
+    /// DeepSeek-V4.1 on a two-Mac pair: the worker's layers, kept under their own numbers.
+    dist_dsv41: ?@import("deepseek_v41.zig").Pair = null,
+    /// Tensor-parallel rank: its slice of each MoE expert (`applyShard`).
+    dist_shard: ?distributed.Shard = null,
     partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
 
@@ -734,6 +741,14 @@ pub const ModelConfig = struct {
     glmv_swiglu_limit: f32 = 10.0,
     glmv_min_image_tokens: u32 = 16,
     glmv_max_image_tokens: u32 = 8000,
+
+    // DeepSeek-V4.1 vision tower (src/dsv41_vision.zig): the release's `vision_config`, on top of the
+    // generic vision_* geometry. `dv_max_wh_ratio` 0 = no cap (the release's null).
+    dsv41_vision: bool = false,
+    dv_downsample: u32 = 3,
+    dv_max_image_tokens: u32 = 1024,
+    dv_min_pixels: u32 = 295936,
+    dv_max_wh_ratio: u32 = 0,
     // MiniCPM-V 4.7 vision (src/minicpm_vision.zig): the SigLIP2 geometry rides the vision_*
     // fields; these are its window merger, slicing and placeholder tokens. The token ids
     // that are not in config.json come from the tokenizer (`populateMiniCpmImageTokens`).
@@ -913,6 +928,41 @@ pub const ModelConfig = struct {
             return self.num_global_key_value_heads;
         }
         return self.num_key_value_heads;
+    }
+
+    /// Turn this config into the short model one pipeline rank serves: layers
+    /// `[span.start, span.end)` renumbered from 0, every per-layer table shifted with them.
+    pub fn applyLayerSpan(self: *ModelConfig, span: distributed.LayerSpan) !void {
+        if (span.total != self.num_hidden_layers or span.end > span.total or span.start >= span.end) return error.DistLayerSpanMismatch;
+        // The interval rule `(i + 1) % interval` stays true only for a seam on a group boundary.
+        if (self.full_attention_interval != 0 and span.start % self.full_attention_interval != 0) return error.DistSplitOffInterval;
+        const st = span.start;
+        inline for (.{ "num_attention_heads_per_layer", "layer_no_rope", "dsv4_compress_ratios", "layer_is_global", "layer_block_types" }) |f| {
+            const arr = &@field(self, f);
+            if (st < arr.len) std.mem.copyForwards(@TypeOf(arr[0]), arr[0 .. arr.len - st], arr[st..]);
+        }
+        if (self.linear_attn_tail_from != 0) self.linear_attn_tail_from -|= st;
+        self.num_hidden_layers = span.len();
+        self.dist_span = span;
+    }
+
+    /// The expert widths one tensor-parallel rank holds.
+    pub fn applyShard(self: *ModelConfig, sh: distributed.Shard) !void {
+        const quantum = sh.size * 64; // every shipped group size divides a 64-aligned part
+        if (self.moe_intermediate_size % quantum != 0 or self.shared_expert_intermediate_size % quantum != 0) return error.DistShardOffGroup;
+        self.moe_intermediate_size /= sh.size;
+        self.shared_expert_intermediate_size /= sh.size;
+        self.dist_shard = sh;
+    }
+
+    /// The PLE's layer among this process's layers; null when another pipeline rank holds it.
+    /// `ple_layer_idx` stays the checkpoint's absolute index (it names the n-gram shards).
+    pub fn pleLocalLayer(self: *const ModelConfig) ?u32 {
+        if (self.ple_layer_idx < 0) return null;
+        const abs: u32 = @intCast(self.ple_layer_idx);
+        const st: u32 = if (self.dist_span) |sp| sp.start else 0;
+        if (abs < st or abs - st >= self.num_hidden_layers) return null;
+        return abs - st;
     }
 
     pub fn isLinearLayer(self: ModelConfig, layer_idx: u32) bool {
@@ -2128,7 +2178,8 @@ fn validateQwen4Config(config: *const ModelConfig) !void {
         if (config.indexer_compress_ratio == 0) return error.InvalidQwen4Indexer;
         if (config.indexer_budget < config.indexer_compress_ratio) return error.InvalidQwen4Indexer;
     }
-    if (config.ple_layer_idx < 0 or config.ple_layer_idx >= @as(i64, config.num_hidden_layers)) {
+    const layers: i64 = if (config.dist_span) |sp| sp.total else config.num_hidden_layers;
+    if (config.ple_layer_idx < 0 or config.ple_layer_idx >= layers) {
         return error.InvalidQwen4PleLayer;
     }
 }
@@ -2671,6 +2722,18 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                     log.err("unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)\n", .{v.string});
                     return error.UnsupportedQuantMode;
                 };
+            }
+        }
+        // Per-weight overrides carry their own mode. An unknown one (EigenLabs' `iq2_xxs` experts) was read
+        // as the top-level affine layout and failed at the FIRST request's matmul; refuse it here, by name.
+        var overrides = q.iterator();
+        while (overrides.next()) |kv| {
+            if (kv.value_ptr.* != .object) continue;
+            const mode = kv.value_ptr.object.get("mode") orelse continue;
+            if (mode != .string) continue;
+            if (QuantMode.fromString(mode.string) == null) {
+                log.err("unsupported quantization mode '{s}' on '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)\n", .{ mode.string, kv.key_ptr.* });
+                return error.UnsupportedQuantMode;
             }
         }
         // MLX ships affine kernels only for bits {2,3,4,5,6,8} (ops.cpp
@@ -4180,8 +4243,25 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             return if (is_v41) error.UnsupportedDsv41Config else error.UnsupportedDsv4Config;
         }
         if (is_v41) {
-            // Text-only: the vision tower is never loaded.
-            config.has_vision = false;
+            // The release's tower (src/dsv41_vision.zig) splices at `<｜deepseek_image｜>`: a pack
+            // without `vision_config` or the image token serves text.
+            config.dsv41_vision = config.has_vision and config.image_token_id != 0;
+            config.has_vision = config.dsv41_vision;
+            if (config.dsv41_vision) {
+                const vc = jsonField(root, "vision_config").?.object;
+                config.vision_rope_theta = 10000.0;
+                if (jsonField(vc, "rope_theta")) |v| config.vision_rope_theta = try jsonFloat(v);
+                if (jsonField(vc, "downsample_ratio")) |v| config.dv_downsample = try jsonU32(v);
+                if (jsonField(vc, "max_image_tokens")) |v| config.dv_max_image_tokens = try jsonU32(v);
+                if (jsonField(vc, "min_pixels")) |v| config.dv_min_pixels = try jsonU32(v);
+                if (jsonField(vc, "max_wh_ratio")) |v| {
+                    if (v == .integer) config.dv_max_wh_ratio = try jsonU32(v);
+                }
+                // The 2-D rotary splits a head into h and w halves of rotate_half pairs.
+                if (config.vision_num_heads == 0 or config.vision_hidden_size % config.vision_num_heads != 0 or
+                    (config.vision_hidden_size / config.vision_num_heads) % 4 != 0 or config.vision_patch_size == 0 or
+                    config.dv_downsample == 0 or config.dv_max_image_tokens < 4) return error.InvalidConfigField;
+            }
             try parseDsv41Fields(cfg_obj, &config);
         }
     } else if (std.mem.eql(u8, model_type, "glm_moe_dsa")) {
@@ -5003,6 +5083,97 @@ fn admitExl3Backend(config: *const ModelConfig, metal: bool) !void {
     return error.Exl3NeedsMetal;
 }
 
+/// A tensor worker never runs the MTP head or the towers.
+const TensorWorker = struct {
+    fn remap(_: TensorWorker, key: []const u8, _: []u8) ?[]const u8 {
+        return if (distributed.headOnly(key)) null else key;
+    }
+};
+
+/// Keeps the tensors one rank holds, under the names `keep.remap` gives them
+/// (`LayerSpan`: its layers renumbered; `TensorWorker`: all but the head-only towers).
+/// DeepSeek-V4.1 on a pair: each Mac's trunk layers under their own numbers (the model reads
+/// sources and Engram layers by absolute index); the worker keeps nothing else, and neither
+/// keeps the DSpark stages, which stay off on a pair.
+const Dsv41Keep = struct {
+    pair: @import("deepseek_v41.zig").Pair,
+
+    pub fn remap(self: Dsv41Keep, key: []const u8, _: []u8) ?[]const u8 {
+        if (std.mem.startsWith(u8, key, "layers.")) {
+            const end = std.mem.indexOfScalarPos(u8, key, 7, '.') orelse return null;
+            const li = std.fmt.parseInt(usize, key[7..end], 10) catch return null;
+            return if (self.pair.holds(li)) key else null;
+        }
+        return if (self.pair.worker) null else key;
+    }
+};
+
+test "a DeepSeek-V4.1 pair keeps each Mac's layers under their own numbers" {
+    var buf: [512]u8 = undefined;
+    const worker: Dsv41Keep = .{ .pair = .{ .lo = 20, .hi = 40, .worker = true } };
+    const host: Dsv41Keep = .{ .pair = .{ .lo = 20, .hi = 40, .worker = false } };
+    try std.testing.expectEqualStrings("layers.20.attn.wkv.weight", worker.remap("layers.20.attn.wkv.weight", &buf).?);
+    try std.testing.expect(worker.remap("layers.19.attn.wkv.weight", &buf) == null);
+    try std.testing.expect(worker.remap("embed.weight", &buf) == null);
+    try std.testing.expect(host.remap("layers.25.ffn.gate.weight", &buf) == null);
+    try std.testing.expectEqualStrings("layers.1.engram.wkv.weight", host.remap("layers.1.engram.wkv.weight", &buf).?);
+    try std.testing.expectEqualStrings("head.weight", host.remap("head.weight", &buf).?);
+    // DSpark drafts on the host.
+    try std.testing.expectEqualStrings("mtp.0.main_proj.weight", host.remap("mtp.0.main_proj.weight", &buf).?);
+    try std.testing.expect(worker.remap("mtp.0.main_proj.weight", &buf) == null);
+}
+
+fn retainPart(weights: *Weights, keep: anytype) !void {
+    const a = weights.allocator;
+    var kept = std.StringHashMap(mlx.mlx_array).init(a);
+    errdefer kept.deinit();
+    var it = weights.map.iterator();
+    while (it.next()) |kv| {
+        var buf: [512]u8 = undefined;
+        const name = keep.remap(kv.key_ptr.*, &buf) orelse {
+            _ = mlx.mlx_array_free(kv.value_ptr.*);
+            a.free(kv.key_ptr.*);
+            continue;
+        };
+        if (name.ptr == kv.key_ptr.*.ptr) {
+            try kept.put(kv.key_ptr.*, kv.value_ptr.*);
+        } else {
+            try kept.put(try a.dupe(u8, name), kv.value_ptr.*);
+            a.free(kv.key_ptr.*);
+        }
+    }
+    weights.map.deinit();
+    weights.map = kept;
+}
+
+/// Keeps this tensor-parallel rank's slice of every expert projection (still lazy, so a
+/// tensor is read once and only its part survives the batch eval). ModelOpt's routed
+/// banks arrive already sliced (`modelopt_pack.buildBanks`).
+fn shardExperts(weights: *Weights, sh: distributed.Shard, banks_sliced: bool) !void {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var it = weights.map.iterator();
+    while (it.next()) |kv| {
+        const axis = distributed.Shard.expertAxis(kv.key_ptr.*) orelse continue;
+        if (banks_sliced and std.mem.indexOf(u8, kv.key_ptr.*, ".switch_mlp.") != null) continue;
+        const shape = mlx.getShape(kv.value_ptr.*);
+        const ax: usize = if (axis == .rows) shape.len - 2 else shape.len - 1;
+        const part: c_int = @divExact(shape[ax], @as(c_int, @intCast(sh.size)));
+        var start: [4]c_int = @splat(0);
+        var stop: [4]c_int = undefined;
+        const strides: [4]c_int = @splat(1);
+        @memcpy(stop[0..shape.len], shape);
+        start[ax] = part * @as(c_int, @intCast(sh.rank));
+        stop[ax] = start[ax] + part;
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(&view, kv.value_ptr.*, &start, shape.len, &stop, shape.len, &strides, shape.len, s));
+        const owned = try @import("transformer.zig").materializedOwnedCopy(s, view);
+        _ = mlx.mlx_array_free(kv.value_ptr.*);
+        kv.value_ptr.* = owned;
+    }
+}
+
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
     if (config.mlxStream()) return Weights.init(allocator); // mlx-stream loads its own
@@ -5014,14 +5185,20 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null, .modelopt = config.modelopt });
+    if (config.dist_span == null and config.dist_shard == null and config.dist_dsv41 == null) if (try distributed.planFor(model_dir, config)) |part| switch (part) {
+        .span => |sp| try config.applyLayerSpan(sp),
+        .shard => |sh| try config.applyShard(sh),
+        .remote => |r| config.dist_dsv41 = .{ .lo = r.start, .hi = r.end, .worker = false },
+    };
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt });
     errdefer weights.deinit();
-    if (config.modelopt) {
-        const s = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(s);
-        try modelopt_pack.adapt(&weights, model_dir, config.num_hidden_layers, s, config.swiglu_limit > 0.0);
-    }
-    if (config.isDsv41()) try loadDsv41Residents(io, allocator, &weights, model_dir);
+    // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
+    if (config.dist_span) |sp| try retainPart(&weights, sp);
+    if (config.dist_dsv41) |p| try retainPart(&weights, Dsv41Keep{ .pair = p });
+    if (config.dist_shard) |sh| if (sh.rank != 0) try retainPart(&weights, TensorWorker{});
+    if (config.modelopt) try modelopt_pack.adapt(&weights, model_dir, if (config.dist_span) |sp| sp.total else config.num_hidden_layers, config.swiglu_limit > 0.0, config.dist_span, config.dist_shard);
+    if (config.dist_shard) |sh| try shardExperts(&weights, sh, config.modelopt);
+    if (config.isDsv41() and !(if (config.dist_dsv41) |p| p.worker else false)) try loadDsv41Residents(io, allocator, &weights, model_dir);
     if (config.isQwen4()) {
         defer reportF16Narrowing();
         resolveWeightPrefix(config, &weights);
@@ -5037,11 +5214,10 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     return weights;
 }
 
-/// deepseek_v41 serves text only and reads its Engram tables from disk per
-/// lookup (~100 GB a layer), so neither the vision tower nor those tables
-/// enter the weight map.
-fn dsv41DropsKey(key: []const u8) bool {
-    return dsv41VisionKey(key) or std.mem.indexOf(u8, key, ".engram.embed.") != null;
+/// deepseek_v41 reads its Engram tables from disk per lookup (~100 GB a layer), so they never enter
+/// the weight map; the vision tower only when the load asks for it.
+fn dsv41DropsKey(key: []const u8, vision: bool) bool {
+    return (!vision and dsv41VisionKey(key)) or std.mem.indexOf(u8, key, ".engram.embed.") != null;
 }
 
 pub fn dsv41VisionKey(key: []const u8) bool {
@@ -5330,7 +5506,7 @@ pub fn loadSafetensorsFile(
 
         const foreign = if (opts.owners) |o| (if (o.get(key_str)) |owner| !std.mem.eql(u8, owner, opts.shard) else false) else false;
         if (foreign or !keepsTensor(key_str, opts) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str)) or
-            (opts.dsv41 and dsv41DropsKey(key_str)))
+            (opts.dsv41 and dsv41DropsKey(key_str, opts.vision)))
         {
             _ = mlx.mlx_array_free(value);
             continue;
@@ -7558,14 +7734,28 @@ pub const dsv41_release_config =
     \\  "num_nextn_predict_layers": 3, "dspark_block_size": 5, "dspark_noise_token_id": 128799,
     \\  "dspark_target_layer_ids": [37, 38, 39], "dspark_markov_rank": 256,
     \\  "dspark_n_routed_experts": 128, "dspark_num_experts_per_tok": 3},
-    \\ "vision_config": {"model_type": "deepseek_v41_vision", "num_hidden_layers": 32}}
+    \\ "image_token_id": 129264,
+    \\ "vision_config": {"model_type": "deepseek_v41_vision", "num_hidden_layers": 32, "hidden_size": 1024,
+    \\  "num_attention_heads": 16, "intermediate_size": 2816, "patch_size": 14, "rope_theta": 10000,
+    \\  "downsample_ratio": 3, "max_image_tokens": 1024, "min_pixels": 295936, "max_wh_ratio": null}}
 ;
 
 test "ModelConfig parses deepseek_v41 (DeepSeek-V4.1-Flash release)" {
     const config = try parseConfigFromJson(testing.allocator, dsv41_release_config);
     try testing.expectEqualStrings("deepseek_v41", config.model_type);
     try testing.expectEqualStrings("", config.weight_prefix);
-    try testing.expect(!config.has_vision); // the tower is not served
+    try testing.expect(config.has_vision and config.dsv41_vision); // the release's tower, at its own geometry
+    try testing.expectEqual(@as(u32, 129264), config.image_token_id);
+    try testing.expectEqual(@as(u32, 32), config.vision_num_layers);
+    try testing.expectEqual(@as(u32, 1024), config.vision_hidden_size);
+    try testing.expectEqual(@as(u32, 16), config.vision_num_heads);
+    try testing.expectEqual(@as(u32, 2816), config.vision_intermediate_size);
+    try testing.expectEqual(@as(u32, 14), config.vision_patch_size);
+    try testing.expectEqual(@as(u32, 3), config.dv_downsample);
+    try testing.expectEqual(@as(u32, 1024), config.dv_max_image_tokens);
+    try testing.expectEqual(@as(u32, 295936), config.dv_min_pixels);
+    try testing.expectEqual(@as(u32, 0), config.dv_max_wh_ratio);
+    try testing.expectApproxEqAbs(@as(f32, 10000.0), config.vision_rope_theta, 1e-3);
     try testing.expectEqual(@as(u32, 5120), config.hidden_size);
     try testing.expectEqual(@as(u32, 40), config.num_hidden_layers);
     try testing.expectEqual(@as(u32, 512), config.head_dim);
@@ -8976,6 +9166,31 @@ test "parseConfigFromJson explicit affine mode keeps biases" {
     const config = try parseConfigFromJson(testing.allocator, json);
     try testing.expectEqual(QuantMode.affine, config.quant_mode);
     try testing.expect(config.quant_mode.hasBiases());
+}
+
+test "parseConfigFromJson refuses an unknown PER-WEIGHT quantization mode by name" {
+    // EigenLabs' Nemotron 3.5 Bolt IQ2: affine at the top, `iq2_xxs` experts underneath. Read as affine the
+    // first request's matmul failed; the load refuses instead.
+    const json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "quantization": {"group_size": 32, "bits": 8, "mode": "affine",
+        \\    "layers.0.mlp.switch_mlp.fc1": {"group_size": 256, "bits": 2, "mode": "iq2_xxs"}}
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedQuantMode, parseConfigFromJson(testing.allocator, json));
+    // A known per-weight mode beside the top-level one still parses.
+    const ok =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "quantization": {"group_size": 32, "bits": 8, "mode": "affine",
+        \\    "layers.0.mlp.switch_mlp.fc1": {"group_size": 16, "bits": 4, "mode": "nvfp4"}}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, ok);
+    try testing.expectEqual(QuantMode.affine, config.quant_mode);
 }
 
 test "parseConfigFromJson unknown quantization mode → error" {
@@ -10719,4 +10934,21 @@ test "Weights.dropPrefix drops one block's tensors and nothing that merely start
     try std.testing.expect(w.get("blocks.10.attn.q.weight") != null and w.get("blocks.2.attn.q.weight") != null and w.get("norm.weight") != null);
     w.dropPrefix("absent.");
     try std.testing.expectEqual(@as(u32, 3), w.count());
+}
+
+test "applyLayerSpan: the PLE stays at its absolute layer and is local only to the rank holding it" {
+    var c: ModelConfig = std.mem.zeroes(ModelConfig);
+    c.num_hidden_layers = 48;
+    c.full_attention_interval = 4;
+    c.ple_layer_idx = 1;
+    var tail = c;
+    try tail.applyLayerSpan(.{ .start = 32, .end = 48, .total = 48 });
+    try std.testing.expectEqual(@as(u32, 16), tail.num_hidden_layers);
+    try std.testing.expectEqual(@as(i32, 1), tail.ple_layer_idx);
+    try std.testing.expect(tail.pleLocalLayer() == null);
+    try std.testing.expect(tail.isLinearLayer(0) and !tail.isLinearLayer(3));
+    var head = c;
+    try head.applyLayerSpan(.{ .start = 0, .end = 32, .total = 48 });
+    try std.testing.expectEqual(@as(u32, 1), head.pleLocalLayer().?);
+    try std.testing.expectError(error.DistSplitOffInterval, c.applyLayerSpan(.{ .start = 30, .end = 48, .total = 48 }));
 }

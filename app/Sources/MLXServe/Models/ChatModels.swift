@@ -1057,6 +1057,9 @@ struct LocalModel: Identifiable, Hashable {
     /// tell two builds of one scheme apart. nil ⇒ derive it from the filename.
     var quantLabel: String? = nil
 
+    /// The files' size on disk, which `sizeFormatted` prints.
+    var sizeBytes: Int64 = 0
+
     /// Non-nil when this directory cannot serve as a model. See `ModelDefect`.
     /// A defective row is listed so you can see and remove it, and is excluded
     /// from every picker.
@@ -1308,6 +1311,16 @@ let gemmaModelOptions: [GemmaModelOption] = [
         displayName: "DeepSeek-V4.1-Flash (streaming repack, EXL3 3.0 bpw)",
         repoId: "OpensourceWTF/DeepSeek-V4.1-Flash-streaming-repack-exl3-3.0bpw",
         sizeEstimate: "~426 GB on disk (experts stream from SSD), needs 128 GB RAM",
+        minHostRamBytes: 128 * (UInt64(1) << 30)
+    ),
+    // GLM-5.3-Flash (glm5_next) as a Sushi pack: EXL3 routed experts, loads resident on a 128 GB Mac,
+    // its DFlash2 drafter attaches with no flags. (The mlx-stream streaming repack answered wrong on
+    // non-NAX Macs in the 26.10.3 validation; it stays installable by repo id.)
+    GemmaModelOption(
+        id: "glm53-flash-sushi",
+        displayName: "GLM-5.3-Flash (Sushi EXL3 2 bpw)",
+        repoId: "beamster/GLM-5.3-Flash-Sushi-2bpw",
+        sizeEstimate: "~88 GB, needs 128 GB RAM",
         minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.

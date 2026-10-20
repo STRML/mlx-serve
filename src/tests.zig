@@ -37,6 +37,7 @@ test {
     _ = @import("muse_vision.zig");
     _ = @import("lfm2_vision.zig");
     _ = @import("glm_vision.zig");
+    _ = @import("dsv41_vision.zig");
     _ = @import("minicpm_vision.zig");
     _ = @import("minicpm_canvas.zig");
     _ = @import("qwen_audio.zig");
@@ -50,6 +51,10 @@ test {
     _ = @import("moe_gather_ubench.zig");
     _ = @import("moe_affine4.zig");
     _ = @import("hc_decode2.zig");
+    _ = @import("hc_cuda.zig");
+    _ = @import("moe_cuda.zig");
+    _ = @import("moe_prefill_cuda.zig");
+    _ = @import("qsa_decode_cuda.zig");
     _ = @import("qsa_mask.zig");
     _ = @import("qsa_decode.zig");
     _ = @import("rowqmv.zig");
@@ -135,6 +140,7 @@ test {
     _ = @import("mage_flow.zig");
     _ = @import("qwen_image.zig");
     _ = @import("qwen_image_edit.zig");
+    _ = @import("moss_image.zig");
     _ = @import("lora.zig");
     _ = @import("ane.zig");
     _ = @import("arch/ane_dflash.zig");
@@ -150,6 +156,8 @@ test {
     _ = @import("ltx_diffvae_forward.zig");
     _ = @import("ltx_audio.zig");
     _ = @import("minimax_h3.zig");
+    _ = @import("h3_split.zig");
+    _ = @import("distributed.zig");
     _ = @import("minimax_h3_vision.zig");
     _ = @import("minimax_h3_vae.zig");
     _ = @import("minimax_h3_audio.zig");

@@ -64,6 +64,10 @@ pub const WIDE_PREFILL_CHUNK: usize = 16384;
 /// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
 pub var prefill_chunk_explicit: bool = false;
 
+/// The widest chunk this machine runs without `--prefill-chunk` (`server.autoPrefillChunkCap`),
+/// set once by main.zig. Every auto width obeys it, the per-request and adaptive rungs included.
+pub var machine_prefill_chunk_cap: usize = std.math.maxInt(usize);
+
 /// `--prefill-chunk` for an embedded engine's u32 chunk (ds4): 0 = the engine's default.
 pub fn explicitPrefillChunkU32() u32 {
     if (!prefill_chunk_explicit) return 0;
@@ -248,10 +252,12 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
     // real KV budget. It NARROWS, never raises, and an explicit
     // `--prefill-chunk` outranks it — the operator asked for a width.
     const launch: usize = if (head_dim == 0 and !prefill_chunk_explicit) WIDE_PREFILL_CHUNK else prefill_chunk_override;
-    const base: usize = if (prefill_chunk_explicit or pinned_chunk == 0)
+    const base: usize = if (prefill_chunk_explicit)
         launch
+    else if (pinned_chunk == 0)
+        @min(launch, machine_prefill_chunk_cap)
     else
-        @min(launch, pinned_chunk);
+        @min(launch, pinned_chunk, machine_prefill_chunk_cap);
     return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
@@ -280,6 +286,26 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     const env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
     try std.testing.expectEqual(@as(usize, 8192), env);
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(env, 1024));
+}
+
+test "effectivePrefillChunk: the machine cap bounds every auto width, an explicit width passes" {
+    const saved_cap = machine_prefill_chunk_cap;
+    const saved_explicit = prefill_chunk_explicit;
+    const saved_override = prefill_chunk_override;
+    defer {
+        machine_prefill_chunk_cap = saved_cap;
+        prefill_chunk_explicit = saved_explicit;
+        prefill_chunk_override = saved_override;
+    }
+    machine_prefill_chunk_cap = 2048;
+    prefill_chunk_explicit = false;
+    prefill_chunk_override = WIDE_PREFILL_CHUNK;
+    // A per-request rung (8192) and an unpinned adaptive cap (0) both stop at the machine's cap.
+    try std.testing.expectEqual(@as(usize, 2048), effectivePrefillChunk(256, 24, 16384, false, true, true, 8192));
+    try std.testing.expectEqual(@as(usize, 2048), effectivePrefillChunk(256, 24, 16384, false, true, true, 0));
+    prefill_chunk_explicit = true;
+    prefill_chunk_override = 8192;
+    try std.testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(256, 24, 16384, false, true, true, 8192));
 }
 
 /// The `[spec-stats] mode=` word of an mlx-stream lane: the first word of the plugin's lane name.
@@ -1498,6 +1524,27 @@ test "capAcceptedForTokenBudget keeps speculative commits inside max_tokens" {
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 401, 400));
 }
 
+/// Drafts a DSpark copy round takes from a context match, or 0 for the stage draft. The stage block
+/// already lands most drafts on repeated text, so only a quoted span (a long agreement) whose copy
+/// is longer than the block is worth the wider verify.
+pub fn dsparkCopyLen(found: ?mtp_lookup.Match, remaining: u32, block: usize) usize {
+    const f = found orelse return 0;
+    if (f.suffix < mtp_lookup.STRONG_SUFFIX) return 0;
+    const n = @min(f.draft.len, remaining);
+    return if (n > block) n else 0;
+}
+
+test "dsparkCopyLen copies only a long agreement that outruns the stage block" {
+    const draft: [15]u32 = @splat(0);
+    const strong = mtp_lookup.STRONG_SUFFIX;
+    try std.testing.expectEqual(@as(usize, 15), dsparkCopyLen(.{ .draft = &draft, .suffix = strong }, 400, 5));
+    try std.testing.expectEqual(@as(usize, 0), dsparkCopyLen(null, 400, 5));
+    try std.testing.expectEqual(@as(usize, 0), dsparkCopyLen(.{ .draft = &draft, .suffix = strong - 1 }, 400, 5));
+    try std.testing.expectEqual(@as(usize, 0), dsparkCopyLen(.{ .draft = draft[0..5], .suffix = strong }, 400, 5));
+    try std.testing.expectEqual(@as(usize, 7), dsparkCopyLen(.{ .draft = &draft, .suffix = strong }, 7, 5));
+    try std.testing.expectEqual(@as(usize, 0), dsparkCopyLen(.{ .draft = &draft, .suffix = strong }, 5, 5));
+}
+
 test "every speculative decoder caps accepted drafts before commit" {
     // Class guard: every speculative path commits an always-emitted anchor
     // plus zero or more accepted drafts. A new/forgotten arm must cap that
@@ -1690,6 +1737,15 @@ pub const Generator = struct {
     dspark_stochastic: bool = false,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
+    /// Rounds whose drafts were copied from the context (`dsparkCopyStep`), included in `dspark_attempted`.
+    dspark_copies: u64 = 0,
+    dspark_copy_drafted: u64 = 0,
+    dspark_copy_accepted: u64 = 0,
+    /// DeepSeek-V4.1's stage rounds under `dflash_policy` (verify rows by the confidence head, plain ticks
+    /// when drafting does not pay); null = every round verifies the whole block.
+    dspark_pol: ?DflashPol = null,
+    dspark_stats: dflash_policy.PositionStats = .{},
+    dspark_plain: u64 = 0,
 
     // ── Gemma 4 assistant drafter state ──
     // External drafter model (cross-attends into target's KV). When
@@ -2216,8 +2272,12 @@ pub const Generator = struct {
                 return;
             }
             log.info(
-                "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2}\n",
-                .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round },
+                "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2} stage_rounds={d} copy_rounds={d} copy_drafted={d} copy_accepted={d}\n",
+                .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, self.dspark_attempted - self.dspark_copies, self.dspark_copies, self.dspark_copy_drafted, self.dspark_copy_accepted },
+            );
+            if (self.dspark_pol) |pol| log.info(
+                "  [spec-stats] dspark policy: plain_ticks={d} skipped={d} probes={d} plain_ms={d:.2} acc_pos={s} rows_hist={s}\n",
+                .{ self.dspark_plain, pol.drafting.skipped, pol.drafting.probes, pol.plain.ms, self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
             );
             return;
         }
@@ -2663,6 +2723,11 @@ pub const Generator = struct {
         const on = dsparkStochEnabledFromEnv(raw);
         dspark_stoch_cache = on;
         return on;
+    }
+
+    /// `MLX_SERVE_DSV4_DSPARK_POLICY=0` verifies the whole block every stage round (the A/B arm of `dspark_pol`).
+    fn dsparkPolicyEnabled() bool {
+        return if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_POLICY")) |v| v[0] != '0' else true;
     }
 
     pub fn initWithOptions(
@@ -3554,6 +3619,9 @@ pub const Generator = struct {
             return gen;
         }
 
+        if (dspark_active) if (xfm.dsv41) |m41| {
+            m41.ds_want_conf = dsparkPolicyEnabled();
+        };
         // Drafter / PLD-v2 / MTP path: sample synchronously and DO NOT
         // pre-forward the sampled token. The first nextDrafter / nextPld /
         // nextMtp call needs the cache at exactly prompt_len (last prompt
@@ -3608,6 +3676,7 @@ pub const Generator = struct {
                 .pld_enabled = pld_active,
                 .dspark_enabled = dspark_active,
                 .dspark_stochastic = dspark_stochastic,
+                .dspark_pol = if (dspark_active and xfm.dsv41 != null and dsparkPolicyEnabled()) .{} else null,
                 .drafter = if (drafter_active) options.drafter else null,
                 .drafter_block_size = options.drafter_block_size,
                 .dflash = if (dflash_active) options.dflash else null,
@@ -4270,14 +4339,65 @@ pub const Generator = struct {
             return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
         }
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+        // A skipped round is a tick of the serial pipeline; the first drafted round after it drains the pipeline.
+        if (self.dspark_pol) |*pol| {
+            if (!pol.drafting.shouldDraft() and self.dflashCanPipeline()) return try self.dsparkPlainPipelined(allocator);
+            pol.plain_watch = null;
+            if (self.has_pending_logits or self.has_pending_token) switch (try self.drainPipelineForSpec(allocator)) {
+                .drained => |tok| return try mtpSerialOneToken(allocator, tok),
+                .stopped => return null,
+                .already_clean, .stay_disabled => return error.PipelineHalfState,
+            };
+        }
         if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
         if (self.xfm.mlx_stream_ext) |m| {
             const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
             const r = try mlx_stream.round(m, allocator, self.next_token_id, cap);
             return self.commitDsparkRound(allocator, .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token }, mlx_stream.position(m));
         }
-        if (self.xfm.dsv41) |mdl| return self.dsparkStep(allocator, dsv41_mod, mdl);
+        if (self.xfm.dsv41) |mdl| {
+            if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
+            if (self.dspark_pol != null) return self.dsparkPolicyStep(allocator, mdl);
+            return self.dsparkStep(allocator, dsv41_mod, mdl);
+        }
         return self.dsparkStep(allocator, dsv4_mod, self.xfm.dsv4.?);
+    }
+
+    var dspark_copy_off_cache: ?bool = null;
+    /// `MLX_SERVE_DSV4_DSPARK_COPY=0` drafts only from the stages (the A/B arm for copied continuations).
+    fn dsparkCopyOff() bool {
+        if (dspark_copy_off_cache) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_DSV4_DSPARK_COPY");
+        const off = raw != null and raw.?[0] == '0';
+        dspark_copy_off_cache = off;
+        return off;
+    }
+
+    /// A DSpark round whose drafts are the context's own continuation after `t1` (an echo, an edit):
+    /// no stage forward, and up to `VERIFY_MAX_DRAFTS` drafts where the block holds `ds_block`.
+    /// Null when the context holds no copy worth verifying.
+    fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv41_mod.Dsv41Model) !?DrafterStepResult {
+        if (dsparkCopyOff()) return null;
+        const t1 = self.next_token_id;
+        const idx = try self.mtpLookupIndex(allocator);
+        const found = idx.matchBest(t1, dsv41_mod.VERIFY_MAX_DRAFTS);
+        const n = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, mdl.ds_block);
+        if (n == 0) return null;
+        const ids = try allocator.alloc(u32, n + 1);
+        ids[0] = t1;
+        @memcpy(ids[1..], found.?.draft[0..n]);
+        var copy: dsv41_mod.DsparkDraft = .{ .ids = ids, .len = n, .logits = &.{}, .confidence = &.{} };
+        defer copy.deinit(allocator);
+        const st = &mdl.dec_state.?;
+        const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+        const round = if (self.dspark_stochastic)
+            try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &copy)
+        else
+            try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &copy, cap);
+        self.dspark_copies += 1;
+        self.dspark_copy_drafted += n;
+        self.dspark_copy_accepted += round.accepted;
+        return self.commitDsparkRound(allocator, round, st.n);
     }
 
     /// One DSpark round on module `mod` (deepseek_v4 or deepseek_v41, which
@@ -4290,10 +4410,59 @@ pub const Generator = struct {
             self.max_tokens,
         );
         const round = if (self.dspark_stochastic)
-            try self.dsparkStochasticRound(allocator, mod, mdl, t1, accepted_cap)
+            try self.dsparkStochasticRound(allocator, mod, mdl, t1, accepted_cap, null)
         else
             try mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
         return self.commitDsparkRound(allocator, round, mdl.dec_state.?.n);
+    }
+
+    /// A round the drafting backoff skipped: one tick of the serial pipeline. Consecutive ticks time the plain step.
+    fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        const tok = (try self.next(allocator)) orelse return null;
+        self.dspark_plain += 1;
+        const pol = &self.dspark_pol.?;
+        if (pol.plain_watch) |*w| pol.plain.sample(@as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms));
+        pol.plain_watch = io_util.Stopwatch.init(self.timer.io);
+        return try mtpSerialOneToken(allocator, tok);
+    }
+
+    /// One DeepSeek-V4.1 stage round under `dspark_pol`: draft, verify the prefix the calibrated confidence pays
+    /// for (none = the trunk token alone), and teach the calibration and the drafting backoff what it bought.
+    fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv41_mod.Dsv41Model) !?DrafterStepResult {
+        const watch = io_util.Stopwatch.init(self.timer.io);
+        const pol = &self.dspark_pol.?;
+        const st = &mdl.dec_state.?;
+        const t1 = self.next_token_id;
+        var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
+        defer d.deinit(allocator);
+        d.len = dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+        const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+        const round = if (self.dspark_stochastic)
+            try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)
+        else
+            try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
+        for (d.confidence[0..d.len], 0..) |c, k| {
+            if (k > round.accepted) break;
+            pol.calib.observe(sigmoid(c), k < round.accepted);
+        }
+        self.dspark_stats.record(@intCast(d.len), round.accepted);
+        const wall_ms = @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms);
+        pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, wall_ms);
+        return self.commitDsparkRound(allocator, round, st.n);
+    }
+
+    fn sigmoid(x: f32) f32 {
+        return 1 / (1 + @exp(-x));
+    }
+
+    /// Drafts a DSpark round verifies: the prefix whose calibrated acceptance (the confidence head's logits through
+    /// `calib`) buys the most tokens per ms of verify, on the verify ladder scaled to this request's plain step.
+    pub fn dsparkVerifyDrafts(conf_logits: []const f32, calib: *const dflash_policy.Calibration, plain_ms: f32) usize {
+        var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+        const n = @min(conf_logits.len, p.len);
+        for (conf_logits[0..n], p[0..n]) |c, *o| o.* = calib.probability(sigmoid(c));
+        const costs = dflash_policy.priorCosts(plain_ms);
+        return dflash_policy.chooseRows(p[0..n], &costs).rows - 1;
     }
 
     /// A draft round's bookkeeping; the module stands at `position`.
@@ -4332,9 +4501,10 @@ pub const Generator = struct {
     /// (the toy-vocab exactness test's invariant), and the correction always
     /// derives from the ORIGINAL verify logits at the acceptance point — the
     /// house partial-accept invariant in sampled form.
-    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32) !mod.DsparkRound {
+    /// `copy`, when set, is the draft instead of the stages' (a one-hot proposal too).
+    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32, copy: ?*const mod.DsparkDraft) !mod.DsparkRound {
         const s = self.xfm.s;
-        var pending = try mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
+        var pending = if (copy) |d| try mod.dsparkBeginWith(mdl, allocator, &mdl.dec_state.?, t1, d) else try mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
         defer pending.deinit();
         const b: u32 = @intCast(pending.b);
 
@@ -4768,9 +4938,9 @@ pub const Generator = struct {
                 if (!full_accept) {
                     const onehot = try pldOneHotRow(draft[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(onehot);
-                    break :blk try sampleResidual(probs, onehot, s);
+                    break :blk try sampleResidual(probs, onehot, self.correctionDraw(accepted), s);
                 } else {
-                    break :blk try sampleFromProbs(probs, s);
+                    break :blk try sampleFromProbs(probs, self.correctionDraw(accepted), s);
                 }
             } else {
                 const lazy = self.sampleLazy(correction_logits);
@@ -4937,6 +5107,15 @@ pub const Generator = struct {
     ///      cache lands at exactly `+j+1`. Sample correction from the
     ///      *original* verify_logits[j] (the model's prediction at the
     ///      rejected position).
+    /// The sampling for a verify round's correction token (the bonus or the residual
+    /// draw after `accepted` drafts): keyed at that token's output position, so a
+    /// seeded request replays under every drafter and no two positions share a key.
+    fn correctionDraw(self: *const Generator, accepted: u32) SamplingParams {
+        var sp = self.sampling;
+        sp.draw = self.generated_ids.items.len + accepted + 2;
+        return sp;
+    }
+
     pub fn nextDrafter(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (self.done) return null;
         std.debug.assert(self.drafter != null);
@@ -5236,9 +5415,9 @@ pub const Generator = struct {
                 if (accepted < m) {
                     const onehot = try pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(onehot);
-                    break :blk try sampleResidual(probs, onehot, s);
+                    break :blk try sampleResidual(probs, onehot, self.correctionDraw(accepted), s);
                 } else {
-                    break :blk try sampleFromProbs(probs, s);
+                    break :blk try sampleFromProbs(probs, self.correctionDraw(accepted), s);
                 }
             } else {
                 // Greedy: reuse the bulk-read argmax row. Already eval'd in
@@ -5978,9 +6157,9 @@ pub const Generator = struct {
                     else
                         try pldOneHotRow(drafts[accepted], vl_shape[2], s);
                     defer _ = mlx.mlx_array_free(q_row);
-                    break :blk try sampleResidual(probs, q_row, s);
+                    break :blk try sampleResidual(probs, q_row, self.correctionDraw(accepted), s);
                 } else {
-                    break :blk try sampleFromProbs(probs, s);
+                    break :blk try sampleFromProbs(probs, self.correctionDraw(accepted), s);
                 }
             } else {
                 const argmax_data = try verify_argmax.ids(1 + m);
@@ -6204,7 +6383,7 @@ pub const Generator = struct {
                 const probs = try probsAtLastPos(logits, self.sampling, s);
                 defer _ = mlx.mlx_array_free(probs);
                 try mlx.check(mlx.mlx_async_eval(eval_vec));
-                break :blk try sampleFromProbs(probs, s);
+                break :blk try sampleFromProbs(probs, self.correctionDraw(0), s);
             }
             picked = if (serial) try self.verifySerialSamples(logits, 1) else try verifyArgmax(logits, self.sampling.suppress_mask, s);
             _ = mlx.mlx_vector_array_append_value(eval_vec, picked.lazy());
@@ -13385,20 +13564,21 @@ fn probAt(probs: mlx.mlx_array, token_id: u32, s: mlx.mlx_stream) !f32 {
     return v;
 }
 
-/// Sample one token from probability distribution `probs` (shape `[B, V]`).
+/// Sample one token from probability distribution `probs` (shape `[B, V]`) with
+/// the request's key (`seedKey`: a seeded request replays, `draw` = the position).
 /// Returns a u32 token id (caller can append directly).
-fn sampleFromProbs(probs: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
+fn sampleFromProbs(probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !u32 {
     // mlx_random_categorical takes logits and applies softmax. Feed log(probs)
     // so the categorical's softmax recovers the original distribution.
     var log_probs = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(log_probs);
     try mlx.check(mlx.mlx_log(&log_probs, probs, s));
 
-    const null_key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(null_key);
+    const key = seedKey(sampling);
+    defer _ = mlx.mlx_array_free(key);
     var sampled = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sampled);
-    try mlx.check(mlx.mlx_random_categorical(&sampled, log_probs, -1, null_key, s));
+    try mlx.check(mlx.mlx_random_categorical(&sampled, log_probs, -1, key, s));
     try mlx.check(mlx.mlx_array_eval(sampled));
     var v: i32 = 0;
     try mlx.check(mlx.mlx_array_item_int32(&v, sampled));
@@ -13672,7 +13852,7 @@ fn lazyOneHotRow(id: mlx.mlx_array, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_ar
 /// renormalized. Used on stochastic-verify reject so the corrected token
 /// preserves the target distribution (per Leviathan et al. speculative
 /// decoding paper).
-fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
+fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !u32 {
     var diff = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(diff);
     try mlx.check(mlx.mlx_subtract(&diff, target_probs, draft_probs, s));
@@ -13683,7 +13863,7 @@ fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: ml
     defer _ = mlx.mlx_array_free(residual);
     try mlx.check(mlx.mlx_maximum(&residual, diff, zero, s));
 
-    return sampleFromProbs(residual, s);
+    return sampleFromProbs(residual, sampling, s);
 }
 
 /// Lazy categorical sample from an already-filtered probability row
@@ -22064,6 +22244,30 @@ test "characterization: a sidecar boot's width-trial SCHEDULE re-reads its perio
     try testing.expectEqual(@as(?u32, 20), run(true)); // shipped: every layout
 }
 
+test "dsparkVerifyDrafts: a sure head verifies the block, an unsure one t1 alone, a doubt mid-block cuts there" {
+    const G = Generator;
+    var calib = dflash_policy.Calibration{};
+    try testing.expectEqual(@as(usize, 5), G.dsparkVerifyDrafts(&.{ 9, 9, 9, 9, 9 }, &calib, 17.6));
+    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{ 0, 0, 0, 0, 0 }, &calib, 17.6));
+    try testing.expectEqual(@as(usize, 2), G.dsparkVerifyDrafts(&.{ 9, 9, -4, 9, 9 }, &calib, 17.6));
+    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{}, &calib, 17.6));
+    // A head that keeps claiming certainty the trunk rejects stops buying rows.
+    for (0..40) |_| calib.observe(G.sigmoid(9), false);
+    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{ 9, 9, 9, 9, 9 }, &calib, 17.6));
+}
+
+test "dspark drafting backoff: prose rounds that lose to the plain step are skipped, copy-like rounds are not" {
+    // A round that commits few tokens for its cost loses to the plain step (costs in ms).
+    var prose = dflash_policy.Drafting{};
+    try testing.expect(prose.shouldDraft());
+    prose.record(3.2 * 17.6, 66);
+    try testing.expect(!prose.shouldDraft());
+    var echo = dflash_policy.Drafting{};
+    try testing.expect(echo.shouldDraft());
+    echo.record(5.5 * 17.6, 70);
+    try testing.expect(echo.shouldDraft());
+}
+
 test "mtpSerialProbeEarned: a sidecar head probes only after a run of low-acceptance rounds" {
     const G = Generator;
     try testing.expect(G.mtpSerialProbeEarned(true, 0)); // the calibrated module head probes at once
@@ -23511,6 +23715,37 @@ test "shortlist top-p equals the whole row's ranking, ties and 248320-wide rows"
     }
 }
 
+test "a seeded correction draw replays: same seed and position, same token; positions differ" {
+    // Bar: the bonus/residual draw of a verify round is keyed like every other draw.
+    const s = mlx.gpuStream();
+    const v: c_int = 64;
+    var vals: [64]f32 = undefined;
+    var sum: f32 = 0;
+    for (&vals, 0..) |*x, i| {
+        x.* = 1.0 / @as(f32, @floatFromInt(i + 1));
+        sum += x.*;
+    }
+    for (&vals) |*x| x.* /= sum;
+    const shape = [_]c_int{ 1, v };
+    const probs = mlx.mlx_array_new_data(&vals, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const onehot = try pldOneHotRow(0, v, s);
+    defer _ = mlx.mlx_array_free(onehot);
+
+    var distinct = false;
+    var prev: ?u32 = null;
+    for (0..16) |d| {
+        const sp: SamplingParams = .{ .seed = 11, .draw = d };
+        const a = try sampleFromProbs(probs, sp, s);
+        try testing.expectEqual(a, try sampleFromProbs(probs, sp, s));
+        try testing.expectEqual(try sampleResidual(probs, onehot, sp, s), try sampleResidual(probs, onehot, sp, s));
+        try testing.expect(try sampleResidual(probs, onehot, sp, s) != 0); // the rejected draft is never redrawn
+        if (prev) |q| distinct = distinct or q != a;
+        prev = a;
+    }
+    try testing.expect(distinct);
+}
+
 test "shortlist top-p holds on rank-3 [B, L, V] blocks" {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -23828,6 +24063,7 @@ test "repeat penalty shapes every sampling path, not only the logprobs one" {
 }
 
 test "keyed sampling draws the softmax distribution" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const probs = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
     var logv: [4]f32 = undefined;
