@@ -531,6 +531,15 @@ pub fn cedSplit(c: *const ModelConfig) ?usize {
     return split;
 }
 
+/// `MLX_SERVE_DSV41_HEAD8=0` serves a dense LM head as the pack ships it instead of requantizing it to 8-bit.
+pub fn head8Wanted() bool {
+    return head8From(std.c.getenv("MLX_SERVE_DSV41_HEAD8"));
+}
+
+fn head8From(v: ?[*:0]const u8) bool {
+    return v == null or v.?[0] != '0';
+}
+
 var ced_env: ?bool = null;
 /// `MLX_SERVE_DSV41_CED=0` keeps every prefill chunk on the full forward.
 fn cedEnabled() bool {
@@ -1998,7 +2007,10 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
     } else {
         m.embed = try getLin(w, cfg.hidden_size, "embed", .{});
         m.head = try getLin(w, cfg.hidden_size, "head", .{});
-        if (opts.head_8bit and m.head.s.ctx == null) m.head = try quantizeLin(m, w, m.head, 8, 64);
+        if (m.head.s.ctx == null) {
+            if (opts.head_8bit) m.head = try quantizeLin(m, w, m.head, 8, 64);
+            log.info("deepseek_v41: lm head {s}\n", .{if (opts.head_8bit) "requantized to 8-bit (MLX_SERVE_DSV41_HEAD8=0 keeps it dense)" else "dense, as shipped"});
+        }
         m.norm = try ownCast(m, try getW(w, "norm.weight", .{}), m.act);
     }
     m.rope_plain = try buildRope(m, cfg.rope_theta, 0, 1, 0, 0);
@@ -6880,4 +6892,10 @@ test "dsv41 pair: a host and a worker split at a valid cut give the unsplit mode
     }
     defer for (got) |g| gpa.free(g);
     try expectRowsClose("pair vs whole", got[1], got[0], t.cfg.vocab_size);
+}
+
+test "dsv41 head: the 8-bit head is the default, MLX_SERVE_DSV41_HEAD8=0 keeps the head as the pack ships it" {
+    try testing.expect(head8From(null));
+    try testing.expect(head8From("1"));
+    try testing.expect(!head8From("0"));
 }
