@@ -26,6 +26,9 @@ const kv_disk_cache = @import("ssd/disk_tier.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const log = @import("../../../sdk/util/log.zig");
 const restore_dump = @import("restore_dump.zig");
+const plugin_driver = @import("../plugin/driver.zig");
+const plugin_abi = @import("../../../abi/plugin.zig");
+const Array = @import("../../../mlx/ops.zig").Array;
 
 const KVCache = transformer_mod.KVCache;
 const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
@@ -160,6 +163,38 @@ pub const LookupResult = struct {
     entry_id: u64 = 0,
 };
 
+/// Borrowed from a loaded transformer. Its plugin binding must stay unchanged until cache deinit.
+/// All cache operations and callbacks run on the inference thread, before the transformer unloads.
+pub const ModuleBinding = struct {
+    xfm: *const transformer_mod.Transformer,
+    aux: plugin_driver.AuxBinding,
+
+    /// Null unless all phase-1 hooks are usable and this loaded instance permits caching.
+    pub fn init(xfm: *const transformer_mod.Transformer) ?ModuleBinding {
+        const aux = plugin_driver.auxBinding(xfm) orelse return null;
+        if (aux.hooks.describe == null or aux.hooks.prefix_key == null or aux.hooks.begin_prompt == null) return null;
+        if (!plugin_driver.auxEnabled(xfm)) return null;
+        return .{ .xfm = xfm, .aux = aux };
+    }
+
+    fn same(a: ModuleBinding, b: ModuleBinding) bool {
+        return a.xfm == b.xfm and a.aux.model == b.aux.model and a.aux.hooks == b.aux.hooks;
+    }
+};
+
+/// A selection survives eviction by carrying identity, never an index into the entry array.
+pub const ModuleMatch = struct { entry_id: u64, n: usize };
+
+const ModulePayload = struct {
+    binding: ModuleBinding,
+    snapshot: plugin_abi.Handle,
+    n: usize,
+    prefix_key: u64,
+    aux_bytes: u64,
+};
+
+const ModuleRequest = struct { binding: ModuleBinding, media_rows: ?Array };
+
 const Entry = struct {
     /// `prompt_ids ++ generated_ids` from the request that produced this snapshot.
     /// Owned by the entry; freed on eviction.
@@ -178,6 +213,8 @@ const Entry = struct {
     /// Snapshot of the live KVCache at end of generation. Owns refcount-shared
     /// handles to the GPU buffers backing positions 0..tokens.len.
     snapshot: KVCacheSnapshot,
+    /// Exclusive with ordinary KV, SSM and speculative snapshots; billed in `kv_bytes`.
+    module: ?ModulePayload = null,
     /// Monotonic counter for LRU. Higher = more recent.
     last_used: u64,
     /// Wave 1.A: full KV-quant config active when this entry was committed.
@@ -551,6 +588,10 @@ pub const HotPrefixCache = struct {
     /// checkpoint array. Used by `deinit`, eviction, and replace paths so
     /// they don't drift apart.
     fn freeEntryOwnedState(allocator: std.mem.Allocator, e: *Entry) void {
+        if (e.module) |m| {
+            plugin_driver.auxFree(m.binding.xfm, m.snapshot);
+            e.module = null;
+        }
         allocator.free(e.tokens);
         allocator.free(e.media);
         e.snapshot.deinit();
@@ -764,6 +805,18 @@ pub const HotPrefixCache = struct {
         const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
+    }
+
+    /// Load-time gate after the plugin has loaded. Auxiliary-only caches are RAM-only:
+    /// the caller must not attach a DiskTier, and must use the module commit/restore functions.
+    pub fn shouldUseInstance(config: *const model_mod.ModelConfig, enable_ssm_checkpoints: bool, xfm: *const transformer_mod.Transformer) bool {
+        if (config.glm_stream or config.dist_span != null or config.dist_shard != null) return false;
+        if (plugin_driver.auxBinding(xfm) != null) {
+            // The plugin's eligibility hook also excludes paired and streamed loaded instances.
+            if (config.expert_bank) return false;
+            return ModuleBinding.init(xfm) != null;
+        }
+        return shouldUse(config, enable_ssm_checkpoints);
     }
 
     fn bumpCounter(self: *HotPrefixCache) u64 {
@@ -1062,6 +1115,20 @@ pub const HotPrefixCache = struct {
         require_ssm_checkpoint: bool,
         probe: ?*MatchProbe,
     ) ?struct { idx: usize, shared: usize } {
+        const m = self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, require_ssm_checkpoint, probe, null) orelse return null;
+        return .{ .idx = m.idx, .shared = m.shared };
+    }
+
+    fn findBestRestorableMatchWithModule(
+        self: *const HotPrefixCache,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        media: []const MediaSpan,
+        quant_config: kv_quant.KVQuantConfig,
+        require_ssm_checkpoint: bool,
+        probe: ?*MatchProbe,
+        module_request: ?ModuleRequest,
+    ) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
         var best_effective: usize = 0;
@@ -1083,6 +1150,23 @@ pub const HotPrefixCache = struct {
                 if (shared > p.best_raw) p.best_raw = shared;
             }
 
+            if (e.module) |m| {
+                const request = module_request orelse continue;
+                if (!ModuleBinding.same(m.binding, request.binding)) continue;
+                if (m.n == 0 or m.n >= prompt_ids.len or shared != m.n or m.n <= best_effective) continue;
+                var key: u64 = 0;
+                const had_error = mlx.errorPending();
+                if (!plugin_driver.auxPrefixKey(request.binding.xfm, e.tokens, request.media_rows, &key).isOk()) {
+                    mlx.dropLatchedErrorUnless(had_error);
+                    continue;
+                }
+                if (key != m.prefix_key) continue;
+                best_effective = m.n;
+                best_shared = m.n;
+                best_idx = i;
+                continue;
+            }
+            if (module_request != null) continue;
             if (!ringRestores(&e.snapshot, shared, prompt_ids.len)) continue;
             const effective = if (require_ssm_checkpoint) blk: {
                 const cps = e.ssm_checkpoints orelse continue;
@@ -1099,6 +1183,45 @@ pub const HotPrefixCache = struct {
         }
         if (best_idx) |idx| return .{ .idx = idx, .shared = best_shared };
         return null;
+    }
+
+    /// Read-only exact-checkpoint selection. Keys use each candidate's IDs and the request's
+    /// media rows; an ineligible longer entry cannot hide a shorter one. Retain only the ID.
+    pub fn findModuleMatch(
+        self: *const HotPrefixCache,
+        binding: ModuleBinding,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        media: []const MediaSpan,
+        media_rows: ?Array,
+        quant_config: kv_quant.KVQuantConfig,
+    ) ?ModuleMatch {
+        const m = self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, false, null, .{ .binding = binding, .media_rows = media_rows }) orelse return null;
+        return .{ .entry_id = self.entries.items[m.idx].id, .n = m.shared };
+    }
+
+    /// Re-find by ID after any admission eviction. Removes the entry before restore and frees
+    /// its wrapper on every outcome; the slot keeps its own references. Zero means go cold.
+    /// Caller updates slot counters and calls auxBeginPrompt at the returned n (zero establishes a cold slot).
+    pub fn consumeModule(self: *HotPrefixCache, binding: ModuleBinding, entry_id: u64, slot: u32) usize {
+        self.last_restored_used = null;
+        self.last_restored_shared = 0;
+        self.last_restored_disk_id = null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.id != entry_id) continue;
+            const payload = e.module orelse return 0;
+            if (!ModuleBinding.same(payload.binding, binding)) return 0;
+            var detached = self.entries.swapRemove(i);
+            self.current_kv_bytes -|= detached.kv_bytes;
+            defer freeEntryOwnedState(self.allocator, &detached);
+            const had_error = mlx.errorPending();
+            if (!plugin_driver.auxRestoreAt(binding.xfm, slot, payload.snapshot, payload.n).isOk()) {
+                mlx.dropLatchedErrorUnless(had_error);
+                return 0;
+            }
+            return payload.n;
+        }
+        return 0;
     }
 
     /// Tokens a RAM restore would cover for a text prompt, read without touching any state. A
@@ -1616,6 +1739,73 @@ pub const HotPrefixCache = struct {
         }
     }
 
+    /// Takes snapshot ownership on every outcome, including allocation errors and declines.
+    /// IDs/key must come from auxDescribe and describe the committing prompt's forwarded prefix.
+    /// Media is clipped below that boundary. Oversized checkpoints are declined whole, never trimmed.
+    pub fn commitModule(
+        self: *HotPrefixCache,
+        binding: ModuleBinding,
+        snapshot: plugin_abi.Handle,
+        ids: []const u32,
+        prefix_key: u64,
+        media: []const MediaSpan,
+        has_tools: bool,
+        quant_config: kv_quant.KVQuantConfig,
+        cache_key: u64,
+    ) !CommitStatus {
+        var retained = false;
+        defer if (!retained) plugin_driver.auxFree(binding.xfm, snapshot);
+        if (!self.ram_enabled or self.max_entries == 0 or self.disk != null) return .declined;
+        if (ids.len == 0) return .declined;
+        var info: plugin_abi.AuxSnapshotInfo = .{};
+        if (!plugin_driver.auxDescribe(binding.xfm, snapshot, &info).isOk()) return .declined;
+        if (info.n != ids.len or info.prefix_key != prefix_key or !std.mem.eql(u32, info.ids.slice(), ids)) return .declined;
+        const aux_bytes = plugin_driver.auxBytes(binding.xfm, snapshot);
+        if (self.max_kv_bytes > 0 and aux_bytes > self.max_kv_bytes) return .declined;
+        const eff_media = spansBelow(media, ids.len);
+        const keys = try dupeEntryKeys(self.allocator, ids, eff_media);
+        defer if (!retained) {
+            self.allocator.free(keys[0]);
+            self.allocator.free(keys[1]);
+        };
+        // Allocate before removing any donor; OOM leaves the resident history intact.
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        for (self.entries.items, 0..) |*e, i| {
+            const m = e.module orelse continue;
+            if (!ModuleBinding.same(m.binding, binding) or e.has_tools != has_tools) continue;
+            if (!std.meta.eql(e.quant_config, quant_config) or e.tokens.len > ids.len) continue;
+            if (mediaSharedBound(e.media, eff_media) < e.tokens.len) continue;
+            if (!std.mem.eql(u32, e.tokens, ids[0..e.tokens.len])) continue;
+            self.evictAt(i, "module checkpoint replaced");
+            break;
+        }
+        while (self.entries.items.len >= self.max_entries) {
+            if (!self.evictOneLruProgress("count cap", cache_key)) return .declined;
+        }
+        if (self.max_kv_bytes > 0) {
+            while (self.current_kv_bytes > self.max_kv_bytes - aux_bytes) {
+                if (!self.evictOneLruProgress("byte budget", cache_key)) return .declined;
+            }
+        }
+        // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
+        self.entries.appendAssumeCapacity(.{
+            .tokens = keys[0],
+            .media = keys[1],
+            .has_tools = has_tools,
+            .quant_config = quant_config,
+            .cache_key = cache_key,
+            .id = self.bumpCounter(),
+            .last_used = self.bumpCounter(),
+            .snapshot = .{ .entries = &.{}, .step = 0, .allocator = self.allocator, .config = quant_config },
+            .module = .{ .binding = binding, .snapshot = snapshot, .n = ids.len, .prefix_key = prefix_key, .aux_bytes = aux_bytes },
+            .kv_bytes = aux_bytes,
+        });
+        retained = true;
+        self.current_kv_bytes += aux_bytes;
+        self.logResident();
+        return .{ .ok = ids.len };
+    }
+
     /// Commit the current `source_cache` state under the given key. Updates
     /// the matching entry if one exists for this exact prefix, otherwise
     /// inserts a new entry, evicting the oldest if at capacity. Snapshot is
@@ -1713,6 +1903,7 @@ pub const HotPrefixCache = struct {
 
         var replace_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
+            if (e.module != null) continue;
             if (e.has_tools != has_tools) continue;
             if (mediaSharedBound(e.media, eff_media) < e.tokens.len) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
@@ -10142,4 +10333,489 @@ test "shouldUse: a pipeline cluster's rank 0 keeps no prefix cache" {
     try std.testing.expect(HotPrefixCache.shouldUse(&cfg, true));
     cfg.dist_span = .{ .start = 0, .end = 16, .total = 48 };
     try std.testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
+}
+
+const ModuleFake = struct {
+    enabled: bool = true,
+    fail_restore: bool = false,
+    latch_restore: bool = false,
+    restores: usize = 0,
+    frees: usize = 0,
+    restored: ?*Snap = null,
+    slot: u32 = 0,
+    key_ids_len: usize = 0,
+    fail_key_at: usize = 0,
+
+    const Snap = struct {
+        owner: *ModuleFake,
+        ids: []const u32,
+        key: u64,
+        bytes: u64 = 40,
+        frees: usize = 0,
+
+        fn put(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan) !CommitStatus {
+            return cache.commitModule(binding, self, self.ids, self.key, media, false, kv_quant.KVQuantConfig.dense, 0);
+        }
+    };
+    const Rows = struct { start: usize, key: u64 };
+
+    fn get(m: *anyopaque) *ModuleFake {
+        return @ptrCast(@alignCast(m));
+    }
+    fn snapOf(snap: plugin_abi.Handle) *Snap {
+        return @ptrCast(@alignCast(snap.?));
+    }
+    fn on(m: *anyopaque) callconv(.c) bool {
+        return get(m).enabled;
+    }
+    fn describe(m: *anyopaque, snap: plugin_abi.Handle, out: *plugin_abi.AuxSnapshotInfo) callconv(.c) plugin_abi.Verdict {
+        const s = snapOf(snap);
+        std.debug.assert(s.owner == get(m) and s.frees == 0);
+        out.* = .{ .n = s.ids.len, .ids = .of(s.ids), .prefix_key = s.key };
+        return .ok;
+    }
+    fn prefixKey(m: *anyopaque, ids: plugin_abi.Span(u32), rows: plugin_abi.Array, out: *u64) callconv(.c) plugin_abi.Verdict {
+        const f = get(m);
+        f.key_ids_len = ids.slice().len;
+        if (f.fail_key_at == ids.len) {
+            mlx.latchErrorForTest("module cache key failure");
+            return plugin_abi.Verdict.refuse(.failed, "fake key failed");
+        }
+        var key: u64 = 0;
+        for (ids.slice()) |id| key += id;
+        if (rows.ctx) |ctx| {
+            const r: *const Rows = @ptrCast(@alignCast(ctx));
+            if (r.start < ids.len) key += r.key;
+        }
+        out.* = key;
+        return .ok;
+    }
+    fn begin(_: *anyopaque, _: u32, _: plugin_abi.Span(u32), _: plugin_abi.Array, _: u64, _: bool) callconv(.c) plugin_abi.Verdict {
+        return .ok;
+    }
+    fn restore(m: *anyopaque, slot: u32, snap: plugin_abi.Handle, n: u64) callconv(.c) plugin_abi.Verdict {
+        const f = get(m);
+        const s = snapOf(snap);
+        std.debug.assert(s.owner == f and s.frees == 0 and n == s.ids.len);
+        f.restores += 1;
+        f.slot = slot;
+        if (f.latch_restore) mlx.latchErrorForTest("module cache restore failure");
+        if (f.fail_restore) return plugin_abi.Verdict.refuse(.failed, "fake restore failed");
+        f.restored = s;
+        return .ok;
+    }
+    fn bytes(m: *anyopaque, snap: plugin_abi.Handle) callconv(.c) u64 {
+        const s = snapOf(snap);
+        std.debug.assert(s.owner == get(m) and s.frees == 0);
+        return s.bytes;
+    }
+    fn free(m: *anyopaque, snap: plugin_abi.Handle) callconv(.c) void {
+        const s = snapOf(snap);
+        std.debug.assert(s.owner == get(m) and s.frees == 0);
+        s.frees += 1;
+        get(m).frees += 1;
+    }
+    const hooks: plugin_abi.AuxHooks = .{
+        .reserve = undefined,
+        .commit = undefined,
+        .snapshot = undefined,
+        .restore_at = &restore,
+        .slice = undefined,
+        .handoff = undefined,
+        .free = &free,
+        .bytes = &bytes,
+        .serialize = undefined,
+        .deserialize = undefined,
+        .enabled = &on,
+        .describe = &describe,
+        .prefix_key = &prefixKey,
+        .begin_prompt = &begin,
+    };
+    const cache_hooks: plugin_abi.CacheHooks = .{ .aux = &hooks };
+    const weights: plugin_abi.WeightHooks = .{};
+    const table: plugin_abi.ModelTable = .{
+        .name = .of("module_cache_fixture"),
+        .claims = undefined,
+        .parse = undefined,
+        .free_parsed = undefined,
+        .bill = undefined,
+        .load = undefined,
+        .unload = undefined,
+        .forward = undefined,
+        .cache = &cache_hooks,
+        .weights = &weights,
+    };
+
+    fn bind(self: *ModuleFake, bound: *plugin_driver.Bound, xfm: *transformer_mod.Transformer) ModuleBinding {
+        bound.* = .{ .table = &table, .model = self };
+        xfm.plugin = bound;
+        return ModuleBinding.init(xfm).?;
+    }
+};
+
+test "HotPrefixCache module: longest exact checkpoint wins and KV lookup cannot select it" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 4);
+    defer cache.deinit();
+    try testing.expect(cache.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
+    try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, 42, 0));
+    var long: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var short: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+    try testing.expectEqual(CommitStatus{ .ok = 4 }, try long.put(&cache, binding, &.{}));
+    _ = try short.put(&cache, binding, &.{});
+    const hit = cache.findModuleMatch(binding, &.{ 1, 2, 3, 4, 5 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(@as(usize, 4), hit.n);
+    try testing.expectEqual(@as(usize, 4), fake.key_ids_len);
+    try testing.expect(cache.findBestMatch(&.{ 1, 2, 3, 4, 5 }, false, &.{}, kv_quant.KVQuantConfig.dense) == null);
+    try testing.expectEqual(@as(u64, 80), cache.current_kv_bytes);
+    try testing.expectEqual(@as(usize, 4), cache.consumeModule(binding, hit.entry_id, 17));
+    try testing.expectEqual(@as(?*ModuleFake.Snap, &long), fake.restored);
+    try testing.expectEqual(@as(u32, 17), fake.slot);
+    try testing.expectEqual(@as(usize, 1), long.frees);
+    try testing.expectEqual(@as(usize, 1), cache.entryCount());
+    try testing.expectEqual(@as(u64, 40), cache.current_kv_bytes);
+    try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, hit.entry_id, 17));
+}
+
+test "HotPrefixCache module: an ineligible longer checkpoint cannot hide a shorter one" {
+    const Case = enum { prefix_key, key_failure, media_key, media_presence, media_position, equal_length, past_length, ids, tools, quant };
+    for (std.enums.values(Case)) |case| {
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        if (case == .key_failure) fake.fail_key_at = 4;
+        var cache = HotPrefixCache.init(testing.allocator, 4);
+        defer cache.deinit();
+        defer mlx.dropLatchedErrorUnless(false);
+        const media = [_]MediaSpan{.{ .start = 3, .key = 8 }};
+        const moved = [_]MediaSpan{.{ .start = 2, .key = 8 }};
+        const changed = [_]MediaSpan{.{ .start = 3, .key = 9 }};
+        var rows: ModuleFake.Rows = .{ .start = 3, .key = 8 };
+        var long: ModuleFake.Snap = .{
+            .owner = &fake,
+            .ids = if (case == .ids) &.{ 1, 2, 9, 4 } else &.{ 1, 2, 3, 4 },
+            .key = if (case == .prefix_key) 99 else if (case == .ids) 24 else 18,
+        };
+        var short: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+        _ = try cache.commitModule(binding, &long, long.ids, long.key, &media, case == .tools, if (case == .quant) kv_quant.KVQuantConfig.affine(4) else kv_quant.KVQuantConfig.dense, 0);
+        _ = try short.put(&cache, binding, &media);
+        const prompt: []const u32 = switch (case) {
+            .equal_length => &.{ 1, 2, 3, 4 },
+            .past_length => &.{ 1, 2, 3 },
+            else => &.{ 1, 2, 3, 4, 5 },
+        };
+        const request_media: []const MediaSpan = switch (case) {
+            .media_key => &changed,
+            .media_presence => &.{},
+            .media_position => &moved,
+            else => &media,
+        };
+        const hit = cache.findModuleMatch(binding, prompt, false, request_media, .{ .ctx = &rows }, kv_quant.KVQuantConfig.dense).?;
+        try testing.expectEqual(@as(usize, 2), hit.n);
+        try testing.expectEqual(@as(usize, 2), cache.consumeModule(binding, hit.entry_id, 0));
+        try testing.expectEqual(@as(?*ModuleFake.Snap, &short), fake.restored);
+        try testing.expectEqual(@as(usize, 0), long.frees);
+        try testing.expect(!mlx.errorPending());
+    }
+}
+
+test "HotPrefixCache module: appended media uses candidate ids and only covered spans" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    const media = [_]MediaSpan{ .{ .start = 1, .key = 8 }, .{ .start = 4, .key = 99 } };
+    var snap: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 18 };
+    _ = try snap.put(&cache, binding, &media);
+    var rows: ModuleFake.Rows = .{ .start = 1, .key = 8 };
+    const hit = cache.findModuleMatch(binding, &.{ 1, 2, 3, 4, 5, 6 }, false, &media, .{ .ctx = &rows }, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(@as(usize, 4), hit.n);
+    try testing.expectEqual(@as(usize, 4), fake.key_ids_len);
+    try testing.expectEqual(@as(usize, 4), cache.consumeModule(binding, hit.entry_id, 0));
+    // The span at the checkpoint itself belongs to the suffix.
+    var text: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+    const appended = [_]MediaSpan{.{ .start = 2, .key = 77 }};
+    _ = try text.put(&cache, binding, &appended);
+    var suffix_rows: ModuleFake.Rows = .{ .start = 2, .key = 77 };
+    try testing.expectEqual(@as(usize, 2), cache.findModuleMatch(binding, &.{ 1, 2, 3, 4 }, false, &appended, .{ .ctx = &suffix_rows }, kv_quant.KVQuantConfig.dense).?.n);
+    try testing.expectEqual(@as(usize, 2), cache.findModuleMatch(binding, &.{ 1, 2, 3, 4 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?.n);
+}
+
+test "HotPrefixCache module: alternating conversations remain resumable within count and bytes" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 2, 80);
+    defer cache.deinit();
+    var snaps: [6]ModuleFake.Snap = undefined;
+    for (&snaps, 0..) |*s, i| {
+        const a = i % 2 == 0;
+        s.* = .{ .owner = &fake, .ids = if (a) &.{ 1, 2 } else &.{ 8, 9 }, .key = if (a) 3 else 17 };
+        if (i >= 2) {
+            const hit = cache.findModuleMatch(binding, if (a) &.{ 1, 2, 3 } else &.{ 8, 9, 10 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+            try testing.expectEqual(@as(usize, 2), cache.consumeModule(binding, hit.entry_id, @intCast(i)));
+        }
+        _ = try s.put(&cache, binding, &.{});
+        try testing.expectEqual(@min(i + 1, 2), cache.entryCount());
+        try testing.expectEqual(@as(u64, @min(i + 1, 2)) * 40, cache.current_kv_bytes);
+    }
+    try testing.expectEqual(@as(usize, 2), cache.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?.n);
+    try testing.expectEqual(@as(usize, 2), cache.findModuleMatch(binding, &.{ 8, 9, 10 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?.n);
+    cache.invalidateAll("test end");
+    for (snaps) |s| try testing.expectEqual(@as(usize, 1), s.frees);
+}
+
+test "HotPrefixCache module: replacement count byte invalidation and deinit free once" {
+    const Case = enum { replace, count, bytes, invalidate, deinit };
+    for (std.enums.values(Case)) |case| {
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var cache = HotPrefixCache.initWithMem(testing.allocator, if (case == .count) 1 else 2, if (case == .bytes) 60 else 0);
+        var old: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+        var next: ModuleFake.Snap = .{ .owner = &fake, .ids = if (case == .replace) &.{ 1, 2, 3 } else &.{ 8, 9 }, .key = if (case == .replace) 6 else 17 };
+        _ = try old.put(&cache, binding, &.{});
+        const selected = cache.findModuleMatch(binding, &.{ 1, 2, 3, 4 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+        if (case == .replace or case == .count or case == .bytes) {
+            _ = try next.put(&cache, binding, &.{});
+            try testing.expectEqual(@as(usize, 1), old.frees);
+            try testing.expectEqual(@as(usize, 1), cache.entryCount());
+            try testing.expectEqual(@as(u64, 40), cache.current_kv_bytes);
+            try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, selected.entry_id, 0));
+            try testing.expectEqual(@as(usize, 0), fake.restores);
+        }
+        if (case == .invalidate) {
+            cache.invalidateAll("test invalidation");
+            cache.invalidateAll("test repeated invalidation");
+            try testing.expectEqual(@as(u64, 0), cache.current_kv_bytes);
+        }
+        cache.deinit();
+        try testing.expectEqual(@as(usize, 1), old.frees);
+        try testing.expectEqual(@as(usize, @intFromBool(case == .replace or case == .count or case == .bytes)), next.frees);
+    }
+}
+
+test "HotPrefixCache module: oversized disabled and malformed commits free the whole candidate" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 2, 60);
+    defer cache.deinit();
+    var kept: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+    _ = try kept.put(&cache, binding, &.{});
+    var huge: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17, .bytes = 61 };
+    try testing.expectEqual(@as(CommitStatus, .declined), try huge.put(&cache, binding, &.{}));
+    try testing.expectEqual(@as(usize, 1), huge.frees);
+    try testing.expectEqual(@as(usize, 0), kept.frees);
+    try testing.expectEqual(@as(u64, 40), cache.current_kv_bytes);
+    var bad: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17 };
+    try testing.expectEqual(@as(CommitStatus, .declined), try cache.commitModule(binding, &bad, &.{ 8, 10 }, 17, &.{}, false, kv_quant.KVQuantConfig.dense, 0));
+    try testing.expectEqual(@as(usize, 1), bad.frees);
+    var disabled = HotPrefixCache.init(testing.allocator, 0);
+    defer disabled.deinit();
+    var declined: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17 };
+    try testing.expectEqual(@as(CommitStatus, .declined), try declined.put(&disabled, binding, &.{}));
+    try testing.expectEqual(@as(usize, 1), declined.frees);
+    try testing.expect(cache.findModuleMatch(binding, &.{}, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
+    try testing.expect(cache.findModuleMatch(binding, &.{1}, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
+    cache.setBudget(20);
+    try testing.expectEqual(@as(usize, 1), kept.frees);
+    try testing.expectEqual(@as(u64, 0), cache.current_kv_bytes);
+}
+
+test "HotPrefixCache module: failed restore loses candidate and stale id never selects a swapped entry" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 2, 80);
+    defer cache.deinit();
+    var a: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+    var b: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17 };
+    var c: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 5, 6 }, .key = 11 };
+    _ = try a.put(&cache, binding, &.{});
+    _ = try b.put(&cache, binding, &.{});
+    const stale = cache.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    _ = try c.put(&cache, binding, &.{});
+    try testing.expectEqual(@as(usize, 1), a.frees);
+    try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, stale.entry_id, 0));
+    try testing.expectEqual(@as(usize, 0), fake.restores);
+    try testing.expectEqual(@as(usize, 0), b.frees);
+    const hit = cache.findModuleMatch(binding, &.{ 8, 9, 10 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    fake.fail_restore = true;
+    try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, hit.entry_id, 0));
+    try testing.expectEqual(@as(usize, 1), b.frees);
+    try testing.expect(cache.findModuleMatch(binding, &.{ 8, 9, 10 }, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
+    try testing.expectEqual(@as(usize, 1), cache.entryCount());
+    try testing.expectEqual(@as(u64, 40), cache.current_kv_bytes);
+}
+
+test "HotPrefixCache module: model bindings cannot select or consume each other's checkpoints" {
+    var models = [_]ModuleFake{ .{}, .{} };
+    var bounds: [2]plugin_driver.Bound = undefined;
+    var shells: [2]transformer_mod.Transformer = undefined;
+    const bindings = [_]ModuleBinding{ models[0].bind(&bounds[0], &shells[0]), models[1].bind(&bounds[1], &shells[1]) };
+    var cache = HotPrefixCache.init(testing.allocator, 4);
+    defer cache.deinit();
+    var a: ModuleFake.Snap = .{ .owner = &models[0], .ids = &.{ 1, 2 }, .key = 3 };
+    var b: ModuleFake.Snap = .{ .owner = &models[1], .ids = &.{ 1, 2 }, .key = 3 };
+    _ = try a.put(&cache, bindings[0], &.{});
+    const hit = cache.findModuleMatch(bindings[0], &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expect(cache.findModuleMatch(bindings[1], &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
+    try testing.expectEqual(@as(usize, 0), cache.consumeModule(bindings[1], hit.entry_id, 0));
+    _ = try b.put(&cache, bindings[1], &.{});
+    try testing.expectEqual(@as(usize, 2), cache.entryCount());
+    try testing.expectEqual(@as(usize, 2), cache.consumeModule(bindings[0], hit.entry_id, 0));
+    try testing.expectEqual(@as(usize, 1), models[0].restores);
+    try testing.expectEqual(@as(usize, 0), models[1].restores);
+    try testing.expectEqual(@as(usize, 0), b.frees);
+    const b_hit = cache.findModuleMatch(bindings[1], &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(@as(usize, 2), cache.consumeModule(bindings[1], b_hit.entry_id, 1));
+    try testing.expectEqual(@as(usize, 1), models[1].restores);
+    try testing.expectEqual(@as(?*ModuleFake.Snap, &b), models[1].restored);
+}
+
+test "HotPrefixCache module: loaded instance gate keeps distributed and streamed packs cold" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    _ = fake.bind(&bound, &xfm);
+    var cfg = model_mod.ModelConfig{};
+    cfg.legacy.caps.prefix_cache = false;
+    try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
+    try testing.expect(HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
+    fake.enabled = false;
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
+    cfg.legacy.caps.prefix_cache = true;
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
+    cfg.legacy.caps.prefix_cache = false;
+    fake.enabled = true;
+    cfg.glm_stream = true;
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
+    cfg.glm_stream = false;
+    cfg.expert_bank = true;
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
+    cfg.expert_bank = false;
+    cfg.dist_span = .{ .start = 0, .end = 1, .total = 2 };
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
+    cfg.dist_span = null;
+    cfg.dist_shard = .{ .rank = 0, .size = 2 };
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
+    cfg.legacy.caps.prefix_cache = true;
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
+    cfg.dist_shard = null;
+    cfg.legacy.caps.prefix_cache = false;
+    xfm.plugin = null;
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
+    cfg.legacy.caps.prefix_cache = true;
+    try testing.expect(HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
+}
+
+
+test "HotPrefixCache module: incoming workload pays for eviction before an older conversation" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 3, 120);
+    defer cache.deinit();
+    var snaps = [_]ModuleFake.Snap{
+        .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17 },
+        .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 },
+        .{ .owner = &fake, .ids = &.{ 3, 4 }, .key = 7 },
+        .{ .owner = &fake, .ids = &.{ 5, 6 }, .key = 11 },
+    };
+    for (&snaps, 0..) |*snap, i| {
+        _ = try cache.commitModule(binding, snap, snap.ids, snap.key, &.{}, false, kv_quant.KVQuantConfig.dense, if (i == 0) 202 else 101);
+    }
+    try testing.expectEqual(@as(usize, 0), snaps[0].frees);
+    try testing.expectEqual(@as(usize, 1), snaps[1].frees);
+    try testing.expectEqual(@as(usize, 3), cache.entryCount());
+    try testing.expectEqual(@as(u64, 120), cache.current_kv_bytes);
+    try testing.expect(cache.findModuleMatch(binding, &.{ 8, 9, 10 }, false, &.{}, null, kv_quant.KVQuantConfig.dense) != null);
+    try testing.expect(cache.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
+    cache.invalidateAll("test end");
+    for (snaps) |snap| try testing.expectEqual(@as(usize, 1), snap.frees);
+}
+
+test "HotPrefixCache module: allocation failures release snapshot and preserve resident history" {
+    // Token copy, media copy and entry-array growth each unwind ownership.
+    for (0..3) |fail_index| {
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var cache = HotPrefixCache.init(failing.allocator(), 2);
+        defer cache.deinit();
+        var snap: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 11 };
+        const spans = [_]MediaSpan{.{ .start = 1, .key = 8 }};
+        try testing.expectError(error.OutOfMemory, snap.put(&cache, binding, &spans));
+        try testing.expectEqual(@as(usize, 1), snap.frees);
+        try testing.expectEqual(@as(usize, 0), cache.entryCount());
+        try testing.expectEqual(@as(u64, 0), cache.current_kv_bytes);
+    }
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    var old: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+    var next: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3 }, .key = 6 };
+    _ = try old.put(&cache, binding, &.{});
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    cache.allocator = failing.allocator();
+    defer cache.allocator = testing.allocator;
+    try testing.expectError(error.OutOfMemory, next.put(&cache, binding, &.{}));
+    try testing.expectEqual(@as(usize, 1), next.frees);
+    try testing.expectEqual(@as(usize, 0), old.frees);
+    try testing.expectEqual(@as(usize, 2), cache.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?.n);
+}
+
+test "HotPrefixCache module: count or byte pressure with only checked-out survivors declines without spinning" {
+    for ([_]bool{ false, true }) |byte_limit| {
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var cache = HotPrefixCache.initWithMem(testing.allocator, if (byte_limit) 2 else 1, if (byte_limit) 60 else 0);
+        defer cache.deinit();
+        try pcAppendCheckedOut(&cache, &.{ 8, 9 }, 40, 1);
+        var snap: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+        try testing.expectEqual(@as(CommitStatus, .declined), try snap.put(&cache, binding, &.{}));
+        try testing.expectEqual(@as(usize, 1), snap.frees);
+        try testing.expectEqual(@as(usize, 1), cache.entryCount());
+        try testing.expectEqual(@as(u64, 40), cache.current_kv_bytes);
+    }
+}
+
+test "HotPrefixCache module: failed restore clears only its own error latch" {
+    defer mlx.dropLatchedErrorUnless(false);
+    for ([_]bool{ false, true }) |preexisting| {
+        mlx.dropLatchedErrorUnless(false);
+        var fake: ModuleFake = .{ .fail_restore = true, .latch_restore = !preexisting };
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var cache = HotPrefixCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        var snap: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+        _ = try snap.put(&cache, binding, &.{});
+        const hit = cache.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+        if (preexisting) mlx.latchErrorForTest("module cache pre-existing failure");
+        try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, hit.entry_id, 0));
+        try testing.expectEqual(preexisting, mlx.errorPending());
+        try testing.expectEqual(@as(usize, 1), snap.frees);
+        try testing.expectEqual(@as(usize, 0), cache.entryCount());
+    }
 }

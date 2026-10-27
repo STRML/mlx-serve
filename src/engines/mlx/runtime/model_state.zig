@@ -8,6 +8,13 @@ const LoadedModel = registry.LoadedModel;
 /// Frees the entry's MLX objects (MTP head, drafters, vision tower, transformer, weights, prefix cache), in
 /// dependency order. Null fields are skipped.
 pub fn freeMlx(self: *LoadedModel) void {
+    // Cache snapshots call into their plugin binding, which the transformer owns.
+    if (self.prefix_cache) |hc| {
+        hc.deinit();
+        self.allocator.destroy(hc);
+        self.prefix_cache = null;
+    }
+
     if (self.mtp) |h| {
         // The Qwen sidecar and the plugin heads are separately allocated; an in-trunk head is owned by the
         // Transformer and freed with it.
@@ -49,11 +56,6 @@ pub fn freeMlx(self: *LoadedModel) void {
         w.deinit();
         self.allocator.destroy(w);
         self.weights = null;
-    }
-    if (self.prefix_cache) |hc| {
-        hc.deinit();
-        self.allocator.destroy(hc);
-        self.prefix_cache = null;
     }
 }
 
