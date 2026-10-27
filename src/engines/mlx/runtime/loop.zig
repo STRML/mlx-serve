@@ -11,6 +11,8 @@ const reviseHotCacheBudgets = @import("../scheduler.zig").reviseHotCacheBudgets;
 const persistAtShutdown = @import("../scheduler.zig").persistAtShutdown;
 const commitSlotIfApplicable = @import("../commit.zig").commitSlotIfApplicable;
 const recordSlotCleanup = @import("../finish.zig").recordSlotCleanup;
+const releasePluginSlot = @import("../finish.zig").releasePluginSlot;
+const publishHotCacheResidency = @import("../cache/budget.zig").publishHotCacheResidency;
 const doLoadOnInferenceThread = @import("../load.zig").doLoadOnInferenceThread;
 const loadErrorName = @import("../../../host/media_jobs/plugin/engine.zig").loadErrorName;
 const VisionEncodeRequest = @import("../media_encode.zig").VisionEncodeRequest;
@@ -208,14 +210,14 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
         // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
         // record must not outlive the bytes `s.deinit()` frees.
         if (s.model.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
+        releasePluginSlot(s);
         if (s.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.resetQsaPooledRope();
         s.deinit();
     }
+    if (cleanup_n > 0) publishHotCacheResidency(sch);
     for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
     for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
     return cleanup_n + vision_n + embed_n > 0;
 }
 
 // ── tests ──
-
-

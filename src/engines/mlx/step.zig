@@ -323,7 +323,11 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         }
         publishLiveKvResidency(sch, null);
     }
-    for (cancelled[0..n_cancelled]) |s| s.markFinished("cancelled");
+    for (cancelled[0..n_cancelled]) |s| {
+        @import("finish.zig").releasePluginSlot(s);
+        s.markFinished("cancelled");
+    }
+    if (n_cancelled > 0) @import("cache/budget.zig").publishHotCacheResidency(sch);
     return if (ran) .ran else .idle;
 }
 
@@ -332,7 +336,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
 pub fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot) void {
     const observe = sch.metrics != null;
     sch.live_session_count = 0;
-    var bytes: u64 = 0;
+    var bytes: u64 = @import("cache/budget.zig").moduleStateBytes(sch);
     if (prefilling) |p| {
         const b = slotStateBytes(p);
         bytes += b;

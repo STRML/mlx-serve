@@ -13,6 +13,21 @@ const commitSlotIfApplicable = @import("commit.zig").commitSlotIfApplicable;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const Slot = @import("slot.zig").Slot;
 const specTickMode = @import("spec/wiring.zig").specTickMode;
+const plugin_settle = @import("plugin/settle.zig");
+
+/// Both contexts name the same plugin slot. Clear them together before either can be destroyed.
+pub fn releasePluginSlot(slot: *Slot) void {
+    const xfm = slot.model.transformer orelse return;
+    if (!xfm.ownsModuleDecodeState()) return;
+    if (slot.legacy_gen) |*g| {
+        xfm.discardDeferredPle(&g.ctx);
+        const id = g.ctx.plugin_slot;
+        plugin_settle.release(xfm, &g.ctx);
+        if (slot.ctx.plugin_slot == id) slot.ctx.plugin_slot = 0;
+    }
+    xfm.discardDeferredPle(&slot.ctx);
+    plugin_settle.release(xfm, &slot.ctx);
+}
 
 /// The terminator a finishing slot publishes, and the only caller of `Slot.markFinished`.
 /// `latched` is a peek (`mlx.peekErrorName`): a decode forward that failed can still hand
@@ -161,6 +176,8 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     }
     if (slot.completion_tokens <= 2) logShortGen(slot, reason);
     commitSlotIfApplicable(sch, slot);
+    releasePluginSlot(slot);
+    publishHotCacheResidency(sch);
     // Restore by move: a slot that ended without committing still holds its checkout, and
     // the record now describes bytes that die with `slot.cache`. Above every early return.
     if (slot.model.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(slot), reason);

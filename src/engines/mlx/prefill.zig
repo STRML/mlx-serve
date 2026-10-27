@@ -12,6 +12,7 @@ const kv_disk_cache = @import("cache/ssd/disk_tier.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const plugin_driver = @import("plugin/driver.zig");
+const plugin_settle = @import("plugin/settle.zig");
 const mlx_stream = @import("modules/stream.zig");
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -42,6 +43,30 @@ const specInitWiring = @import("spec/wiring.zig").specInitWiring;
 const publishLiveKvResidency = @import("step.zig").publishLiveKvResidency;
 const scheduler_mod = @import("scheduler.zig");
 const intree = @import("plugin/intree.zig");
+
+fn beginModulePrompt(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, n: usize) !void {
+    const id = plugin_settle.slotId(slot.model.transformer.?.plugin.?, &slot.ctx);
+    const capture = if (slot.model.prefix_cache) |hc| hc.ram_enabled and hc.max_entries > 0 else false;
+    const v = plugin_driver.auxBeginPrompt(binding.xfm, id, slot.full_prompt, slot.vision_embeddings, n, capture);
+    if (!v.isOk()) {
+        log.err("[hot-cache] module prompt setup failed: {s}\n", .{v.why.slice()});
+        return error.PluginForwardFailed;
+    }
+    slot.cache.step = n;
+    slot.moe_seq_offset = n;
+}
+
+fn restoreModulePrompt(slot: *Slot, binding: prefix_cache_mod.ModuleBinding) !usize {
+    const id = plugin_settle.slotId(slot.model.transformer.?.plugin.?, &slot.ctx);
+    var n: usize = 0;
+    if (!slot.skip_prefix_cache) if (slot.model.prefix_cache) |hc| {
+        if (hc.findModuleMatch(binding, slot.full_prompt, slot.has_tools, slot.media, slot.vision_embeddings, slot.cache.config)) |match| {
+            n = hc.consumeModule(binding, match.entry_id, id);
+        }
+    };
+    try beginModulePrompt(slot, binding, n);
+    return n;
+}
 
 pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
@@ -154,20 +179,32 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // slot's LoadedModel. Both stay resident for the slot's lifetime
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
-    // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
-    const resumed: u64 = if (plugin_driver.resumePrompt(xfm_ptr, &slot.ctx, slot.full_prompt, slot.vision_embeddings)) |n|
-        n
-    else if (xfm_ptr.mlx_stream_ext) |m|
-        try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
-    else
-        0;
-    if (resumed > 0) {
-        hot_matched = @intCast(resumed);
-        prefill_tokens = slot.full_prompt[resumed..];
-        slot.cache.step = resumed;
-        log.info("[dsv41] resumed {d} of {d} prompt tokens\n", .{ resumed, slot.full_prompt.len });
+    const module_binding = prefix_cache_mod.ModuleBinding.init(xfm_ptr);
+    errdefer if (module_binding != null) {
+        @import("finish.zig").releasePluginSlot(slot);
+        publishHotCacheResidency(sch);
+    };
+    if (module_binding) |binding| {
+        hot_matched = @intCast(try restoreModulePrompt(slot, binding));
+        prefill_tokens = slot.full_prompt[hot_matched..];
+        hot_checked_out = hot_matched > 0;
+        publishHotCacheResidency(sch);
+    } else {
+        // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
+        const resumed: u64 = if (plugin_driver.resumePrompt(xfm_ptr, &slot.ctx, slot.full_prompt, slot.vision_embeddings)) |n|
+            n
+        else if (xfm_ptr.mlx_stream_ext) |m|
+            try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
+        else
+            0;
+        if (resumed > 0) {
+            hot_matched = @intCast(resumed);
+            prefill_tokens = slot.full_prompt[resumed..];
+            slot.cache.step = resumed;
+            log.info("[dsv41] resumed {d} of {d} prompt tokens\n", .{ resumed, slot.full_prompt.len });
+        }
     }
-    if (slot.model.prefix_cache) |hc| {
+    if (module_binding == null) if (slot.model.prefix_cache) |hc| {
         {
             // Only build a restore target when this request will actually
             // draft — a non-dflash turn leaves the payload in the entry for
@@ -244,7 +281,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 mtp_target = null;
             }
         }
-    }
+    };
 
     // A request admitted at another prefill's chunk boundary must not turn into a long prefill of its
     // own: the restore covered less than the pre-filter peeked (SSD tier, lien, QSA gap, a checkout
@@ -337,7 +374,25 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 publishHotCacheResidency(sch);
                 // What the allocator returned, not what the cache was billed for.
                 evicted_live_bytes = report.bytes;
-                if (!report.admitted) {
+                fits = report.admitted;
+                if (!fits and hot_matched > 0) if (module_binding) |binding| {
+                    // Consumed snapshots have no donor left to evict. Drop their live state once.
+                    try beginModulePrompt(slot, binding, 0);
+                    hot_matched = 0;
+                    hot_checked_out = false;
+                    prefill_tokens = slot.full_prompt;
+                    slot.restored_entry = 0;
+                    probe.warm_matched = 0;
+                    probe.warm_capacity = 0;
+                    probe.warm_will_donate = false;
+                    publishHotCacheResidency(sch);
+                    // Dropping the restore can also unpin buffers shared with remaining entries.
+                    const cold_report = slot.model.prefix_cache.?.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, false);
+                    evicted_live_bytes += cold_report.bytes;
+                    fits = cold_report.admitted;
+                    publishHotCacheResidency(sch);
+                };
+                if (!fits) {
                     log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
                     if (scheduler_mod.prefill_admission_refused_log) |report_fn| {
                         slot.refused_bill = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);

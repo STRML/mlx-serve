@@ -5,6 +5,8 @@ const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
+const plugin_driver = @import("plugin/driver.zig");
+const plugin_abi = @import("../../abi/plugin.zig");
 const log = @import("../../sdk/util/log.zig");
 const Generator = generate_mod.Generator;
 const testing = std.testing;
@@ -74,6 +76,27 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // `finishSlot` can be reached on an EOS the failing forward itself produced, before the
     // tick wrapper reads the latch: an unread latch means the KV under this commit may be garbage.
     if (mlx.errorPending()) return;
+    if (slot.model.transformer) |xfm| if (prefix_cache_mod.ModuleBinding.init(xfm)) |binding| {
+        if (slot.cancelled.load(.acquire)) return;
+        const gen = if (slot.legacy_gen) |*g| g else return;
+        if (commitDeclinesPadOnly(gen.generated_ids.items.len, slot.was_pad_only)) return;
+        const snap = plugin_driver.auxSnapshot(xfm, gen.ctx.plugin_slot) orelse return;
+        var info: plugin_abi.AuxSnapshotInfo = .{};
+        if (!plugin_driver.auxDescribe(xfm, snap, &info).isOk() or
+            info.n == 0 or info.n != info.ids.len or info.n > slot.full_prompt.len or
+            !std.mem.eql(u32, info.ids.slice(), slot.full_prompt[0..@intCast(info.n)]) or mlx.errorPending())
+        {
+            plugin_driver.auxFree(xfm, snap);
+            return;
+        }
+        // The snapshot describes its own forwarded prompt boundary, excluding the generated tail.
+        _ = hc.commitModule(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key) catch |err| {
+            log.warn("[hot-cache] module commit failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        publishHotCacheResidency(sch);
+        return;
+    };
     const gen_ptr = if (slot.legacy_gen) |*g| g else {
         // A Generator-less slot whose cache is non-empty is a prefill the
         // client disconnected from mid-chunk-loop: initWithOptions threw

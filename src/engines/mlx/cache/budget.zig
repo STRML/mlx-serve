@@ -55,10 +55,9 @@ pub fn reviseHotCacheBudgets(sch: *Scheduler, grow_only: bool) void {
     publishHotCacheResidency(sch);
 }
 
-/// What the module-owned archs retain between requests: DeepSeek-V4.1 keeps one conversation's decode
-/// state (window rings, compressed rows) in the module, outside every KVCache, so the KV figures would
-/// read 0 with 200 GB of weights resident. Inference thread only (the module replaces those buffers).
-fn moduleStateBytes(sch: *Scheduler) u64 {
+/// Active, parked and pending-capture state, counted once per model. Cache-owned snapshots bill separately.
+/// Inference thread only; the caller must not hold registry.mutex.
+pub fn moduleStateBytes(sch: *Scheduler) u64 {
     var bytes: u64 = 0;
     sch.registry.mutex.lockUncancelable(sch.io);
     defer sch.registry.mutex.unlock(sch.io);
@@ -91,11 +90,13 @@ pub fn moveHotCacheViewOff(sch: *Scheduler, leaving: *LoadedModel) void {
 }
 
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
-    var bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
-    bytes += moduleStateBytes(sch);
+    const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
+    sch.queue_mu.lockUncancelable(sch.io);
+    @import("../step.zig").publishLiveKvResidency(sch, null);
+    sch.queue_mu.unlock(sch.io);
     publishHotCacheDigests(sch);
     if (sch.metrics != null) publishCachedSessions(sch);
 }
@@ -311,6 +312,9 @@ test "hot-cache view: a revise that follows an unload raises a budget but never 
     sch.digest_residency = 0;
     sch.resident_hot_cache_bytes = std.atomic.Value(u64).init(0);
     sch.reclaimable_hot_cache_bytes = std.atomic.Value(u64).init(0);
+    sch.resident_live_kv_bytes = .init(0);
+    sch.queue_mu = .init;
+    sch.decoding = .empty;
 
     hc.max_kv_bytes = 600 << 20;
     reviseHotCacheBudgets(&sch, true);
@@ -322,4 +326,54 @@ test "hot-cache view: a revise that follows an unload raises a budget but never 
     hc.max_kv_bytes = 600 << 20;
     reviseHotCacheBudgets(&sch, false);
     try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
+}
+
+test "module live residency is counted once per model and cannot be credited as evictable cache" {
+    const abi = @import("../../../abi/plugin.zig");
+    const Fake = struct {
+        fn bytes(_: *anyopaque) callconv(.c) u64 {
+            return 64;
+        }
+        const table: abi.ModelTable = .{
+            .name = .of("live_residency_fixture"),
+            .claims = undefined,
+            .parse = undefined,
+            .free_parsed = undefined,
+            .bill = undefined,
+            .load = undefined,
+            .unload = undefined,
+            .forward = undefined,
+            .cache = &.{ .state_bytes = &bytes },
+            .weights = &.{},
+        };
+    };
+    const reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    var token: u8 = 0;
+    var bound: plugin_driver.Bound = .{ .table = &Fake.table, .model = &token };
+    var xfm: @import("../transformer.zig").Transformer = undefined;
+    xfm.plugin = &bound;
+    const m = try reg.registerStub("m", "/m", 1);
+    m.state = .ready;
+    m.transformer = &xfm;
+    defer m.transformer = null;
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = reg.io;
+    sch.allocator = testing.allocator;
+    sch.metrics = null;
+    sch.hot_prefix_cache = null;
+    sch.hot_cache_digests = &.{};
+    sch.digest_mu = .init;
+    sch.queue_mu = .init;
+    sch.decoding = .empty;
+    sch.resident_hot_cache_bytes = .init(0);
+    sch.reclaimable_hot_cache_bytes = .init(0);
+    sch.resident_live_kv_bytes = .init(0);
+    publishHotCacheResidency(&sch);
+    try testing.expectEqual(@as(u64, 0), sch.resident_hot_cache_bytes.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), sch.reclaimable_hot_cache_bytes.load(.monotonic));
+    try testing.expectEqual(@as(u64, 64), sch.resident_live_kv_bytes.load(.monotonic));
+    publishHotCacheResidency(&sch);
+    try testing.expectEqual(@as(u64, 64), sch.resident_live_kv_bytes.load(.monotonic));
 }
