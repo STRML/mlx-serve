@@ -1,7 +1,7 @@
 //! DeepSeek-V4.1-Flash: the module-owned native arch (`deepseek_v41.zig`) and its vision tower behind the model table.
 //! One state per slot: the module runs the active one (`dec_state`), the others wait here, and plain decode tokens of
-//! several slots run as one batch (`extendBatched`). The last finished conversation resumes (`resume`, keyed on its
-//! image rows). A streamed pack's routed experts come from its EXL3 bank (`sdk/weights/streamed.zig` `Exl3`).
+//! several slots run as one batch (`extendBatched`). Prompt captures transfer to the engine's prefix cache.
+//! A streamed pack's routed experts come from its EXL3 bank (`sdk/weights/streamed.zig` `Exl3`).
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -34,7 +34,7 @@ pub const table = abi.ModelTable{
     .forward = &forward,
     .release_slot = &releaseSlot,
     .activate_slot = &activateSlot,
-    .cache = &.{ .layout = &layout, .resume_prompt = &resumePrompt, .state_bytes = &stateBytes },
+    .cache = &.{ .layout = &layout, .resume_prompt = &resumePrompt, .state_bytes = &stateBytes, .aux = &aux_hooks },
     .media = &.{ .tower = &media.tower, .prepare = &media.prepare, .placeholder_rows = &media.placeholderRows },
     .spec = &.{ .trunk_weight = &trunkWeight },
     .weights = &.{ .resident_bytes = &residentBytes },
@@ -84,10 +84,9 @@ pub const Model = struct {
     bank: ?Bank = null,
     bank_context: u64 = 0,
     /// The slot whose state is `mdl.dec_state` (0: none claimed it yet, a resumed state or the module's own); every
-    /// other live slot's waits in `parked`. `idle` is the last finished slot's, which the next prompt resumes from.
+    /// other live slot's waits in `parked`. Excluded configurations keep an unclaimed state for legacy resume.
     owner: u32 = 0,
     parked: std.AutoHashMapUnmanaged(u32, Kept) = .empty,
-    idle: ?Kept = null,
 };
 
 /// A state off the module, with its identity (`Dsv41Model.state_gen`).
@@ -100,24 +99,23 @@ const Kept = struct {
     }
 };
 
-/// Takes the module's state off it: a slot's waits in `parked`, an unclaimed one becomes `idle`.
+/// Parks a live slot; an unclaimed state belongs only to the excluded configuration's legacy resume.
 fn park(m: *Model) !void {
     const st = m.mdl.dec_state orelse return;
     const k: Kept = .{ .st = st, .gen = m.mdl.state_gen };
-    if (m.owner != 0) try m.parked.put(gpa, m.owner, k) else keepIdle(m, k);
+    if (m.owner != 0) try m.parked.put(gpa, m.owner, k) else {
+        var orphan = k;
+        orphan.deinit();
+    }
     m.mdl.dec_state = null;
     m.owner = 0;
 }
 
-fn keepIdle(m: *Model, k: Kept) void {
-    if (m.idle) |*old| old.deinit();
-    m.idle = k;
-}
-
 /// Makes `slot`'s state the module's. A slot new here claims an unclaimed state (the prompt `resumePrompt` just
-/// readied), else starts with none: its prompt at position 0 builds one. Slot 0 (no slots) keeps the module's.
+/// readied), else starts with none: its prompt at position 0 builds one. Slot 0 parks any other live slot first.
 fn activate(m: *Model, slot: u32) !void {
-    if (slot == 0 or slot == m.owner) return;
+    if (slot == m.owner) return;
+    if (slot == 0) return park(m);
     const mine = m.parked.fetchRemove(slot);
     if (mine == null and m.owner == 0) {
         m.owner = slot;
@@ -138,8 +136,14 @@ fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (slot == m.owner) {
         m.owner = 0;
-        park(m) catch unreachable; // an unclaimed state is never put in `parked`
-    } else if (m.parked.fetchRemove(slot)) |kv| keepIdle(m, kv.value);
+        if (auxEnabled(mp)) {
+            if (m.mdl.dec_state) |*st| st.deinit();
+            m.mdl.dec_state = null;
+        }
+    } else if (m.parked.fetchRemove(slot)) |kv| {
+        var k = kv.value;
+        k.deinit();
+    }
 }
 
 fn activateSlot(mp: *anyopaque, slot: u32) callconv(.c) Verdict {
@@ -228,7 +232,6 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.bank = null;
     m.owner = 0;
     m.parked = .empty;
-    m.idle = null;
     if (c.dsv41_streamed) {
         const dir = ctx.model_dir.slice();
         if (c.dsv41_exl3_bank) try openBank(m, io, dir, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
@@ -303,7 +306,6 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     var it = m.parked.valueIterator();
     while (it.next()) |k| k.deinit();
     m.parked.deinit(gpa);
-    if (m.idle) |*k| k.deinit();
     m.mdl.deinit();
     m.weights.deinit();
     gpa.destroy(m);
@@ -443,18 +445,11 @@ fn runPrompt(m: *Model, ids: []const u32, pos: usize, rows: ?dsv41.VisionRows) !
 pub fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: abi.Array) callconv(.c) u64 {
     const m: *Model = @ptrCast(@alignCast(mp));
     const rows: ?mlx.mlx_array = if (media_rows.ctx != null) .{ .ctx = media_rows.ctx } else null;
-    // Another live slot's state stays its own: a slot without one resumes from the last finished conversation's.
-    activate(m, slot) catch {
-        dsv41.reset(m.mdl, gpa) catch {};
-        return 0;
-    };
-    if (m.mdl.dec_state == null) if (m.idle) |k| {
-        m.mdl.dec_state = k.st;
-        m.mdl.state_gen = k.gen;
-        m.idle = null;
-    };
+    if (auxEnabled(mp)) return 0;
+    // A parking failure leaves the other live slot untouched.
+    activate(m, slot) catch return 0;
     return dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch blk: {
-        // A failed reset leaves no state; the forward at position 0 builds one.
+        // The forward at position 0 establishes the cold state even if this reset fails.
         dsv41.reset(m.mdl, gpa) catch {};
         break :blk 0;
     };
@@ -466,8 +461,158 @@ pub fn stateBytes(mp: *anyopaque) callconv(.c) u64 {
     var bytes: u64 = if (m.mdl.dec_state) |*st| dsv41.stateBytes(st) else 0;
     var it = m.parked.valueIterator();
     while (it.next()) |k| bytes += dsv41.stateBytes(&k.st);
-    if (m.idle) |*k| bytes += dsv41.stateBytes(&k.st);
     return bytes;
+}
+
+const aux_hooks = abi.AuxHooks{
+    .enabled = &auxEnabled,
+    .describe = &auxDescribe,
+    .prefix_key = &auxPrefixKey,
+    .begin_prompt = &auxBeginPrompt,
+    .reserve = &auxReserve,
+    .commit = &auxCommit,
+    .snapshot = &auxSnapshot,
+    .restore_at = &auxRestoreAt,
+    .slice = &auxSlice,
+    .handoff = &auxHandoff,
+    .free = &auxFree,
+    .bytes = &auxBytes,
+    .serialize = &auxSerialize,
+    .deserialize = &auxDeserialize,
+};
+
+fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
+    const m: *Model = @ptrCast(@alignCast(mp));
+    return !m.cfg.dsv41_streamed and m.bank == null and m.mdl.streamed == null and m.mdl.pair == null;
+}
+
+fn liveState(m: *Model, slot: u32) ?*dsv41.State {
+    if (slot == m.owner) return if (m.mdl.dec_state) |*st| st else null;
+    const kept = m.parked.getPtr(slot) orelse return null;
+    return &kept.st;
+}
+
+fn snapOf(handle: abi.Handle) ?*dsv41.Snap {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn auxDescribe(_: *anyopaque, handle: abi.Handle, out: *abi.AuxSnapshotInfo) callconv(.c) Verdict {
+    const sn = snapOf(handle) orelse return Verdict.refuse(.unsupported, "deepseek_v41: no snapshot to describe");
+    if (out.size < @sizeOf(abi.AuxSnapshotInfo)) return Verdict.refuse(.unsupported, "deepseek_v41: snapshot metadata is too short");
+    if (sn.n != sn.ids.len) return Verdict.refuse(.failed, "deepseek_v41: snapshot boundary differs from its ids");
+    out.* = .{ .n = sn.n, .ids = .of(sn.ids), .prefix_key = sn.vision_key };
+    return .ok;
+}
+
+fn auxPrefixKey(mp: *anyopaque, ids: abi.Span(u32), rows: abi.Array, out: *u64) callconv(.c) Verdict {
+    const m: *Model = @ptrCast(@alignCast(mp));
+    out.* = dsv41.prefixKey(m.mdl, ids.slice(), if (rows.ctx != null) .{ .ctx = rows.ctx } else null) catch |e| return Verdict.named(.failed, @errorName(e));
+    return .ok;
+}
+
+fn auxBeginPrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), rows: abi.Array, restored_at: u64, capture: bool) callconv(.c) Verdict {
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    const m: *Model = @ptrCast(@alignCast(mp));
+    if (restored_at != 0) {
+        const st = liveState(m, slot) orelse return Verdict.refuse(.failed, "deepseek_v41: restored slot has no state");
+        if (st.n != restored_at or restored_at >= prompt.len) return Verdict.refuse(.failed, "deepseek_v41: restored position differs from the prompt boundary");
+    }
+    activate(m, slot) catch |e| return Verdict.named(.failed, @errorName(e));
+    if (restored_at == 0) {
+        dsv41.reset(m.mdl, gpa) catch |e| return Verdict.named(.failed, @errorName(e));
+    }
+    dsv41.armPrompt(m.mdl, prompt.slice(), if (rows.ctx != null) .{ .ctx = rows.ctx } else null, capture) catch |e| return Verdict.named(.failed, @errorName(e));
+    return .ok;
+}
+
+fn auxReserve(_: *anyopaque, _: u32, _: u64) callconv(.c) Verdict {
+    return .ok;
+}
+
+fn auxCommit(mp: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict {
+    const m: *Model = @ptrCast(@alignCast(mp));
+    const st = liveState(m, slot) orelse return Verdict.refuse(.failed, "deepseek_v41: no live slot to commit");
+    if (len != st.n and (st.snap == null or st.snap.?.n != len)) return Verdict.refuse(.unsupported, "deepseek_v41: commit requires a completed boundary");
+    return .ok;
+}
+
+fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict {
+    out.* = null;
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    const m: *Model = @ptrCast(@alignCast(mp));
+    const st = liveState(m, slot) orelse return .ok;
+    const sn = st.snap orelse return .ok;
+    if (sn.n != sn.ids.len) return Verdict.refuse(.failed, "deepseek_v41: snapshot boundary differs from its ids");
+    const owned = gpa.create(dsv41.Snap) catch |e| return Verdict.named(.failed, @errorName(e));
+    owned.* = sn;
+    st.snap = null;
+    out.* = owned;
+    return .ok;
+}
+
+fn auxRestoreAt(mp: *anyopaque, slot: u32, handle: abi.Handle, pos: u64) callconv(.c) Verdict {
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    const sn = snapOf(handle) orelse return Verdict.refuse(.unsupported, "deepseek_v41: no snapshot to restore");
+    if (pos != sn.n or sn.n != sn.ids.len) return Verdict.refuse(.unsupported, "deepseek_v41: restore requires the snapshot's exact position");
+    const m: *Model = @ptrCast(@alignCast(mp));
+    var fresh = dsv41.stateFromSnapshot(m.mdl, gpa, sn) catch |e| return Verdict.named(.failed, @errorName(e));
+    activate(m, slot) catch |e| {
+        fresh.deinit();
+        return Verdict.named(.failed, @errorName(e));
+    };
+    if (m.mdl.dec_state) |*old| old.deinit();
+    m.mdl.dec_state = fresh;
+    m.mdl.gens += 1;
+    m.mdl.state_gen = m.mdl.gens;
+    return .ok;
+}
+
+fn auxSlice(_: *anyopaque, handle: abi.Handle, len: u64, out: *abi.Handle) callconv(.c) Verdict {
+    out.* = null;
+    const sn = snapOf(handle) orelse return Verdict.refuse(.unsupported, "deepseek_v41: no snapshot to slice");
+    if (len != sn.n) return Verdict.refuse(.unsupported, "deepseek_v41: a snapshot cannot be shortened through its rings");
+    const owned = gpa.create(dsv41.Snap) catch |e| return Verdict.named(.failed, @errorName(e));
+    owned.* = sn.clone(gpa) catch |e| {
+        gpa.destroy(owned);
+        return Verdict.named(.failed, @errorName(e));
+    };
+    out.* = owned;
+    return .ok;
+}
+
+fn auxHandoff(mp: *anyopaque, from: u32, to: u32) callconv(.c) Verdict {
+    const m: *Model = @ptrCast(@alignCast(mp));
+    if (to == 0 or to == m.owner or m.parked.contains(to)) return Verdict.refuse(.busy, "deepseek_v41: handoff destination is in use");
+    if (liveState(m, from) == null) return Verdict.refuse(.failed, "deepseek_v41: handoff source has no state");
+    if (from == m.owner) {
+        m.owner = to;
+        return .ok;
+    }
+    m.parked.ensureUnusedCapacity(gpa, 1) catch |e| return Verdict.named(.failed, @errorName(e));
+    const kept = m.parked.fetchRemove(from).?.value;
+    m.parked.putAssumeCapacity(to, kept);
+    return .ok;
+}
+
+fn auxFree(_: *anyopaque, handle: abi.Handle) callconv(.c) void {
+    const sn = snapOf(handle) orelse return;
+    sn.deinit(gpa);
+    gpa.destroy(sn);
+}
+
+fn auxBytes(_: *anyopaque, handle: abi.Handle) callconv(.c) u64 {
+    const sn = snapOf(handle) orelse return 0;
+    return sn.bytes();
+}
+
+fn auxSerialize(_: *anyopaque, _: abi.Handle, _: [*]u8, _: usize, len: *usize) callconv(.c) Verdict {
+    len.* = 0;
+    return Verdict.refuse(.unsupported, "deepseek_v41: snapshot serialization is unavailable");
+}
+
+fn auxDeserialize(_: *anyopaque, _: abi.Str, out: *abi.Handle) callconv(.c) Verdict {
+    out.* = null;
+    return Verdict.refuse(.unsupported, "deepseek_v41: snapshot deserialization is unavailable");
 }
 
 /// The load reads its Engram tables from disk per lookup and drops the tensors it never loads

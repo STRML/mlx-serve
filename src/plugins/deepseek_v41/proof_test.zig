@@ -23,19 +23,22 @@ test "deepseek_v41 plugin: prefill, GPU decode, a verify block and a later chunk
     try proof.expectSteps(v41, t);
 }
 
-test "deepseek_v41 plugin: a prompt extending the last one resumes as the legacy resume does, and continues bit-equal" {
+test "deepseek_v41 plugin: excluded configuration keeps the legacy resume and continues bit-equal" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), @embedFile("fixtures/proof-resume.tape"));
     defer t.close();
+    const model: *v41.Model = @ptrCast(@alignCast(t.m));
+    model.cfg.dsv41_streamed = true;
     const first = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
     const second = first ++ [_]u32{ 11, 2, 90 };
     for ([_][]const u32{ &first, &second }) |prompt| {
-        const n: u32 = @intCast(v41.resumePrompt(t.m, 0, .of(prompt), .{}));
+        const n: u32 = @intCast(v41.resumePrompt(t.m, 7, .of(prompt), .{}));
         try t.check(mlx.mlx_array_new_data(&n, &[_]c_int{1}, 1, .uint32));
         try t.check(try t.plugin(.{ .mode = .prefill, .ids = prompt[n..] }, n));
+        v41.table.release_slot.?(t.m, 7);
     }
     try t.tape.expectDone();
 }
@@ -138,4 +141,146 @@ test "deepseek_v41 plugin: a one-slot batch is the slot's own decode step, bit f
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(f32, want, got);
     }
+}
+
+test "deepseek_v41 aux: overlapping captures survive either release order and restore independently" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const prompts = [2][]const u32{ &.{ 3, 17, 42, 9, 7, 25, 1, 60 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6 } };
+    for ([_][2]u32{ .{ 1, 2 }, .{ 2, 1 } }) |order| {
+        const t = try Twin.open(files, "");
+        defer t.close();
+        const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+        try testing.expect(aux.enabled.?(t.m));
+        for (prompts, 1..) |p, slot| {
+            try testing.expect(aux.begin_prompt.?(t.m, @intCast(slot), .of(p), .{}, 0, true).isOk());
+            testing.allocator.free(try slotForward(t, .prefill, &.{@intCast(slot)}, p[0..2], &.{0}));
+        }
+        for (prompts, 1..) |p, slot| testing.allocator.free(try slotForward(t, .prefill, &.{@intCast(slot)}, p[2..], &.{2}));
+        var snaps: [2]abi.Handle = .{ null, null };
+        defer for (snaps) |sn| aux.free(t.m, sn);
+        for (order) |slot| {
+            const i = slot - 1;
+            try testing.expect(aux.snapshot(t.m, slot, &snaps[i]).isOk());
+            try testing.expect(snaps[i] != null);
+            var empty: abi.Handle = null;
+            try testing.expect(aux.snapshot(t.m, slot, &empty).isOk());
+            try testing.expect(empty == null);
+            v41.table.release_slot.?(t.m, slot);
+            v41.table.release_slot.?(t.m, slot);
+        }
+        try testing.expectEqual(@as(u64, 0), v41.stateBytes(t.m));
+        for (snaps, prompts) |sn, p| {
+            var info: abi.AuxSnapshotInfo = .{};
+            try testing.expect(aux.describe.?(t.m, sn, &info).isOk());
+            try testing.expectEqual(p.len - 1, info.n);
+            try testing.expectEqualSlices(u32, p[0 .. p.len - 1], info.ids.slice());
+            try testing.expect(aux.bytes(t.m, sn) > 0);
+            try testing.expectEqual(abi.Verdict.Code.unsupported, aux.restore_at(t.m, 3, sn, info.n - 1).code);
+            var clone: abi.Handle = null;
+            try testing.expectEqual(abi.Verdict.Code.unsupported, aux.slice(t.m, sn, info.n - 1, &clone).code);
+            try testing.expect(clone == null);
+            try testing.expectEqual(abi.Verdict.Code.unsupported, aux.slice(t.m, sn, info.n + 1, &clone).code);
+            try testing.expect(clone == null);
+            try testing.expect(aux.slice(t.m, sn, info.n, &clone).isOk());
+            defer aux.free(t.m, clone);
+            var warm: [2][]f32 = undefined;
+            for ([_]u32{ 3, 4 }, 0..) |slot, k| {
+                try testing.expect(aux.restore_at(t.m, slot, if (k == 0) sn else clone, info.n).isOk());
+                try testing.expectEqual(abi.Verdict.Code.unsupported, aux.restore_at(t.m, slot, sn, info.n + 1).code);
+                try testing.expectEqual(abi.Verdict.Code.failed, aux.begin_prompt.?(t.m, slot, .of(p), .{}, info.n - 1, false).code);
+                try testing.expect(aux.begin_prompt.?(t.m, slot, .of(p), .{}, info.n, false).isOk());
+                warm[k] = try slotForward(t, .prefill, &.{slot}, p[info.n..], &.{@intCast(info.n)});
+            }
+            defer for (warm) |row| testing.allocator.free(row);
+            try testing.expectEqualSlices(f32, warm[0], warm[1]);
+            try testing.expectEqual(abi.Verdict.Code.busy, aux.handoff(t.m, 3, 4).code);
+            try testing.expect(aux.handoff(t.m, 3, 5).isOk());
+            v41.table.release_slot.?(t.m, 3);
+            v41.table.release_slot.?(t.m, 5);
+            try testing.expect(aux.begin_prompt.?(t.m, 4, .of(p), .{}, 0, false).isOk());
+            try testing.expect(aux.commit(t.m, 4, 0).isOk());
+            testing.allocator.free(try slotForward(t, .prefill, &.{4}, p[0..2], &.{0}));
+            testing.allocator.free(try slotForward(t, .prefill, &.{4}, p[2 .. p.len - 1], &.{2}));
+            const cold = try slotForward(t, .prefill, &.{4}, p[p.len - 1 ..], &.{@intCast(p.len - 1)});
+            defer testing.allocator.free(cold);
+            try testing.expectEqualSlices(f32, cold, warm[0]);
+            const reference = try Twin.open(files, "");
+            defer reference.close();
+            testing.allocator.free(try slotForward(reference, .prefill, &.{1}, p[0..2], &.{0}));
+            testing.allocator.free(try slotForward(reference, .prefill, &.{1}, p[2 .. p.len - 1], &.{2}));
+            const fresh = try slotForward(reference, .prefill, &.{1}, p[p.len - 1 ..], &.{@intCast(p.len - 1)});
+            defer testing.allocator.free(fresh);
+            for (fresh) |value| try testing.expect(std.math.isFinite(value));
+            try testing.expectEqualSlices(f32, fresh, warm[0]);
+            var no_capture: abi.Handle = null;
+            try testing.expect(aux.snapshot(t.m, 4, &no_capture).isOk());
+            try testing.expect(no_capture == null);
+            v41.table.release_slot.?(t.m, 4);
+        }
+    }
+}
+
+test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint, codecs refuse by name" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+    for ([_][]const u32{ &.{}, &.{3}, &.{ 3, 4, 5 } }) |p| {
+        try testing.expect(aux.begin_prompt.?(t.m, 1, .of(p), .{}, 0, p.len < 2).isOk());
+        try testing.expect(aux.reserve(t.m, 1, p.len).isOk());
+        if (p.len > 0) testing.allocator.free(try slotForward(t, .prefill, &.{1}, p, &.{0}));
+        try testing.expect(aux.commit(t.m, 1, p.len).isOk());
+        try testing.expectEqual(abi.Verdict.Code.unsupported, aux.commit(t.m, 1, p.len + 1).code);
+        var sn: abi.Handle = null;
+        try testing.expect(aux.snapshot(t.m, 1, &sn).isOk());
+        try testing.expect(sn == null);
+        v41.table.release_slot.?(t.m, 1);
+    }
+    var buf: [1]u8 = undefined;
+    var len: usize = 99;
+    const encoded = aux.serialize(t.m, null, &buf, buf.len, &len);
+    try testing.expectEqual(abi.Verdict.Code.unsupported, encoded.code);
+    try testing.expect(encoded.why.len > 0);
+    try testing.expectEqual(@as(usize, 0), len);
+    var sn: abi.Handle = null;
+    const decoded = aux.deserialize(t.m, .of(&.{}), &sn);
+    try testing.expectEqual(abi.Verdict.Code.unsupported, decoded.code);
+    try testing.expect(decoded.why.len > 0 and sn == null);
+}
+
+test "deepseek_v41 aux: candidate image key ignores later rows and eligibility excludes streamed and paired instances" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+    m.mdl.cfg.image_token_id = 17;
+    const a = mlx.mlx_array_new_data(&[_]f32{ 1, 2, 3, 4 }, &[_]c_int{ 2, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(a);
+    const b = mlx.mlx_array_new_data(&[_]f32{ 1, 2, 9, 8 }, &[_]c_int{ 2, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(b);
+    var key: [4]u64 = undefined;
+    try testing.expect(aux.prefix_key.?(t.m, .of(&.{ 3, 17, 4 }), .{ .ctx = a.ctx }, &key[0]).isOk());
+    try testing.expect(aux.prefix_key.?(t.m, .of(&.{ 3, 17, 4 }), .{ .ctx = b.ctx }, &key[1]).isOk());
+    try testing.expect(aux.prefix_key.?(t.m, .of(&.{ 3, 17, 4, 17 }), .{ .ctx = a.ctx }, &key[2]).isOk());
+    try testing.expect(aux.prefix_key.?(t.m, .of(&.{ 3, 17, 4, 17 }), .{ .ctx = b.ctx }, &key[3]).isOk());
+    try testing.expectEqual(key[0], key[1]);
+    try testing.expect(key[2] != key[3]);
+    try testing.expect(aux.prefix_key.?(t.m, .of(&.{ 3, 17, 4 }), .{}, &key[1]).isOk());
+    try testing.expect(key[0] != key[1]);
+    try testing.expect(aux.enabled.?(t.m));
+    m.cfg.dsv41_streamed = true;
+    try testing.expect(!aux.enabled.?(t.m));
+    try testing.expectEqual(abi.Verdict.Code.unsupported, aux.begin_prompt.?(t.m, 1, .of(&.{ 3, 4 }), .{}, 0, true).code);
+    m.cfg.dsv41_streamed = false;
+    m.mdl.pair = .{ .lo = 2, .hi = 4, .worker = false };
+    defer m.mdl.pair = null;
+    try testing.expect(!aux.enabled.?(t.m));
 }

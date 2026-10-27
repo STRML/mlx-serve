@@ -1,13 +1,13 @@
 # deepseek_v41
 
 DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, 1M context, MLX packs) with its vision tower, as a native,
-module-owned arch. One conversation resumes (`resumePrompt`, keyed on its image rows too). Packs:
+module-owned arch. Resident unpaired captures transfer to the engine's prefix cache, keyed on image rows. Packs:
 `ddalcu/DeepSeek-V4.1-Flash-1017-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
 OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank, streamed).
 
 ## Files
-- `plugin.zig`: the table; `CacheHooks.resume_prompt` / `state_bytes` (a cold or failed resume resets and returns
-  0); a streamed pack's bank (`openBank`) and its prompt calls (`runPrompt`).
+- `plugin.zig`: the table; `CacheHooks.aux` / live `state_bytes`; streamed/paired legacy `resume_prompt`;
+  a streamed pack's bank (`openBank`) and its prompt calls (`runPrompt`).
 - `config.zig`: claims + V4.1 fields on top of `../deepseek_v4/config.zig`; `bill.zig`: compressed caches per
   token, attended keys, `dsv41_mod.prefillBytes`; a streamed bank's budget (`streamBudget`).
 - `media.zig`: decode, the release's processor (`vision.preprocess`), tower, placeholder run.
@@ -19,12 +19,12 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - `contract.zig`: kernel contract registrations of `kernels/*.metal`.
 
 ## Facts the table declares
-- `owns_decode_state`, `prefix_cache = false` (the module resumes its own state), `slot_state` + `batches_decode`
-  (a streamed pack: single-flight): one state per slot, the active one in `dec_state`, the others parked in the
-  plugin, the last finished one kept to resume from; plain decode tokens of several slots run as one batch
-  (`extendBatched`: the compiled stretches over every row, attention per state). No spec rollback (DSpark rewinds inside the module), DSpark stages from the config (`native_stages`);
-  `spec.trunk_weight` lends the loaded embedding and head; a Thunderbolt pair's load re-reads the engine's plan
-  (`distributed.planFor`, idempotent: untested without two Macs).
+- `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`,
+  other live slots in `parked`; plain decode batches through `extendBatched`. Each State owns its pending capture.
+- `prefix_cache` for resident packs; `aux.enabled` also excludes Thunderbolt pairs. Snapshots retain every buffer
+  and restore only at their exact position; the engine owns finished history. Streamed/paired keep legacy resume.
+- No spec rollback (DSpark rewinds inside the module); DSpark stages from `native_stages`;
+  `spec.trunk_weight` lends the embedding and head; a pair's load re-reads `distributed.planFor` (idempotent).
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.
 - Metal only: a CPU host stream loads on this thread's GPU stream; no GPU = refused by name.
 
@@ -68,7 +68,9 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   (nine scattered reads an expert vs one EXL3 record): the repack stays the fast way to stream.
 
 ## Known issues
-- Prefix cache off (module-owned rings); one resume snapshot per model (a busy server resumes the last armed one).
+- Auxiliary snapshots are RAM-only; serialization and shortened slices return named unsupported verdicts.
+- Excluded configurations keep the last released active state for legacy resume; a finished parked slot is freed,
+  so overlapping paired requests can lose that slot's resume opportunity.
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Prefill compute-bound at ~16 TFLOPS; the MoE at 2048 rows streams each layer's expert bank 4x per 8192 chunk
   (M about 32 per expert): the single biggest inefficiency.
@@ -86,7 +88,7 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 ## The row from the root architecture table
 
 DeepSeek-V4/V4.1 Flash, 1M ctx. Spec off but DSpark; V4 single-flight, V4.1 batches plain decode across slots; DSML tools, OUR byte-pinned templates. V4:
-prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, resumes one conversation (keyed on the image rows
-too); the EXL3 repack's experts streamed from its bank. V4.1 images: every span position carries `image_token_id` (without the
+prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, resident unpaired auxiliary snapshots keyed on
+image rows; the EXL3 repack's experts streamed from its bank. V4.1 images: every span position carries `image_token_id` (without the
 request's rows that id is TEXT, as in the reference), the module splices the rows itself, image rows route by
 `gate.bias_vl` and get no Engram write (`Hash.DEAD`)

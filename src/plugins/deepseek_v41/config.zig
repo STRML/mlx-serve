@@ -29,7 +29,9 @@ const ParseError = v4.ParseError;
 
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
     _ = span;
-    return v4.parseInto(dir, config_json, stub, true, streamsPack(settings_json.slice()), out, &extend);
+    const result = v4.parseInto(dir, config_json, stub, true, streamsPack(settings_json.slice()), out, &extend);
+    if (result.isOk()) out.caps.prefix_cache = !of(out).dsv41_streamed;
+    return result;
 }
 
 /// The per-model `stream_experts` setting (`true` or a row count) asks for an MLX pack's routed experts to stream.
@@ -182,6 +184,7 @@ test "deepseek_v41 config: the release pack parses with its sources, Engram, DSp
     try testing.expectEqual(@as(u32, 128), c.dsv41_dspark_experts);
     try testing.expect(c.dsv41_vision and p.caps.images and !p.caps.spec_rollback);
     try testing.expect(p.caps.slot_state and p.caps.batches_decode and p.caps.owns_decode_state);
+    try testing.expect(p.caps.prefix_cache);
     try testing.expectEqual(@as(u32, 129264), p.placeholder_ids.image);
     try testing.expectEqual(abi.ThinkingDefault.on, p.chat.thinking_default);
     try testing.expectEqual(abi.EffortVocab.dsv41, p.chat.effort_vocab);
@@ -195,6 +198,7 @@ test "deepseek_v41 config: an experts.bin bank streams, its prompt passed whole"
     defer freeParsed(&p);
     try testing.expect(of(&p).dsv41_streamed and of(&p).dsv41_exl3_bank and p.caps.whole_prompt_prefill and p.caps.streamed_weights);
     try testing.expect(!p.caps.slot_state and !p.caps.batches_decode);
+    try testing.expect(!p.caps.prefix_cache);
     var q: abi.Parsed = .{};
     try testing.expect(parseFiles(&.{.{ .name = "config.json", .bytes = iq3 }}, true, &q).isOk());
     defer freeParsed(&q);

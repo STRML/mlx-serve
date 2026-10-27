@@ -423,16 +423,6 @@ pub const Dsv41Model = struct {
     /// replaced, so a state parked by its slot and swapped back in keeps its own.
     state_gen: u64 = 0,
     gens: u64 = 0,
-    /// The state the armed snapshot is due on (`snap_at` belongs to that request alone).
-    snap_gen: u64 = 0,
-    /// The last prompt's state one token short of its end (`resumePrompt`).
-    snap: ?Snap = null,
-    /// Where this prompt's snapshot is taken (`armSnapshot`), and its tokens.
-    snap_at: ?usize = null,
-    snap_ids: []u32 = &.{},
-    /// The image rows inside the snapshot's ids (`visionKey`): a prefix of the same ids with other pixels never resumes,
-    /// and an image added AFTER the prefix does not stop it.
-    snap_vision_key: u64 = 0,
     ds_conf_thr: f32 = -std.math.inf(f32),
     /// The adaptive verify policy reads each draft's confidence; otherwise only a finite `ds_conf_thr` does.
     ds_want_conf: bool = false,
@@ -447,8 +437,6 @@ pub const Dsv41Model = struct {
 
     pub fn deinit(self: *Dsv41Model) void {
         if (self.dec_state) |*st| st.deinit();
-        if (self.snap) |*sn| sn.deinit(self.gpa);
-        self.gpa.free(self.snap_ids);
         self.dropAhead();
         self.gpa.free(self.prompt);
         for (self.engrams) |*e| e.table.close();
@@ -1644,6 +1632,7 @@ pub const Ring = struct {
 
     fn init(cap: usize, width: usize, dt: mlx.mlx_dtype, s: S) !Ring {
         var z = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(z);
         try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{ ci(cap), ci(width) }, 2, dt, s));
         return .{ .buf = z, .cap = cap, .width = width };
     }
@@ -1724,8 +1713,15 @@ pub const State = struct {
     /// The last committed position's main hidden `[1, targets * dim]`.
     mh: A = none,
     verify: ?Verify = null,
+    /// One prompt boundary awaiting transfer to the engine (or the excluded configuration's legacy resume).
+    snap: ?Snap = null,
+    snap_at: ?usize = null,
+    snap_ids: []u32 = &.{},
+    snap_vision_key: u64 = 0,
 
     pub fn deinit(self: *State) void {
+        if (self.snap) |*sn| sn.deinit(self.gpa);
+        self.gpa.free(self.snap_ids);
         for (self.layers) |*l| l.deinit();
         self.gpa.free(self.layers);
         for (self.ds) |*r| r.deinit();
@@ -1768,6 +1764,7 @@ pub fn stateBytes(st: *const State) u64 {
         if (l.idx_k) |r| bytes += arrayBytes(r.buf);
     }
     for (st.ds) |r| bytes += arrayBytes(r.buf);
+    if (st.snap) |*sn| bytes += sn.bytes();
     return bytes + arrayBytes(st.mh);
 }
 
@@ -3414,7 +3411,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     }
     if (m.pair) |p| {
         try runLayers(m, gpa, st, &sp, held, 0, p.lo);
-        try exchange(m, gpa, &sp, p0, m.snap_at != null and m.snap_at.? == p0 + L, if (st.verify) |v| v.n0 == p0 else false);
+        try exchange(m, gpa, &sp, p0, st.snap_at != null and st.snap_at.? == p0 + L, if (st.verify) |v| v.n0 == p0 else false);
         from = p.hi;
     }
     const enc_hi = if (tail != null) m.ced_split.? else m.n_layers;
@@ -3582,8 +3579,7 @@ pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usiz
     for (st.layers[p.lo..p.hi]) |*ls| try appendLayerState(gpa, &ev, ls);
     try evalAll(ev.items);
     if (snap) {
-        m.snap_at = st.n;
-        m.snap_gen = m.state_gen;
+        st.snap_at = st.n;
         try snapshotIfDue(m);
     }
     return .{ sc.out(xo), sc.out(po) };
@@ -3900,35 +3896,47 @@ pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision:
 
 /// A fresh request's empty state.
 pub fn reset(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
-    if (m.dec_state) |*st| st.deinit();
-    m.dec_state = null;
+    var fresh = try initState(m, gpa);
+    if (m.dec_state) |*st| {
+        fresh.snap_at = st.snap_at;
+        fresh.snap_ids = st.snap_ids;
+        fresh.snap_vision_key = st.snap_vision_key;
+        st.snap_ids = &.{};
+        st.deinit();
+    }
     newGen(m);
-    m.dec_state = try initState(m, gpa);
+    m.dec_state = fresh;
 }
 
-/// A new identity for `dec_state`, which replaces the current one: a snapshot armed for the request whose state it
-/// was stays armed for its new one.
 fn newGen(m: *Dsv41Model) void {
-    const armed = m.snap_gen == m.state_gen;
     m.gens += 1;
     m.state_gen = m.gens;
-    if (armed) m.snap_gen = m.state_gen;
 }
 
 /// `extend` with every row's logits (a verify block), taking the armed snapshot on the way.
 pub fn extendAllResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32) !A {
     try snapshotIfDue(m);
-    const out = try extend(m, gpa, &m.dec_state.?, ids, .all);
+    const st = &m.dec_state.?;
+    if (st.snap_at) |at| if (at > st.n and at < st.n + ids.len) {
+        const k = at - st.n;
+        const head = try extend(m, gpa, st, ids[0..k], .all);
+        defer _ = mlx.mlx_array_free(head);
+        try snapshotIfDue(m);
+        const tail = try extend(m, gpa, st, ids[k..], .all);
+        defer _ = mlx.mlx_array_free(tail);
+        var sc = Scope.init(gpa, m.s);
+        defer sc.deinit();
+        return sc.out(try sc.concat(&.{ head, tail }, 0));
+    };
+    const out = try extend(m, gpa, st, ids, .all);
     try snapshotIfDue(m);
     return out;
 }
 
-// ── prefix resume: one conversation ──────────────────────────────────────
+// ── prompt snapshots ────────────────────────────────────────────────────
 
-/// What a resume restores: every buffer a later step replaces rather than
-/// appends to is held by reference (a ring's first write after copies it
-/// once), and append-only rows by their count.
-const Snap = struct {
+/// Every GPU handle is retained: appends and ring writes replace handles, so a donor may grow or disappear.
+pub const Snap = struct {
     gen: u64,
     vision_key: u64,
     /// The state's position: `ids.len` on the host; a worker keeps no ids.
@@ -3939,12 +3947,16 @@ const Snap = struct {
     mh: A,
     hist: []u32,
 
-    const LSnap = struct { win: A, comp_used: usize, idx_used: usize, pend_kv: A, pend_gate: A };
+    const LSnap = struct { win: A, comp: ?Rows, idx_k: ?Rows, pend_kv: A, pend_gate: A };
 
-    fn deinit(self: *Snap, gpa: std.mem.Allocator) void {
-        for (self.layers) |l| for ([_]A{ l.win, l.pend_kv, l.pend_gate }) |a| if (a.ctx != null) {
-            _ = mlx.mlx_array_free(a);
-        };
+    pub fn deinit(self: *Snap, gpa: std.mem.Allocator) void {
+        for (self.layers) |*l| {
+            for ([_]A{ l.win, l.pend_kv, l.pend_gate }) |a| if (a.ctx != null) {
+                _ = mlx.mlx_array_free(a);
+            };
+            if (l.comp) |*r| r.deinit();
+            if (l.idx_k) |*r| r.deinit();
+        }
         for (self.ds) |a| _ = mlx.mlx_array_free(a);
         if (self.mh.ctx != null) _ = mlx.mlx_array_free(self.mh);
         gpa.free(self.layers);
@@ -3952,7 +3964,52 @@ const Snap = struct {
         gpa.free(self.hist);
         gpa.free(self.ids);
     }
+
+    pub fn bytes(self: *const Snap) u64 {
+        var n = arrayBytes(self.mh);
+        for (self.layers) |l| {
+            n += arrayBytes(l.win) + arrayBytes(l.pend_kv) + arrayBytes(l.pend_gate);
+            if (l.comp) |r| n += arrayBytes(r.buf);
+            if (l.idx_k) |r| n += arrayBytes(r.buf);
+        }
+        for (self.ds) |a| n += arrayBytes(a);
+        return n;
+    }
+
+    pub fn clone(self: *const Snap, gpa: std.mem.Allocator) !Snap {
+        const ids = try gpa.dupe(u32, self.ids);
+        errdefer gpa.free(ids);
+        const layers = try gpa.alloc(LSnap, self.layers.len);
+        errdefer gpa.free(layers);
+        const ds = try gpa.alloc(A, self.ds.len);
+        errdefer gpa.free(ds);
+        const hist = try gpa.dupe(u32, self.hist);
+        for (layers, self.layers) |*o, l| o.* = .{
+            .win = ref(l.win),
+            .comp = refRows(l.comp),
+            .idx_k = refRows(l.idx_k),
+            .pend_kv = ref(l.pend_kv),
+            .pend_gate = ref(l.pend_gate),
+        };
+        for (ds, self.ds) |*o, a| o.* = ref(a);
+        return .{
+            .gen = self.gen,
+            .vision_key = self.vision_key,
+            .n = self.n,
+            .ids = ids,
+            .layers = layers,
+            .ds = ds,
+            .mh = ref(self.mh),
+            .hist = hist,
+        };
+    }
 };
+
+fn refRows(rows: ?Rows) ?Rows {
+    var r = rows orelse return null;
+    r.buf = ref(r.buf);
+    return r;
+}
 
 fn ref(x: A) A {
     var o = mlx.mlx_array_new();
@@ -3969,23 +4026,36 @@ fn ref(x: A) A {
 /// prefix of `prompt` and returns its length (0: a cold prompt). A restore
 /// always leaves a token to forward.
 pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {
+    const n = try restore(m, prompt, vision_rows);
+    if (n == 0) try reset(m, m.gpa);
+    try armPrompt(m, prompt, vision_rows, true);
+    return n;
+}
+
+/// Arms only this live State; candidate identity covers the boundary's ids and image rows.
+pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: bool) !void {
     m.dropAhead();
     m.gpa.free(m.prompt);
     m.prompt = &.{};
     m.prompt = try m.gpa.dupe(u32, prompt);
-    const n = try restore(m, prompt, vision_rows);
-    if (n == 0) try reset(m, m.gpa);
-    m.snap_gen = m.state_gen;
-    m.gpa.free(m.snap_ids);
-    m.snap_ids = &.{};
-    m.snap_at = null;
-    m.snap_vision_key = 0;
-    if (prompt.len >= 2) {
-        m.snap_ids = try m.gpa.dupe(u32, prompt[0 .. prompt.len - 1]);
-        m.snap_at = prompt.len - 1;
-        m.snap_vision_key = try visionKey(vision_rows, m.imageRows(m.snap_ids));
-    }
-    return n;
+    const st = &m.dec_state.?;
+    if (st.snap) |*sn| sn.deinit(st.gpa);
+    st.snap = null;
+    st.gpa.free(st.snap_ids);
+    st.snap_ids = &.{};
+    st.snap_at = null;
+    st.snap_vision_key = 0;
+    if (!capture or prompt.len < 2) return;
+    const key = try visionKey(vision_rows, m.imageRows(prompt[0 .. prompt.len - 1]));
+    const ids = try st.gpa.dupe(u32, prompt[0 .. prompt.len - 1]);
+    st.snap_ids = ids;
+    st.snap_at = ids.len;
+    st.snap_vision_key = key;
+    try snapshotIfDue(m);
+}
+
+pub fn prefixKey(m: *const Dsv41Model, ids: []const u32, rows: ?A) !u64 {
+    return visionKey(rows, m.imageRows(ids));
 }
 
 /// What a snapshot keys its images by: a hash of the first `n` soft-token rows (0 for none), `n` being the image
@@ -4007,8 +4077,8 @@ pub fn visionKey(rows: ?A, n: usize) !u64 {
 }
 
 fn restore(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {
-    const sn = &(m.snap orelse return 0);
-    const st = &(m.dec_state orelse return 0);
+    const st = if (m.dec_state) |*st| st else return 0;
+    const sn = if (st.snap) |*sn| sn else return 0;
     if (sn.gen != m.state_gen or sn.ids.len >= prompt.len or !std.mem.eql(u32, sn.ids, prompt[0..sn.ids.len])) return 0;
     if (sn.vision_key != try visionKey(vision_rows, m.imageRows(sn.ids))) return 0;
     try applySnap(st, sn);
@@ -4017,8 +4087,8 @@ fn restore(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {
 
 /// Worker: rewinds to its snapshot at `n`, where the host restored its own.
 fn restoreAt(m: *Dsv41Model, n: usize) !bool {
-    const sn = &(m.snap orelse return false);
-    const st = &(m.dec_state orelse return false);
+    const st = if (m.dec_state) |*st| st else return false;
+    const sn = if (st.snap) |*sn| sn else return false;
     if (sn.gen != m.state_gen or sn.n != n) return false;
     try applySnap(st, sn);
     return true;
@@ -4028,8 +4098,10 @@ fn applySnap(st: *State, sn: *const Snap) !void {
     st.dropVerify();
     for (st.layers, sn.layers) |*l, s| {
         hold(&l.win.buf, s.win);
-        if (l.comp) |*r| r.used = s.comp_used;
-        if (l.idx_k) |*r| r.used = s.idx_used;
+        if (l.comp) |*r| r.deinit();
+        if (l.idx_k) |*r| r.deinit();
+        l.comp = refRows(s.comp);
+        l.idx_k = refRows(s.idx_k);
         hold(&l.pend_kv, s.pend_kv);
         hold(&l.pend_gate, s.pend_gate);
     }
@@ -4040,34 +4112,62 @@ fn applySnap(st: *State, sn: *const Snap) !void {
     st.n = sn.n;
 }
 
-/// Takes the armed snapshot once the state stands at its position.
-fn snapshotIfDue(m: *Dsv41Model) !void {
-    const st = &(m.dec_state orelse return);
-    return snapshotStateIfDue(m, st, m.state_gen);
+/// Constructs the full replacement before the caller installs it in a slot.
+pub fn stateFromSnapshot(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap) !State {
+    if (sn.layers.len != m.n_layers or sn.ds.len != m.n_mtp) return error.Dsv41SnapshotGeometry;
+    const layers = try gpa.alloc(LState, sn.layers.len);
+    errdefer gpa.free(layers);
+    const ds = try gpa.alloc(Ring, sn.ds.len);
+    errdefer gpa.free(ds);
+    var hist: std.ArrayList(u32) = .empty;
+    errdefer hist.deinit(gpa);
+    try hist.appendSlice(gpa, sn.hist);
+    for (layers, sn.layers) |*l, saved| l.* = .{
+        .win = .{ .buf = ref(saved.win), .cap = dim(saved.win, 0), .width = dim(saved.win, 1) },
+        .comp = refRows(saved.comp),
+        .idx_k = refRows(saved.idx_k),
+        .pend_kv = ref(saved.pend_kv),
+        .pend_gate = ref(saved.pend_gate),
+    };
+    for (ds, sn.ds) |*r, saved| r.* = .{ .buf = ref(saved), .cap = dim(saved, 0), .width = dim(saved, 1) };
+    return .{ .gpa = gpa, .n = sn.n, .layers = layers, .ds = ds, .hist = hist, .mh = ref(sn.mh) };
 }
 
-/// `snapshotIfDue` for state `st` of identity `gen` (a slot's, active or not).
-fn snapshotStateIfDue(m: *Dsv41Model, st: *const State, gen: u64) !void {
-    const at = m.snap_at orelse return;
-    if (gen != m.snap_gen or st.n != at) return;
-    m.snap_at = null;
-    if (m.snap) |*old| old.deinit(m.gpa);
-    m.snap = null;
-    const layers = try m.gpa.alloc(Snap.LSnap, st.layers.len);
-    errdefer m.gpa.free(layers);
-    const ds = try m.gpa.alloc(A, st.ds.len);
-    errdefer m.gpa.free(ds);
-    const hist = try m.gpa.dupe(u32, st.hist.items);
+/// Takes the armed snapshot once the state stands at its position.
+fn snapshotIfDue(m: *Dsv41Model) !void {
+    const st = if (m.dec_state) |*st| st else return;
+    return snapshotStateIfDue(st, m.state_gen);
+}
+
+fn snapshotStateIfDue(st: *State, gen: u64) !void {
+    const at = st.snap_at orelse return;
+    if (st.n != at) return;
+    const layers = try st.gpa.alloc(Snap.LSnap, st.layers.len);
+    errdefer st.gpa.free(layers);
+    const ds = try st.gpa.alloc(A, st.ds.len);
+    errdefer st.gpa.free(ds);
+    const hist = try st.gpa.dupe(u32, st.hist.items);
     for (layers, st.layers) |*o, *l| o.* = .{
         .win = ref(l.win.buf),
-        .comp_used = if (l.comp) |r| r.used else 0,
-        .idx_used = if (l.idx_k) |r| r.used else 0,
+        .comp = refRows(l.comp),
+        .idx_k = refRows(l.idx_k),
         .pend_kv = ref(l.pend_kv),
         .pend_gate = ref(l.pend_gate),
     };
     for (ds, st.ds) |*o, r| o.* = ref(r.buf);
-    m.snap = .{ .gen = gen, .vision_key = m.snap_vision_key, .n = st.n, .ids = m.snap_ids, .layers = layers, .ds = ds, .mh = ref(st.mh), .hist = hist };
-    m.snap_ids = &.{};
+    if (st.snap) |*old| old.deinit(st.gpa);
+    st.snap = .{
+        .gen = gen,
+        .vision_key = st.snap_vision_key,
+        .n = st.n,
+        .ids = st.snap_ids,
+        .layers = layers,
+        .ds = ds,
+        .mh = ref(st.mh),
+        .hist = hist,
+    };
+    st.snap_ids = &.{};
+    st.snap_at = null;
 }
 
 /// `extend` that takes the armed snapshot on the way: a chunk crossing its
@@ -4083,7 +4183,7 @@ pub fn extendResumableGpu(m: *Dsv41Model, gpa: std.mem.Allocator, tok: A) !A {
 pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision: ?VisionRows) !A {
     try snapshotIfDue(m);
     const st = &m.dec_state.?;
-    if (m.snap_at) |at| if (at > st.n and at < st.n + ids.len) {
+    if (st.snap_at) |at| if (at > st.n and at < st.n + ids.len) {
         const k = at - st.n;
         const head = try extendIds(m, gpa, st, .{ .host = ids[0..k] }, .last, vision);
         _ = mlx.mlx_array_free(head);
@@ -4107,7 +4207,7 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     if (N == 0 or N > region_rows or states.len != N or gens.len != N or m.pair != null or m.streamed != null) return error.Dsv41BatchUnsupported;
     for (states, gens) |st, g| {
         if (st.verify != null) return error.Dsv41BatchUnsupported;
-        try snapshotStateIfDue(m, st, g);
+        try snapshotStateIfDue(st, g);
     }
     for (toks) |t| if (t >= m.vocab) return error.TokenPastVocabulary;
     const targets: usize = if (m.n_mtp > 0) c.dsv4_n_dspark_target_layers else 0;
@@ -4172,7 +4272,7 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_async_eval(vec));
-    for (states, gens) |st, g| try snapshotStateIfDue(m, st, g);
+    for (states, gens) |st, g| try snapshotStateIfDue(st, g);
     return sc.out(logits);
 }
 
@@ -5816,13 +5916,14 @@ fn hcTestModelFree(m: *Dsv41Model) void {
     for ([_]mlx.mlx_fast_metal_kernel{ m.hc_mix_kernel, m.hc_norm_kernel, m.hc_stage_kernel, m.hc_stage_x_kernel, m.hc_split_kernel }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
 }
 
-test "dsv41 state bytes: the window rings and the compressed rows as allocated" {
+test "dsv41 state bytes: snapshots bill window, compressed and index capacities until transferred" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const s = mlx.gpuStream();
     const layers = try gpa.alloc(LState, 2);
     defer gpa.free(layers);
     layers[0] = .{ .win = try Ring.init(144, 512, .bfloat16, s) };
-    layers[1] = .{ .win = try Ring.init(144, 512, .bfloat16, s), .comp = .{ .width = 512, .dtype = .bfloat16 } };
+    layers[1] = .{ .win = try Ring.init(144, 512, .bfloat16, s), .comp = .{ .width = 512, .dtype = .bfloat16 }, .idx_k = .{ .width = 512, .dtype = .float32 } };
     var st: State = .{ .gpa = gpa, .layers = layers };
     defer for (layers) |*l| l.deinit();
     try testing.expectEqual(@as(u64, 2 * 144 * 512 * 2), stateBytes(&st));
@@ -5831,6 +5932,18 @@ test "dsv41 state bytes: the window rings and the compressed rows as allocated" 
     try mlx.check(mlx.mlx_zeros(&row, &[_]c_int{ 1, 512 }, 2, .bfloat16, s));
     try layers[1].comp.?.append(row, s); // the first append allocates 64 rows of capacity
     try testing.expectEqual(@as(u64, 2 * 144 * 512 * 2 + 64 * 512 * 2), stateBytes(&st));
+    try layers[1].idx_k.?.append(row, s);
+    const retained: u64 = 2 * 144 * 512 * 2 + 64 * 512 * 2 + 64 * 512 * 4;
+    st.n = 1;
+    st.snap_at = 1;
+    st.snap_ids = try gpa.dupe(u32, &.{3});
+    try snapshotStateIfDue(&st, 1);
+    try testing.expectEqual(2 * retained, stateBytes(&st));
+    var sn = st.snap.?;
+    st.snap = null;
+    defer sn.deinit(gpa);
+    try testing.expectEqual(retained, sn.bytes());
+    try testing.expectEqual(retained, stateBytes(&st));
 }
 
 test "dsv41 router: the wide f32 matmul gives the logits the decode kernel gives" {
@@ -6224,7 +6337,7 @@ fn argmaxHost(l: A) !u32 {
     return @intCast((mlx.mlx_array_data_uint32(o) orelse return error.NoData)[0]);
 }
 
-test "dsv41 resume: a prompt that extends the last one resumes its state and matches a cold prefill (DSV41_TINY)" {
+test "dsv41 snapshot: survives origin destruction, row growth and verify rollback, restores twice equal to cold (DSV41_TINY)" {
     const root = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
     const gpa = testing.allocator;
     var t = try Tiny.open(root, "repack", "fixture.safetensors");
@@ -6240,21 +6353,51 @@ test "dsv41 resume: a prompt that extends the last one resumes its state and mat
     for ([_][]const u32{ b, a }) |p| {
         // Turn 1: the prompt, then three decode steps.
         try testing.expectEqual(@as(usize, 0), try resumePrompt(m, a, null));
-        _ = mlx.mlx_array_free(try prefill(m, gpa, a, null));
+        _ = mlx.mlx_array_free(try extendAllResumable(m, gpa, a));
+        var sn = m.dec_state.?.snap orelse return error.MissingSnapshot;
+        m.dec_state.?.snap = null;
+        defer sn.deinit(gpa);
+        const extra = try gpa.alloc(u32, 192);
+        defer gpa.free(extra);
+        @memset(extra, 5);
+        _ = mlx.mlx_array_free(try extendResumable(m, gpa, extra, null));
+        for (m.dec_state.?.layers, sn.layers) |l, saved| {
+            if (saved.comp) |r| try testing.expect(l.comp.?.cap > r.cap);
+            if (saved.idx_k) |r| try testing.expect(l.idx_k.?.cap > r.cap);
+        }
+        try armVerify(&m.dec_state.?, m.n_layers);
+        _ = mlx.mlx_array_free(try extendAllResumable(m, gpa, &.{ 7, 9, 11 }));
+        try rollbackVerify(m, &m.dec_state.?, 1);
+        m.dec_state.?.deinit();
+        m.dec_state = null;
+        try testing.expect(sn.hist.len > 0 and sn.ds.len > 0);
+        for (0..3) |fail_at| {
+            var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+            try testing.expectError(error.OutOfMemory, stateFromSnapshot(m, failing.allocator(), &sn));
+        }
+        var restored = try stateFromSnapshot(m, gpa, &sn);
+        defer restored.deinit();
+        const independent = try logitsHost(m, &restored, p[sn.n..], .last);
+        defer gpa.free(independent);
+        m.dec_state = try stateFromSnapshot(m, gpa, &sn);
         for ([_]u32{ 5, 9, 13 }) |tok| _ = mlx.mlx_array_free(try extendResumable(m, gpa, &.{tok}, null));
-        const n = try resumePrompt(m, p, null);
+        m.dec_state.?.deinit();
+        m.dec_state = try stateFromSnapshot(m, gpa, &sn);
+        const n = sn.n;
         try testing.expectEqual(a.len - 1, n);
         const wl = try extendResumable(m, gpa, p[n..], null);
         defer _ = mlx.mlx_array_free(wl);
         const warm = try hostF32(wl);
         defer gpa.free(warm);
-        m.snap.?.deinit(gpa);
-        m.snap = null;
+        try testing.expectEqualSlices(f32, independent, warm);
+        m.dec_state.?.deinit();
+        m.dec_state = null;
         try testing.expectEqual(@as(usize, 0), try resumePrompt(m, p, null));
         const cl = try prefill(m, gpa, p, null);
         defer _ = mlx.mlx_array_free(cl);
         const cold = try hostF32(cl);
         defer gpa.free(cold);
+        for (cold) |value| try testing.expect(std.math.isFinite(value));
         try testing.expectEqualSlices(f32, cold, warm);
     }
 }
@@ -6276,8 +6419,10 @@ test "dsv41 image token: without image rows it is text, as in the reference's te
     defer if (want) |w| gpa.free(w);
     for ([_]u32{ 0, a[1] }) |img| {
         m.cfg.image_token_id = img;
-        if (m.snap) |*sn| sn.deinit(gpa);
-        m.snap = null;
+        if (m.dec_state) |*st| {
+            if (st.snap) |*sn| sn.deinit(gpa);
+            st.snap = null;
+        }
         try testing.expectEqual(@as(usize, 0), try resumePrompt(m, a, null));
         _ = mlx.mlx_array_free(try prefill(m, gpa, a, null));
         const n = try resumePrompt(m, b, null);
@@ -6481,9 +6626,9 @@ test "dsv41 CED resume: a prompt that extends the last one replays the tail a co
             try testing.expectEqual(@as(usize, 0), try resumePrompt(m, a, null));
             _ = mlx.mlx_array_free(try prefill(m, gpa, a, null));
             for ([_]u32{ 5, 9, 13 }) |tok| _ = mlx.mlx_array_free(try extendResumable(m, gpa, &.{tok}, null));
-        } else if (m.snap) |*sn| {
-            sn.deinit(gpa);
-            m.snap = null;
+        } else if (m.dec_state) |*st| {
+            if (st.snap) |*sn| sn.deinit(gpa);
+            st.snap = null;
         }
         const n = try resumePrompt(m, b, null);
         try testing.expectEqual(if (warm == 1) a.len - 1 else 0, n);
