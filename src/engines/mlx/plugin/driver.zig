@@ -549,6 +549,78 @@ pub fn stateBytes(xfm: *const Transformer) u64 {
     return f(b.model);
 }
 
+/// Borrowed from one loaded model; snapshots must be freed before that model unloads.
+pub const AuxBinding = struct {
+    model: *anyopaque,
+    hooks: *const abi.AuxHooks,
+};
+
+/// The complete auxiliary interface for this model. A shorter table cannot supply the required tail.
+pub fn auxBinding(xfm: *const Transformer) ?AuxBinding {
+    const b = xfm.plugin orelse return null;
+    const cache = b.table.cache;
+    if (cache.size < @sizeOf(abi.CacheHooks)) return null;
+    const hooks = cache.aux orelse return null;
+    if (hooks.size < @sizeOf(abi.AuxHooks)) return null;
+    return .{ .model = b.model, .hooks = hooks };
+}
+
+pub fn auxEnabled(xfm: *const Transformer) bool {
+    const b = auxBinding(xfm) orelse return false;
+    const f = b.hooks.enabled orelse return false;
+    return f(b.model);
+}
+
+/// Transfers a completed capture to the caller; absence or failure leaves no usable checkpoint.
+pub fn auxSnapshot(xfm: *const Transformer, slot: u32) abi.Handle {
+    const b = auxBinding(xfm) orelse return null;
+    var snap: abi.Handle = null;
+    const v = b.hooks.snapshot(b.model, slot, &snap);
+    if (!v.isOk()) return null;
+    return snap;
+}
+
+pub fn auxDescribe(xfm: *const Transformer, snap: abi.Handle, out: *abi.AuxSnapshotInfo) abi.Verdict {
+    const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
+    const f = b.hooks.describe orelse return abi.Verdict.refuse(.unsupported, "model auxiliary describe is unavailable");
+    if (snap == null) return abi.Verdict.refuse(.unsupported, "no auxiliary snapshot to describe");
+    return f(b.model, snap, out);
+}
+
+pub fn auxPrefixKey(xfm: *const Transformer, ids: []const u32, media: ?Array, out: *u64) abi.Verdict {
+    const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
+    const f = b.hooks.prefix_key orelse return abi.Verdict.refuse(.unsupported, "model auxiliary prefix_key is unavailable");
+    return f(b.model, .of(ids), .{ .ctx = if (media) |m| m.ctx else null }, out);
+}
+
+pub fn auxBeginPrompt(xfm: *const Transformer, slot: u32, prompt: []const u32, media: ?Array, restored_at: u64, capture: bool) abi.Verdict {
+    const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
+    const f = b.hooks.begin_prompt orelse return abi.Verdict.refuse(.unsupported, "model auxiliary begin_prompt is unavailable");
+    return f(b.model, slot, .of(prompt), .{ .ctx = if (media) |m| m.ctx else null }, restored_at, capture);
+}
+
+/// Exact-position restore borrows the snapshot; success and failure both leave it for the caller to free.
+pub fn auxRestoreAt(xfm: *const Transformer, slot: u32, snap: abi.Handle, pos: u64) abi.Verdict {
+    const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
+    var info: abi.AuxSnapshotInfo = .{};
+    const v = auxDescribe(xfm, snap, &info);
+    if (!v.isOk()) return v;
+    if (pos != info.n) return abi.Verdict.refuse(.unsupported, "auxiliary restore requires the snapshot's exact position");
+    return b.hooks.restore_at(b.model, slot, snap, pos);
+}
+
+pub fn auxBytes(xfm: *const Transformer, snap: abi.Handle) u64 {
+    const b = auxBinding(xfm) orelse return 0;
+    if (snap == null) return 0;
+    return b.hooks.bytes(b.model, snap);
+}
+
+pub fn auxFree(xfm: *const Transformer, snap: abi.Handle) void {
+    const b = auxBinding(xfm) orelse return;
+    if (snap == null) return;
+    b.hooks.free(b.model, snap);
+}
+
 /// `forwardBatchedDecode` / `forwardMoeBatchedDecode` for a served model: one row per slot at its own position, each
 /// slot's logits `[1, 1, vocab]` and, when `hidden_rows` is asked, its final-normed hidden `[1, 1, hidden]` (caller
 /// owns the slices and every array). The tick advances the slots' positions.
@@ -790,4 +862,257 @@ test "driver: a DeepSeek-V4.1 pack's vision, aligner and image rows move to the 
     try std.testing.expect(!towerKey(&c, "layers.0.attn.wq_a.weight"));
     c.model_type = "qwen3_5";
     try std.testing.expect(!towerKey(&c, "vision.patch_embed.proj.weight"));
+}
+
+// ── tests ──
+
+const AuxFake = struct {
+    on: bool = true,
+    captured: bool = true,
+    fail_snapshot: bool = false,
+    fail_restore: bool = false,
+    calls: usize = 0,
+    restores: usize = 0,
+    frees: usize = 0,
+    slot: u32 = 0,
+    restored_at: u64 = 0,
+    capture: bool = false,
+    media: ?*anyopaque = null,
+    ids: [3]u32 = .{ 4, 8, 15 },
+    key: u64 = 71,
+    resident: u64 = 4096,
+
+    fn get(m: *anyopaque) *AuxFake {
+        return @ptrCast(@alignCast(m));
+    }
+    fn enabled(m: *anyopaque) callconv(.c) bool {
+        const f = get(m);
+        f.calls += 1;
+        return f.on;
+    }
+    fn snapshot(m: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) abi.Verdict {
+        const f = get(m);
+        f.calls += 1;
+        f.slot = slot;
+        if (f.fail_snapshot) return abi.Verdict.refuse(.failed, "fake snapshot failed");
+        out.* = if (f.captured) m else null;
+        f.captured = false;
+        return .ok;
+    }
+    fn describe(m: *anyopaque, snap: abi.Handle, out: *abi.AuxSnapshotInfo) callconv(.c) abi.Verdict {
+        const f = get(m);
+        f.calls += 1;
+        if (snap != m) return abi.Verdict.refuse(.failed, "foreign snapshot");
+        out.* = .{ .n = f.ids.len, .ids = .of(&f.ids), .prefix_key = f.key };
+        return .ok;
+    }
+    fn prefixKey(m: *anyopaque, ids: abi.Span(u32), media: abi.Array, out: *u64) callconv(.c) abi.Verdict {
+        const f = get(m);
+        f.calls += 1;
+        f.media = media.ctx;
+        if (!std.mem.eql(u32, ids.slice(), &f.ids)) return abi.Verdict.refuse(.failed, "unexpected prefix");
+        out.* = f.key;
+        return .ok;
+    }
+    fn beginPrompt(m: *anyopaque, slot: u32, prompt: abi.Span(u32), media: abi.Array, restored_at: u64, capture: bool) callconv(.c) abi.Verdict {
+        const f = get(m);
+        f.calls += 1;
+        f.slot = slot;
+        f.media = media.ctx;
+        f.restored_at = restored_at;
+        f.capture = capture;
+        if (prompt.len != 4 or prompt.slice()[3] != 16) return abi.Verdict.refuse(.failed, "unexpected prompt");
+        return .ok;
+    }
+    fn restoreAt(m: *anyopaque, slot: u32, snap: abi.Handle, pos: u64) callconv(.c) abi.Verdict {
+        const f = get(m);
+        f.calls += 1;
+        f.restores += 1;
+        f.slot = slot;
+        if (f.fail_restore) return abi.Verdict.refuse(.failed, "fake restore failed");
+        if (snap != m or pos != f.ids.len) return abi.Verdict.refuse(.failed, "invalid restore");
+        return .ok;
+    }
+    fn bytes(m: *anyopaque, snap: abi.Handle) callconv(.c) u64 {
+        const f = get(m);
+        std.debug.assert(snap == m);
+        f.calls += 1;
+        return f.resident;
+    }
+    fn free(m: *anyopaque, snap: abi.Handle) callconv(.c) void {
+        const f = get(m);
+        std.debug.assert(snap == m);
+        f.calls += 1;
+        f.frees += 1;
+    }
+    const hooks: abi.AuxHooks = .{
+        .reserve = undefined,
+        .commit = undefined,
+        .snapshot = &snapshot,
+        .restore_at = &restoreAt,
+        .slice = undefined,
+        .handoff = undefined,
+        .free = &free,
+        .bytes = &bytes,
+        .serialize = undefined,
+        .deserialize = undefined,
+        .enabled = &enabled,
+        .describe = &describe,
+        .prefix_key = &prefixKey,
+        .begin_prompt = &beginPrompt,
+    };
+    const weights: abi.WeightHooks = .{};
+
+    fn table(cache: *const abi.CacheHooks) abi.ModelTable {
+        return .{ .name = .of("aux_fixture"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = cache, .weights = &weights };
+    }
+};
+
+test "plugin aux: absent and short tables refuse without calling hooks" {
+    const t = std.testing;
+    var fake: AuxFake = .{};
+    var cache: abi.CacheHooks = .{};
+    const table = AuxFake.table(&cache);
+    var bound: Bound = .{ .table = &table, .model = &fake };
+    var x: Transformer = undefined;
+    x.plugin = null;
+    var info: abi.AuxSnapshotInfo = .{};
+    var key: u64 = 0;
+    // The allocation ends before any callback, including the original table's members.
+    var short: [@alignOf(abi.AuxHooks)]u8 align(@alignOf(abi.AuxHooks)) = @splat(0);
+    @as(*u32, @ptrCast(&short)).* = @sizeOf(u32);
+    var hooks = AuxFake.hooks;
+    for (0..9) |case| {
+        switch (case) {
+            0 => x.plugin = null,
+            1 => x.plugin = &bound,
+            2 => cache.aux = @ptrCast(&short),
+            3 => {
+                cache.aux = &hooks;
+                hooks.size = @offsetOf(abi.AuxHooks, "enabled");
+            },
+            4 => hooks.size = @offsetOf(abi.AuxHooks, "describe"),
+            5 => hooks.size = @offsetOf(abi.AuxHooks, "prefix_key"),
+            6 => hooks.size = @offsetOf(abi.AuxHooks, "begin_prompt"),
+            7 => hooks.size = @sizeOf(abi.AuxHooks) - 1,
+            8 => {
+                hooks.size = @sizeOf(abi.AuxHooks);
+                cache.size = @offsetOf(abi.CacheHooks, "aux");
+            },
+            else => unreachable,
+        }
+        try t.expect(!auxEnabled(&x));
+        try t.expectEqual(@as(abi.Handle, null), auxSnapshot(&x, 7));
+        try t.expectEqual(abi.Verdict.Code.unsupported, auxDescribe(&x, &fake, &info).code);
+        try t.expectEqual(abi.Verdict.Code.unsupported, auxPrefixKey(&x, &fake.ids, null, &key).code);
+        try t.expectEqual(abi.Verdict.Code.unsupported, auxBeginPrompt(&x, 7, &.{ 4, 8, 15, 16 }, null, 0, false).code);
+        const v = auxRestoreAt(&x, 7, &fake, 3);
+        try t.expectEqual(abi.Verdict.Code.unsupported, v.code);
+        try t.expect(v.why.len > 0);
+        try t.expectEqual(@as(u64, 0), auxBytes(&x, &fake));
+        auxFree(&x, &fake);
+        try t.expectEqual(@as(usize, 0), fake.calls);
+    }
+}
+
+test "plugin aux: optional hooks default to unsupported and eligibility is per instance" {
+    const t = std.testing;
+    var fake: AuxFake = .{ .on = false };
+    var hooks = AuxFake.hooks;
+    const cache: abi.CacheHooks = .{ .aux = &hooks };
+    const table = AuxFake.table(&cache);
+    var bound: Bound = .{ .table = &table, .model = &fake };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    try t.expect(!auxEnabled(&x));
+    fake.on = true;
+    try t.expect(auxEnabled(&x));
+    hooks.enabled = null;
+    hooks.describe = null;
+    hooks.prefix_key = null;
+    hooks.begin_prompt = null;
+    fake.calls = 0;
+    var info: abi.AuxSnapshotInfo = .{};
+    var key: u64 = 0;
+    try t.expect(!auxEnabled(&x));
+    try t.expectEqual(abi.Verdict.Code.unsupported, auxDescribe(&x, &fake, &info).code);
+    try t.expectEqual(abi.Verdict.Code.unsupported, auxPrefixKey(&x, &fake.ids, null, &key).code);
+    try t.expectEqual(abi.Verdict.Code.unsupported, auxBeginPrompt(&x, 7, &.{}, null, 0, false).code);
+    try t.expectEqual(abi.Verdict.Code.unsupported, auxRestoreAt(&x, 7, &fake, 3).code);
+    try t.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "plugin aux: a missing or failed capture returns no snapshot" {
+    const t = std.testing;
+    var fake: AuxFake = .{ .captured = false };
+    const cache: abi.CacheHooks = .{ .aux = &AuxFake.hooks };
+    const table = AuxFake.table(&cache);
+    var bound: Bound = .{ .table = &table, .model = &fake };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    try t.expectEqual(@as(abi.Handle, null), auxSnapshot(&x, 7));
+    fake.fail_snapshot = true;
+    try t.expectEqual(@as(abi.Handle, null), auxSnapshot(&x, 7));
+    try t.expectEqual(@as(usize, 2), fake.calls);
+    try t.expectEqual(@as(u32, 7), fake.slot);
+    auxFree(&x, null);
+    try t.expectEqual(@as(usize, 0), fake.frees);
+}
+
+test "plugin aux: model-local snapshots describe restore and free exactly once" {
+    const t = std.testing;
+    var models = [_]AuxFake{ .{}, .{ .key = 83, .resident = 8192 } };
+    const cache: abi.CacheHooks = .{ .aux = &AuxFake.hooks };
+    const table = AuxFake.table(&cache);
+    var bounds: [2]Bound = undefined;
+    var shells: [2]Transformer = undefined;
+    var snaps: [2]abi.Handle = undefined;
+    for (&models, 0..) |*fake, i| {
+        bounds[i] = .{ .table = &table, .model = fake };
+        shells[i].plugin = &bounds[i];
+        snaps[i] = auxSnapshot(&shells[i], @intCast(i + 7)) orelse return error.TestExpectedSnapshot;
+    }
+    for (&models, 0..) |*fake, i| {
+        const x = &shells[i];
+        const slot: u32 = @intCast(i + 7);
+        const snap = snaps[i];
+        try t.expectEqual(slot, fake.slot);
+        var info: abi.AuxSnapshotInfo = .{};
+        try t.expect(auxDescribe(x, snap, &info).isOk());
+        try t.expectEqual(@as(u64, 3), info.n);
+        try t.expectEqualSlices(u32, &.{ 4, 8, 15 }, info.ids.slice());
+        try t.expectEqual(fake.key, info.prefix_key);
+        var key: u64 = 0;
+        try t.expect(auxPrefixKey(x, info.ids.slice(), .{ .ctx = fake }, &key).isOk());
+        try t.expectEqual(info.prefix_key, key);
+        try t.expect(fake.media == @as(?*anyopaque, fake));
+        try t.expect(auxBeginPrompt(x, slot, &.{ 4, 8, 15, 16 }, .{ .ctx = fake }, info.n, true).isOk());
+        try t.expectEqual(info.n, fake.restored_at);
+        try t.expect(fake.capture and fake.media == @as(?*anyopaque, fake));
+        try t.expectEqual(slot, fake.slot);
+        try t.expect(auxBeginPrompt(x, slot, &.{ 4, 8, 15, 16 }, null, 0, false).isOk());
+        try t.expectEqual(@as(u64, 0), fake.restored_at);
+        try t.expect(!fake.capture and fake.media == null);
+        for ([_]u64{ 0, 2, 4 }) |pos| {
+            const v = auxRestoreAt(x, slot, snap, pos);
+            try t.expectEqual(abi.Verdict.Code.unsupported, v.code);
+            try t.expect(v.why.len > 0);
+        }
+        try t.expectEqual(@as(usize, 0), fake.restores);
+        try t.expect(auxRestoreAt(x, slot, snap, info.n).isOk());
+        try t.expectEqual(@as(usize, 1), fake.restores);
+        try t.expectEqual(slot, fake.slot);
+        try t.expectEqual(@as(usize, 0), fake.frees);
+        try t.expectEqual(fake.resident, auxBytes(x, snap));
+        fake.fail_restore = true;
+        const v = auxRestoreAt(x, slot, snap, info.n);
+        try t.expectEqual(abi.Verdict.Code.failed, v.code);
+        try t.expectEqualStrings("fake restore failed", v.why.slice());
+        try t.expectEqual(@as(usize, 0), fake.frees);
+        auxFree(x, snap);
+        auxFree(x, null);
+        try t.expectEqual(@as(usize, 1), fake.frees);
+    }
+    try t.expectEqual(@as(usize, 1), models[0].frees);
+    try t.expectEqual(@as(usize, 1), models[1].frees);
 }

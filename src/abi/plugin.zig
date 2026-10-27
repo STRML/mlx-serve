@@ -541,21 +541,43 @@ pub const LayerCache = extern struct {
     v_dim: u32 = 0,
 };
 
+/// Snapshot metadata; `ids` is borrowed until the snapshot's `free`, and `n == ids.len`.
+pub const AuxSnapshotInfo = extern struct {
+    size: u32 = @sizeOf(AuxSnapshotInfo),
+    n: u64 = 0,
+    ids: Span(u32) = .{},
+    prefix_key: u64 = 0,
+};
+
 /// A plugin's opaque per-slot state beside the KV cache, under the RAM prefix cache, the SSD tier and restores.
-/// A snapshot is a plugin-owned `Handle`, freed by `free`.
+/// Every call, including `free`, runs on the inference thread. A snapshot's caller owns it until `free`.
 pub const AuxHooks = extern struct {
     size: u32 = @sizeOf(AuxHooks),
     reserve: *const fn (m: *anyopaque, slot: u32, tokens: u64) callconv(.c) Verdict,
     commit: *const fn (m: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict,
+    /// Transfers the slot's completed capture to the caller; null means no checkpoint was reached.
     snapshot: *const fn (m: *anyopaque, slot: u32, out: *Handle) callconv(.c) Verdict,
+    /// Accepts only `pos == snap.n`; builds the replacement before installing it. The caller keeps the snapshot.
     restore_at: *const fn (m: *anyopaque, slot: u32, snap: Handle, pos: u64) callconv(.c) Verdict,
+    /// Clones references when `len == snap.n`; any other length returns named `.unsupported`.
     slice: *const fn (m: *anyopaque, snap: Handle, len: u64, out: *Handle) callconv(.c) Verdict,
     handoff: *const fn (m: *anyopaque, from_slot: u32, to_slot: u32) callconv(.c) Verdict,
+    /// Releases the complete snapshot and its host allocations exactly once.
     free: *const fn (m: *anyopaque, snap: Handle) callconv(.c) void,
+    /// Resident bytes, including retained buffer capacities; encoded size is a separate quantity.
     bytes: *const fn (m: *anyopaque, snap: Handle) callconv(.c) u64,
-    /// Writes `snap` into the host's `buf` (at least `bytes(snap)` long), setting `len`.
+    /// Writes the encoding into `buf` up to `cap`, setting `len`; refuses insufficient capacity by name.
     serialize: *const fn (m: *anyopaque, snap: Handle, buf: [*]u8, cap: usize, len: *usize) callconv(.c) Verdict,
     deserialize: *const fn (m: *anyopaque, bytes: Str, out: *Handle) callconv(.c) Verdict,
+    /// Whether this loaded instance supports auxiliary caching, including its runtime configuration.
+    enabled: ?*const fn (m: *anyopaque) callconv(.c) bool = null,
+    /// Describes the snapshot's own boundary and identity; `ids` remains borrowed until its `free`.
+    describe: ?*const fn (m: *anyopaque, snap: Handle, out: *AuxSnapshotInfo) callconv(.c) Verdict = null,
+    /// Computes identity for `ids` and only the media rows belonging to that prefix.
+    prefix_key: ?*const fn (m: *anyopaque, ids: Span(u32), media_rows: Array, out: *u64) callconv(.c) Verdict = null,
+    /// Activates `slot`; zero `restored_at` resets it, otherwise verifies its position. Arms that slot's capture
+    /// at `prompt.len - 1` only when `capture` is true; media rows are borrowed for this call.
+    begin_prompt: ?*const fn (m: *anyopaque, slot: u32, prompt: Span(u32), media_rows: Array, restored_at: u64, capture: bool) callconv(.c) Verdict = null,
 };
 
 pub const CacheHooks = extern struct {

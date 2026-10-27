@@ -78,7 +78,7 @@ pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
                 return Verdict.refuse(.unsupported, "a model hook table is older than this host's");
             if (t.spec) |s| if (!sized(model_abi.HeadHooks, s.head) or !sized(model_abi.NativeDrafter, s.native_drafter))
                 return Verdict.refuse(.unsupported, "a model hook table is older than this host's");
-            if (!sized(model_abi.AuxHooks, t.cache.aux)) return Verdict.refuse(.unsupported, "a model hook table is older than this host's");
+            if (!sized(model_abi.AuxHooks, t.cache.aux)) return Verdict.refuse(.unsupported, "model auxiliary hook table is older than this host's");
         },
         .media => {
             if (head.version != media_abi.version) return Verdict.refuse(.unsupported, "media table version is not this host's");
@@ -201,4 +201,44 @@ test "abi dylib: plugin names are lower-case words, never paths" {
     try testing.expect(validName("toy_2") and validName("_example"));
     const long: [65]u8 = @splat('x');
     for ([_][]const u8{ "", "Toy", "a/b", "a.b", "a-b", &long }) |n| try testing.expect(!validName(n));
+}
+
+test "abi dylib: auxiliary tables require the complete tail and optional hooks may be absent" {
+    var aux: model_abi.AuxHooks = .{
+        .reserve = undefined,
+        .commit = undefined,
+        .snapshot = undefined,
+        .restore_at = undefined,
+        .slice = undefined,
+        .handoff = undefined,
+        .free = undefined,
+        .bytes = undefined,
+        .serialize = undefined,
+        .deserialize = undefined,
+    };
+    var cache: model_abi.CacheHooks = .{ .aux = &aux };
+    const weights: model_abi.WeightHooks = .{};
+    const table: model_abi.ModelTable = .{ .name = .of("aux_fixture"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .weights = &weights };
+    const m: Manifest = .{ .name = .of("aux_fixture"), .kind = .model, .mlx = .of("p"), .table = &table, .fixture = noFixture, .fixture_free = noFree };
+    try testing.expect(negotiate(&m, "p").isOk());
+    try testing.expect(aux.enabled == null and aux.describe == null and aux.prefix_key == null and aux.begin_prompt == null);
+    for ([_]u32{
+        @sizeOf(u32),
+        @offsetOf(model_abi.AuxHooks, "enabled"),
+        @offsetOf(model_abi.AuxHooks, "describe"),
+        @offsetOf(model_abi.AuxHooks, "prefix_key"),
+        @offsetOf(model_abi.AuxHooks, "begin_prompt"),
+        @sizeOf(model_abi.AuxHooks) - 1,
+    }) |size| {
+        aux.size = size;
+        const v = negotiate(&m, "p");
+        try testing.expectEqual(Verdict.Code.unsupported, v.code);
+        try testing.expectEqualStrings("model auxiliary hook table is older than this host's", v.why.slice());
+    }
+    aux.size = @sizeOf(model_abi.AuxHooks) + 8;
+    try testing.expect(negotiate(&m, "p").isOk());
+    var short: [@alignOf(model_abi.AuxHooks)]u8 align(@alignOf(model_abi.AuxHooks)) = @splat(0);
+    @as(*u32, @ptrCast(&short)).* = @sizeOf(u32);
+    cache.aux = @ptrCast(&short);
+    try testing.expectEqual(Verdict.Code.unsupported, negotiate(&m, "p").code);
 }
