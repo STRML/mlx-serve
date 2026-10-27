@@ -550,7 +550,8 @@ pub const AuxSnapshotInfo = extern struct {
 };
 
 /// A plugin's opaque per-slot state beside the KV cache, under the RAM prefix cache, the SSD tier and restores.
-/// Every call, including `free`, runs on the inference thread. A snapshot's caller owns it until `free`.
+/// Every call runs on the inference thread, except `free` at process teardown, which runs on the thread tearing the
+/// model down after the inference thread has exited. A snapshot's caller owns it until `free`.
 pub const AuxHooks = extern struct {
     size: u32 = @sizeOf(AuxHooks),
     reserve: *const fn (m: *anyopaque, slot: u32, tokens: u64) callconv(.c) Verdict,

@@ -810,10 +810,11 @@ pub const HotPrefixCache = struct {
     /// Load-time gate after the plugin has loaded. Auxiliary-only caches are RAM-only:
     /// the caller must not attach a DiskTier, and must use the module commit/restore functions.
     pub fn shouldUseInstance(config: *const model_mod.ModelConfig, enable_ssm_checkpoints: bool, xfm: *const transformer_mod.Transformer) bool {
-        if (config.glm_stream or config.dist_span != null or config.dist_shard != null) return false;
+        // A module snapshot holds this rank's state only: a pipeline or tensor-parallel worker holds the rest.
+        // Other models keep `shouldUse` exactly (a tensor-parallel rank 0 keeps its KV cache: the worker is stateless).
         if (plugin_driver.auxBinding(xfm) != null) {
+            if (config.glm_stream or config.dist_span != null or config.dist_shard != null or config.expert_bank) return false;
             // The plugin's eligibility hook also excludes paired and streamed loaded instances.
-            if (config.expert_bank) return false;
             return ModuleBinding.init(xfm) != null;
         }
         return shouldUse(config, enable_ssm_checkpoints);
@@ -10718,6 +10719,11 @@ test "HotPrefixCache module: loaded instance gate keeps distributed and streamed
     try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
     cfg.legacy.caps.prefix_cache = true;
     try testing.expect(HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
+    // A model without module state follows `shouldUse` exactly: a tensor-parallel rank 0 keeps its KV cache.
+    cfg.dist_shard = .{ .rank = 0, .size = 2 };
+    try testing.expect(HotPrefixCache.shouldUse(&cfg, false));
+    try testing.expect(HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
+    cfg.dist_shard = null;
 }
 
 

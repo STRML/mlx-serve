@@ -789,6 +789,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (module_binding != null and disk_prefix_cache) {
         log.info("[hot-cache] --prefix-cache-disk does not apply to module snapshots yet; using RAM retention when enabled\n", .{});
     }
+    // Such a model keeps no conversation of its own any more: without a RAM prefix cache every turn prefills cold.
+    if (module_binding != null and (params.prefix_cache_capacity == 0 or !ram_prefix_cache)) {
+        log.warn("[hot-cache] no RAM prefix cache (--prefix-cache-entries 0 or --no-prefix-cache-ram): this model retains no conversation, every prompt prefills cold\n", .{});
+    }
     if (params.prefix_cache_capacity > 0 and (ram_prefix_cache or disk_prefix_cache) and
         prefix_cache_mod.HotPrefixCache.shouldUseInstance(params.config, enable_ssm_cps, xfm_ptr) and
         (module_binding == null or ram_prefix_cache))

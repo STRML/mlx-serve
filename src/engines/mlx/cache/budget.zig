@@ -94,9 +94,8 @@ pub fn publishHotCacheResidency(sch: *Scheduler) void {
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
-    sch.queue_mu.lockUncancelable(sch.io);
-    @import("../step.zig").publishLiveKvResidency(sch, null);
-    sch.queue_mu.unlock(sch.io);
+    // Live module state is published with the live KV (`publishLiveKvResidency`, per pass and per chunk), never here:
+    // it is not evictable, and republishing live sessions here would drop the slot being prefilled.
     publishHotCacheDigests(sch);
     if (sch.metrics != null) publishCachedSessions(sch);
 }
@@ -373,7 +372,12 @@ test "module live residency is counted once per model and cannot be credited as 
     publishHotCacheResidency(&sch);
     try testing.expectEqual(@as(u64, 0), sch.resident_hot_cache_bytes.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), sch.reclaimable_hot_cache_bytes.load(.monotonic));
-    try testing.expectEqual(@as(u64, 64), sch.resident_live_kv_bytes.load(.monotonic));
-    publishHotCacheResidency(&sch);
-    try testing.expectEqual(@as(u64, 64), sch.resident_live_kv_bytes.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), sch.resident_live_kv_bytes.load(.monotonic));
+    for (0..2) |_| {
+        sch.queue_mu.lockUncancelable(sch.io);
+        @import("../step.zig").publishLiveKvResidency(&sch, null);
+        sch.queue_mu.unlock(sch.io);
+        try testing.expectEqual(@as(u64, 64), sch.resident_live_kv_bytes.load(.monotonic));
+    }
+    try testing.expectEqual(@as(u64, 0), sch.resident_hot_cache_bytes.load(.monotonic));
 }
