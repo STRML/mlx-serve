@@ -374,8 +374,9 @@ test "module live residency is counted once per model and cannot be credited as 
     try testing.expectEqual(@as(u64, 0), sch.reclaimable_hot_cache_bytes.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), sch.resident_live_kv_bytes.load(.monotonic));
     for (0..2) |_| {
+        const module_bytes = moduleStateBytes(&sch);
         sch.queue_mu.lockUncancelable(sch.io);
-        @import("../step.zig").publishLiveKvResidency(&sch, null);
+        @import("../step.zig").publishLiveKvResidency(&sch, null, module_bytes);
         sch.queue_mu.unlock(sch.io);
         try testing.expectEqual(@as(u64, 64), sch.resident_live_kv_bytes.load(.monotonic));
     }

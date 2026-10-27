@@ -502,10 +502,11 @@ pub fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const r = runOwedDecodeTicks(share, chunk_ns +| nested_ns, first_ns, &owed, admitThenTick);
     ic.ticks += r.ticks;
     ic.decode_ns +|= r.spent_ns +| nested_ns;
+    const module_bytes = @import("cache/budget.zig").moduleStateBytes(ic.sch);
     {
         ic.sch.queue_mu.lockUncancelable(ic.sch.io);
         defer ic.sch.queue_mu.unlock(ic.sch.io);
-        publishLiveKvResidency(ic.sch, ic.slot);
+        publishLiveKvResidency(ic.sch, ic.slot, module_bytes);
     }
     ic.chunk_sw.reset();
 }

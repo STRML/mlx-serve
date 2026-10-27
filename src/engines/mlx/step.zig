@@ -296,6 +296,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     // the stream, not the slot; a client's cancel reached the stream first. Sent past `queue_mu` (the stream locks).
     var cancelled: [64]*Slot = undefined;
     var n_cancelled: usize = 0;
+    const module_bytes = @import("cache/budget.zig").moduleStateBytes(sch);
     {
         sch.queue_mu.lockUncancelable(sch.io);
         defer sch.queue_mu.unlock(sch.io);
@@ -321,7 +322,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                 _ = sch.decoding.orderedRemove(i);
             } else i += 1;
         }
-        publishLiveKvResidency(sch, null);
+        publishLiveKvResidency(sch, null, module_bytes);
     }
     for (cancelled[0..n_cancelled]) |s| {
         @import("finish.zig").releasePluginSlot(s);
@@ -333,10 +334,11 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
 
 /// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
 /// `prefilling` is the slot mid-prefill, which is not in `decoding` yet.
-pub fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot) void {
+/// Read `module_bytes` before taking `queue_mu`; publication does not access the registry.
+pub fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot, module_bytes: u64) void {
     const observe = sch.metrics != null;
     sch.live_session_count = 0;
-    var bytes: u64 = @import("cache/budget.zig").moduleStateBytes(sch);
+    var bytes = module_bytes;
     if (prefilling) |p| {
         const b = slotStateBytes(p);
         bytes += b;

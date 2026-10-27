@@ -203,8 +203,12 @@ test "abi dylib: plugin names are lower-case words, never paths" {
     for ([_][]const u8{ "", "Toy", "a/b", "a.b", "a-b", &long }) |n| try testing.expect(!validName(n));
 }
 
-test "abi dylib: auxiliary tables require the complete tail and optional hooks may be absent" {
+test "abi dylib: auxiliary tables require the complete tail" {
     var aux: model_abi.AuxHooks = .{
+        .enabled = undefined,
+        .describe = undefined,
+        .prefix_key = undefined,
+        .begin_prompt = undefined,
         .reserve = undefined,
         .commit = undefined,
         .snapshot = undefined,
@@ -221,7 +225,6 @@ test "abi dylib: auxiliary tables require the complete tail and optional hooks m
     const table: model_abi.ModelTable = .{ .name = .of("aux_fixture"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .weights = &weights };
     const m: Manifest = .{ .name = .of("aux_fixture"), .kind = .model, .mlx = .of("p"), .table = &table, .fixture = noFixture, .fixture_free = noFree };
     try testing.expect(negotiate(&m, "p").isOk());
-    try testing.expect(aux.enabled == null and aux.describe == null and aux.prefix_key == null and aux.begin_prompt == null);
     for ([_]u32{
         @sizeOf(u32),
         @offsetOf(model_abi.AuxHooks, "enabled"),

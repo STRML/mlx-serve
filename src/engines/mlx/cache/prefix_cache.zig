@@ -169,10 +169,9 @@ pub const ModuleBinding = struct {
     xfm: *const transformer_mod.Transformer,
     aux: plugin_driver.AuxBinding,
 
-    /// Null unless all phase-1 hooks are usable and this loaded instance permits caching.
+    /// Null unless the auxiliary table is complete and this loaded instance permits caching.
     pub fn init(xfm: *const transformer_mod.Transformer) ?ModuleBinding {
         const aux = plugin_driver.auxBinding(xfm) orelse return null;
-        if (aux.hooks.describe == null or aux.hooks.prefix_key == null or aux.hooks.begin_prompt == null) return null;
         if (!plugin_driver.auxEnabled(xfm)) return null;
         return .{ .xfm = xfm, .aux = aux };
     }

@@ -571,14 +571,14 @@ pub const AuxHooks = extern struct {
     serialize: *const fn (m: *anyopaque, snap: Handle, buf: [*]u8, cap: usize, len: *usize) callconv(.c) Verdict,
     deserialize: *const fn (m: *anyopaque, bytes: Str, out: *Handle) callconv(.c) Verdict,
     /// Whether this loaded instance supports auxiliary caching, including its runtime configuration.
-    enabled: ?*const fn (m: *anyopaque) callconv(.c) bool = null,
+    enabled: *const fn (m: *anyopaque) callconv(.c) bool,
     /// Describes the snapshot's own boundary and identity; `ids` remains borrowed until its `free`.
-    describe: ?*const fn (m: *anyopaque, snap: Handle, out: *AuxSnapshotInfo) callconv(.c) Verdict = null,
+    describe: *const fn (m: *anyopaque, snap: Handle, out: *AuxSnapshotInfo) callconv(.c) Verdict,
     /// Computes identity for `ids` and only the media rows belonging to that prefix.
-    prefix_key: ?*const fn (m: *anyopaque, ids: Span(u32), media_rows: Array, out: *u64) callconv(.c) Verdict = null,
+    prefix_key: *const fn (m: *anyopaque, ids: Span(u32), media_rows: Array, out: *u64) callconv(.c) Verdict,
     /// Activates `slot`; zero `restored_at` resets it, otherwise verifies its position. Arms that slot's capture
     /// at `prompt.len - 1` only when `capture` is true; media rows are borrowed for this call.
-    begin_prompt: ?*const fn (m: *anyopaque, slot: u32, prompt: Span(u32), media_rows: Array, restored_at: u64, capture: bool) callconv(.c) Verdict = null,
+    begin_prompt: *const fn (m: *anyopaque, slot: u32, prompt: Span(u32), media_rows: Array, restored_at: u64, capture: bool) callconv(.c) Verdict,
 };
 
 pub const CacheHooks = extern struct {
@@ -770,6 +770,15 @@ test "abi plugin: every struct opens with its size, set by default" {
     }
     inline for (.{ LoadCtx, Forward, Offload, CacheOps, AuxHooks, HeadHooks, NativeDrafter, MediaHooks, DistHooks, ModelTable }) |T|
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
+}
+
+test "abi plugin: auxiliary callbacks are required function pointers" {
+    const info = @typeInfo(AuxHooks).@"struct";
+    inline for (info.field_names, info.field_types, info.field_attrs) |name, T, attrs| {
+        if (comptime std.mem.eql(u8, name, "size")) continue;
+        try testing.expect(@typeInfo(T) == .pointer);
+        try testing.expect(attrs.defaultValue(T) == null);
+    }
 }
 
 test "abi plugin: unset generation defaults read as unset" {

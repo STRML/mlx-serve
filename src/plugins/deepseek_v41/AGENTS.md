@@ -69,8 +69,6 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 
 ## Known issues
 - Auxiliary snapshots are RAM-only; serialization and shortened slices return named unsupported verdicts.
-- Excluded configurations keep the last released active state for legacy resume; a finished parked slot is freed,
-  so overlapping paired requests can lose that slot's resume opportunity.
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Prefill compute-bound at ~16 TFLOPS; the MoE at 2048 rows streams each layer's expert bank 4x per 8192 chunk
   (M about 32 per expert): the single biggest inefficiency.

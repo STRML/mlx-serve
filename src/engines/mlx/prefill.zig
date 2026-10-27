@@ -80,9 +80,10 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const observe = sch.metrics != null;
     if (observe) {
         _ = sch.requests_prefilling.fetchAdd(1, .monotonic);
+        const module_bytes = @import("cache/budget.zig").moduleStateBytes(sch);
         sch.queue_mu.lockUncancelable(sch.io);
         defer sch.queue_mu.unlock(sch.io);
-        publishLiveKvResidency(sch, slot);
+        publishLiveKvResidency(sch, slot, module_bytes);
     }
     defer if (observe) {
         _ = sch.requests_prefilling.fetchSub(1, .monotonic);

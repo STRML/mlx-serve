@@ -28,19 +28,27 @@ test "deepseek_v41 plugin: excluded configuration keeps the legacy resume and co
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), @embedFile("fixtures/proof-resume.tape"));
-    defer t.close();
-    const model: *v41.Model = @ptrCast(@alignCast(t.m));
-    model.cfg.dsv41_streamed = true;
     const first = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
     const second = first ++ [_]u32{ 11, 2, 90 };
-    for ([_][]const u32{ &first, &second }) |prompt| {
-        const n: u32 = @intCast(v41.resumePrompt(t.m, 7, .of(prompt), .{}));
-        try t.check(mlx.mlx_array_new_data(&n, &[_]c_int{1}, 1, .uint32));
-        try t.check(try t.plugin(.{ .mode = .prefill, .ids = prompt[n..] }, n));
-        v41.table.release_slot.?(t.m, 7);
+    for ([_]bool{ false, true }) |release_parked| {
+        const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), @embedFile("fixtures/proof-resume.tape"));
+        defer t.close();
+        const model: *v41.Model = @ptrCast(@alignCast(t.m));
+        model.cfg.dsv41_streamed = true;
+        for ([_][]const u32{ &first, &second }, 0..) |prompt, turn| {
+            const n: u32 = @intCast(v41.resumePrompt(t.m, 7, .of(prompt), .{}));
+            if (turn == 1) try testing.expect(n > 0);
+            try t.check(mlx.mlx_array_new_data(&n, &[_]c_int{1}, 1, .uint32));
+            try t.check(try t.plugin(.{ .mode = .prefill, .ids = prompt[n..] }, n));
+            if (turn == 0 and release_parked)
+                testing.allocator.free(try slotForward(t, .prefill, &.{8}, &.{ 4, 12, 6 }, &.{0}));
+            v41.table.release_slot.?(t.m, 7);
+            if (turn == 0 and !release_parked)
+                testing.allocator.free(try slotForward(t, .prefill, &.{8}, &.{ 4, 12, 6 }, &.{0}));
+        }
+        try t.tape.expectDone();
+        testing.allocator.free(try slotForward(t, .decode, &.{8}, &.{13}, &.{3}));
     }
-    try t.tape.expectDone();
 }
 
 test "deepseek_v41 plugin: a decode token on the device equals the legacy decode" {
@@ -153,9 +161,9 @@ test "deepseek_v41 aux: overlapping captures survive either release order and re
         const t = try Twin.open(files, "");
         defer t.close();
         const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
-        try testing.expect(aux.enabled.?(t.m));
+        try testing.expect(aux.enabled(t.m));
         for (prompts, 1..) |p, slot| {
-            try testing.expect(aux.begin_prompt.?(t.m, @intCast(slot), .of(p), .{}, 0, true).isOk());
+            try testing.expect(aux.begin_prompt(t.m, @intCast(slot), .of(p), .{}, 0, true).isOk());
             testing.allocator.free(try slotForward(t, .prefill, &.{@intCast(slot)}, p[0..2], &.{0}));
         }
         for (prompts, 1..) |p, slot| testing.allocator.free(try slotForward(t, .prefill, &.{@intCast(slot)}, p[2..], &.{2}));
@@ -174,7 +182,7 @@ test "deepseek_v41 aux: overlapping captures survive either release order and re
         try testing.expectEqual(@as(u64, 0), v41.stateBytes(t.m));
         for (snaps, prompts) |sn, p| {
             var info: abi.AuxSnapshotInfo = .{};
-            try testing.expect(aux.describe.?(t.m, sn, &info).isOk());
+            try testing.expect(aux.describe(t.m, sn, &info).isOk());
             try testing.expectEqual(p.len - 1, info.n);
             try testing.expectEqualSlices(u32, p[0 .. p.len - 1], info.ids.slice());
             try testing.expect(aux.bytes(t.m, sn) > 0);
@@ -190,8 +198,8 @@ test "deepseek_v41 aux: overlapping captures survive either release order and re
             for ([_]u32{ 3, 4 }, 0..) |slot, k| {
                 try testing.expect(aux.restore_at(t.m, slot, if (k == 0) sn else clone, info.n).isOk());
                 try testing.expectEqual(abi.Verdict.Code.unsupported, aux.restore_at(t.m, slot, sn, info.n + 1).code);
-                try testing.expectEqual(abi.Verdict.Code.failed, aux.begin_prompt.?(t.m, slot, .of(p), .{}, info.n - 1, false).code);
-                try testing.expect(aux.begin_prompt.?(t.m, slot, .of(p), .{}, info.n, false).isOk());
+                try testing.expectEqual(abi.Verdict.Code.failed, aux.begin_prompt(t.m, slot, .of(p), .{}, info.n - 1, false).code);
+                try testing.expect(aux.begin_prompt(t.m, slot, .of(p), .{}, info.n, false).isOk());
                 warm[k] = try slotForward(t, .prefill, &.{slot}, p[info.n..], &.{@intCast(info.n)});
             }
             defer for (warm) |row| testing.allocator.free(row);
@@ -200,7 +208,7 @@ test "deepseek_v41 aux: overlapping captures survive either release order and re
             try testing.expect(aux.handoff(t.m, 3, 5).isOk());
             v41.table.release_slot.?(t.m, 3);
             v41.table.release_slot.?(t.m, 5);
-            try testing.expect(aux.begin_prompt.?(t.m, 4, .of(p), .{}, 0, false).isOk());
+            try testing.expect(aux.begin_prompt(t.m, 4, .of(p), .{}, 0, false).isOk());
             try testing.expect(aux.commit(t.m, 4, 0).isOk());
             testing.allocator.free(try slotForward(t, .prefill, &.{4}, p[0..2], &.{0}));
             testing.allocator.free(try slotForward(t, .prefill, &.{4}, p[2 .. p.len - 1], &.{2}));
@@ -231,7 +239,7 @@ test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint,
     defer t.close();
     const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
     for ([_][]const u32{ &.{}, &.{3}, &.{ 3, 4, 5 } }) |p| {
-        try testing.expect(aux.begin_prompt.?(t.m, 1, .of(p), .{}, 0, p.len < 2).isOk());
+        try testing.expect(aux.begin_prompt(t.m, 1, .of(p), .{}, 0, p.len < 2).isOk());
         try testing.expect(aux.reserve(t.m, 1, p.len).isOk());
         if (p.len > 0) testing.allocator.free(try slotForward(t, .prefill, &.{1}, p, &.{0}));
         try testing.expect(aux.commit(t.m, 1, p.len).isOk());
@@ -267,20 +275,20 @@ test "deepseek_v41 aux: candidate image key ignores later rows and eligibility e
     const b = mlx.mlx_array_new_data(&[_]f32{ 1, 2, 9, 8 }, &[_]c_int{ 2, 2 }, 2, .float32);
     defer _ = mlx.mlx_array_free(b);
     var key: [4]u64 = undefined;
-    try testing.expect(aux.prefix_key.?(t.m, .of(&.{ 3, 17, 4 }), .{ .ctx = a.ctx }, &key[0]).isOk());
-    try testing.expect(aux.prefix_key.?(t.m, .of(&.{ 3, 17, 4 }), .{ .ctx = b.ctx }, &key[1]).isOk());
-    try testing.expect(aux.prefix_key.?(t.m, .of(&.{ 3, 17, 4, 17 }), .{ .ctx = a.ctx }, &key[2]).isOk());
-    try testing.expect(aux.prefix_key.?(t.m, .of(&.{ 3, 17, 4, 17 }), .{ .ctx = b.ctx }, &key[3]).isOk());
+    try testing.expect(aux.prefix_key(t.m, .of(&.{ 3, 17, 4 }), .{ .ctx = a.ctx }, &key[0]).isOk());
+    try testing.expect(aux.prefix_key(t.m, .of(&.{ 3, 17, 4 }), .{ .ctx = b.ctx }, &key[1]).isOk());
+    try testing.expect(aux.prefix_key(t.m, .of(&.{ 3, 17, 4, 17 }), .{ .ctx = a.ctx }, &key[2]).isOk());
+    try testing.expect(aux.prefix_key(t.m, .of(&.{ 3, 17, 4, 17 }), .{ .ctx = b.ctx }, &key[3]).isOk());
     try testing.expectEqual(key[0], key[1]);
     try testing.expect(key[2] != key[3]);
-    try testing.expect(aux.prefix_key.?(t.m, .of(&.{ 3, 17, 4 }), .{}, &key[1]).isOk());
+    try testing.expect(aux.prefix_key(t.m, .of(&.{ 3, 17, 4 }), .{}, &key[1]).isOk());
     try testing.expect(key[0] != key[1]);
-    try testing.expect(aux.enabled.?(t.m));
+    try testing.expect(aux.enabled(t.m));
     m.cfg.dsv41_streamed = true;
-    try testing.expect(!aux.enabled.?(t.m));
-    try testing.expectEqual(abi.Verdict.Code.unsupported, aux.begin_prompt.?(t.m, 1, .of(&.{ 3, 4 }), .{}, 0, true).code);
+    try testing.expect(!aux.enabled(t.m));
+    try testing.expectEqual(abi.Verdict.Code.unsupported, aux.begin_prompt(t.m, 1, .of(&.{ 3, 4 }), .{}, 0, true).code);
     m.cfg.dsv41_streamed = false;
     m.mdl.pair = .{ .lo = 2, .hi = 4, .worker = false };
     defer m.mdl.pair = null;
-    try testing.expect(!aux.enabled.?(t.m));
+    try testing.expect(!aux.enabled(t.m));
 }

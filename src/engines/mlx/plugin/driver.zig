@@ -567,8 +567,7 @@ pub fn auxBinding(xfm: *const Transformer) ?AuxBinding {
 
 pub fn auxEnabled(xfm: *const Transformer) bool {
     const b = auxBinding(xfm) orelse return false;
-    const f = b.hooks.enabled orelse return false;
-    return f(b.model);
+    return b.hooks.enabled(b.model);
 }
 
 /// Transfers a completed capture to the caller; absence or failure leaves no usable checkpoint.
@@ -582,21 +581,18 @@ pub fn auxSnapshot(xfm: *const Transformer, slot: u32) abi.Handle {
 
 pub fn auxDescribe(xfm: *const Transformer, snap: abi.Handle, out: *abi.AuxSnapshotInfo) abi.Verdict {
     const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
-    const f = b.hooks.describe orelse return abi.Verdict.refuse(.unsupported, "model auxiliary describe is unavailable");
     if (snap == null) return abi.Verdict.refuse(.unsupported, "no auxiliary snapshot to describe");
-    return f(b.model, snap, out);
+    return b.hooks.describe(b.model, snap, out);
 }
 
 pub fn auxPrefixKey(xfm: *const Transformer, ids: []const u32, media: ?Array, out: *u64) abi.Verdict {
     const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
-    const f = b.hooks.prefix_key orelse return abi.Verdict.refuse(.unsupported, "model auxiliary prefix_key is unavailable");
-    return f(b.model, .of(ids), .{ .ctx = if (media) |m| m.ctx else null }, out);
+    return b.hooks.prefix_key(b.model, .of(ids), .{ .ctx = if (media) |m| m.ctx else null }, out);
 }
 
 pub fn auxBeginPrompt(xfm: *const Transformer, slot: u32, prompt: []const u32, media: ?Array, restored_at: u64, capture: bool) abi.Verdict {
     const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
-    const f = b.hooks.begin_prompt orelse return abi.Verdict.refuse(.unsupported, "model auxiliary begin_prompt is unavailable");
-    return f(b.model, slot, .of(prompt), .{ .ctx = if (media) |m| m.ctx else null }, restored_at, capture);
+    return b.hooks.begin_prompt(b.model, slot, .of(prompt), .{ .ctx = if (media) |m| m.ctx else null }, restored_at, capture);
 }
 
 /// Exact-position restore borrows the snapshot; success and failure both leave it for the caller to free.
@@ -1015,11 +1011,10 @@ test "plugin aux: absent and short tables refuse without calling hooks" {
     }
 }
 
-test "plugin aux: optional hooks default to unsupported and eligibility is per instance" {
+test "plugin aux: eligibility is per instance" {
     const t = std.testing;
     var fake: AuxFake = .{ .on = false };
-    var hooks = AuxFake.hooks;
-    const cache: abi.CacheHooks = .{ .aux = &hooks };
+    const cache: abi.CacheHooks = .{ .aux = &AuxFake.hooks };
     const table = AuxFake.table(&cache);
     var bound: Bound = .{ .table = &table, .model = &fake };
     var x: Transformer = undefined;
@@ -1027,19 +1022,6 @@ test "plugin aux: optional hooks default to unsupported and eligibility is per i
     try t.expect(!auxEnabled(&x));
     fake.on = true;
     try t.expect(auxEnabled(&x));
-    hooks.enabled = null;
-    hooks.describe = null;
-    hooks.prefix_key = null;
-    hooks.begin_prompt = null;
-    fake.calls = 0;
-    var info: abi.AuxSnapshotInfo = .{};
-    var key: u64 = 0;
-    try t.expect(!auxEnabled(&x));
-    try t.expectEqual(abi.Verdict.Code.unsupported, auxDescribe(&x, &fake, &info).code);
-    try t.expectEqual(abi.Verdict.Code.unsupported, auxPrefixKey(&x, &fake.ids, null, &key).code);
-    try t.expectEqual(abi.Verdict.Code.unsupported, auxBeginPrompt(&x, 7, &.{}, null, 0, false).code);
-    try t.expectEqual(abi.Verdict.Code.unsupported, auxRestoreAt(&x, 7, &fake, 3).code);
-    try t.expectEqual(@as(usize, 0), fake.calls);
 }
 
 test "plugin aux: a missing or failed capture returns no snapshot" {

@@ -84,9 +84,10 @@ pub const Model = struct {
     bank: ?Bank = null,
     bank_context: u64 = 0,
     /// The slot whose state is `mdl.dec_state` (0: none claimed it yet, a resumed state or the module's own); every
-    /// other live slot's waits in `parked`. Excluded configurations keep an unclaimed state for legacy resume.
+    /// other live slot's waits in `parked`. Excluded configurations keep the last finished state in `idle`.
     owner: u32 = 0,
     parked: std.AutoHashMapUnmanaged(u32, Kept) = .empty,
+    idle: ?Kept = null,
 };
 
 /// A state off the module, with its identity (`Dsv41Model.state_gen`).
@@ -99,11 +100,11 @@ const Kept = struct {
     }
 };
 
-/// Parks a live slot; an unclaimed state belongs only to the excluded configuration's legacy resume.
+/// Parks a live slot; excluded configurations retain an unclaimed state for legacy resume.
 fn park(m: *Model) !void {
     const st = m.mdl.dec_state orelse return;
     const k: Kept = .{ .st = st, .gen = m.mdl.state_gen };
-    if (m.owner != 0) try m.parked.put(gpa, m.owner, k) else {
+    if (m.owner != 0) try m.parked.put(gpa, m.owner, k) else if (!auxEnabled(m)) keepIdle(m, k) else {
         var orphan = k;
         orphan.deinit();
     }
@@ -111,11 +112,19 @@ fn park(m: *Model) !void {
     m.owner = 0;
 }
 
+fn keepIdle(m: *Model, k: Kept) void {
+    if (m.idle) |*old| old.deinit();
+    m.idle = k;
+}
+
 /// Makes `slot`'s state the module's. A slot new here claims an unclaimed state (the prompt `resumePrompt` just
-/// readied), else starts with none: its prompt at position 0 builds one. Slot 0 parks any other live slot first.
+/// readied), else starts with none: its prompt at position 0 builds one. Slot 0 parks a live state only for aux.
 fn activate(m: *Model, slot: u32) !void {
     if (slot == m.owner) return;
-    if (slot == 0) return park(m);
+    if (slot == 0) {
+        if (auxEnabled(m)) try park(m);
+        return;
+    }
     const mine = m.parked.fetchRemove(slot);
     if (mine == null and m.owner == 0) {
         m.owner = slot;
@@ -134,12 +143,17 @@ fn activate(m: *Model, slot: u32) !void {
 
 fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
+    if (!auxEnabled(mp)) {
+        if (slot == m.owner) {
+            m.owner = 0;
+            park(m) catch unreachable; // An unclaimed state never allocates a parked entry.
+        } else if (m.parked.fetchRemove(slot)) |kv| keepIdle(m, kv.value);
+        return;
+    }
     if (slot == m.owner) {
         m.owner = 0;
-        if (auxEnabled(mp)) {
-            if (m.mdl.dec_state) |*st| st.deinit();
-            m.mdl.dec_state = null;
-        }
+        if (m.mdl.dec_state) |*st| st.deinit();
+        m.mdl.dec_state = null;
     } else if (m.parked.fetchRemove(slot)) |kv| {
         var k = kv.value;
         k.deinit();
@@ -232,6 +246,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.bank = null;
     m.owner = 0;
     m.parked = .empty;
+    m.idle = null;
     if (c.dsv41_streamed) {
         const dir = ctx.model_dir.slice();
         if (c.dsv41_exl3_bank) try openBank(m, io, dir, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
@@ -306,6 +321,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     var it = m.parked.valueIterator();
     while (it.next()) |k| k.deinit();
     m.parked.deinit(gpa);
+    if (m.idle) |*k| k.deinit();
     m.mdl.deinit();
     m.weights.deinit();
     gpa.destroy(m);
@@ -448,6 +464,11 @@ pub fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows
     if (auxEnabled(mp)) return 0;
     // A parking failure leaves the other live slot untouched.
     activate(m, slot) catch return 0;
+    if (m.mdl.dec_state == null) if (m.idle) |k| {
+        m.mdl.dec_state = k.st;
+        m.mdl.state_gen = k.gen;
+        m.idle = null;
+    };
     return dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch blk: {
         // The forward at position 0 establishes the cold state even if this reset fails.
         dsv41.reset(m.mdl, gpa) catch {};
@@ -461,6 +482,7 @@ pub fn stateBytes(mp: *anyopaque) callconv(.c) u64 {
     var bytes: u64 = if (m.mdl.dec_state) |*st| dsv41.stateBytes(st) else 0;
     var it = m.parked.valueIterator();
     while (it.next()) |k| bytes += dsv41.stateBytes(&k.st);
+    if (m.idle) |*k| bytes += dsv41.stateBytes(&k.st);
     return bytes;
 }
 
