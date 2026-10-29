@@ -764,6 +764,12 @@ pub fn initWithOptions(
     errdefer if (dflash_active) {
         for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
     };
+    // A whole-prompt prefill chunks inside this one forward, so the model reports its own progress.
+    if (final_start == 0 and tail_len > 1) {
+        if (options.prefill_expected) |e| e.store(@intCast(tail_len), .monotonic);
+        ctx.prefill_progress = options.prefill_progress;
+    }
+    defer ctx.prefill_progress = null;
     const raw_logits = if (tail_mtp_capture) blk: {
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);

@@ -448,6 +448,9 @@ pub const Forward = extern struct {
     /// Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`);
     /// empty = embed the ids.
     embeds: Array = .{},
+    /// A prompt forward's live progress: a model that chunks the prompt itself (`Caps.whole_prompt_prefill`) stores
+    /// the rows it has forwarded so far here (`@atomicStore`, monotonic) after each chunk; null = nobody is watching.
+    progress: ?*u64 = null,
 };
 
 /// The engine's calls a forward makes at a layer's projections: each returns true with new references in its outputs

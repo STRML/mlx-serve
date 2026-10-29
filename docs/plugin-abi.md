@@ -530,6 +530,7 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `accept_cap` | `u32` | `0` | A native drafter's round (`NativeDrafter.step`): the most drafts it may keep, the tokens still allowed less one. |
 | `suppress_mask` | `Array` | `.{}` | The sampler's suppress mask `[vocab]` (true = never drawn), which a round's greedy accept applies; empty = none. |
 | `embeds` | `Array` | `.{}` | Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`); empty = embed the ids. |
+| `progress` | `?*u64` | `null` | A prompt forward's live progress: a model that chunks the prompt itself (`Caps.whole_prompt_prefill`) stores the rows it has forwarded so far here (`@atomicStore`, monotonic) after each chunk; null = nobody is watching. |
 
 ### `Offload` (extern struct)
 
