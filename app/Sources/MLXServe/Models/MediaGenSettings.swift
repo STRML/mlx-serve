@@ -625,6 +625,13 @@ struct Model3DGenSettings: Codable, Equatable {
     var decimationTarget: Int = 300_000
     var textureSize: Int = 2048
     var finish: Model3DFinish = .model
+    /// Idol: sampler steps, guidance, Gaussians generated, the kind of picture.
+    var splatSteps: Int = 50
+    var splatGuidance: Double = 3.0
+    var splatGaussians: Int = 262_144
+    var splatPhoto: Model3DPhotoKind = .render
+    /// The Gaussian counts the pane offers; a stored value that is none of them snaps to the nearest.
+    static let gaussianOptions = [65_536, 131_072, 262_144, 524_288, 1_048_576]
     /// The face counts the pane offers; a stored value that is none of them snaps to the nearest.
     static let faceOptions = [100_000, 300_000, 600_000, 1_000_000, 2_000_000]
     /// The draft: the pane unmounts on navigation, so the photo and the
@@ -674,6 +681,12 @@ extension Model3DGenSettings {
         }
         if let v = try c.decodeIfPresent(Int.self, forKey: .textureSize) { textureSize = v }
         if let v = try c.decodeIfPresent(Model3DFinish.self, forKey: .finish) { finish = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .splatSteps) { splatSteps = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .splatGuidance) { splatGuidance = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .splatGaussians) {
+            splatGaussians = Self.gaussianOptions.min { abs($0 - v) < abs($1 - v) } ?? v
+        }
+        if let v = try c.decodeIfPresent(Model3DPhotoKind.self, forKey: .splatPhoto) { splatPhoto = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .photoPath) { photoPath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
     }

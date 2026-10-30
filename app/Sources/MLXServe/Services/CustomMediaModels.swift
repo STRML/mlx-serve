@@ -82,6 +82,7 @@ enum CustomMediaModels {
         switch arch {
         case "trellis2": return .trellis2Family
         case "pixal3d": return .pixal3dFamily
+        case "idol": return .idolFamily
         default: return nil
         }
     }

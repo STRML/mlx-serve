@@ -445,6 +445,27 @@ extension MediaBundle {
         ])
     }
 
+    /// Idol: the three transformers, BiRefNet, and the two image encoders (DINOv3 and the FLUX.2 VAE) it reads, all
+    /// under the paths the server loads them from (`tests/convert_idol_weights.py` writes this layout).
+    static func idol(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        let files = [
+            "denoiser.safetensors", "decoder.safetensors", "decoder_gs.safetensors", "birefnet.safetensors",
+            "dinov3/model.safetensors", "vae/model.safetensors",
+        ]
+        return MediaBundle(
+            id: "idol:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, keepSafetensors: Set(files.map { ($0 as NSString).lastPathComponent })),
+                    readyMarkers: ["config.json", "dinov3/config.json"] + files
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     private static func cascade3D(kind: String, repo: String, displayName: String, sizeGB: Double, files: [String]) -> MediaBundle {
         MediaBundle(
             id: "\(kind):\(repo)",
@@ -687,6 +708,7 @@ extension Model3DModelPreset {
         case .hunyuan3d: return .model3d(repo: repo, displayName: name, sizeGB: approxDownloadGB)
         case .trellis2: return .trellis2(repo: repo, displayName: name, sizeGB: approxDownloadGB)
         case .pixal3d: return .pixal3d(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        case .idol: return .idol(repo: repo, displayName: name, sizeGB: approxDownloadGB)
         }
     }
 }

@@ -33,6 +33,8 @@ pub const Cfg = struct {
     registers: usize,
     rope_theta: f32,
     eps: f32,
+    /// SwiGLU feed-forward (`gate_proj`, `up_proj`, `down_proj`) instead of GELU (ViT-H+).
+    gated: bool = false,
 };
 
 const Layer = struct {
@@ -46,6 +48,7 @@ const Layer = struct {
     norm2_w: A,
     norm2_b: A,
     up: Linear,
+    gate: ?Linear,
     down: Linear,
     ls2: A,
 };
@@ -61,6 +64,9 @@ pub const Encoder = struct {
     patch_b: A,
     layers: []Layer,
     owned: std.ArrayList(A) = .empty,
+    /// The checkpoint's own final LayerNorm, applied before the non-affine one when set: what `last_hidden_state`
+    /// is in transformers (Idol reads it so; TRELLIS.2 reads the block output).
+    affine_final: bool = false,
 
     /// `<dir>/config.json` + `<dir>/model.safetensors`.
     pub fn open(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) !Encoder {
@@ -82,7 +88,6 @@ pub const Encoder = struct {
         var parsed = try std.json.parseFromSlice(Raw, gpa, bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const r = parsed.value;
-        if (r.use_gated_mlp) return error.UnsupportedDinov3;
         if (r.hidden_size % r.num_attention_heads != 0 or (r.hidden_size / r.num_attention_heads) % 4 != 0) return error.UnsupportedDinov3;
         const w = try loadWeightsFile(gpa, dir, "model.safetensors");
         return load(gpa, w, .{
@@ -94,6 +99,7 @@ pub const Encoder = struct {
             .registers = r.num_register_tokens,
             .rope_theta = r.rope_theta,
             .eps = r.layer_norm_eps,
+            .gated = r.use_gated_mlp,
         });
     }
 
@@ -132,6 +138,7 @@ pub const Encoder = struct {
                     .norm2_w = try scope_mod.getW(&e.w, pre ++ ".norm2.weight", .{i}),
                     .norm2_b = try scope_mod.getW(&e.w, pre ++ ".norm2.bias", .{i}),
                     .up = try scope_mod.linear(&e.w, pre ++ ".mlp.up_proj", .{i}, hid),
+                    .gate = if (cfg.gated) try scope_mod.linear(&e.w, pre ++ ".mlp.gate_proj", .{i}, hid) else null,
                     .down = try scope_mod.linear(&e.w, pre ++ ".mlp.down_proj", .{i}, @intCast(cfg.mlp)),
                     .ls2 = try scope_mod.getW(&e.w, pre ++ ".layer_scale2.lambda1", .{i}),
                 };
@@ -220,8 +227,15 @@ pub const Encoder = struct {
             const att = try sc.reshape(try sc.transpose(try sc.sdpa(q, k, v, scale), &perm), &.{ 1, l, hid });
             h = try sc.add(h, try sc.mul(try ly.o.forward(sc, att), try asLike(sc, ly.ls1, h)));
             const y = try sc.layerNorm(h, try asLike(sc, ly.norm2_w, h), try asLike(sc, ly.norm2_b, h), self.cfg.eps);
-            const m = try ly.down.forward(sc, try sc.geluErf(try ly.up.forward(sc, y)));
+            const up = try ly.up.forward(sc, y);
+            const act = if (ly.gate) |g| try sc.mul(try sc.silu(try g.forward(sc, y)), up) else try sc.geluErf(up);
+            const m = try ly.down.forward(sc, act);
             h = try sc.add(h, try sc.mul(m, try asLike(sc, ly.ls2, h)));
+        }
+        if (self.affine_final) {
+            const w = try scope_mod.getW(&self.w, "norm.weight", .{});
+            const b = try scope_mod.getW(&self.w, "norm.bias", .{});
+            h = try sc.layerNorm(h, try asLike(sc, w, h), try asLike(sc, b, h), self.cfg.eps);
         }
         return sc.layerNorm(h, NONE, NONE, FINAL_LN_EPS);
     }

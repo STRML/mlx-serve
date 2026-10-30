@@ -79,6 +79,14 @@ final class CustomMediaModelsTests: XCTestCase {
         XCTAssertFalse(b?.components[0].readyMarkers.contains("dit.safetensors") ?? true)
     }
 
+    func testAnIdolPackOnDiskJoinsThe3DPaneAsItsOwnFamily() {
+        let models = [info("me/idol-local", arch: "idol", caps: ["3d"])]
+        XCTAssertEqual(CustomMediaModels.meshPresets(from: models).first?.family, .idol)
+        let markers = CustomMediaModels.bundle(arch: "idol", repoId: "me/idol-local")?.components[0].readyMarkers
+        XCTAssertEqual(markers?.contains("vae/model.safetensors"), true)
+        XCTAssertEqual(markers?.contains("birefnet.safetensors"), true)
+    }
+
     func testAPixal3DPackOnDiskJoinsThe3DPaneAsItsOwnFamily() {
         let models = [info("me/pixal3d-local", arch: "pixal3d", caps: ["3d"])]
         XCTAssertEqual(CustomMediaModels.meshPresets(from: models).first?.family, .pixal3d)

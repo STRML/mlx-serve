@@ -669,6 +669,20 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
     }
 
+    func testIdolIsAPublishedPackWhoseBundleNamesEveryFileTheServerLoads() {
+        let p = Model3DModelPreset.idol_8bit
+        XCTAssertEqual(p.repo, "ddalcu/Idol-MLX-Serve-8bit")
+        XCTAssertFalse(p.isLocalOnly)
+        XCTAssertEqual(p.family, .idol)
+        let comp = p.bundle.components[0]
+        for f in ["config.json", "denoiser.safetensors", "decoder.safetensors", "decoder_gs.safetensors",
+                  "birefnet.safetensors", "dinov3/config.json", "dinov3/model.safetensors", "vae/model.safetensors"] {
+            XCTAssertTrue(comp.readyMarkers.contains(f), f)
+        }
+        // Twin of the idol plugin's `required_file`: the FLUX.2 VAE lands last.
+        XCTAssertEqual(DownloadManager.requiredMediaMarker(modelType: "idol"), "vae/model.safetensors")
+    }
+
     func testThePublishedTrellisPacksAreCatalogEntriesThatFetchOnlyWhatTheyServe() {
         XCTAssertEqual(Model3DModelPreset.trellis2_8bit.repo, "ddalcu/TRELLIS.2-4B-MLX-Serve-8bit")
         XCTAssertEqual(Model3DModelPreset.pixal3d_8bit.repo, "ddalcu/Pixal3D-MLX-Serve-8bit")

@@ -1547,29 +1547,50 @@ struct Model3DModelPreset: Identifiable, Hashable {
         id: "pixal3d-8bit", name: "Pixal3D (8-bit)", repo: "ddalcu/Pixal3D-MLX-Serve-8bit",
         approxRAMGB: 22, approxDownloadGB: 8.7, family: .pixal3d)
 
+    /// Idol, 8-bit: one photo to a 3D Gaussian splat, background cutout and both image encoders included. 3.0 GB,
+    /// ~3.6 GB resident at peak (a float16 pack, `ddalcu/Idol-MLX-Serve-fp16`, is the quality reference).
+    static let idol_8bit = Model3DModelPreset(
+        id: "idol-8bit", name: "Idol (8-bit)", repo: "ddalcu/Idol-MLX-Serve-8bit",
+        approxRAMGB: 6, approxDownloadGB: 3.0, family: .idol)
+
     /// Family templates for a pack on disk: it joins the picker through `CustomMediaModels`, synthesized from these.
     static let trellis2Family = Model3DModelPreset(
         id: "trellis2", name: "TRELLIS.2", repo: "", approxRAMGB: 22, approxDownloadGB: 0, family: .trellis2)
     static let pixal3dFamily = Model3DModelPreset(
         id: "pixal3d", name: "Pixal3D", repo: "", approxRAMGB: 22, approxDownloadGB: 0, family: .pixal3d)
+    static let idolFamily = Model3DModelPreset(
+        id: "idol", name: "Idol", repo: "", approxRAMGB: 6, approxDownloadGB: 0, family: .idol)
 
     /// Catalog. Order matters: the picker leads with the first of the largest that fits (`MediaModelPicks.featured`).
-    static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit, .trellis2_8bit, .pixal3d_8bit]
+    static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit, .trellis2_8bit, .pixal3d_8bit, .idol_8bit]
 }
 
 /// The 3D backends behind one endpoint. They share `image` and `seed` and nothing else.
 enum Model3DFamily: Hashable {
-    case hunyuan3d, trellis2, pixal3d
+    case hunyuan3d, trellis2, pixal3d, idol
 
-    /// Hunyuan3D textures in a separate paint pass; TRELLIS.2 and Pixal3D always texture.
+    /// Hunyuan3D textures in a separate paint pass; TRELLIS.2 and Pixal3D always texture (Idol makes splats).
     var hasPaintStage: Bool { self == .hunyuan3d }
 
     /// TRELLIS.2 and Pixal3D read the cutout's alpha as the subject (a white background would become part of
     /// the object); Hunyuan3D composites on white itself.
-    var cutoutKeepsAlpha: Bool { self != .hunyuan3d }
+    var cutoutKeepsAlpha: Bool { self == .trellis2 || self == .pixal3d }
+
+    /// Idol cuts the subject out itself (BiRefNet), so it gets the photo as it is.
+    var sendsRawPhoto: Bool { self == .idol }
 
     /// TRELLIS.2 and Pixal3D share one cascade and its request fields: resolution, faces, texture size, finish.
-    var hasCascadeControls: Bool { self != .hunyuan3d }
+    var hasCascadeControls: Bool { self == .trellis2 || self == .pixal3d }
+}
+
+/// What kind of picture Idol is given: the crop it leaves around the subject (the server's `mode`).
+enum Model3DPhotoKind: String, CaseIterable, Codable {
+    case render, photo
+
+    var title: String { self == .render ? "Render" : "Photo" }
+
+    /// The server's `mode`: `synthetic` fills the frame, `real` leaves room around a photographed object.
+    var serverMode: String { self == .render ? "synthetic" : "real" }
 }
 
 /// How shiny a TRELLIS.2 or Pixal3D model looks. The model predicts one roughness per texel and its map is
@@ -2787,6 +2808,11 @@ struct Model3DGenRequest {
     var textureSize: Int = 2048
     /// TRELLIS.2 and Pixal3D: how shiny the model looks (`.model` sends nothing).
     var finish: Model3DFinish = .model
+    /// Idol only: sampler steps, guidance, Gaussians generated and the kind of picture.
+    var splatSteps: Int = 50
+    var splatGuidance: Double = 3.0
+    var splatGaussians: Int = 262_144
+    var splatPhoto: Model3DPhotoKind = .render
 }
 
 // MARK: - RAM checks

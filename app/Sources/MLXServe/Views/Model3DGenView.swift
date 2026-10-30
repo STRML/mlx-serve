@@ -30,6 +30,10 @@ struct Model3DGenView: View {
     @State private var turntable: Bool = true
     @State private var texture: Bool = false
     @State private var trellisResolution: Int = 1024
+    @State private var splatSteps: Int = 50
+    @State private var splatGuidance: Double = 3.0
+    @State private var splatGaussians: Int = 262_144
+    @State private var splatPhoto: Model3DPhotoKind = .render
     @State private var decimationTarget: Int = 300_000
     @State private var textureSize: Int = 2048
     @State private var finish: Model3DFinish = .model
@@ -179,7 +183,9 @@ struct Model3DGenView: View {
                               isTargeted: isDropTargeted) { choosePhoto() }
                 // The well says how to add a photo; what is left to say is
                 // which photo works.
-                Text(L10n.text(model.family.cutoutKeepsAlpha
+                Text(L10n.text(model.family.sendsRawPhoto
+                     ? "One object, any background: the model cuts the subject out itself. A cutout with a transparent background is used as is."
+                     : model.family.cutoutKeepsAlpha
                      ? "A single, well-lit photo of one object works best. A cutout with a transparent background is used as is; otherwise the subject is auto-cut."
                      : "A single, well-lit photo of one object works best. The subject is auto-cut from its background."))
                     .font(.app(.caption2)).foregroundStyle(.secondary)
@@ -200,6 +206,7 @@ struct Model3DGenView: View {
                 switch model.family {
                 case .hunyuan3d: hunyuanControls
                 case .trellis2, .pixal3d: cascadeControls
+                case .idol: splatControls
                 }
             }
         }
@@ -237,6 +244,19 @@ struct Model3DGenView: View {
         segmentedRow("Finish", selection: $finish,
                      options: Model3DFinish.allCases.map { ($0, L10n.text($0.title)) },
                      note: "The model decides what is shiny; a finish scales it. A glossier finish shows every bump in the surface.")
+    }
+
+    /// Idol draws a Gaussian splat in one published recipe: steps and guidance trade speed for detail and
+    /// fidelity to the photo, the count sets how many Gaussians the model places.
+    @ViewBuilder private var splatControls: some View {
+        segmentedRow("Picture", selection: $splatPhoto,
+                     options: Model3DPhotoKind.allCases.map { ($0, L10n.text($0.title)) },
+                     note: "A render or generated image fills the frame; a photo leaves room around the object.")
+        intSliderRow("Steps", value: $splatSteps, range: 10...100)
+        sliderRow("Guidance", value: $splatGuidance, range: 0...10, step: 0.5)
+        segmentedRow("Gaussians", selection: $splatGaussians,
+                     options: Model3DGenSettings.gaussianOptions.map { ($0, $0 >= 1_000_000 ? "1M" : "\($0 / 1024)k") },
+                     note: "More Gaussians keep finer detail and make a larger file (about 60 bytes each).")
     }
 
     private func segmentedRow<T: Hashable>(_ label: String, selection: Binding<T>, options: [(T, String)], note: String?) -> some View {
@@ -369,6 +389,10 @@ struct Model3DGenView: View {
                 Text(URL(fileURLWithPath: path).lastPathComponent)
                     .font(.app(.caption)).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
+                if model.family == .idol {
+                    Button { exportPLY(path) } label: { Image(systemName: "square.and.arrow.up") }
+                        .buttonStyle(.borderless).help("Save as .ply, the format splat viewers open")
+                }
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
                 } label: { Image(systemName: "folder") }
@@ -376,6 +400,17 @@ struct Model3DGenView: View {
             }
         }
         .padding(16)
+    }
+
+    /// Save the splat GLB at `path` as a standard `.ply` (read and converted only now, on the click).
+    private func exportPLY(_ path: String) {
+        guard let glb = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe),
+              let ply = SplatPLYExport.ply(fromGLB: glb) else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent + ".ply"
+        panel.allowedContentTypes = [.init(filenameExtension: "ply") ?? .data]
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
+        try? ply.write(to: url)
     }
 
     private var outputFolderLink: some View {
@@ -443,6 +478,10 @@ struct Model3DGenView: View {
         decimationTarget = s.decimationTarget
         textureSize = s.textureSize
         finish = s.finish
+        splatSteps = s.splatSteps
+        splatGuidance = s.splatGuidance
+        splatGaussians = s.splatGaussians
+        splatPhoto = s.splatPhoto
         showAdvanced = s.showAdvanced
         // A photo that has gone since is dropped, as the other panes do.
         photoURL = s.photoPath.flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
@@ -463,6 +502,10 @@ struct Model3DGenView: View {
         s.decimationTarget = decimationTarget
         s.textureSize = textureSize
         s.finish = finish
+        s.splatSteps = splatSteps
+        s.splatGuidance = splatGuidance
+        s.splatGaussians = splatGaussians
+        s.splatPhoto = splatPhoto
         s.photoPath = photoURL?.path
         s.showAdvanced = showAdvanced
         return s
@@ -486,7 +529,11 @@ struct Model3DGenView: View {
             trellisResolution: trellisResolution,
             decimationTarget: decimationTarget,
             textureSize: textureSize,
-            finish: finish
+            finish: finish,
+            splatSteps: splatSteps,
+            splatGuidance: splatGuidance,
+            splatGaussians: splatGaussians,
+            splatPhoto: splatPhoto
         )
         persist()
         let total = RAMChecker.totalGB
@@ -674,7 +721,15 @@ enum GLBMeshLoader {
         for mesh in meshes {
             guard let prims = mesh["primitives"] as? [[String: Any]] else { continue }
             for prim in prims {
-                // mode 4 (TRIANGLES) is the only mode the writer emits; default is 4.
+                // mode 0 (POINTS) is Idol's Gaussian splat (`KHR_gaussian_splatting`), drawn as a coloured
+                // point cloud; mode 4 (TRIANGLES, the default) is every mesh the writers emit.
+                if (prim["mode"] as? Int) == 0 {
+                    if let node = buildPoints(prim: prim, accessors: accessors, views: views, raw: raw, bin: bin) {
+                        scene.rootNode.addChildNode(node)
+                        built = true
+                    }
+                    continue
+                }
                 guard (prim["mode"] as? Int ?? 4) == 4,
                       let attrs = prim["attributes"] as? [String: Any],
                       let posIdx = attrs["POSITION"] as? Int,
@@ -710,6 +765,142 @@ enum GLBMeshLoader {
             }
         }
         return built ? scene : nil
+    }
+
+    /// A POINTS primitive as a node of screen-sized, vertex-coloured points. `COLOR_0` (normalized bytes or floats)
+    /// carries the splat's colour and opacity; points that are nearly transparent are left out, and the rest
+    /// drawn opaque.
+    static func buildPoints(prim: [String: Any], accessors: [[String: Any]], views: [[String: Any]],
+                            raw: UnsafeRawBufferPointer, bin: Range<Int>) -> SCNNode? {
+        guard let attrs = prim["attributes"] as? [String: Any],
+              let posIdx = attrs["POSITION"] as? Int,
+              let positions = readVec3(accessors, views, raw, bin, posIdx), !positions.isEmpty else { return nil }
+        let colors = (attrs["COLOR_0"] as? Int).flatMap { readColors(accessors, views, raw, bin, $0, count: positions.count) }
+        var kept: [SCNVector3] = []
+        var rgba: [Float] = []
+        kept.reserveCapacity(positions.count)
+        for (i, p) in positions.enumerated() {
+            if let c = colors {
+                if c[i * 4 + 3] < 0.04 { continue }
+                // SceneKit reads vertex colours as linear; the splat's are sRGB.
+                rgba.append(contentsOf: [powf(c[i * 4], 2.2), powf(c[i * 4 + 1], 2.2), powf(c[i * 4 + 2], 2.2), 1])
+            } else {
+                rgba.append(contentsOf: [0.8, 0.8, 0.8, 1])
+            }
+            kept.append(p)
+        }
+        guard !kept.isEmpty else { return nil }
+        // With the extension's rotation and scale, each Gaussian becomes an oriented disc in the plane of its two
+        // longest axes (opaque, depth-tested): a solid stand-in for the blended splat that fills like one.
+        if let ri = attrs["KHR_gaussian_splatting:ROTATION"] as? Int, let si = attrs["KHR_gaussian_splatting:SCALE"] as? Int,
+           let rot = readFloats(accessors, views, raw, bin, ri, comps: 4, count: positions.count),
+           let scl = readFloats(accessors, views, raw, bin, si, comps: 3, count: positions.count),
+           let node = buildDiscs(positions: positions, rot: rot, scale: scl, rgba: colors, keep: { i in (colors?[i * 4 + 3] ?? 1) >= 0.05 }) {
+            return node
+        }
+        var sources = [SCNGeometrySource(vertices: kept)]
+        let colorData = rgba.withUnsafeBytes { Data($0) }
+        sources.append(SCNGeometrySource(data: colorData, semantic: .color, vectorCount: kept.count,
+                                         usesFloatComponents: true, componentsPerVector: 4,
+                                         bytesPerComponent: MemoryLayout<Float>.size, dataOffset: 0,
+                                         dataStride: 4 * MemoryLayout<Float>.size))
+        let element = SCNGeometryElement(indices: Array(0..<Int32(kept.count)), primitiveType: .point)
+        element.pointSize = 0.006
+        element.minimumPointScreenSpaceRadius = 2.5
+        element.maximumPointScreenSpaceRadius = 7
+        let geometry = SCNGeometry(sources: sources, elements: [element])
+        let material = SCNMaterial()
+        material.lightingModel = .constant
+        material.diffuse.contents = NSColor.white
+        geometry.materials = [material]
+        return SCNNode(geometry: geometry)
+    }
+
+    /// One quad per kept Gaussian: centre +- `reach` standard deviations along its two longest axes.
+    private static func buildDiscs(positions: [SCNVector3], rot: [Float], scale: [Float], rgba: [Float]?,
+                                   keep: (Int) -> Bool) -> SCNNode? {
+        let reach: Float = 1.5
+        var verts: [SCNVector3] = []
+        var cols: [Float] = []
+        var idx: [Int32] = []
+        for i in 0..<positions.count where keep(i) {
+            let x = rot[i * 4], y = rot[i * 4 + 1], z = rot[i * 4 + 2], w = rot[i * 4 + 3]
+            let axes: [SIMD3<Float>] = [
+                SIMD3(1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w)),
+                SIMD3(2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w)),
+                SIMD3(2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)),
+            ]
+            let s = [scale[i * 3], scale[i * 3 + 1], scale[i * 3 + 2]]
+            let order = [0, 1, 2].sorted { s[$0] > s[$1] }
+            let cap: Float = 0.012   // the object spans about 1 unit: a larger Gaussian is blur the blend would soften
+            let a = axes[order[0]] * min(reach * s[order[0]], cap), b = axes[order[1]] * min(reach * s[order[1]], cap)
+            let c = SIMD3<Float>(Float(positions[i].x), Float(positions[i].y), Float(positions[i].z))
+            let base = Int32(verts.count)
+            for (sa, sb) in [(-1, -1), (1, -1), (-1, 1), (1, 1)] as [(Float, Float)] {
+                let p = c + a * sa + b * sb
+                verts.append(SCNVector3(CGFloat(p.x), CGFloat(p.y), CGFloat(p.z)))
+                if let col = rgba {
+                    cols += [powf(col[i * 4], 2.2), powf(col[i * 4 + 1], 2.2), powf(col[i * 4 + 2], 2.2), 1]
+                } else { cols += [0.8, 0.8, 0.8, 1] }
+            }
+            idx += [base, base + 1, base + 2, base + 1, base + 3, base + 2]
+        }
+        guard !verts.isEmpty else { return nil }
+        let colorData = cols.withUnsafeBytes { Data($0) }
+        let sources = [SCNGeometrySource(vertices: verts),
+                       SCNGeometrySource(data: colorData, semantic: .color, vectorCount: verts.count,
+                                         usesFloatComponents: true, componentsPerVector: 4,
+                                         bytesPerComponent: MemoryLayout<Float>.size, dataOffset: 0,
+                                         dataStride: 4 * MemoryLayout<Float>.size)]
+        let geometry = SCNGeometry(sources: sources, elements: [SCNGeometryElement(indices: idx, primitiveType: .triangles)])
+        let material = SCNMaterial()
+        material.lightingModel = .constant
+        material.isDoubleSided = true
+        material.diffuse.contents = NSColor.white
+        geometry.materials = [material]
+        return SCNNode(geometry: geometry)
+    }
+
+    /// Read a float VEC`comps` accessor as `count` x `comps` floats.
+    private static func readFloats(_ accessors: [[String: Any]], _ views: [[String: Any]], _ raw: UnsafeRawBufferPointer,
+                                   _ bin: Range<Int>, _ idx: Int, comps: Int, count: Int) -> [Float]? {
+        guard idx >= 0, idx < accessors.count else { return nil }
+        let a = accessors[idx]
+        guard a["componentType"] as? Int == 5126, a["count"] as? Int == count,
+              let v = a["bufferView"] as? Int, v >= 0, v < views.count else { return nil }
+        let start = bin.lowerBound + ((views[v]["byteOffset"] as? Int) ?? 0) + ((a["byteOffset"] as? Int) ?? 0)
+        guard start + count * comps * 4 <= bin.upperBound else { return nil }
+        return (0..<(count * comps)).map { raw.loadUnaligned(fromByteOffset: start + $0 * 4, as: Float.self) }
+    }
+
+    /// Read a VEC4 (or VEC3) `COLOR_0` accessor, unsigned-byte or unsigned-short normalized or float, as `count` x 4 floats.
+    private static func readColors(_ accessors: [[String: Any]], _ views: [[String: Any]],
+                                   _ raw: UnsafeRawBufferPointer, _ bin: Range<Int>, _ idx: Int, count: Int) -> [Float]? {
+        guard idx >= 0, idx < accessors.count else { return nil }
+        let acc = accessors[idx]
+        guard let type = acc["type"] as? String, type == "VEC4" || type == "VEC3",
+              let ct = acc["componentType"] as? Int, acc["count"] as? Int == count,
+              let vIdx = acc["bufferView"] as? Int, vIdx >= 0, vIdx < views.count else { return nil }
+        let comps = type == "VEC4" ? 4 : 3
+        let size = ct == 5126 ? 4 : (ct == 5123 ? 2 : 1)
+        guard ct == 5126 || ct == 5123 || ct == 5121 else { return nil }
+        let view = views[vIdx]
+        let start = bin.lowerBound + ((view["byteOffset"] as? Int) ?? 0) + ((acc["byteOffset"] as? Int) ?? 0)
+        let stride = (view["byteStride"] as? Int) ?? comps * size
+        var out = [Float](repeating: 1, count: count * 4)
+        for i in 0..<count {
+            let base = start + i * stride
+            guard base + comps * size <= bin.upperBound else { return nil }
+            for c in 0..<comps {
+                let at = base + c * size
+                switch ct {
+                case 5126: out[i * 4 + c] = raw.loadUnaligned(fromByteOffset: at, as: Float.self)
+                case 5123: out[i * 4 + c] = Float(raw.loadUnaligned(fromByteOffset: at, as: UInt16.self)) / 65535
+                default: out[i * 4 + c] = Float(raw.loadUnaligned(fromByteOffset: at, as: UInt8.self)) / 255
+                }
+            }
+        }
+        return out
     }
 
     /// Build an SCNMaterial from a glTF PBR material: embedded-PNG baseColor →
