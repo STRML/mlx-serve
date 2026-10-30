@@ -167,6 +167,13 @@ req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"response_for
 expect_status 400 "json_schema without a schema"
 req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":20,\"output_config\":{\"format\":{\"type\":\"json_schema\"}},\"messages\":[$U]}"
 expect_status 400 "messages: output_config json_schema without a schema"
+BADS='{"type":"object","properties":{"a":{"type":"strng"}},"required":["a"]}'
+req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"x\",\"schema\":$BADS}},\"max_tokens\":20}"
+expect_status 400 "json_schema the grammar cannot compile"
+req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":20,\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":$BADS}},\"messages\":[$U]}"
+expect_status 400 "messages: output_config schema the grammar cannot compile"
+req POST /v1/responses "{\"model\":\"m\",\"max_output_tokens\":20,\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"x\",\"schema\":$BADS}},\"input\":\"hi\"}"
+expect_status 400 "responses: text.format schema the grammar cannot compile"
 req POST /v1/responses '{"model":"m","max_output_tokens":20,"text":{"format":{"type":"json_schema","name":"x","schema":"nope"}},"input":"hi"}'
 expect_status 400 "responses: text.format json_schema with a non-object schema"
 req POST /v1/chat/completions '{"model":"m","messages":[{"role":"user","content":"Describe a cat."}],"response_format":{"type":"json_schema","json_schema":{"name":"x","strict":true,"schema":{"type":"object","properties":{"kind":{"type":"string","enum":["cat","dog"]},"legs":{"type":"integer"},"tags":{"type":"array","items":{"type":"string"}},"meta":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}},"required":["kind","legs","tags","meta"],"additionalProperties":false}}},"max_tokens":120,"temperature":0}'

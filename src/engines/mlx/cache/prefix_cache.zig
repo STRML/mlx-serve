@@ -25,6 +25,7 @@ const kv_quant = @import("kv_quant.zig");
 const kv_disk_cache = @import("ssd/disk_tier.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const log = @import("../../../sdk/util/log.zig");
+const crt = @import("../../../sdk/util/crt.zig");
 const restore_dump = @import("restore_dump.zig");
 const plugin_driver = @import("../plugin/driver.zig");
 const plugin_abi = @import("../../../abi/plugin.zig");
@@ -322,6 +323,8 @@ const Entry = struct {
     module: ?ModulePayload = null,
     /// Monotonic counter for LRU. Higher = more recent.
     last_used: u64,
+    /// `crt.monotonicMs()` of the last touch; the default never reads as idle.
+    touched_ms: i64 = std.math.maxInt(i64),
     /// Wave 1.A: full KV-quant config active when this entry was committed.
     /// A new request whose `KVQuantConfig` differs in any field cannot
     /// restore from this entry — the underlying buffer layout (dense bf16 vs
@@ -617,6 +620,8 @@ pub const EvictionReport = struct {
 pub const HotPrefixCache = struct {
     entries: std.ArrayList(Entry),
     max_entries: u32,
+    /// An entry untouched this long is evicted before the workload-fair rule applies.
+    stale_after_ms: i64 = 30 * 60 * 1000,
     /// Wave 1.B: total KV bytes the cache is allowed to keep resident across
     /// all entries. 0 disables the byte budget (count cap still applies).
     /// Enforced on `commit`: evict LRU entries (in addition to the count
@@ -1670,6 +1675,7 @@ pub const HotPrefixCache = struct {
         }
         const used_before_restore = e.last_used;
         e.last_used = self.bumpCounter();
+        e.touched_ms = crt.monotonicMs();
         // Identity of the entry this request runs on: evicting it frees nothing (shared buffers).
         self.last_restored_used = e.last_used;
         self.last_restored_shared = m.shared;
@@ -1943,6 +1949,7 @@ pub const HotPrefixCache = struct {
             .cache_key = cache_key,
             .id = self.bumpCounter(),
             .last_used = self.bumpCounter(),
+            .touched_ms = crt.monotonicMs(),
             .snapshot = .{ .entries = &.{}, .step = 0, .allocator = self.allocator, .config = quant_config },
             .module = .{ .binding = binding, .snapshot = snapshot, .n = ids.len, .prefix_key = prefix_key, .aux_bytes = aux_bytes },
             .kv_bytes = aux_bytes,
@@ -2536,6 +2543,7 @@ pub const HotPrefixCache = struct {
             e.checked_out_by = null;
             e.checkout_donated = false;
             e.last_used = self.bumpCounter();
+            e.touched_ms = crt.monotonicMs();
             e.disk_dirty = self.disk != null;
             self.current_kv_bytes += e.kv_bytes;
             // Inherited SSM checkpoints can make a replacement larger than
@@ -2589,6 +2597,7 @@ pub const HotPrefixCache = struct {
             .snapshot = new_snap,
             .id = self.bumpCounter(),
             .last_used = self.bumpCounter(),
+            .touched_ms = crt.monotonicMs(),
             .quant_config = quant_config,
             .kv_bytes = new_bytes,
             .ssm_checkpoints = eff_cps,
@@ -3728,11 +3737,24 @@ pub const HotPrefixCache = struct {
     /// Least-recently-used entry index, skipping the one whose `last_used` equals `protect`.
     /// Workload-fair: only entries of the `cache_key` holding the most eligible entries
     /// (`incoming_key` counts as one more) are candidates, so a sweep evicts its own
-    /// documents before another workload's conversation. One key = plain LRU.
+    /// documents before another workload's conversation. One key = plain LRU. An entry idle past
+    /// `stale_after_ms` goes first: a finished session's lone entry must not shield itself forever.
     fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
         var max_count: usize = 0;
+        if (self.stale_after_ms > 0) {
+            const now = crt.monotonicMs();
+            for (self.entries.items, 0..) |*e, i| {
+                if (e.checked_out_by != null) continue;
+                if (protect) |p| if (e.last_used == p) continue;
+                if (now - e.touched_ms > self.stale_after_ms and e.last_used < best_used) {
+                    best_used = e.last_used;
+                    best = i;
+                }
+            }
+            if (best != null) return best;
+        }
         for (self.entries.items, 0..) |*e, i| {
             // Held by a live slot that owns its buffers: evicting it frees nothing.
             if (e.checked_out_by != null) continue;
@@ -10552,6 +10574,35 @@ test "HotPrefixCache: eviction picks the LRU of the key holding the most entries
     // One workload = plain LRU: C goes first.
     for (cache.entries.items) |*e| e.cache_key = 0;
     try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, 0));
+}
+
+test "HotPrefixCache: an idle single-entry key is evicted before the live workload's own entries" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const live: u64 = 0xb;
+    const idle_for = cache.stale_after_ms + 1000;
+    const now = crt.monotonicMs();
+    // Six finished sessions with one entry each (key 1..6), then a live key with two.
+    const keys = [_]u64{ 1, 2, 3, 4, 5, 6, live, live };
+    for (keys, 1..) |k, used| {
+        try cache.entries.append(testing.allocator, .{
+            .tokens = try testing.allocator.dupe(u32, &[_]u32{ 1, @intCast(used) }),
+            .has_tools = false,
+            .cache_key = k,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = used,
+            .touched_ms = if (k == live) now else now - idle_for,
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = 0,
+            .ssm_checkpoints = null,
+            .ssm_bytes = 0,
+        });
+    }
+    // The live key's commit evicts the oldest idle session, not its own LRU entry.
+    try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, live));
+    // Idle entries gone: the workload-fair rule applies unchanged.
+    for (cache.entries.items[0..6]) |*e| e.touched_ms = now;
+    try testing.expectEqual(@as(?usize, 6), cache.lruIndexExcluding(null, live));
 }
 
 test "a restore names its entry, and a commit that extends it in place keeps the id" {

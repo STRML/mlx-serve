@@ -21,10 +21,10 @@
 
 | Model | 26.10.2 | 26.10.3 | 26.11.1 |
 |---|---|---|---|
-| Gemma 4 E4B 4b | 196 pld | 199 pld | · |
-| Gemma 4 26B-A4B 4b | 187 pld | 186 pld | · |
-| Qwen3.6 35B-A3B 4b (MTP) | 416 mtp | 424 mtp | · |
-| Qwen3.8 27B 4b (ddalcu) | 242 dflash | 242 dflash | · |
+| Gemma 4 E4B 4b | 196 pld | 199 pld | 196 pld |
+| Gemma 4 26B-A4B 4b | 187 pld | 186 pld | 186 pld |
+| Qwen3.6 35B-A3B 4b (MTP) | 416 mtp | 424 mtp | 414 mtp |
+| Qwen3.8 27B 4b (ddalcu) | 242 dflash | 242 dflash | 250 dflash |
 | Qwen3.8 27B iQ-MLX 3.8bpw | 134 mtp | 136 mtp | · |
 | Qwen3.8 Flash-Next mixed 4-8b | · | 129 mtp | · |
 | Qwen3.8 Flash-Next iQ-MLX 4.7bpw | 169 mtp | 175 mtp | 174 mtp |

@@ -339,8 +339,8 @@ engaged() {  # pattern expected_count leg
 }
 engaged "model id=$ID_A ready" 1 "chat A load"
 engaged "model id=$ID_B ready" 1 "chat B load"
-[ -n "$ID_IMG" ] && engaged '\[image\] -> [0-9]+ PNG bytes' $((N_IMG * SOAK_WAVES)) "image generations"
-[ -n "$ID_TTS" ] && engaged ' -> [0-9]+ WAV bytes' $((N_TTS * SOAK_WAVES)) "TTS generations"
+[ -n "$ID_IMG" ] && engaged '\[gen\] [a-z0-9_]+ -> [0-9]+ bytes|\[image\] -> [0-9]+ PNG bytes' $((N_IMG * SOAK_WAVES)) "image generations"
+[ -n "$ID_TTS" ] && engaged '\[gen\] (qwen3_tts|kokoro) -> [0-9]+ bytes| -> [0-9]+ WAV bytes' $((N_TTS * SOAK_WAVES)) "TTS generations"
 
 if [ "$FAILED" -gt 0 ]; then
     echo -e "${RED}FAIL${NC} $FAILED worker(s) failed (server survived)"

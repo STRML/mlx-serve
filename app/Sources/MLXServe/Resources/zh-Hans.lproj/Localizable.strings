@@ -2392,6 +2392,12 @@
 "Everything at once: pictures, video and your voice in, text or its own voice out. Native voice mode in a model under 3 GB." = "一应俱全：输入图片、视频和你的声音，输出文字或它自己的声音。不到 3 GB 的模型就有原生语音模式。";
 "Voice mode — the model hears you itself, and the voice chosen in Settings reads its answer." = "语音模式 —— 模型直接听你说话，并由设置中选择的声音朗读它的回答。";
 "LiquidAI's speech model: 19 languages, a female and a male voice each. When your chat model is LFM3 Audio or Omni, that same model reads the answers, with no second model." = "LiquidAI 的语音模型：19 种语言，每种各有一个女声和一个男声。当你的聊天模型是 LFM3 Audio 或 Omni 时，由同一个模型朗读回答，无需第二个模型。";
+"Available" = "可用";
+"Install with an AI agent" = "用 AI 智能体安装";
+"Model, media and quant-format plugins from the community. A plugin is native code that runs with your rights. Restart the server after any change." = "来自社区的模型、媒体和量化格式插件。插件是以你的权限运行的原生代码。任何更改后请重启服务器。";
+"In ~/.mlx-serve/plugins. Each is checked against its recorded hash when the server loads it." = "位于 ~/.mlx-serve/plugins。服务器加载每个插件时都会核对其记录的哈希值。";
+"From github.com/CommunityServe/plugins. Install downloads the source, shows you the commit, then compiles it on this Mac with a pinned Zig. Needs the Xcode Command Line Tools." = "来自 github.com/CommunityServe/plugins。安装会下载源码、向你显示提交，然后在这台 Mac 上用固定版本的 Zig 编译。需要 Xcode 命令行工具。";
+"Paste this into a coding agent (pi, Claude Code, Codex...) to have it install a plugin safely. Each plugin above also has its own copy button." = "把这段粘贴到编程智能体（pi、Claude Code、Codex……）中，让它安全地安装插件。上面每个插件也有各自的复制按钮。";
 "Picture" = "图片类型";
 "Gaussians" = "高斯数量";
 "Render" = "渲染图";

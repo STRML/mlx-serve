@@ -123,6 +123,7 @@ test {
     _ = @import("host/gpu_thread/params.zig");
     _ = @import("host/gpu_thread/requests.zig");
     _ = @import("host/api/request_options.zig");
+    _ = @import("host/api/schema_check.zig");
     _ = @import("sdk/util/err_name.zig");
     _ = @import("sdk/request/request.zig");
     _ = @import("sdk/spec/dflash_contract.zig");

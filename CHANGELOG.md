@@ -12,6 +12,7 @@
 - **DeepSeek-V4.1-Flash reads long prompts faster.** Prompts are read 8,192 tokens at a time where memory allows, and the attention, expert and Engram work behind each chunk is faster on M5 Macs.
 - **An embeddings request no longer crashes a DeepSeek server.** Asking DeepSeek-V4 or V4.1 for embeddings now returns a clear error instead of stopping the server.
 - **Outside plugins can use the server's layer blocks.** The plugin kit ships `kit.blocks` (norms, conv, ssm, schedulers, vae, dit pieces, embedding, and the linear, quantized-matmul, MLP, RoPE, attention, MoE, hyper-connection and GDN blocks), versioned with the kit, and `kit.foreign` to register a weight layout of your own, so a plugin calls them instead of rewriting the layer.
+- **Hardening before release.** A JSON schema the grammar cannot enforce (a typo'd type, tuple items, a pattern it cannot compile) now answers HTTP 400 on chat completions, Messages and Responses instead of free text with a 200; a long-running server no longer lets finished sessions' lone prompt-cache entries force a live multi-stream workload to evict itself; and Flash-Next packs with mixed 5-bit/group-64 hyper-connection weights no longer fail their first request.
 
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster
 

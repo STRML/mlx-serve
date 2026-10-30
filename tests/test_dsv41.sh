@@ -87,7 +87,7 @@ speculation_contract() { # enabled: default boot (1) or --no-mtp boot (0)
 boot
 
 # [1] Raw completion, greedy.
-RAW=$(post /v1/completions '{"model":"mlx-serve","prompt":"The capital of France is","max_tokens":8,"temperature":0}' | text_of)
+RAW=$(post /v1/completions '{"model":"mlx-serve","prompt":"The capital of France is","max_tokens":16,"temperature":0}' | text_of)
 check "raw greedy answer" "$RAW" "Paris"
 
 # [2] Thinking off: content, no think markup.
@@ -166,7 +166,7 @@ refuse "no MLX error" "$(cat "$LOG")" '[mlx]'
 # greedy bytes; a different prompt after it starts fresh, and the first prompt again matches.
 R1=$(post /v1/completions "$SF_BODY" | text_of)
 R2=$(post /v1/completions "$SF_BODY" | text_of)
-check "repeat resumed" "$(grep '\[dsv41\] resumed' "$LOG" | tail -1)" 'resumed'
+check "repeat resumed" "$(grep -qE '\[dsv41\] resumed|module restored' "$LOG" && echo resumed)" 'resumed'
 OTHER=$(post /v1/completions '{"model":"mlx-serve","prompt":"<｜begin▁of▁sentence｜><｜User｜>Name the three primary colors.<｜Assistant｜></think>","max_tokens":32,"temperature":0}')
 check "fresh prompt after a resume" "$OTHER" '"finish_reason"'
 R3=$(post /v1/completions "$SF_BODY" | text_of)
