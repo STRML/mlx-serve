@@ -2475,7 +2475,8 @@ pub const AneState = struct {
     /// routed submitted, one eval at the end) with the ANE never run. `fold`: the shared expert rides the routed launches
     /// as on the live path (lossless); `separate`: routed alone plus the shared expert's own GPU chain queued after it;
     /// `skip`: no shared expert (wrong output, the ceiling at this coverage and order). `live`: the live path's own order
-    /// (no pack, no early wait, one eval), timed: the neutral control of this tree and its per-layer split.
+    /// (no pack, no early wait, one eval), timed: the neutral control of this tree and its per-layer split. `queue`: the
+    /// live fold with the picks and the routed launches submitted ahead of the one eval, no wait for the input.
     gpu: Gpu = .off,
     planes: [ane_mod.max_units]A = @splat(none),
     idle_ns: u64 = 2_000_000_000,
@@ -2489,7 +2490,7 @@ pub const AneState = struct {
     chunks: u64 = 0,
 
     pub const Mode = enum { plain, skip_idle, warm_idle };
-    pub const Gpu = enum { off, fold, separate, skip, live };
+    pub const Gpu = enum { off, fold, separate, skip, live, queue };
 
     /// One chunk's per-layer timings, summed (ns).
     const Acc = struct {
@@ -2735,7 +2736,7 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
     if (st.chunk_skip) return null;
     st.joinWarm();
     const t0 = ane_mod.nowNs();
-    if (st.gpu == .live) return try liveControl(sc, m, st, li, h, hk, r, t0);
+    if (st.gpu == .live or st.gpu == .queue) return try liveControl(sc, m, st, li, h, hk, r, t0);
     const x = try if (st.early and st.pack) anePack(sc, st, h) else aneInput(sc, st, h);
     try submit(x);
     // The router's picks queued right behind the input: the host's read of them then finds them done, so the early
@@ -2808,7 +2809,7 @@ fn gpuControl(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const 
     const sum = switch (st.gpu) {
         .fold => if (fold) routed else try sc.add(routed, try sc.astype(try sharedExpert(sc, m, li, ly, h), .float32)),
         .separate => try sc.add(routed, try sc.astype(try sharedExpert(sc, m, li, ly, h), .float32)),
-        .skip, .off, .live => routed,
+        .skip, .off, .live, .queue => routed,
     };
     const out = try sc.astype(sum, m.act);
     const t4 = ane_mod.nowNs();
@@ -2822,7 +2823,10 @@ fn gpuControl(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const 
 /// The live path's wide-chunk order (`moe`: the folded routed launches built, then one eval), timed: build is the graph
 /// up to the queued routed launches, tail the eval.
 fn liveControl(sc: *Scope, m: *const Model, st: *AneState, li: usize, h: A, hk: Experts.Hook, r: kernels.Routes, t0: u64) !A {
-    const out = try sc.astype(try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, .{ .layer = .{ .m = m, .li = li } }), m.act);
+    if (st.gpu == .queue) try submit(r.idx);
+    const routed = try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, .{ .layer = .{ .m = m, .li = li } });
+    if (st.gpu == .queue) try submit(routed);
+    const out = try sc.astype(routed, m.act);
     const t1 = ane_mod.nowNs();
     try mlx.check(mlx.mlx_array_eval(out));
     const t5 = ane_mod.nowNs();
