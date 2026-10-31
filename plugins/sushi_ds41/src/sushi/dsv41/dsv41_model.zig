@@ -833,6 +833,9 @@ pub const Model = struct {
         if (self.profile) |pf| self.gpa.destroy(pf);
         if (self.ane) |st| {
             st.joinWarm();
+            for (st.planes) |a| if (a.ctx != null) {
+                _ = mlx.mlx_array_free(a);
+            };
             st.progs.deinit();
             self.gpa.destroy(st);
         }
@@ -2465,6 +2468,10 @@ pub const AneState = struct {
     early: bool = true,
     /// The outputs reach MLX without a copy (`SUSHI_DS41_ANE_ZEROCOPY=0`: copied).
     zero_copy: bool = true,
+    /// The early path's input planes as MLX arrays over the surfaces (no copy), written by `ane_pack_def` on the GPU
+    /// (`SUSHI_DS41_ANE_PACK=0`: a transposed copy the ANE threads memcpy in).
+    pack: bool = true,
+    planes: [ane_mod.max_units]A = @splat(none),
     idle_ns: u64 = 2_000_000_000,
     last_ns: u64 = 0,
     evals: u64 = 0,
@@ -2599,8 +2606,13 @@ fn initAneShared(m: *Model, units: usize) !*AneState {
     st.idle_ns = envUsize("SUSHI_DS41_ANE_IDLE_MS", 2000) * 1_000_000;
     st.early = envUsize("SUSHI_DS41_ANE_EARLY", 1) != 0;
     st.zero_copy = envUsize("SUSHI_DS41_ANE_ZEROCOPY", 1) != 0;
-    log.info("[sushi_ds41] ane shared: {d} layers x {d}x{d} SwiGLU (limit {d}), {d} unit(s) of {d} rows, chunks of {d}..{d} rows, mode {s}, early {}, zero-copy {}; weights {d:.1} s, programs {d:.1} s\n", .{
-        layers, d, f, c.swiglu_limit, units, progs.rows, st.min_rows, chunk, @tagName(st.mode), st.early, st.zero_copy, @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(ane_mod.nowNs() - t1)) / 1e9,
+    st.pack = envUsize("SUSHI_DS41_ANE_PACK", 1) != 0;
+    for (0..progs.n_units) |u| {
+        const shape = [_]c_int{ci(progs.slabLen())};
+        st.planes[u] = mlx.mlx_array_new_data_managed(@ptrCast(st.progs.input(u)), &shape, 1, .float16, aneNoFree);
+    }
+    log.info("[sushi_ds41] ane shared: {d} layers x {d}x{d} SwiGLU (limit {d}), {d} unit(s) of {d} rows, chunks of {d}..{d} rows, mode {s}, early {}, zero-copy {}, gpu pack {}; weights {d:.1} s, programs {d:.1} s\n", .{
+        layers, d, f, c.swiglu_limit, units, progs.rows, st.min_rows, chunk, @tagName(st.mode), st.early, st.zero_copy, st.pack, @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(ane_mod.nowNs() - t1)) / 1e9,
     });
     try aneSelfCheck(m, st);
     return st;
@@ -2617,6 +2629,29 @@ fn aneInput(sc: *Scope, st: *const AneState, h: A) !A {
 }
 
 fn aneNoFree(_: ?*anyopaque) callconv(.c) void {}
+
+/// `x` `[ROWS, D]` into the units' input planes (fp16, channel-major `[D][R]` each, unit `r / R` taking row `r`), zero
+/// past `ROWS`. Writes through the planes' const pointers: they are the ANE's IOSurfaces, wrapped without a copy.
+const ANE_PACK_SOURCE =
+    \\uint r = thread_position_in_grid.x; uint c = thread_position_in_grid.y;
+    \\if (r >= uint(CH) || c >= uint(D)) return;
+    \\uint u = r / uint(R);
+    \\device half *p = (device half *)(u == 0 ? p0 : p1);
+    \\float v = r < uint(ROWS) ? static_cast<float>(x[r * uint(D) + c]) : 0.0f;
+    \\p[c * uint(R) + (r - u * uint(R))] = static_cast<half>(v);
+    \\if (r == 0 && c == 0) done[0] = 0;
+;
+var ane_pack_def = kernels.Def{ .name = "dsv41_ane_pack", .ins = &.{ "x", "p0", "p1" }, .outs = &.{"done"}, .source = ANE_PACK_SOURCE };
+
+fn anePack(sc: *Scope, st: *const AneState, h: A) !A {
+    const d = dim(h, 1);
+    var out: [1]A = undefined;
+    const p1 = if (st.progs.n_units > 1) st.planes[1] else st.planes[0];
+    try kernels.launch(sc, &ane_pack_def, &.{ h, st.planes[0], p1 }, &.{.{ .shape = &.{1}, .dt = .float16 }}, .{ st.chunk_rows, d, 1 }, .{ 32, 8, 1 }, &.{
+        .{ .name = "ROWS", .v = ci(dim(h, 0)) }, .{ .name = "D", .v = ci(d) }, .{ .name = "R", .v = ci(st.progs.rows) }, .{ .name = "CH", .v = ci(st.chunk_rows) },
+    }, &.{}, &out);
+    return out[0];
+}
 
 /// The units' outputs as f32 `[rows, dim]`.
 fn aneOutput(sc: *Scope, st: *const AneState, rows: usize, d: usize) !A {
@@ -2653,6 +2688,20 @@ fn aneSelfCheck(m: *Model, st: *AneState) !void {
     const cos = v[0] / @sqrt(v[1] * v[2]);
     log.info("[sushi_ds41] ane shared: self-check layer 0, {d} random rows: cos {d:.6} vs the GPU chain, |ane|/|gpu| {d:.4}, unit ms {d:.2}/{d:.2}\n", .{ st.chunk_rows, cos, @sqrt(v[1] / v[2]), @as(f64, @floatFromInt(ran.unit_ns[0])) / 1e6, @as(f64, @floatFromInt(ran.unit_ns[1])) / 1e6 });
     if (!(cos > 0.99)) return error.AneSharedSelfCheck;
+    if (!st.pack) return;
+    // The GPU-packed planes: the same rows must give the same output, bit for bit.
+    const y0 = try sc.contiguous(y);
+    try mlx.check(mlx.mlx_array_eval(y0));
+    const done = try anePack(&sc, st, h);
+    try mlx.check(mlx.mlx_array_eval(done));
+    var pend: ane_mod.Programs.Pending = .{};
+    st.progs.start(&pend, 0, null);
+    if (!pend.join().ok) return error.AneSharedEval;
+    const y1 = try aneOutput(&sc, st, st.chunk_rows, d);
+    const diff = try sc.max(try sc.reshape(try sc.op1(mlx.mlx_abs, try sc.sub(y1, y0)), &.{-1}), 0, false);
+    const md = (try sc_mod.hostF32(diff))[0];
+    log.info("[sushi_ds41] ane shared: GPU-packed input planes vs host copy: max |diff| {d}\n", .{md});
+    if (md != 0) st.pack = false;
 }
 
 /// Layer `li`'s routed experts and shared expert of a wide chunk, the shared expert on the Neural Engine while the
@@ -2678,7 +2727,7 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
     if (st.chunk_skip) return null;
     st.joinWarm();
     const t0 = ane_mod.nowNs();
-    const x = try aneInput(sc, st, h);
+    const x = try if (st.early and st.pack) anePack(sc, st, h) else aneInput(sc, st, h);
     try submit(x);
     var routed: A = undefined;
     var t1: u64 = 0;
@@ -2689,7 +2738,7 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
         // the routed launches alike.
         try mlx.check(mlx.mlx_array_eval(x));
         t1 = ane_mod.nowNs();
-        const ptr: [*]const f16 = @ptrCast(@alignCast(mlx.mlx_array_data_uint8(x) orelse return error.HostRead));
+        const ptr: ?[*]const f16 = if (st.pack) null else @ptrCast(@alignCast(mlx.mlx_array_data_uint8(x) orelse return error.HostRead));
         var pend: ane_mod.Programs.Pending = .{};
         st.progs.start(&pend, li, ptr);
         routed = hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, .none) catch |e| {

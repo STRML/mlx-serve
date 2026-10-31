@@ -117,17 +117,22 @@ pub const Programs = struct {
         return @as(usize, self.hidden) * self.rows;
     }
 
+    pub fn input(self: *const Programs, u: usize) [*]f16 {
+        return s41_ane_mlp_input(self.units[u]).?;
+    }
+
     pub fn output(self: *const Programs, u: usize) [*]const f16 {
         return s41_ane_mlp_output(self.units[u]).?;
     }
 
-    const Job = struct { p: *const Programs, u: usize, proc: u32, x: [*]const f16, ok: bool = false, ns: u64 = 0, copy_ns: u64 = 0 };
+    const Job = struct { p: *const Programs, u: usize, proc: u32, x: ?[*]const f16, ok: bool = false, ns: u64 = 0, copy_ns: u64 = 0 };
 
     fn runUnit(j: *Job) void {
         const t0 = nowNs();
         const n = j.p.slabLen();
         const dst = s41_ane_mlp_input(j.p.units[j.u]).?;
-        @memcpy(dst[0..n], j.x[j.u * n ..][0..n]);
+        // A null input means the GPU already wrote the plane (`input`).
+        if (j.x) |x| @memcpy(dst[0..n], x[j.u * n ..][0..n]);
         j.copy_ns = nowNs() - t0;
         var err: [256]u8 = @splat(0);
         // eval returns 1 on success.
@@ -180,7 +185,7 @@ pub const Programs = struct {
     };
 
     /// Starts layer `li` over `x` on every unit; `p` must stay put until `p.join()`.
-    pub fn start(self: *const Programs, p: *Pending, li: usize, x: [*]const f16) void {
+    pub fn start(self: *const Programs, p: *Pending, li: usize, x: ?[*]const f16) void {
         const proc: u32 = @intCast(self.proc[li]);
         p.n = self.n_units;
         for (0..self.n_units) |u| {
