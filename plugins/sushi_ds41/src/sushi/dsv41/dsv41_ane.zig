@@ -121,13 +121,14 @@ pub const Programs = struct {
         return s41_ane_mlp_output(self.units[u]).?;
     }
 
-    const Job = struct { p: *const Programs, u: usize, proc: u32, x: [*]const f16, ok: bool = false, ns: u64 = 0 };
+    const Job = struct { p: *const Programs, u: usize, proc: u32, x: [*]const f16, ok: bool = false, ns: u64 = 0, copy_ns: u64 = 0 };
 
     fn runUnit(j: *Job) void {
         const t0 = nowNs();
         const n = j.p.slabLen();
         const dst = s41_ane_mlp_input(j.p.units[j.u]).?;
         @memcpy(dst[0..n], j.x[j.u * n ..][0..n]);
+        j.copy_ns = nowNs() - t0;
         var err: [256]u8 = @splat(0);
         // eval returns 1 on success.
         j.ok = s41_ane_mlp_eval(j.p.units[j.u], j.proc, &err, err.len) == 1;
@@ -135,7 +136,7 @@ pub const Programs = struct {
         j.ns = nowNs() - t0;
     }
 
-    pub const Ran = struct { ok: bool, unit_ns: [max_units]u64 };
+    pub const Ran = struct { ok: bool, unit_ns: [max_units]u64, copy_ns: u64 = 0 };
 
     /// Layer `li` over `x`: `n_units` channel-major slabs of `slabLen()` fp16 each, back to back. Unit 0 runs on the
     /// calling thread, unit 1 on its own; both copy their slab in and evaluate. The outputs are in `output(u)`.
@@ -153,6 +154,7 @@ pub const Programs = struct {
         for (0..self.n_units) |u| {
             r.ok = r.ok and jobs[u].ok;
             r.unit_ns[u] = jobs[u].ns;
+            r.copy_ns = @max(r.copy_ns, jobs[u].copy_ns);
         }
         return r;
     }
@@ -171,6 +173,7 @@ pub const Programs = struct {
             for (0..self.n) |u| {
                 r.ok = r.ok and self.jobs[u].ok;
                 r.unit_ns[u] = self.jobs[u].ns;
+                r.copy_ns = @max(r.copy_ns, self.jobs[u].copy_ns);
             }
             return r;
         }

@@ -2463,6 +2463,8 @@ pub const AneState = struct {
     /// The ANE starts once the layer's input is evaluated, before the host reads the picks (`SUSHI_DS41_ANE_EARLY=0`:
     /// after the routed launches are queued).
     early: bool = true,
+    /// The outputs reach MLX without a copy (`SUSHI_DS41_ANE_ZEROCOPY=0`: copied).
+    zero_copy: bool = true,
     idle_ns: u64 = 2_000_000_000,
     last_ns: u64 = 0,
     evals: u64 = 0,
@@ -2484,6 +2486,7 @@ pub const AneState = struct {
         ane: u64 = 0,
         ane_first: u64 = 0,
         join: u64 = 0,
+        copy: u64 = 0,
         ane_max: u64 = 0,
         wrap: u64 = 0,
         tail: u64 = 0,
@@ -2510,8 +2513,8 @@ pub const AneState = struct {
                 return @as(f64, @floatFromInt(v)) / 1e6;
             }
         }.f;
-        log.info("[sushi_ds41] ane shared: chunk {d} rows={d} layers={d} idle_before={d:.1}s per-layer ms: build {d:.2} hwait {d:.2} ane {d:.2} (first {d:.2}, max {d:.2}) join {d:.2} wrap {d:.2} tail {d:.2} (first {d:.2}); evals {d} fails {d}\n", .{
-            self.chunks, rows, a.layers, a.idle_s, ms(a.build) / n, ms(a.hwait) / n, ms(a.ane) / n, ms(a.ane_first), ms(a.ane_max), ms(a.join) / n, ms(a.wrap) / n, ms(a.tail) / n, ms(a.first_tail), self.evals, self.fails,
+        log.info("[sushi_ds41] ane shared: chunk {d} rows={d} layers={d} idle_before={d:.1}s per-layer ms: build {d:.2} hwait {d:.2} ane {d:.2} (first {d:.2}, max {d:.2}; input copy {d:.2}) join {d:.2} wrap {d:.2} tail {d:.2} (first {d:.2}); evals {d} fails {d}\n", .{
+            self.chunks, rows, a.layers, a.idle_s, ms(a.build) / n, ms(a.hwait) / n, ms(a.ane) / n, ms(a.ane_first), ms(a.ane_max), ms(a.copy) / n, ms(a.join) / n, ms(a.wrap) / n, ms(a.tail) / n, ms(a.first_tail), self.evals, self.fails,
         });
     }
 };
@@ -2595,8 +2598,9 @@ fn initAneShared(m: *Model, units: usize) !*AneState {
     if (std.c.getenv("SUSHI_DS41_ANE_MODE")) |mv| st.mode = std.meta.stringToEnum(AneState.Mode, std.mem.span(mv)) orelse .plain;
     st.idle_ns = envUsize("SUSHI_DS41_ANE_IDLE_MS", 2000) * 1_000_000;
     st.early = envUsize("SUSHI_DS41_ANE_EARLY", 1) != 0;
-    log.info("[sushi_ds41] ane shared: {d} layers x {d}x{d} SwiGLU (limit {d}), {d} unit(s) of {d} rows, chunks of {d}..{d} rows, mode {s}, early {}; weights {d:.1} s, programs {d:.1} s\n", .{
-        layers, d, f, c.swiglu_limit, units, progs.rows, st.min_rows, chunk, @tagName(st.mode), st.early, @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(ane_mod.nowNs() - t1)) / 1e9,
+    st.zero_copy = envUsize("SUSHI_DS41_ANE_ZEROCOPY", 1) != 0;
+    log.info("[sushi_ds41] ane shared: {d} layers x {d}x{d} SwiGLU (limit {d}), {d} unit(s) of {d} rows, chunks of {d}..{d} rows, mode {s}, early {}, zero-copy {}; weights {d:.1} s, programs {d:.1} s\n", .{
+        layers, d, f, c.swiglu_limit, units, progs.rows, st.min_rows, chunk, @tagName(st.mode), st.early, st.zero_copy, @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(ane_mod.nowNs() - t1)) / 1e9,
     });
     try aneSelfCheck(m, st);
     return st;
@@ -2612,11 +2616,18 @@ fn aneInput(sc: *Scope, st: *const AneState, h: A) !A {
     return sc.contiguous(try sc.transpose(try sc.reshape(x, &.{ ci(nu), ci(st.progs.rows), ci(d) }), &.{ 0, 2, 1 }));
 }
 
+fn aneNoFree(_: ?*anyopaque) callconv(.c) void {}
+
 /// The units' outputs as f32 `[rows, dim]`.
 fn aneOutput(sc: *Scope, st: *const AneState, rows: usize, d: usize) !A {
     var parts: [ane_mod.max_units]A = undefined;
     const shape = [_]c_int{ ci(d), ci(st.progs.rows) };
-    for (0..st.progs.n_units) |u| parts[u] = try sc.keep(mlx.mlx_array_new_data(@ptrCast(st.progs.output(u)), &shape, 2, .float16));
+    for (0..st.progs.n_units) |u| {
+        const ptr: *anyopaque = @ptrCast(@constCast(st.progs.output(u)));
+        // Zero-copy: MLX wraps a page-aligned, page-multiple buffer as a Metal buffer without a copy. The output surface
+        // outlives the array (the programs own it) and the next eval writes it only after this layer is evaluated.
+        parts[u] = try sc.keep(if (st.zero_copy) mlx.mlx_array_new_data_managed(ptr, &shape, 2, .float16, aneNoFree) else mlx.mlx_array_new_data(ptr, &shape, 2, .float16));
+    }
     const y = try sc.t2(try sc.concat(parts[0..st.progs.n_units], 1)); // [chunk, d]
     return sc.astype(try sc.slice(y, 0, 0, rows), .float32);
 }
@@ -2731,6 +2742,7 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
     a.hwait += t2 - t1;
     a.join += t3 - t2;
     a.ane += ane_ns;
+    a.copy += ran.copy_ns;
     a.ane_max = @max(a.ane_max, ane_ns);
     a.wrap += t4 - t3;
     a.tail += t5 - t4;
