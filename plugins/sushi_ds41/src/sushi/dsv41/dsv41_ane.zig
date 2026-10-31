@@ -157,6 +157,36 @@ pub const Programs = struct {
         return r;
     }
 
+    /// `run` with every unit on its own thread, returned at once: the caller queues GPU work, then `join`s.
+    pub const Pending = struct {
+        jobs: [max_units]Job = undefined,
+        th: [max_units]?std.Thread = @splat(null),
+        n: usize = 0,
+
+        pub fn join(self: *Pending) Ran {
+            for (0..self.n) |u| {
+                if (self.th[u]) |t| t.join() else runUnit(&self.jobs[u]);
+            }
+            var r: Ran = .{ .ok = true, .unit_ns = @splat(0) };
+            for (0..self.n) |u| {
+                r.ok = r.ok and self.jobs[u].ok;
+                r.unit_ns[u] = self.jobs[u].ns;
+            }
+            return r;
+        }
+    };
+
+    /// Starts layer `li` over `x` on every unit; `p` must stay put until `p.join()`.
+    pub fn start(self: *const Programs, p: *Pending, li: usize, x: [*]const f16) void {
+        const proc: u32 = @intCast(self.proc[li]);
+        p.n = self.n_units;
+        for (0..self.n_units) |u| {
+            p.jobs[u] = .{ .p = self, .u = u, .proc = proc, .x = x };
+            // A unit whose thread did not start runs in `join`.
+            p.th[u] = std.Thread.spawn(.{}, runUnit, .{&p.jobs[u]}) catch null;
+        }
+    }
+
     /// One eval of procedure 0 on every unit with whatever the planes hold: wakes the dies.
     pub fn warm(self: *const Programs) void {
         var err: [256]u8 = @splat(0);

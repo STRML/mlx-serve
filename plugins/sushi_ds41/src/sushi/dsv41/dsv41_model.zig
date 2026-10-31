@@ -2460,6 +2460,9 @@ pub const AneState = struct {
     /// Layers `0..layers` have programs (the CED encoder's, which run every row of a chunk).
     layers: usize,
     mode: Mode = .plain,
+    /// The ANE starts once the layer's input is evaluated, before the host reads the picks (`SUSHI_DS41_ANE_EARLY=0`:
+    /// after the routed launches are queued).
+    early: bool = true,
     idle_ns: u64 = 2_000_000_000,
     last_ns: u64 = 0,
     evals: u64 = 0,
@@ -2480,6 +2483,7 @@ pub const AneState = struct {
         hwait: u64 = 0,
         ane: u64 = 0,
         ane_first: u64 = 0,
+        join: u64 = 0,
         ane_max: u64 = 0,
         wrap: u64 = 0,
         tail: u64 = 0,
@@ -2506,8 +2510,8 @@ pub const AneState = struct {
                 return @as(f64, @floatFromInt(v)) / 1e6;
             }
         }.f;
-        log.info("[sushi_ds41] ane shared: chunk {d} rows={d} layers={d} idle_before={d:.1}s per-layer ms: build {d:.2} hwait {d:.2} ane {d:.2} (first {d:.2}, max {d:.2}) wrap {d:.2} tail {d:.2} (first {d:.2}); evals {d} fails {d}\n", .{
-            self.chunks, rows, a.layers, a.idle_s, ms(a.build) / n, ms(a.hwait) / n, ms(a.ane) / n, ms(a.ane_first), ms(a.ane_max), ms(a.wrap) / n, ms(a.tail) / n, ms(a.first_tail), self.evals, self.fails,
+        log.info("[sushi_ds41] ane shared: chunk {d} rows={d} layers={d} idle_before={d:.1}s per-layer ms: build {d:.2} hwait {d:.2} ane {d:.2} (first {d:.2}, max {d:.2}) join {d:.2} wrap {d:.2} tail {d:.2} (first {d:.2}); evals {d} fails {d}\n", .{
+            self.chunks, rows, a.layers, a.idle_s, ms(a.build) / n, ms(a.hwait) / n, ms(a.ane) / n, ms(a.ane_first), ms(a.ane_max), ms(a.join) / n, ms(a.wrap) / n, ms(a.tail) / n, ms(a.first_tail), self.evals, self.fails,
         });
     }
 };
@@ -2590,8 +2594,9 @@ fn initAneShared(m: *Model, units: usize) !*AneState {
     st.* = .{ .progs = progs, .chunk_rows = chunk, .min_rows = envUsize("SUSHI_DS41_ANE_MIN_ROWS", chunk), .layers = layers };
     if (std.c.getenv("SUSHI_DS41_ANE_MODE")) |mv| st.mode = std.meta.stringToEnum(AneState.Mode, std.mem.span(mv)) orelse .plain;
     st.idle_ns = envUsize("SUSHI_DS41_ANE_IDLE_MS", 2000) * 1_000_000;
-    log.info("[sushi_ds41] ane shared: {d} layers x {d}x{d} SwiGLU (limit {d}), {d} unit(s) of {d} rows, chunks of {d}..{d} rows, mode {s}; weights {d:.1} s, programs {d:.1} s\n", .{
-        layers, d, f, c.swiglu_limit, units, progs.rows, st.min_rows, chunk, @tagName(st.mode), @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(ane_mod.nowNs() - t1)) / 1e9,
+    st.early = envUsize("SUSHI_DS41_ANE_EARLY", 1) != 0;
+    log.info("[sushi_ds41] ane shared: {d} layers x {d}x{d} SwiGLU (limit {d}), {d} unit(s) of {d} rows, chunks of {d}..{d} rows, mode {s}, early {}; weights {d:.1} s, programs {d:.1} s\n", .{
+        layers, d, f, c.swiglu_limit, units, progs.rows, st.min_rows, chunk, @tagName(st.mode), st.early, @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(ane_mod.nowNs() - t1)) / 1e9,
     });
     try aneSelfCheck(m, st);
     return st;
@@ -2664,13 +2669,37 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
     const t0 = ane_mod.nowNs();
     const x = try aneInput(sc, st, h);
     try submit(x);
-    const routed = try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, .none);
-    try submit(routed);
-    const t1 = ane_mod.nowNs();
-    try mlx.check(mlx.mlx_array_eval(x));
-    const t2 = ane_mod.nowNs();
-    const ptr: [*]const f16 = @ptrCast(@alignCast(mlx.mlx_array_data_uint8(x) orelse return error.HostRead));
-    const ran = st.progs.run(li, ptr);
+    var routed: A = undefined;
+    var t1: u64 = 0;
+    var t2: u64 = 0;
+    var ran: ane_mod.Programs.Ran = undefined;
+    if (st.early) {
+        // The ANE starts as soon as the layer's input is there, so it runs beside the host's read of the picks and
+        // the routed launches alike.
+        try mlx.check(mlx.mlx_array_eval(x));
+        t1 = ane_mod.nowNs();
+        const ptr: [*]const f16 = @ptrCast(@alignCast(mlx.mlx_array_data_uint8(x) orelse return error.HostRead));
+        var pend: ane_mod.Programs.Pending = .{};
+        st.progs.start(&pend, li, ptr);
+        routed = hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, .none) catch |e| {
+            _ = pend.join();
+            return e;
+        };
+        submit(routed) catch |e| {
+            _ = pend.join();
+            return e;
+        };
+        t2 = ane_mod.nowNs();
+        ran = pend.join();
+    } else {
+        routed = try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, .none);
+        try submit(routed);
+        t1 = ane_mod.nowNs();
+        try mlx.check(mlx.mlx_array_eval(x));
+        t2 = ane_mod.nowNs();
+        const ptr: [*]const f16 = @ptrCast(@alignCast(mlx.mlx_array_data_uint8(x) orelse return error.HostRead));
+        ran = st.progs.run(li, ptr);
+    }
     const t3 = ane_mod.nowNs();
     st.last_ns = t3;
     if (!ran.ok) {
@@ -2691,14 +2720,16 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
     try mlx.check(mlx.mlx_array_eval(out));
     const t5 = ane_mod.nowNs();
     const a = &st.chunk;
-    const ane_ns = t3 - t2;
+    const ane_ns = @max(ran.unit_ns[0], ran.unit_ns[1]);
     if (a.layers == 0) {
         a.ane_first = ane_ns;
         a.first_tail = t5 - t4;
     }
     a.layers += 1;
+    // early: build = graph + wait for h, hwait = picks read and routed queueing, join = the wait for the ANE after.
     a.build += t1 - t0;
     a.hwait += t2 - t1;
+    a.join += t3 - t2;
     a.ane += ane_ns;
     a.ane_max = @max(a.ane_max, ane_ns);
     a.wrap += t4 - t3;
