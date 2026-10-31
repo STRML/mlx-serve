@@ -98,12 +98,14 @@ pub const Programs = struct {
         var err: [512]u8 = @splat(0);
         for (0..self.n_units) |u| {
             var name: [64]u8 = undefined;
-            const nm = try std.fmt.bufPrintZ(&name, "ds41_shared_r{d}_u{d}of{d}", .{ self.rows, u, self.n_units });
+            const txt = try std.fmt.bufPrint(name[0 .. name.len - 1], "ds41_shared_r{d}_u{d}of{d}", .{ self.rows, u, self.n_units });
+            name[txt.len] = 0;
+            const nm: [*:0]const u8 = @ptrCast(&name);
             // A single unit gets no instance hint (the runtime picks a die); two pin one die each.
             const inst: c_int = if (self.n_units == 1) 0 else @intCast(u + 1);
             const b = self.banks[u];
             self.banks[u] = null;
-            self.units[u] = s41_ane_bank_finish(b, nm.ptr, inst, null, null, &err, err.len) orelse {
+            self.units[u] = s41_ane_bank_finish(b, nm, inst, null, null, &err, err.len) orelse {
                 log.err("[sushi_ds41] ane shared: compile of unit {d}: {s}\n", .{ u, std.mem.sliceTo(&err, 0) });
                 return error.AneSharedCompile;
             };
