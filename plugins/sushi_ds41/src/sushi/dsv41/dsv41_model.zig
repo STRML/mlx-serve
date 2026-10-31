@@ -2478,6 +2478,10 @@ pub const AneState = struct {
     /// (no pack, no early wait, one eval), timed: the neutral control of this tree and its per-layer split. `queue`: the
     /// live fold with the picks and the routed launches submitted ahead of the one eval, no wait for the input.
     gpu: Gpu = .off,
+    /// With a GPU control: what runs beside the routed launches where E runs the ANE (`SUSHI_DS41_ANE_SHAM`):
+    /// `ane` the real ANE eval, output discarded; `spin` two threads busy for `sham_us`; `sleep` two threads asleep for it.
+    sham: Sham = .off,
+    sham_us: u64 = 4900,
     planes: [ane_mod.max_units]A = @splat(none),
     idle_ns: u64 = 2_000_000_000,
     last_ns: u64 = 0,
@@ -2491,6 +2495,7 @@ pub const AneState = struct {
 
     pub const Mode = enum { plain, skip_idle, warm_idle };
     pub const Gpu = enum { off, fold, separate, skip, live, queue };
+    pub const Sham = enum { off, ane, spin, sleep };
 
     /// One chunk's per-layer timings, summed (ns).
     const Acc = struct {
@@ -2616,12 +2621,14 @@ fn initAneShared(m: *Model, units: usize) !*AneState {
     st.zero_copy = envUsize("SUSHI_DS41_ANE_ZEROCOPY", 1) != 0;
     st.pack = envUsize("SUSHI_DS41_ANE_PACK", 1) != 0;
     if (std.c.getenv("SUSHI_DS41_ANE_GPU")) |gv| st.gpu = std.meta.stringToEnum(AneState.Gpu, std.mem.span(gv)) orelse .off;
+    if (std.c.getenv("SUSHI_DS41_ANE_SHAM")) |sv| st.sham = std.meta.stringToEnum(AneState.Sham, std.mem.span(sv)) orelse .off;
+    st.sham_us = envUsize("SUSHI_DS41_ANE_SHAM_US", 4900);
     for (0..progs.n_units) |u| {
         const shape = [_]c_int{ci(progs.slabLen())};
         st.planes[u] = mlx.mlx_array_new_data_managed(@ptrCast(st.progs.input(u)), &shape, 1, .float16, aneNoFree);
     }
-    log.info("[sushi_ds41] ane shared: {d} layers x {d}x{d} SwiGLU (limit {d}), {d} unit(s) of {d} rows, chunks of {d}..{d} rows, mode {s}, early {}, zero-copy {}, gpu pack {}, gpu control {s}; weights {d:.1} s, programs {d:.1} s\n", .{
-        layers, d, f, c.swiglu_limit, units, progs.rows, st.min_rows, chunk, @tagName(st.mode), st.early, st.zero_copy, st.pack, @tagName(st.gpu), @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(ane_mod.nowNs() - t1)) / 1e9,
+    log.info("[sushi_ds41] ane shared: {d} layers x {d}x{d} SwiGLU (limit {d}), {d} unit(s) of {d} rows, chunks of {d}..{d} rows, mode {s}, early {}, zero-copy {}, gpu pack {}, gpu control {s}, sham {s}; weights {d:.1} s, programs {d:.1} s\n", .{
+        layers, d, f, c.swiglu_limit, units, progs.rows, st.min_rows, chunk, @tagName(st.mode), st.early, st.zero_copy, st.pack, @tagName(st.gpu), @tagName(st.sham), @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(ane_mod.nowNs() - t1)) / 1e9,
     });
     try aneSelfCheck(m, st);
     return st;
@@ -2801,6 +2808,19 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
 fn gpuControl(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Layer, h: A, hk: Experts.Hook, r: kernels.Routes, x: A, t0: u64) !A {
     try mlx.check(mlx.mlx_array_eval(x));
     const t1 = ane_mod.nowNs();
+    var pend: ane_mod.Programs.Pending = .{};
+    var shams: [2]?std.Thread = @splat(null);
+    switch (st.sham) {
+        .off => {},
+        .ane => st.progs.start(&pend, li, null),
+        .spin, .sleep => for (&shams) |*t| {
+            t.* = std.Thread.spawn(.{}, shamRun, .{ st.sham == .spin, st.sham_us }) catch null;
+        },
+    }
+    defer {
+        if (st.sham == .ane) _ = pend.join();
+        for (shams) |t| if (t) |th| th.join();
+    }
     const fold = st.gpu == .fold and m.shared_fold and ly.shared[0].stq != null;
     const sy: SharedOp = if (fold) .{ .layer = .{ .m = m, .li = li } } else .none;
     const routed = try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, sy);
@@ -2818,6 +2838,17 @@ fn gpuControl(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const 
     st.last_ns = t5;
     noteLayer(st, li, dim(h, 0), .{ t0, t1, t2, t2, t4, t5 }, 0, 0);
     return out;
+}
+
+/// A sham ANE unit: busy (`spin`) or asleep for `us` microseconds.
+fn shamRun(spin: bool, us: u64) void {
+    const end = ane_mod.nowNs() + us * 1000;
+    if (!spin) {
+        var ts = std.c.timespec{ .sec = 0, .nsec = @intCast(us * 1000) };
+        _ = std.c.nanosleep(&ts, null);
+        return;
+    }
+    while (ane_mod.nowNs() < end) std.atomic.spinLoopHint();
 }
 
 /// The live path's wide-chunk order (`moe`: the folded routed launches built, then one eval), timed: build is the graph
