@@ -21,6 +21,7 @@ const model_mod = @import("../model.zig");
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("expert_usage.zig");
 const transient_peak = @import("transient_peak.zig");
+const ane_mod = @import("dsv41_ane.zig");
 
 const A = sc_mod.A;
 const S = sc_mod.S;
@@ -770,6 +771,10 @@ pub const Model = struct {
     /// A wide chunk's shared expert rides the routed prefill launches where the trellis chain takes it there; off, it runs
     /// as a chain of its own (the tests' oracle).
     shared_fold: bool = true,
+    /// The shared expert of wide prefill chunks on the Neural Engine (`setAneShared`).
+    ane: ?*AneState = null,
+    /// Diagnostic (`SUSHI_DS41_SKIP_SHARED`): wide chunks drop the shared expert (wrong output; the GPU ceiling of the ANE arm).
+    skip_shared: bool = false,
     /// TEMPORARY A/B: a decode-width pass reads its Engram rows ahead (`prefetchEngram`).
     decode_engram_ahead: bool = true,
     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
@@ -826,6 +831,11 @@ pub const Model = struct {
     pub fn deinit(self: *Model) void {
         pipeDrain(self) catch {};
         if (self.profile) |pf| self.gpa.destroy(pf);
+        if (self.ane) |st| {
+            st.joinWarm();
+            st.progs.deinit();
+            self.gpa.destroy(st);
+        }
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
         self.dropEmbedAhead();
@@ -2267,11 +2277,14 @@ fn moeWide(sc: *Scope, m: *const Model, li: usize, h: A, r: kernels.Routes, sy: 
 pub const SharedOp = union(enum) {
     array: A,
     layer: struct { m: *const Model, li: usize },
+    /// A wide chunk's routed sum alone: the caller adds the shared expert (`aneMoe`) or drops it (`skip_shared`).
+    none,
 
     pub fn value(self: SharedOp, sc: *Scope, x: A) !A {
         return switch (self) {
             .array => |a| a,
             .layer => |l| sharedExpert(sc, l.m, l.li, &l.m.layers[l.li], x),
+            .none => error.Dsv41SharedNone,
         };
     }
 };
@@ -2315,6 +2328,10 @@ pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const e
     }
     if (shared == .layer) {
         if (try prefillWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k)) |y| return y;
+    }
+    if (shared == .none) {
+        exl3.kernels.setDecodeParams(dec);
+        return sc.astype(try sc.keep(try exl3.rate_groups.moePrefillClamped(sc.s, x, rb, flat, scores, k, limit)), .float32);
     }
     const sy = try shared.value(sc, x);
     exl3.kernels.setDecodeParams(dec);
@@ -2431,6 +2448,265 @@ fn sharedExpert(sc: *Scope, m: *const Model, li: usize, ly: *const Layer, h: A) 
     return ly.shared[2].apply(sc, act);
 }
 
+extern "c" fn mlx_eye(res: *A, n: c_int, m: c_int, k: c_int, dtype: mlx.mlx_dtype, s: S) c_int;
+
+/// The shared expert of wide prefill chunks on the Neural Engine (`SUSHI_DS41_ANE_SHARED=1|2`, the unit count; a
+/// prototype, lossy: int8 weights, fp16 activations). See `dsv41_ane.zig`.
+pub const AneState = struct {
+    progs: ane_mod.Programs,
+    /// Rows a chunk's programs take (`n_units * rows`); a narrower chunk is zero-padded up to it.
+    chunk_rows: usize,
+    min_rows: usize,
+    /// Layers `0..layers` have programs (the CED encoder's, which run every row of a chunk).
+    layers: usize,
+    mode: Mode = .plain,
+    idle_ns: u64 = 2_000_000_000,
+    last_ns: u64 = 0,
+    evals: u64 = 0,
+    fails: u64 = 0,
+    disabled: bool = false,
+    chunk_skip: bool = false,
+    warm_thread: ?std.Thread = null,
+    chunk: Acc = .{},
+    chunks: u64 = 0,
+
+    pub const Mode = enum { plain, skip_idle, warm_idle };
+
+    /// One chunk's per-layer timings, summed (ns).
+    const Acc = struct {
+        idle_s: f64 = 0,
+        layers: u32 = 0,
+        build: u64 = 0,
+        hwait: u64 = 0,
+        ane: u64 = 0,
+        ane_first: u64 = 0,
+        ane_max: u64 = 0,
+        wrap: u64 = 0,
+        tail: u64 = 0,
+        first_tail: u64 = 0,
+    };
+
+    fn joinWarm(self: *AneState) void {
+        if (self.warm_thread) |t| t.join();
+        self.warm_thread = null;
+    }
+
+    fn kickWarm(self: *AneState) void {
+        self.joinWarm();
+        self.warm_thread = std.Thread.spawn(.{}, ane_mod.Programs.warm, .{&self.progs}) catch null;
+        self.last_ns = ane_mod.nowNs();
+    }
+
+    fn report(self: *AneState, rows: usize) void {
+        const a = self.chunk;
+        if (a.layers == 0) return;
+        const n: f64 = @floatFromInt(a.layers);
+        const ms = struct {
+            fn f(v: u64) f64 {
+                return @as(f64, @floatFromInt(v)) / 1e6;
+            }
+        }.f;
+        log.info("[sushi_ds41] ane shared: chunk {d} rows={d} layers={d} idle_before={d:.1}s per-layer ms: build {d:.2} hwait {d:.2} ane {d:.2} (first {d:.2}, max {d:.2}) wrap {d:.2} tail {d:.2} (first {d:.2}); evals {d} fails {d}\n", .{
+            self.chunks, rows, a.layers, a.idle_s, ms(a.build) / n, ms(a.hwait) / n, ms(a.ane) / n, ms(a.ane_first), ms(a.ane_max), ms(a.wrap) / n, ms(a.tail) / n, ms(a.first_tail), self.evals, self.fails,
+        });
+    }
+};
+
+/// Reads `SUSHI_DS41_ANE_SHARED` (1 or 2 units) and `SUSHI_DS41_SKIP_SHARED` (diagnostic: wide chunks drop the shared
+/// expert, wrong output, timing only) and builds the programs. A failure leaves the GPU path serving.
+pub fn setAneShared(m: *Model) void {
+    if (std.c.getenv("SUSHI_DS41_SKIP_SHARED") != null) {
+        m.skip_shared = true;
+        log.warn("[sushi_ds41] SUSHI_DS41_SKIP_SHARED: wide chunks skip the shared expert (diagnostic, wrong output)\n", .{});
+    }
+    const raw = std.c.getenv("SUSHI_DS41_ANE_SHARED") orelse return;
+    const units = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch 1;
+    const st = initAneShared(m, units) catch |e| {
+        log.warn("[sushi_ds41] ane shared: off ({s})\n", .{@errorName(e)});
+        return;
+    };
+    m.ane = st;
+}
+
+fn envUsize(name: [*:0]const u8, default: usize) usize {
+    const v = std.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
+}
+
+/// `lin`'s effective `[out, in]` weight in f32 on the host (its kernel run on the identity, so the codec's transforms
+/// come out as they apply), into `dst`.
+fn linF32(m: *const Model, lin: *const Lin, in: usize, dst: []f32) !void {
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    var eye = mlx.mlx_array_new();
+    const I = try sc.res(mlx_eye(&eye, ci(in), ci(in), 0, m.act, m.s), &eye);
+    const wt = try lin.apply(&sc, I); // [in, out]
+    const w = try sc.contiguous(try sc.astype(try sc.t2(wt), .float32));
+    const host = try sc_mod.hostF32(w);
+    if (host.len != dst.len) return error.Dsv41WeightLayout;
+    @memcpy(dst, host);
+}
+
+fn initAneShared(m: *Model, units: usize) !*AneState {
+    if (!ane_mod.available()) return error.AneUnavailable;
+    const c = &m.cfg;
+    const d: usize = c.dim;
+    const f: usize = m.layers[0].shared[0].outDim();
+    const chunk: usize = envUsize("SUSHI_DS41_ANE_ROWS", cfg_mod.prefill_width);
+    const layers = @min(envUsize("SUSHI_DS41_ANE_LAYERS", m.ced_split orelse c.layers), @min(c.layers, ane_mod.max_layers));
+    var progs = try ane_mod.Programs.init(units, @intCast(chunk), @intCast(d), @intCast(f));
+    errdefer progs.deinit();
+    const gpa = m.gpa;
+    const wf = try gpa.alloc(f32, d * f);
+    defer gpa.free(wf);
+    const gq = try gpa.alloc(i8, d * f);
+    defer gpa.free(gq);
+    const uq = try gpa.alloc(i8, d * f);
+    defer gpa.free(uq);
+    const dq = try gpa.alloc(i8, d * f);
+    defer gpa.free(dq);
+    const gs = try gpa.alloc(f32, f);
+    defer gpa.free(gs);
+    const us = try gpa.alloc(f32, f);
+    defer gpa.free(us);
+    const ds = try gpa.alloc(f32, d);
+    defer gpa.free(ds);
+    const t0 = ane_mod.nowNs();
+    for (0..layers) |li| {
+        const ly = &m.layers[li];
+        if (ly.shared[0].outDim() != f or ly.shared[2].outDim() != d) return error.Dsv41WeightLayout;
+        try linF32(m, &ly.shared[0], d, wf);
+        ane_mod.quantizeRows(wf, f, d, gq, gs);
+        try linF32(m, &ly.shared[1], d, wf);
+        ane_mod.quantizeRows(wf, f, d, uq, us);
+        try linF32(m, &ly.shared[2], f, wf);
+        ane_mod.quantizeRows(wf, d, f, dq, ds);
+        try progs.addLayer(li, gq, gs, uq, us, dq, ds, c.swiglu_limit);
+    }
+    const t1 = ane_mod.nowNs();
+    try progs.finish();
+    const st = try gpa.create(AneState);
+    errdefer gpa.destroy(st);
+    st.* = .{ .progs = progs, .chunk_rows = chunk, .min_rows = envUsize("SUSHI_DS41_ANE_MIN_ROWS", chunk), .layers = layers };
+    if (std.c.getenv("SUSHI_DS41_ANE_MODE")) |mv| st.mode = std.meta.stringToEnum(AneState.Mode, std.mem.span(mv)) orelse .plain;
+    st.idle_ns = envUsize("SUSHI_DS41_ANE_IDLE_MS", 2000) * 1_000_000;
+    log.info("[sushi_ds41] ane shared: {d} layers x {d}x{d} SwiGLU (limit {d}), {d} unit(s) of {d} rows, chunks of {d}..{d} rows, mode {s}; weights {d:.1} s, programs {d:.1} s\n", .{
+        layers, d, f, c.swiglu_limit, units, progs.rows, st.min_rows, chunk, @tagName(st.mode), @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(ane_mod.nowNs() - t1)) / 1e9,
+    });
+    try aneSelfCheck(m, st);
+    return st;
+}
+
+/// `h` (`[rows, dim]`, rows <= chunk) as the units' channel-major fp16 slabs, zero-padded to the chunk.
+fn aneInput(sc: *Scope, st: *const AneState, h: A) !A {
+    const rows = dim(h, 0);
+    const d = dim(h, 1);
+    var x = try sc.astype(h, .float16);
+    if (rows < st.chunk_rows) x = try sc.concat(&.{ x, try sc.zeros(&.{ ci(st.chunk_rows - rows), ci(d) }, .float16) }, 0);
+    const nu = st.progs.n_units;
+    return sc.contiguous(try sc.transpose(try sc.reshape(x, &.{ ci(nu), ci(st.progs.rows), ci(d) }), &.{ 0, 2, 1 }));
+}
+
+/// The units' outputs as f32 `[rows, dim]`.
+fn aneOutput(sc: *Scope, st: *const AneState, rows: usize, d: usize) !A {
+    var parts: [ane_mod.max_units]A = undefined;
+    const shape = [_]c_int{ ci(d), ci(st.progs.rows) };
+    for (0..st.progs.n_units) |u| parts[u] = try sc.keep(mlx.mlx_array_new_data(st.progs.output(u), &shape, 2, .float16));
+    const y = try sc.t2(try sc.concat(parts[0..st.progs.n_units], 1)); // [chunk, d]
+    return sc.astype(try sc.slice(y, 0, 0, rows), .float32);
+}
+
+fn aneSelfCheck(m: *Model, st: *AneState) !void {
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    const d = m.cfg.dim;
+    var hn = mlx.mlx_array_new();
+    const shape = [_]c_int{ ci(st.chunk_rows), ci(d) };
+    const h = try sc.res(mlx.mlx_random_normal(&hn, &shape, 2, m.act, 0, 1, none, m.s), &hn);
+    const ref = try sc.astype(try sharedExpert(&sc, m, 0, &m.layers[0], h), .float32);
+    const x = try aneInput(&sc, st, h);
+    try evalAll(&.{ ref, x });
+    const ptr: [*]const f16 = @ptrCast(@alignCast(mlx.mlx_array_data_uint8(x) orelse return error.HostRead));
+    const ran = st.progs.run(0, ptr);
+    if (!ran.ok) return error.AneSharedEval;
+    const y = try aneOutput(&sc, st, st.chunk_rows, d);
+    const dot = try sc.sum(try sc.reshape(try sc.mul(y, ref), &.{-1}), 0, false);
+    const ny = try sc.sum(try sc.reshape(try sc.mul(y, y), &.{-1}), 0, false);
+    const nr = try sc.sum(try sc.reshape(try sc.mul(ref, ref), &.{-1}), 0, false);
+    const v = [3]f32{ (try sc_mod.hostF32(dot))[0], (try sc_mod.hostF32(ny))[0], (try sc_mod.hostF32(nr))[0] };
+    const cos = v[0] / @sqrt(v[1] * v[2]);
+    log.info("[sushi_ds41] ane shared: self-check layer 0, {d} random rows: cos {d:.6} vs the GPU chain, |ane|/|gpu| {d:.4}, unit ms {d:.2}/{d:.2}\n", .{ st.chunk_rows, cos, @sqrt(v[1] / v[2]), @as(f64, @floatFromInt(ran.unit_ns[0])) / 1e6, @as(f64, @floatFromInt(ran.unit_ns[1])) / 1e6 });
+    if (!(cos > 0.99)) return error.AneSharedSelfCheck;
+}
+
+/// Layer `li`'s routed experts and shared expert of a wide chunk, the shared expert on the Neural Engine while the
+/// GPU runs the routed ones. Evaluated. Null where the ANE does not take this layer (the GPU path serves).
+fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Layer, h: A, hk: Experts.Hook, r: kernels.Routes) !?A {
+    const rows = dim(h, 0);
+    if (st.disabled or m.tap != null or li >= st.layers or rows < st.min_rows or rows > st.chunk_rows) return null;
+    if (li == 0) {
+        st.chunk = .{};
+        st.chunks += 1;
+        st.chunk_skip = false;
+        st.joinWarm();
+        const now = ane_mod.nowNs();
+        const idle = st.last_ns == 0 or now - st.last_ns > st.idle_ns;
+        st.chunk.idle_s = if (st.last_ns == 0) -1 else @as(f64, @floatFromInt(now - st.last_ns)) / 1e9;
+        if (idle and st.mode != .plain) {
+            st.kickWarm();
+            st.chunk_skip = st.mode == .skip_idle;
+            // warm_idle: layer 0 on the GPU while the dies wake.
+            if (st.mode == .warm_idle) return null;
+        }
+    }
+    if (st.chunk_skip) return null;
+    st.joinWarm();
+    const t0 = ane_mod.nowNs();
+    const x = try aneInput(sc, st, h);
+    try submit(x);
+    const routed = try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, .none);
+    try submit(routed);
+    const t1 = ane_mod.nowNs();
+    try mlx.check(mlx.mlx_array_eval(x));
+    const t2 = ane_mod.nowNs();
+    const ptr: [*]const f16 = @ptrCast(@alignCast(mlx.mlx_array_data_uint8(x) orelse return error.HostRead));
+    const ran = st.progs.run(li, ptr);
+    const t3 = ane_mod.nowNs();
+    st.last_ns = t3;
+    if (!ran.ok) {
+        st.fails += 1;
+        if (st.fails == 1) log.warn("[sushi_ds41] ane shared: eval failed at layer {d}; this layer falls back to the GPU\n", .{li});
+        if (st.fails >= 8) {
+            st.disabled = true;
+            log.warn("[sushi_ds41] ane shared: {d} failures, off for the rest of this run\n", .{st.fails});
+        }
+        const out = try sc.astype(try sc.add(routed, try sc.astype(try sharedExpert(sc, m, li, ly, h), .float32)), m.act);
+        try mlx.check(mlx.mlx_array_eval(out));
+        return out;
+    }
+    st.evals += st.progs.n_units;
+    const y = try aneOutput(sc, st, rows, dim(h, 1));
+    const out = try sc.astype(try sc.add(routed, y), m.act);
+    const t4 = ane_mod.nowNs();
+    try mlx.check(mlx.mlx_array_eval(out));
+    const t5 = ane_mod.nowNs();
+    const a = &st.chunk;
+    const ane_ns = t3 - t2;
+    if (a.layers == 0) {
+        a.ane_first = ane_ns;
+        a.first_tail = t5 - t4;
+    }
+    a.layers += 1;
+    a.build += t1 - t0;
+    a.hwait += t2 - t1;
+    a.ane += ane_ns;
+    a.ane_max = @max(a.ane_max, ane_ns);
+    a.wrap += t4 - t3;
+    a.tail += t5 - t4;
+    if (li + 1 == st.layers) st.report(rows);
+    return out;
+}
+
 fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
     const img = sh.img;
     const c = &m.cfg;
@@ -2459,6 +2735,14 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
                 sh.spec.?.pred_layer = target.?;
             }
             try submit(out);
+            return out;
+        }
+        if (m.ane) |st| if (li < c.layers and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX) {
+            if (try aneMoe(sc, m, st, li, ly, h, hk, r)) |out| return out;
+        };
+        if (m.skip_shared and li < c.layers and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX) {
+            const out = try sc.astype(try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, .none), m.act);
+            try mlx.check(mlx.mlx_array_eval(out));
             return out;
         }
         // At decode widths the GPU runs the shared expert while the host reads the picks and fills the misses, and the

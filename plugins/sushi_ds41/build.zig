@@ -14,6 +14,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "mlx_host", .module = root }},
     });
     root.addImport("sushi_exl3", exl3);
+    // The Neural Engine runtime (a copy of mlx-serve's lib/ane, symbols renamed `s41_` so they never bind to the host's
+    // `msv_` copy): the shared expert's prefill programs (`SUSHI_DS41_ANE_SHARED`).
+    const objc = &[_][]const u8{ "-O3", "-fobjc-arc", "-Wno-deprecated-declarations" };
+    root.addCSourceFile(.{ .file = b.path("src/ane/ane_bridge.m"), .flags = objc });
+    root.addCSourceFile(.{ .file = b.path("src/ane/ane_mlp.m"), .flags = objc });
+    root.addIncludePath(b.path("src/ane"));
+    root.linkFramework("Foundation", .{});
+    root.linkFramework("IOSurface", .{});
     // The kit's test step roots config.zig, which needs the vendored module; this one roots the plugin and leaves MLX
     // undefined (the tests never call it).
     const tests = b.addTest(.{ .root_module = root, .filters = &.{"sushi_ds41"} });
