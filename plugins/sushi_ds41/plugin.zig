@@ -342,6 +342,8 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     const host = hostIds(m, f) catch return Verdict.refuse(.failed, "sushi_ds41: the token ids do not read back");
     defer host.deinit();
     const pos: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
+    // A forward between rounds (a prefill, a plain step) is not the engine's time between rounds.
+    roundProf().exit = null;
     if (pos == 0) reset(m);
     const st = dsv.ensureState(m.mdl) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
     if (st.n != pos) return Verdict.refuse(.failed, "sushi_ds41: the position does not follow the model's state");
@@ -816,6 +818,66 @@ fn now() std.Io.Timestamp {
     return std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake);
 }
 
+/// Diagnostic (`SUSHI_DS41_ROUND_PROF`): where a greedy round's wall time goes, logged as the mean of 256 rounds.
+/// `engine` is the host's time between rounds (the engine's side, then the round's entry), `draft_wait` the part of
+/// `draft` spent waiting for its ids, `verify` the host building and submitting the verify, `wait` the argmax's wait
+/// for the verify's GPU tail.
+const RoundProf = struct {
+    const Phase = enum { engine, copy, draft, draft_wait, plan, verify, wait, close };
+    on: bool,
+    active: bool = false,
+    at: std.Io.Timestamp = undefined,
+    exit: ?std.Io.Timestamp = null,
+    rounds: u64 = 0,
+    ms: [std.meta.tags(Phase).len]f64 = @splat(0),
+
+    fn begin(self: *RoundProf) void {
+        if (!self.on) return;
+        self.active = true;
+        self.at = self.exit orelse now();
+        self.lap(.engine);
+    }
+
+    fn lap(self: *RoundProf, phase: Phase) void {
+        if (!self.active) return;
+        const t = now();
+        self.ms[@intFromEnum(phase)] += @as(f64, @floatFromInt(self.at.untilNow(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds)) / 1e6;
+        self.at = t;
+        if (phase == .draft) {
+            const w = @as(f64, @floatFromInt(dsv.draft_wait_ns)) / 1e6;
+            self.ms[@intFromEnum(Phase.draft)] -= w;
+            self.ms[@intFromEnum(Phase.draft_wait)] += w;
+        }
+    }
+
+    fn end(self: *RoundProf) void {
+        if (!self.active) return;
+        self.lap(.close);
+        self.active = false;
+        self.exit = self.at;
+        self.rounds += 1;
+        if (self.rounds < 256) return;
+        const n: f64 = @floatFromInt(self.rounds);
+        var total: f64 = 0;
+        for (self.ms) |v| total += v;
+        const p = self.ms;
+        log.info("[sushi_ds41] round-prof ms (mean of {d}): engine {d:.3} copy {d:.3} draft {d:.3} draft_wait {d:.3} plan {d:.3} verify {d:.3} wait {d:.3} close {d:.3} total {d:.3}\n", .{ self.rounds, p[0] / n, p[1] / n, p[2] / n, p[3] / n, p[4] / n, p[5] / n, p[6] / n, p[7] / n, total / n });
+        self.rounds = 0;
+        self.ms = @splat(0);
+    }
+};
+
+var round_prof: RoundProf = .{ .on = false };
+var round_prof_read = false;
+
+fn roundProf() *RoundProf {
+    if (!round_prof_read) {
+        round_prof_read = true;
+        round_prof.on = std.c.getenv("SUSHI_DS41_ROUND_PROF") != null;
+    }
+    return &round_prof;
+}
+
 /// Checks shared by the round's entry points; the state the round starts from.
 fn roundEntry(m: *Model, f: *const abi.Forward, out: *const abi.ForwardOut) ?Verdict {
     if (out.size < @sizeOf(abi.ForwardOut)) return Verdict.refuse(.unsupported, "sushi_ds41: the host's ForwardOut has no round");
@@ -845,11 +907,15 @@ fn nativeStep(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callc
     if (roundEntry(m, f, out)) |refused| return refused;
     if (armAblation(m, f)) |refused| return refused;
     defer ablation.disarm(m.mdl);
+    const rp = roundProf();
+    rp.begin();
+    defer rp.end();
     const suppress: ?mlx.mlx_array = if (f.suppress_mask.ctx != null) .{ .ctx = f.suppress_mask.ctx } else null;
     var open = openRound(m, f.tokens.slice()[0], f.accept_cap) catch |e| return roundFailed(e);
     defer _ = mlx.mlx_array_free(open.logits);
     const best = argmaxRows(m, open.logits, suppress, open.rows) catch |e| return roundFailed(e);
     defer gpa.free(best);
+    rp.lap(.wait);
     var accepted: usize = 0;
     while (accepted + 1 < open.rows and best[accepted] == open.ids[1 + accepted]) accepted += 1;
     closeRound(m, &open, accepted, &out.round) catch |e| return roundFailed(e);
@@ -901,7 +967,10 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
     const draft_start = now();
     var o: Open = .{ .ids = undefined, .rows = 1, .conf = @splat(0), .block_len = 1, .drafted = false, .copied = false, .draft_ms = 0, .verify_start = undefined, .logits = .{ .ctx = null } };
     o.ids[0] = t1;
-    if (try copyDrafts(m, t1, cap, o.ids[1..])) |n| {
+    const rp = roundProf();
+    const copied = try copyDrafts(m, t1, cap, o.ids[1..]);
+    rp.lap(.copy);
+    if (copied) |n| {
         o.rows = 1 + n;
         o.block_len = 1 + n;
         o.drafted = true;
@@ -917,11 +986,13 @@ fn openRound(m: *Model, t1: u32, cap: u32) !Open {
         o.block_len = @min(block.ids.len, max_drafts + 1);
         @memcpy(o.ids[0..o.block_len], block.ids[0..o.block_len]);
         @memcpy(o.conf[0 .. o.block_len - 1], block.conf[0 .. o.block_len - 1]);
+        rp.lap(.draft);
     }
     o.draft_ms = nanosSince(draft_start);
     const wanted: usize = if (plain) 1 else m.policy.rows(o.conf[0 .. o.block_len - 1]);
     const rows = std.math.clamp(wanted, 1, @min(@as(usize, cap) + 1, max_verify_rows));
     o.rows = @min(rows, o.block_len);
+    rp.lap(.plan);
     return verifyOpen(m, o);
 }
 
@@ -951,6 +1022,7 @@ fn verifyOpen(m: *Model, open: Open) !Open {
     defer m.mdl.head_wait = true;
     o.logits = try dsv.verify(m.mdl, o.ids[0..o.rows]);
     m.engine.finishForward(o.rows);
+    roundProf().lap(.verify);
     return o;
 }
 

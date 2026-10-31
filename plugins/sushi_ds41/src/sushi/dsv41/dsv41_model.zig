@@ -3122,6 +3122,8 @@ const Unresolved = struct {
     }
 };
 
+/// The last draft's wait for its ids and confidences (the host's one read of the draft), for a caller's round profile.
+pub var draft_wait_ns: u64 = 0;
 pub var spec_kept: u64 = 0;
 pub var spec_rebuilt: u64 = 0;
 
@@ -3818,7 +3820,9 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     const all = try sc.concat(picks[0..B], 0);
     const heads = if (with_heads) try sc.concat(rows[0..B], 0) else all;
     const conf = if (with_conf) try sc.reshape(try sc.concat(confs[0..B], 0), &.{ci(B)}) else all;
+    const wait_t0 = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake);
     try evalAll(&.{ all, heads, conf });
+    draft_wait_ns = @intCast(wait_t0.untilNow(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds);
     var out: Draft = .{ .gpa = gpa, .ids = &.{}, .logits = &.{}, .conf = &.{} };
     errdefer out.deinit();
     out.ids = try gpa.alloc(u32, B + 1);
