@@ -214,10 +214,12 @@ pub const TruthErr = struct { rms: f64, max: f64 };
 pub fn testErrVsTruth(y: mlx.mlx_array, truth: mlx.mlx_array, s: mlx.mlx_stream) !TruthErr {
     const n = mlx.mlx_array_size(truth);
     if (mlx.mlx_array_size(y) != n) return error.ShapeMismatch;
-    const a = try testing.allocator.alloc(f32, n);
-    defer testing.allocator.free(a);
-    const b = try testing.allocator.alloc(f32, n);
-    defer testing.allocator.free(b);
+    // Not `testing.allocator`: the kit's blocks check compiles every public function outside a test, where that
+    // allocator is a `@compileError`.
+    const a = try std.heap.page_allocator.alloc(f32, n);
+    defer std.heap.page_allocator.free(a);
+    const b = try std.heap.page_allocator.alloc(f32, n);
+    defer std.heap.page_allocator.free(b);
     try testReadF32(y, a, s);
     try testReadF32(truth, b, s);
     var sq: f64 = 0;
