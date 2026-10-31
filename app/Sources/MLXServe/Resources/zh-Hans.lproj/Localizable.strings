@@ -2401,7 +2401,14 @@
 "Picture" = "图片类型";
 "Gaussians" = "高斯数量";
 "Render" = "渲染图";
-"A render or generated image fills the frame; a photo leaves room around the object." = "渲染图或生成的图像会占满画面；照片则在物体周围留出空间。";
-"More Gaussians keep finer detail and make a larger file (about 60 bytes each)." = "高斯越多，细节越精细，文件也越大（每个约 60 字节）。";
+"How tightly Idol frames the object once it is cut out. Render fills the frame (renders and generated images); Photo leaves a margin around the object (real photographs)." = "抠出物体后 Idol 的取景松紧。渲染图会占满画面（适用于渲染图和生成的图像）；照片会在物体周围留出边距（适用于真实照片）。";
+"The object is a cloud of Gaussians, small coloured 3D blobs. More keep finer detail and make a larger file (about 60 bytes each)." = "物体由大量高斯组成，即彩色的小型 3D 光斑。越多，细节越精细，文件也越大（每个约 60 字节）。";
 "One object, any background: the model cuts the subject out itself. A cutout with a transparent background is used as is." = "单个物体，背景不限：模型会自己抠出主体。带透明背景的抠图将直接使用。";
 "Best for turning a photo into a Gaussian splat" = "最适合把照片变成高斯点云";
+"Photo to 3D: one picture in, a 3D Gaussian splat out." = "照片转 3D：输入一张图片，生成 3D 高斯点云。";
+"Recommended. Turns one photo or render into a 3D Gaussian splat: a cloud of coloured points you can orbit in the app, save as .ply or open in any viewer. It cuts the subject out of the picture itself and is light on memory." = "推荐。把一张照片或渲染图变成 3D 高斯点云：由彩色点组成的点云，可在应用中环绕查看，保存为 .ply，或用任意查看器打开。它会自己把主体从图片中抠出，内存占用也小。";
+"More steps refine the shape further and take longer." = "步数越多，形状越精细，耗时也越长。";
+"How strongly the shape is pushed toward your photo. Higher follows it more closely." = "形状向你的照片靠拢的力度。数值越高，越贴近照片。";
+"The size of the picture painted onto the surface. Larger keeps finer surface detail and uses more memory." = "贴在表面上的图片尺寸。越大，表面细节越精细，占用内存也越多。";
+"How many refinement passes Idol makes. Time grows with the count; 50 is the published setting, and fewer steps finish sooner but refine the result less." = "Idol 进行多少次细化。耗时随步数增加；50 是官方发布的设置，步数越少完成越快，但结果的细化程度也越低。";
+"How strongly Idol is pushed toward your picture. Higher follows it more closely. 0 turns guidance off and makes each step about twice as fast." = "Idol 向你的图片靠拢的力度。数值越高，越贴近图片。设为 0 会关闭引导，每一步的速度约快一倍。";

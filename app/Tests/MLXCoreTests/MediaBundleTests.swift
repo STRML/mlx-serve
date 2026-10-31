@@ -892,6 +892,7 @@ final class MediaBundleTests: XCTestCase {
         assertUnique(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertUnique(VideoModelPreset.all, "video")
         assertUnique(MusicModelPreset.all, "music")
+        assertUnique(Model3DModelPreset.modelBrowserCatalog, "3d")
     }
 
     /// Every preset resolves to a real bundle with a primary repo and a
@@ -907,6 +908,7 @@ final class MediaBundleTests: XCTestCase {
         assertDisplayable(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertDisplayable(VideoModelPreset.all, "video")
         assertDisplayable(MusicModelPreset.all, "music")
+        assertDisplayable(Model3DModelPreset.modelBrowserCatalog, "3d")
     }
 
     /// Every preset needs a real, non-stub plain-English description — the
@@ -922,6 +924,12 @@ final class MediaBundleTests: XCTestCase {
         assertDescribed(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertDescribed(VideoModelPreset.all, "video")
         assertDescribed(MusicModelPreset.all, "music")
+        assertDescribed(Model3DModelPreset.modelBrowserCatalog, "3d")
+    }
+
+    /// 3D has a catalogue of four for its Create pane, but the Media tab lists the recommended model alone.
+    func testTheMediaTabListsOnlyIdolFor3D() {
+        XCTAssertEqual(Model3DModelPreset.modelBrowserCatalog, [.idol_8bit])
     }
 
     // MARK: - MediaModelPreset.meetsSystemRequirements

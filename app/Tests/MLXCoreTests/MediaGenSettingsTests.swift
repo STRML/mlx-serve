@@ -392,7 +392,14 @@ final class MediaGenSettingsTests: XCTestCase {
         s.modelId = Model3DModelPreset.hunyuan3d21_8bit.id
         XCTAssertEqual(s.resolvedModel.id, Model3DModelPreset.hunyuan3d21_8bit.id)
         s.modelId = "nope/nope"
-        XCTAssertEqual(s.resolvedModel.id, Model3DModelPreset.hunyuan3d21_8bit.id)
+        XCTAssertEqual(s.resolvedModel.id, Model3DModelPreset.idol_8bit.id)
+    }
+
+    /// Idol is the recommended 3D model: a pane nobody has used starts on it and leads its picker. A pick already
+    /// saved (the test above) is the user's and is kept.
+    func testModel3DStartsOnIdol() {
+        XCTAssertEqual(Model3DGenSettings().resolvedModel, .idol_8bit)
+        XCTAssertEqual(Model3DModelPreset.all.first, .idol_8bit)
     }
 
     func testModel3DDefaultsMatchThePreset() {

@@ -1513,6 +1513,8 @@ struct Model3DModelPreset: Identifiable, Hashable {
     /// Which backend answers `/v1/3d/generations` for this checkpoint; it decides the request fields,
     /// the pane's controls and how the photo is cut out.
     var family: Model3DFamily = .hunyuan3d
+    /// What the Models browser says under the model: set for the presets it lists (`modelBrowserCatalog`), empty for the rest.
+    var description: String = ""
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -1551,7 +1553,8 @@ struct Model3DModelPreset: Identifiable, Hashable {
     /// ~3.6 GB resident at peak (a float16 pack, `ddalcu/Idol-MLX-Serve-fp16`, is the quality reference).
     static let idol_8bit = Model3DModelPreset(
         id: "idol-8bit", name: "Idol (8-bit)", repo: "ddalcu/Idol-MLX-Serve-8bit",
-        approxRAMGB: 6, approxDownloadGB: 3.0, family: .idol)
+        approxRAMGB: 6, approxDownloadGB: 3.0, family: .idol,
+        description: "Recommended. Turns one photo or render into a 3D Gaussian splat: a cloud of coloured points you can orbit in the app, save as .ply or open in any viewer. It cuts the subject out of the picture itself and is light on memory.")
 
     /// Family templates for a pack on disk: it joins the picker through `CustomMediaModels`, synthesized from these.
     static let trellis2Family = Model3DModelPreset(
@@ -1561,8 +1564,14 @@ struct Model3DModelPreset: Identifiable, Hashable {
     static let idolFamily = Model3DModelPreset(
         id: "idol", name: "Idol", repo: "", approxRAMGB: 6, approxDownloadGB: 0, family: .idol)
 
+    /// The recommended model: first in the picker, and what a pane nobody has used (or whose saved model is gone) starts on.
+    static let recommended = idol_8bit
+
     /// Catalog. Order matters: the picker leads with the first of the largest that fits (`MediaModelPicks.featured`).
-    static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit, .trellis2_8bit, .pixal3d_8bit, .idol_8bit]
+    static let all: [Model3DModelPreset] = [.recommended, .hunyuan3d21_8bit, .trellis2_8bit, .pixal3d_8bit]
+
+    /// What the Models browser's Media tab lists for 3D: the recommended model alone.
+    static let modelBrowserCatalog: [Model3DModelPreset] = [.recommended]
 }
 
 /// The 3D backends behind one endpoint. They share `image` and `seed` and nothing else.

@@ -609,7 +609,7 @@ enum VideoAudioSource: String, Codable {
 // MARK: - 3D
 
 struct Model3DGenSettings: Codable, Equatable {
-    var modelId: String = Model3DModelPreset.hunyuan3d21_8bit.id
+    var modelId: String = Model3DModelPreset.recommended.id
     var steps: Int = 30
     var guidance: Double = 5.0
     /// Marching-cubes octree resolution (128 / 256 / 384 — the reference
@@ -661,7 +661,7 @@ extension Model3DGenSettings {
     func resolvedModel(models: [ModelInfo]) -> Model3DModelPreset {
         Model3DModelPreset.all.first { $0.id == modelId }
             ?? CustomMediaModels.meshPreset(for: modelId, from: models)
-            ?? .hunyuan3d21_8bit
+            ?? .recommended
     }
 
     init(from decoder: Decoder) throws {

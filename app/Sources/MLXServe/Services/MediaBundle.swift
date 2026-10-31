@@ -730,15 +730,8 @@ extension SoundModelPreset {
 
 // MARK: - Media pane generic surface
 
-/// Common surface every media-gen preset (image/audio/video/music) exposes to
-/// the Model Browser's Media tab, so ONE generic row renders all four
-/// modalities instead of four near-duplicate views. `Model3DModelPreset`
-/// deliberately does NOT conform — the Media tab covers exactly the four
-/// modalities the user asked for; 3D stays its own thing for now.
-/// What every media preset — INCLUDING 3D — can say about its cost. Split out
-/// of `MediaModelPreset` so a Create pane's picker can rank all five catalogues
-/// (`MediaModelPicks`) without dragging 3D into the Model Browser's Media tab,
-/// which is what conforming it to the fuller protocol below would do.
+/// What every media preset can say about its cost: all a Create pane's picker
+/// (`MediaModelPicks`) needs to rank a catalogue.
 protocol MediaModelSizing: Identifiable where ID == String {
     var name: String { get }
     /// Peak unified-memory footprint, GB — already the full RAM-needed
@@ -757,6 +750,10 @@ extension MediaModelSizing {
     }
 }
 
+/// Common surface every media-gen preset exposes to the Model Browser's Media
+/// tab, so ONE generic row renders every modality instead of near-duplicate
+/// views. The tab lists each modality's whole catalogue except 3D's, where it
+/// lists `Model3DModelPreset.modelBrowserCatalog` alone.
 protocol MediaModelPreset: MediaModelSizing, Hashable {
     var bundle: MediaBundle { get }
     /// Plain-English explanation shown under the model in the Media pane —
@@ -769,5 +766,4 @@ extension AudioModelPreset: MediaModelPreset {}
 extension VideoModelPreset: MediaModelPreset {}
 extension MusicModelPreset: MediaModelPreset {}
 extension SoundModelPreset: MediaModelPreset {}
-// Sizing only — see `MediaModelSizing`: 3D stays out of the Media tab.
-extension Model3DModelPreset: MediaModelSizing {}
+extension Model3DModelPreset: MediaModelPreset {}

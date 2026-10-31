@@ -33,6 +33,7 @@ struct ModelBrowserPane: View {
             + readyCount(VideoModelPreset.all)
             + readyCount(MusicModelPreset.all)
             + readyCount(SoundModelPreset.all)
+            + readyCount(Model3DModelPreset.modelBrowserCatalog)
         return .live(localModelCount: appState.localModels.count,
                      activeDownloadCount: activeDownloads.count,
                      mediaReadyCount: media)
@@ -950,10 +951,11 @@ private struct DownloadsPane: View {
 
 // MARK: - Media pane
 
-/// Every media-generation model (image/audio/video/music), grouped by
-/// modality. Its own sidebar destination — there's one catalog per modality
-/// and none of them are large enough to need Discover-style search, so one
-/// scrollable page beats splitting each modality into its own sidebar row.
+/// Every media-generation model (image/audio/video/music/sound), plus the
+/// recommended 3D one, grouped by modality. Its own sidebar destination —
+/// there's one catalog per modality and none of them are large enough to need
+/// Discover-style search, so one scrollable page beats splitting each
+/// modality into its own sidebar row.
 private struct MediaPane: View {
     private var physicalMemory: UInt64 { ProcessInfo.processInfo.physicalMemory }
 
@@ -1003,6 +1005,14 @@ private struct MediaPane: View {
                 ) {
                     ForEach(SoundModelPreset.all) { MediaModelRow(preset: $0, modality: .sound, physicalMemoryBytes: physicalMemory) }
                 }
+                ModelGroupSection(
+                    title: "3D",
+                    subtitle: "Photo to 3D: one picture in, a 3D Gaussian splat out.",
+                    systemImage: "cube.transparent",
+                    tint: .purple
+                ) {
+                    ForEach(Model3DModelPreset.modelBrowserCatalog) { MediaModelRow(preset: $0, modality: .mesh, physicalMemoryBytes: physicalMemory) }
+                }
             }
             .padding(16)
         }
@@ -1041,7 +1051,7 @@ private struct ModelGroupSection<Content: View>: View {
     }
 }
 
-/// One row for any media preset (image/audio/video/music) — generic over
+/// One row for any media preset — generic over
 /// `MediaModelPreset` so the four modalities share this instead of four
 /// near-duplicate views. Download/progress/retry mirrors `BundleDownloadBar`.
 ///

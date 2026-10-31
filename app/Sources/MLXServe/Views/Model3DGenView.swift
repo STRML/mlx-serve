@@ -20,7 +20,7 @@ struct Model3DGenView: View {
     @EnvironmentObject var appState: AppState
 
     @State private var photoURL: URL? = nil
-    @State private var model: Model3DModelPreset = .hunyuan3d21_8bit
+    @State private var model: Model3DModelPreset = .recommended
     /// Selected network model's routing id (`<model>@<peer>`); nil = local.
     @State private var lanModel: String? = nil
     @State private var steps: Int = 30
@@ -183,12 +183,11 @@ struct Model3DGenView: View {
                               isTargeted: isDropTargeted) { choosePhoto() }
                 // The well says how to add a photo; what is left to say is
                 // which photo works.
-                Text(L10n.text(model.family.sendsRawPhoto
+                fieldNote(model.family.sendsRawPhoto
                      ? "One object, any background: the model cuts the subject out itself. A cutout with a transparent background is used as is."
                      : model.family.cutoutKeepsAlpha
                      ? "A single, well-lit photo of one object works best. A cutout with a transparent background is used as is; otherwise the subject is auto-cut."
-                     : "A single, well-lit photo of one object works best. The subject is auto-cut from its background."))
-                    .font(.app(.caption2)).foregroundStyle(.secondary)
+                     : "A single, well-lit photo of one object works best. The subject is auto-cut from its background.")
             }
         }
         // One photo slot, so a drop replaces what's there — see
@@ -213,8 +212,10 @@ struct Model3DGenView: View {
     }
 
     @ViewBuilder private var hunyuanControls: some View {
-        intSliderRow("Steps", value: $steps, range: 10...50)
-        sliderRow("Guidance", value: $guidance, range: 1...10, step: 0.5)
+        intSliderRow("Steps", value: $steps, range: 10...50,
+                     note: "More steps refine the shape further and take longer.")
+        sliderRow("Guidance", value: $guidance, range: 1...10, step: 0.5,
+                  note: "How strongly the shape is pushed toward your photo. Higher follows it more closely.")
         VStack(alignment: .leading, spacing: 4) {
             Text("Mesh resolution").font(.app(.rowTitle))
             Picker("", selection: $resolution) {
@@ -224,7 +225,7 @@ struct Model3DGenView: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            Text("Higher = finer mesh, more memory and time.").font(.app(.caption2)).foregroundStyle(.secondary)
+            fieldNote("Higher = finer mesh, more memory and time.")
         }
         Toggle("Texture (PBR)", isOn: $texture)
             .font(.app(.caption))
@@ -240,7 +241,8 @@ struct Model3DGenView: View {
                      options: Model3DGenSettings.faceOptions.map { ($0, $0 >= 1_000_000 ? "\($0 / 1_000_000)M" : "\($0 / 1000)k") },
                      note: "More faces keep more detail. At 1M faces and above the file passes 60 MB.")
         segmentedRow("Texture size", selection: $textureSize,
-                     options: [(1024, "1024"), (2048, "2048"), (4096, "4096")], note: nil)
+                     options: [(1024, "1024"), (2048, "2048"), (4096, "4096")],
+                     note: "The size of the picture painted onto the surface. Larger keeps finer surface detail and uses more memory.")
         segmentedRow("Finish", selection: $finish,
                      options: Model3DFinish.allCases.map { ($0, L10n.text($0.title)) },
                      note: "The model decides what is shiny; a finish scales it. A glossier finish shows every bump in the surface.")
@@ -251,15 +253,22 @@ struct Model3DGenView: View {
     @ViewBuilder private var splatControls: some View {
         segmentedRow("Picture", selection: $splatPhoto,
                      options: Model3DPhotoKind.allCases.map { ($0, L10n.text($0.title)) },
-                     note: "A render or generated image fills the frame; a photo leaves room around the object.")
-        intSliderRow("Steps", value: $splatSteps, range: 10...100)
-        sliderRow("Guidance", value: $splatGuidance, range: 0...10, step: 0.5)
+                     note: "How tightly Idol frames the object once it is cut out. Render fills the frame (renders and generated images); Photo leaves a margin around the object (real photographs).")
+        intSliderRow("Steps", value: $splatSteps, range: 10...100,
+                     note: "How many refinement passes Idol makes. Time grows with the count; 50 is the published setting, and fewer steps finish sooner but refine the result less.")
+        sliderRow("Guidance", value: $splatGuidance, range: 0...10, step: 0.5,
+                  note: "How strongly Idol is pushed toward your picture. Higher follows it more closely. 0 turns guidance off and makes each step about twice as fast.")
         segmentedRow("Gaussians", selection: $splatGaussians,
                      options: Model3DGenSettings.gaussianOptions.map { ($0, $0 >= 1_000_000 ? "1M" : "\($0 / 1024)k") },
-                     note: "More Gaussians keep finer detail and make a larger file (about 60 bytes each).")
+                     note: "The object is a cloud of Gaussians, small coloured 3D blobs. More keep finer detail and make a larger file (about 60 bytes each).")
     }
 
-    private func segmentedRow<T: Hashable>(_ label: String, selection: Binding<T>, options: [(T, String)], note: String?) -> some View {
+    /// The line of help under a control.
+    private func fieldNote(_ text: String) -> some View {
+        Text(L10n.text(text)).font(.app(.caption2)).foregroundStyle(.secondary)
+    }
+
+    private func segmentedRow<T: Hashable>(_ label: String, selection: Binding<T>, options: [(T, String)], note: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(L10n.text(label)).font(.app(.rowTitle))
             Picker("", selection: selection) {
@@ -267,15 +276,13 @@ struct Model3DGenView: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            if let note {
-                Text(L10n.text(note)).font(.app(.caption2)).foregroundStyle(.secondary)
-            }
+            fieldNote(note)
         }
     }
 
     /// Labeled slider for a `Double` setting, the value read out on the right.
     private func sliderRow(_ label: String, value: Binding<Double>, range: ClosedRange<Double>,
-                           step: Double) -> some View {
+                           step: Double, note: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text(L10n.text(label)).font(.app(.rowTitle))
@@ -286,11 +293,12 @@ struct Model3DGenView: View {
             }
             Slider(value: value, in: range, step: step)
                 .padding(.top, Self.steppedSliderTrackDrop).font(.app(.body))
+            fieldNote(note)
         }
     }
 
     /// Labeled slider for an `Int` setting (bridges to a `Double` slider).
-    private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {
+    private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>, note: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text(L10n.text(label)).font(.app(.rowTitle))
@@ -308,6 +316,7 @@ struct Model3DGenView: View {
                 step: 1
             )
             .padding(.top, Self.steppedSliderTrackDrop).font(.app(.body))
+            fieldNote(note)
         }
     }
 

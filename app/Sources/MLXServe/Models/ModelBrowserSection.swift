@@ -13,7 +13,7 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
     case myModels
     /// The transfer queue: in-flight and failed downloads.
     case downloads
-    /// Media-gen model catalog (image/audio/video/music), grouped by modality.
+    /// Media-gen model catalog (image/audio/video/music/sound, and the recommended 3D model), grouped by modality.
     case media
     /// Outside plugins: the catalog, installed ones with their switches, and agent install instructions.
     case plugins
@@ -66,7 +66,7 @@ struct ModelBrowserBadgeCounts: Equatable {
     /// Downloading *or* failed — both want the user's attention, and both are
     /// what the Downloads pane lists.
     let activeDownloads: Int
-    /// Media (image/audio/video/music) bundles fully on disk.
+    /// Media bundles fully on disk: the ones the Media pane lists.
     let mediaReady: Int
 
     /// The live counts, from the two objects that hold them. ONE place, because
