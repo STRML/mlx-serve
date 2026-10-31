@@ -1379,7 +1379,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items, 0..) |*e, i| {
             if (e.id != entry_id) continue;
             const payload = e.module orelse return 0;
-            if (!ModuleBinding.same(payload.binding, binding)) return 0;
+            if (!ModuleBinding.same(payload.binding, binding) or payload.binding.variant != binding.variant) return 0;
             var detached = self.entries.swapRemove(i);
             self.current_kv_bytes -|= detached.kv_bytes;
             defer self.releaseModuleEntry(&detached, null);
