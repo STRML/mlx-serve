@@ -8,6 +8,7 @@ const scope_mod = @import("../../mlx/scope.zig");
 const model_mod = @import("../../sdk/weights/load.zig");
 const graph_call = @import("../../sdk/media/graph_call.zig").call;
 const gelu_blk = @import("../../sdk/blocks/mlp/gelu.zig");
+const glue = @import("glue.zig");
 
 pub const A = mlx.mlx_array;
 pub const Scope = scope_mod.Scope;
@@ -61,13 +62,18 @@ pub fn headNorm(sc: *Scope, x: A, gamma: A, ones: A) !A {
     return asDtype(sc, try sc.mul(n, try asDtype(sc, gamma, .float32)), dt);
 }
 
-/// Attention over `[1, L, H, D]` q and `[1, Lk, H, D]` k, v; returns `[1, L, H*D]`.
-pub fn attend(sc: *Scope, q: A, k: A, v: A) !A {
-    const perm = [_]c_int{ 0, 2, 1, 3 };
+/// Attention over heads-major `[1, H, L, D]` q and `[1, H, Lk, D]` k, v; returns `[1, L, H*D]`.
+pub fn attendHeads(sc: *Scope, q: A, k: A, v: A) !A {
     const sh = mlx.getShape(q);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(sh[3])));
-    const o = try sc.sdpa(try sc.transpose(q, &perm), try sc.transpose(k, &perm), try sc.transpose(v, &perm), scale);
-    return sc.reshape(try sc.transpose(o, &perm), &.{ sh[0], sh[1], sh[2] * sh[3] });
+    const o = try sc.sdpa(q, k, v, scale);
+    return sc.reshape(try sc.transpose(o, &.{ 0, 2, 1, 3 }), &.{ sh[0], sh[2], sh[1] * sh[3] });
+}
+
+/// `attendHeads` over `[1, L, H, D]` q and `[1, Lk, H, D]` k, v.
+pub fn attend(sc: *Scope, q: A, k: A, v: A) !A {
+    const perm = [_]c_int{ 0, 2, 1, 3 };
+    return attendHeads(sc, try sc.transpose(q, &perm), try sc.transpose(k, &perm), try sc.transpose(v, &perm));
 }
 
 /// One column group `[1, L, n, D]` of a fused `[1, L, k*n*D]` projection, `i` of `k`.
@@ -132,7 +138,12 @@ pub const Mlp = struct {
     }
 
     pub fn forward(self: *const Mlp, sc: *Scope, x: A) !A {
-        return self.fc2.forward(sc, try geluTanh(sc, try self.fc1.forward(sc, x)));
+        const y = try self.fc1.project(sc, x);
+        const hidden = if (self.fc1.bias) |b|
+            if (try glue.biasGelu(y, b, sc.s)) |g| try sc.keep(g) else try geluTanh(sc, try sc.add(y, b))
+        else
+            try geluTanh(sc, y);
+        return self.fc2.forward(sc, hidden);
     }
 };
 

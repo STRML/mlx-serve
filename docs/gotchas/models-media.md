@@ -678,6 +678,16 @@ request failed `Dsv41VisionRowsMissing`. Cause: the added token splits out of an
 with no rows. Fix: without the request's rows the image token is text (no splice, no VL routing bias, its own Engram
 id); a literal beside a real image stays a named 400. Guard: `dsv41 image token: without image rows it is text`.
 
+### A fused kernel is bit-equal to its chain only if it keeps the chain's roundings and sum order
+Defect: Idol's fused q/k prep (RoPE, RMS norm, head-major layout) flipped about one f16 output in 10^4 against the chain,
+and its first fused GELU missed its bound in the negative tail. Cause: the compiler fused `x0*c - x1*s` into one
+multiply-add (the chain rounds each product); the sum of squares added in another order than MLX's `rms_single_row`
+(thread t sums elements 4t..4t+3, lane t < 16 enters one `simd_sum`); `0.5 x (1 + tanh a)` cancels in f32 where
+`tanh` rounds to -1. Fix: the products in separate statements, the rms order mirrored, GELU as `x / (1 + e^-2a)` (one
+rounding, as PyTorch's fused GELU; the chain's eight f16 roundings flatten that tail). Probe in seconds with
+`mx.fast.metal_kernel` in the Python venv against the Python chain, byte for byte. Guard: `kernel contract idol`
+(the bit-equal gate), `idol oracle: the fused glue keeps the velocity as close to the reference as the chain`.
+
 ## Parity method
 
 ### Fixtures for fp16-fragile giants are dumped fp32 on CPU

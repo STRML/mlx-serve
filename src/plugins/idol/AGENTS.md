@@ -20,6 +20,7 @@ places the anchors (a CPU systematic-sampling descent) -> the Gaussian decoder t
 | `birefnet.zig` | BiRefNet (Swin-L, deformable ASPP decoder as gathers), f32 channels-last |
 | `image.zig` | `preprocess_image` in Pillow's arithmetic (premultiplied resize, `MinFilter(3)`, `paste`) |
 | `splat.zig` | the disc-mesh GLB, the splat GLB (glTF y-up) and the standard 3DGS `.ply` (the reference's `save_ply` axes) |
+| `glue.zig` / `kernels/` / `contract.zig` | the denoiser block's fused passes (q/k RoPE + head norm + head-major layout, fc1 bias + tanh GELU), their launchers and kernel-contract registrations |
 
 ## Rules
 
@@ -38,6 +39,11 @@ places the anchors (a CPU systematic-sampling descent) -> the Gaussian decoder t
   is a multiple of 64 (`tests/convert_idol_weights.py --bits 8`); the VAE's middle attention is always 8-bit (flux2's
   loader reads only quantized ones there).
 - The FLUX.2 VAE ships from the ungated klein repo (the same VAE as FLUX.2-dev's, whose repo is gated).
+- `qkv_prep.metal` is BIT-EQUAL to the chain it replaces: the rope products are separate statements (a fused
+  multiply-add flips f16 roundings) and the sum of squares runs in MLX's `rms_single_row` order. `bias_gelu` is not:
+  `x / (1 + e^-2a)` in f32, one rounding as PyTorch's fused GELU; the chain's eight f16 roundings flatten its tail.
+- `--w8a8` converts the joint blocks' linears (`blocks.*`: qkv, out, mlp) to int8 copies at load (`Weights.w8`, read by
+  `scope.linear`); the refiners, RePo layers and decoders stay packed. Bar: cos 0.9994 to the packed velocity.
 - Viewers ignore per-vertex colour (Preview draws it white) and Preview draws a POINTS primitive as bare dots: the disc
   mesh bakes colour into a texture with nearest sampling. It is opaque, so glassy or hazy regions show one layer of the
   blend (windshields speckle); only a blended renderer fixes that.

@@ -7,6 +7,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const scope_mod = @import("../../mlx/scope.zig");
 const L = @import("layers.zig");
+const glue = @import("glue.zig");
 
 const A = L.A;
 const Scope = L.Scope;
@@ -99,7 +100,7 @@ const Repo = struct {
 };
 
 /// `x` `[1, L, H, 64]` rotated pairwise (even, odd) by `cos`/`sin` `[1, L, H, 32]`, f32 math, x's dtype out.
-fn applyRope(sc: *Scope, x: A, cos: A, sin: A) !A {
+pub fn applyRope(sc: *Scope, x: A, cos: A, sin: A) !A {
     const dt = mlx.mlx_array_dtype(x);
     const sh = mlx.getShape(x);
     const pair = [_]c_int{ sh[0], sh[1], sh[2], @divExact(sh[3], 2), 2 };
@@ -210,26 +211,31 @@ pub const Denoiser = struct {
         return @intCast(self.cfg.num_heads);
     }
 
-    fn block(self: *const Denoiser, sc: *Scope, b: *const Block, x: A, mod: ?A, rope: anytype) !A {
-        const c = self.cfg.model_channels;
+    /// Attention over the fused projection `y`: q and k rotated, then RMS-normalized per head (fused into one pass on
+    /// the GPU), heads-major. Returns `[1, L, C]`.
+    fn attention(self: *const Denoiser, sc: *Scope, b: *const Block, y: A, rope: anytype) !A {
         const h = self.heads();
         const d: c_int = L.HEAD_DIM;
+        if (try glue.qkvPrep(y, b.q_gamma, b.k_gamma, rope.cos, rope.sin, L.HEAD_NORM_EPS, h, sc.s)) |f| {
+            return L.attendHeads(sc, try sc.keep(f.q), try sc.keep(f.k), try sc.keep(f.v));
+        }
+        const q = try L.headNorm(sc, try applyRope(sc, try L.part(sc, y, 3, 0, h, d), rope.cos, rope.sin), b.q_gamma, self.ones);
+        const k = try L.headNorm(sc, try applyRope(sc, try L.part(sc, y, 3, 1, h, d), rope.cos, rope.sin), b.k_gamma, self.ones);
+        return L.attend(sc, q, k, try L.part(sc, y, 3, 2, h, d));
+    }
+
+    fn block(self: *const Denoiser, sc: *Scope, b: *const Block, x: A, mod: ?A, rope: anytype) !A {
+        const c = self.cfg.model_channels;
         if (mod == null) {
             const n1 = try L.asDtype(sc, try sc.layerNorm(try L.asDtype(sc, x, .float32), b.norm1_w.?, b.norm1_b.?, L.LN_EPS), self.act);
-            const y = try b.qkv.forward(sc, n1);
-            const q = try L.headNorm(sc, try applyRope(sc, try L.part(sc, y, 3, 0, h, d), rope.cos, rope.sin), b.q_gamma, self.ones);
-            const k = try L.headNorm(sc, try applyRope(sc, try L.part(sc, y, 3, 1, h, d), rope.cos, rope.sin), b.k_gamma, self.ones);
-            const x1 = try sc.add(x, try b.out.forward(sc, try L.attend(sc, q, k, try L.part(sc, y, 3, 2, h, d))));
+            const x1 = try sc.add(x, try b.out.forward(sc, try self.attention(sc, b, try b.qkv.forward(sc, n1), rope)));
             const n2 = try L.asDtype(sc, try sc.layerNorm(try L.asDtype(sc, x1, .float32), b.norm2_w.?, b.norm2_b.?, L.LN_EPS), self.act);
             return sc.add(x1, try b.mlp.forward(sc, n2));
         }
         const m = try sc.add(mod.?, try L.asLike(sc, b.shift_table.?, mod.?));
         const shift_msa, const scale_msa, const gate_msa, const shift_mlp, const scale_mlp, const gate_mlp = try L.chunks6(sc, m, c);
         const n1 = try L.modulate(sc, try sc.layerNorm(x, NONE, NONE, L.LN_EPS), shift_msa, scale_msa);
-        const y = try b.qkv.forward(sc, n1);
-        const q = try L.headNorm(sc, try applyRope(sc, try L.part(sc, y, 3, 0, h, d), rope.cos, rope.sin), b.q_gamma, self.ones);
-        const k = try L.headNorm(sc, try applyRope(sc, try L.part(sc, y, 3, 1, h, d), rope.cos, rope.sin), b.k_gamma, self.ones);
-        const att = try b.out.forward(sc, try L.attend(sc, q, k, try L.part(sc, y, 3, 2, h, d)));
+        const att = try b.out.forward(sc, try self.attention(sc, b, try b.qkv.forward(sc, n1), rope));
         const x1 = try sc.add(x, try sc.mul(att, gate_msa));
         const n2 = try L.modulate(sc, try sc.layerNorm(x1, NONE, NONE, L.LN_EPS), shift_mlp, scale_mlp);
         return sc.add(x1, try sc.mul(try b.mlp.forward(sc, n2), gate_mlp));

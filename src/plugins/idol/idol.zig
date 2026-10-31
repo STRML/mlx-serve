@@ -17,6 +17,7 @@ const model_mod = @import("../../sdk/weights/load.zig");
 const scope_mod = @import("../../mlx/scope.zig");
 const sse = @import("../../sdk/media/progress.zig");
 const dino = @import("../../sdk/vision/dinov3.zig");
+const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
 const flux = @import("../flux2/flux.zig");
 const L = @import("layers.zig");
 const den = @import("denoiser.zig");
@@ -131,6 +132,10 @@ pub const Engine = struct {
         errdefer self.w_den.deinit();
         try L.castLinears(gpa, &self.w_den, &.{ "blocks.", "noise_refiner.", "context_refiner." }, act);
         try scope_mod.evalAll(&self.w_den);
+        if (w8a8.w8a8State().enabled) {
+            const n = try self.w_den.w8.convert(gpa, &self.w_den.map, .{ .base = "blocks.0.attn.qkv", .in_features = raw.denoiser.args.model_channels }, s);
+            log.info("[idol] int8: {d} denoiser linears\n", .{n});
+        }
         self.denoiser = try den.Denoiser.load(gpa, &self.w_den, raw.denoiser.args, act);
         errdefer self.denoiser.deinit();
 
@@ -402,6 +407,7 @@ test "idol: decode_camera reads a direction, an inverse distance and a half widt
 const env = @import("../../env.zig");
 const t2 = @import("../trellis2/trellis2.zig");
 const splat = @import("splat.zig");
+const glue = @import("glue.zig");
 
 fn envDir(comptime name: []const u8) ![]const u8 {
     return std.mem.span(env.named(name) orelse return error.SkipZigTest);
@@ -504,6 +510,75 @@ test "idol oracle: one velocity, guided and not, matches the reference (IDOL_FIX
     try t2.expectClose("v_camera", &sc, v.camera, fx.get("v_camera").?, 0.995, 0.05);
     const vu = try e.denoiser.velocity(&sc, fx.get("noise_latent").?, fx.get("noise_camera").?, t[0], ctx_u);
     try t2.expectClose("v_latent_uncond", &sc, vu.latent, fx.get("v_latent_uncond").?, 0.995, 0.05);
+}
+
+fn cosine(a: []const f32, b: []const f32) f64 {
+    var dot: f64 = 0;
+    var aa: f64 = 0;
+    var bb: f64 = 0;
+    for (a, b) |x, y| {
+        dot += @as(f64, x) * y;
+        aa += @as(f64, x) * x;
+        bb += @as(f64, y) * y;
+    }
+    return dot / @sqrt(aa * bb);
+}
+
+test "idol oracle: the fused glue keeps the velocity as close to the reference as the chain it replaces (IDOL_FIXTURES, IDOL_PACK)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    var fx = try loadFixtures();
+    defer fx.deinit();
+    const e = try openEngine(s);
+    defer e.deinit();
+    var sc = Scope.init(gpa, s);
+    defer sc.deinit();
+    const t = try t2.hostF32(&sc, fx.get("t").?);
+    const want = try t2.hostF32(&sc, fx.get("v_latent").?);
+    var got: [2][]const f32 = undefined;
+    for (&got, 0..) |*out, arm| {
+        glue.disabled_for_test = arm == 0;
+        defer glue.disabled_for_test = false;
+        const ctx = try sc.keep(try e.denoiser.context(&sc, fx.get("feature1").?, fx.get("feature2").?));
+        out.* = try t2.hostF32(&sc, (try e.denoiser.velocity(&sc, fx.get("noise_latent").?, fx.get("noise_camera").?, t[0], ctx)).latent);
+    }
+    const chain = cosine(got[0], want);
+    const fused = cosine(got[1], want);
+    std.debug.print("idol velocity vs the reference: chain cos {d:.7}, fused cos {d:.7}; fused vs chain {d:.7}\n", .{ chain, fused, cosine(got[0], got[1]) });
+    try testing.expect(cosine(got[0], got[1]) > 0.9999);
+    try testing.expect(fused > chain - 1e-4);
+}
+
+test "idol oracle: the w8a8 route stays within its bar of the packed velocity (IDOL_FIXTURES, IDOL_PACK)" {
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    var fx = try loadFixtures();
+    defer fx.deinit();
+    var sc = Scope.init(gpa, s);
+    defer sc.deinit();
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
+    const t = try t2.hostF32(&sc, fx.get("t").?);
+    var v: [2]A = undefined;
+    for (&v, 0..) |*out, arm| {
+        w8a8.w8a8State().enabled = arm == 1;
+        const e = try openEngine(s);
+        defer e.deinit();
+        const ctx = try sc.keep(try e.denoiser.context(&sc, fx.get("feature1").?, fx.get("feature2").?));
+        out.* = (try e.denoiser.velocity(&sc, fx.get("noise_latent").?, fx.get("noise_camera").?, t[0], ctx)).latent;
+        try mlx.check(mlx.mlx_array_eval(out.*));
+    }
+    w8a8.dropMemo();
+    const g = try w8a8.agreement(v[1], v[0], s);
+    const want = try t2.hostF32(&sc, fx.get("v_latent").?);
+    std.debug.print("idol w8a8 velocity: int8 vs packed cos {d:.6} rms ratio {d:.5}; to the reference packed {d:.6} int8 {d:.6}\n", .{ g.cos, g.rms_ratio, cosine(try t2.hostF32(&sc, v[0]), want), cosine(try t2.hostF32(&sc, v[1]), want) });
+    try testing.expect(g.cos < 0.99999); // the route engaged: packed numerics would be identical
+    try testing.expect(g.cos > 0.998);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), g.rms_ratio, 0.02);
 }
 
 test "idol oracle: the octree logits and the Gaussians match the reference (IDOL_FIXTURES, IDOL_PACK)" {
