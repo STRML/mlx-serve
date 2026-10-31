@@ -798,6 +798,9 @@ pub const Model = struct {
     pipe_q: [pipe_max]A = @splat(none),
     pipe_head: usize = 0,
     pipe_n: usize = 0,
+    /// False: a decode-width pass submits its logits and returns them unevaluated, so the caller's first read of
+    /// them (an argmax, the engine's sampling) is the pass's one wait. A DSpark round turns it off around its verify.
+    head_wait: bool = true,
     /// TEMPORARY A/B: a decode-width STQ layer queues its routed chain from the stream's cache map before the host
     /// reads its picks (`Experts.Spec`); off, it waits for them.
     route_spec: bool = true,
@@ -3409,10 +3412,10 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
         defer msc.deinit();
         const main_rows = try msc.concat(p.targets[0..c.dspark.n_targets], -1); // [L, targets * dim]
         if (p.st.verify) |*v| {
+            // Submitted, not waited on: `finishVerify` only slices it into the stages' lazy commit, so the head's
+            // read below (or the caller's) is the pass's one wait.
             v.mh = msc.out(main_rows);
-            const t0 = readStart();
-            defer readDone(.state, t0);
-            try mlx.check(mlx.mlx_array_eval(v.mh));
+            try submit(v.mh);
         } else try commitMain(&msc, m, p.st, main_rows, p.p0, if (L > exl3.kernels.DECODE_ROWS_MAX) .wait else .lazy);
     }
     if (m.tap) |t| {
@@ -3425,6 +3428,11 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
         pf.restart();
         try pf.mark(.head, &.{res});
         pf.report(L, p.p0);
+    }
+    if (!m.head_wait and L <= exl3.kernels.DECODE_ROWS_MAX and prof(m, L) == null) {
+        try submit(res);
+        reportReads(L);
+        return res;
     }
     const t0 = readStart();
     defer readDone(.head, t0);
@@ -3865,6 +3873,9 @@ pub fn finishVerify(m: *Model, accepted: usize) !void {
     defer sc.deinit();
     const end = v.n0 + keep;
     if (keep < v.rows) {
+        // The cut groups are views the next pass reads: submitted together, never waited on.
+        var cut: std.ArrayList(A) = .empty;
+        defer cut.deinit(m.gpa);
         for (st.layers, 0..) |*ls, li| {
             const r = m.ratio(li);
             if (r == 0) continue;
@@ -3878,8 +3889,13 @@ pub fn finishVerify(m: *Model, accepted: usize) !void {
                 if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
                 ls.pend_kv = if (hi > lo) sc.out(try sc.slice(v.pend_kv[li], 0, lo, hi)) else none;
                 ls.pend_gate = if (hi > lo) sc.out(try sc.slice(v.pend_gate[li], 0, lo, hi)) else none;
-                if (ls.pend_kv.ctx != null) try evalAll(&.{ ls.pend_kv, ls.pend_gate });
+                if (ls.pend_kv.ctx != null) try cut.appendSlice(m.gpa, &.{ ls.pend_kv, ls.pend_gate });
             }
+        }
+        if (cut.items.len > 0) {
+            const vec = mlx.mlx_vector_array_new_data(cut.items.ptr, cut.items.len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_async_eval(vec));
         }
         st.n = end;
         if (st.hist.items.len > end) st.hist.shrinkRetainingCapacity(end);

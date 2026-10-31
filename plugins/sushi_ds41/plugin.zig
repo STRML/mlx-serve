@@ -946,6 +946,9 @@ fn verifyOpen(m: *Model, open: Open) !Open {
     };
     o.verify_start = now();
     m.engine.beginForward();
+    // The logits come back submitted, not evaluated: the round's argmax (or the engine's sampling) is its one wait.
+    m.mdl.head_wait = false;
+    defer m.mdl.head_wait = true;
     o.logits = try dsv.verify(m.mdl, o.ids[0..o.rows]);
     m.engine.finishForward(o.rows);
     return o;
