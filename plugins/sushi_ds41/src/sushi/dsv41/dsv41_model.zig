@@ -2729,6 +2729,9 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
     const t0 = ane_mod.nowNs();
     const x = try if (st.early and st.pack) anePack(sc, st, h) else aneInput(sc, st, h);
     try submit(x);
+    // The router's picks queued right behind the input: the host's read of them then finds them done, so the early
+    // wait for `x` adds no GPU bubble before the routed launches.
+    if (st.early) try submit(r.idx);
     var routed: A = undefined;
     var t1: u64 = 0;
     var t2: u64 = 0;
