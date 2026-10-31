@@ -3545,19 +3545,35 @@ fn prefetchEngram(m: *Model, p: *Pass) !void {
 fn aheadEngram(m: *Model, p: *Pass) !void {
     if (p.ahead_started or p.ahead.len == 0) return;
     p.ahead_started = true;
+    try startEngramAhead(m, p.st, p.ahead);
+}
+
+/// Starts reading the Engram rows of `ids`, the tokens right after the state's history, into `m.engram_ahead`; the
+/// pass over them adopts the read when its rows match (`prefetchEngram`).
+fn startEngramAhead(m: *Model, st: *const State, ids: []const u32) !void {
     const hs = &(m.hash orelse return);
-    if (m.engrams.len == 0) return;
+    if (m.engrams.len == 0 or ids.len == 0) return;
     const gpa = m.gpa;
-    const comp = try gpa.alloc(u32, p.ahead.len);
+    const comp = try gpa.alloc(u32, ids.len);
     defer gpa.free(comp);
-    for (p.ahead, comp) |t, *o| o.* = m.compressedId(t);
+    for (ids, comp) |t, *o| o.* = m.compressedId(t);
     const rows = try gpa.alloc(u32, comp.len * hs.n_layers * hs.cols());
     defer gpa.free(rows);
-    hs.rows(p.st.hist.items, comp, rows);
+    hs.rows(st.hist.items, comp, rows);
     var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
     for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
     m.dropAhead();
-    m.engram_ahead = try engram.Prefetch.start(gpa, tables[0..m.engrams.len], &.{.{ .at = p.st.hist.items.len, .len = comp.len, .ids = rows }}, hs.cols(), comp.len);
+    m.engram_ahead = try engram.Prefetch.start(gpa, tables[0..m.engrams.len], &.{.{ .at = st.hist.items.len, .len = comp.len, .ids = rows }}, hs.cols(), comp.len);
+}
+
+/// A prompt's first chunk, `ids`, known before its forward (the host's begin-prompt call): its embedding and Engram rows
+/// start reading now, so the forward finds them read instead of waiting on the SSD at layer 1. The same rows either
+/// way; a forward over other ids reads its own. A failure leaves the forward to read its own.
+pub fn readAheadPrompt(m: *Model, ids: []const u32) void {
+    if (ids.len == 0) return;
+    const st = ensureState(m) catch return;
+    aheadEmbed(m, ids);
+    startEngramAhead(m, st, ids) catch {};
 }
 
 /// Whether the pass's chunk runs the CED decoder over its last rows only: it does when it is wider than the window and

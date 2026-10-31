@@ -84,6 +84,10 @@ const Model = struct {
     prev_cache_limit: ?usize = null,
     /// The MLX buffer-pool cap in force (`borrow.poolCap` of the last pass's rows): `pool_bytes` at decode widths.
     pool_now: u64 = pool_bytes,
+    /// `SUSHI_DS41_EARLY_ENGRAM=1`: the begin-prompt call starts reading the first chunk's embedding and Engram rows.
+    early_engram: bool = false,
+    /// The begin-prompt call reset the state for a prompt at 0 and read ahead; the forward at 0 keeps it (`forward`).
+    fresh: bool = false,
     /// Positions the expert cache was sized to leave room for (a request's state and one prefill chunk's working set).
     billed_context: u64 = default_context,
     /// Calibration (`SUSHI_DS41_TAP_DIR`): where each prompt's tap is written, and how many were.
@@ -242,6 +246,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         gpa.destroy(t);
         m.mdl.stream_tap = null;
     };
+    m.early_engram = if (std.c.getenv("SUSHI_DS41_EARLY_ENGRAM")) |raw| std.mem.eql(u8, std.mem.span(raw), "1") else false;
+    if (m.early_engram) log.info("[sushi_ds41] early Engram: a prompt's first chunk reads its rows at begin-prompt\n", .{});
     // The tower borrows its tensors from `m.weights`, which the model left them in.
     if (c.vision != null) m.tower = try vis.Dsv41Vision.init(gpa, .{ .dsv41 = c.* }, &m.weights);
     errdefer if (m.tower) |*t| t.deinit();
@@ -344,7 +350,9 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     const pos: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
     // A forward between rounds (a prefill, a plain step) is not the engine's time between rounds.
     roundProf().exit = null;
-    if (pos == 0) reset(m);
+    // A prompt the begin-prompt call already reset (and read ahead for) keeps its read-ahead: resetting again would drop it.
+    if (pos == 0 and !(m.fresh and m.ids.items.len == 0)) reset(m);
+    m.fresh = false;
     const st = dsv.ensureState(m.mdl) catch return Verdict.refuse(.failed, "sushi_ds41: out of memory");
     if (st.n != pos) return Verdict.refuse(.failed, "sushi_ds41: the position does not follow the model's state");
     if (pos + host.ids.len > m.billed_context + generation_rows) return Verdict.refuse(.failed, "sushi_ds41: the request is longer than the context the expert cache was sized for (raise ctx_size)");
@@ -644,6 +652,17 @@ fn auxBeginPrompt(mp: *anyopaque, _: u32, prompt: abi.Span(u32), media: abi.Arra
         m.snap = null;
     }
     m.arm = .{ .target = prompt.len - 1, .capture = capture_on, .vision_key = key };
+    m.fresh = restored_at == 0 and m.early_engram;
+    if (m.early_engram and media.ctx == null) {
+        // The first chunk `run` will forward: from the restored position, cut by the same rule.
+        const prefix = prompt.len - 1;
+        const at: usize = @intCast(restored_at);
+        if (at < prefix) {
+            var end = @min(at + sc.prefill_width, prefix);
+            if (end < prefix and prefix - end < sc.tail_merge_rows) end = prefix;
+            dsv.readAheadPrompt(m.mdl, prompt.slice()[at..end]);
+        }
+    }
     return .ok;
 }
 
