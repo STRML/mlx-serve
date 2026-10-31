@@ -2611,7 +2611,7 @@ fn aneInput(sc: *Scope, st: *const AneState, h: A) !A {
 fn aneOutput(sc: *Scope, st: *const AneState, rows: usize, d: usize) !A {
     var parts: [ane_mod.max_units]A = undefined;
     const shape = [_]c_int{ ci(d), ci(st.progs.rows) };
-    for (0..st.progs.n_units) |u| parts[u] = try sc.keep(mlx.mlx_array_new_data(st.progs.output(u), &shape, 2, .float16));
+    for (0..st.progs.n_units) |u| parts[u] = try sc.keep(mlx.mlx_array_new_data(@ptrCast(st.progs.output(u)), &shape, 2, .float16));
     const y = try sc.t2(try sc.concat(parts[0..st.progs.n_units], 1)); // [chunk, d]
     return sc.astype(try sc.slice(y, 0, 0, rows), .float32);
 }
