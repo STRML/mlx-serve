@@ -2471,6 +2471,12 @@ pub const AneState = struct {
     /// The early path's input planes as MLX arrays over the surfaces (no copy), written by `ane_pack_def` on the GPU
     /// (`SUSHI_DS41_ANE_PACK=0`: a transposed copy the ANE threads memcpy in).
     pack: bool = true,
+    /// Controls (`SUSHI_DS41_ANE_GPU`): the early path's exact host/GPU order (pack, picks queued, wait for the input,
+    /// routed submitted, one eval at the end) with the ANE never run. `fold`: the shared expert rides the routed launches
+    /// as on the live path (lossless); `separate`: routed alone plus the shared expert's own GPU chain queued after it;
+    /// `skip`: no shared expert (wrong output, the ceiling at this coverage and order). `live`: the live path's own order
+    /// (no pack, no early wait, one eval), timed: the neutral control of this tree and its per-layer split.
+    gpu: Gpu = .off,
     planes: [ane_mod.max_units]A = @splat(none),
     idle_ns: u64 = 2_000_000_000,
     last_ns: u64 = 0,
@@ -2483,6 +2489,7 @@ pub const AneState = struct {
     chunks: u64 = 0,
 
     pub const Mode = enum { plain, skip_idle, warm_idle };
+    pub const Gpu = enum { off, fold, separate, skip, live };
 
     /// One chunk's per-layer timings, summed (ns).
     const Acc = struct {
@@ -2607,12 +2614,13 @@ fn initAneShared(m: *Model, units: usize) !*AneState {
     st.early = envUsize("SUSHI_DS41_ANE_EARLY", 1) != 0;
     st.zero_copy = envUsize("SUSHI_DS41_ANE_ZEROCOPY", 1) != 0;
     st.pack = envUsize("SUSHI_DS41_ANE_PACK", 1) != 0;
+    if (std.c.getenv("SUSHI_DS41_ANE_GPU")) |gv| st.gpu = std.meta.stringToEnum(AneState.Gpu, std.mem.span(gv)) orelse .off;
     for (0..progs.n_units) |u| {
         const shape = [_]c_int{ci(progs.slabLen())};
         st.planes[u] = mlx.mlx_array_new_data_managed(@ptrCast(st.progs.input(u)), &shape, 1, .float16, aneNoFree);
     }
-    log.info("[sushi_ds41] ane shared: {d} layers x {d}x{d} SwiGLU (limit {d}), {d} unit(s) of {d} rows, chunks of {d}..{d} rows, mode {s}, early {}, zero-copy {}, gpu pack {}; weights {d:.1} s, programs {d:.1} s\n", .{
-        layers, d, f, c.swiglu_limit, units, progs.rows, st.min_rows, chunk, @tagName(st.mode), st.early, st.zero_copy, st.pack, @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(ane_mod.nowNs() - t1)) / 1e9,
+    log.info("[sushi_ds41] ane shared: {d} layers x {d}x{d} SwiGLU (limit {d}), {d} unit(s) of {d} rows, chunks of {d}..{d} rows, mode {s}, early {}, zero-copy {}, gpu pack {}, gpu control {s}; weights {d:.1} s, programs {d:.1} s\n", .{
+        layers, d, f, c.swiglu_limit, units, progs.rows, st.min_rows, chunk, @tagName(st.mode), st.early, st.zero_copy, st.pack, @tagName(st.gpu), @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(ane_mod.nowNs() - t1)) / 1e9,
     });
     try aneSelfCheck(m, st);
     return st;
@@ -2727,11 +2735,13 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
     if (st.chunk_skip) return null;
     st.joinWarm();
     const t0 = ane_mod.nowNs();
+    if (st.gpu == .live) return try liveControl(sc, m, st, li, h, hk, r, t0);
     const x = try if (st.early and st.pack) anePack(sc, st, h) else aneInput(sc, st, h);
     try submit(x);
     // The router's picks queued right behind the input: the host's read of them then finds them done, so the early
     // wait for `x` adds no GPU bubble before the routed launches.
     if (st.early) try submit(r.idx);
+    if (st.gpu != .off) return try gpuControl(sc, m, st, li, ly, h, hk, r, x, t0);
     var routed: A = undefined;
     var t1: u64 = 0;
     var t2: u64 = 0;
@@ -2782,8 +2792,53 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
     const t4 = ane_mod.nowNs();
     try mlx.check(mlx.mlx_array_eval(out));
     const t5 = ane_mod.nowNs();
+    noteLayer(st, li, rows, .{ t0, t1, t2, t3, t4, t5 }, @max(ran.unit_ns[0], ran.unit_ns[1]), ran.copy_ns);
+    return out;
+}
+
+/// `aneMoe`'s early order with the shared expert on the GPU (`AneState.gpu`), timed into the same fields (ane 0).
+fn gpuControl(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Layer, h: A, hk: Experts.Hook, r: kernels.Routes, x: A, t0: u64) !A {
+    try mlx.check(mlx.mlx_array_eval(x));
+    const t1 = ane_mod.nowNs();
+    const fold = st.gpu == .fold and m.shared_fold and ly.shared[0].stq != null;
+    const sy: SharedOp = if (fold) .{ .layer = .{ .m = m, .li = li } } else .none;
+    const routed = try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, sy);
+    try submit(routed);
+    const t2 = ane_mod.nowNs();
+    const sum = switch (st.gpu) {
+        .fold => if (fold) routed else try sc.add(routed, try sc.astype(try sharedExpert(sc, m, li, ly, h), .float32)),
+        .separate => try sc.add(routed, try sc.astype(try sharedExpert(sc, m, li, ly, h), .float32)),
+        .skip, .off, .live => routed,
+    };
+    const out = try sc.astype(sum, m.act);
+    const t4 = ane_mod.nowNs();
+    try mlx.check(mlx.mlx_array_eval(out));
+    const t5 = ane_mod.nowNs();
+    st.last_ns = t5;
+    noteLayer(st, li, dim(h, 0), .{ t0, t1, t2, t2, t4, t5 }, 0, 0);
+    return out;
+}
+
+/// The live path's wide-chunk order (`moe`: the folded routed launches built, then one eval), timed: build is the graph
+/// up to the queued routed launches, tail the eval.
+fn liveControl(sc: *Scope, m: *const Model, st: *AneState, li: usize, h: A, hk: Experts.Hook, r: kernels.Routes, t0: u64) !A {
+    const out = try sc.astype(try hk.apply(hk.ctx, sc, li, h, r.idx, r.wts, r.logits, .{ .layer = .{ .m = m, .li = li } }), m.act);
+    const t1 = ane_mod.nowNs();
+    try mlx.check(mlx.mlx_array_eval(out));
+    const t5 = ane_mod.nowNs();
+    st.last_ns = t5;
+    noteLayer(st, li, dim(h, 0), .{ t0, t1, t1, t1, t1, t5 }, 0, 0);
+    return out;
+}
+
+fn noteLayer(st: *AneState, li: usize, rows: usize, t: [6]u64, ane_ns: u64, copy_ns: u64) void {
+    const t0 = t[0];
+    const t1 = t[1];
+    const t2 = t[2];
+    const t3 = t[3];
+    const t4 = t[4];
+    const t5 = t[5];
     const a = &st.chunk;
-    const ane_ns = @max(ran.unit_ns[0], ran.unit_ns[1]);
     if (a.layers == 0) {
         a.ane_first = ane_ns;
         a.first_tail = t5 - t4;
@@ -2794,12 +2849,11 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
     a.hwait += t2 - t1;
     a.join += t3 - t2;
     a.ane += ane_ns;
-    a.copy += ran.copy_ns;
+    a.copy += copy_ns;
     a.ane_max = @max(a.ane_max, ane_ns);
     a.wrap += t4 - t3;
     a.tail += t5 - t4;
     if (li + 1 == st.layers) st.report(rows);
-    return out;
 }
 
 fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
