@@ -2720,8 +2720,24 @@ fn aneSelfCheck(m: *Model, st: *AneState) !void {
     if (md != 0) st.pack = false;
 }
 
+/// Ends a layer of the ANE paths: evaluated, or under the prefill pipeline (`pipeOn`) only submitted, so the caller's
+/// `pipeSubmit` owns the wait as on the GPU path.
+///
+/// The ANE planes are reused by every covered layer, and the pipeline lets the host run ahead of the GPU. Still safe:
+/// - Input planes: layer L's ANE run is joined before `aneMoe` returns, so layer L+1's pack cannot overwrite them
+///   under it.
+/// - Output planes: layer L's add reads them on the GPU, possibly after `aneMoe` returned. Layer L+1 waits for its
+///   own input `x` (built from layer L's output, so after that add) before its ANE run writes them.
+/// - The next chunk's layer 0 does not depend on this chunk's last add, but every wide pass ends in `finishPass`,
+///   whose head read is followed by `pipeDrain`, so the GPU is idle by then.
+/// Dropping the wait for `x` breaks the second point first.
+fn aneLayerOut(m: *const Model, out: A) !void {
+    try if (pipeOn(m, dim(out, 0))) submit(out) else mlx.check(mlx.mlx_array_eval(out));
+}
+
 /// Layer `li`'s routed experts and shared expert of a wide chunk, the shared expert on the Neural Engine while the
-/// GPU runs the routed ones. Evaluated. Null where the ANE does not take this layer (the GPU path serves).
+/// GPU runs the routed ones. Evaluated, or submitted under the prefill pipeline (`aneLayerOut`). Null where the ANE
+/// does not take this layer (the GPU path serves).
 fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Layer, h: A, hk: Experts.Hook, r: kernels.Routes) !?A {
     const rows = dim(h, 0);
     if (st.disabled or m.tap != null or li >= st.layers or rows < st.min_rows or rows > st.chunk_rows) return null;
@@ -2791,14 +2807,14 @@ fn aneMoe(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const Laye
             log.warn("[sushi_ds41] ane shared: {d} failures, off for the rest of this run\n", .{st.fails});
         }
         const out = try sc.astype(try sc.add(routed, try sc.astype(try sharedExpert(sc, m, li, ly, h), .float32)), m.act);
-        try mlx.check(mlx.mlx_array_eval(out));
+        try aneLayerOut(m, out);
         return out;
     }
     st.evals += st.progs.n_units;
     const y = try aneOutput(sc, st, rows, dim(h, 1));
     const out = try sc.astype(try sc.add(routed, y), m.act);
     const t4 = ane_mod.nowNs();
-    try mlx.check(mlx.mlx_array_eval(out));
+    try aneLayerOut(m, out);
     const t5 = ane_mod.nowNs();
     noteLayer(st, li, rows, .{ t0, t1, t2, t3, t4, t5 }, @max(ran.unit_ns[0], ran.unit_ns[1]), ran.copy_ns);
     return out;
@@ -2833,7 +2849,7 @@ fn gpuControl(sc: *Scope, m: *const Model, st: *AneState, li: usize, ly: *const 
     };
     const out = try sc.astype(sum, m.act);
     const t4 = ane_mod.nowNs();
-    try mlx.check(mlx.mlx_array_eval(out));
+    try aneLayerOut(m, out);
     const t5 = ane_mod.nowNs();
     st.last_ns = t5;
     noteLayer(st, li, dim(h, 0), .{ t0, t1, t2, t2, t4, t5 }, 0, 0);
@@ -2859,7 +2875,7 @@ fn liveControl(sc: *Scope, m: *const Model, st: *AneState, li: usize, h: A, hk: 
     if (st.gpu == .queue) try submit(routed);
     const out = try sc.astype(routed, m.act);
     const t1 = ane_mod.nowNs();
-    try mlx.check(mlx.mlx_array_eval(out));
+    try aneLayerOut(m, out);
     const t5 = ane_mod.nowNs();
     st.last_ns = t5;
     noteLayer(st, li, dim(h, 0), .{ t0, t1, t1, t1, t1, t5 }, 0, 0);
