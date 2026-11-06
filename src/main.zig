@@ -151,10 +151,10 @@ fn printUsage(io: std.Io) void {
         \\  serve               Start the server over ~/.mlx-serve/models
         \\                      (every pulled model loads on demand by name)
         \\  worker              Lend this Mac to another Mac's --dist host:
-        \\                      --coordinator <ip:port> --device <rdma_enX>
+        \\                      --coordinator <ip:port> --device <rdma_enX|tcp:...>
         \\                      [--model-dir <dir>]... (default ~/.mlx-serve/models)
-        \\  dist-probe          Measure the RDMA link: --rank 0|1 --coordinator
-        \\                      <ip:port> --device <rdma_enX> [--soak N]
+        \\  dist-probe          Measure the cluster link: --rank 0|1 --coordinator
+        \\                      <ip:port> --device <rdma_enX|tcp:...> [--soak N]
         \\  launch <agent>      Configure + launch a coding agent CLI against the
         \\                      local server (claude, pi, omp, opencode, codex,
         \\                      hermes, aider, zcode); starts the MLX-Serve app if the
@@ -538,7 +538,9 @@ fn printUsage(io: std.Io) void {
         \\                        worker runs `mlx-serve worker`.
         \\  --dist-model <dir>  The model the two Macs serve (default: --model)
         \\  --dist-coordinator <ip:port>  This Mac's address the worker dials
-        \\  --dist-device <rdma_enX>  The RDMA port facing the worker (`ibv_devinfo`)
+        \\  --dist-device <rdma_enX|tcp:ip:port,ip:port>  The RDMA port facing the
+        \\                        worker (`ibv_devinfo`), or tcp: and one listen
+        \\                        address per rank (MLX's ring backend, no RDMA)
         \\  --dist-split <n>    Pipeline: layers kept here (default: by free memory)
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --log-file <path>   Persist the server log ("off" disables).
@@ -1474,7 +1476,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         const device = dist_device orelse {
-            log.err("--dist needs --dist-device rdma_enX (the RDMA port facing the worker; see `ibv_devinfo`)\n", .{});
+            log.err("--dist needs --dist-device rdma_enX (the RDMA port facing the worker; see `ibv_devinfo`) or tcp:IP:PORT,IP:PORT\n", .{});
             std.process.exit(1);
         };
         const group_model = dist_model orelse if (model_dir.len > 0) model_dir else {

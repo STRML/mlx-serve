@@ -35,9 +35,11 @@ pub const Mode = enum {
     }
 };
 
-/// How this process joins the group. Each rank names only its OWN RDMA device
-/// (the `rdma_enX` whose port faces the peer); JACCL reads only its own row of
-/// the device matrix but validates the whole square, so the other rows repeat it.
+/// How this process joins the group. `device` names the transport:
+/// - `rdma_enX`: JACCL over Thunderbolt RDMA. Each rank names only its OWN RDMA device (the port facing the peer);
+///   JACCL reads only its own row of the device matrix but validates the whole square, so the other rows repeat it.
+/// - `tcp:IP:PORT,IP:PORT`: MLX's ring backend over TCP, one listen address per rank in rank order, the same list
+///   on every rank. No RDMA needed: two ranks on one Mac, or Macs on any network.
 pub const Config = struct {
     rank: u32,
     size: u32 = 2,
@@ -45,6 +47,41 @@ pub const Config = struct {
     coordinator: []const u8,
     device: []const u8,
 };
+
+pub const Transport = union(enum) {
+    rdma: []const u8,
+    tcp: []const u8,
+
+    pub fn of(device: []const u8) Transport {
+        const prefix = "tcp:";
+        if (std.mem.startsWith(u8, device, prefix)) return .{ .tcp = device[prefix.len..] };
+        return .{ .rdma = device };
+    }
+
+    fn backend(self: Transport) [:0]const u8 {
+        return switch (self) {
+            .rdma => "jaccl",
+            .tcp => "ring",
+        };
+    }
+};
+
+/// Writes the ring backend's hostfile for `hosts` (`IP:PORT,IP:PORT`, rank order) into `out`: one
+/// single-address list per rank.
+pub fn ringHostfileJson(hosts: []const u8, size: u32, out: []u8) ![]const u8 {
+    var w: std.Io.Writer = .fixed(out);
+    try w.writeByte('[');
+    var it = std.mem.splitScalar(u8, hosts, ',');
+    var n: u32 = 0;
+    while (it.next()) |h| : (n += 1) {
+        if (h.len == 0 or std.mem.indexOfScalar(u8, h, ':') == null) return error.DistRingHostInvalid;
+        if (n != 0) try w.writeByte(',');
+        try w.print("[\"{s}\"]", .{h});
+    }
+    if (n != size) return error.DistRingHostCount;
+    try w.writeByte(']');
+    return w.buffered();
+}
 
 /// Writes the JACCL device matrix for `cfg` into `out`.
 pub fn deviceMatrixJson(cfg: Config, out: []u8) ![]const u8 {
@@ -78,14 +115,21 @@ pub const Link = struct {
     /// Joins the group. Blocks until every rank has connected to the coordinator.
     pub fn open(io: std.Io, cfg: Config) !Link {
         if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable;
-        if (!mlx.mlx_distributed_is_available("jaccl")) {
-            log.err("[dist] JACCL is unavailable: RDMA over Thunderbolt needs macOS 26.2+ and `rdma_ctl enable` (Recovery)\n", .{});
+        const transport = Transport.of(cfg.device);
+        if (!mlx.mlx_distributed_is_available(transport.backend())) {
+            switch (transport) {
+                .rdma => log.err("[dist] JACCL is unavailable: RDMA over Thunderbolt needs macOS 26.2+ and `rdma_ctl enable` (Recovery)\n", .{}),
+                .tcp => log.err("[dist] MLX's ring backend is not in this build\n", .{}),
+            }
             return error.RdmaUnavailable;
         }
         var path_buf: [128]u8 = undefined;
-        const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/mlx-serve-jaccl-{d}.json", .{std.c.getpid()}, 0);
+        const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/mlx-serve-{s}-{d}.json", .{ transport.backend(), std.c.getpid() }, 0);
         var json_buf: [1024]u8 = undefined;
-        const json = try deviceMatrixJson(cfg, &json_buf);
+        const json = switch (transport) {
+            .rdma => try deviceMatrixJson(cfg, &json_buf),
+            .tcp => |hosts| try ringHostfileJson(hosts, cfg.size, &json_buf),
+        };
         {
             const f = try std.Io.Dir.createFileAbsolute(io, path, .{});
             defer f.close(io);
@@ -97,8 +141,13 @@ pub const Link = struct {
         var rank_buf: [16]u8 = undefined;
         var coord_buf: [128]u8 = undefined;
         _ = env.setForeign("MLX_RANK", try std.fmt.bufPrintSentinel(&rank_buf, "{d}", .{cfg.rank}, 0));
-        _ = env.setForeign("MLX_JACCL_COORDINATOR", try std.fmt.bufPrintSentinel(&coord_buf, "{s}", .{cfg.coordinator}, 0));
-        _ = env.setForeign("MLX_IBV_DEVICES", path);
+        switch (transport) {
+            .rdma => {
+                _ = env.setForeign("MLX_JACCL_COORDINATOR", try std.fmt.bufPrintSentinel(&coord_buf, "{s}", .{cfg.coordinator}, 0));
+                _ = env.setForeign("MLX_IBV_DEVICES", path);
+            },
+            .tcp => _ = env.setForeign("MLX_HOSTFILE", path),
+        }
         log.info("[dist] joining as rank {d}/{d} via {s}, coordinator {s}\n", .{ cfg.rank, cfg.size, cfg.device, cfg.coordinator });
         // Rank 0 listens for the bell before the group forms, so rank 1 finds it once it does.
         const coord = try parseCoordinator(cfg.coordinator);
@@ -107,9 +156,9 @@ pub const Link = struct {
             _ = std.c.close(listener);
         };
         var g = mlx.mlx_distributed_group_new();
-        mlx.check(mlx.mlx_distributed_init(&g, true, "jaccl")) catch {
+        mlx.check(mlx.mlx_distributed_init(&g, true, transport.backend())) catch {
             var eb: [512]u8 = undefined;
-            log.err("[dist] JACCL init failed: {s}\n", .{mlx.takeError(&eb) orelse "unknown"});
+            log.err("[dist] {s} init failed: {s}\n", .{ transport.backend(), mlx.takeError(&eb) orelse "unknown" });
             return error.RdmaInitFailed;
         };
         var link: Link = .{ .group = g, .rank = @intCast(mlx.mlx_distributed_group_rank(g)), .size = @intCast(mlx.mlx_distributed_group_size(g)) };
@@ -1375,7 +1424,7 @@ fn sameModel(io: std.Io, allocator: std.mem.Allocator, parts: []const []const u8
     return null;
 }
 
-/// `mlx-serve worker --coordinator IP:PORT --device rdma_enX [--model-dir DIR]...`: joins
+/// `mlx-serve worker --coordinator IP:PORT --device rdma_enX|tcp:... [--model-dir DIR]...`: joins
 /// rank 0's group, loads the part of the model rank 0 names (found by folder name in its own
 /// model folders, `~/.mlx-serve/models` by default), then runs forwards until rank 0 stops it.
 pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -1670,7 +1719,7 @@ fn chainProbe(io: std.Io, link: *const Link, s: mlx.mlx_stream) !void {
     }
 }
 
-/// `mlx-serve dist-probe --rank R --coordinator IP:PORT --device rdma_enX`:
+/// `mlx-serve dist-probe --rank R --coordinator IP:PORT --device rdma_enX|tcp:...`:
 /// joins the group and measures round trips at the sizes inference moves
 /// (one decode row of a hyper-connection stream, a prefill chunk) and all_sum.
 pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
@@ -1832,10 +1881,23 @@ pub fn parseArgs(args: []const []const u8) !Config {
         i += 1;
     }
     if (rank == null or coordinator == null or device == null) {
-        log.err("usage: mlx-serve dist-probe --rank N --coordinator IP:PORT --device rdma_enX\n", .{});
+        log.err("usage: mlx-serve dist-probe --rank N --coordinator IP:PORT --device rdma_enX|tcp:IP:PORT,IP:PORT\n", .{});
         return error.InvalidArgs;
     }
     return .{ .rank = rank.?, .coordinator = coordinator.?, .device = device.? };
+}
+
+test "Transport.of: tcp: names the ring backend's hosts, anything else an RDMA device" {
+    try std.testing.expectEqualStrings("10.0.0.1:5000,10.0.0.2:5000", Transport.of("tcp:10.0.0.1:5000,10.0.0.2:5000").tcp);
+    try std.testing.expectEqualStrings("rdma_en4", Transport.of("rdma_en4").rdma);
+}
+
+test "ringHostfileJson: one address list per rank, in rank order; the count must match the group" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("[[\"127.0.0.1:5000\"],[\"127.0.0.1:5001\"]]", try ringHostfileJson("127.0.0.1:5000,127.0.0.1:5001", 2, &buf));
+    try std.testing.expectError(error.DistRingHostCount, ringHostfileJson("127.0.0.1:5000", 2, &buf));
+    try std.testing.expectError(error.DistRingHostInvalid, ringHostfileJson("127.0.0.1:5000,,", 2, &buf));
+    try std.testing.expectError(error.DistRingHostInvalid, ringHostfileJson("127.0.0.1,127.0.0.2:5001", 2, &buf));
 }
 
 test "deviceMatrixJson: each row names the local device, the diagonal is null" {
