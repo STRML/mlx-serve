@@ -17,7 +17,8 @@ const iou = @import("../../../sdk/util/io_util.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
 const fixture = @import("fixture.zig");
-const ffn_seg = @import("ffn_seg.zig");
+const seg = @import("seg.zig");
+const seg_bounds = @import("seg_bounds.zig");
 
 const A = mlx.mlx_array;
 
@@ -98,7 +99,12 @@ test "dsv41 kernel map: a TP rank's full decode step in a loop for a GPU trace (
     defer probe.deinit();
     fx.m.probe = &probe.hook;
     defer fx.m.probe = null;
-    ffn_seg.cache_on = true;
+    seg_bounds.cache_on = true;
+    defer {
+        seg_bounds.cache_on = false;
+        seg_bounds.release();
+        applyArm(fx, .{});
+    }
     var exps = std.mem.tokenizeScalar(u8, std.mem.span(ab_spec), ';');
     while (exps.next()) |exp| {
         var ab: Ab = .{ .probe = probe, .name = exp };
@@ -111,8 +117,6 @@ test "dsv41 kernel map: a TP rank's full decode step in a loop for a GPU trace (
         while (rows_it.next()) |tok| try phase(gpa, fx, try std.fmt.parseInt(usize, tok, 10), steps, &p0, &ab);
     }
     probe.arm = .{};
-    ffn_seg.set(.base);
-    try segCheck(gpa, fx, lo, hi);
     if (std.c.getenv("DSV41_KMAP_CHAIN")) |raw| {
         var it = std.mem.tokenizeScalar(u8, std.mem.span(raw), ',');
         while (it.next()) |tok| try probe.reportChains(std.meta.stringToEnum(dsv41.ProjAt, tok) orelse return error.BadProjection);
@@ -120,14 +124,24 @@ test "dsv41 kernel map: a TP rank's full decode step in a loop for a GPU trace (
 }
 
 const ProjAt = dsv41.ProjAt;
-const Mode = enum { base, ctl, twin, same, pre, precopy, ffn };
-const Arm = struct { mode: Mode = .base, at: ProjAt = .in_proj, index: ?bool = null, ffn: ffn_seg.Arm = .base };
+const Mode = enum { base, ctl, twin, same, pre, precopy, ffn, seg };
+
+pub const Under = union(enum) { level: seg.Level, broken };
+
+const Arm = struct { mode: Mode = .base, at: ProjAt = .in_proj, index: ?bool = null, ffn: seg_bounds.Arm = .base, under: Under = .{ .level = .off } };
+
+fn parseUnder(tok: []const u8) !Under {
+    if (std.mem.eql(u8, tok, "broken")) return .broken;
+    const n = std.fmt.parseInt(u8, tok, 10) catch return error.BadArm;
+    return .{ .level = std.enums.fromInt(seg.Level, n) orelse return error.BadArm };
+}
 
 fn parseArm(tok: []const u8) !Arm {
     var it = std.mem.tokenizeAny(u8, tok, ":@");
     const mode = std.meta.stringToEnum(Mode, it.next() orelse "base") orelse return error.BadArm;
     if (mode == .base) return .{};
-    if (mode == .ffn) return .{ .ffn = std.meta.stringToEnum(ffn_seg.Arm, it.next() orelse return error.BadArm) orelse return error.BadArm };
+    if (mode == .ffn) return .{ .mode = .ffn, .ffn = std.meta.stringToEnum(seg_bounds.Arm, it.next() orelse return error.BadArm) orelse return error.BadArm };
+    if (mode == .seg) return .{ .mode = .seg, .under = try parseUnder(it.next() orelse return error.BadArm) };
     const at = std.meta.stringToEnum(ProjAt, it.next() orelse return error.BadArm) orelse return error.BadArm;
     const where = it.next() orelse return .{ .mode = mode, .at = at };
     if (std.mem.eql(u8, where, "idx")) return .{ .mode = mode, .at = at, .index = true };
@@ -207,7 +221,11 @@ const Probe = struct {
     }
 
     fn applies(p: *const Probe, li: usize, at: ProjAt) bool {
-        if (p.arm.mode == .base or p.arm.at != at) return false;
+        switch (p.arm.mode) {
+            .base, .ffn, .seg => return false,
+            else => {},
+        }
+        if (p.arm.at != at) return false;
         const want = p.arm.index orelse return true;
         return (p.m.layers[li].idx != null) == want;
     }
@@ -217,7 +235,7 @@ const Probe = struct {
         p.remember(li, at, ins);
         if (!p.applies(li, at)) return ins[0];
         const dep = switch (p.arm.mode) {
-            .base, .ctl, .ffn => ins[0],
+            .base, .ctl, .ffn, .seg => ins[0],
             .twin => try twinLaunch(sc, m, &p.copies[li - p.lo], li, at, ins),
             .same => try twinLaunch(sc, m, &m.layers[li], li, at, ins),
             .pre, .precopy => return passAfter(sc, p.pass_after, ins[0], try readLaunch(sc, p.read, weightsOf(if (p.arm.mode == .pre) &m.layers[li] else &p.copies[li - p.lo], at))),
@@ -348,84 +366,152 @@ fn medianOf(xs: []f64) f64 {
     return xs[xs.len / 2];
 }
 
-fn segCheck(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize) !void {
-    const m = fx.m;
-    var worst: f64 = 0;
-    var ndiff: usize = 0;
-    var total: usize = 0;
-    var layers: usize = 0;
-    for (lo..hi) |li| {
-        const c = ffn_seg.heldOf(li) orelse continue;
-        var sc = dsv41.Scope.init(gpa, m.s);
-        defer sc.deinit();
-        const ly = &m.layers[li];
-        const a = (try dsv41.moeFused(&sc, m, ly, c[0], c[1], c[2])) orelse return error.Declined;
-        const b = (try ffn_seg.moeSplit(&sc, m, ly, c[0], c[1], c[2])) orelse return error.Declined;
-        const af = try sc.astype(a, .float32);
-        const bf = try sc.astype(b, .float32);
-        try dsv41.evalAll(&.{ af, bf });
-        const n = mlx.mlx_array_size(af);
-        const pa = mlx.mlx_array_data_float32(af).?[0..n];
-        const pb = mlx.mlx_array_data_float32(bf).?[0..n];
-        for (pa, pb) |x, y| {
-            if (x != y) ndiff += 1;
-            worst = @max(worst, @abs(@as(f64, x) - @as(f64, y)));
-        }
-        total += n;
-        layers += 1;
-    }
-    std.debug.print("[kmap] ffn segment split vs stock MoE: {d} layers, {d} of {d} outputs differ, max abs diff {e}\n", .{ layers, ndiff, total, worst });
-    for ([_]ffn_seg.Arm{ .split, .rsu, .fin, .finsplit }) |arm| try segArm(gpa, fx, lo, hi, arm);
+fn setUnder(m: *dsv41.Dsv41Model, u: Under) void {
+    seg.broken = u == .broken;
+    m.fused_seg = switch (u) {
+        .level => |l| l,
+        .broken => .off,
+    };
 }
 
-fn segArm(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize, arm: ffn_seg.Arm) !void {
+fn applyArm(fx: *fixture.Fixture, arm: Arm) void {
+    setUnder(fx.m, if (arm.mode == .seg) arm.under else .{ .level = fx.opts.seg });
+    seg_bounds.set(arm.ffn);
+}
+
+fn underName(buf: []u8, u: Under) []const u8 {
+    return switch (u) {
+        .level => |l| std.fmt.bufPrint(buf, "seg:{d}", .{@intFromEnum(l)}) catch "seg",
+        .broken => "seg:broken",
+    };
+}
+
+const layer_rms_max = 5e-3;
+const whole_seeds = 3;
+const whole_layers = 6;
+const whole_ratio = 1.15;
+
+const LayerStat = struct { layers: usize = 0, total: usize = 0, ndiff: usize = 0, route_miss: usize = 0, num: f64 = 0, den: f64 = 0, worst: f64 = 0 };
+
+fn dup(sc: *dsv41.Scope, a: A) !A {
+    return sc.keep(sc.out(a));
+}
+
+fn routesOf(sc: *dsv41.Scope, li: usize) !A {
+    const c = seg_bounds.heldOf(li) orelse return error.NoCapture;
+    return sc.astype(c[1], .float32);
+}
+
+fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize, under: Under) !LayerStat {
     const m = fx.m;
-    var num: f64 = 0;
-    var den: f64 = 0;
-    var worst: f64 = 0;
-    var ndiff: usize = 0;
-    var total: usize = 0;
-    var route_miss: usize = 0;
-    var layers: usize = 0;
+    var st: LayerStat = .{};
     for (lo..hi) |li| {
-        const c = ffn_seg.inOf(li) orelse continue;
+        const c = seg_bounds.inOf(li) orelse continue;
         var sc = dsv41.Scope.init(gpa, m.s);
         defer sc.deinit();
-        var pa = c[0];
-        var pb = c[0];
-        const sa: dsv41.Split = .{ .pre = c[2], .post = c[3], .comb = c[4] };
-        ffn_seg.set(.base);
-        const ya = (try ffn_seg.segment(&sc, m, li, c[0], c[1], &sa, &pa)) orelse return error.Declined;
-        ffn_seg.set(arm);
-        const yb = (try ffn_seg.segment(&sc, m, li, c[0], c[1], &sa, &pb)) orelse return error.Declined;
-        ffn_seg.set(.base);
+        const x = try dup(&sc, c[0]);
+        const ao = try dup(&sc, c[1]);
+        const sa: dsv41.Split = .{ .pre = try dup(&sc, c[2]), .post = try dup(&sc, c[3]), .comb = try dup(&sc, c[4]) };
+        var pre_a = x;
+        var pre_b = x;
+        setUnder(m, .{ .level = .off });
+        const ya = try dsv41.tpFfn(&sc, m, li, x, ao, &sa, &pre_a);
+        const ia = try routesOf(&sc, li);
+        setUnder(m, under);
+        const yb = try dsv41.tpFfn(&sc, m, li, x, ao, &sa, &pre_b);
+        const ib = try routesOf(&sc, li);
         const af = try sc.astype(ya, .float32);
         const bf = try sc.astype(yb, .float32);
-        const ia = try sc.astype(ffn_seg.last_idx[0], .float32);
-        const ib = try sc.astype(ffn_seg.last_idx[1], .float32);
         try dsv41.evalAll(&.{ af, bf, ia, ib });
         const n = mlx.mlx_array_size(af);
         const xa = mlx.mlx_array_data_float32(af).?[0..n];
         const xb = mlx.mlx_array_data_float32(bf).?[0..n];
-        for (xa, xb) |x, y| {
-            if (x != y) ndiff += 1;
-            const d = @as(f64, x) - @as(f64, y);
-            num += d * d;
-            den += @as(f64, x) * @as(f64, x);
-            worst = @max(worst, @abs(d));
+        for (xa, xb) |u, v| {
+            if (u != v) st.ndiff += 1;
+            const d = @as(f64, u) - @as(f64, v);
+            st.num += d * d;
+            st.den += @as(f64, u) * @as(f64, u);
+            st.worst = @max(st.worst, @abs(d));
         }
         const k = mlx.mlx_array_size(ia);
         const ra = mlx.mlx_array_data_float32(ia).?[0..k];
         const rb = mlx.mlx_array_data_float32(ib).?[0..k];
-        for (ra) |x| {
-            var found = false;
-            for (rb) |y| found = found or x == y;
-            if (!found) route_miss += 1;
+        for (ra) |u| {
+            if (std.mem.indexOfScalar(f32, rb, u) == null) st.route_miss += 1;
         }
-        total += n;
-        layers += 1;
+        st.total += n;
+        st.layers += 1;
     }
-    std.debug.print("[kmap] segment {s} vs stock: {d} layers, {d} of {d} stream values differ, rel rms {e:.3}, max abs {e:.3}, routes missed {d}\n", .{ @tagName(arm), layers, ndiff, total, @sqrt(num / @max(den, 1e-30)), worst, route_miss });
+    return st;
+}
+
+const Whole = struct { stock: f64, arm: f64 };
+
+fn wholeStep(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize, under: Under) !Whole {
+    const captured = seg_bounds.cache_on;
+    seg_bounds.cache_on = false;
+    defer seg_bounds.cache_on = captured;
+    var stock: [whole_seeds]f64 = undefined;
+    var armed: [whole_seeds]f64 = undefined;
+    for (&stock, &armed, 1..) |*e_stock, *e_arm, seed| {
+        var o = fx.opts;
+        o.lo = lo;
+        o.hi = @min(hi, lo + whole_layers);
+        o.experts = @min(o.experts, 16);
+        o.ctx = 0;
+        o.seed = seed;
+        o.fused = true;
+        o.act = .bfloat16;
+        o.seg = .off;
+        var twin = o;
+        twin.act = .float32;
+        twin.fused = false;
+        const truth = try fixture.Fixture.init(gpa, twin);
+        defer truth.deinit();
+        const run = try fixture.Fixture.init(gpa, o);
+        defer run.deinit();
+        const in = try fixture.Input.of(run, 1);
+        defer in.deinit();
+        const t = try fixture.streamOf(gpa, truth, in);
+        defer gpa.free(t);
+        defer setUnder(run.m, .{ .level = .off });
+        const s = try fixture.streamOf(gpa, run, in);
+        defer gpa.free(s);
+        setUnder(run.m, under);
+        const a = try fixture.streamOf(gpa, run, in);
+        defer gpa.free(a);
+        e_stock.* = decode.relRms(s, t);
+        e_arm.* = decode.relRms(a, t);
+    }
+    std.mem.sort(f64, &stock, {}, std.sort.asc(f64));
+    std.mem.sort(f64, &armed, {}, std.sort.asc(f64));
+    return .{ .stock = stock[whole_seeds / 2], .arm = armed[whole_seeds / 2] };
+}
+
+pub fn segCheck(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize, under: Under) !void {
+    defer applyArm(fx, .{});
+    seg_bounds.set(.base);
+    const st = try layerStat(gpa, fx, lo, hi, under);
+    const whole = try wholeStep(gpa, fx, lo, hi, under);
+    const rms = @sqrt(st.num / @max(st.den, 1e-30));
+    var buf: [16]u8 = undefined;
+    const name = underName(&buf, under);
+    std.debug.print("[kmap] {s} vs stock: {d} layers, {d} of {d} stream values differ, rel rms {e:.3}, max abs {e:.3}, routes missed {d}; whole step from the f32 model (median of {d} seeds): stock {e:.3}, {s} {e:.3}\n", .{ name, st.layers, st.ndiff, st.total, rms, st.worst, st.route_miss, whole_seeds, whole.stock, name, whole.arm });
+    const why: ?[]const u8 = if (st.layers == 0)
+        "no layer captured"
+    else if (st.route_miss != 0)
+        "routes missed"
+    else if (rms > layer_rms_max)
+        "layer outputs differ from stock"
+    else if (whole.arm > whole_ratio * whole.stock + 1e-4)
+        "whole step further from the f32 model than stock"
+    else
+        null;
+    if (why) |w| {
+        std.debug.print("SEG-CHECK-FAIL {s}: {s}\n", .{ name, w });
+        return error.SegCheckFailed;
+    }
+    std.debug.print("SEG-CHECK-OK {s}\n", .{name});
 }
 
 fn printArms(ab: *const Ab, rows: usize, us: []const f64) void {
@@ -500,19 +586,22 @@ fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize
         if (k == warm) sleepSecs(500);
         if (ab) |a| {
             a.probe.arm = a.arms[if (k < warm) k % a.n else a.armOf(k - warm)];
-            ffn_seg.set(a.probe.arm.ffn);
+            applyArm(fx, a.probe.arm);
         }
         const s0 = nowUs();
         const out = try dsv41.workerStep(fx.m, gpa, xs[k], pres[k], p0.*, false, false);
         for (out) |o| _ = mlx.mlx_array_free(o);
         if (k >= warm) {
             us[k - warm] = @floatFromInt(nowUs() - s0);
-            bus[k - warm] = @floatFromInt(ffn_seg.build_us);
+            bus[k - warm] = @floatFromInt(seg_bounds.build_us);
         }
         p0.* += rows;
     }
     sleepSecs(500);
     if (ab) |a| {
+        applyArm(fx, .{});
+        const pair = fx.m.pair.?;
+        for (a.arms[0..a.n]) |arm| if (arm.mode == .seg) try segCheck(gpa, fx, pair.lo, pair.hi, arm.under);
         printArms(a, rows, us[0 .. steps - steps % a.n]);
         printBuild(a, rows, bus[0 .. steps - steps % a.n]);
     }
