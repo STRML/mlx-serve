@@ -26,6 +26,9 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   every GPU (NAX too); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the
   expert-pruned packs are 2-bit g128). Otherwise `routed` runs. `DSV41_MOE_BW=0` keeps the first launches (bit-equal).
   Its ubench times both arms at the per-rank widths 2304 / 1152 / 576 against a streaming read.
+- `DSV41_HC_FUSE=0` gives the FFN's hc split its own `hc_split` launch again. On (the default), the decode regions'
+  FFN entry (`ffnEntry`) runs it in one more threadgroup a row of the router's gate launch (`GATE_SPLIT_SOURCE`:
+  `hc_split.metal` as it stands), bit-equal, one launch fewer a layer.
 - A MoE ubench routes scattered experts and cycles 80+ weight sets: consecutive expert ids read far slower on M5 Max
   than a router's picks, and one reused set reads from the cache.
 - Under `tp` each `tpSum` is a CPU-stream JACCL all_sum, two a layer. With `MLX_METAL_FAST_SYNCH` (on in a group) MLX

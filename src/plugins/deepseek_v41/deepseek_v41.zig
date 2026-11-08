@@ -620,13 +620,14 @@ pub const Dec = struct {
     moe_up: ?dkern.moe_up.Kernel = null,
     moe_fp4: ?dkern.moe_fp4.Kernels = null,
     moe_down: ?mlx.mlx_fast_metal_kernel = null,
+    gate_split: ?mlx.mlx_fast_metal_kernel = null,
     /// `dkern.moe_down.probe`'s output rows a threadgroup on this GPU.
     moe_down_rb: usize = 0,
 
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
         // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.buildArm(dkern.attnBw()), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.buildArm(dkern.attnBw()), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.buildArm(dkern.attnBw()), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.buildArm(dkern.attnBw()), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null, .gate_split = if (hcFuse()) try buildGateSplit() else null };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -647,13 +648,22 @@ pub const Dec = struct {
         if (d.ffn_in) |k| dkern.ffn_in.free(k);
         if (d.wq_b) |k| k.deinit();
         if (d.wo_a) |k| k.deinit();
-        inline for (.{ d.attn, d.moe_down }) |k| if (k) |kern| {
+        inline for (.{ d.attn, d.moe_down, d.gate_split }) |k| if (k) |kern| {
             _ = mlx.mlx_fast_metal_kernel_free(kern);
         };
         if (d.wo_a_counter.ctx != null) _ = mlx.mlx_array_free(d.wo_a_counter);
         d.* = .{};
     }
 };
+
+pub fn hcFuse() bool {
+    const v = env.get(.DSV41_HC_FUSE);
+    return v == null or v.?[0] != '0';
+}
+
+pub fn buildGateSplit() !mlx.mlx_fast_metal_kernel {
+    return buildKernel("dsv41_gate_split", &GATE_SPLIT_INS, &GATE_SPLIT_OUTS, GATE_SPLIT_SOURCE, "");
+}
 
 pub fn cedSplit(c: *const Config) ?usize {
     if (!c.has_sliding_window or c.sliding_window == 0 or c.dsv41_kv_sources == 0) return null;
@@ -1332,6 +1342,9 @@ const HC_STAGE_TAIL = kernelSource("plugins/deepseek_v41/kernels/hc_stage_tail.m
 pub const HC_SPLIT_SOURCE = kernelSource("plugins/deepseek_v41/kernels/hc_split.metal");
 
 pub const HC_STAGE_SOURCE = HC_STAGE_HEAD ++ HC_STAGE_LOAD_PLAIN ++ HC_STAGE_TAIL;
+pub const GATE_SPLIT_SOURCE = "if (int(threadgroup_position_in_grid.x) == GATE_TGS) {\nif (simdgroup_index_in_threadgroup == 0) {\n" ++ HC_SPLIT_SOURCE ++ "\n}\nreturn;\n}\n" ++ GATE_SOURCE;
+pub const GATE_SPLIT_INS = [_][*:0]const u8{ "x", "w", "z", "eps" };
+pub const GATE_SPLIT_OUTS = [_][*:0]const u8{ "logits", "pre", "post", "comb" };
 pub const HC_STAGE_X_SOURCE = HC_STAGE_HEAD ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
 pub const HC_STAGE_INS = [_][*:0]const u8{ "x", "cpre", "w", "fn", "scale", "base", "eps" };
 pub const HC_STAGE_X_INS = [_][*:0]const u8{ "x", "y", "spost", "scomb", "cpre", "w", "fn", "scale", "base", "eps" };
@@ -2274,11 +2287,17 @@ pub fn hcEps(sc: *Scope, m: *const Dsv41Model) !A {
 }
 
 pub const Staged = struct { x1: A, sp: Split, h: A, z: A = none };
+pub const Mixed = struct { x1: A, h: A, z: A };
 pub const Expand = struct { y: A, sp: *const Split };
 
 /// `hcPreNorm` (with `ex`: `hcExpandPreNorm`, the stream being `hcExpand(x, y, ex.sp)`) as
 /// `HC_STAGE_SOURCE` and `HC_SPLIT_SOURCE`.
 pub fn hcStage(sc: *Scope, m: *const Dsv41Model, x: A, ex: ?Expand, cpre: A, hc: *const Hc, norm_w: A) !Staged {
+    const mx = try hcStageMixes(sc, m, x, ex, cpre, hc, norm_w);
+    return .{ .x1 = mx.x1, .sp = try hcSplit(sc, m, mx.z), .h = mx.h, .z = mx.z };
+}
+
+pub fn hcStageMixes(sc: *Scope, m: *const Dsv41Model, x: A, ex: ?Expand, cpre: A, hc: *const Hc, norm_w: A) !Mixed {
     const tg = m.hc_tg;
     const L = dim(x, 0);
     const D = dim(x, 2);
@@ -2314,27 +2333,40 @@ pub fn hcStage(sc: *Scope, m: *const Dsv41Model, x: A, ex: ?Expand, cpre: A, hc:
             _ = try sc.keep(o.*);
         }
     }
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    return .{ .x1 = if (ex != null) outs[2] else x, .h = outs[0], .z = outs[1] };
+}
+
+fn addSplitOutputs(cfg: mlx.mlx_fast_metal_kernel_config, m: *const Dsv41Model, L: usize) !void {
+    const nh = m.cfg.dsv4_hc_mult;
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(nh) }, 2, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(nh) }, 2, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(nh), ci(nh) }, 3, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, ci(L), 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HC", ci(nh)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ITERS", @intCast(m.cfg.dsv4_hc_sinkhorn_iters)));
-    const iv = mlx.mlx_vector_array_new_data(&[_]A{ outs[1], eps }, 2);
+}
+
+fn keptOutputs(sc: *Scope, ov: mlx.mlx_vector_array, out: []A) !void {
+    for (out, 0..) |*o, k| {
+        o.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(o, ov, k));
+        _ = try sc.keep(o.*);
+    }
+}
+
+pub fn hcSplit(sc: *Scope, m: *const Dsv41Model, z: A) !Split {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try addSplitOutputs(cfg, m, dim(z, 0));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, ci(dim(z, 0)), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ z, try hcEps(sc, m) }, 2);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, m.hc_split_kernel, iv, cfg, sc.s));
     var g: [3]A = undefined;
-    for (&g, 0..) |*o, k| {
-        o.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(o, ov, k));
-        _ = try sc.keep(o.*);
-    }
-    return .{ .x1 = if (ex != null) outs[2] else x, .sp = .{ .pre = g[0], .post = g[1], .comb = g[2] }, .h = outs[0], .z = outs[1] };
+    try keptOutputs(sc, ov, &g);
+    return .{ .pre = g[0], .post = g[1], .comb = g[2] };
 }
 
 /// `hcPreNorm` for the stream `hcExpand(x, y, sp)` makes, which it returns beside the rest. At decode
@@ -3631,15 +3663,11 @@ pub fn gateLogits(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
         const w = try sc.astype(ly.gate_w, .float32);
         return sc.matmul(try sc.astype(x, .float32), try sc.transpose(w, &.{ 1, 0 }));
     }
-    const sgs: usize = 8;
     var lo = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(lo);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(E) }, 2, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci((E + sgs - 1) / sgs * 32), ci(sgs * L), 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, ci(sgs), 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SGS", ci(sgs)));
+    try gateGrid(cfg, L, E, 0);
     const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, ly.gate_w }, 2);
     defer _ = mlx.mlx_vector_array_free(iv);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&lo, m.gate_kernel, iv, cfg, sc.s));
@@ -3647,12 +3675,63 @@ pub fn gateLogits(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
     return sc.res(mlx.mlx_vector_array_get(&logits, lo, 0), &logits);
 }
 
+const gate_sgs: usize = 8;
+
+fn gateTgs(E: usize) usize {
+    return (E + gate_sgs - 1) / gate_sgs;
+}
+
+fn gateGrid(cfg: mlx.mlx_fast_metal_kernel_config, L: usize, E: usize, split_tgs: usize) !void {
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(E) }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci((gateTgs(E) + split_tgs) * 32), ci(gate_sgs * L), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, ci(gate_sgs), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SGS", ci(gate_sgs)));
+}
+
+pub const GateSplit = struct { logits: A, sp: Split };
+
+pub fn gateSplit(sc: *Scope, m: *const Dsv41Model, k: mlx.mlx_fast_metal_kernel, ly: *const Layer, h: A, z: A) !GateSplit {
+    const L = dim(h, 0);
+    const E = dim(ly.gate_w, 0);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try gateGrid(cfg, L, E, 1);
+    try addSplitOutputs(cfg, m, L);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GATE_TGS", ci(gateTgs(E))));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ h, ly.gate_w, z, try hcEps(sc, m) }, 4);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, sc.s));
+    var g: [4]A = undefined;
+    try keptOutputs(sc, ov, &g);
+    return .{ .logits = g[0], .sp = .{ .pre = g[1], .post = g[2], .comb = g[3] } };
+}
+
+pub const FfnEntry = struct { pf: Staged, r: Routes };
+
+pub fn ffnEntry(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, y: A, sa: *const Split) !FfnEntry {
+    const k = m.dec.gate_split orelse return ffnEntryChain(sc, m, ly, x, y, sa);
+    if (dim(x, 0) > region_rows) return ffnEntryChain(sc, m, ly, x, y, sa);
+    const mx = try hcStageMixes(sc, m, x, .{ .y = y, .sp = sa }, sa.pre, &ly.hc_ffn, ly.ffn_norm);
+    const g = try gateSplit(sc, m, k, ly, mx.h, mx.z);
+    return .{ .pf = .{ .x1 = mx.x1, .sp = g.sp, .h = mx.h, .z = mx.z }, .r = try routeLogits(sc, m, ly, g.logits, none) };
+}
+
+fn ffnEntryChain(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, y: A, sa: *const Split) !FfnEntry {
+    const pf = try hcExpandPreNorm(sc, m, x, y, sa, sa.pre, &ly.hc_ffn, ly.ffn_norm);
+    return .{ .pf = pf, .r = try route(sc, m, ly, pf.h, none) };
+}
+
 /// `img` (`[L]` bool, or none) names the rows inside an image span, which pick their experts by `gate_bias_vl`.
 pub fn route(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, img: A) !Routes {
-    const L = dim(x, 0);
+    return routeLogits(sc, m, ly, try gateLogits(sc, m, ly, x), img);
+}
+
+pub fn routeLogits(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, logits: A, img: A) !Routes {
+    const L = dim(logits, 0);
     const E = dim(ly.gate_w, 0);
     const K = ly.top_k;
-    const logits = try gateLogits(sc, m, ly, x);
     const bias = if (img.ctx != null and ly.gate_bias_vl != null) try sc.where(try sc.expand(img, -1), ly.gate_bias_vl.?, ly.gate_bias) else ly.gate_bias;
     const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -4824,7 +4903,7 @@ pub fn compiledAt(m: *const Dsv41Model, rows: usize) bool {
     return rows <= region_rows and m.regions.len > 0 and m.trace == null;
 }
 
-fn compileRegions(m: *Dsv41Model) !void {
+pub fn compileRegions(m: *Dsv41Model) !void {
     m.regions = try m.gpa.alloc(LayerRegions, m.n_layers);
     for (m.regions, 0..) |*r, li| r.* = .{ .m = m, .li = li };
     for (m.regions) |*r| inline for (comptime std.enums.values(Region)) |kind| {
@@ -4834,7 +4913,7 @@ fn compileRegions(m: *Dsv41Model) !void {
     };
 }
 
-fn freeRegions(m: *Dsv41Model) void {
+pub fn freeRegions(m: *Dsv41Model) void {
     for (m.regions) |r| for (r.fns) |f| if (f.ctx != null) {
         _ = mlx.mlx_closure_free(f);
     };
@@ -4896,17 +4975,19 @@ fn RegionBody(comptime kind: Region) type {
                 // x, the attention's output and mix -> the new stream and the FFN's pre
                 .ffn => {
                     const sa: Split = .{ .pre = a[2], .post = a[3], .comb = a[4] };
-                    const pf = try hcExpandPreNorm(&sc, m, a[0], a[1], &sa, a[2], &ly.hc_ffn, ly.ffn_norm);
+                    const fe = try ffnEntry(&sc, m, ly, a[0], a[1], &sa);
+                    const pf = fe.pf;
                     const x1 = pf.x1;
-                    const r = try route(&sc, m, ly, pf.h, none);
+                    const r = fe.r;
                     const y = try ffnDecode(&sc, m, ly, pf.h, r.idx, r.wts, x1, &pf.sp) orelse try hcExpand(&sc, x1, try withShared(&sc, m, ly, pf.h, try routed(&sc, m, ly, pf.h, r.idx, r.wts)), &pf.sp);
                     res.* = mlx.mlx_vector_array_new_data(&.{ y, pf.sp.pre }, 2);
                 },
                 // `ffn` up to the router: the new stream, the FFN's mix, its normed input and its routes
                 .ffn_pre => {
                     const sa: Split = .{ .pre = a[2], .post = a[3], .comb = a[4] };
-                    const pf = try hcExpandPreNorm(&sc, m, a[0], a[1], &sa, a[2], &ly.hc_ffn, ly.ffn_norm);
-                    const r = try route(&sc, m, ly, pf.h, none);
+                    const fe = try ffnEntry(&sc, m, ly, a[0], a[1], &sa);
+                    const pf = fe.pf;
+                    const r = fe.r;
                     res.* = mlx.mlx_vector_array_new_data(&.{ pf.x1, pf.sp.pre, pf.sp.post, pf.sp.comb, pf.h, r.idx, r.wts }, 7);
                 },
                 // `routed`'s gate and up rows and the weights -> the weighted activation
@@ -7682,6 +7763,94 @@ test "dsv41 bench: one hyper-connection stage as a dependent chain (DSV41_BENCH_
         best = @min(best, @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / 200);
     }
     std.debug.print("[hc] {d} rows: expand+mix+norm+add chain {d:.1} us/call\n", .{ L, best });
+}
+
+test "dsv41 hc fuse: the gate launch's hc split and the routes after it are hc_split's and route's bit for bit, rows 1 2 6 16" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    try hcTestModel(&m);
+    defer hcTestModelFree(&m);
+    try probeHcThreads(gpa, &m);
+    m.cfg.router_scaling_factor = 2.5;
+    m.cfg.moe_route_norm = true;
+    m.gate_kernel = try buildKernel("dsv41_gate", &.{ "x", "w" }, &.{"logits"}, GATE_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.gate_kernel);
+    m.route_kernel = try buildKernel("dsv41_route", &.{ "logits", "bias", "scal" }, &.{ "idx", "wts" }, ROUTE_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.route_kernel);
+    const fused = try buildGateSplit();
+    defer _ = mlx.mlx_fast_metal_kernel_free(fused);
+    var checked: usize = 0;
+    for ([_]u64{ 11, 12, 13 }) |seed| for ([_]c_int{ 1, 2, 6, 16 }) |L| {
+        const t = try hcFuseInputs(&sc, seed, L);
+        var ly: Layer = undefined;
+        ly.hc_ffn = .{ .fn_w = t[5], .scale = t[6], .base = t[7] };
+        ly.ffn_norm = t[8];
+        ly.gate_w = t[9];
+        ly.gate_bias = t[10];
+        ly.gate_bias_vl = null;
+        ly.top_k = 6;
+        const sa: Split = .{ .pre = t[2], .post = t[3], .comb = t[4] };
+        m.dec = .{};
+        const want = try ffnEntry(&sc, &m, &ly, t[0], t[1], &sa);
+        m.dec = .{ .gate_split = fused };
+        const got = try ffnEntry(&sc, &m, &ly, t[0], t[1], &sa);
+        m.dec = .{};
+        const pairs = [_][2]A{
+            .{ want.pf.x1, got.pf.x1 },         .{ want.pf.h, got.pf.h },           .{ want.pf.z, got.pf.z },
+            .{ want.pf.sp.pre, got.pf.sp.pre }, .{ want.pf.sp.post, got.pf.sp.post }, .{ want.pf.sp.comb, got.pf.sp.comb },
+            .{ want.r.idx, got.r.idx },         .{ want.r.wts, got.r.wts },
+        };
+        for (pairs, 0..) |pr, i| {
+            if (!try bitEqual(&sc, pr[0], pr[1])) {
+                std.debug.print("hc fuse seed={d} rows={d}: output {d} differs\n", .{ seed, L, i });
+                return error.TestUnexpectedResult;
+            }
+            checked += 1;
+        }
+    };
+    try testing.expectEqual(@as(usize, 3 * 4 * 8), checked);
+}
+
+fn hcFuseInputs(sc: *Scope, seed: u64, L: c_int) ![11]A {
+    const shapes = [_][]const c_int{ &.{ L, 4, 5120 }, &.{ L, 5120 }, &.{ L, 4 }, &.{ L, 4 }, &.{ L, 4, 4 }, &.{ 24, 20480 }, &.{24}, &.{24}, &.{5120}, &.{ 384, 5120 }, &.{ 1, 384 } };
+    const bf16 = [_]bool{ true, true, false, false, false, false, false, false, true, true, false };
+    const std_ = [_]f32{ 1, 1, 1, 1, 1, 0.01, 1, 1, 1, 0.02, 0.1 };
+    var t: [11]A = undefined;
+    for (shapes, &t, 0..) |sh, *o, i| {
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        try mlx.check(mlx.mlx_random_key(&k, seed * 100 + i));
+        var r = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, if (bf16[i]) .bfloat16 else .float32, 0, std_[i], k, sc.s));
+        o.* = try sc.keep(r);
+    }
+    try evalAll(&t);
+    return t;
+}
+
+fn bitsOf(sc: *Scope, a: A) !A {
+    const as: mlx.mlx_dtype = switch (mlx.mlx_array_dtype(a)) {
+        .float32 => .uint32,
+        .bfloat16 => .uint16,
+        else => return a,
+    };
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_view(&o, a, as, sc.s), &o);
+}
+
+fn bitEqual(sc: *Scope, a: A, b: A) !bool {
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, try bitsOf(sc, a), try bitsOf(sc, b), false, sc.s));
+    try mlx.check(mlx.mlx_array_eval(eq));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    return same;
 }
 
 /// A model with only the hc kernels built, at the release's widths.

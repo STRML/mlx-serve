@@ -8,6 +8,8 @@
 //!
 //!   DSV41_KMAP_ROWS (1,6: row counts, one phase each)  DSV41_KMAP_STEPS (32, even)  DSV41_KMAP_CTX (2048)  DSV41_KMAP_TP (4)
 //!   DSV41_KMAP_LAYERS (0-40)  DSV41_KMAP_EXPERTS (384)  DSV41_KMAP_GO (a file to wait for after the setup)
+//!   DSV41_KMAP_HC_AB (unset: off; `aa`: both arms the hc_split launch): steps alternate the FFN's own hc_split launch
+//!   and the gate launch's (DSV41_HC_FUSE)
 //!
 //! Lines start `[kmap]`.
 
@@ -80,16 +82,68 @@ test "dsv41 kernel map: a TP rank's full decode step in a loop for a GPU trace (
     std.debug.print("[kmap] fixture tp={d} layers={d}-{d} experts={d} ctx={d} built in {d:.0} s\n", .{ tp, lo, hi, experts, ctx, @as(f64, @floatFromInt(nowUs() - t0)) / 1e6 });
 
     waitForGo();
+    var arms: ?HcArms = if (std.c.getenv("DSV41_KMAP_HC_AB")) |v| try HcArms.init(fx.m, v[0] == 'a') else null;
+    defer if (arms) |*a| a.deinit(fx.m);
     var p0: usize = ctx;
     var rows_it = std.mem.tokenizeScalar(u8, rows_list, ',');
     while (rows_it.next()) |tok| {
         const rows = try std.fmt.parseInt(usize, tok, 10);
-        try phase(gpa, fx, rows, steps, &p0);
+        try phase(gpa, fx, rows, steps, &p0, if (arms) |*a| a else null);
     }
 }
 
+const Regions = @FieldType(dsv41.Dsv41Model, "regions");
+
+const HcArms = struct {
+    regions: [2]Regions,
+    gate: [2]?mlx.mlx_fast_metal_kernel,
+    fused: mlx.mlx_fast_metal_kernel,
+
+    fn init(m: *dsv41.Dsv41Model, same: bool) !HcArms {
+        const fused = m.dec.gate_split orelse try dsv41.buildGateSplit();
+        const own = m.regions;
+        m.regions = &.{};
+        try dsv41.compileRegions(m);
+        return .{ .regions = .{ own, m.regions }, .gate = .{ null, if (same) null else fused }, .fused = fused };
+    }
+
+    fn use(a: *const HcArms, m: *dsv41.Dsv41Model, arm: usize) void {
+        m.regions = a.regions[arm];
+        m.dec.gate_split = a.gate[arm];
+    }
+
+    fn deinit(a: *HcArms, m: *dsv41.Dsv41Model) void {
+        a.use(m, 1);
+        dsv41.freeRegions(m);
+        m.regions = a.regions[0];
+        m.dec.gate_split = a.fused;
+    }
+};
+
+fn medianOf(xs: []f64) f64 {
+    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
+    return xs[xs.len / 2];
+}
+
+fn printArms(rows: usize, us: []const f64) void {
+    var by: [2][128]f64 = undefined;
+    var diff: [128]f64 = undefined;
+    const pairs = us.len / 2;
+    for (0..pairs) |i| {
+        const a0 = us[2 * i + 1];
+        const a1 = us[2 * i];
+        by[0][i] = a0;
+        by[1][i] = a1;
+        diff[i] = a1 - a0;
+    }
+    const d = medianOf(diff[0..pairs]);
+    const m0 = medianOf(by[0][0..pairs]);
+    const m1 = medianOf(by[1][0..pairs]);
+    std.debug.print("[kmap] hc ab rows={d} pairs={d}: split launch median={d:.0} min={d:.0}, gate launch median={d:.0} min={d:.0}, paired diff median={d:.0} us\n", .{ rows, pairs, m0, by[0][0], m1, by[1][0], d });
+}
+
 /// One row count: 3 warm-up steps and `steps` timed ones from position `p0`, which moves past them.
-fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize, p0: *usize) !void {
+fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize, p0: *usize, arms: ?*const HcArms) !void {
     const warm = 3;
     const total = warm + steps;
     const xs = try gpa.alloc(A, total);
@@ -112,6 +166,7 @@ fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize
     sleepSecs(2000);
     for (0..total) |k| {
         if (k == warm) sleepSecs(500);
+        if (arms) |a| a.use(fx.m, k % 2);
         const s0 = nowUs();
         const out = try dsv41.workerStep(fx.m, gpa, xs[k], pres[k], p0.*, false, false);
         for (out) |o| _ = mlx.mlx_array_free(o);
@@ -119,6 +174,7 @@ fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize
         p0.* += rows;
     }
     sleepSecs(500);
+    if (arms != null) printArms(rows, us[0..steps]);
     var sorted: [256]f64 = undefined;
     @memcpy(sorted[0..steps], us[0..steps]);
     std.mem.sort(f64, sorted[0..steps], {}, std.sort.asc(f64));
