@@ -86,10 +86,22 @@ M5 Max, 384 experts, 1 row, 720 steps in 60 rotated blocks of 12 arms, median of
 The copy is the stock step (`sk:none`, `sk:raw` inside the null), `sk:all-small` is about its parts' sum (-1925 against
 -1717), and the groups' stand-ins add up to 12.4 of the 13.1 ms. A stand-in launch costs about 2.5 us a layer (`ctl:wo_b`),
 so hc's two and attention's one hide about 0.2 and 0.1 ms over 40 layers. The host has built the last layer at 3.1-3.5 ms
-of a 6.3-6.7 ms half, so the step is GPU-bound in every arm. Per layer: router 24 us (its `gate_w` is 3.1 MB, 7 us of
-reading), hc 19 us plus its stand-ins, attention core and indexer 23 us, the four projections 131 us (the twins above
-put 90-100 us on their bytes; the rest is what rides inside them), the MoE 114 us. The Mac had other GPU tenants: quote
-these to about 15%.
+of a 6.3-6.7 ms half, so the step is GPU-bound in every arm. The Mac had other GPU tenants: quote these to about 15%.
+
+Against the bytes each group reads (the test prints them after the fixture: `[kmap] bytes`), over 40 layers at the
+450 GB/s streaming read:
+
+| group | in the step | bytes | at 450 GB/s | beyond its bytes |
+|---|---|---|---|---|
+| four projections (+ the attention's hc mixes `in_proj` reads) | 5.22 ms (+0.2 stand-ins) | 1751 MB | 3.89 ms | 1.3-1.5 ms |
+| MoE (6 routed slices + the shared expert) | 4.57 ms | 1493 MB | 3.32 ms | 1.25 ms |
+| router (`gate_w`, 3.15 MB a layer) | 0.96 ms | 126 MB | 0.28 ms | 0.68 ms |
+| hc (FFN side) | 0.76 ms (+0.2 stand-ins) | 79 MB | 0.17 ms | 0.6-0.8 ms |
+| attention core and indexer | 0.91 ms (+0.1 stand-in) | KV only | ~0.05 ms | 0.9-1.0 ms |
+| the step | 13.08 ms | 3449 MB | 7.66 ms | 5.4 ms |
+
+So on the M5 Max the time past the bytes splits about evenly between the two big groups (2.6-2.8 ms together) and the
+three small ones (2.2-2.5 ms), and the KV write and stray copies hold none of it (`sk:norm`).
 
 ## Two steps on two GPU streams
 
@@ -177,6 +189,14 @@ The index-owner layers (wider `wq_b`, the index scorer and top-k) are 2, 8, 14, 
     KMAP_MLX_LIB=<labelled lib dir> scripts/kernel_map_trace.sh OUT patched_a 0-20 patched   # and 20-40
     scripts/kernel_map_report.py --rows 1 --seg 4 --patched A.trace:B.trace[,A2:B2] --stock A.trace:B.trace[,..]
     # --seg 4 is the 1-row phase of the test, --seg 1 the 6-row phase
+
+    # stand-in arms (one process a half; 720 steps = 60 blocks of the 12 arms)
+    DSV41_DEC_UBENCH=1 DSV41_KMAP=1 DSV41_KMAP_ROWS=1 DSV41_KMAP_LAYERS=20-40 DSV41_KMAP_STEPS=720 \
+      DSV41_KMAP_AB="base/base/sk:none/sk:raw/sk:hc/sk:router/sk:norm/sk:attn/sk:moe/sk:proj/sk:all-small/ctl:wo_b" \
+      ./zig-out/tests/test
+    # two fixtures on two streams (two 384-expert fixtures need about 81 GB)
+    DSV41_DEC_UBENCH=1 DSV41_KMAP_PAIR=1 DSV41_KMAP_ROWS=1 DSV41_KMAP_LAYERS=20-40 DSV41_KMAP_EXPERTS=192 \
+      DSV41_KMAP_STEPS=700 ./zig-out/tests/test   # DSV41_KMAP_PAIR_ARMS, default one/one/oneb/two/stock/onepre/twopre
 
 ## 1 row
 

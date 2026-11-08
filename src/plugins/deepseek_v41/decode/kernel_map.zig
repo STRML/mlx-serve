@@ -132,9 +132,43 @@ const KmapOpts = struct {
         std.debug.print("[kmap] fixture tp={d} layers={d}-{d} experts={d} ctx={d} seed={d} built in {d:.0} s\n", .{ o.tp, o.lo, o.hi, o.experts, o.ctx, seed, @as(f64, @floatFromInt(nowUs() - t0)) / 1e6 });
         _ = mlx.mlx_clear_cache();
         memLine("after the fixture");
+        bytesLine(fx.m, o.lo, o.hi);
         return fx;
     }
 };
+
+fn arrBytes(a: A) usize {
+    return if (a.ctx == null) 0 else bytesOf(a);
+}
+
+fn linBytes(l: dsv41.Lin) usize {
+    return arrBytes(l.w) + arrBytes(l.s) + arrBytes(l.b);
+}
+
+fn bankBytes(b: dsv41.Bank) usize {
+    return arrBytes(b.w) + arrBytes(b.s) + arrBytes(b.b);
+}
+
+fn bytesLine(m: *const dsv41.Dsv41Model, lo: usize, hi: usize) void {
+    var g: [5]usize = @splat(0);
+    for (m.layers[lo..hi]) |*ly| {
+        for ([_]?dsv41.Lin{ ly.q_kv, ly.wq_b, ly.wo_a, ly.wo_b, if (ly.idx) |x| x.wq_b else null, if (ly.idx) |x| x.weights_proj else null, if (ly.comp) |x| x.wkv else null }) |l| if (l) |v| {
+            g[0] += linBytes(v);
+        };
+        g[1] += arrBytes(ly.hc_attn.fn_w);
+        g[2] += arrBytes(ly.hc_ffn.fn_w);
+        g[3] += arrBytes(ly.gate_w);
+        const e = mlx.getShape(ly.gate_w)[0];
+        const routed = if (ly.experts.gu) |gu| bankBytes(gu) + bankBytes(ly.experts.down) else bankBytes(ly.experts.gate) + bankBytes(ly.experts.up) + bankBytes(ly.experts.down);
+        g[4] += routed / @as(usize, @intCast(e)) * ly.top_k + (if (ly.shared_gu) |v| linBytes(v) else linBytes(ly.shared[0]) + linBytes(ly.shared[1])) + linBytes(ly.shared[2]);
+    }
+    const mb = struct {
+        fn f(x: usize) f64 {
+            return @as(f64, @floatFromInt(x)) / 1e6;
+        }
+    }.f;
+    std.debug.print("[kmap] bytes a 1-row step over layers {d}-{d}: projections {d:.1} MB (+ hc_attn mixes read in in_proj {d:.1} MB), hc_ffn mixes {d:.1} MB, router gate {d:.1} MB, MoE top-k + shared {d:.1} MB\n", .{ lo, hi, mb(g[0]), mb(g[1]), mb(g[2]), mb(g[3]), mb(g[4]) });
+}
 
 fn memLine(tag: []const u8) void {
     var active: usize = 0;
@@ -334,7 +368,7 @@ const Probe = struct {
     }
 
     fn fire(p: *Probe, st: Stage) void {
-        if (p.capturing == null) p.fired[p.arm_ix][@intFromEnum(st)] += 1;
+        if (p.capturing == null) p.fired[p.arm_ix][@backingInt(st)] += 1;
     }
 
     fn layerHook(ctx: *anyopaque, sc: *dsv41.Scope, m: *dsv41.Dsv41Model, st: *dsv41.State, li: usize, x: A, pre: *A, p0: usize, sh: *dsv41.Shared) anyerror!?A {
@@ -607,7 +641,6 @@ fn hold(slot: *A, x: A) void {
     drop(slot);
     slot.* = o;
 }
-
 
 fn twinLaunch(sc: *dsv41.Scope, m: *dsv41.Dsv41Model, ly: *const dsv41.Layer, li: usize, at: ProjAt, ins: []const A) !A {
     return switch (at) {
@@ -927,7 +960,11 @@ test "dsv41 kernel map: two fixtures stepped together on two GPU streams (DSV41_
     const fb = try o.build(gpa, 2, sb);
     defer fb.deinit();
     waitForGo();
-    try overlapCheck(gpa, sb);
+    const light = try overlapCheck(gpa, sb);
+    if (light > starved_us) {
+        std.debug.print("[kmap] pair: {d} tiny launches took {d:.0} us on one stream (healthy is a few ms): the GPU is starved for memory, stopping\n", .{ tick_links, light });
+        return error.KmapGpuStarved;
+    }
     var arms: [max_arms]PairArm = undefined;
     var n: usize = 0;
     var it = std.mem.tokenizeScalar(u8, std.mem.span(std.c.getenv("DSV41_KMAP_PAIR_ARMS") orelse "one/one/oneb/two/stock/onepre/twopre"), '/');
@@ -935,14 +972,20 @@ test "dsv41 kernel map: two fixtures stepped together on two GPU streams (DSV41_
     try pairPhase(gpa, fa, fb, rows, o.steps, arms[0..n]);
 }
 
-fn overlapCheck(gpa: std.mem.Allocator, sb: mlx.mlx_stream) !void {
+const starved_us = 20_000;
+
+fn overlapCheck(gpa: std.mem.Allocator, sb: mlx.mlx_stream) !f64 {
     const k = try dsv41.buildKernel("dsv41_kmap_tick", &.{"x"}, &.{"y"}, TICK_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    var light: f64 = 0;
     for ([_]c_int{ 0, 2048 }) |iters| {
         const one = try tickChains(gpa, k, iters, &.{mlx.gpuStream()});
         const two = try tickChains(gpa, k, iters, &.{ mlx.gpuStream(), sb });
         std.debug.print("[kmap] streams: {d} dependent tiny launches of {d} fma steps on one stream {d:.0} us, the same on each of two streams at once {d:.0} us (x{d:.2})\n", .{ tick_links, iters, one, two, two / one });
+        if (iters == 0) light = one;
+        if (light > starved_us) break;
     }
+    return light;
 }
 
 fn tickChains(gpa: std.mem.Allocator, k: mlx.mlx_fast_metal_kernel, iters: c_int, streams: []const mlx.mlx_stream) !f64 {
