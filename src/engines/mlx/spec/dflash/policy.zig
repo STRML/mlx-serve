@@ -150,6 +150,15 @@ pub const CopyStats = struct {
     hit: [2]f32 = .{ PRIOR[0] * PRIOR_WEIGHT, PRIOR[1] * PRIOR_WEIGHT },
     tries: [2]f32 = .{ PRIOR_WEIGHT, PRIOR_WEIGHT },
 
+    pub fn fromEnv() CopyStats {
+        const raw = std.c.getenv("DSV41_COPY_PRIOR") orelse return .{};
+        const strong = std.fmt.parseFloat(f32, std.mem.span(raw)) catch return .{};
+        if (!(strong > 0 and strong < 1)) return .{};
+        var stats: CopyStats = .{};
+        stats.hit[1] = strong * PRIOR_WEIGHT;
+        return stats;
+    }
+
     fn class(suffix: u32) usize {
         return @intFromBool(suffix >= STRONG);
     }
