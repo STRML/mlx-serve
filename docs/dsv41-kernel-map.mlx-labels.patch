@@ -1,0 +1,67 @@
+--- lib/mlx-src/mlx/backend/metal/device.cpp	2026-11-08 07:42:53
++++ /private/tmp/claude-501/-Users-samuelreed-git-oss-local-llm/13bec99d-5c06-422b-bccd-40eb4a2beecb/scratchpad/kmap-mlx/src/mlx/backend/metal/device.cpp	2026-11-08 08:03:31
+@@ -433,6 +433,21 @@
+       std::make_move_iterator(arrays.end()));
+ }
+ 
++static std::mutex g_kmap_mtx;
++static std::unordered_map<const void*, std::string>& kmap_registry() {
++  static std::unordered_map<const void*, std::string> m;
++  return m;
++}
++
++void CommandEncoder::set_compute_pipeline_state(
++    MTL::ComputePipelineState* kernel) {
++  get_command_encoder()->setComputePipelineState(kernel);
++  std::lock_guard lk(g_kmap_mtx);
++  auto it = kmap_registry().find(kernel);
++  kmap_names_ += (it == kmap_registry().end() ? std::string("?") : it->second);
++  kmap_names_ += ';';
++}
++
+ void CommandEncoder::maybeInsertBarrier() {
+   if (needs_barrier_) {
+     get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
+@@ -537,6 +552,10 @@
+     }
+   });
+ 
++  if (!kmap_names_.empty()) {
++    encoder_->setLabel(NS::String::string(kmap_names_.c_str(), NS::UTF8StringEncoding));
++    kmap_names_.clear();
++  }
+   encoder_->endEncoding();
+   encoder_.reset();
+   needs_barrier_ = false;
+@@ -961,6 +980,10 @@
+ 
+   // Add kernel to cache
+   kernel_map_.insert({hash_name, kernel});
++  {
++    std::lock_guard lk(g_kmap_mtx);
++    kmap_registry()[kernel.get()] = hash_name;
++  }
+ 
+   return kernel.get();
+ }
+--- lib/mlx-src/mlx/backend/metal/device.h	2026-11-08 07:42:53
++++ /private/tmp/claude-501/-Users-samuelreed-git-oss-local-llm/13bec99d-5c06-422b-bccd-40eb4a2beecb/scratchpad/kmap-mlx/src/mlx/backend/metal/device.h	2026-11-08 08:03:31
+@@ -56,9 +56,7 @@
+   void dispatch_threads(MTL::Size grid_dims, MTL::Size group_dims);
+   void maybeInsertBarrier();
+ 
+-  void set_compute_pipeline_state(MTL::ComputePipelineState* kernel) {
+-    get_command_encoder()->setComputePipelineState(kernel);
+-  }
++  void set_compute_pipeline_state(MTL::ComputePipelineState* kernel);
+ 
+   template <typename Vec, typename = std::enable_if_t<is_vector_v<Vec>>>
+   void set_vector_bytes(const Vec& vec, size_t nelems, int idx) {
+@@ -141,6 +139,7 @@
+   NS::SharedPtr<MTL::Fence> fence_;
+   bool needs_barrier_{false};
+   bool concurrent_{false};
++  std::string kmap_names_;
+   std::vector<array> temporaries_;
+   std::unordered_set<MTL::Resource*> prev_inputs_;
+   std::unordered_set<MTL::Resource*> prev_outputs_;
