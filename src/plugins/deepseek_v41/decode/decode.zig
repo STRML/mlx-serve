@@ -601,5 +601,6 @@ test "dsv41 dec attention side: the DSV41_ATTN_BW launches write today's bytes, 
 
 test {
     _ = fixture;
+    _ = @import("kernel_map.zig");
     inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;
 }
