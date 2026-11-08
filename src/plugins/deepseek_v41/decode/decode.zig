@@ -17,7 +17,8 @@ pub const ffn_in = @import("ffn_in.zig");
 pub const moe_up = @import("moe_up.zig");
 pub const moe_fp4 = @import("moe_fp4.zig");
 pub const moe_down = @import("moe_down.zig");
-pub const ffn_seg = @import("ffn_seg.zig");
+pub const seg = @import("seg.zig");
+pub const seg_bounds = @import("seg_bounds.zig");
 
 const dsv41 = @import("../deepseek_v41.zig");
 
@@ -603,5 +604,6 @@ test "dsv41 dec attention side: the DSV41_ATTN_BW launches write today's bytes, 
 test {
     _ = fixture;
     _ = @import("kernel_map.zig");
+    _ = @import("seg_test.zig");
     inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;
 }
