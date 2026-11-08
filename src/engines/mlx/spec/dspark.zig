@@ -221,6 +221,17 @@ fn samplePlainMs(self: *Generator, ms: f32) void {
     self.xfm.dspark_plain = pol.plain;
 }
 
+/// `DSV41_DSPARK_ROWS=k` verifies k rows (t1 included) every round the draft has them, for measuring the verify
+/// ladder; unset or 0, the policy chooses.
+var forced_rows: ?usize = null;
+fn forcedVerifyRows() ?usize {
+    if (forced_rows == null) {
+        const raw = std.c.getenv("DSV41_DSPARK_ROWS");
+        forced_rows = if (raw) |r| std.fmt.parseInt(usize, std.mem.span(r), 10) catch 0 else 0;
+    }
+    return if (forced_rows.? > 0) forced_rows.? else null;
+}
+
 fn msSince(w: *const io_util.Stopwatch) f32 {
     return @as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms);
 }
@@ -234,14 +245,18 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     const t1 = self.next_token_id;
     var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
     defer d.deinit(allocator);
+    const drafted = d.len;
     d.len = dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+    if (forcedVerifyRows()) |rows| d.len = @min(rows - 1, drafted);
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     const verify_watch = io_util.Stopwatch.init(self.timer.io);
     const round = if (self.dspark_stochastic)
         try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
-    if (d.len == 0) self.samplePlainMs(msSince(&verify_watch));
+    const verify_ms = msSince(&verify_watch);
+    self.dspark_stats.recordVerifyMs(@intCast(d.len + 1), verify_ms);
+    if (d.len == 0) self.samplePlainMs(verify_ms);
     for (d.confidence[0..d.len], 0..) |c, k| {
         if (k > round.accepted) break;
         pol.calib.observe(sigmoid(c), k < round.accepted);
