@@ -26,6 +26,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   `flash_attn`: the lossy flash kernel, default on beside a plugin bank only).
 - `spec/markov.zig`: DSpark's Markov chain in B + 1 launches; `decode/engram_decode.zig` the Engram LRU,
   `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
+- `DSV41_ATTN_BW=0` keeps the first in_proj / wq_b / wo_a layouts (bit-equal; `decode.zig` tests both arms' bytes and
+  times them at a rank of four against a streaming read).
 - `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built on
   every GPU (NAX too); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the
   expert-pruned packs are 2-bit g128). Otherwise `routed` runs. `DSV41_MOE_BW=0` keeps the first launches (bit-equal).
