@@ -14,7 +14,7 @@ pub fn nowUs() i64 {
 const A = mlx.mlx_array;
 const none: A = .{ .ctx = null };
 
-pub const Arm = enum { base, split, nopre, rsu, fin, finsplit, oracle };
+pub const Arm = enum { base, split, nopre, rsu, fin, finsplit, oracle, noshared };
 
 pub var arm: Arm = .base;
 var arm_read = false;
@@ -164,12 +164,25 @@ fn down(sc: *dsv41.Scope, k: Kern, ly: *const dsv41.Layer, act: A, sx: A, idx: A
     return apply(sc, k.down, cfg, &.{ act, dn.w, dn.s, sh.w, sh.s, idx, one.pre, one.post, one.comb, sx });
 }
 
+var zero_sx: A = none;
+
+fn zeroSx(R: usize, n: usize) !A {
+    if (zero_sx.ctx == null or dims(zero_sx, 0) != R) {
+        if (zero_sx.ctx != null) _ = mlx.mlx_array_free(zero_sx);
+        zero_sx = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&zero_sx, &[_]c_int{ ci(R), 1, ci(n) }, 3, .bfloat16, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_array_eval(zero_sx));
+    }
+    return zero_sx;
+}
+
 pub fn moeSplit(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, h: A, idx: A, wts: A) !?A {
     const kf = m.dec.moe_fp4 orelse return null;
     if (!kf.bw) return null;
     const k = try kernels();
     const R = dims(h, 0);
-    const su = try up(sc, k, kf.lim, 1, ly, h, idx, wts, h);
+    const n = dims(ly.shared_gu.?.w, 0) / 2;
+    const su = if (current() == .noshared) try zeroSx(R, n) else try up(sc, k, kf.lim, 1, ly, h, idx, wts, h);
     const ru = try up(sc, k, kf.lim, 2, ly, h, idx, wts, h);
     const y = try down(sc, k, ly, ru, su, idx, &m.tp_units[R - 1]);
     return try sc.reshape(y, &.{ ci(R), ci(dims(h, 1)) });
@@ -266,6 +279,13 @@ pub fn tpFfn(sc: *dsv41.Scope, m: *dsv41.Dsv41Model, li: usize, x: A, ao: A, sa:
         const y = (try moe_fp4.moeDown(sc, kf, ly, act, c[1], one.pre, one)) orelse return null;
         pre.* = c[3];
         return try dsv41.hcExpand(sc, x, try dsv41.tpSum(sc, m, try sc.reshape(y, &.{ ci(R), ci(dims(x, 2)) })), &.{ .pre = c[3], .post = c[4], .comb = c[5] });
+    }
+    if (a == .noshared) {
+        var p: [7]A = undefined;
+        try dsv41.runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
+        pre.* = p[1];
+        const part = (try moeSplit(sc, m, ly, p[4], p[5], p[6])) orelse return null;
+        return try dsv41.hcExpand(sc, p[0], try dsv41.tpSum(sc, m, part), &.{ .pre = p[1], .post = p[2], .comb = p[3] });
     }
     if (a == .oracle) {
         const c = heldOf(li) orelse return null;
