@@ -43,6 +43,13 @@ fn waitForGo() void {
     while (std.c.access(go, 0) != 0) sleepSecs(100);
 }
 
+fn waitForGate() void {
+    const gate = std.c.getenv("DSV41_KMAP_GATE") orelse return;
+    _ = std.c.unlink(gate);
+    std.debug.print("[kmap] gate\n", .{});
+    while (std.c.access(gate, 0) != 0) sleepSecs(50);
+}
+
 fn sleepSecs(ms: i64) void {
     std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(ms), .real) catch {};
 }
@@ -81,15 +88,242 @@ test "dsv41 kernel map: a TP rank's full decode step in a loop for a GPU trace (
 
     waitForGo();
     var p0: usize = ctx;
-    var rows_it = std.mem.tokenizeScalar(u8, rows_list, ',');
-    while (rows_it.next()) |tok| {
-        const rows = try std.fmt.parseInt(usize, tok, 10);
-        try phase(gpa, fx, rows, steps, &p0);
+    const ab_spec = std.c.getenv("DSV41_KMAP_AB") orelse {
+        var rows_it = std.mem.tokenizeScalar(u8, rows_list, ',');
+        while (rows_it.next()) |tok| try phase(gpa, fx, try std.fmt.parseInt(usize, tok, 10), steps, &p0, null);
+        return;
+    };
+    const probe = try Probe.init(gpa, fx, lo, hi);
+    defer probe.deinit();
+    fx.m.probe = &probe.hook;
+    defer fx.m.probe = null;
+    var exps = std.mem.tokenizeScalar(u8, std.mem.span(ab_spec), ';');
+    while (exps.next()) |exp| {
+        var ab: Ab = .{ .probe = probe, .name = exp };
+        var it = std.mem.tokenizeScalar(u8, exp, '/');
+        while (it.next()) |tok| {
+            ab.arms[ab.n] = try parseArm(tok);
+            ab.n += 1;
+        }
+        var rows_it = std.mem.tokenizeScalar(u8, rows_list, ',');
+        while (rows_it.next()) |tok| try phase(gpa, fx, try std.fmt.parseInt(usize, tok, 10), steps, &p0, &ab);
+    }
+    probe.arm = .{};
+    if (std.c.getenv("DSV41_KMAP_CHAIN")) |raw| {
+        var it = std.mem.tokenizeScalar(u8, std.mem.span(raw), ',');
+        while (it.next()) |tok| try probe.reportChains(std.meta.stringToEnum(dsv41.ProjAt, tok) orelse return error.BadProjection);
     }
 }
 
+const ProjAt = dsv41.ProjAt;
+const Mode = enum { base, ctl, twin, same };
+const Arm = struct { mode: Mode = .base, at: ProjAt = .in_proj, index: ?bool = null };
+
+fn parseArm(tok: []const u8) !Arm {
+    var it = std.mem.tokenizeAny(u8, tok, ":@");
+    const mode = std.meta.stringToEnum(Mode, it.next() orelse "base") orelse return error.BadArm;
+    if (mode == .base) return .{};
+    const at = std.meta.stringToEnum(ProjAt, it.next() orelse return error.BadArm) orelse return error.BadArm;
+    const where = it.next() orelse return .{ .mode = mode, .at = at };
+    if (std.mem.eql(u8, where, "idx")) return .{ .mode = mode, .at = at, .index = true };
+    if (std.mem.eql(u8, where, "plain")) return .{ .mode = mode, .at = at, .index = false };
+    return error.BadArm;
+}
+
+const max_arms = 12;
+
+const Ab = struct {
+    probe: *Probe,
+    arms: [max_arms]Arm = @splat(.{}),
+    n: usize = 0,
+    name: []const u8,
+
+    fn armOf(ab: *const Ab, k: usize) usize {
+        const block = k / ab.n;
+        return (k % ab.n + block) % ab.n;
+    }
+};
+
+const PASS_SOURCE =
+    \\    uint i = thread_position_in_grid.x;
+    \\    y[i] = x[i];
+;
+
+const max_layers = 64;
+const Ins = struct { a: [4]A = @splat(none), n: usize = 0 };
+const none: A = .{ .ctx = null };
+
+const Probe = struct {
+    gpa: std.mem.Allocator,
+    m: *dsv41.Dsv41Model,
+    lo: usize,
+    hi: usize,
+    held: dsv41.Scope,
+    copies: []dsv41.Layer,
+    pass: mlx.mlx_fast_metal_kernel,
+    arm: Arm = .{},
+    seen: [4][max_layers]Ins = @splat(@splat(.{})),
+    hook: dsv41.ProjProbe,
+
+    fn init(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize) !*Probe {
+        std.debug.assert(hi <= max_layers);
+        const p = try gpa.create(Probe);
+        errdefer gpa.destroy(p);
+        p.* = .{ .gpa = gpa, .m = fx.m, .lo = lo, .hi = hi, .held = dsv41.Scope.init(gpa, fx.m.s), .copies = try gpa.alloc(dsv41.Layer, hi - lo), .pass = try dsv41.buildKernel("dsv41_kmap_pass", &.{ "x", "dep" }, &.{"y"}, PASS_SOURCE, ""), .hook = .{ .ctx = p, .before = &before } };
+        for (p.copies, lo..) |*c, li| c.* = try decode.layerCopy(&p.held, fx.layer(li));
+        return p;
+    }
+
+    fn deinit(p: *Probe) void {
+        for (&p.seen) |*row| for (row) |*ins| forget(ins);
+        _ = mlx.mlx_fast_metal_kernel_free(p.pass);
+        p.held.deinit();
+        p.gpa.free(p.copies);
+        p.gpa.destroy(p);
+    }
+
+    fn forget(ins: *Ins) void {
+        for (ins.a[0..ins.n]) |a| _ = mlx.mlx_array_free(a);
+        ins.n = 0;
+    }
+
+    fn remember(p: *Probe, li: usize, at: ProjAt, ins: []const A) void {
+        const slot = &p.seen[@backingInt(at)][li];
+        forget(slot);
+        for (ins, 0..) |a, i| {
+            slot.a[i] = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&slot.a[i], a);
+        }
+        slot.n = ins.len;
+    }
+
+    fn applies(p: *const Probe, li: usize, at: ProjAt) bool {
+        if (p.arm.mode == .base or p.arm.at != at) return false;
+        const want = p.arm.index orelse return true;
+        return (p.m.layers[li].idx != null) == want;
+    }
+
+    fn before(ctx: *anyopaque, sc: *dsv41.Scope, m: *dsv41.Dsv41Model, li: usize, at: ProjAt, ins: []const A) anyerror!A {
+        const p: *Probe = @ptrCast(@alignCast(ctx));
+        p.remember(li, at, ins);
+        if (!p.applies(li, at)) return ins[0];
+        const dep = switch (p.arm.mode) {
+            .base, .ctl => ins[0],
+            .twin => try twinLaunch(sc, m, &p.copies[li - p.lo], li, at, ins),
+            .same => try twinLaunch(sc, m, &m.layers[li], li, at, ins),
+        };
+        return passLaunch(sc, p.pass, ins[0], dep);
+    }
+
+    fn chainUs(p: *Probe, at: ProjAt, index: bool, twin: bool) !f64 {
+        var lis: [max_layers]usize = undefined;
+        var n: usize = 0;
+        for (p.lo..p.hi) |li| if (p.seen[@backingInt(at)][li].n > 0 and (p.m.layers[li].idx != null) == index) {
+            lis[n] = li;
+            n += 1;
+        };
+        if (n == 0) return 0;
+        const links = 4 * n;
+        var times: [7]f64 = undefined;
+        for (0..2 + times.len) |rep| {
+            var sc = dsv41.Scope.init(p.gpa, p.m.s);
+            defer sc.deinit();
+            var prev = p.seen[@backingInt(at)][lis[0]].a[0];
+            for (0..links) |i| {
+                const li = lis[i % n];
+                const ins = &p.seen[@backingInt(at)][li];
+                const g = try passLaunch(&sc, p.pass, ins.a[0], prev);
+                if (!twin) {
+                    prev = g;
+                    continue;
+                }
+                var fed = ins.a;
+                fed[0] = g;
+                prev = try twinLaunch(&sc, p.m, &p.copies[li - p.lo], li, at, fed[0..ins.n]);
+            }
+            const t0 = nowUs();
+            try mlx.check(mlx.mlx_array_eval(prev));
+            if (rep >= 2) times[rep - 2] = @as(f64, @floatFromInt(nowUs() - t0)) / @as(f64, @floatFromInt(links));
+        }
+        return medianOf(&times);
+    }
+
+    fn reportChains(p: *Probe, at: ProjAt) !void {
+        for ([_]bool{ false, true }) |index| {
+            waitForGate();
+            const pass_us = try p.chainUs(at, index, false);
+            const both_us = try p.chainUs(at, index, true);
+            std.debug.print("[kmap] chain {s} {s} layers: copy launch {d:.1} us, projection + copy {d:.1} us, projection {d:.1} us a link\n", .{ @tagName(at), if (index) "index" else "plain", pass_us, both_us, both_us - pass_us });
+        }
+    }
+};
+
+fn twinLaunch(sc: *dsv41.Scope, m: *dsv41.Dsv41Model, ly: *const dsv41.Layer, li: usize, at: ProjAt, ins: []const A) !A {
+    return switch (at) {
+        .in_proj => ((try decode.in_proj.run(sc, &m.dec.in_proj.?, m, ly, ins[0], ins[1])) orelse return error.Declined).z,
+        .wq_b => ((try decode.wq_b.run(sc, m, m.dec.wq_b.?, ly, li, ins[0], ins[1], ins[2], ins[3])) orelse return error.Declined).q,
+        .wo_a => (try decode.wo_a.apply(sc, m, ly, m.dec.wo_a.?, m.dec.wo_a_counter, dsv41.ropeFor(m, li).inv, ins[3], ins[0], ins[1], ins[2])) orelse error.Declined,
+        .wo_b => ly.wo_b.apply(sc, ins[0]),
+    };
+}
+
+fn passLaunch(sc: *dsv41.Scope, k: mlx.mlx_fast_metal_kernel, x: A, dep: A) !A {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const shape = mlx.getShape(x);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, shape.ptr, shape.len, mlx.mlx_array_dtype(x)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(mlx.mlx_array_size(x)), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, dep }, 2);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+
+fn medianOf(xs: []f64) f64 {
+    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
+    return xs[xs.len / 2];
+}
+
+fn printArms(ab: *const Ab, rows: usize, us: []const f64) void {
+    const blocks = us.len / ab.n;
+    var by: [max_arms][max_steps]f64 = undefined;
+    var diff: [max_arms][max_steps]f64 = undefined;
+    for (0..blocks) |b| for (0..ab.n) |pos| {
+        const k = b * ab.n + pos;
+        by[ab.armOf(k)][b] = us[k];
+    };
+    for (0..blocks) |b| for (0..ab.n) |j| {
+        diff[j][b] = by[j][b] - by[0][b];
+    };
+    for (0..ab.n) |j| {
+        const d = medianOf(diff[j][0..blocks]);
+        const q10 = quantileOf(by[j][0..blocks], 0.1);
+        const q25 = quantileOf(by[j][0..blocks], 0.25);
+        const med = quantileOf(by[j][0..blocks], 0.5);
+        std.debug.print("[kmap] arm {s} #{d} rows={d} blocks={d}: q10 {d:.0} q25 {d:.0} median {d:.0} us, block diff from arm 0 median {d:.0} us\n", .{ ab.name, j, rows, blocks, q10, q25, med, d });
+    }
+    var line: [max_steps * 8]u8 = undefined;
+    var n: usize = 0;
+    for (us, 0..) |u, k| {
+        const piece = std.fmt.bufPrint(line[n..], "{d}:{d:.0} ", .{ ab.armOf(k), u }) catch break;
+        n += piece.len;
+    }
+    std.debug.print("[kmap] raw {s} rows={d}: {s}\n", .{ ab.name, rows, line[0..n] });
+}
+
+fn quantileOf(xs: []f64, f: f64) f64 {
+    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
+    return xs[@intFromFloat(f * @as(f64, @floatFromInt(xs.len - 1)))];
+}
+
+const max_steps = 1024;
+
 /// One row count: 3 warm-up steps and `steps` timed ones from position `p0`, which moves past them.
-fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize, p0: *usize) !void {
+fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize, p0: *usize, ab: ?*const Ab) !void {
     const warm = 3;
     const total = warm + steps;
     const xs = try gpa.alloc(A, total);
@@ -107,11 +341,13 @@ fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize
     for (xs) |x| try mlx.check(mlx.mlx_array_eval(x));
     for (pres) |p| try mlx.check(mlx.mlx_array_eval(p));
 
-    var us: [256]f64 = undefined;
+    var us: [max_steps]f64 = undefined;
     std.debug.assert(steps <= us.len);
     sleepSecs(2000);
+    waitForGate();
     for (0..total) |k| {
         if (k == warm) sleepSecs(500);
+        if (ab) |a| a.probe.arm = a.arms[a.armOf(k -| warm)];
         const s0 = nowUs();
         const out = try dsv41.workerStep(fx.m, gpa, xs[k], pres[k], p0.*, false, false);
         for (out) |o| _ = mlx.mlx_array_free(o);
@@ -119,7 +355,8 @@ fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize
         p0.* += rows;
     }
     sleepSecs(500);
-    var sorted: [256]f64 = undefined;
+    if (ab) |a| printArms(a, rows, us[0 .. steps - steps % a.n]);
+    var sorted: [max_steps]f64 = undefined;
     @memcpy(sorted[0..steps], us[0..steps]);
     std.mem.sort(f64, sorted[0..steps], {}, std.sort.asc(f64));
     std.debug.print("[kmap] rows={d} steps={d} layers={d} host step us: min={d:.0} median={d:.0} max={d:.0}\n", .{ rows, steps, fx.m.pair.?.hi - fx.m.pair.?.lo, sorted[0], sorted[steps / 2], sorted[steps - 1] });

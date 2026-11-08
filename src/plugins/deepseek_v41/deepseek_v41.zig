@@ -480,6 +480,7 @@ pub const Dsv41Model = struct {
     trace: ?*Trace = null,
     /// Test-only: skip the QAT round-trips (the reference's plain-math mode).
     qat_off: bool = false,
+    probe: ?*const ProjProbe = null,
     /// The routed experts from a streamed bank (`sdk/weights/streamed.zig`); null = the in-memory banks.
     streamed: ?streamed.Routed = null,
     /// The pack's routed experts live in a streamed bank: the trunk loads none (`InitOpts.streamed_experts`).
@@ -4823,6 +4824,18 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     return out;
 }
 
+pub const ProjAt = enum { in_proj, wq_b, wo_a, wo_b };
+
+pub const ProjProbe = struct {
+    ctx: *anyopaque,
+    before: *const fn (ctx: *anyopaque, sc: *Scope, m: *Dsv41Model, li: usize, at: ProjAt, ins: []const A) anyerror!A,
+};
+
+fn probed(sc: *Scope, m: *Dsv41Model, li: usize, at: ProjAt, ins: []const A) !A {
+    const p = m.probe orelse return ins[0];
+    return p.before(p.ctx, sc, m, li, at, ins);
+}
+
 /// `block` for at most `dkern.max_rows` rows on the fused decode kernels (`decode/`), today's stretches where one is
 /// missing; null (before any state moves) where a kernel declines the layer.
 fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !?A {
@@ -4832,8 +4845,9 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const ls = &st.layers[li];
     const L = dim(x, 0);
     const hd = m.cfg.head_dim;
-    const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
-    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, p0, L)) orelse return null;
+    const a = try dkern.in_proj.run(sc, kp, m, ly, try probed(sc, m, li, .in_proj, &.{ x, pre.* }), pre.*) orelse return null;
+    const pos = try dkern.wq_b.rowsAt(sc, p0, L);
+    const w = try dkern.wq_b.run(sc, m, kq, ly, li, try probed(sc, m, li, .wq_b, &.{ a.qa, a.kv, a.z, pos }), a.kv, a.z, pos) orelse return null;
     try ls.win.write(w.kv_row, p0, sc.s);
     var comp_rows = none;
     var topk = none;
@@ -4848,7 +4862,8 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const inv = ropeFor(m, li).inv;
     var oa: ?A = null;
     if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, w.q, ls.win, comp_rows, topk, p0, scale)) |p| {
-        oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, try attnMeta(sc, m, w.q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
+        const meta = try attnMeta(sc, m, w.q, ls.win, comp_rows, topk, p0);
+        oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, meta, try probed(sc, m, li, .wo_a, &.{ p.acc, p.m, p.l, meta }), p.m, p.l);
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &w.sa)) |f| {
@@ -4856,7 +4871,7 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
         return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
     };
     var ao: [1]A = undefined;
-    if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
+    if (oa) |v| ao[0] = try ly.wo_b.apply(sc, try probed(sc, m, li, .wo_b, &.{v})) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
     if (m.tp != null) return try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, pre);
     var out: [2]A = undefined;
     try runRegion(sc, m, li, .ffn, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &out);
