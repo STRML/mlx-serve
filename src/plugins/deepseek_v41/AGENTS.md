@@ -61,6 +61,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - Under `tp` a plain decode step whose token is still on the GPU goes by bell alone (`DSV41_TP_PIPE`): every rank gathers
   rank 0's token in its graph (`tpToken`). Rank 0 pipes only the state the workers last stepped, where they left it
   (distributed.zig `TpLive`, cleared by any other message), never a step a header carries (snapshot, verify, all rows).
+- A decode chunk's Engram rows for every layer are read at once on GCD before its first Engram layer is built
+  (`Prefetch.readNow`, `DSV41_ENGRAM_EARLY`); a prompt's stay on the prefetch thread. `MLX_SERVE_DIAG=engram-laps` times
+  each host phase of a GPU-token decode step (`Laps`).
 - Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
   worker keeps it; a step on another state (`st != &dec_state`) is refused.
 - Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken
