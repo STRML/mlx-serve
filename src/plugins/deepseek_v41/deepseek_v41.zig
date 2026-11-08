@@ -2378,7 +2378,21 @@ pub const Shared = struct {
     floor: ?usize = null,
     /// Set by `attention` when it handed back the heads grouped and inverse-roped (`attnGather`'s `grouped`).
     grouped: bool = false,
+    /// The caller carries `pend` from one layer to the next and `settle`s the stream after the last.
+    carry: bool = false,
+    /// The hc expand a block left to the next layer's input: the stream is `hcExpand(x, y, post and comb)`.
+    pend: Pend = .{},
 };
+
+pub const Pend = struct { y: A = none, post: A = none, comb: A = none };
+
+/// The stream `x` with the expand `sh` holds applied (`x` itself where none is pending).
+pub fn settle(sc: *Scope, x: A, sh: *Shared) !A {
+    const p = sh.pend;
+    if (p.y.ctx == null) return x;
+    sh.pend = .{};
+    return hcExpand(sc, x, p.y, &.{ .pre = none, .post = p.post, .comb = p.comb });
+}
 
 /// `x` normed attention input `[L, dim]` at positions [p0, p0 + L). With `pre` (the rows' projections,
 /// made over the whole chunk by `wideLayer`) the heads `[L, H, hd]` come back before `attnOut`.
@@ -3711,6 +3725,17 @@ pub fn tpSum(sc: *Scope, m: *const Dsv41Model, x: A) !A {
     return sc.astype(try sc.keep(try sum(part)), m.act);
 }
 
+/// `DSV41_TP_FUSE=0` keeps a tensor split's hc expand after the MoE sum as its own launch; on, the next layer's fused
+/// input (`in_proj`) expands the stream itself.
+pub var tp_fuse: ?bool = null;
+fn tpFuse() bool {
+    if (tp_fuse == null) {
+        const v = env.get(.DSV41_TP_FUSE);
+        tp_fuse = v == null or v.?[0] != '0';
+    }
+    return tp_fuse.?;
+}
+
 /// The routed and shared experts this process holds over routed rows: the whole MoE, or one rank's slice of it. f32
 /// at decode width, so the ranks' sum rounds once; the activation dtype past it.
 fn moePartial(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A) !A {
@@ -3803,9 +3828,10 @@ pub const Want = enum { last, all };
 /// One block over one span: the staggered hyper-connections around
 /// attention and the MoE. Returns the new stream; `pre` becomes the FFN's
 /// mix, which the next layer's attention collapses with.
-pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !A {
-    if (sh.floor == null and sh.img.ctx == null and m.streamed == null and li < m.regions.len and dim(x, 0) <= dkern.max_rows and compiledAt(m, dim(x, 0)))
-        if (try blockFused(sc, m, st, li, x, pre, p0, sh)) |y| return y;
+pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x0: A, pre: *A, p0: usize, sh: *Shared) !A {
+    if (sh.floor == null and sh.img.ctx == null and m.streamed == null and li < m.regions.len and dim(x0, 0) <= dkern.max_rows and compiledAt(m, dim(x0, 0)))
+        if (try blockFused(sc, m, st, li, x0, pre, p0, sh)) |y| return y;
+    const x = try settle(sc, x0, sh);
     if (sh.floor == null and sh.img.ctx == null and li < m.regions.len and compiledAt(m, dim(x, 0)) and fetchServes(m, dim(x, 0))) {
         var a: [4]A = undefined; // the attention's pre, post, comb; its input
         try runRegion(sc, m, li, .attn_in, &.{ x, pre.* }, &a);
@@ -3825,7 +3851,7 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
             pre.* = p[1];
             return y[0];
         }
-        if (m.tp != null) return tpFfn(sc, m, li, x, ao, &.{ .pre = a[0], .post = a[1], .comb = a[2] }, pre);
+        if (m.tp != null) return tpFfn(sc, m, li, x, ao, &.{ .pre = a[0], .post = a[1], .comb = a[2] }, pre, deferTo(sh));
         var o: [2]A = undefined;
         try runRegion(sc, m, li, .ffn, &.{ x, ao, a[0], a[1], a[2] }, &o);
         pre.* = o[1];
@@ -3838,17 +3864,25 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     return hcExpand(sc, mid.x1, y, &mid.sf);
 }
 
+/// Where a tensor split's FFN leaves its hc expand: to the next layer's input when the caller carries it.
+fn deferTo(sh: *Shared) ?*Pend {
+    return if (sh.carry and tpFuse()) &sh.pend else null;
+}
+
 /// `block` for at most `dkern.max_rows` rows on the fused decode kernels (`decode/`), today's stretches where one is
-/// missing; null (before any state moves) where a kernel declines the layer.
-fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !?A {
+/// missing; null (before any state moves) where a kernel declines the layer. `in_proj` makes the stream `sh.pend`
+/// leaves it.
+fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x0: A, pre: *A, p0: usize, sh: *Shared) !?A {
     const kp = &(m.dec.in_proj orelse return null);
     const kq = m.dec.wq_b orelse return null;
     const ly = &m.layers[li];
     const ls = &st.layers[li];
-    const L = dim(x, 0);
+    const L = dim(x0, 0);
     const hd = m.cfg.head_dim;
-    const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
+    const a = try dkern.in_proj.run(sc, kp, m, ly, x0, pre.*, if (sh.pend.y.ctx != null) sh.pend else null) orelse return null;
     const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, p0, L)) orelse return null;
+    const x = a.x1 orelse x0;
+    sh.pend = .{};
     try ls.win.write(w.kv_row, p0, sc.s);
     var comp_rows = none;
     var topk = none;
@@ -3872,7 +3906,7 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     };
     var ao: [1]A = undefined;
     if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
-    if (m.tp != null) return try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, pre);
+    if (m.tp != null) return try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, pre, deferTo(sh));
     var out: [2]A = undefined;
     try runRegion(sc, m, li, .ffn, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &out);
     pre.* = out[1];
@@ -3880,14 +3914,18 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
 }
 
 /// A tensor split's FFN at decode width, from the summed attention output `ao`: this rank's experts over the routes,
-/// summed with the other ranks', then the hc expand. `pre` becomes the FFN's mix.
-fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, pre: *A) !A {
+/// summed with the other ranks', then the hc expand, or (`pend`) the stream before it with the expand left in `pend`.
+/// `pre` becomes the FFN's mix.
+fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, pre: *A, pend: ?*Pend) !A {
     const ly = &m.layers[li];
     var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
     try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
     pre.* = p[1];
     const part = try moeFused(sc, m, ly, p[4], p[5], p[6]) orelse try moePartial(sc, m, ly, p[4], p[5], p[6]);
-    return hcExpand(sc, p[0], try tpSum(sc, m, part), &.{ .pre = p[1], .post = p[2], .comb = p[3] });
+    const y = try tpSum(sc, m, part);
+    const to = pend orelse return hcExpand(sc, p[0], y, &.{ .pre = p[1], .post = p[2], .comb = p[3] });
+    to.* = .{ .y = y, .post = p[2], .comb = p[3] };
+    return p[0];
 }
 
 /// The routed and shared rows this rank holds on the fused mxfp4 launches (`[R, dim]`), or null where they decline:
@@ -4232,15 +4270,27 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
     const n_spans = sp.xs.len;
     // Wide spans run a layer's row-wise stages over the whole chunk, attention's core per span.
     const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
+    // A decode step under a tensor split hands each layer's hc expand to the next layer's input (`Shared.pend`):
+    // `sp.xs[0]` is then the stream before it, and `pend` holds the rest.
+    const carry = n_spans == 1 and m.tp != null and m.trace == null;
+    var pend: [3]A = .{ none, none, none };
+    defer for (pend) |a| if (a.ctx != null) {
+        _ = mlx.mlx_array_free(a);
+    };
     for (lo..hi) |li| {
         if (wide) try wideLayer(m, gpa, st, sp, li) else for (0..n_spans) |k| {
             // A span's intermediates are dropped as soon as it is built, so the
             // layer's evaluation frees each one when its consumers are done.
             var sc = Scope.init(gpa, m.s);
             defer sc.deinit();
+            var sh: Shared = .{ .carry = carry, .pend = .{ .y = pend[0], .post = pend[1], .comb = pend[2] } };
+            if (streamRead(m, li)) hold(&sp.xs[k], try settle(&sc, sp.xs[k], &sh));
             var x = try spanIn(&sc, m, gpa, sp, li, k);
             const a, const b = sp.bounds(k);
-            var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .img = try sp.imgSlice(&sc, a, b) };
+            sh.topk = sp.topks[k];
+            sh.cand = sp.cands[k];
+            sh.floor = sp.floor;
+            sh.img = try sp.imgSlice(&sc, a, b);
             var pre = sp.pres[k];
             x = try block(&sc, m, st, li, x, &pre, sp.p0 + k * sp.span, &sh);
             if (m.trace) |t| try t.put("stream_{d}", .{li}, x);
@@ -4248,12 +4298,14 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
             hold(&sp.pres[k], pre);
             hold(&sp.topks[k], sh.topk);
             hold(&sp.cands[k], sh.cand);
+            for (&pend, [_]A{ sh.pend.y, sh.pend.post, sh.pend.comb }) |*slot, v| hold(slot, v);
         }
         const decode = n_spans == 1 and sp.L <= region_rows;
         if (n_spans > 1 or (decode and li + 1 < hi)) {
             var ev: std.ArrayList(A) = .empty;
             defer ev.deinit(gpa);
             for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
+            for (pend) |x| if (x.ctx != null) try ev.append(gpa, x);
             try appendLayerState(gpa, &ev, &st.layers[li]);
             if (!decode) try evalAll(ev.items) else {
                 // A decode step's graph takes the host about as long as the GPU
@@ -4264,6 +4316,17 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
             }
         }
     }
+    if (pend[0].ctx == null) return;
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    var sh: Shared = .{ .pend = .{ .y = pend[0], .post = pend[1], .comb = pend[2] } };
+    hold(&sp.xs[0], try settle(&sc, sp.xs[0], &sh));
+}
+
+/// Whether layer `li`'s input reads the stream itself before its block (an Engram write, a DSpark target's capture).
+fn streamRead(m: *const Dsv41Model, li: usize) bool {
+    for (m.engrams) |*e| if (e.layer == li) return true;
+    return m.n_mtp > 0 and m.dsparkTarget(li) != null;
 }
 
 /// Host: every span's stream and mix to the worker, and back as they stand after its layers.
@@ -4846,7 +4909,7 @@ fn hold(slot: *A, x: A) void {
     slot.* = o;
 }
 
-fn appendLayerState(gpa: std.mem.Allocator, ev: *std.ArrayList(A), ls: *const LState) !void {
+pub fn appendLayerState(gpa: std.mem.Allocator, ev: *std.ArrayList(A), ls: *const LState) !void {
     try ev.append(gpa, ls.win.buf);
     if (ls.comp) |r| if (r.buf.ctx != null) try ev.append(gpa, r.buf);
     if (ls.idx_k) |r| if (r.buf.ctx != null) try ev.append(gpa, r.buf);
@@ -5550,7 +5613,7 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
     try runRegion(&sc, m, li, .attn_out, &.{try sc.concat(heads, 0)}, &ao);
     var o: [2]A = undefined; // the new stream, the FFN's mix
     if (m.tp != null) {
-        o[0] = try tpFfn(&sc, m, li, x, try tpSum(&sc, m, ao[0]), &.{ .pre = a[0], .post = a[1], .comb = a[2] }, &o[1]);
+        o[0] = try tpFfn(&sc, m, li, x, try tpSum(&sc, m, ao[0]), &.{ .pre = a[0], .post = a[1], .comb = a[2] }, &o[1], null);
     } else try runRegion(&sc, m, li, .ffn, &.{ x, ao[0], a[0], a[1], a[2] }, &o);
     for (0..N) |k| {
         const lo, const hi = sp.bounds(k);
@@ -5568,7 +5631,7 @@ fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const S
     if (m.dec.attn != null or sp.L > dkern.max_rows or li >= m.regions.len or m.streamed != null) return false;
     const ly = &m.layers[li];
     const x = try sc.concat(parts, 0);
-    const a = try dkern.in_proj.run(sc, kp, m, ly, x, try sc.concat(sp.pres, 0)) orelse return false;
+    const a = try dkern.in_proj.run(sc, kp, m, ly, x, try sc.concat(sp.pres, 0), null) orelse return false;
     var pos: [dkern.max_rows]i32 = undefined;
     for (states, 0..) |st, k| {
         const lo, const hi = sp.bounds(k);
@@ -5601,7 +5664,7 @@ fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const S
     var ao: [1]A = undefined;
     try runRegion(sc, m, li, .attn_out, &.{try sc.concat(heads[0..states.len], 0)}, &ao);
     var pre = none;
-    const y = try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, &pre);
+    const y = try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, &pre, null);
     for (0..states.len) |k| {
         const lo, const hi = sp.bounds(k);
         hold(&sp.xs[k], try sc.slice(y, 0, lo, hi));
@@ -8062,11 +8125,11 @@ test "dsv41 group: greedy DSpark group rounds against batched plain steps, by st
         const plain_ms = @as(f64, @floatFromInt(plain_us)) / rounds / 1000;
         const round_ms = @as(f64, @floatFromInt(us[0] + us[1] + us[2])) / rounds / 1000;
         std.debug.print("[group] ctx {d} states {d}: plain step {d:.2} ms = {d:.1} tok/s | round {d:.2} ms (draft {d:.2}, verify {d:.2} of {d:.1} rows, finish {d:.2}), {d:.2} tokens a state = {d:.1} tok/s\n", .{
-            ctx,                                                          n,
-            plain_ms,                                                     @as(f64, @floatFromInt(n)) * 1000 / plain_ms,
-            round_ms,                                                     @as(f64, @floatFromInt(us[0])) / rounds / 1000,
-            @as(f64, @floatFromInt(us[1])) / rounds / 1000,               @as(f64, @floatFromInt(rows)) / rounds,
-            @as(f64, @floatFromInt(us[2])) / rounds / 1000,               @as(f64, @floatFromInt(tokens)) / rounds / @as(f64, @floatFromInt(n)),
+            ctx,                                                        n,
+            plain_ms,                                                   @as(f64, @floatFromInt(n)) * 1000 / plain_ms,
+            round_ms,                                                   @as(f64, @floatFromInt(us[0])) / rounds / 1000,
+            @as(f64, @floatFromInt(us[1])) / rounds / 1000,             @as(f64, @floatFromInt(rows)) / rounds,
+            @as(f64, @floatFromInt(us[2])) / rounds / 1000,             @as(f64, @floatFromInt(tokens)) / rounds / @as(f64, @floatFromInt(n)),
             @as(f64, @floatFromInt(tokens)) * 1000 / rounds / round_ms,
         });
     }

@@ -1,21 +1,14 @@
-// dec_in_proj_stage: h = rms(collapse(x, cpre), w) of one row a threadgroup of D / 8 threads, rounded to bf16 where hc_stage rounds it.
+// dec_in_proj_stage: h = rms(collapse(x, cpre), w) of one row a threadgroup of D / 8 threads, rounded to bf16 where hc_stage rounds it;
+// the stream read and handed on as in dec_in_proj.
 constexpr int HC = 4, NT = D / 8, NSG = NT / 32;
 const uint t = thread_position_in_threadgroup.x, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
 const int r = threadgroup_position_in_grid.x;
 threadgroup float ps[NSG];
 float v[HC][8], cp[HC];
+DSV41_STREAM8(r, v);
+DSV41_KEEP8(r, v);
 #pragma unroll
-for (int j = 0; j < HC; ++j) {
-  cp[j] = cpre[r * HC + j];
-  const uint4 xv = *(const device uint4*)(x + (size_t(r) * HC + j) * D + 8 * t);
-  const uint xw[4] = {xv.x, xv.y, xv.z, xv.w};
-  #pragma unroll
-  for (int q = 0; q < 4; ++q) {
-    const float2 u = dsv41_bf2(xw[q]);
-    v[j][2 * q] = u.x;
-    v[j][2 * q + 1] = u.y;
-  }
-}
+for (int j = 0; j < HC; ++j) cp[j] = cpre[r * HC + j];
 const uint4 nv = *(const device uint4*)(w + 8 * t);
 float hb[8], s = 0.0f;
 #pragma unroll

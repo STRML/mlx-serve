@@ -16,12 +16,18 @@ const none: A = .{ .ctx = null };
 
 const MAIN_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_in_proj.metal");
 const STAGE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_in_proj_stage.metal");
-/// bf16 pairs from a word, and the mxfp8 e4m3 pair decode.
-const HEADER = mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_in_proj_header.metal");
+const BASE_HEADER = mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_in_proj_header.metal");
+/// bf16 pairs from a word, the mxfp8 e4m3 pair decode, and the stream read as it is.
+const HEADER = BASE_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_in_proj_load.metal");
+/// The same, the stream rebuilt from the previous block's summed output (a tensor split's deferred hc expand): the stage
+/// kernel's, whatever the rows.
+const HEADER_X = BASE_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_in_proj_load_expand.metal");
 const MAIN_INS = [_][*:0]const u8{ "x", "cpre", "attn_w", "eps", "hin", "fn_w", "scale", "base", "wq", "wsc", "wp", "cw" };
 const MAIN_OUTS = [_][*:0]const u8{ "h", "qa", "kv", "iw", "comp", "z" };
 const STAGE_INS = [_][*:0]const u8{ "x", "cpre", "w", "eps" };
 const STAGE_OUTS = [_][*:0]const u8{"h"};
+const STAGE_X_INS = STAGE_INS ++ [_][*:0]const u8{ "y", "spost", "scomb" };
+const STAGE_X_OUTS = STAGE_OUTS ++ [_][*:0]const u8{"x1"};
 
 /// The first Apple GPU family (M3) that runs its 640-thread groups at every row count: M1 and M2 cap a pipeline's
 /// threads by its registers, and R = 6 with bf16 rows compiles for fewer.
@@ -37,16 +43,24 @@ const n_mix = (2 + hc) * hc;
 pub const Kernels = struct {
     main: mlx.mlx_fast_metal_kernel,
     stage: mlx.mlx_fast_metal_kernel,
+    /// The stage kernel expanding the stream on the way in (`Args.ex`): it writes the stream the main kernel reads.
+    stage_x: mlx.mlx_fast_metal_kernel,
 
     pub fn build() !Kernels {
-        const main = try v41.buildKernel("dsv41_dec_in_proj", &MAIN_INS, &MAIN_OUTS, MAIN_SOURCE, HEADER);
-        errdefer _ = mlx.mlx_fast_metal_kernel_free(main);
-        return .{ .main = main, .stage = try v41.buildKernel("dsv41_dec_in_proj_stage", &STAGE_INS, &STAGE_OUTS, STAGE_SOURCE, HEADER) };
+        var made: [3]mlx.mlx_fast_metal_kernel = undefined;
+        var n: usize = 0;
+        errdefer for (made[0..n]) |k| {
+            _ = mlx.mlx_fast_metal_kernel_free(k);
+        };
+        inline for (.{ main_l, stage_l, stage_x_l }) |l| {
+            made[n] = try v41.buildKernel(l.name.ptr, l.inputs, l.outputs, l.source.ptr, l.header.ptr);
+            n += 1;
+        }
+        return .{ .main = made[0], .stage = made[1], .stage_x = made[2] };
     }
 
     pub fn deinit(k: Kernels) void {
-        _ = mlx.mlx_fast_metal_kernel_free(k.main);
-        _ = mlx.mlx_fast_metal_kernel_free(k.stage);
+        for ([_]mlx.mlx_fast_metal_kernel{ k.main, k.stage, k.stage_x }) |f| _ = mlx.mlx_fast_metal_kernel_free(f);
     }
 };
 
@@ -63,6 +77,9 @@ pub const Plan = struct {
     comp_f32: bool = false,
     /// Every threadgroup collapses the stream itself (up to `fuse_rows` rows); else `dec_in_proj_stage.metal` makes h first.
     fuse: bool = true,
+    /// The stream comes expanded on the way in (`Args.ex`): the stage kernel makes and writes it, at any rows (in every
+    /// threadgroup of the main kernel the expand costs more than the launch it saves).
+    expand: bool = false,
 
     fn compDtype(p: Plan) mlx.mlx_dtype {
         return if (p.comp_f32) .float32 else .bfloat16;
@@ -78,8 +95,9 @@ pub const Plan = struct {
     }
 };
 
-/// Every array a launch reads (`wp`, `cw`: null where the layer has no such rows).
-pub const Args = struct { x: A, cpre: A, attn_w: A, eps: A, fn_w: A, scale: A, base: A, wq: A, wsc: A, wp: ?A = null, cw: ?A = null };
+/// Every array a launch reads (`wp`, `cw`: null where the layer has no such rows). With `ex` the stream is
+/// `hcExpand(x, ex.y, ex.post and ex.comb)`, which the launch makes on the way in and returns as `Out.x1`.
+pub const Args = struct { x: A, cpre: A, attn_w: A, eps: A, fn_w: A, scale: A, base: A, wq: A, wsc: A, wp: ?A = null, cw: ?A = null, ex: ?v41.Pend = null };
 
 pub const Out = struct {
     /// rms(collapse(x, cpre), attn_norm) `[R, D]`.
@@ -92,6 +110,8 @@ pub const Out = struct {
     comp: ?A,
     /// This stage's mixes `[R, 24]` f32, the input of the hc split.
     z: A,
+    /// The expanded stream `[R, hc, D]` (`Args.ex`), null where the launch read `x` as it is.
+    x1: ?A = null,
 };
 
 fn dims(a: A) []const c_int {
@@ -156,10 +176,14 @@ pub fn argsOf(ly: *const v41.Layer, x: A, cpre: A, eps: A) Args {
     };
 }
 
-/// The attention input of `ly` for `x` `[R, hc, D]` and the previous mix `cpre`, or null (see `plan`).
-pub fn run(sc: *v41.Scope, k: *const Kernels, m: *const v41.Dsv41Model, ly: *const v41.Layer, x: A, cpre: A) !?Out {
+/// The attention input of `ly` for `x` `[R, hc, D]` (expanded by `ex` on the way in) and the previous mix `cpre`, or
+/// null (see `plan`).
+pub fn run(sc: *v41.Scope, k: *const Kernels, m: *const v41.Dsv41Model, ly: *const v41.Layer, x: A, cpre: A, ex: ?v41.Pend) !?Out {
     const p = plan(m, ly, x) orelse return null;
-    return try launch(sc, k, p, argsOf(ly, x, cpre, try v41.hcEps(sc, m)));
+    if (ex) |e| if (!is(e.y, .bfloat16, &.{ p.rows, p.dim })) return null;
+    var a = argsOf(ly, x, cpre, try v41.hcEps(sc, m));
+    a.ex = ex;
+    return try launch(sc, k, p, a);
 }
 
 fn keep(sc: *v41.Scope, a: A) !A {
@@ -205,6 +229,7 @@ fn launchGeometry(p: Plan) kc.metal.Geometry {
 fn stageGeometry(p: Plan) kc.metal.Geometry {
     var g: kc.metal.Geometry = .{ .grid = .{ ci(p.rows * p.threads()), 1, 1 }, .tg = .{ ci(p.threads()), 1, 1 } };
     g.out(&.{ ci(p.rows), ci(p.dim) }, .bfloat16);
+    if (p.expand) g.out(&.{ ci(p.rows), hc, ci(p.dim) }, .bfloat16);
     g.int("D", p.dim);
     return g;
 }
@@ -235,11 +260,15 @@ fn dispatch(sc: *v41.Scope, kernel: mlx.mlx_fast_metal_kernel, g: kc.metal.Geome
     for (outs, 0..) |*o, i| o.* = try output(sc, ov, i);
 }
 
-/// The stage kernel: the normed collapse `[R, D]` of the stream, for the plans that do not collapse it in the main kernel.
-fn stage(sc: *v41.Scope, k: *const Kernels, p: Plan, a: Args) !A {
-    var o: [1]A = undefined;
-    try dispatch(sc, k.stage, stageGeometry(p), &.{ a.x, a.cpre, a.attn_w, a.eps }, &o);
-    return o[0];
+/// The stage kernel: the normed collapse `[R, D]` of the stream (and the stream, expanding it), for the plans that do
+/// not collapse it in the main kernel.
+fn stage(sc: *v41.Scope, k: *const Kernels, p: Plan, a: Args) ![2]A {
+    var o: [2]A = .{ none, none };
+    if (a.ex) |e|
+        try dispatch(sc, k.stage_x, stageGeometry(p), &.{ a.x, a.cpre, a.attn_w, a.eps, e.y, e.post, e.comb }, &o)
+    else
+        try dispatch(sc, k.stage, stageGeometry(p), &.{ a.x, a.cpre, a.attn_w, a.eps }, o[0..1]);
+    return o;
 }
 
 /// The main kernel: `hin` the staged normed collapse (null where the plan collapses the stream itself).
@@ -251,9 +280,19 @@ fn project(sc: *v41.Scope, k: *const Kernels, p: Plan, a: Args, hin: ?A) !Out {
     return .{ .h = hin orelse o[0], .qa = o[1], .kv = o[2], .iw = if (p.nw > 0) o[3] else null, .comp = if (p.nc > 0) o[4] else null, .z = o[5] };
 }
 
-/// The launch itself: for `a`'s arrays, as `p` says.
-pub fn launch(sc: *v41.Scope, k: *const Kernels, p: Plan, a: Args) !Out {
-    return project(sc, k, p, a, if (p.fuse) null else try stage(sc, k, p, a));
+/// The launch itself: for `a`'s arrays, as `p` says. Expanding, the stage kernel runs at any rows and writes the stream
+/// the main kernel's mixes read.
+pub fn launch(sc: *v41.Scope, k: *const Kernels, p0: Plan, a: Args) !Out {
+    var p = p0;
+    p.expand = a.ex != null;
+    if (p.expand) p.fuse = false;
+    if (p.fuse) return project(sc, k, p, a, null);
+    const st = try stage(sc, k, p, a);
+    var plain = a;
+    if (p.expand) plain.x = st[1];
+    var out = try project(sc, k, p, plain, st[0]);
+    if (p.expand) out.x1 = st[1];
+    return out;
 }
 
 // ── the kernel contract ───────────────────────────────────────────────────
@@ -300,6 +339,14 @@ const stage_l: metal.Launch = .{
     .m1 = 1024,
     .m2 = 1024,
     .min_gen = first_gen,
+};
+const stage_x_l: metal.Launch = blk: {
+    var l = stage_l;
+    l.name = "dsv41_dec_in_proj_stage_x";
+    l.inputs = &STAGE_X_INS;
+    l.outputs = &STAGE_X_OUTS;
+    l.header = HEADER_X;
+    break :blk l;
 };
 
 fn bf(v: f64) f64 {
@@ -359,8 +406,8 @@ fn stageRow(sum: Sum, a: std.mem.Allocator, x: []const f64, cpre: []const f64, w
 }
 
 /// The kernel's normed rows (bf16 from the start of its output) inside the intervals of their roundings (`point`:
-/// float64 classes); inputs 0..3 are the stream, `cpre`, the norm weights and the eps.
-fn normedOk(k: anytype, point: bool) !?[]const u8 {
+/// float64 classes) over the stream `xs` it read; inputs 1..3 are `cpre`, the norm weights and the eps.
+fn normedOk(k: anytype, point: bool, xs: []const f64) !?[]const u8 {
     const d = k.shape.k;
     const a = k.scratch();
     const hm = try a.alloc(f64, 2 * d);
@@ -369,7 +416,7 @@ fn normedOk(k: anytype, point: bool) !?[]const u8 {
     defer a.free(iv);
     const eps = spec.roundTo(.f32, k.in(3)[0]);
     for (0..k.shape.rows) |r| {
-        const x = k.in(0)[r * hc * d ..][0 .. hc * d];
+        const x = xs[r * hc * d ..][0 .. hc * d];
         const cp = k.in(1)[r * hc ..][0..hc];
         for (0..d) |i| {
             hm[i] = 0;
@@ -407,6 +454,62 @@ fn stressMixes(rng: std.Random, fnw: []f64, x: []const f64) void {
         fnw[m * n + i] = b * x[i] / 32;
         fnw[m * n + h + i] = -0x1p10 * x[h + i] / 32;
     };
+}
+
+/// An expanding launch's summed output, post and comb (inputs `y_in`..) as the identity expand: the stream is `x`.
+fn identityExpand(k: anytype, y_in: usize) void {
+    @memset(k.in(y_in), 0);
+    @memset(k.in(y_in + 1), 0);
+    for (k.in(y_in + 2), 0..) |*v, i| v.* = if (i / hc % hc == i % hc) 1 else 0;
+}
+
+/// The summed output, post and comb an expanding launch reads after its own inputs.
+fn addExpand(k: anytype, rng: std.Random, rows: usize, d: usize) !void {
+    kit.uniform(rng, try k.add(.bfloat16, &.{ rows, d }), -3, 3);
+    kit.uniform(rng, try k.add(.float32, &.{ rows, hc }), 0, 2);
+    kit.uniform(rng, try k.add(.float32, &.{ rows, hc, hc }), 0, 0.5);
+}
+
+/// The stream the launch reads, every row: input 0 as it is, or (`y_in`) its hc expand
+/// `T(post[i] * y + sum_j comb[j][i] x_j)` by the inputs from `y_in`, every sum as `sum` asks.
+fn expanded(k: anytype, y_in: ?usize, sum: Sum, out: []f64) void {
+    const d = k.shape.k;
+    const x = k.in(0);
+    const yi = y_in orelse return @memcpy(out, x[0..out.len]);
+    for (0..k.shape.rows) |r| for (0..hc) |i| for (0..d) |c| {
+        var terms: [hc + 1]f64 = undefined;
+        terms[0] = k.in(yi + 1)[r * hc + i] * k.in(yi)[r * d + c];
+        for (0..hc) |j| terms[j + 1] = k.in(yi + 2)[(r * hc + j) * hc + i] * x[(r * hc + j) * d + c];
+        out[(r * hc + i) * d + c] = bf(sum.of(&terms));
+    };
+}
+
+/// `expanded` as the launch wrote it (bf16 output bytes from `at`), each element first checked inside the interval of
+/// its roundings (`point`: float64 classes); null where all hold.
+fn seenStream(k: anytype, y_in: ?usize, at: usize, point: bool, out: []f64) ?[]const u8 {
+    const d = k.shape.k;
+    const x = k.in(0);
+    const yi = y_in orelse {
+        @memcpy(out, x[0..out.len]);
+        return null;
+    };
+    const bytes = k.rig.outputBytes()[at..];
+    for (0..k.shape.rows) |r| for (0..hc) |i| for (0..d) |c| {
+        const e = (r * hc + i) * d + c;
+        var acc: f64 = k.in(yi + 1)[r * hc + i] * k.in(yi)[r * d + c];
+        var mag: f64 = @abs(acc);
+        for (0..hc) |j| {
+            const t = k.in(yi + 2)[(r * hc + j) * hc + i] * x[(r * hc + j) * d + c];
+            acc += t;
+            mag += @abs(t);
+        }
+        const iv = if (point) Iv.pt(bf(acc)) else Iv.of(acc, spec.gamma(hc + 1, u) * mag).round(.bfloat16);
+        const g = spec.read(.bf16, bytes, e);
+        const ok = if (point) spec.classOf(g) == spec.classOf(iv.lo) else iv.has(g);
+        if (!ok) return std.fmt.bufPrint(&k.msg, "row {d} stream {d} is {e} outside [{e}, {e}]", .{ r, i * d + c, g, iv.lo, iv.hi }) catch "x1";
+        out[e] = if (point) iv.lo else g;
+    };
+    return null;
 }
 
 fn depthMixes(_: Shape) usize {
@@ -538,10 +641,11 @@ fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf
             const n = hc * d;
             const a = k.scratch();
             const eps = spec.roundTo(.f32, k.in(3)[0]);
+            const xs = k.in(0)[0 .. rows * n];
             const h = try a.alloc(f64, rows * d);
             defer a.free(h);
             if (fuse) {
-                for (0..rows) |r| try stageRow(sum, a, k.in(0)[r * n ..][0..n], k.in(1)[r * hc ..][0..hc], k.in(2), eps, out[r * d ..][0..d], mag[r * d ..][0..d]);
+                for (0..rows) |r| try stageRow(sum, a, xs[r * n ..][0..n], k.in(1)[r * hc ..][0..hc], k.in(2), eps, out[r * d ..][0..d], mag[r * d ..][0..d]);
                 @memcpy(h, out[0 .. rows * d]);
             } else @memcpy(h, k.in(4)[0 .. rows * d]);
             const t = try a.alloc(f64, n);
@@ -559,7 +663,7 @@ fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf
                 }
             }
             for (0..rows) |r| {
-                const xr = k.in(0)[r * n ..][0..n];
+                const xr = xs[r * n ..][0..n];
                 for (t, xr) |*o, v| o.* = v * v;
                 const rs = 1 / @sqrt(sum.of(t) / @as(f64, @floatFromInt(n)) + eps);
                 for (0..n_mix) |m| {
@@ -583,17 +687,18 @@ fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf
             const comp_at = 2 * bf16s(k.shape);
             const z_at = comp_at + comps(k.shape) * @as(usize, if (cf32) 4 else 2);
             const eps = spec.roundTo(.f32, k.in(3)[0]);
+            const xs = k.in(0)[0 .. rows * n];
             var z: [n_mix]f64 = undefined;
             var al: [n_mix]f64 = undefined;
             for (0..rows) |r| {
-                contract.mixRow(k.in(0)[r * n ..][0..n], k.in(5), k.in(6), k.in(7), eps, &z, &al);
+                contract.mixRow(xs[r * n ..][0..n], k.in(5), k.in(6), k.in(7), eps, &z, &al);
                 for (z, al, 0..) |want, allow, m| {
                     const g = spec.read(.f32, bytes[z_at..], r * n_mix + m);
                     const ok = if (point) spec.classOf(g) == spec.classOf(want) else @abs(g - want) <= allow;
                     if (!ok) return std.fmt.bufPrint(&k.msg, "row {d} mix {d} is {e} where float64 gives {e}", .{ r, m, g, want }) catch "z";
                 }
             }
-            if (fuse) if (try normedOk(k, point)) |why| return why;
+            if (fuse) if (try normedOk(k, point, xs)) |why| return why;
             const h = try a.alloc(f64, rows * d);
             defer a.free(h);
             for (h, 0..) |*o, i| o.* = if (fuse) spec.read(.bf16, bytes, i) else k.in(4)[i];
@@ -625,65 +730,78 @@ fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf
     };
 }
 
-/// The stage kernel: the normed collapse of each row, a threadgroup a row.
-const Stage = struct {
-    pub const Params = struct {};
+/// The stage kernel: the normed collapse of each row, a threadgroup a row; with `ex` the stream expanded on the way in,
+/// which follows the collapse.
+fn StageOf(comptime ex: bool) type {
+    return struct {
+        pub const Params = struct {};
+        const y_in: ?usize = if (ex) 4 else null;
 
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
-        if (s.rows < 1 or s.rows > decode.max_rows or s.k != DIM) return null;
-        return stageGeometry(.{ .rows = s.rows, .dim = s.k, .nq = 0, .qa = 0 });
-    }
-
-    pub fn count(_: Params, s: Shape) usize {
-        return s.rows * s.k;
-    }
-
-    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
-        const rows = k.shape.rows;
-        const d = k.shape.k;
-        const x = try k.add(.bfloat16, &.{ rows, hc, d });
-        const cpre = try k.add(.float32, &.{ rows, hc });
-        const w = try k.add(.bfloat16, &.{d});
-        const eps = try k.add(.float32, &.{2});
-        kit.uniform(rng, x, -3, 3);
-        kit.uniform(rng, cpre, 0.05, 0.45);
-        kit.uniform(rng, w, 0.5, 1.5);
-        eps[0] = EPS_RMS;
-        eps[1] = EPS_HC;
-        switch (f) {
-            .random => {},
-            .nonfinite => kit.plantRows(x, rows, hc * d),
-            .stress => {
-                const a = k.scratch();
-                const pat = try a.alloc(f64, d);
-                defer a.free(pat);
-                const scrap = try a.alloc(f64, d);
-                defer a.free(scrap);
-                try contract.stressDot(rng, pat, scrap, 1, d, 64, 7, a);
-                eps[0] = 0;
-                stressStream(rng, x, rows, d, true);
-                for (0..rows) |r| for (0..hc) |j| {
-                    cpre[r * hc + j] = if (j == 0) 1 else 0;
-                };
-                @memcpy(w, pat);
-            },
+        pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+            if (s.rows < 1 or s.rows > decode.max_rows or s.k != DIM) return null;
+            return stageGeometry(.{ .rows = s.rows, .dim = s.k, .nq = 0, .qa = 0, .expand = ex });
         }
-    }
 
-    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
-        const d = k.shape.k;
-        const eps = spec.roundTo(.f32, k.in(3)[0]);
-        for (0..k.shape.rows) |r| try stageRow(sum, k.scratch(), k.in(0)[r * hc * d ..][0 .. hc * d], k.in(1)[r * hc ..][0..hc], k.in(2), eps, out[r * d ..][0..d], mag[r * d ..][0..d]);
-    }
+        pub fn count(_: Params, s: Shape) usize {
+            return s.rows * s.k;
+        }
 
-    pub fn check(k: anytype, at: spec.Gate) !?[]const u8 {
-        return normedOk(k, at == .nonfinite);
-    }
-};
+        pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+            const rows = k.shape.rows;
+            const d = k.shape.k;
+            const x = try k.add(.bfloat16, &.{ rows, hc, d });
+            const cpre = try k.add(.float32, &.{ rows, hc });
+            const w = try k.add(.bfloat16, &.{d});
+            const eps = try k.add(.float32, &.{2});
+            kit.uniform(rng, x, -3, 3);
+            kit.uniform(rng, cpre, 0.05, 0.45);
+            kit.uniform(rng, w, 0.5, 1.5);
+            eps[0] = EPS_RMS;
+            eps[1] = EPS_HC;
+            if (ex) try addExpand(k, rng, rows, d);
+            switch (f) {
+                .random => {},
+                .nonfinite => kit.plantRows(x, rows, hc * d),
+                .stress => {
+                    const a = k.scratch();
+                    const pat = try a.alloc(f64, d);
+                    defer a.free(pat);
+                    const scrap = try a.alloc(f64, d);
+                    defer a.free(scrap);
+                    try contract.stressDot(rng, pat, scrap, 1, d, 64, 7, a);
+                    eps[0] = 0;
+                    stressStream(rng, x, rows, d, true);
+                    for (0..rows) |r| for (0..hc) |j| {
+                        cpre[r * hc + j] = if (j == 0) 1 else 0;
+                    };
+                    @memcpy(w, pat);
+                    if (ex) identityExpand(k, y_in.?);
+                },
+            }
+        }
+
+        pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+            const d = k.shape.k;
+            const eps = spec.roundTo(.f32, k.in(3)[0]);
+            const xs = try k.scratch().alloc(f64, k.shape.rows * hc * d);
+            defer k.scratch().free(xs);
+            expanded(k, y_in, sum, xs);
+            for (0..k.shape.rows) |r| try stageRow(sum, k.scratch(), xs[r * hc * d ..][0 .. hc * d], k.in(1)[r * hc ..][0..hc], k.in(2), eps, out[r * d ..][0..d], mag[r * d ..][0..d]);
+        }
+
+        pub fn check(k: anytype, at: spec.Gate) !?[]const u8 {
+            const xs = try k.scratch().alloc(f64, k.shape.rows * hc * k.shape.k);
+            defer k.scratch().free(xs);
+            if (seenStream(k, y_in, 2 * k.shape.rows * k.shape.k, at == .nonfinite, xs)) |why| return why;
+            return normedOk(k, at == .nonfinite, xs);
+        }
+    };
+}
 
 const nan_rule: spec.Nan = .{ .stated = "classes as float64 gives them; the normed rows within the intervals of their roundings, the dots and mixes within their sums' allowance" };
 const fused_shapes: []const Shape = &.{ .{ .rows = 1, .n = NQ, .k = DIM }, .{ .rows = fuse_rows, .n = NQ, .k = DIM } };
-const staged_shapes: []const Shape = &.{ .{ .rows = fuse_rows + 1, .n = NQ, .k = DIM }, .{ .rows = decode.max_rows, .n = NQ, .k = DIM } };
+/// The staged launches serve every row count: past `fuse_rows`, and at any rows where the stream comes expanded.
+const staged_shapes: []const Shape = &.{ .{ .rows = 1, .n = NQ, .k = DIM }, .{ .rows = fuse_rows, .n = NQ, .k = DIM }, .{ .rows = fuse_rows + 1, .n = NQ, .k = DIM }, .{ .rows = decode.max_rows, .n = NQ, .k = DIM } };
 
 fn addMain(set: *kc.Set, comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime name: []const u8) !void {
     const T = Main(fuse, nw, nc, cf32);
@@ -707,15 +825,20 @@ pub fn register(set: *kc.Set) !void {
     try addMain(set, false, 0, 0, false, "dsv41 dec in_proj, 3..6 rows (q_kv, hc mixes)");
     try addMain(set, false, 8, 16, true, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, f32 compressor)");
     try addMain(set, false, 8, 16, false, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, bf16 compressor)");
-    try kit.add(set, Stage, &stage_l, .{}, .{
-        .name = "dsv41 dec in_proj_stage (normed collapse)",
+    try addStage(set, false, "dsv41 dec in_proj_stage (normed collapse)");
+    try addStage(set, true, "dsv41 dec in_proj_stage_x (hc expand, normed collapse)");
+}
+
+fn addStage(set: *kc.Set, comptime ex: bool, comptime name: []const u8) !void {
+    try kit.add(set, StageOf(ex), if (ex) &stage_x_l else &stage_l, .{}, .{
+        .name = name,
         .accum = .f32,
         .depth = depthNorm,
         .ops = 4,
         .mids = 2,
         .out = .bf16,
         .nan = nan_rule,
-        .served = &.{ .{ .rows = fuse_rows + 1, .n = DIM, .k = DIM }, .{ .rows = decode.max_rows, .n = DIM, .k = DIM } },
+        .served = &.{ .{ .rows = 1, .n = DIM, .k = DIM }, .{ .rows = fuse_rows, .n = DIM, .k = DIM }, .{ .rows = fuse_rows + 1, .n = DIM, .k = DIM }, .{ .rows = decode.max_rows, .n = DIM, .k = DIM } },
         .sums = .{ .f16 = 0, .bf16 = 0, .why = "a sum of squares cannot cancel" },
     });
 }
@@ -727,7 +850,7 @@ test "dsv41 dec in_proj: the declared launches are the shipped wrapper's, byte f
     defer kn.deinit();
     var sc = v41.Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
-    inline for (.{ .{ true, 0, 0, false, 1 }, .{ true, 8, 16, true, 2 }, .{ true, 8, 16, false, 1 }, .{ false, 0, 0, false, 3 }, .{ false, 8, 16, true, 6 }, .{ false, 8, 16, false, 4 } }) |v| {
+    inline for (.{ .{ true, 0, 0, false, 1 }, .{ true, 8, 16, true, 2 }, .{ true, 8, 16, false, 1 }, .{ false, 0, 0, false, 3 }, .{ false, 8, 16, true, 6 }, .{ false, 8, 16, false, 4 }, .{ false, 8, 16, true, 1 } }) |v| {
         const T = Main(v[0], v[1], v[2], v[3]);
         const shape: Shape = .{ .rows = v[4], .n = NQ, .k = DIM };
         var c = kit.Case(T).init(gpa, &main_l, .{});
@@ -746,8 +869,19 @@ test "dsv41 dec in_proj: the declared launches are the shipped wrapper's, byte f
         try testing.expectEqualSlices(u8, c.rig.outputBytes(), try c.rig.bytesOf(theirs[0..n]));
         if (!v[0]) {
             try c.rig.launch(&stage_l, stageGeometry(p), c.args[0..4]);
-            try testing.expectEqualSlices(u8, c.rig.outputBytes(), try c.rig.bytesOf(&.{try stage(&sc, &kn, p, a)}));
+            try testing.expectEqualSlices(u8, c.rig.outputBytes(), try c.rig.bytesOf(&.{(try stage(&sc, &kn, p, a))[0]}));
         }
+    }
+    inline for (.{ 1, fuse_rows, fuse_rows + 1, decode.max_rows }) |rows| {
+        const T = StageOf(true);
+        const shape: Shape = .{ .rows = rows, .n = DIM, .k = DIM };
+        var c = kit.Case(T).init(gpa, &stage_x_l, .{});
+        defer c.deinit();
+        try testing.expect(try c.prepare(shape, .random, 7));
+        try c.run();
+        const p: Plan = .{ .rows = rows, .dim = DIM, .nq = 0, .qa = 0, .fuse = false, .expand = true };
+        const a = Args{ .x = c.args[0], .cpre = c.args[1], .attn_w = c.args[2], .eps = c.args[3], .fn_w = none, .scale = none, .base = none, .wq = none, .wsc = none, .ex = .{ .y = c.args[4], .post = c.args[5], .comb = c.args[6] } };
+        try testing.expectEqualSlices(u8, c.rig.outputBytes(), try c.rig.bytesOf(&(try stage(&sc, &kn, p, a))));
     }
 }
 
@@ -886,7 +1020,7 @@ fn expectLayer(gpa: std.mem.Allocator, fx: *fixture.Fixture, k: *const Kernels, 
     defer sc.deinit();
     std.debug.print("[dec] in_proj layer {d} rows {d}\n", .{ li, rows });
 
-    const out = (try run(&sc, k, m, ly, x, cpre)) orelse return error.Declined;
+    const out = (try run(&sc, k, m, ly, x, cpre, null)) orelse return error.Declined;
     const staged = try v41.hcStage(&sc, m, x, null, cpre, &ly.hc_attn, ly.attn_norm);
     const tz = try todayStage(&sc, m, x, cpre, ly);
     const h_chain = try host(staged.h);
@@ -1142,4 +1276,65 @@ test "dsv41 dec in_proj: ubench against its byte floor and the chain it replaces
             decode.report(try std.fmt.bufPrint(&name_buf, "in_proj ({s}, {d} copies)", .{ kind.name, cyc.n }), rows, us, @as(f64, @floatFromInt(bytes)), chain_us);
         }
     }
+}
+
+/// A tensor split's layer boundary: the previous block's hc expand then the launch (`fused` false), or the launch
+/// expanding the stream itself. Each step's mixes are the next one's `cpre` and its post, so the expand waits on them.
+const ExpandChain = struct {
+    sc: *v41.Scope,
+    k: *const Kernels,
+    p: Plan,
+    cyc: *const Cycle,
+    base: Args,
+    ex: v41.Pend,
+    fused: bool,
+    z: A = none,
+
+    pub fn step(c: *ExpandChain, i: usize) !A {
+        if (i == 0) restart(c.sc);
+        var a = c.cyc.args(i, c.base);
+        var ex = c.ex;
+        if (i > 0) {
+            a.cpre = c.z;
+            ex.post = c.z;
+        }
+        if (c.fused) a.ex = ex else a.x = try v41.hcExpand(c.sc, a.x, ex.y, &.{ .pre = none, .post = ex.post, .comb = ex.comb });
+        c.z = (try launch(c.sc, c.k, c.p, a)).z;
+        return c.z;
+    }
+};
+
+test "dsv41 dec in_proj ubench: the launch expanding the stream against the expand kernel then the launch (DSV41_DEC_UBENCH)" {
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const k = try Kernels.build();
+    defer k.deinit();
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 25, .ctx = 0 });
+    defer fx.deinit();
+    const m = fx.m;
+    for ([_]usize{ 21, 24 }) |li| for ([_]usize{ 1, 2, 3, 6 }) |rows| {
+        const ly = fx.layer(li);
+        const x = try fx.stream(rows);
+        defer _ = mlx.mlx_array_free(x);
+        const cpre = try fx.cpre(rows);
+        defer _ = mlx.mlx_array_free(cpre);
+        var sc = v41.Scope.init(gpa, m.s);
+        defer sc.deinit();
+        const y = try keep(&sc, try fx.normal(&.{ @intCast(rows), @intCast(m.cfg.hidden_size) }, .bfloat16, 0, 1));
+        const post = try keep(&sc, try fx.uniform(&.{ @intCast(rows), hc }, 0, 2));
+        const comb = try keep(&sc, try fx.uniform(&.{ @intCast(rows), hc, hc }, 0, 0.5));
+        const p = plan(m, ly, x) orelse return error.Declined;
+        const base = argsOf(ly, x, cpre, try v41.hcEps(&sc, m));
+        const cyc = try Cycle.init(gpa, &sc, ly, layerBytes(p), 2_200_000_000);
+        defer cyc.deinit(gpa);
+        var us: [2]f64 = undefined;
+        for (&us, [_]bool{ false, true }) |*t, fused| {
+            var own = v41.Scope.init(gpa, m.s);
+            defer own.deinit();
+            var c: ExpandChain = .{ .sc = &own, .k = &k, .p = p, .cyc = &cyc, .base = base, .ex = .{ .y = y, .post = post, .comb = comb }, .fused = fused };
+            _ = try decode.chainUs(&c, cyc.n);
+            t.* = try decode.chainUs(&c, cyc.n);
+        }
+        std.debug.print("[dec-ubench] in_proj layer {d} R={d}: expand + launch {d:.1} us, expanding launch {d:.1} us\n", .{ li, rows, us[0], us[1] });
+    };
 }

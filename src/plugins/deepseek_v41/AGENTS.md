@@ -44,6 +44,9 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   both ranks run every layer and `tpSum` each attention and MoE output. Every rank must build the same sums in the same
   order: `blockFused` and `batchedLayer` sum between their stages (`tpFfn`). DSpark drafts on rank 0 alone: its stages
   load whole and sum nothing, and the worker follows each verify's rollback.
+- Under `tp` a single-span step leaves each layer's hc expand to the next layer's `in_proj` (`Shared.pend`, `DSV41_TP_FUSE`):
+  between layers `sp.xs` is the stream before it, so whatever reads the stream there settles it first (`runLayers`'
+  `streamRead`, `settle`), and `runLayers` settles it after its last layer.
 - Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
   worker keeps it; a step on another state (`st != &dec_state`) is refused.
 - Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken

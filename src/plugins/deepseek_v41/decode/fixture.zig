@@ -50,10 +50,15 @@ pub const Fixture = struct {
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();
         cfg.num_experts = opts.experts;
+        // The fixture holds no Engram (a pair worker refuses an Engram layer), so layers 1 and 14 run as plain layers.
+        cfg.dsv41_n_engram_layers = 0;
         fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64 };
         errdefer fx.w.deinit();
-        for (opts.lo..opts.hi) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
-        if (opts.tp) |t| try fx.sliceShard(t);
+        // Cut a layer as soon as it is made, so a wide bank never stands whole for every layer at once.
+        for (opts.lo..opts.hi) |li| {
+            try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
+            if (opts.tp) |t| try fx.sliceShard(t, li);
+        }
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
         errdefer fx.m.deinit();
         if (!opts.fused) fx.m.dec.deinit();
@@ -72,11 +77,14 @@ pub const Fixture = struct {
         return fx;
     }
 
-    /// Every tensor `Shard.axis` names cut to `t`'s part of its axis, in a buffer of its own.
-    fn sliceShard(fx: *Fixture, t: Shard) !void {
+    /// Every tensor of layer `li` `Shard.axis` names cut to `t`'s part of its axis, in a buffer of its own.
+    fn sliceShard(fx: *Fixture, t: Shard, li: usize) !void {
         const s = mlx.gpuStream();
+        var pbuf: [32]u8 = undefined;
+        const pfx = try std.fmt.bufPrint(&pbuf, "layers.{d}.", .{li});
         var it = fx.w.map.iterator();
         while (it.next()) |kv| {
+            if (!std.mem.startsWith(u8, kv.key_ptr.*, pfx)) continue;
             const axis = Shard.axis(kv.key_ptr.*) orelse continue;
             const shape = mlx.getShape(kv.value_ptr.*);
             const ax = axis.of(shape.len);
@@ -452,6 +460,78 @@ test "dsv41 tensor parallel: the ranks on the fused decode kernels decode no fur
         std.mem.sort(f64, &chain, {}, std.sort.asc(f64));
         std.debug.print("[dec] tensor parallel R={d}: median new-truth {e:.2}, chain-truth {e:.2} (rel rms)\n", .{ rows, tp[2], chain[2] });
         try std.testing.expect(tp[2] <= 1.25 * chain[2] + 1e-4);
+    }
+}
+
+/// A collective that hands each rank back its own part: two arms of one rank then sum the same values.
+fn ownPart(x: A) anyerror!A {
+    var out = mlx.mlx_array_new();
+    _ = mlx.mlx_array_set(&out, x);
+    return out;
+}
+
+test "dsv41 tensor parallel: each hc expand made inside the next layer's fused input (DSV41_TP_FUSE) gives today's streams and caches bit for bit" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    dsv41.clusterHooks().tp_sum = &ownPart;
+    defer dsv41.clusterHooks().tp_sum = null;
+    defer dsv41.tp_fuse = null;
+    // Ratio 0 and 2 (the compressor commits on every other position), then ratio 1 (KV, index and candidate sources);
+    // steps of 1, 2 (one launch collapses the stream) and 3, 6 (the stage kernel does), each after the last.
+    for ([_][2]usize{ .{ 0, 4 }, .{ 20, 25 } }) |range| {
+        var arms: [2]*Fixture = undefined;
+        var made: usize = 0;
+        defer for (arms[0..made]) |fx| fx.deinit();
+        for (&arms) |*fx| {
+            fx.* = try Fixture.init(gpa, .{ .lo = range[0], .hi = range[1], .experts = 8, .ctx = 97, .seed = 5, .fused = true, .experts_fp4 = true, .tp = .{ .rank = 0, .size = 4 } });
+            made += 1;
+        }
+        var p0: usize = 97;
+        for ([_]usize{ 1, 2, 3, decode.max_rows, 1, 1 }) |rows| {
+            const in = try Input.of(arms[0], rows);
+            defer in.deinit();
+            var got: [2][2][]f32 = undefined;
+            for (arms, [_]bool{ false, true }, &got) |fx, on, *g| {
+                dsv41.tp_fuse = on;
+                const out = try dsv41.workerStep(fx.m, gpa, in.x, in.pre, p0, false, false);
+                defer for (out) |o| {
+                    _ = mlx.mlx_array_free(o);
+                };
+                g[0] = try dsv41.hostF32(out[0]);
+                g[1] = try dsv41.hostF32(out[1]);
+            }
+            defer for (got) |g| for (g) |v| gpa.free(v);
+            try std.testing.expectEqualSlices(f32, got[0][0], got[1][0]);
+            try std.testing.expectEqualSlices(f32, got[0][1], got[1][1]);
+            for (arms[0].m.dec_state.?.layers[range[0]..range[1]], arms[1].m.dec_state.?.layers[range[0]..range[1]]) |a, b| {
+                try expectSameArray(gpa, a.win.buf, b.win.buf);
+                if (a.comp) |c| try expectSameArray(gpa, c.buf, b.comp.?.buf);
+                if (a.idx_k) |c| try expectSameArray(gpa, c.buf, b.idx_k.?.buf);
+                try expectSameArray(gpa, a.pend_kv, b.pend_kv);
+                try expectSameArray(gpa, a.pend_gate, b.pend_gate);
+            }
+            p0 += rows;
+        }
+    }
+}
+
+test "dist N-rank: four ranks on the fused decode kernels give the same stream with each hc expand inside the next layer's input (DSV41_TP_FUSE)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    defer dsv41.tp_fuse = null;
+    const base: Opts = .{ .lo = 20, .hi = 23, .experts = 8, .ctx = 0, .fused = true, .experts_fp4 = true, .seed = 2 };
+    const probe = try Fixture.init(gpa, base);
+    defer probe.deinit();
+    for ([_]usize{ 1, 3 }) |rows| {
+        const in = try Input.of(probe, rows);
+        defer in.deinit();
+        dsv41.tp_fuse = false;
+        const want = try tpStreamN(gpa, base, in, 4);
+        defer gpa.free(want);
+        dsv41.tp_fuse = true;
+        const got = try tpStreamN(gpa, base, in, 4);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(f32, want, got);
     }
 }
 
