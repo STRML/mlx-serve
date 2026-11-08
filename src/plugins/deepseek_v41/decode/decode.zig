@@ -239,7 +239,7 @@ fn copyOf(sc: *dsv41.Scope, a: A) !A {
 }
 
 /// `ly` with every attention-side weight in new memory.
-fn layerCopy(sc: *dsv41.Scope, ly: *const dsv41.Layer) !dsv41.Layer {
+pub fn layerCopy(sc: *dsv41.Scope, ly: *const dsv41.Layer) !dsv41.Layer {
     var c = ly.*;
     const q = &c.q_kv.?;
     q.w = try copyOf(sc, q.w);
