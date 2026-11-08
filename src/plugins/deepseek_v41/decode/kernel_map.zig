@@ -161,6 +161,7 @@ const Probe = struct {
     held: dsv41.Scope,
     copies: []dsv41.Layer,
     pass: mlx.mlx_fast_metal_kernel,
+    pass_after: mlx.mlx_fast_metal_kernel,
     read: mlx.mlx_fast_metal_kernel,
     arm: Arm = .{},
     seen: [4][max_layers]Ins = @splat(@splat(.{})),
@@ -170,7 +171,7 @@ const Probe = struct {
         std.debug.assert(hi <= max_layers);
         const p = try gpa.create(Probe);
         errdefer gpa.destroy(p);
-        p.* = .{ .gpa = gpa, .m = fx.m, .lo = lo, .hi = hi, .held = dsv41.Scope.init(gpa, fx.m.s), .copies = try gpa.alloc(dsv41.Layer, hi - lo), .pass = try dsv41.buildKernel("dsv41_kmap_pass", &.{ "x", "dep" }, &.{"y"}, PASS_SOURCE, ""), .read = try dsv41.buildKernel("dsv41_kmap_read", &.{ "w", "s" }, &.{"out"}, READ_SOURCE, ""), .hook = .{ .ctx = p, .before = &before } };
+        p.* = .{ .gpa = gpa, .m = fx.m, .lo = lo, .hi = hi, .held = dsv41.Scope.init(gpa, fx.m.s), .copies = try gpa.alloc(dsv41.Layer, hi - lo), .pass = try dsv41.buildKernel("dsv41_kmap_pass", &.{ "x", "dep" }, &.{"y"}, PASS_SOURCE, ""), .pass_after = try dsv41.buildKernel("dsv41_kmap_pass_after", &.{ "dep", "x" }, &.{"y"}, PASS_SOURCE, ""), .read = try dsv41.buildKernel("dsv41_kmap_read", &.{ "w", "s" }, &.{"out"}, READ_SOURCE, ""), .hook = .{ .ctx = p, .before = &before } };
         for (p.copies, lo..) |*c, li| c.* = try decode.layerCopy(&p.held, fx.layer(li));
         return p;
     }
@@ -179,6 +180,7 @@ const Probe = struct {
         for (&p.seen) |*row| for (row) |*ins| forget(ins);
         _ = mlx.mlx_fast_metal_kernel_free(p.pass);
         _ = mlx.mlx_fast_metal_kernel_free(p.read);
+        _ = mlx.mlx_fast_metal_kernel_free(p.pass_after);
         p.held.deinit();
         p.gpa.free(p.copies);
         p.gpa.destroy(p);
@@ -213,8 +215,7 @@ const Probe = struct {
             .base, .ctl => ins[0],
             .twin => try twinLaunch(sc, m, &p.copies[li - p.lo], li, at, ins),
             .same => try twinLaunch(sc, m, &m.layers[li], li, at, ins),
-            .pre => try readLaunch(sc, p.read, weightsOf(&m.layers[li], at)),
-            .precopy => try readLaunch(sc, p.read, weightsOf(&p.copies[li - p.lo], at)),
+            .pre, .precopy => return passAfter(sc, p.pass_after, ins[0], try readLaunch(sc, p.read, weightsOf(if (p.arm.mode == .pre) &m.layers[li] else &p.copies[li - p.lo], at))),
         };
         return passLaunch(sc, p.pass, ins[0], dep);
     }
@@ -313,14 +314,22 @@ fn readLaunch(sc: *dsv41.Scope, k: mlx.mlx_fast_metal_kernel, l: dsv41.Lin) !A {
     return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
 
+fn passAfter(sc: *dsv41.Scope, k: mlx.mlx_fast_metal_kernel, x: A, dep: A) !A {
+    return passWith(sc, k, x, &.{ dep, x });
+}
+
 fn passLaunch(sc: *dsv41.Scope, k: mlx.mlx_fast_metal_kernel, x: A, dep: A) !A {
+    return passWith(sc, k, x, &.{ x, dep });
+}
+
+fn passWith(sc: *dsv41.Scope, k: mlx.mlx_fast_metal_kernel, x: A, ins: *const [2]A) !A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const shape = mlx.getShape(x);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, shape.ptr, shape.len, mlx.mlx_array_dtype(x)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(mlx.mlx_array_size(x)), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
-    const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, dep }, 2);
+    const iv = mlx.mlx_vector_array_new_data(ins, 2);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
