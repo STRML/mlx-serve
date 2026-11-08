@@ -419,6 +419,8 @@ pub const Transformer = struct {
     dspark_plain: @import("spec/dflash/policy.zig").PlainCost = .{},
     /// Drafted DSpark rounds run since the load, up to the warm-up count. Inference thread only.
     dspark_warm_rounds: u32 = 0,
+    /// What a DSpark verify costs by rows on this model, learned from its verifies. Inference thread only.
+    dspark_verify: @import("spec/dflash/policy.zig").VerifyCost = .{},
     cost_trace_active: bool = false,
     cost_attention: u8 = 0,
     cost_moe: u8 = 0,

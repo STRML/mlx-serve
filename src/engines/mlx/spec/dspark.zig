@@ -246,7 +246,8 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
     defer d.deinit(allocator);
     const drafted = d.len;
-    d.len = dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+    const verify_costs = self.xfm.dspark_verify.costs();
+    d.len = dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, &verify_costs);
     if (forcedVerifyRows()) |rows| d.len = @min(rows - 1, drafted);
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     const verify_watch = io_util.Stopwatch.init(self.timer.io);
@@ -256,6 +257,7 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
     const verify_ms = msSince(&verify_watch);
     self.dspark_stats.recordVerifyMs(@intCast(d.len + 1), verify_ms);
+    self.xfm.dspark_verify.sample(@intCast(d.len + 1), verify_ms);
     if (d.len == 0) samplePlainMs(self, verify_ms);
     for (d.confidence[0..d.len], 0..) |c, k| {
         if (k > round.accepted) break;
@@ -273,13 +275,12 @@ pub fn sigmoid(x: f32) f32 {
 }
 
 /// Drafts a DSpark round verifies: the prefix whose calibrated acceptance (the confidence head's logits through
-/// `calib`) buys the most tokens per ms of verify, on the verify ladder scaled to this request's plain step.
-pub fn dsparkVerifyDrafts(conf_logits: []const f32, calib: *const dflash_policy.Calibration, plain_ms: f32) usize {
+/// `calib`) buys the most tokens per ms of verify, on `costs` (the model's learned verify ladder).
+pub fn dsparkVerifyDrafts(conf_logits: []const f32, calib: *const dflash_policy.Calibration, costs: *const dflash_policy.Costs) usize {
     var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
     const n = @min(conf_logits.len, p.len);
     for (conf_logits[0..n], p[0..n]) |c, *o| o.* = calib.probability(sigmoid(c));
-    const costs = dflash_policy.priorCosts(plain_ms);
-    return dflash_policy.chooseRows(p[0..n], &costs).rows - 1;
+    return dflash_policy.chooseRows(p[0..n], costs).rows - 1;
 }
 
 /// A draft round's bookkeeping; the module stands at `position`.
@@ -883,13 +884,14 @@ test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit 
 test "dsparkVerifyDrafts: a sure head verifies the block, an unsure one t1 alone, a doubt mid-block cuts there" {
     const G = Generator;
     var calib = dflash_policy.Calibration{};
-    try testing.expectEqual(@as(usize, 5), G.dsparkVerifyDrafts(&.{ 9, 9, 9, 9, 9 }, &calib, 17.6));
-    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{ 0, 0, 0, 0, 0 }, &calib, 17.6));
-    try testing.expectEqual(@as(usize, 2), G.dsparkVerifyDrafts(&.{ 9, 9, -4, 9, 9 }, &calib, 17.6));
-    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{}, &calib, 17.6));
+    const prior = dflash_policy.priorCosts(17.6);
+    try testing.expectEqual(@as(usize, 5), G.dsparkVerifyDrafts(&.{ 9, 9, 9, 9, 9 }, &calib, &prior));
+    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{ 0, 0, 0, 0, 0 }, &calib, &prior));
+    try testing.expectEqual(@as(usize, 2), G.dsparkVerifyDrafts(&.{ 9, 9, -4, 9, 9 }, &calib, &prior));
+    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{}, &calib, &prior));
     // A head that keeps claiming certainty the trunk rejects stops buying rows.
     for (0..40) |_| calib.observe(G.sigmoid(9), false);
-    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{ 9, 9, 9, 9, 9 }, &calib, 17.6));
+    try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{ 9, 9, 9, 9, 9 }, &calib, &prior));
 }
 
 test "dspark drafting backoff: prose rounds that lose to the plain step are skipped, copy-like rounds are not" {

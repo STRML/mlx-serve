@@ -308,6 +308,66 @@ pub const GroupCost = struct {
     }
 };
 
+/// What a verify costs by rows on this model and machine, `base + per_row * (rows - 1)`: a least-squares line over the
+/// verifies seen, each round weighing KEEP of the one after it. Until the widths seen spread by MIN_SPREAD rows (a
+/// variance), only the level is learned and the slope is the prior ladder's scaled to it, as `priorCosts` scales the
+/// whole ladder. The prior is GLM-5.3's (~4.9 ms a row against a 17.7 ms step); a TP4 DeepSeek-V4.1 verify pays well
+/// under 1 ms a row.
+pub const VerifyCost = struct {
+    const KEEP: f32 = 0.98;
+    const MIN_SPREAD: f32 = 1;
+    /// Below this many rounds' weight a sample sets the level within 4x of the prior (PlainCost's seed rule); above
+    /// it, a sample moves at most twofold.
+    const SEED_WEIGHT: f32 = 3;
+
+    w: f32 = 0,
+    x: f32 = 0,
+    xx: f32 = 0,
+    y: f32 = 0,
+    xy: f32 = 0,
+
+    pub fn sample(self: *VerifyCost, rows: u32, took: f32) void {
+        if (rows == 0 or rows > MAX_ROWS or !std.math.isFinite(took) or took <= 0) return;
+        const now = self.ms(rows);
+        if (self.w < SEED_WEIGHT and (took < now / 4 or took > now * 4)) return;
+        const y = if (self.w < SEED_WEIGHT) took else std.math.clamp(took, now * 0.5, now * 2);
+        const x: f32 = @floatFromInt(rows - 1);
+        self.w = self.w * KEEP + 1;
+        self.x = self.x * KEEP + x;
+        self.xx = self.xx * KEEP + x * x;
+        self.y = self.y * KEEP + y;
+        self.xy = self.xy * KEEP + x * y;
+    }
+
+    pub fn ms(self: *const VerifyCost, rows: u32) f32 {
+        const l = self.line();
+        return l[0] + l[1] * @as(f32, @floatFromInt(rows -| 1));
+    }
+
+    /// `.{ base, per_row }`, the row slope never below zero.
+    fn line(self: *const VerifyCost) [2]f32 {
+        const prior = priorCosts(PRIOR_PLAIN_MS);
+        const prior_slope = (prior[6] - prior[1]) / 5 / prior[1];
+        if (self.w <= 0) return .{ prior[1], prior_slope * prior[1] };
+        const mx = self.x / self.w;
+        const my = self.y / self.w;
+        const spread = self.xx / self.w - mx * mx;
+        if (spread < MIN_SPREAD) {
+            const base = my / (1 + prior_slope * mx);
+            return .{ base, prior_slope * base };
+        }
+        const per_row = @max(0, (self.xy / self.w - mx * my) / spread);
+        return .{ my - per_row * mx, per_row };
+    }
+
+    pub fn costs(self: *const VerifyCost) Costs {
+        var out: Costs = undefined;
+        out[0] = 0;
+        for (1..MAX_ROWS + 1) |r| out[r] = self.ms(@intCast(r));
+        return out;
+    }
+};
+
 /// Per-draft-position acceptance and the verify widths a request ran, for `[spec-stats]`.
 pub const PositionStats = struct {
     reached: [MAX_DRAFTS]u64 = @splat(0),
@@ -484,6 +544,28 @@ test "PlainCost: the first samples replace the prior, the fastest of them kept" 
     try approx(c.ms, 12.2);
     c.sample(30.0); // seeded: back to the slow, bounded walk
     try testing.expect(c.ms > 12.2 and c.ms < 12.6);
+}
+
+test "VerifyCost: starts on the prior's line, learns a cheaper slope from two widths, keeps the slope from one" {
+    var v = VerifyCost{};
+    const prior = priorCosts(PRIOR_PLAIN_MS);
+    try approx(v.ms(1), prior[1]);
+    try approx(v.ms(6), prior[6]);
+    var tp4 = VerifyCost{};
+    for (0..60) |i| tp4.sample(if (i % 2 == 0) 1 else 6, if (i % 2 == 0) 12.2 else 16.45);
+    try testing.expect(@abs(tp4.ms(1) - 12.2) < 0.6);
+    try testing.expect(tp4.ms(6) - tp4.ms(1) < 6);
+    try testing.expect(tp4.ms(16) < 30);
+    var one = VerifyCost{};
+    for (0..60) |_| one.sample(1, 12.2);
+    try testing.expect(one.ms(6) - one.ms(1) > 0);
+    try testing.expect(one.ms(2) >= one.ms(1));
+}
+
+test "VerifyCost: a stall moves a width's sample at most twofold" {
+    var v = VerifyCost{};
+    v.sample(1, 4000);
+    try testing.expect(v.ms(1) < 2 * PRIOR_PLAIN_MS);
 }
 
 test "Drafting: one cold-kernel round moves the average wall at most twofold" {
