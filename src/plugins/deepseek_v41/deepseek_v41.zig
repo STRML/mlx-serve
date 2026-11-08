@@ -574,7 +574,7 @@ pub const Dsv41Model = struct {
         return p.holds(li);
     }
 
-    fn isKvSource(self: *const Dsv41Model, l: usize) bool {
+    pub fn isKvSource(self: *const Dsv41Model, l: usize) bool {
         return l < self.n_layers and (self.cfg.dsv41_kv_sources >> @intCast(l)) & 1 != 0;
     }
     fn isIndexSource(self: *const Dsv41Model, l: usize) bool {
@@ -585,14 +585,14 @@ pub const Dsv41Model = struct {
     }
     /// The latest layer at or above `l` that matches `pred` (config parse
     /// proved one exists wherever a compressed layer asks).
-    fn latest(self: *const Dsv41Model, l: usize, comptime pred: fn (*const Dsv41Model, usize) bool) usize {
+    pub fn latest(self: *const Dsv41Model, l: usize, comptime pred: fn (*const Dsv41Model, usize) bool) usize {
         var j = l + 1;
         while (j > 0) : (j -= 1) {
             if (pred(self, j - 1)) return j - 1;
         }
         unreachable;
     }
-    fn isOwner(self: *const Dsv41Model, l: usize) bool {
+    pub fn isOwner(self: *const Dsv41Model, l: usize) bool {
         return self.isKvSource(l) and self.isIndexSource(l);
     }
     fn dsparkTarget(self: *const Dsv41Model, l: usize) ?usize {
@@ -1953,7 +1953,7 @@ pub const Rows = struct {
     }
 
     /// Rows [0, n) (caller frees).
-    fn view(self: *const Rows, n: usize, s: S) !A {
+    pub fn view(self: *const Rows, n: usize, s: S) !A {
         var o = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(o);
         try mlx.check(mlx.mlx_slice(&o, self.buf, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(n), ci(self.width) }, 2, &[_]c_int{ 1, 1 }, 2, s));
@@ -1979,7 +1979,7 @@ pub const Ring = struct {
     }
 
     /// Rows for positions [p0, p0 + n); only the last `cap` can survive.
-    fn write(self: *Ring, x: A, p0: usize, s: S) !void {
+    pub fn write(self: *Ring, x: A, p0: usize, s: S) !void {
         const n = dim(x, 0);
         const keep_n = @min(n, self.cap);
         const first = p0 + n - keep_n;
@@ -2766,7 +2766,7 @@ pub fn attnDecodeSplit(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, q: A,
 }
 
 /// The decode attention kernels' meta: {p0, L, K, window, cap, n_comp}.
-fn attnMeta(sc: *Scope, m: *const Dsv41Model, q: A, win: Ring, comp_rows: A, topk: A, p0: usize) !A {
+pub fn attnMeta(sc: *Scope, m: *const Dsv41Model, q: A, win: Ring, comp_rows: A, topk: A, p0: usize) !A {
     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
     const meta_v = [_]i32{ @intCast(p0), @intCast(dim(q, 0)), @intCast(K), @intCast(m.cfg.sliding_window), @intCast(win.cap), if (K > 0) @intCast(dim(comp_rows, 0)) else 0 };
     return sc.ints(&meta_v, &.{meta_v.len});
@@ -2911,7 +2911,7 @@ pub fn compress(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Co
 }
 
 /// `compressFrom` on the fused pool step (`decode/idx_score.zig`); false (nothing moved) where it declines.
-fn compressFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, proj: A, p0: usize) !bool {
+pub fn compressFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, proj: A, p0: usize) !bool {
     const k = &(m.dec.idx_score orelse return false);
     const ls = &st.layers[li];
     const p = (try dkern.idx_score.pool(sc, m, k, li, proj, ls.pend_kv, ls.pend_gate, p0)) orelse return false;
@@ -2940,7 +2940,7 @@ fn compressFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, proj: A, p0:
 
 /// `compress` from the rows' projection `proj`: `[L, head_dim]` at ratio 1, the kv then gate rows `[L, 2 head_dim]` f32
 /// above it.
-fn compressFrom(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Comp, proj: A, p0: usize) !void {
+pub fn compressFrom(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Comp, proj: A, p0: usize) !void {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const ls = &st.layers[li];
@@ -3019,7 +3019,7 @@ pub fn indexer(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, iw: *const Idx
 }
 
 /// `indexer` from the rows' roped, round-tripped index queries `q` [L, heads, dim] f32 and head weights `w` [L, heads].
-fn indexerQ(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, w: A, q: A, p0: usize, sh: *Shared) !A {
+pub fn indexerQ(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, w: A, q: A, p0: usize, sh: *Shared) !A {
     const c = &m.cfg;
     const L = dim(q, 0);
     const r: usize = m.ratio(li);
@@ -3881,6 +3881,7 @@ pub const ProjAt = enum { in_proj, wq_b, wo_a, wo_b };
 pub const ProjProbe = struct {
     ctx: *anyopaque,
     before: *const fn (ctx: *anyopaque, sc: *Scope, m: *Dsv41Model, li: usize, at: ProjAt, ins: []const A) anyerror!A,
+    layer: ?*const fn (ctx: *anyopaque, sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) anyerror!?A = null,
 };
 
 fn probed(sc: *Scope, m: *Dsv41Model, li: usize, at: ProjAt, ins: []const A) !A {
@@ -3891,6 +3892,7 @@ fn probed(sc: *Scope, m: *Dsv41Model, li: usize, at: ProjAt, ins: []const A) !A 
 /// `block` for at most `dkern.max_rows` rows on the fused decode kernels (`decode/`), today's stretches where one is
 /// missing; null (before any state moves) where a kernel declines the layer.
 fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !?A {
+    if (m.probe) |p| if (p.layer) |f| if (try f(p.ctx, sc, m, st, li, x, pre, p0, sh)) |y| return y;
     const kp = &(m.dec.in_proj orelse return null);
     const kq = m.dec.wq_b orelse return null;
     const ly = &m.layers[li];
@@ -3944,7 +3946,7 @@ fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, p
 
 /// The routed and shared rows this rank holds on the fused mxfp4 launches (`[R, dim]`), or null where they decline:
 /// the down launch's hc expand over one copy with no residual and a unit post is the MoE output itself.
-fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A) !?A {
+pub fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A) !?A {
     const kf = m.dec.moe_fp4 orelse return null;
     const act = try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts) orelse return null;
     const R = dim(h, 0);

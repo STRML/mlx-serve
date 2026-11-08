@@ -35,6 +35,7 @@ pub const Opts = struct {
     /// Every routed projection affine at this width over groups of 128 (the expert-pruned packs) instead of the iQ
     /// pack's plan (gate/up 2 or 3 bits, down 3, groups of 64).
     experts_affine: ?u32 = null,
+    stream: ?mlx.mlx_stream = null,
 };
 
 pub const DraftOpts = struct {
@@ -84,7 +85,7 @@ pub const Fixture = struct {
             try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
             if (opts.tp) |t| try fx.sliceShard(t, li);
         }
-        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, opts.stream orelse mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
         errdefer fx.m.deinit();
         if (!opts.fused) fx.m.dec.deinit();
         var p0: usize = 0;

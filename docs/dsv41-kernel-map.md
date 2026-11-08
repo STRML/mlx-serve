@@ -40,6 +40,84 @@ against 19 alone), and the warm `wo_a` then saves about as much, so the step rea
 nothing was built. The Mac had other GPU tenants through every run, and the base step's 10th percentile moved 10%
 between phases of one process: quote these to about 15%.
 
+## Stand-in arms: what each stage group costs inside the step
+
+`sk:<group>` arms (`DSV41_KMAP_AB`) run each layer through a copy of `blockFused`'s tensor-parallel path (the probe's
+`layer` hook) with one group of stages replaced by a stand-in of the same shapes and dtypes, holding real outputs captured
+from 4 stock steps (rotated by step). The step stays pipelined as served. A stand-in is one copy launch that takes the
+replaced stages' real inputs as inputs, so MLX's barriers and the dependency chain do not move; where every consumer also
+reads a real chain value (the router's ids and weights, the MoE output) it is a constant with no launch. The router's
+stand-in ids are made on the host, distinct, new every step (64 sets), so the MoE never reads warm experts.
+
+| arm | replaces, a layer | stand-in launches |
+|---|---|---|
+| `sk:hc` | `dsv41_hc_stage_x` + `dsv41_hc_split` (FFN side), `glm5_hc_expand` | 2 |
+| `sk:router` | `dsv41_gate`, `dsv41_route` (the top-k) | 0 |
+| `sk:norm` | the KV window write | 0 |
+| `sk:attn` | `dsv41_dec_attn` partials, the indexer's `idx_score` + `topk` | 1 |
+| `sk:moe` | `moe_fp4` up + down (routed and shared) | 0 |
+| `sk:proj` | `in_proj`, `wq_b`, `wo_a`, `wo_b` | 2 |
+| `sk:all-small` | hc + router + norm | 2 |
+| `sk:none`, `sk:raw` | nothing: the copy as is; the copy with the FFN-pre region uncompiled, as `sk:hc` and `sk:router` run it | 0 |
+
+Norms and ropes have no launch of their own at TP4 and 1 row: the attention norm and hc collapse are inside `in_proj`,
+`q_norm`, the ropes and the attention's hc split inside `wq_b`, the FFN norm inside `hc_stage_x`, the inverse rope inside
+`wo_a`. `sk:proj` removes them with the projections, and `sk:norm` can only remove the KV write. The compressor's pool
+stays in every arm. `ctl:wo_b` adds one dependent copy launch a layer: what a stand-in launch costs.
+
+M5 Max, 384 experts, 1 row, 720 steps in 60 rotated blocks of 12 arms, median of the per-block step difference from
+`base` (us, host wall time of the step; the second `base` is the A/A null):
+
+| arm | layers 0-20 | layers 20-40 | 40 layers |
+|---|---|---|---|
+| base (step median) | 6732 | 6347 | 13079 |
+| base (A/A) | -40 | -39 | -79 |
+| `sk:none` | +7 | -42 | -35 |
+| `sk:raw` | -23 | +4 | -19 |
+| `sk:hc` | -362 | -397 | -759 |
+| `sk:router` | -538 | -422 | -960 |
+| `sk:norm` | +9 | -7 | +2 |
+| `sk:attn` | -469 | -444 | -913 |
+| `sk:moe` | -2290 | -2278 | -4568 |
+| `sk:proj` | -2761 | -2461 | -5222 |
+| `sk:all-small` | -1064 | -861 | -1925 |
+| `ctl:wo_b` | +56 | +44 | +100 |
+
+The copy is the stock step (`sk:none`, `sk:raw` inside the null), `sk:all-small` is about its parts' sum (-1925 against
+-1717), and the groups' stand-ins add up to 12.4 of the 13.1 ms. A stand-in launch costs about 2.5 us a layer (`ctl:wo_b`),
+so hc's two and attention's one hide about 0.2 and 0.1 ms over 40 layers. The host has built the last layer at 3.1-3.5 ms
+of a 6.3-6.7 ms half, so the step is GPU-bound in every arm. Per layer: router 24 us (its `gate_w` is 3.1 MB, 7 us of
+reading), hc 19 us plus its stand-ins, attention core and indexer 23 us, the four projections 131 us (the twins above
+put 90-100 us on their bytes; the rest is what rides inside them), the MoE 114 us. The Mac had other GPU tenants: quote
+these to about 15%.
+
+## Two steps on two GPU streams
+
+`DSV41_KMAP_PAIR` builds two fixtures (separate weights, caches and states, seeds 1 and 2), the second on its own MLX GPU
+stream (its own command queue), and steps them in rotated blocks: `one` (A alone), `oneb` (B alone), `two` (both, each
+layer of A then of B handed to the GPU, both evaluated at the end), `stock` (A through `workerStep`), and `onepre` /
+`twopre` (the whole step's graph built first, then evaluated at once, so the time after the build is the GPU's with the
+host's encoding hidden under it). A check first runs 512 dependent launches on one stream and on each of two at once.
+
+M5 Max, 192 experts (two 384-expert fixtures need 81 GB and left this Mac 6% free; one 384-expert step reads 15% longer
+in the MoE than a 192-expert one, so compare within the run), 1 row, 700 steps in 100 blocks of 7:
+
+| | layers 0-20 | layers 20-40 |
+|---|---|---|
+| tiny launches, two streams against one (2048 dependent fma a launch) | x0.94 | x1.01 |
+| the same with no work in the launch (host encoding bound) | x1.90 | x1.30 |
+| `one` step median / A/A null | 5631 / -92 us | 5407 / -95 us |
+| `stock` against `one` | -52 us | -43 us |
+| `two` against `one` | x1.835 (+4696 us) | x1.841 (+4580 us) |
+| `two` host done building at | 7297 us of 10347 | 6773 us of 10109 |
+| `twopre` against `onepre`, after the build | x1.936 | x1.929 |
+
+Two queues run latency-bound launches fully side by side, but two decode steps barely overlap: A and B together take
+x1.84 of one, and their GPU time with the build out of the way x1.93. The host is not what holds `two` back: it is done
+3 ms before the GPU. If the small stages (hc, router, attention core and indexer: 2.6 of 13.1 ms above) hid entirely
+under the other step's weight streaming, two steps would take about x1.6 (2 x (13.1 - 2.6) / 13.1); interleaved they
+recover about 40% of that gap (x1.84), with whole graphs about 20% (x1.93).
+
 ## Method
 
 `src/plugins/deepseek_v41/decode/kernel_map.zig` builds the fixture, then runs `workerStep` as the serving loop does (a
@@ -49,7 +127,7 @@ layer handed to the GPU as it is built) for 3 warm-up and 32 timed steps per row
 
 Two builds of MLX, the same step in both:
 - stock: one compute encoder a layer. It gives the real span, GPU busy time and the idle between encoders.
-- labelled (`docs/dsv41-kernel-map.mlx-labels.patch`, `MLX_MAX_OPS_PER_BUFFER=0`): one primitive a command buffer, each
+- labelled (`scripts/dsv41-kernel-map.mlx-labels.patch`, `MLX_MAX_OPS_PER_BUFFER=0`): one primitive a command buffer, each
   encoder labelled with the kernels it dispatched, so every dispatch is its own interval with its name. No result
   changes; the extra command-buffer gaps are not in the kernel times (the serialized span is 1.8x the real one at 1
   row, 1.2x at 6).

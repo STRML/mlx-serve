@@ -7,7 +7,7 @@ The test (`decode/kernel_map.zig`) runs, per row count, 2 s of sleep, 3 warm-up 
 The process's compute encoders split at GPU idle gaps of 300 ms or more; --seg K takes the K-th stretch from the end
 (with row counts 1,6: 3 is the timed steps at 1 row, 1 the timed steps at 6 rows).
 
-With an MLX built to label each encoder with the kernels it dispatched (`docs/dsv41-kernel-map.mlx-labels.patch`) and
+With an MLX built to label each encoder with the kernels it dispatched (`scripts/dsv41-kernel-map.mlx-labels.patch`) and
 MLX_MAX_OPS_PER_BUFFER=0 (one command buffer a primitive), an encoder's label is `name;name;`: the table groups by
 those names. Without the patch the labels are generic and only the busy / idle / encoder totals mean anything.
 """
