@@ -75,10 +75,15 @@ pub const Fixture = struct {
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();
         cfg.num_experts = opts.experts;
+        // The fixture holds no Engram (a pair worker refuses an Engram layer), so layers 1 and 14 run as plain layers.
+        cfg.dsv41_n_engram_layers = 0;
         fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64 };
         errdefer fx.w.deinit();
-        for (opts.lo..opts.hi) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
-        if (opts.tp) |t| try fx.sliceShard(t);
+        // Cut a layer as soon as it is made, so a wide bank never stands whole for every layer at once.
+        for (opts.lo..opts.hi) |li| {
+            try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
+            if (opts.tp) |t| try fx.sliceShard(t, li);
+        }
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
         errdefer fx.m.deinit();
         if (!opts.fused) fx.m.dec.deinit();
@@ -111,7 +116,7 @@ pub const Fixture = struct {
         errdefer fx.w.deinit();
         try fx.putDraftHeads(&cfg);
         for (0..cfg.dsparkStages()) |si| try fx.putLayer(&cfg, "mtp.{d}.", si, opts.experts, true, null);
-        if (opts.tp) |t| try fx.sliceShard(.{ .rank = t.rank, .size = t.size, .stages = true });
+        if (opts.tp) |t| try fx.sliceShard(.{ .rank = t.rank, .size = t.size, .stages = true }, null);
         const holds_nothing: dsv41.Pair = .{ .lo = 0, .hi = cfg.num_hidden_layers, .worker = false };
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = holds_nothing, .act = opts.act, .dspark = true, .head_8bit = true, .tp = opts.tp, .draft_shard = opts.tp != null });
         errdefer fx.m.deinit();
@@ -141,7 +146,7 @@ pub const Fixture = struct {
         try fx.putVec("norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
         for (0..opts.layers) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, true, null);
         for (cfg.dsv41_engram_layers[0..cfg.dsv41_n_engram_layers]) |l| try fx.putEngram(&cfg, l);
-        if (opts.tp) |t| try fx.sliceShard(t);
+        if (opts.tp) |t| try fx.sliceShard(t, null);
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .tp = opts.tp, .pack_dir = opts.engram_dir });
         return fx;
     }
@@ -183,10 +188,13 @@ pub const Fixture = struct {
     }
 
     /// Every tensor `t.axisOf` names cut to `t`'s part of its axis, in a buffer of its own.
-    fn sliceShard(fx: *Fixture, t: Shard) !void {
+    fn sliceShard(fx: *Fixture, t: Shard, layer_only: ?usize) !void {
         const s = mlx.gpuStream();
+        var pbuf: [32]u8 = undefined;
+        const pfx = if (layer_only) |li| try std.fmt.bufPrint(&pbuf, "layers.{d}.", .{li}) else "";
         var it = fx.w.map.iterator();
         while (it.next()) |kv| {
+            if (!std.mem.startsWith(u8, kv.key_ptr.*, pfx)) continue;
             const axis = t.axisOf(kv.key_ptr.*) orelse continue;
             const shape = mlx.getShape(kv.value_ptr.*);
             const ax = axis.of(shape.len);
