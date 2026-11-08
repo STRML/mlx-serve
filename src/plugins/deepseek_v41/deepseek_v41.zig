@@ -4777,6 +4777,7 @@ fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []
         return a;
     }
     const cur_spec: engram.Prefetch.Spec = .{ .at = p0, .len = L, .ids = rows };
+    if (next.len == 0 and L <= region_rows and engramAtOnce()) return engram.Prefetch.readNow(gpa, tables, cur_spec, hs.cols(), span);
     const pf = try engram.Prefetch.start(gpa, tables, if (next.len > 0) &.{ cur_spec, ahead_spec } else &.{cur_spec}, hs.cols(), span);
     if (next.len > 0) m.ahead = pf;
     return pf;
@@ -4823,6 +4824,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     const p0 = st.n;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
+    Laps.begin();
     // a prompt chunk's Engram row ids hashed and their read thread started first, before the phase
     // change, the embedding and the spans' setup (a decode-sized chunk: after them, below). The thread copies the ids
     // and the tables it is handed, so nothing it reads depends on what follows.
@@ -4938,6 +4940,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     if (ids == .gpu and m.engrams.len > 0) {
         var first = m.n_layers;
         for (m.engrams) |e| first = @min(first, e.layer);
+        Laps.arm(first);
         try runLayers(m, gpa, st, &sp, held, 0, first);
         var ev: std.ArrayList(A) = .empty;
         defer ev.deinit(gpa);
@@ -4946,11 +4949,15 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
         const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
         defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_async_eval(vec));
+        Laps.lap(.lead);
         const tok = try hostToken(ids.gpu);
+        Laps.lap(.readback);
         eng_ids = try engramIds(m, gpa, st, &.{tok}, images);
         sp.eng_ids = eng_ids;
+        Laps.lap(.hash);
         prefetch = try engramPrefetch(m, gpa, st, eng_tables, &.{tok}, eng_ids, span, images);
         sp.prefetch = prefetch;
+        Laps.lap(.prefetch);
         from = first;
     }
     if (m.pair) |p| {
@@ -4960,6 +4967,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     }
     const enc_hi = if (tail != null) m.ced_split.? else m.n_layers;
     try runLayers(m, gpa, st, &sp, held, from, enc_hi);
+    Laps.lap(.build);
     if (tail) |tl| {
         var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
         tsp.whole = held[held.len - 2 ..][0..2];
@@ -5007,7 +5015,116 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_async_eval(vec));
+    Laps.lap(.submit);
+    Laps.end(m);
     return sc.out(logits);
+}
+
+const Laps = struct {
+    const every = 64;
+    const Phase = enum { lead, readback, hash, prefetch, first, build, submit };
+    const max_layers = 4;
+    var armed = false;
+    var first_layer: usize = 0;
+    var handed_first = false;
+    var t0: i64 = 0;
+    var mark: i64 = 0;
+    var steps: u32 = 0;
+    var total: u64 = 0;
+    var phase: [std.enums.values(Phase).len]u64 = @splat(0);
+    var read: [max_layers]u64 = @splat(0);
+    var wait: [max_layers]u64 = @splat(0);
+    var dequant: [max_layers]u64 = @splat(0);
+
+    fn enabled() bool {
+        return env.get(.ENGRAM_LAPS) != null;
+    }
+
+    fn begin() void {
+        armed = false;
+        if (!enabled()) return;
+        t0 = monoUs();
+        mark = t0;
+    }
+
+    fn arm(first: usize) void {
+        armed = enabled();
+        first_layer = first;
+        handed_first = false;
+    }
+
+    fn handed(li: usize) void {
+        if (!armed or handed_first or li != first_layer) return;
+        handed_first = true;
+        lap(.first);
+    }
+
+    fn lap(p: Phase) void {
+        if (!armed) return;
+        const now = monoUs();
+        phase[@intFromEnum(p)] += @intCast(@max(now - mark, 0));
+        mark = now;
+    }
+
+    fn engram(ek: usize, read_us: u32, wait_us: i64, dequant_us: i64) void {
+        if (!armed or ek >= max_layers) return;
+        read[ek] += read_us;
+        wait[ek] += @intCast(@max(wait_us, 0));
+        dequant[ek] += @intCast(@max(dequant_us, 0));
+    }
+
+    fn end(m: *const Dsv41Model) void {
+        if (!armed) return;
+        armed = false;
+        total += @intCast(@max(monoUs() - t0, 0));
+        steps += 1;
+        if (steps < every) return;
+        var buf: [512]u8 = undefined;
+        log.info("{s}\n", .{line(m, &buf)});
+        clear();
+    }
+
+    fn clear() void {
+        steps = 0;
+        total = 0;
+        phase = @splat(0);
+        read = @splat(0);
+        wait = @splat(0);
+        dequant = @splat(0);
+    }
+
+    fn line(m: *const Dsv41Model, out: []u8) []const u8 {
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        const n: u64 = @max(steps, 1);
+        var later_waits: u64 = 0;
+        for (m.engrams[0..@min(m.engrams.len, max_layers)], 0..) |e, k| {
+            if (k > 0) later_waits += wait[k] + dequant[k];
+            w.print(" | L{d} read {d} wait {d} dequant {d}", .{ e.layer, read[k] / n, wait[k] / n, dequant[k] / n }) catch break;
+        }
+        const ph = phase;
+        const build = ph[@intFromEnum(Phase.build)] -| later_waits;
+        const gap = ph[@intFromEnum(Phase.hash)] + ph[@intFromEnum(Phase.prefetch)] + ph[@intFromEnum(Phase.first)];
+        return std.fmt.bufPrint(out, "[engram-laps] {d} steps, us a step: lead {d} readback {d} | readback to the GPU's next work {d}: hash {d} prefetch {d} layer {d}{s} | build {d} submit {d} | total {d} (DSV41_ENGRAM_AT_ONCE {s})", .{
+            steps,
+            ph[@intFromEnum(Phase.lead)] / n,
+            ph[@intFromEnum(Phase.readback)] / n,
+            gap / n,
+            ph[@intFromEnum(Phase.hash)] / n,
+            ph[@intFromEnum(Phase.prefetch)] / n,
+            ph[@intFromEnum(Phase.first)] / n,
+            w.buffered(),
+            build / n,
+            ph[@intFromEnum(Phase.submit)] / n,
+            total / n,
+            if (engramAtOnce()) "on" else "off",
+        }) catch out[0..0];
+    }
+};
+
+fn engramAtOnce() bool {
+    const v = env.get(.DSV41_ENGRAM_AT_ONCE) orelse return true;
+    return v[0] != '0';
 }
 
 fn monoUs() i64 {
@@ -5060,6 +5177,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
                 const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_async_eval(vec));
+                Laps.handed(li);
             }
         }
     }
@@ -5647,10 +5765,14 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
         if (e.layer != li) continue;
         const nc = sp.ncols;
         const rows = if (sp.prefetch) |pf| blk: {
+            const t0 = monoUs();
             // A batch reads grid k, state k's rows, as one span.
-            const raw = if (sp.offs.len > 0) try pf.take(k, ek, 0) else try pf.take(sp.p0, ek, k);
-            defer raw.deinit(gpa);
-            break :blk try sc.keep(try e.table.dequant(raw, (hi - lo) * nc, sc.s));
+            const got = if (sp.offs.len > 0) try pf.take(k, ek, 0) else try pf.take(sp.p0, ek, k);
+            defer got.raw.deinit(gpa);
+            const t1 = monoUs();
+            const out = try sc.keep(try e.table.dequant(got.raw, (hi - lo) * nc, sc.s));
+            Laps.engram(ek, got.read_us, t1 - t0, monoUs() - t1);
+            break :blk out;
         } else blk: {
             const mine = try gpa.alloc(u32, (hi - lo) * nc);
             defer gpa.free(mine);
@@ -5661,6 +5783,10 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
         // An image span's rows get no Engram write (the reference shuts their gate).
         x = if (sp.img.ctx != null) try sc.where(try sc.expand(try sc.expand(try sp.imgSlice(sc, lo, hi), -1), -1), x, y) else y;
         if (m.trace) |t| try t.put("engram_{d}", .{li}, x);
+        if (sp.xs.len == 1 and sp.L <= region_rows and engramAtOnce()) {
+            try asyncEval(x);
+            Laps.handed(li);
+        }
     }
     if (m.n_mtp > 0) if (m.dsparkTarget(li)) |t| {
         hold(&sp.mh[k * m.cfg.dsv4_n_dspark_target_layers + t], try sc.astype(try sc.mean(try sc.astype(x, .float32), 1, false), m.act));

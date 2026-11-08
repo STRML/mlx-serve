@@ -1,6 +1,7 @@
 //! A DeepSeek-V4.1 model at the release's shapes over random weights in the served formats, built through the plugin's
 //! own `init` as a pair worker holding layers [lo, hi) (no embed, head or Engram), its state prefilled with `ctx`
-//! random stream rows through those layers: what the decode kernels' tests and ubenches run against.
+//! random stream rows through those layers: what the decode kernels' tests and ubenches run against. `initWhole`
+//! builds a whole model instead, Engram read from a pack `writeEngramPack` wrote.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -11,6 +12,7 @@ const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
 const device = @import("../../../mlx/device.zig");
 const Shard = @import("../../../sdk/weights/shard.zig").Shard;
+const env = @import("../../../env.zig");
 
 const A = mlx.mlx_array;
 const none: A = .{ .ctx = null };
@@ -34,6 +36,15 @@ pub const Opts = struct {
     /// Every routed projection affine at this width over groups of 128 (the expert-pruned packs) instead of the iQ
     /// pack's plan (gate/up 2 or 3 bits, down 3, groups of 64).
     experts_affine: ?u32 = null,
+};
+
+pub const WholeOpts = struct {
+    layers: u32 = 2,
+    experts: u32 = 8,
+    vocab: u32 = 1024,
+    seed: u64 = 1,
+    engram_dir: ?[]const u8 = null,
+    engram_layers: [2]u8 = .{ 1, 14 },
 };
 
 pub const Fixture = struct {
@@ -70,6 +81,37 @@ pub const Fixture = struct {
         }
         if (opts.ctx == 0) fx.m.dec_state = try dsv41.initState(fx.m, gpa);
         return fx;
+    }
+
+    pub fn initWhole(gpa: std.mem.Allocator, opts: WholeOpts) !*Fixture {
+        const fx = try gpa.create(Fixture);
+        errdefer gpa.destroy(fx);
+        var cfg = try releaseConfig();
+        cfg.num_experts = opts.experts;
+        cfg.num_hidden_layers = opts.layers;
+        cfg.vocab_size = opts.vocab;
+        cfg.dsv41_n_engram_layers = 0;
+        if (opts.engram_dir != null) engramConfig(&cfg, opts.engram_layers);
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed };
+        errdefer fx.w.deinit();
+        const d: c_int = @intCast(cfg.hidden_size);
+        const v: c_int = @intCast(cfg.vocab_size);
+        try fx.putVec("embed.weight", .{}, &.{ v, d }, .bfloat16, 0, 1);
+        try fx.putVec("head.weight", .{}, &.{ v, d }, .bfloat16, 0, 0.05);
+        try fx.putVec("norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
+        for (0..opts.layers) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, true, null);
+        for (cfg.dsv41_engram_layers[0..cfg.dsv41_n_engram_layers]) |l| try fx.putEngram(&cfg, l);
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pack_dir = opts.engram_dir });
+        return fx;
+    }
+
+    fn putEngram(fx: *Fixture, c: *const config.Config, l: usize) !void {
+        const d: c_int = @intCast(c.hidden_size);
+        const hc: c_int = @intCast(c.dsv4_hc_mult);
+        const cols: c_int = @intCast((c.dsv41_engram_max_ngram - 1) * c.dsv41_engram_n_heads);
+        try fx.putVec("layers.{d}.engram.q_weight", .{l}, &.{ hc, d }, .bfloat16, 1, 0.1);
+        try fx.putVec("layers.{d}.engram.k_weight", .{l}, &.{ hc, d }, .bfloat16, 1, 0.1);
+        try fx.putLin("layers.{d}.engram.wkv", .{l}, &.{ (hc + 1) * d, cols * @as(c_int, @intCast(c.dsv41_engram_head_dim)) }, .mxfp8);
     }
 
     /// Every tensor `Shard.axis` names cut to `t`'s part of its axis, in a buffer of its own.
@@ -784,4 +826,138 @@ fn expectSameArray(gpa: std.mem.Allocator, a: A, b: A) !void {
     const v = try dsv41.hostF32(b);
     defer gpa.free(v);
     try std.testing.expectEqualSlices(f32, u, v);
+}
+
+pub fn engramConfig(cfg: *config.Config, layers: [2]u8) void {
+    cfg.dsv41_n_engram_layers = 2;
+    cfg.dsv41_engram_layers[0] = layers[0];
+    cfg.dsv41_engram_layers[1] = layers[1];
+    cfg.dsv41_engram_max_ngram = 4;
+    cfg.dsv41_engram_n_heads = 8;
+    cfg.dsv41_engram_head_dim = 256;
+    cfg.dsv41_engram_vocab_size = 1000;
+    cfg.dsv41_engram_pad_id = 2;
+    cfg.dsv41_engram_compressed_vocab = cfg.vocab_size;
+    var p = cfg.dsv41_engram_vocab_size - 1;
+    const cols = (cfg.dsv41_engram_max_ngram - 1) * cfg.dsv41_engram_n_heads;
+    for (0..2) |l| {
+        var rows: u64 = 0;
+        for (0..cols) |_| {
+            p += 1;
+            while (!isPrime(p)) p += 1;
+            rows += p;
+        }
+        cfg.dsv41_engram_rows[l] = rows;
+    }
+}
+
+fn isPrime(n: u64) bool {
+    if (n < 2) return false;
+    var i: u64 = 2;
+    while (i * i <= n) : (i += 1) if (n % i == 0) return false;
+    return true;
+}
+
+pub fn writeEngramPack(gpa: std.mem.Allocator, dir: std.Io.Dir, vocab: u32, layers: [2]u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var cfg = try releaseConfig();
+    cfg.vocab_size = vocab;
+    engramConfig(&cfg, layers);
+    try dir.createDirPath(io, "engram");
+    const hd = cfg.dsv41_engram_head_dim;
+    const rec = hd + hd / 32;
+    var man: std.ArrayList(u8) = .empty;
+    defer man.deinit(gpa);
+    try man.appendSlice(gpa, "{\"layers\":[");
+    for (layers, 0..) |l, k| {
+        const rows = cfg.dsv41_engram_rows[k];
+        const name = try std.fmt.allocPrint(gpa, "engram/layer{d}.bin", .{l});
+        defer gpa.free(name);
+        const buf = try gpa.alloc(u8, @intCast(rows * rec));
+        defer gpa.free(buf);
+        var rng = std.Random.DefaultPrng.init(l);
+        rng.random().bytes(buf);
+        for (0..rows) |r| {
+            const row = buf[r * rec ..][0..rec];
+            for (row[0..hd]) |*b| b.* &= 0xb7;
+            for (row[hd..]) |*b| b.* = 120 + (b.* & 7);
+        }
+        try dir.writeFile(io, .{ .sub_path = name, .data = buf });
+        if (k > 0) try man.append(gpa, ',');
+        try man.print(gpa, "{{\"layer_id\":{d},\"file\":\"layer{d}.bin\",\"rows\":{d},\"record_bytes\":{d},\"quant\":{{\"bits\":8,\"group_size\":32,\"mode\":\"mxfp8\",\"head_dim\":{d}}}}}", .{ l, l, rows, rec, hd });
+    }
+    try man.appendSlice(gpa, "]}");
+    try dir.writeFile(io, .{ .sub_path = "engram/engram-manifest.json", .data = man.items });
+    const map = try gpa.alloc(u8, vocab * 4);
+    defer gpa.free(map);
+    for (0..vocab) |i| std.mem.writeInt(u32, map[i * 4 ..][0..4], @intCast(i), .little);
+    try dir.writeFile(io, .{ .sub_path = "engram-token-map.u32", .data = map });
+}
+
+fn pathOf(gpa: std.mem.Allocator, dir: std.Io.Dir) ![]u8 {
+    var buf: [1024]u8 = undefined;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return gpa.dupe(u8, buf[0..try dir.realPath(io, &buf)]);
+}
+
+fn argmaxOf(logits: A) !A {
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_argmax_axis(&o, logits, -1, false, mlx.gpuStream()));
+    return o;
+}
+
+fn decodeAlone(gpa: std.mem.Allocator, m: *dsv41.Dsv41Model, prompt: []const u32, n: usize) ![][]f32 {
+    try dsv41.reset(m, gpa);
+    var logits = try dsv41.extendResumable(m, gpa, prompt, null);
+    defer _ = mlx.mlx_array_free(logits);
+    var out: std.ArrayList([]f32) = .empty;
+    errdefer {
+        for (out.items) |x| gpa.free(x);
+        out.deinit(gpa);
+    }
+    for (0..n) |_| {
+        const t = try argmaxOf(logits);
+        defer _ = mlx.mlx_array_free(t);
+        const next = try dsv41.extendResumableGpu(m, gpa, t);
+        _ = mlx.mlx_array_free(logits);
+        logits = next;
+        try out.append(gpa, try dsv41.hostF32(logits));
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn freeF32s(gpa: std.mem.Allocator, xs: [][]f32) void {
+    for (xs) |x| gpa.free(x);
+    gpa.free(xs);
+}
+
+fn expectSameF32s(a: []const []f32, b: []const []f32) !void {
+    try std.testing.expectEqual(a.len, b.len);
+    for (a, b) |x, y| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(x), std.mem.sliceAsBytes(y));
+}
+
+test "dsv41 engram at once: a decode token's Engram rows read at once decode as the prefetch thread's, bit for bit" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeEngramPack(gpa, td.dir, 1024, .{ 1, 3 });
+    const dir = try pathOf(gpa, td.dir);
+    defer gpa.free(dir);
+    const fx = try Fixture.initWhole(gpa, .{ .layers = 4, .engram_dir = dir, .engram_layers = .{ 1, 3 } });
+    defer fx.deinit();
+    try std.testing.expectEqual(@as(usize, 2), fx.m.engrams.len);
+    const prior = env.override(.DSV41_ENGRAM_AT_ONCE, "0");
+    defer prior.restore();
+    const prompt = [_]u32{ 11, 400, 7, 901, 55 };
+    var arms: [2][][]f32 = undefined;
+    var made: usize = 0;
+    defer for (arms[0..made]) |a| freeF32s(gpa, a);
+    for ([_][*:0]const u8{ "0", "1" }, &arms) |v, *a| {
+        env.set(.DSV41_ENGRAM_AT_ONCE, v);
+        a.* = try decodeAlone(gpa, fx.m, &prompt, 8);
+        made += 1;
+    }
+    try expectSameF32s(arms[0], arms[1]);
 }

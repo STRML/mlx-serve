@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const crt = @import("../../sdk/util/crt.zig");
+const io_util = @import("../../sdk/util/io_util.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const Config = @import("config.zig").Config;
 const weights_load = @import("../../sdk/weights/load.zig");
@@ -785,6 +786,7 @@ pub const Prefetch = struct {
     const Item = struct {
         raw: ?Table.Raw = null,
         state: std.atomic.Value(u8) = .init(pending),
+        read_us: u32 = 0,
     };
     const pending = 0;
     const done = 1;
@@ -800,7 +802,38 @@ pub const Prefetch = struct {
         return startOrdered(gpa, tables, specs, nc, span, true);
     }
 
+    pub fn readNow(gpa: std.mem.Allocator, tables: []const *const Table, spec: Spec, nc: usize, span: usize) !*Prefetch {
+        const self = try make(gpa, tables, &.{spec}, nc, span, false);
+        const n = self.grids[0].items.len;
+        if (comptime builtin.os.tag.isDarwin()) {
+            dispatch_apply_f(n, dispatch_get_global_queue(qos_user_initiated, 0), self, readItem);
+        } else for (0..n) |i| readItem(self, i);
+        return self;
+    }
+
+    fn readItem(ctx: ?*anyopaque, i: usize) callconv(.c) void {
+        const self: *Prefetch = @ptrCast(@alignCast(ctx.?));
+        const g = &self.grids[0];
+        const n_spans = g.items.len / self.tables.len;
+        self.readItemAt(g, i / n_spans, i % n_spans);
+    }
+
+    fn readItemAt(self: *Prefetch, g: *Grid, layer: usize, k: usize) void {
+        const item = &g.items[layer * (g.items.len / self.tables.len) + k];
+        const t0 = nowUs();
+        item.raw = self.readSpan(g, self.tables[layer], layer, k) catch null;
+        item.read_us = @intCast(@min(nowUs() - t0, std.math.maxInt(u32)));
+        item.state.store(if (item.raw != null) done else failed, .release);
+    }
+
     fn startOrdered(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize, across: bool) !*Prefetch {
+        const self = try make(gpa, tables, specs, nc, span, across);
+        errdefer self.finish();
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
+
+    fn make(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize, across: bool) !*Prefetch {
         const self = try gpa.create(Prefetch);
         errdefer gpa.destroy(self);
         const own_tables = try gpa.dupe(*const Table, tables);
@@ -820,7 +853,6 @@ pub const Prefetch = struct {
             made += 1;
         }
         self.* = .{ .gpa = gpa, .tables = own_tables, .grids = grids, .span = span, .nc = nc, .across = across };
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
     }
 
@@ -847,9 +879,7 @@ pub const Prefetch = struct {
         }
         for (0..n_spans) |k| {
             if (self.stop.load(.acquire)) return false;
-            const item = &g.items[layer * n_spans + k];
-            item.raw = self.readSpan(g, self.tables[layer], layer, k) catch null;
-            item.state.store(if (item.raw != null) done else failed, .release);
+            self.readItemAt(g, layer, k);
         }
         return true;
     }
@@ -930,13 +960,13 @@ pub const Prefetch = struct {
     }
 
     /// The rows of `layer`'s span `k` of the grid at `at`, once read (the caller frees them).
-    pub fn take(self: *Prefetch, at: usize, layer: usize, k: usize) !Table.Raw {
+    pub fn take(self: *Prefetch, at: usize, layer: usize, k: usize) !struct { raw: Table.Raw, read_us: u32 } {
         for (self.grids) |*g| if (g.at == at) {
             const item = &g.items[layer * (g.items.len / self.tables.len) + k];
             while (item.state.load(.acquire) == pending) std.Thread.yield() catch {};
             const raw = item.raw orelse return error.EngramRead;
             item.raw = null;
-            return raw;
+            return .{ .raw = raw, .read_us = item.read_us };
         };
         return error.EngramRead;
     }
@@ -960,6 +990,10 @@ extern "c" fn dispatch_apply_f(iterations: usize, queue: ?*anyopaque, context: ?
 
 const PAR_ROWS_PER_THREAD = 16;
 const PAR_THREADS = 32;
+
+fn nowUs() i64 {
+    return io_util.nowUsMonotonic(std.Io.Threaded.global_single_threaded.io());
+}
 
 /// The direct Engram reads: a prompt span's read threads when the reads go past the cache.
 const PAR_THREADS_DIRECT = 64;
@@ -1313,14 +1347,16 @@ test "dsv41 engram: a prefetch hands each span's rows as a gather of the same id
     var pf = try Prefetch.start(testing.allocator, &tables, &.{ .{ .at = 0, .len = 5, .ids = &ids }, .{ .at = 5, .len = 2, .ids = ids[0..8] } }, 2, 2);
     defer pf.finish();
     try testing.expect(pf.covers(5, 2) and pf.covers(0, 3) and !pf.covers(0, 6) and !pf.covers(4, 1));
-    for (0..2) |layer| for (0..3) |k| {
+    var now = try Prefetch.readNow(testing.allocator, &tables, .{ .at = 0, .len = 5, .ids = &ids }, 2, 2);
+    defer now.finish();
+    for ([_]*Prefetch{ pf, now }) |p| for (0..2) |layer| for (0..3) |k| {
         const lo = k * 2;
         const hi = @min(5, lo + 2);
         var mine: [4]u32 = undefined;
         for (lo..hi) |tok| @memcpy(mine[(tok - lo) * 2 ..][0..2], ids[(tok * 2 + layer) * 2 ..][0..2]);
         const want = try t.gather(testing.allocator, mine[0 .. (hi - lo) * 2], s);
         defer _ = mlx.mlx_array_free(want);
-        const raw = try pf.take(0, layer, k);
+        const raw = (try p.take(0, layer, k)).raw;
         defer raw.deinit(testing.allocator);
         const got = try t.dequant(raw, (hi - lo) * 2, s);
         defer _ = mlx.mlx_array_free(got);
@@ -1330,7 +1366,7 @@ test "dsv41 engram: a prefetch hands each span's rows as a gather of the same id
         try testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(want).?[0..n], mlx.mlx_array_data_float32(got).?[0..n]);
     };
     // The lookahead grid is the same rows as a gather of its ids; the grid that was not asked for is freed unread.
-    const ahead = try pf.take(5, 1, 0);
+    const ahead = (try pf.take(5, 1, 0)).raw;
     defer ahead.deinit(testing.allocator);
     var mine: [4]u32 = undefined;
     for (0..2) |tok| @memcpy(mine[tok * 2 ..][0..2], ids[(tok * 2 + 1) * 2 ..][0..2]);
@@ -1364,9 +1400,9 @@ test "dsv41 engram: a prompt grid read whole past the cache (a streamed bank's t
     for (&pfs, [_]*const Table{ &plain, &direct }) |*pf, t| pf.* = try Prefetch.start(testing.allocator, &.{t}, &.{.{ .at = 0, .len = grid_rows, .ids = ids }}, 2, 256);
     defer for (pfs) |pf| pf.finish();
     for (0..grid_rows / 256) |k| {
-        const a = try pfs[0].take(0, 0, k);
+        const a = (try pfs[0].take(0, 0, k)).raw;
         defer a.deinit(testing.allocator);
-        const b = try pfs[1].take(0, 0, k);
+        const b = (try pfs[1].take(0, 0, k)).raw;
         defer b.deinit(testing.allocator);
         try testing.expectEqualSlices(u8, a.w, b.w);
         try testing.expectEqualSlices(u8, a.s, b.s);
