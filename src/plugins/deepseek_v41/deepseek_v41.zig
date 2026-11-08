@@ -1421,6 +1421,8 @@ pub const InitOpts = struct {
 };
 
 pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opts: InitOpts) !*Dsv41Model {
+    // A worker holds no Engram tables. Refused before anything is made, so the refusal leaks nothing.
+    if (opts.pair) |p| if (p.worker and engramIn(whole, p.lo, p.hi)) return error.DsvPairEngram;
     var sliced = whole.*;
     // A streamed bank reads whole experts and only rank 0 opens one; a split's ranks hold half of each.
     if (opts.tp != null and opts.streamed_experts) return error.Dsv41TpStreamedExperts;
@@ -1482,7 +1484,6 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     if (mlx.metalKernelsAvailable()) m.moe_wt_kernel = try buildKernel("dsv41_moe_wt", &.{ "a", "wts" }, &.{"out"}, MOE_WT_SOURCE, "");
     const tp_worker = if (opts.tp) |t| t.rank != 0 else false;
     const worker = if (opts.pair) |p| p.worker else false;
-    if (opts.pair) |p| if (p.worker and engramIn(cfg, p.lo, p.hi)) return error.DsvPairEngram;
     errdefer {
         freeRegions(m);
         for (m.engrams) |*e| e.table.close();
@@ -3569,8 +3570,8 @@ pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
 /// `DSV41_TP_SUM`: `auto` (default) keeps a pair's rule and sums past a pair in the activation dtype (JACCL
 /// accumulates in f32 and rounds once; +5-6% decode at TP4, KLD unchanged); `bf16` does so at any size, `f32` sums
 /// wider past a pair as before, `off` skips the sums (wrong output, timing only).
-const TpSumMode = enum { auto, bf16, off, f32 };
-var tp_sum_mode: ?TpSumMode = null;
+pub const TpSumMode = enum { auto, bf16, off, f32 };
+pub var tp_sum_mode: ?TpSumMode = null;
 fn tpSumMode() TpSumMode {
     if (tp_sum_mode) |v| return v;
     const raw = std.c.getenv("DSV41_TP_SUM");
@@ -3723,6 +3724,21 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     return hcExpand(sc, mid.x1, y, &mid.sf);
 }
 
+/// The decode roofline's cut (`decode/roofline.zig`): a fused tensor-split layer stops after this stage and hands back
+/// its input stream plus zero times one value of the stage's output, so each stage's cost is the step's time at its
+/// cut less the one before. `.none` outside that ubench.
+pub const DecCut = enum(u8) { none, start, in_proj, wq_b, win, comp, idx, attn, wo_a, wo_b, sum_attn, ffn_pre, moe_up, moe_down };
+pub var dec_cut: DecCut = .none;
+/// Layers that stopped at `dec_cut` (a stage that declined never reaches its cut).
+pub var dec_cut_hits: usize = 0;
+
+fn cutAt(sc: *Scope, k: DecCut, x: A, y: A) !?A {
+    if (dec_cut != k) return null;
+    dec_cut_hits += 1;
+    const first = try sc.astype(try sc.slice(try sc.reshape(y, &.{-1}), 0, 0, 1), .float32);
+    return try sc.astype(try sc.add(x, try sc.mul(first, try sc.f(0))), mlx.mlx_array_dtype(x));
+}
+
 /// `block` for at most `dkern.max_rows` rows on the fused decode kernels (`decode/`), today's stretches where one is
 /// missing; null (before any state moves) where a kernel declines the layer.
 fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !?A {
@@ -3732,23 +3748,31 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const ls = &st.layers[li];
     const L = dim(x, 0);
     const hd = m.cfg.head_dim;
+    if (try cutAt(sc, .start, x, x)) |v| return v;
     const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
+    if (try cutAt(sc, .in_proj, x, a.qa)) |v| return v;
     const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, p0, L)) orelse return null;
+    if (try cutAt(sc, .wq_b, x, w.q)) |v| return v;
     try ls.win.write(w.kv_row, p0, sc.s);
+    if (try cutAt(sc, .win, x, ls.win.buf)) |v| return v;
     var comp_rows = none;
     var topk = none;
     if (ly.ratio > 0) {
         const clen = (p0 + L) / ly.ratio;
         if (ly.comp) |*cw| if (!try compressFused(sc, m, st, li, a.comp.?, p0)) try compressFrom(sc, m, st, li, cw, a.comp.?, p0);
+        if (try cutAt(sc, .comp, x, x)) |v| return v;
         if (ly.idx) |_| sh.topk = if (clen == 0) none else try indexerQ(sc, m, st, li, a.iw.?, w.q_idx.?, p0, sh);
         topk = sh.topk;
+        if (try cutAt(sc, .idx, x, if (topk.ctx != null) topk else x)) |v| return v;
         if (clen > 0 and topk.ctx != null) comp_rows = try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s));
-    }
+    } else if (dec_cut == .comp or dec_cut == .idx) return (try cutAt(sc, dec_cut, x, x)).?;
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     const inv = ropeFor(m, li).inv;
     var oa: ?A = null;
     if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, w.q, ls.win, comp_rows, topk, p0, scale)) |p| {
+        if (try cutAt(sc, .attn, x, p.acc)) |v| return v;
         oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, try attnMeta(sc, m, w.q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
+        if (oa) |v| if (try cutAt(sc, .wo_a, x, v)) |c| return c;
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &w.sa)) |f| {
@@ -3757,7 +3781,12 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     };
     var ao: [1]A = undefined;
     if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
-    if (m.tp != null) return try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, pre);
+    if (try cutAt(sc, .wo_b, x, ao[0])) |v| return v;
+    if (m.tp != null) {
+        const summed = try tpSum(sc, m, ao[0]);
+        if (try cutAt(sc, .sum_attn, x, summed)) |v| return v;
+        return try tpFfn(sc, m, li, x, summed, &w.sa, pre);
+    }
     var out: [2]A = undefined;
     try runRegion(sc, m, li, .ffn, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &out);
     pre.* = out[1];
@@ -3770,8 +3799,11 @@ fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, p
     const ly = &m.layers[li];
     var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
     try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
+    if (try cutAt(sc, .ffn_pre, x, p[4])) |v| return v;
     pre.* = p[1];
     const part = try moeFused(sc, m, ly, p[4], p[5], p[6]) orelse try moePartial(sc, m, ly, p[4], p[5], p[6]);
+    if (try cutAt(sc, .moe_up, x, part)) |v| return v;
+    if (try cutAt(sc, .moe_down, x, part)) |v| return v;
     return hcExpand(sc, p[0], try tpSum(sc, m, part), &.{ .pre = p[1], .post = p[2], .comb = p[3] });
 }
 
@@ -3780,6 +3812,7 @@ fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, p
 fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A) !?A {
     const kf = m.dec.moe_fp4 orelse return null;
     const act = try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts) orelse return null;
+    if (dec_cut == .moe_up) return act;
     const R = dim(h, 0);
     const one = &m.tp_units[R - 1];
     const y = try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, one.pre, one) orelse return null;
@@ -4732,7 +4765,7 @@ fn hold(slot: *A, x: A) void {
     slot.* = o;
 }
 
-fn appendLayerState(gpa: std.mem.Allocator, ev: *std.ArrayList(A), ls: *const LState) !void {
+pub fn appendLayerState(gpa: std.mem.Allocator, ev: *std.ArrayList(A), ls: *const LState) !void {
     try ev.append(gpa, ls.win.buf);
     if (ls.comp) |r| if (r.buf.ctx != null) try ev.append(gpa, r.buf);
     if (ls.idx_k) |r| if (r.buf.ctx != null) try ev.append(gpa, r.buf);
@@ -8546,6 +8579,16 @@ test "dsv41 pair cuts: valid only where no layer past the cut reads what a layer
     for (0..9) |x| try testing.expectEqual(x == 0 or x == 1 or x == 2 or x == 5 or x == 8, pairCutOk(&c, x));
     // The worker's share of 40% of memory is 3.2 layers: the run within it, holding no Engram layer.
     try testing.expectEqual([2]usize{ 5, 8 }, pairRange(&c, 60, 40).?);
+}
+
+test "dsv41 pair: a worker over an Engram layer is refused before init makes anything" {
+    var c: Config = .{ .model_type = "deepseek_v41", .num_hidden_layers = 4 };
+    c.dsv41_engram_layers[0] = 1;
+    c.dsv41_n_engram_layers = 1;
+    var w = Weights.init(testing.allocator);
+    defer w.deinit();
+    // The testing allocator fails the test on anything init allocated before refusing.
+    try testing.expectError(error.DsvPairEngram, init(testing.allocator, &c, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 0, .hi = 2, .worker = true } }));
 }
 
 test "dsv41 pair: a host and a worker split at a valid cut give the unsplit model's logits, resume included (DSV41_TINY)" {

@@ -16,6 +16,7 @@ const kit = @import("../../deepseek_v4/contract_kit.zig");
 const contract = @import("../contract.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
+const attn = @import("attn.zig");
 const fixture = @import("fixture.zig");
 
 const A = mlx.mlx_array;
@@ -75,7 +76,7 @@ pub fn plan(rows: c_int, heads: c_int, splits: c_int, dim: c_int, groups: c_int,
     const nsg: c_int = if (nax) NAX_NSG else NSG;
     const nr: c_int = if (nax) NAX_NR else NR;
     const nt = nsg * nr;
-    if (rows < 1 or rows > decode.max_rows or splits < 1 or splits > 8 or dim != HD or groups < 1 or @mod(heads, groups) != 0) return null;
+    if (rows < 1 or rows > decode.max_rows or splits < 1 or splits > attn.MAX_SPLITS_NARROW or dim != HD or groups < 1 or @mod(heads, groups) != 0) return null;
     if (out_rank < nt or @mod(out_rank, nt) != 0 or groups * @divExact(out_rank, nt) > counter_words) return null;
     const tg = nsg * 32;
     return .{
