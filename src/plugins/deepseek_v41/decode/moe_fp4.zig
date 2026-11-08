@@ -1260,7 +1260,7 @@ const StreamChain = struct {
 };
 
 /// Microseconds a step of the probe over `bytes` (a multiple of 4 KB) takes at its best grid, over 80 buffers.
-fn streamUs(gpa: std.mem.Allocator, kern: mlx.mlx_fast_metal_kernel, bytes: usize) !f64 {
+pub fn streamUs(gpa: std.mem.Allocator, kern: mlx.mlx_fast_metal_kernel, bytes: usize) !f64 {
     var held: Held = .{ .gpa = gpa };
     defer held.deinit();
     var bufs: [bench_sets]A = undefined;
