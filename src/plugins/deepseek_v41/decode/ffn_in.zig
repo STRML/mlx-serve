@@ -86,7 +86,7 @@ fn bWords(p: Dims) usize {
     return @max(@max(rowsTg(p) * (p.d / 2 + 16), p.rows * (slices(p) + 1) * (mixes + 1)), 2 * p.rows * p.e);
 }
 
-fn servesB(p: Dims) bool {
+pub fn servesB(p: Dims) bool {
     if (p.rows < 1 or p.rows > decode.max_rows or p.d % 512 != 0 or p.d > 6144) return false;
     if (p.top_k < 1 or p.top_k > 32 or p.e < p.top_k) return false;
     return 4 * bWords(p) + 16 <= 32 * 1024;
@@ -116,7 +116,7 @@ fn routerTgs(p: Dims) usize {
 }
 
 /// Floats of mix partials launch 2's threadgroups hand to its last one: a slice's 24 dots and its sum of squares.
-fn partsLen(p: Dims) usize {
+pub fn partsLen(p: Dims) usize {
     return p.rows * slices(p) * (mixes + 1);
 }
 
