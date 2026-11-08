@@ -3196,9 +3196,20 @@ pub fn attnWide(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, keys_w: A, wp: 
 pub fn indexScores(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize) !A {
     const ih = dim(q, 1);
     const ihd = dim(q, 2);
-    if (dim(q, 0) > region_rows and dim(keys, 0) > 0 and ih % 8 == 0 and ih <= 128 and ihd % 8 == 0)
+    if (dim(q, 0) > tiledIndexRows() and dim(keys, 0) > 0 and ih % 8 == 0 and ih <= 128 and ihd % 8 == 0)
         return indexScoresTiled(sc, m, q, keys, weights, wscale, p0, ratio);
     return indexScoresScalar(sc, m, q, keys, weights, wscale, p0, ratio);
+}
+
+/// Rows above which index scores take the tiled matrix kernel (`DSV41_IDX_TILED_ROWS`, default `region_rows`): the
+/// scalar scorer costs rows x depth, which a 7-16-row verify (a copy round) pays in full.
+var tiled_index_rows: ?usize = null;
+fn tiledIndexRows() usize {
+    if (tiled_index_rows) |v| return v;
+    const raw = std.c.getenv("DSV41_IDX_TILED_ROWS");
+    const v = if (raw) |r| std.fmt.parseInt(usize, std.mem.span(r), 10) catch region_rows else region_rows;
+    tiled_index_rows = v;
+    return v;
 }
 
 pub fn indexScoresTiled(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize) !A {
@@ -4095,12 +4106,21 @@ fn slotWide(sc: *Scope, m: *const Dsv41Model, src: streamed.Routed, li: usize, x
 
 /// The fused gate/up bank's products with the clamped SwiGLU in one NAX kernel (`[n, 1, inter]`), or null where it does
 /// not serve (no fused bank, a limit that is not a whole number).
+fn fp4PairedOff() bool {
+    const raw = std.c.getenv("DSV41_FP4_PAIRED") orelse return false;
+    return std.mem.eql(u8, std.mem.span(raw), "0");
+}
+
 fn gateUpPaired(sc: *Scope, m: *const Dsv41Model, e: *const Experts, x3: A, rows: A, sidx: A) !?A {
     const gu = e.gu orelse return null;
     const lim = m.cfg.dsv4_swiglu_limit;
-    if (gu.qp.mode != .affine or gu.s.ctx == null or lim < 0 or lim != @floor(lim) or !verify_qmm_nax.verifyQmmNaxAvailable()) return null;
+    // An MXFP4 bank (the lossless pack) takes the same paired kernel with mx scales; DSV41_FP4_PAIRED=0 keeps it on the
+    // separate gather + moe_act path. The kernel's canary declines a bank it does not reproduce.
+    const mx = gu.qp.mode.isFp4();
+    if (mx and fp4PairedOff()) return null;
+    if ((gu.qp.mode != .affine and !mx) or gu.s.ctx == null or lim < 0 or lim != @floor(lim) or !verify_qmm_nax.verifyQmmNaxAvailable()) return null;
     const sigtab = try @import("../../sdk/blocks/hc/hc_prefill.zig").sigmoidTable(sc.s);
-    const y = (try gather_nax.sortedGateUpFused(x3, rows, gu.w, gu.s, gu.b, sidx, sigtab, @intFromFloat(lim), gu.qp.bits, gu.qp.group_size, false, true, sc.s)) orelse return null;
+    const y = (try gather_nax.sortedGateUpFused(x3, rows, gu.w, gu.s, gu.b, sidx, sigtab, @intFromFloat(lim), gu.qp.bits, gu.qp.group_size, mx, true, sc.s)) orelse return null;
     return try sc.keep(y);
 }
 
