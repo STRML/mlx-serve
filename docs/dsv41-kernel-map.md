@@ -18,23 +18,27 @@ others. At 6 rows `hc_split` grows to 62 us a launch, 8.8% of the step, and the 
 The per-launch numbers above are the labelled build's (one primitive a command buffer, then spread over the stock busy
 time), and they overstate the attention projections. Measured in the stock step instead, by launching each projection
 once more on a copy of its weights just before the real one (`twin:<at>` less `ctl:<at>`, the copy launch alone, in the
-same rotated blocks; `DSV41_KMAP_AB`), at 1 row with 96 experts, a projection costs about its weights at the 450 GB/s
-streaming read the ubench measures:
+same rotated blocks; `DSV41_KMAP_AB`), at 1 row with 96 experts (layers 0-20 and 20-40) and with 384 (layers 20-30, as
+the map's fixture holds them), a projection costs about its weights at the 450 GB/s streaming read the ubench measures:
 
 | projection | MB a launch | at 450 GB/s | in the step, twin less ctl (phases) |
 |---|---|---|---|
-| in_proj | 11.4 | 25.4 us | 24.6, 27.1 (20-40); 23.7, 26.5 (0-20) |
-| wq_b, plain layers | 10.8 | 24.0 us | 25.0, 28.5, 29.9 (20-40, 15 layers) |
+| in_proj | 11.4 | 25.4 us | 24.6, 27.1 (20-40); 23.7, 26.5 (0-20); 384 experts 25.1, 27.1, 23.4 |
+| wq_b, plain layers | 10.8 | 24.0 us | 25.0, 28.5, 29.9 (20-40, 15 layers); 384 experts 16.7, 19.3, 18.9 |
 | wq_b, index owners | 16.2 | 36.0 us | 34, 31, 48 (20-40, 5 layers) |
-| wo_a | 8.65 | 19.2 us | 19.7, 18.3, 20.8 (20-40); 26.0, 26.0 (0-20) |
-| wo_b | 10.8 | 24.0 us | 26.9, 26.4 (20-40); 23.1, 28.4 (0-20) |
+| wo_a | 8.65 | 19.2 us | 19.7, 18.3, 20.8 (20-40); 26.0, 26.0 (0-20); 384 experts 19.2, 22.4, 21.4 |
+| wo_b | 10.8 | 24.0 us | 26.9, 26.4 (20-40); 23.1, 28.4 (0-20); 384 experts 21.7, 23.4, 24.5 |
 
-So there is no in-step premium to recover: each projection streams at 75-100% of the read floor inside the step. The
+So there is no in-step premium to recover: each projection streams at 75-100% of the read floor inside the step (the
+384-expert plain `wq_b` reads 21-24 us by the arms' 10th percentiles; its block medians above beat the floor). Expert
+count does not change it. The
 index owners' wider `wq_b` is their extra bytes (the index heads' 4096 rows, 1.5x). A dependent copy launch costs 0-6 us
 (`ctl` less `base`). The same twin on the layer's own weights (`same:wq_b`) leaves the real launch 10-11 us faster, so a
-projection whose weights sit in the cache reads in about 40% less time; a concurrent read of `wo_a`'s weights placed
-beside the attention launch (`pre:wo_a`, `precopy:wo_a`) did not overlap it (the read cost what a lone read costs) and
-left the step 2-4 us a layer slower. The Mac had other GPU tenants through every run: quote these to about 15%.
+projection whose weights sit in the cache reads in about 40% less time. A read of `wo_a`'s weights launched beside the
+attention launch (`pre:wo_a`, its own weights; `precopy:wo_a`, a copy) overlaps it by about half (10-13 us a layer
+against 19 alone), and the warm `wo_a` then saves about as much, so the step reads 0-7 us a layer slower, never faster;
+nothing was built. The Mac had other GPU tenants through every run, and the base step's 10th percentile moved 10%
+between phases of one process: quote these to about 15%.
 
 ## Method
 
