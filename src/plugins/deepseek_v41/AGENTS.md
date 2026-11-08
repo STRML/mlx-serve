@@ -20,6 +20,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - `decode/`: the fused decode kernels (`kernels/dec_*.metal`, one file a stage) a step or verify of up to `max_rows`
   rows runs through `blockFused`; `decode/fixture.zig` builds release-shape layers on random weights for their
   equivalence tests and the `DSV41_DEC_UBENCH` meters.
+- `DSV41_ATTN_BW=0` keeps the first in_proj / wq_b / wo_a layouts (bit-equal; `decode.zig` tests both arms' bytes and
+  times them at a rank of four against a streaming read).
 - `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built on
   every GPU (NAX too); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the
   expert-pruned packs are 2-bit g128). Otherwise `routed` runs. `DSV41_MOE_BW=0` keeps the first launches (bit-equal).
