@@ -36,6 +36,16 @@ pub const Opts = struct {
     experts_affine: ?u32 = null,
 };
 
+pub const DraftOpts = struct {
+    /// The DSpark stages' routed experts (the release has 128).
+    experts: u32 = 128,
+    vocab: u32 = 129280,
+    /// Committed positions the stages' windows hold.
+    ctx: usize = 1024,
+    seed: u64 = 1,
+    act: mlx.mlx_dtype = .bfloat16,
+};
+
 pub const Fixture = struct {
     gpa: std.mem.Allocator,
     m: *dsv41.Dsv41Model,
@@ -70,6 +80,50 @@ pub const Fixture = struct {
         }
         if (opts.ctx == 0) fx.m.dec_state = try dsv41.initState(fx.m, gpa);
         return fx;
+    }
+
+    /// A whole-model host at the release's shapes holding only the embedding, head and DSpark stages (the trunk's
+    /// layers are empty), its state at `ctx` positions with random rows in every stage's window ring: what a draft runs on.
+    pub fn initDraft(gpa: std.mem.Allocator, opts: DraftOpts) !*Fixture {
+        const fx = try gpa.create(Fixture);
+        errdefer gpa.destroy(fx);
+        var cfg = try releaseConfig();
+        cfg.dsv41_dspark_experts = opts.experts;
+        cfg.vocab_size = opts.vocab;
+        cfg.dsv4_dspark_noise_token_id = @min(cfg.dsv4_dspark_noise_token_id, opts.vocab - 1);
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed };
+        errdefer fx.w.deinit();
+        try fx.putDraftHeads(&cfg);
+        for (0..cfg.dsparkStages()) |si| try fx.putLayer(&cfg, "mtp.{d}.", si, opts.experts, true, null);
+        const holds_nothing: dsv41.Pair = .{ .lo = 0, .hi = cfg.num_hidden_layers, .worker = false };
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = holds_nothing, .act = opts.act, .dspark = true, .head_8bit = true });
+        errdefer fx.m.deinit();
+        fx.m.dec.deinit();
+        fx.m.dec_state = try dsv41.initState(fx.m, gpa);
+        const st = fx.state();
+        st.n = opts.ctx;
+        for (st.ds) |*ring| {
+            _ = mlx.mlx_array_free(ring.buf);
+            ring.buf = try fx.normal(&.{ @intCast(ring.cap), @intCast(ring.width) }, fx.m.act, 0, 1);
+        }
+        return fx;
+    }
+
+    fn putDraftHeads(fx: *Fixture, c: *const config.Config) !void {
+        const d: c_int = @intCast(c.hidden_size);
+        const v: c_int = @intCast(c.vocab_size);
+        const rank: c_int = @intCast(c.dsv4_dspark_markov_rank);
+        const targets: c_int = @intCast(c.dsv4_n_dspark_target_layers);
+        const last = c.dsparkStages() - 1;
+        try fx.putVec("embed.weight", .{}, &.{ v, d }, .bfloat16, 0, 0.02);
+        try fx.putVec("head.weight", .{}, &.{ v, d }, .bfloat16, 0, 0.02);
+        try fx.putVec("norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
+        try fx.putVec("mtp.0.main_proj.weight", .{}, &.{ d, targets * d }, .bfloat16, 0, 0.02);
+        try fx.putVec("mtp.0.main_norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
+        try fx.putVec("mtp.{d}.norm.weight", .{last}, &.{d}, .bfloat16, 1, 0.1);
+        try fx.putVec("mtp.{d}.markov_head.embed.weight", .{last}, &.{ v, rank }, .bfloat16, 0, 0.5);
+        try fx.putVec("mtp.{d}.markov_head.head.weight", .{last}, &.{ v, rank }, .bfloat16, 0, 0.5);
+        try fx.putVec("mtp.{d}.confidence_head.proj.weight", .{last}, &.{ 1, d + rank }, .bfloat16, 0, 0.02);
     }
 
     /// Every tensor `Shard.axis` names cut to `t`'s part of its axis, in a buffer of its own.

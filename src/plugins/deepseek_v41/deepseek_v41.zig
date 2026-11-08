@@ -464,6 +464,8 @@ pub const Dsv41Model = struct {
     ds_prof_comp_sync_ns: u64 = 0,
     /// The last draft's time, host sync included (`DsparkProfile`).
     ds_draft_ns: u64 = 0,
+    /// A draft's stages and tail run as compiled regions (`DSV41_DRAFT_COMPILE=0` keeps the op chains).
+    draft_compiled: bool = true,
 
     fn dropAhead(self: *Dsv41Model) void {
         if (self.ahead) |a| a.finish();
@@ -1555,6 +1557,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         m.n_mtp = n_stages;
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
         m.ds_block = cfg.dsv4_dspark_block_size;
+        m.draft_compiled = if (env.get(.DSV41_DRAFT_COMPILE)) |v| v[0] != '0' else true;
     }
     if (!worker) if (opts.pack_dir) |dir| try initEngram(m, w, dir);
     {
@@ -4598,8 +4601,9 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
 pub const region_rows = 16;
 
 /// With a streamed bank the FFN stretch runs as three (`ffn_pre`, `ffn_act`, `ffn_post`) around the source's host
-/// barrier, cut where `ffn` has no fusable op across the cut.
-pub const Region = enum { attn_in, q_kv, q_rows, attn_out, ffn, ffn_pre, ffn_act, ffn_post };
+/// barrier, cut where `ffn` has no fusable op across the cut. The DSpark draft's stages add `stage_heads` and
+/// `stage_ffn` (the stage layers' own, beside `attn_in`, `q_rows` and `attn_out`) and its `draft_tail` runs on the last stage's.
+pub const Region = enum { attn_in, q_kv, q_rows, attn_out, ffn, ffn_pre, ffn_act, ffn_post, stage_heads, stage_ffn, draft_tail, draft_tail_conf };
 
 const LayerRegions = struct {
     m: *Dsv41Model,
@@ -4618,7 +4622,7 @@ pub fn compiledAt(m: *const Dsv41Model, rows: usize) bool {
 }
 
 fn compileRegions(m: *Dsv41Model) !void {
-    m.regions = try m.gpa.alloc(LayerRegions, m.n_layers);
+    m.regions = try m.gpa.alloc(LayerRegions, m.layers.len);
     for (m.regions, 0..) |*r, li| r.* = .{ .m = m, .li = li };
     for (m.regions) |*r| inline for (comptime std.enums.values(Region)) |kind| {
         const raw = mlx.mlx_closure_new_func_payload(&RegionBody(kind).call, @ptrCast(r), null);
@@ -4714,6 +4718,20 @@ fn RegionBody(comptime kind: Region) type {
                     const sp: Split = .{ .pre = none, .post = a[1], .comb = a[2] };
                     const ro = if (mlx.getShape(a[4]).len == 2) a[4] else try rowSum(&sc, a[4]);
                     res.* = mlx.mlx_vector_array_new_data(&.{try hcExpand(&sc, a[0], try withShared(&sc, m, ly, a[3], ro), &sp)}, 1);
+                },
+                // a DSpark stage's query heads, window row, the window's keys and the draft's position -> its attention heads
+                .stage_heads => res.* = mlx.mlx_vector_array_new_data(&.{try dsparkHeads(&sc, m, ly, .{ .q = a[0], .kv = a[1], .qr = none }, a[2], a[3])}, 1),
+                // x, the stage's attention output and mix -> the new stream and the FFN's mix
+                .stage_ffn => {
+                    const f = try stageFfnOps(&sc, m, li, a[0], a[1], &.{ .pre = a[2], .post = a[3], .comb = a[4] });
+                    res.* = mlx.mlx_vector_array_new_data(&.{ f.x, f.pre }, 2);
+                },
+                // the last stage's stream and mix, the first tokens -> the drafted ids
+                .draft_tail => res.* = mlx.mlx_vector_array_new_data(&.{(try draftTailOps(&sc, m, a[0], a[1], a[2], false, false)).ids}, 1),
+                // and the confidence of each
+                .draft_tail_conf => {
+                    const g = try draftTailOps(&sc, m, a[0], a[1], a[2], true, false);
+                    res.* = mlx.mlx_vector_array_new_data(&.{ g.ids, g.conf }, 2);
                 },
             }
         }
@@ -5514,12 +5532,11 @@ fn commitMain(sc: *Scope, m: *Dsv41Model, st: *State, mh: A, p0: usize) !void {
     }
 }
 
-/// A stage's attention heads for one state's draft rows at [p0, p0 + B) from their projections `rows` (made over every
+/// A stage's attention heads for one state's draft rows at position `pos` from their projections `rows` (made over every
 /// state's rows), inverse-roped for `attnOutRoped`: every row sees the stage's window of committed main rows and every
 /// draft row.
-fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_keys: A, p0: usize) !A {
+fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_keys: A, pos: A) !A {
     const hd = m.cfg.head_dim;
-    const pos = try sc.i(ci(p0));
     const pj = try ropeProj(sc, m, ly, m.rope_plain.fwd, rows, pos);
     const keys = try sc.astype(try sc.concat(&.{ main_keys, pj.kv }, 0), .float32);
     const qf = try sc.astype(pj.q, .float32);
@@ -5558,49 +5575,45 @@ fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_l
 pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, t1s: []const u32, keep_logits: bool, out: []DsparkDraft) !void {
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
+    const g = try draftGraph(&sc, m, gpa, states, t1s, keep_logits);
+    var ev = [_]A{ g.ids, g.conf, g.logits };
+    try evalAll(&ev);
+    try readDrafts(m, gpa, g, t1s, keep_logits, out);
+}
+
+/// The draft's lazy outputs: `ids` and `conf` `[N, B]`, `logits` `[N, B, vocab]`; each is `ids` where it was not asked for.
+pub const DraftGraph = struct { ids: A, conf: A, logits: A };
+
+fn wantsConfidence(m: *const Dsv41Model) bool {
+    return m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
+}
+
+pub fn draftGraph(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, t1s: []const u32, keep_logits: bool) !DraftGraph {
     const c = &m.cfg;
     const B = m.ds_block;
     const N = states.len;
-    const hc = c.dsv4_hc_mult;
-    const d = c.hidden_size;
-    const ds = &m.dspark.?;
     const ids = try gpa.alloc(i32, N * B);
     defer gpa.free(ids);
     for (t1s, 0..) |t1, k| for (0..B) |j| {
         ids[k * B + j] = @intCast(if (j == 0) t1 else c.dsv4_dspark_noise_token_id);
     };
-    const emb = try m.embed.rows(&sc, try sc.ints(ids, &.{ci(N * B)}), m.act);
-    var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(N * B), ci(hc), ci(d) });
-    var pre = try onehotPre(&sc, m, N * B);
-    for (0..m.n_mtp) |si| x = try stageBlock(&sc, m, states, m.n_layers + si, x, &pre, B);
-    const flat = try hcCollapse(&sc, x, pre);
-    const hout = try sc.reshape(flat, &.{ ci(N), ci(B), ci(d) });
-    const logits = try sc.reshape(try sc.astype(try m.head.apply(&sc, try sc.rms(flat, ds.norm, c.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
+    const emb = try m.embed.rows(sc, try sc.ints(ids, &.{ci(N * B)}), m.act);
+    var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(N * B), ci(c.dsv4_hc_mult), ci(c.hidden_size) });
+    var pre = try onehotPre(sc, m, N * B);
+    for (0..m.n_mtp) |si| x = try stageBlock(sc, m, states, m.n_layers + si, x, &pre, B);
     const firsts = try gpa.alloc(i32, N);
     defer gpa.free(firsts);
     for (firsts, t1s) |*f, t| f.* = @intCast(t);
-    var cur = try sc.ints(firsts, &.{ci(N)});
-    const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
-    var toks: [16]A = undefined;
-    var confs: [16]A = undefined;
-    var rows_k: [16]A = undefined;
-    for (0..B) |k| {
-        const e = try sc.take(ds.markov_embed, cur, 0); // [N, rank]
-        const me = try sc.astype(e, .float32);
-        const bias = try sc.astype(try sc.matmul(try sc.astype(e, m.act), try sc.t2(ds.markov_head)), .float32);
-        const row = try sc.add(try sc.reshape(try sc.slice(logits, 1, k, k + 1), &.{ ci(N), -1 }), bias);
-        rows_k[k] = row;
-        if (want_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.reshape(try sc.slice(hout, 1, k, k + 1), &.{ ci(N), ci(d) }), .float32), me }, -1), try sc.t2(ds.conf));
-        cur = try sc.astype(try sc.argmax(row, -1), .int32);
-        toks[k] = cur;
-    }
-    const all = try sc.stack(toks[0..B], 1); // [N, B]
-    const rows_all = if (keep_logits) try sc.stack(rows_k[0..B], 1) else all;
-    var ev = [_]A{ all, if (want_conf) try sc.astype(try sc.concat(confs[0..B], -1), .float32) else all, rows_all };
-    try evalAll(&ev);
-    const data = mlx.mlx_array_data_int32(all) orelse return error.NoData;
-    const conf_data: []const f32 = if (want_conf) (mlx.mlx_array_data_float32(ev[1]) orelse return error.NoData)[0 .. N * B] else &.{};
-    const logit_data: []const f32 = if (keep_logits) (mlx.mlx_array_data_float32(rows_all) orelse return error.NoData)[0 .. N * B * m.vocab] else &.{};
+    return draftTail(sc, m, x, pre, try sc.ints(firsts, &.{ci(N)}), keep_logits);
+}
+
+fn readDrafts(m: *const Dsv41Model, gpa: std.mem.Allocator, g: DraftGraph, t1s: []const u32, keep_logits: bool, out: []DsparkDraft) !void {
+    const B = m.ds_block;
+    const N = t1s.len;
+    const want_conf = wantsConfidence(m);
+    const data = mlx.mlx_array_data_int32(g.ids) orelse return error.NoData;
+    const conf_data: []const f32 = if (want_conf) (mlx.mlx_array_data_float32(g.conf) orelse return error.NoData)[0 .. N * B] else &.{};
+    const logit_data: []const f32 = if (keep_logits) (mlx.mlx_array_data_float32(g.logits) orelse return error.NoData)[0 .. N * B * m.vocab] else &.{};
     var made: usize = 0;
     errdefer for (out[0..made]) |*o| o.deinit(gpa);
     for (out[0..N], t1s, 0..) |*o, t1, k| {
@@ -5627,26 +5640,137 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
     }
 }
 
+fn draftCompiled(m: *const Dsv41Model, rows: usize) bool {
+    return m.draft_compiled and compiledAt(m, rows);
+}
+
+/// The last stage's collapse through the trunk head and the Markov chain, as one compiled region where the draft
+/// compiles (the logits stay on the op chain).
+fn draftTail(sc: *Scope, m: *const Dsv41Model, x: A, pre: A, firsts: A, keep_logits: bool) !DraftGraph {
+    const want_conf = wantsConfidence(m);
+    if (keep_logits or !draftCompiled(m, dim(x, 0))) return draftTailOps(sc, m, x, pre, firsts, want_conf, keep_logits);
+    const last = m.layers.len - 1;
+    if (!want_conf) {
+        var o: [1]A = undefined;
+        try runRegion(sc, m, last, .draft_tail, &.{ x, pre, firsts }, &o);
+        return .{ .ids = o[0], .conf = o[0], .logits = o[0] };
+    }
+    var o: [2]A = undefined;
+    try runRegion(sc, m, last, .draft_tail_conf, &.{ x, pre, firsts }, &o);
+    return .{ .ids = o[0], .conf = o[1], .logits = o[0] };
+}
+
+fn draftTailOps(sc: *Scope, m: *const Dsv41Model, x: A, pre: A, firsts: A, want_conf: bool, keep_logits: bool) !DraftGraph {
+    const ds = &m.dspark.?;
+    const B = m.ds_block;
+    const N = dim(x, 0) / B;
+    const d = m.cfg.hidden_size;
+    const flat = try hcCollapse(sc, x, pre);
+    const hout = try sc.reshape(flat, &.{ ci(N), ci(B), ci(d) });
+    const logits = try sc.reshape(try sc.astype(try m.head.apply(sc, try sc.rms(flat, ds.norm, m.cfg.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
+    var toks: [16]A = undefined;
+    var confs: [16]A = undefined;
+    var rows_k: [16]A = undefined;
+    var cur = firsts;
+    for (0..B) |k| {
+        const step = try markovStep(sc, m, logits, hout, cur, k, want_conf);
+        rows_k[k] = step.row;
+        confs[k] = step.conf;
+        cur = step.tok;
+        toks[k] = cur;
+    }
+    const all = try sc.stack(toks[0..B], 1); // [N, B]
+    return .{
+        .ids = all,
+        .conf = if (want_conf) try sc.astype(try sc.concat(confs[0..B], -1), .float32) else all,
+        .logits = if (keep_logits) try sc.stack(rows_k[0..B], 1) else all,
+    };
+}
+
+const MarkovStep = struct { row: A, conf: A, tok: A };
+
+/// Position `k`'s logits `[N, vocab]` biased by the Markov table row of the previous token `cur`, its greedy token and,
+/// when asked, the confidence head's logit over the position's hidden row beside that embedding.
+fn markovStep(sc: *Scope, m: *const Dsv41Model, logits: A, hout: A, cur: A, k: usize, want_conf: bool) !MarkovStep {
+    const ds = &m.dspark.?;
+    const N = dim(logits, 0);
+    const e = try sc.take(ds.markov_embed, cur, 0); // [N, rank]
+    const bias = try sc.astype(try sc.matmul(try sc.astype(e, m.act), try sc.t2(ds.markov_head)), .float32);
+    const row = try sc.add(try sc.reshape(try sc.slice(logits, 1, k, k + 1), &.{ ci(N), -1 }), bias);
+    const tok = try sc.astype(try sc.argmax(row, -1), .int32);
+    if (!want_conf) return .{ .row = row, .conf = row, .tok = tok };
+    const hidden = try sc.astype(try sc.reshape(try sc.slice(hout, 1, k, k + 1), &.{ ci(N), ci(dim(hout, 2)) }), .float32);
+    const conf = try sc.matmul(try sc.concat(&.{ hidden, try sc.astype(e, .float32) }, -1), try sc.t2(ds.conf));
+    return .{ .row = row, .conf = conf, .tok = tok };
+}
+
 /// A DSpark stage over `B` draft rows a state: the mixes, norms and FFN over every row, each state's attention
-/// against its own window of committed main rows.
+/// against its own window of committed main rows. Where the draft compiles, the stretches around the attention run as
+/// regions (`stageAttnIn`, `stageRows`, `stageHeads`, `stageAttnOut`, `stageFfn`).
 fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: A, pre: *A, B: usize) !A {
-    const ly = &m.layers[li];
     const si = li - m.n_layers;
-    const pa = try hcPreNorm(sc, m, x, pre.*, &ly.hc_attn, ly.attn_norm);
+    const compiled = draftCompiled(m, states.len * B);
+    const pa = try stageAttnIn(sc, m, li, compiled, x, pre.*);
     // The projections read their weights once for every state's rows; the rope and the attention are each state's.
-    const rows = try qkvRows(sc, m, ly, pa.h);
+    const rows = try stageRows(sc, m, li, compiled, pa.h);
     var heads: [region_rows]A = undefined;
     for (states, heads[0..states.len], 0..) |st, *o, k| {
         const window = @min(m.cfg.sliding_window, st.n);
         const keys = try st.ds[si].read(sc, st.n - window, st.n);
         const mine: Proj = if (states.len == 1) rows else .{ .q = try sc.slice(rows.q, 0, k * B, (k + 1) * B), .kv = try sc.slice(rows.kv, 0, k * B, (k + 1) * B), .qr = rows.qr };
-        o.* = try dsparkHeads(sc, m, ly, mine, keys, st.n);
+        o.* = try stageHeads(sc, m, li, compiled, mine, keys, st.n);
     }
-    const h = try attnOutRoped(sc, m, ly, if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0));
-    const pf = try hcExpandPreNorm(sc, m, x, h, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
+    const h = try stageAttnOut(sc, m, li, compiled, if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0));
+    const f = try stageFfn(sc, m, li, compiled, x, h, &pa.sp);
+    pre.* = f.pre;
+    return f.x;
+}
+
+fn stageAttnIn(sc: *Scope, m: *Dsv41Model, li: usize, compiled: bool, x: A, pre: A) !Normed {
+    const ly = &m.layers[li];
+    if (!compiled) return hcPreNorm(sc, m, x, pre, &ly.hc_attn, ly.attn_norm);
+    var a: [4]A = undefined; // the attention's pre, post, comb; its input
+    try runRegion(sc, m, li, .attn_in, &.{ x, pre }, &a);
+    return .{ .sp = .{ .pre = a[0], .post = a[1], .comb = a[2] }, .h = a[3] };
+}
+
+fn stageRows(sc: *Scope, m: *Dsv41Model, li: usize, compiled: bool, h: A) !Proj {
+    if (!compiled) return qkvRows(sc, m, &m.layers[li], h);
+    var q: [3]A = undefined; // query heads, window rows, query latents
+    try runRegion(sc, m, li, .q_rows, &.{h}, &q);
+    return .{ .q = q[0], .kv = q[1], .qr = q[2] };
+}
+
+fn stageHeads(sc: *Scope, m: *Dsv41Model, li: usize, compiled: bool, rows: Proj, keys: A, p0: usize) !A {
+    const pos = try sc.i(ci(p0));
+    if (!compiled) return dsparkHeads(sc, m, &m.layers[li], rows, keys, pos);
+    var o: [1]A = undefined;
+    try runRegion(sc, m, li, .stage_heads, &.{ rows.q, rows.kv, keys, pos }, &o);
+    return o[0];
+}
+
+fn stageAttnOut(sc: *Scope, m: *Dsv41Model, li: usize, compiled: bool, heads: A) !A {
+    if (!compiled) return attnOutRoped(sc, m, &m.layers[li], heads);
+    var o: [1]A = undefined;
+    try runRegion(sc, m, li, .attn_out, &.{heads}, &o);
+    return o[0];
+}
+
+const StageOut = struct { x: A, pre: A };
+
+fn stageFfn(sc: *Scope, m: *Dsv41Model, li: usize, compiled: bool, x: A, h: A, sa: *const Split) !StageOut {
+    if (!compiled) return stageFfnOps(sc, m, li, x, h, sa);
+    var o: [2]A = undefined;
+    try runRegion(sc, m, li, .stage_ffn, &.{ x, h, sa.pre, sa.post, sa.comb }, &o);
+    return .{ .x = o[0], .pre = o[1] };
+}
+
+/// The new stream and the FFN's mix of a stage's block, from the stream `x`, the attention's output `h` and the attention's mix.
+fn stageFfnOps(sc: *Scope, m: *Dsv41Model, li: usize, x: A, h: A, sa: *const Split) !StageOut {
+    const ly = &m.layers[li];
+    const pf = try hcExpandPreNorm(sc, m, x, h, sa, sa.pre, &ly.hc_ffn, ly.ffn_norm);
     const y = try moe(sc, m, li, pf.h, none);
-    pre.* = pf.sp.pre;
-    return hcExpand(sc, pf.x1, y, &pf.sp);
+    return .{ .x = try hcExpand(sc, pf.x1, y, &pf.sp), .pre = pf.sp.pre };
 }
 
 pub const DsparkPending = struct {
