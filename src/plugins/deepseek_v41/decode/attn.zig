@@ -5,6 +5,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
+const system = @import("../../../sdk/util/system.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const kit = @import("../../deepseek_v4/contract_kit.zig");
@@ -25,6 +26,8 @@ const HD = 512;
 /// The most keys a split holds, the most splits a (row, head group) has, a threadgroup's threads and its bytes.
 const BK = 128;
 const MAX_SPLITS = 8;
+/// The most splits a narrow launch takes (`narrowCap`).
+pub const MAX_SPLITS_NARROW = 32;
 const TG = 128;
 const TG_BYTES = 4 * (BK + 2 * 4 * 16) + 2 * 2 * (BK / 16) * 32 * 8;
 
@@ -40,13 +43,40 @@ fn dimOf(x: A, axis: usize) c_int {
     return mlx.getShape(x)[axis];
 }
 
-/// The splits for a list of `keys`: at most BK keys each, and for a short list about 32, which is all the parallelism
-/// a row's 16-head groups get. Null: the list needs more than MAX_SPLITS.
-fn splitsFor(keys: usize) ?c_int {
+/// The splits for a list of `keys` over `groups` (row, 16-head group) pairs: at most BK keys each, and for a short list
+/// about 32, which is all the parallelism a row's 16-head groups get. Null: the list needs more than MAX_SPLITS.
+fn splitsFor(keys: usize, groups: usize) ?c_int {
     const least = (keys + BK - 1) / BK;
     if (least > MAX_SPLITS) return null;
-    const s: c_int = @intCast(@max(least, @min(MAX_SPLITS, (keys + 31) / 32)));
+    const s: c_int = @intCast(@max(least, @min(narrowCap(groups), (keys + 31) / 32)));
     return s;
+}
+
+/// The split cap for `groups` (row, 16-head group) pairs: MAX_SPLITS where they fill the GPU, else as many as give
+/// its cores two threadgroups each (up to MAX_SPLITS_NARROW). A tensor split's rank holds 16 heads at four ranks, one
+/// group a row: a decode step's attention ran as 8 threadgroups on 40 or 80 cores. `DSV41_ATTN_SPLITS=0` keeps
+/// MAX_SPLITS everywhere, `=<n>` caps every launch at n (8..32).
+pub fn narrowCap(groups: usize) usize {
+    const forced = narrowSetting();
+    if (forced == 0) return MAX_SPLITS;
+    if (forced > 0) return @intCast(forced);
+    const cores: usize = @max(system.gpuCoreCount(), 1);
+    return std.math.clamp((2 * cores + groups - 1) / @max(groups, 1), MAX_SPLITS, MAX_SPLITS_NARROW);
+}
+
+var narrow_setting: ?i32 = null;
+/// -1 unset (the core rule), 0 off, else the forced cap.
+fn narrowSetting() i32 {
+    if (narrow_setting) |v| return v;
+    const raw = std.c.getenv("DSV41_ATTN_SPLITS");
+    const v: i32 = if (raw) |r| std.math.clamp(std.fmt.parseInt(i32, std.mem.span(r), 10) catch -1, -1, MAX_SPLITS_NARROW) else -1;
+    narrow_setting = if (v > 0 and v < MAX_SPLITS) MAX_SPLITS else v;
+    return narrow_setting.?;
+}
+
+/// Tests: the narrow rule as `v` (-1 the core rule, 0 off, else a forced cap) until reset with null.
+pub fn setNarrow(v: ?i32) void {
+    narrow_setting = v;
 }
 
 /// Rows q [R, H, 512] bf16 (roped, 1..`decode.max_rows` of them, H a multiple of 16) at positions p0.., the window
@@ -67,7 +97,7 @@ fn run(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Model, 
     const K: c_int = if (comp_rows.ctx != null) dimOf(topk, 1) else 0;
     const nc: c_int = if (K > 0) dimOf(comp_rows, 0) else 0;
     if (K > 0 and nc == 0) return null;
-    const S = splitsFor(m.cfg.sliding_window + @as(usize, @intCast(K))) orelse return null;
+    const S = splitsFor(m.cfg.sliding_window + @as(usize, @intCast(K)), @intCast(@divExact(H, 16) * R)) orelse return null;
     const meta_v = [_]i32{ @intCast(p0), nc, @intCast(m.cfg.sliding_window), @intCast(win.cap) };
     const meta = try sc.ints(&meta_v, &.{meta_v.len});
     const comp = if (K > 0) try sc.astype(comp_rows, .bfloat16) else win.buf;
@@ -337,6 +367,66 @@ test "dsv41 dec attn: matches today's split and merge" {
             return error.TestUnexpectedResult;
         }
     };
+}
+
+test "dsv41 dec attn: a tensor rank's 16 heads in up to 32 splits merge no further from truth than in 8" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    defer setNarrow(null);
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m = try todayModel();
+    defer freeTodayModel(&m);
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const H = 16;
+    for ([_]usize{ 512, 100, 0 }) |k| for ([_]usize{ 1, 2, 4, 6 }) |R| for ([_]usize{ 300, 5000 }) |ctx| {
+        const rig = try Rig.init(&sc, R, ctx, k, 1, 1, ctx, 11);
+        defer rig.deinit();
+        // The first 16 of the rig's heads: a rank's at four ranks.
+        var q16 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&q16, rig.q, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ @intCast(R), H, HD }, 3, &[_]c_int{ 1, 1, 1 }, 3, sc.s));
+        const q = try sc.keep(q16);
+        var s16 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&s16, rig.sink, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, H, 1 }, 3, &[_]c_int{ 1, 1, 1 }, 3, sc.s));
+        const sink = try sc.keep(s16);
+        var heads: [2][]f32 = undefined;
+        var splits: [2]c_int = undefined;
+        for ([_]i32{ 0, MAX_SPLITS_NARROW }, &heads, &splits) |v, *h, *sp| {
+            setNarrow(v);
+            const p = (try partials(&sc, kern, &m, q, rig.win(), rig.comps[0], rig.picks[0], rig.p0, SCALE)) orelse return error.Declined;
+            sp.* = p.splits;
+            h.* = try dsv41.hostF32(try mergeToday(&sc, &m, p, sink, rig.p0));
+        }
+        defer for (heads) |h| gpa.free(h);
+        try testing.expect(splits[0] <= MAX_SPLITS);
+        // 640 keys at 32 a split: 20; a short list keeps its few.
+        try testing.expectEqual(@as(c_int, @intCast(@max((WINDOW + k + BK - 1) / BK, (WINDOW + k + 31) / 32))), splits[1]);
+        const hq = try dsv41.hostF32(rig.q);
+        defer gpa.free(hq);
+        const hr = try dsv41.hostF32(rig.ring);
+        defer gpa.free(hr);
+        const hcomp = if (k > 0) try dsv41.hostF32(rig.comps[0]) else try gpa.alloc(f32, 0);
+        defer gpa.free(hcomp);
+        const hs = try dsv41.hostF32(rig.sink);
+        defer gpa.free(hs);
+        const picks = if (k > 0) try hostI32(rig.picks[0]) else try gpa.alloc(i32, 0);
+        defer gpa.free(picks);
+        const all = try truthHeads(gpa, hq, hr, hcomp, picks, hs, R, k, ctx, rig.p0);
+        defer gpa.free(all);
+        const truth = try gpa.alloc(f32, R * H * HD);
+        defer gpa.free(truth);
+        for (0..R) |r| @memcpy(truth[r * H * HD ..][0 .. H * HD], all[r * HEADS * HD ..][0 .. H * HD]);
+        var label: [64]u8 = undefined;
+        try decode.expectNoWorse(try std.fmt.bufPrint(&label, "attn 16 heads K={d} R={d} ctx={d} S={d}", .{ k, R, ctx, splits[1] }), heads[1], heads[0], truth);
+    };
+}
+
+fn hostI32(x: A) ![]i32 {
+    try mlx.check(mlx.mlx_array_eval(x));
+    const n = mlx.mlx_array_size(x);
+    const src = mlx.mlx_array_data_int32(x) orelse return error.NoData;
+    return testing.allocator.dupe(i32, src[0..n]);
 }
 
 /// f64 attention of each (row, head) over its window rows and picked rows, the sink in the denominator only: heads

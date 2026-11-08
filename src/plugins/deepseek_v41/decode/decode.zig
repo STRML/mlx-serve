@@ -214,5 +214,6 @@ test "dsv41 dec ubench: a tensor sum's GPU-CPU-GPU hand-off without the network 
 
 test {
     _ = fixture;
+    _ = @import("roofline.zig");
     inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;
 }

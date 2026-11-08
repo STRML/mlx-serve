@@ -50,10 +50,15 @@ pub const Fixture = struct {
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();
         cfg.num_experts = opts.experts;
+        // The fixture holds no Engram (a pair worker refuses an Engram layer), so layers 1 and 14 run as plain layers.
+        cfg.dsv41_n_engram_layers = 0;
         fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64 };
         errdefer fx.w.deinit();
-        for (opts.lo..opts.hi) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
-        if (opts.tp) |t| try fx.sliceShard(t);
+        // Cut a layer as soon as it is made, so a wide bank never stands whole for every layer at once.
+        for (opts.lo..opts.hi) |li| {
+            try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
+            if (opts.tp) |t| try fx.sliceShard(t, li);
+        }
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
         errdefer fx.m.deinit();
         if (!opts.fused) fx.m.dec.deinit();
@@ -72,11 +77,14 @@ pub const Fixture = struct {
         return fx;
     }
 
-    /// Every tensor `Shard.axis` names cut to `t`'s part of its axis, in a buffer of its own.
-    fn sliceShard(fx: *Fixture, t: Shard) !void {
+    /// Every tensor of layer `li` `Shard.axis` names cut to `t`'s part of its axis, in a buffer of its own.
+    fn sliceShard(fx: *Fixture, t: Shard, li: usize) !void {
         const s = mlx.gpuStream();
+        var pbuf: [32]u8 = undefined;
+        const pfx = try std.fmt.bufPrint(&pbuf, "layers.{d}.", .{li});
         var it = fx.w.map.iterator();
         while (it.next()) |kv| {
+            if (!std.mem.startsWith(u8, kv.key_ptr.*, pfx)) continue;
             const axis = Shard.axis(kv.key_ptr.*) orelse continue;
             const shape = mlx.getShape(kv.value_ptr.*);
             const ax = axis.of(shape.len);
