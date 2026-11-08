@@ -17,6 +17,7 @@ const iou = @import("../../../sdk/util/io_util.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
 const fixture = @import("fixture.zig");
+const ffn_seg = @import("ffn_seg.zig");
 
 const A = mlx.mlx_array;
 
@@ -97,6 +98,7 @@ test "dsv41 kernel map: a TP rank's full decode step in a loop for a GPU trace (
     defer probe.deinit();
     fx.m.probe = &probe.hook;
     defer fx.m.probe = null;
+    ffn_seg.cache_on = true;
     var exps = std.mem.tokenizeScalar(u8, std.mem.span(ab_spec), ';');
     while (exps.next()) |exp| {
         var ab: Ab = .{ .probe = probe, .name = exp };
@@ -109,6 +111,8 @@ test "dsv41 kernel map: a TP rank's full decode step in a loop for a GPU trace (
         while (rows_it.next()) |tok| try phase(gpa, fx, try std.fmt.parseInt(usize, tok, 10), steps, &p0, &ab);
     }
     probe.arm = .{};
+    ffn_seg.set(.base);
+    try segCheck(gpa, fx, lo, hi);
     if (std.c.getenv("DSV41_KMAP_CHAIN")) |raw| {
         var it = std.mem.tokenizeScalar(u8, std.mem.span(raw), ',');
         while (it.next()) |tok| try probe.reportChains(std.meta.stringToEnum(dsv41.ProjAt, tok) orelse return error.BadProjection);
@@ -116,13 +120,14 @@ test "dsv41 kernel map: a TP rank's full decode step in a loop for a GPU trace (
 }
 
 const ProjAt = dsv41.ProjAt;
-const Mode = enum { base, ctl, twin, same, pre, precopy };
-const Arm = struct { mode: Mode = .base, at: ProjAt = .in_proj, index: ?bool = null };
+const Mode = enum { base, ctl, twin, same, pre, precopy, ffn };
+const Arm = struct { mode: Mode = .base, at: ProjAt = .in_proj, index: ?bool = null, ffn: ffn_seg.Arm = .base };
 
 fn parseArm(tok: []const u8) !Arm {
     var it = std.mem.tokenizeAny(u8, tok, ":@");
     const mode = std.meta.stringToEnum(Mode, it.next() orelse "base") orelse return error.BadArm;
     if (mode == .base) return .{};
+    if (mode == .ffn) return .{ .ffn = std.meta.stringToEnum(ffn_seg.Arm, it.next() orelse return error.BadArm) orelse return error.BadArm };
     const at = std.meta.stringToEnum(ProjAt, it.next() orelse return error.BadArm) orelse return error.BadArm;
     const where = it.next() orelse return .{ .mode = mode, .at = at };
     if (std.mem.eql(u8, where, "idx")) return .{ .mode = mode, .at = at, .index = true };
@@ -212,7 +217,7 @@ const Probe = struct {
         p.remember(li, at, ins);
         if (!p.applies(li, at)) return ins[0];
         const dep = switch (p.arm.mode) {
-            .base, .ctl => ins[0],
+            .base, .ctl, .ffn => ins[0],
             .twin => try twinLaunch(sc, m, &p.copies[li - p.lo], li, at, ins),
             .same => try twinLaunch(sc, m, &m.layers[li], li, at, ins),
             .pre, .precopy => return passAfter(sc, p.pass_after, ins[0], try readLaunch(sc, p.read, weightsOf(if (p.arm.mode == .pre) &m.layers[li] else &p.copies[li - p.lo], at))),
@@ -343,6 +348,86 @@ fn medianOf(xs: []f64) f64 {
     return xs[xs.len / 2];
 }
 
+fn segCheck(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize) !void {
+    const m = fx.m;
+    var worst: f64 = 0;
+    var ndiff: usize = 0;
+    var total: usize = 0;
+    var layers: usize = 0;
+    for (lo..hi) |li| {
+        const c = ffn_seg.heldOf(li) orelse continue;
+        var sc = dsv41.Scope.init(gpa, m.s);
+        defer sc.deinit();
+        const ly = &m.layers[li];
+        const a = (try dsv41.moeFused(&sc, m, ly, c[0], c[1], c[2])) orelse return error.Declined;
+        const b = (try ffn_seg.moeSplit(&sc, m, ly, c[0], c[1], c[2])) orelse return error.Declined;
+        const af = try sc.astype(a, .float32);
+        const bf = try sc.astype(b, .float32);
+        try dsv41.evalAll(&.{ af, bf });
+        const n = mlx.mlx_array_size(af);
+        const pa = mlx.mlx_array_data_float32(af).?[0..n];
+        const pb = mlx.mlx_array_data_float32(bf).?[0..n];
+        for (pa, pb) |x, y| {
+            if (x != y) ndiff += 1;
+            worst = @max(worst, @abs(@as(f64, x) - @as(f64, y)));
+        }
+        total += n;
+        layers += 1;
+    }
+    std.debug.print("[kmap] ffn segment split vs stock MoE: {d} layers, {d} of {d} outputs differ, max abs diff {e}\n", .{ layers, ndiff, total, worst });
+    for ([_]ffn_seg.Arm{ .split, .rsu, .fin, .finsplit }) |arm| try segArm(gpa, fx, lo, hi, arm);
+}
+
+fn segArm(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize, arm: ffn_seg.Arm) !void {
+    const m = fx.m;
+    var num: f64 = 0;
+    var den: f64 = 0;
+    var worst: f64 = 0;
+    var ndiff: usize = 0;
+    var total: usize = 0;
+    var route_miss: usize = 0;
+    var layers: usize = 0;
+    for (lo..hi) |li| {
+        const c = ffn_seg.inOf(li) orelse continue;
+        var sc = dsv41.Scope.init(gpa, m.s);
+        defer sc.deinit();
+        var pa = c[0];
+        var pb = c[0];
+        const sa: dsv41.Split = .{ .pre = c[2], .post = c[3], .comb = c[4] };
+        ffn_seg.set(.base);
+        const ya = (try ffn_seg.segment(&sc, m, li, c[0], c[1], &sa, &pa)) orelse return error.Declined;
+        ffn_seg.set(arm);
+        const yb = (try ffn_seg.segment(&sc, m, li, c[0], c[1], &sa, &pb)) orelse return error.Declined;
+        ffn_seg.set(.base);
+        const af = try sc.astype(ya, .float32);
+        const bf = try sc.astype(yb, .float32);
+        const ia = try sc.astype(ffn_seg.last_idx[0], .float32);
+        const ib = try sc.astype(ffn_seg.last_idx[1], .float32);
+        try dsv41.evalAll(&.{ af, bf, ia, ib });
+        const n = mlx.mlx_array_size(af);
+        const xa = mlx.mlx_array_data_float32(af).?[0..n];
+        const xb = mlx.mlx_array_data_float32(bf).?[0..n];
+        for (xa, xb) |x, y| {
+            if (x != y) ndiff += 1;
+            const d = @as(f64, x) - @as(f64, y);
+            num += d * d;
+            den += @as(f64, x) * @as(f64, x);
+            worst = @max(worst, @abs(d));
+        }
+        const k = mlx.mlx_array_size(ia);
+        const ra = mlx.mlx_array_data_float32(ia).?[0..k];
+        const rb = mlx.mlx_array_data_float32(ib).?[0..k];
+        for (ra) |x| {
+            var found = false;
+            for (rb) |y| found = found or x == y;
+            if (!found) route_miss += 1;
+        }
+        total += n;
+        layers += 1;
+    }
+    std.debug.print("[kmap] segment {s} vs stock: {d} layers, {d} of {d} stream values differ, rel rms {e:.3}, max abs {e:.3}, routes missed {d}\n", .{ @tagName(arm), layers, ndiff, total, @sqrt(num / @max(den, 1e-30)), worst, route_miss });
+}
+
 fn printArms(ab: *const Ab, rows: usize, us: []const f64) void {
     const blocks = us.len / ab.n;
     var by: [max_arms][max_steps]f64 = undefined;
@@ -370,6 +455,16 @@ fn printArms(ab: *const Ab, rows: usize, us: []const f64) void {
     std.debug.print("[kmap] raw {s} rows={d}: {s}\n", .{ ab.name, rows, line[0..n] });
 }
 
+fn printBuild(ab: *const Ab, rows: usize, us: []const f64) void {
+    const blocks = us.len / ab.n;
+    var by: [max_arms][max_steps]f64 = undefined;
+    for (0..blocks) |b| for (0..ab.n) |pos| {
+        const k = b * ab.n + pos;
+        by[ab.armOf(k)][b] = us[k];
+    };
+    for (0..ab.n) |j| std.debug.print("[kmap] arm {s} #{d} rows={d}: host build median {d:.0} us\n", .{ ab.name, j, rows, quantileOf(by[j][0..blocks], 0.5) });
+}
+
 fn quantileOf(xs: []f64, f: f64) f64 {
     std.mem.sort(f64, xs, {}, std.sort.asc(f64));
     return xs[@intFromFloat(f * @as(f64, @floatFromInt(xs.len - 1)))];
@@ -379,7 +474,7 @@ const max_steps = 1024;
 
 /// One row count: 3 warm-up steps and `steps` timed ones from position `p0`, which moves past them.
 fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize, p0: *usize, ab: ?*const Ab) !void {
-    const warm = 3;
+    const warm = 3 + if (ab) |a| 2 * a.n else 0;
     const total = warm + steps;
     const xs = try gpa.alloc(A, total);
     defer gpa.free(xs);
@@ -397,20 +492,30 @@ fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize
     for (pres) |p| try mlx.check(mlx.mlx_array_eval(p));
 
     var us: [max_steps]f64 = undefined;
+    var bus: [max_steps]f64 = undefined;
     std.debug.assert(steps <= us.len);
     sleepSecs(2000);
     waitForGate();
     for (0..total) |k| {
         if (k == warm) sleepSecs(500);
-        if (ab) |a| a.probe.arm = a.arms[a.armOf(k -| warm)];
+        if (ab) |a| {
+            a.probe.arm = a.arms[if (k < warm) k % a.n else a.armOf(k - warm)];
+            ffn_seg.set(a.probe.arm.ffn);
+        }
         const s0 = nowUs();
         const out = try dsv41.workerStep(fx.m, gpa, xs[k], pres[k], p0.*, false, false);
         for (out) |o| _ = mlx.mlx_array_free(o);
-        if (k >= warm) us[k - warm] = @floatFromInt(nowUs() - s0);
+        if (k >= warm) {
+            us[k - warm] = @floatFromInt(nowUs() - s0);
+            bus[k - warm] = @floatFromInt(ffn_seg.build_us);
+        }
         p0.* += rows;
     }
     sleepSecs(500);
-    if (ab) |a| printArms(a, rows, us[0 .. steps - steps % a.n]);
+    if (ab) |a| {
+        printArms(a, rows, us[0 .. steps - steps % a.n]);
+        printBuild(a, rows, bus[0 .. steps - steps % a.n]);
+    }
     var sorted: [max_steps]f64 = undefined;
     @memcpy(sorted[0..steps], us[0..steps]);
     std.mem.sort(f64, sorted[0..steps], {}, std.sort.asc(f64));
