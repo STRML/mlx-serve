@@ -165,7 +165,9 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     const t1 = self.next_token_id;
     const idx = try self.mtpLookupIndex(allocator);
     const found = idx.matchBest(t1, @intCast(dsv41_mod.maxVerifyDrafts(mdl)));
-    const n = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, mdl.ds_block);
+    const longest = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, mdl.ds_block);
+    if (longest == 0) return null;
+    const n = sizedCopyLen(self, longest, found.?.suffix);
     if (n == 0) return null;
     const ids = try allocator.alloc(u32, n + 1);
     ids[0] = t1;
@@ -181,7 +183,29 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     self.dspark_copies += 1;
     self.dspark_copy_drafted += n;
     self.dspark_copy_accepted += round.accepted;
+    if (self.dspark_pol) |*pol| pol.copy.observe(found.?.suffix, @intCast(n), round.accepted);
     return self.commitDsparkRound(allocator, round, st.n);
+}
+
+/// The copied drafts worth verifying: each priced at the copy's measured survival (`CopyStats`) against the verify
+/// ladder, at most `longest`. `DSV41_COPY_SIZE=0` verifies `longest` every time.
+fn sizedCopyLen(self: *Generator, longest: usize, suffix: u32) usize {
+    const pol = if (self.dspark_pol) |*p| p else return longest;
+    if (!copySizing()) return longest;
+    var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+    const m = @min(longest, p.len);
+    @memset(p[0..m], pol.copy.probability(suffix));
+    const costs = dflash_policy.priorCosts(pol.plain.ms);
+    return dflash_policy.chooseRows(p[0..m], &costs).rows - 1;
+}
+
+var copy_sizing: ?bool = null;
+fn copySizing() bool {
+    if (copy_sizing == null) {
+        const raw = std.c.getenv("DSV41_COPY_SIZE");
+        copy_sizing = if (raw) |r| r[0] != '0' else true;
+    }
+    return copy_sizing.?;
 }
 
 /// One DSpark round on module `mod` (deepseek_v4 or deepseek_v41, which
