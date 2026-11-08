@@ -28,8 +28,10 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
 - `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built on
   every GPU (NAX too); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the
-  expert-pruned packs are 2-bit g128). Otherwise `routed` runs. Its ubench times both launches at the per-rank widths
-  2304 / 1152 / 576.
+  expert-pruned packs are 2-bit g128). Otherwise `routed` runs. `DSV41_MOE_BW=0` keeps the first launches (bit-equal).
+  Its ubench times both arms at the per-rank widths 2304 / 1152 / 576 against a streaming read.
+- A MoE ubench routes scattered experts and cycles 80+ weight sets: consecutive expert ids read far slower on M5 Max
+  than a router's picks, and one reused set reads from the cache.
 - Under `tp` each `tpSum` is a CPU-stream JACCL all_sum, two a layer. With `MLX_METAL_FAST_SYNCH` (on in a group) MLX
   hands off through its fences (`mlx/backend/metal/fence.cpp`): the GPU dispatches `input_coherent` and `fence_update`
   before the sum and spins in the one-thread `fence_wait` kernel until the CPU finishes it, so the collective's wait
