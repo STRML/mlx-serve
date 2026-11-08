@@ -81,6 +81,14 @@ at 6 rows head 0.33-0.37 ms, Engram 2 x 0.46-0.52 ms. The Engram quant is a gues
 A real 1-row step therefore adds about 0.3 ms (head) + 2 x 0.3 ms (Engram wkv) = 0.9-1.0 ms to the tables below, plus
 the head's all-gather.
 
+## A/B arms
+
+`DSV41_KMAP_AB="base/seg:0/seg:1"` (`;` joins experiments) rotates the arms in blocks. Arms: `base`; `ctl|twin|same|pre|precopy:<in_proj|wq_b|wo_a|wo_b>[:idx|plain]`
+(a projection probe); `ffn:nopre|oracle` (FFN ceilings, `seg_bounds.zig`); `seg:<0-5>` (`DSV41_FUSED_SEG` level N); `seg:broken` (the
+stock MoE with the shared expert zeroed, test-only). After each phase a `seg:` arm runs `segCheck`: every captured layer's FFN segment
+against stock (rel rms, routes missed) and a smaller twin's whole step against its f32 twin, printing `SEG-CHECK-OK` or
+`SEG-CHECK-FAIL <what>`; on a failure the A/B lines are not printed.
+
 ## Layers
 
 `layer:r<compress ratio><K=KV source><I=index source><E=Engram>`, printed by the test:

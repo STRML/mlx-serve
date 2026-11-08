@@ -481,6 +481,8 @@ pub const Dsv41Model = struct {
     /// Test-only: skip the QAT round-trips (the reference's plain-math mode).
     qat_off: bool = false,
     probe: ?*const ProjProbe = null,
+    fused_seg: dkern.seg.Level = .off,
+    seg: ?*dkern.seg.State = null,
     /// The routed experts from a streamed bank (`sdk/weights/streamed.zig`); null = the in-memory banks.
     streamed: ?streamed.Routed = null,
     /// The pack's routed experts live in a streamed bank: the trunk loads none (`InitOpts.streamed_experts`).
@@ -1957,6 +1959,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         const r = ci(R);
         u.* = .{ .pre = try ownConst(m, &.{ r, 1, ci(cfg.hidden_size) }, .bfloat16, 0), .post = try ownConst(m, &.{ r, 1 }, .float32, 1), .comb = try ownConst(m, &.{ r, 1, 1 }, .float32, 0) };
     };
+    m.fused_seg = dkern.seg.levelFromEnv();
+    dkern.seg.announce(m);
     try compileRegions(m);
     if (n_stages > 0) {
         if (m.draft_shard and m.head_part == null) return error.Dsv41DraftShardNeedsVocabHead;
@@ -4881,13 +4885,13 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
 
 /// A tensor split's FFN at decode width, from the summed attention output `ao`: this rank's experts over the routes,
 /// summed with the other ranks', then the hc expand. `pre` becomes the FFN's mix.
-fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, pre: *A) !A {
-    if (try dkern.ffn_seg.tpFfn(sc, m, li, x, ao, sa, pre)) |y| return y;
+pub fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, pre: *A) !A {
+    if (try dkern.seg_bounds.tpFfn(sc, m, li, x, ao, sa, pre)) |y| return y;
     const ly = &m.layers[li];
     var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
     try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
     try VerifyPicks.note(m, li, p[5]);
-    dkern.ffn_seg.remember(li, &p);
+    dkern.seg_bounds.remember(li, &p);
     pre.* = p[1];
     const part = try moeFused(sc, m, ly, p[4], p[5], p[6]) orelse try moePartial(sc, m, ly, p[4], p[5], p[6]);
     return hcExpand(sc, p[0], try tpSum(sc, m, part), &.{ .pre = p[1], .post = p[2], .comb = p[3] });
@@ -4897,7 +4901,8 @@ fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, p
 /// the down launch's hc expand over one copy with no residual and a unit post is the MoE output itself.
 pub fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A) !?A {
     const kf = m.dec.moe_fp4 orelse return null;
-    const act = try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts) orelse return null;
+    const up = try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts) orelse return null;
+    const act = if (dkern.seg.broken) try dkern.seg.zeroShared(sc, up) else up;
     const R = dim(h, 0);
     const one = &m.tp_units[R - 1];
     const y = try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, one.pre, one) orelse return null;
@@ -5883,9 +5888,9 @@ pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usiz
         }
     }
     if (verify) try armVerify(st, m.n_layers);
-    const tb = dkern.ffn_seg.nowUs();
+    const tb = dkern.seg_bounds.nowUs();
     try runLayers(m, gpa, st, &sp, held, p.lo, p.hi);
-    dkern.ffn_seg.build_us = dkern.ffn_seg.nowUs() - tb;
+    dkern.seg_bounds.build_us = dkern.seg_bounds.nowUs() - tb;
     st.n = p0 + L;
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
