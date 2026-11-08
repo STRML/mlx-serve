@@ -10,8 +10,31 @@ At 1 row the three groups that had no name, hc stages, router and attention core
 (13% + 8% + 6%). The rest of the gap to the ubench per-launch numbers is that the named kernels cost more in the step
 than alone: wo_a 35.8 us against 22.2, wo_b 35.1 against 23.9, in_proj 38.3 against 24.9, wq_b 39.8 against 25.8, MoE up
 59.1 against 49.6, down 37.7 against 30.3 (scaling by the stock busy time brings the MoE launches to the ubench numbers
-and leaves the projections 30-40% above them). On the 8 index-owner layers `wq_b` runs at 46-55 us against 30-36 on the
+and leaves the projections 30-40% above them; measured in the stock step they are not, see the next section). On the 8 index-owner layers `wq_b` runs at 46-55 us against 30-36 on the
 others. At 6 rows `hc_split` grows to 62 us a launch, 8.8% of the step, and the MoE takes 52%.
+
+## The projections cost their bytes in the step
+
+The per-launch numbers above are the labelled build's (one primitive a command buffer, then spread over the stock busy
+time), and they overstate the attention projections. Measured in the stock step instead, by launching each projection
+once more on a copy of its weights just before the real one (`twin:<at>` less `ctl:<at>`, the copy launch alone, in the
+same rotated blocks; `DSV41_KMAP_AB`), at 1 row with 96 experts, a projection costs about its weights at the 450 GB/s
+streaming read the ubench measures:
+
+| projection | MB a launch | at 450 GB/s | in the step, twin less ctl (phases) |
+|---|---|---|---|
+| in_proj | 11.4 | 25.4 us | 24.6, 27.1 (20-40); 23.7, 26.5 (0-20) |
+| wq_b, plain layers | 10.8 | 24.0 us | 25.0, 28.5, 29.9 (20-40, 15 layers) |
+| wq_b, index owners | 16.2 | 36.0 us | 34, 31, 48 (20-40, 5 layers) |
+| wo_a | 8.65 | 19.2 us | 19.7, 18.3, 20.8 (20-40); 26.0, 26.0 (0-20) |
+| wo_b | 10.8 | 24.0 us | 26.9, 26.4 (20-40); 23.1, 28.4 (0-20) |
+
+So there is no in-step premium to recover: each projection streams at 75-100% of the read floor inside the step. The
+index owners' wider `wq_b` is their extra bytes (the index heads' 4096 rows, 1.5x). A dependent copy launch costs 0-6 us
+(`ctl` less `base`). The same twin on the layer's own weights (`same:wq_b`) leaves the real launch 10-11 us faster, so a
+projection whose weights sit in the cache reads in about 40% less time; a concurrent read of `wo_a`'s weights placed
+beside the attention launch (`pre:wo_a`, `precopy:wo_a`) did not overlap it (the read cost what a lone read costs) and
+left the step 2-4 us a layer slower. The Mac had other GPU tenants through every run: quote these to about 15%.
 
 ## Method
 
