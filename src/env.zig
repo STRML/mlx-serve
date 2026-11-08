@@ -303,6 +303,7 @@ pub const vars = struct {
 
     // ── kill switches and opt-in arms ──
     pub const DSV41_DRAFT_SHARD: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.3", .doc = "DeepSeek-V4.1 tensor group: every rank drafts DSpark on its slice of the stages (=0: rank 0 alone); rank 0's value reaches the workers" };
+    pub const DSV41_ATTN_BW: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.3", .doc = "DeepSeek-V4.1 fused attention-side decode launches laid out for the memory system, the same sums: in_proj staged from two rows, wq_b at four threadgroups a core, wo_a's split merge shared per row (=0: the previous layout)" };
     pub const DSV41_MOE_BW: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.3", .doc = "DeepSeek-V4.1 fused mxfp4 MoE decode launches laid out for memory bandwidth, the same sums (=0: the previous layout)" };
     pub const MINIMAX_H3_GLUE_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 fused glue kernels (=0: the op chain)" };
     pub const MINIMAX_H3_VSA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 trained VSA sparse attention (=0: dense attention, no gate branch)" };
