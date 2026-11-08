@@ -210,8 +210,7 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
     return try mtpSerialOneToken(allocator, tok);
 }
 
-/// The first drafted rounds after a load run on cold kernels and would judge drafting a loss for the whole request
-/// (48 tok/s against 169 warm on the TP4 lossless group, 2026-11-07).
+/// The first drafted rounds after a load run on cold kernels and would judge drafting a loss for the whole request.
 const DSPARK_WARMUP_ROUNDS: u32 = 16;
 
 /// A plain step's cost, learned per model: the next request starts from it instead of the prior.
