@@ -157,6 +157,7 @@ fn printUsage(io: std.Io) void {
         \\                      [--model-dir <dir>]... (default ~/.mlx-serve/models)
         \\  dist-probe          Measure the RDMA link: --rank 0|1 --coordinator
         \\                      <ip:port> --device <rdma_enX> [--soak N]
+        \\                      [--size N] [--sweep: all_sum at 4 B .. 256 KiB]
         \\  launch <agent>      Configure + launch a coding agent CLI against the
         \\                      local server (claude, pi, omp, opencode, codex,
         \\                      hermes, aider, zcode); starts the MLX-Serve app if the

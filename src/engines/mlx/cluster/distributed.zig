@@ -20,6 +20,8 @@ const h3_split = @import("../../../plugins/minimax_h3/cluster.zig");
 const wire = @import("../../../sdk/util/wire.zig");
 const lan = @import("../../../host/lan/lan.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
+const sum_timeline = @import("sum_timeline.zig");
+const sum_sweep = @import("sum_sweep.zig");
 
 pub const Mode = enum {
     /// Each rank owns a contiguous range of layers; the hidden stream hops at the seams.
@@ -974,6 +976,7 @@ fn noteJob(split: [2]u32, line: []const u8) void {
 /// Rank 0 at shutdown: releases the worker. A peer that vanishes mid-protocol crashes the
 /// other side inside Apple's RDMA library, so the group always ends with this message.
 pub fn shutdown() void {
+    sum_timeline.disarm();
     const p = peer() orelse return;
     if (!p.ready) return;
     // The stopped workers post no more receives: a later message (the model's unload) would wait forever.
@@ -994,6 +997,7 @@ pub fn shutdown() void {
 /// Rank 0, on the inference thread, when the group's model unloads here: every worker frees its
 /// part too and waits for the next plan, which the model's next load sends.
 pub fn release() void {
+    sum_timeline.disarm();
     const p = peer() orelse return;
     if (!p.ready) return;
     for (1..p.link.size) |k| sendMsg(&p.link, .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 }, @intCast(k)) catch |err| {
@@ -1211,6 +1215,7 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
             self.plan_id = try pl.send(&self.link, model_dir);
             self.planned = true;
             cluster().tp_link = &self.link;
+            sum_timeline.arm(self.link.rank);
             dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
             dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
             dsv41_mod.clusterHooks().tp_step = &dsv41TpStep;
@@ -1253,6 +1258,7 @@ fn dsv41TpGather(x: mlx.mlx_array) anyerror!mlx.mlx_array {
 
 /// The sums the step before this one built, logged where a prompt step ends or the count is not a decode step's.
 fn noteTpStep(p0: usize, rows: usize) void {
+    sum_timeline.step();
     const c = cluster();
     if (c.tp_last.rows > 0 and (c.tp_last.rows > 1 or c.tp_sums != 80)) log.info("[dist] tensor step at {d}: {d} rows, {d} sums of {d} values\n", .{ c.tp_last.p0, c.tp_last.rows, c.tp_sums, c.tp_values });
     c.tp_sums = 0;
@@ -1448,9 +1454,11 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     };
     defer m.deinit();
     cluster().tp_link = link;
+    sum_timeline.arm(link.rank);
     dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
     dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
     defer {
+        sum_timeline.disarm();
         dsv41_mod.clusterHooks().tp_sum = null;
         dsv41_mod.clusterHooks().tp_gather = null;
         cluster().tp_link = null;
@@ -2090,10 +2098,12 @@ fn chainProbe(io: std.Io, link: *const Link, s: mlx.mlx_stream) !void {
 /// `mlx-serve dist-probe --rank R --coordinator IP:PORT --device rdma_enX`:
 /// joins the group and measures round trips at the sizes inference moves
 /// (one decode row of a hyper-connection stream, a prefill chunk) and all_sum.
+/// `--sweep`, at any `--size`, times all_sum at 4 B .. 256 KiB in bf16 and f32 instead (`sum_sweep`).
 pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     // `--soak N`: N header + one-row-stream round trips, the shape of a pipeline decode hop.
     var soak: u64 = 0;
     var chain = false;
+    var sweep = false;
     var rest: [16][]const u8 = undefined;
     var n_rest: usize = 0;
     var ai: usize = 0;
@@ -2103,6 +2113,8 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
             ai += 1;
         } else if (std.mem.eql(u8, args[ai], "--chain")) {
             chain = true;
+        } else if (std.mem.eql(u8, args[ai], "--sweep")) {
+            sweep = true;
         } else if (n_rest < rest.len) {
             rest[n_rest] = args[ai];
             n_rest += 1;
@@ -2116,6 +2128,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     const other: u32 = if (link.rank == 0) 1 else 0;
     if (soak > 0) return soakLink(io, &link, other, soak, s);
     if (chain) return chainProbe(io, &link, s);
+    if (sweep) return sum_sweep.run(io, &link, s);
 
     const sizes = [_]c_int{ 1, 5120, 10240, 262144, 6553600 }; // f32 elements: 4 B .. 25 MB
     for (sizes) |n| {
@@ -2252,7 +2265,7 @@ pub fn parseArgs(args: []const []const u8) !Config {
         i += 1;
     }
     if (rank == null or coordinator == null or device == null) {
-        log.err("usage: mlx-serve dist-probe --rank N [--size N] --coordinator IP:PORT --device rdma_enX[,rdma_enY...]\n", .{});
+        log.err("usage: mlx-serve dist-probe --rank N [--size N] --coordinator IP:PORT --device rdma_enX[,rdma_enY...] [--sweep]\n", .{});
         return error.InvalidArgs;
     }
     if (size < 2 or size > max_ranks or rank.? >= size) {

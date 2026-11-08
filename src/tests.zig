@@ -306,6 +306,8 @@ test {
     _ = @import("plugins/minimax_h3/vsa.zig");
     _ = @import("plugins/minimax_h3/cluster.zig");
     _ = @import("engines/mlx/cluster/distributed.zig");
+    _ = @import("engines/mlx/cluster/sum_timeline.zig");
+    _ = @import("engines/mlx/cluster/sum_sweep.zig");
     _ = @import("plugins/minimax_h3/vision.zig");
     _ = @import("plugins/minimax_h3/vae.zig");
     _ = @import("plugins/minimax_h3/audio.zig");

@@ -1,0 +1,63 @@
+--- a/mlx/distributed/jaccl/lib/jaccl/rdma.h
++++ b/mlx/distributed/jaccl/lib/jaccl/rdma.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include <infiniband/verbs.h>
++#include <time.h>
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -57,6 +58,16 @@
+ 
+ namespace jaccl {
+ 
++using CqeHook = void (*)(uint32_t peer, uint64_t ns);
++
++inline std::atomic<CqeHook> cqe_hook{nullptr};
++
++inline void note_recv_cqe(int peer) {
++  if (auto hook = cqe_hook.load(std::memory_order_relaxed)) {
++    hook(peer, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
++  }
++}
++
+ /**
+  * Wrapper for the ibverbs API.
+  */
+--- a/mlx/distributed/jaccl/lib/jaccl/rdma.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/rdma.cpp
+@@ -420,3 +420,7 @@
+ }
+ 
+ } // namespace jaccl
++
++extern "C" void jaccl_set_cqe_hook(jaccl::CqeHook hook) {
++  jaccl::cqe_hook.store(hook, std::memory_order_relaxed);
++}
+--- a/mlx/distributed/jaccl/lib/jaccl/mesh_impl.h
++++ b/mlx/distributed/jaccl/lib/jaccl/mesh_impl.h
+@@ -125,6 +125,7 @@
+         }
+ 
+         else if (work_type == RECV_WR) {
++          note_recv_cqe(rank);
+           recv_end[rank]++;
+         }
+       }
+@@ -275,6 +276,7 @@
+ 
+         // Recv completed. If we have more chunks then post another recv.
+         else if (work_type == RECV_WR) {
++          note_recv_cqe(rank);
+           std::copy(
+               recv_buffer(sz, buff, rank).begin<char>(),
+               recv_buffer(sz, buff, rank).begin<char>() +
+@@ -391,6 +393,7 @@
+         // Recv completed. Reduce the peer's contribution into our chunk and, if
+         // there is more data to fetch from that peer, post another recv.
+         else if (work_type == RECV_WR) {
++          note_recv_cqe(rank);
+           int64_t elems = std::min(N, total - write_offset[rank]);
+           reduce_op(
+               scatter_recv_buffer(sz, buff, rank).begin<T>(),

@@ -28,6 +28,9 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   hands off through its fences (`mlx/backend/metal/fence.cpp`): the GPU dispatches `input_coherent` and `fence_update`
   before the sum and spins in the one-thread `fence_wait` kernel until the CPU finishes it, so the collective's wait
   counts as GPU busy time. `DSV41_DEC_UBENCH` also times that hand-off without the network (decode.zig).
+- Where a sum's time goes: `MLX_SERVE_DIAG=tp-sum-timeline` on every rank prints `[tp-sum]` lines (p50/p90/max of spin,
+  a>b, b>c, c>d, per-peer CQE) every 256 forwards. Needs `patches/mlx-tp-sum-timeline.patch` (+ `jaccl-tp-sum-cqe.patch`)
+  applied to `lib/mlx-src` and MLX rebuilt; a stock MLX logs one `[tp-sum]` line saying so. `dist-probe --sweep` times all_sum by size.
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
   (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.

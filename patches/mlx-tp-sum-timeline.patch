@@ -1,0 +1,108 @@
+--- /dev/null
++++ b/mlx/tp_sum_hook.h
+@@ -0,0 +1,45 @@
++// Copyright © 2026 Apple Inc.
++
++#pragma once
++
++#include <time.h>
++#include <atomic>
++#include <cstdint>
++
++namespace mlx::core {
++
++// The phases of one tensor-parallel sum on the CPU stream, in order: the wait
++// task for the GPU's fence starts spinning, sees the fence, the collective is
++// entered (arg: bytes) and returns, and the CPU's fence update that releases
++// the GPU's wait runs.
++enum class TpSumPhase : uint32_t {
++  WaitBegin,
++  FenceSeen,
++  SumEnter,
++  SumReturn,
++  Release,
++};
++
++using TpSumHook = void (*)(uint32_t phase, uint64_t arg, uint64_t ns);
++
++inline std::atomic<TpSumHook> tp_sum_hook{nullptr};
++
++struct TpSumStamp {
++  TpSumHook hook;
++  uint64_t ns;
++};
++
++// Reads the clock only when a hook is set, so the stamp is taken at the call
++// site and the hook runs after it.
++inline TpSumStamp tp_sum_now() {
++  auto hook = tp_sum_hook.load(std::memory_order_relaxed);
++  return {hook, hook ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0};
++}
++
++inline void tp_sum_emit(TpSumStamp s, TpSumPhase phase, uint64_t arg = 0) {
++  if (s.hook) {
++    s.hook(static_cast<uint32_t>(phase), arg, s.ns);
++  }
++}
++
++} // namespace mlx::core
+--- a/mlx/backend/metal/fence.cpp
++++ b/mlx/backend/metal/fence.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "mlx/backend/metal/device.h"
+ #include "mlx/scheduler.h"
++#include "mlx/tp_sum_hook.h"
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core {
+@@ -56,9 +57,11 @@
+ 
+   if (stream.device == Device::cpu) {
+     scheduler::enqueue(stream, [fence_ = fence_, value]() mutable {
++      tp_sum_emit(tp_sum_now(), TpSumPhase::WaitBegin);
+       auto& f = *static_cast<FenceImpl*>(fence_.get());
+       while (f.cpu_value()[0] < value) {
+       }
++      tp_sum_emit(tp_sum_now(), TpSumPhase::FenceSeen);
+     });
+     return;
+   }
+@@ -98,7 +101,9 @@
+   if (stream.device == Device::cpu) {
+     scheduler::enqueue(stream, [fence_ = fence_, count = f.count]() mutable {
+       auto& f = *static_cast<FenceImpl*>(fence_.get());
++      auto stamp = tp_sum_now();
+       f.cpu_value()[0] = count;
++      tp_sum_emit(stamp, TpSumPhase::Release);
+     });
+     return f.count;
+   }
+--- a/mlx/distributed/jaccl/jaccl.cpp
++++ b/mlx/distributed/jaccl/jaccl.cpp
+@@ -4,6 +4,7 @@
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/distributed/distributed_impl.h"
+ #include "mlx/dtype_utils.h"
++#include "mlx/tp_sum_hook.h"
+ 
+ #include <jaccl/group.h>
+ #include <jaccl/jaccl.h>
+@@ -87,7 +88,9 @@
+     encoder.set_input_array(input);
+     encoder.set_output_array(output);
+     encoder.dispatch([in_ptr, out_ptr, n_bytes, dtype, this]() {
++      tp_sum_emit(tp_sum_now(), TpSumPhase::SumEnter, n_bytes);
+       group_->all_sum(in_ptr, out_ptr, n_bytes, dtype);
++      tp_sum_emit(tp_sum_now(), TpSumPhase::SumReturn);
+     });
+   }
+ 
+@@ -191,3 +194,7 @@
+ }
+ 
+ } // namespace mlx::core::distributed::jaccl
++
++extern "C" __attribute__((visibility("default"))) void mlx_set_tp_sum_hook(mlx::core::TpSumHook hook) {
++  mlx::core::tp_sum_hook.store(hook, std::memory_order_relaxed);
++}

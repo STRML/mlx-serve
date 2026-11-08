@@ -33,6 +33,7 @@ comptime {
     _ = @import("engines/mlx/transformer.zig").cli_shared;
     _ = @import("engines/mlx/generate.zig").prefillCli_shared;
     _ = @import("engines/mlx/cluster/distributed.zig").cluster_shared;
+    _ = @import("engines/mlx/cluster/sum_timeline.zig").timeline_shared;
     _ = @import("engines/mlx/diag/profile.zig").profileState_shared;
     _ = @import("engines/mlx/ssm/group.zig").ssmGroup_shared;
     _ = @import("engines/mlx/modules/stream_glue.zig").glueState_shared;

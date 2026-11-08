@@ -388,6 +388,7 @@ pub const vars = struct {
     pub const SUSHI_EXL3_UNION_HIST: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/quant/exl3/sushi", .since = "26.10.1", .doc = "sushi EXL3 meter: exl3 union hist" };
     pub const SUSHI_EXL3_WIDE_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/quant/exl3/sushi", .since = "unreleased", .doc = "sushi EXL3 meter: exl3 wide ubench" };
     pub const SUSHI_GLM_T1_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/quant/exl3/sushi", .since = "26.10.3", .doc = "sushi EXL3 meter: glm t1 ubench" };
+    pub const TP_SUM_TIMELINE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "engines/mlx/cluster", .since = "unreleased", .doc = "tensor-parallel sums: per rank, p50/p90/max of each sum's fence-to-entry, collective and release time every 256 steps (`[tp-sum]`); needs the patched MLX, patches/mlx-tp-sum-timeline.patch" };
     pub const TTS_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/qwen3_tts", .since = "26.6.13", .doc = "Qwen3-TTS first frames' codes on stderr" };
     pub const VERIFY_WIDTH_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/blocks/linear", .since = "26.8.5", .doc = "spec-verify width sweep µbench" };
     pub const VQMM_FN_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/blocks/linear", .since = "26.10.2", .doc = "verifyQmm Flash Next shapes µbench: stock vs plain vs NAX per width" };
