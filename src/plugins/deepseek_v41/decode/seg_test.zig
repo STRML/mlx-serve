@@ -4,14 +4,18 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
 const env = @import("../../../env.zig");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
+const ffn_in = @import("ffn_in.zig");
 const fixture = @import("fixture.zig");
 const kernel_map = @import("kernel_map.zig");
 const seg = @import("seg.zig");
+const seg_ffn_in = @import("seg_ffn_in.zig");
 const seg_bounds = @import("seg_bounds.zig");
 
 const A = mlx.mlx_array;
+const none: A = .{ .ctx = null };
 const Fixture = fixture.Fixture;
 
 fn gpuTest() bool {
@@ -298,4 +302,256 @@ test "dsv41 fused seg: init reads DSV41_FUSED_SEG into the model" {
         defer fx.deinit();
         try std.testing.expectEqual(e.level, fx.m.fused_seg);
     }
+}
+
+fn hostsOf(comptime n: usize, srcs: [n]A) ![n][]f32 {
+    var out: [n][]f32 = undefined;
+    var made: usize = 0;
+    errdefer for (out[0..made]) |h| std.testing.allocator.free(h);
+    for (srcs, &out) |a, *h| {
+        h.* = try dsv41.hostF32(a);
+        made += 1;
+    }
+    return out;
+}
+
+const Inputs = struct { x: A, y: A, cpre: A, sa: dsv41.Split };
+
+fn inputsOf(sc: *dsv41.Scope, fx: *Fixture, ly: *const dsv41.Layer, rows: usize) !Inputs {
+    const x = try sc.keep(try fx.stream(rows));
+    const cpre = try sc.keep(try fx.cpre(rows));
+    const y = try sc.keep(try fx.normal(&.{ @intCast(rows), @intCast(fx.m.cfg.hidden_size) }, .bfloat16, 0, 1));
+    const sa = (try dsv41.hcStage(sc, fx.m, x, null, cpre, &ly.hc_attn, ly.attn_norm)).sp;
+    return .{ .x = x, .y = y, .cpre = cpre, .sa = sa };
+}
+
+fn chainOf(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, in: Inputs) !ffn_in.Out {
+    const pf = try dsv41.hcExpandPreNorm(sc, m, in.x, in.y, &in.sa, in.sa.pre, &ly.hc_ffn, ly.ffn_norm);
+    const rt = try dsv41.route(sc, m, ly, pf.h, none);
+    return .{ .x1 = pf.x1, .h2 = pf.h, .sf = pf.sp, .idx = rt.idx, .wts = rt.wts };
+}
+
+fn evalOut(o: ffn_in.Out) !void {
+    try dsv41.evalAll(&.{ o.x1, o.h2, o.sf.pre, o.sf.post, o.sf.comb, o.idx, o.wts });
+}
+
+test "dsv41 fused seg ffn_in: R = 1 at 384 experts no further from float64 than today's chain" {
+    if (!gpuTest()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 0, .fused = true });
+    defer fx.deinit();
+    _ = try seg.ensure(fx.m);
+    const w = try ffn_in.randomWeights(77);
+    defer ffn_in.freeWeights(w);
+    const ly = ffn_in.layerWith(fx.layer(21), w);
+    const c = &fx.m.cfg;
+    var worst_wts: f64 = 0;
+    for ([_]usize{ 1, 6 }) |rows| {
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const in = try inputsOf(&sc, fx, &ly, rows);
+        const chain = try chainOf(&sc, fx.m, &ly, in);
+        const before = seg.dispatches;
+        const out = (try seg_ffn_in.launch(&sc, fx.m, 21, &ly, in.x, in.y, &in.sa)) orelse return error.Declined;
+        try std.testing.expectEqual(before + 1, seg.dispatches);
+        try evalOut(chain);
+        try evalOut(out);
+        const p: ffn_in.Dims = .{ .rows = rows, .d = c.hidden_size, .e = 384, .top_k = ly.top_k, .iters = c.dsv4_hc_sinkhorn_iters, .norm = c.moe_route_norm and ly.top_k > 1 };
+        const h = try hostsOf(11, .{ in.x, in.sa.pre, in.sa.post, in.sa.comb, w.fn_w, w.fn_scale, w.fn_base, w.norm_w, w.gate_w, w.gate_bias, in.y });
+        defer for (h) |a| gpa.free(a);
+        var truth = try ffn_in.truthOf(gpa, .{ .p = p, .wo = &.{}, .oa = &.{}, .x = h[0], .pre = h[1], .post = h[2], .comb = h[3], .fnw = h[4], .scale = h[5], .base = h[6], .norm_w = h[7], .gate_w = h[8], .bias = h[9], .eps0 = c.rms_norm_eps, .eps1 = c.dsv4_hc_eps, .y = h[10] });
+        defer truth.deinit();
+        const cmp = try ffn_in.compareToChain(gpa, fx.m, p, &truth, chain, out);
+        try std.testing.expectEqual(@as(usize, 0), cmp.differ);
+        worst_wts = @max(worst_wts, cmp.wts_rel);
+    }
+    std.debug.print("[seg] ffn_in route weights vs the chain: largest relative difference {e:.2}\n", .{worst_wts});
+}
+
+fn expectSameBytes(gpa: std.mem.Allocator, label: []const u8, a: A, b: A) !void {
+    const u = try dsv41.hostF32(a);
+    defer gpa.free(u);
+    const v = try dsv41.hostF32(b);
+    defer gpa.free(v);
+    std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(u), std.mem.sliceAsBytes(v)) catch |e| {
+        std.debug.print("{s} differs\n", .{label});
+        return e;
+    };
+}
+
+const tp_source = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_tp.metal");
+const spike_ins = [_][*:0]const u8{ "y", "x", "spre", "spost", "scomb" };
+const spike_outs = [_][*:0]const u8{ "x1", "hv", "ctr", "parts", "logits" };
+
+fn spikeChain(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, in: Inputs) !ffn_in.Out {
+    const rows: usize = @intCast(mlx.getShape(in.x)[0]);
+    const c = &m.cfg;
+    const p: ffn_in.Dims = .{ .rows = rows, .d = c.hidden_size, .e = @intCast(mlx.getShape(ly.gate_w)[0]), .top_k = ly.top_k, .iters = c.dsv4_hc_sinkhorn_iters, .norm = c.moe_route_norm and ly.top_k > 1 };
+    const kern = try dsv41.buildKernel("dsv41_dec_ffn_in_tp", &spike_ins, &spike_outs, tp_source, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const D: c_int = @intCast(p.d);
+    const R: c_int = @intCast(rows);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ R, 4, D }, 3, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ R, D }, 2, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{16}, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{@intCast(ffn_in.partsLen(p))}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ R, @intCast(p.e) }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, D, R, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", D));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HC", 4));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    const ins = [_]A{ in.y, in.x, in.sa.pre, in.sa.post, in.sa.comb };
+    const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
+    var a: [5]A = undefined;
+    for (&a, 0..) |*o, i| {
+        o.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(o, ov, i));
+        _ = try sc.keep(o.*);
+    }
+    const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{c.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
+    const ks = m.dec.ffn_in orelse return error.Declined;
+    const b = try ffn_in.launchB(sc, ks, p, ffn_in.weightsOf(ly), .{ .x1 = a[0], .hv = a[1], .ctr = a[2], .parts = a[3], .logits = a[4] }, try dsv41.hcEps(sc, m), scal);
+    return .{ .x1 = a[0], .h2 = b.h2, .sf = b.sf, .idx = b.idx, .wts = b.wts };
+}
+
+test "dsv41 fused seg ffn_in: the one launch writes the spike's two launches' bytes" {
+    if (!gpuTest()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 0, .fused = true });
+    defer fx.deinit();
+    _ = try seg.ensure(fx.m);
+    const w = try ffn_in.randomWeights(78);
+    defer ffn_in.freeWeights(w);
+    const ly = ffn_in.layerWith(fx.layer(22), w);
+    for ([_]usize{ 1, 2, 3, 6 }) |rows| {
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const in = try inputsOf(&sc, fx, &ly, rows);
+        const want = try spikeChain(&sc, fx.m, &ly, in);
+        const got = (try seg_ffn_in.launch(&sc, fx.m, 22, &ly, in.x, in.y, &in.sa)) orelse return error.Declined;
+        try evalOut(want);
+        try evalOut(got);
+        const names = [_][]const u8{ "x1", "h2", "pre", "post", "comb", "idx", "wts" };
+        const a = [_]A{ want.x1, want.h2, want.sf.pre, want.sf.post, want.sf.comb, want.idx, want.wts };
+        const b = [_]A{ got.x1, got.h2, got.sf.pre, got.sf.post, got.sf.comb, got.idx, got.wts };
+        for (names, a, b) |name, u, v| try expectSameBytes(gpa, name, u, v);
+    }
+}
+
+test "dsv41 fused seg: a router read of another group's scores goes through the coherent reader" {
+    const src: []const u8 = seg_ffn_in.SOURCE;
+    try std.testing.expect(std.mem.indexOf(u8, src, "seg_read_peer_f32(parts, ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "seg_read_peer_f32(logits, ") != null);
+    for ([_][]const u8{ "parts[", "logits[" }) |name| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, src, from, name)) |at| {
+            const close = std.mem.indexOfScalarPos(u8, src, at, ']').?;
+            try std.testing.expect(std.mem.startsWith(u8, src[close + 1 ..], " = "));
+            from = close;
+        }
+    }
+}
+
+fn tieLayer(w: ffn_in.Weights, base: *const dsv41.Layer) !dsv41.Layer {
+    const host = try dsv41.hostF32(w.gate_w);
+    defer std.testing.allocator.free(host);
+    const d = host.len / 384;
+    @memcpy(host[300 * d ..][0..d], host[7 * d ..][0..d]);
+    const gate = mlx.mlx_array_new_data(host.ptr, &[_]c_int{ 384, @intCast(d) }, 2, .float32);
+    var gate_bf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gate);
+    try mlx.check(mlx.mlx_astype(&gate_bf, gate, .bfloat16, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_array_eval(gate_bf));
+    var bias: [384]f32 = @splat(0);
+    for (0..5) |e| bias[e] = 100;
+    bias[7] = 50;
+    bias[300] = 50;
+    const bias_a = mlx.mlx_array_new_data(&bias, &[_]c_int{ 1, 384 }, 2, .float32);
+    var l = ffn_in.layerWith(base, w);
+    l.gate_w = gate_bf;
+    l.gate_bias = bias_a;
+    return l;
+}
+
+test "dsv41 fused seg: four ranks route bit for bit over 1000 launches, an exact tie to the lower index" {
+    if (!gpuTest()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var ranks: [4]*Fixture = undefined;
+    var made: usize = 0;
+    defer for (ranks[0..made]) |r| r.deinit();
+    for (&ranks, 0..) |*r, i| {
+        var o = tp4;
+        o.lo = 21;
+        o.hi = 22;
+        o.ctx = 0;
+        o.tp = .{ .rank = @intCast(i), .size = 4 };
+        r.* = try Fixture.init(gpa, o);
+        made += 1;
+        _ = try seg.ensure(r.*.m);
+    }
+    const w = try ffn_in.randomWeights(79);
+    defer ffn_in.freeWeights(w);
+    const ly = try tieLayer(w, ranks[0].layer(21));
+    defer {
+        _ = mlx.mlx_array_free(ly.gate_w);
+        _ = mlx.mlx_array_free(ly.gate_bias);
+    }
+    var sc0 = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc0.deinit();
+    const in = try inputsOf(&sc0, ranks[0], &ly, 1);
+    var first: ?[2][]f32 = null;
+    defer if (first) |f| for (f) |a| gpa.free(a);
+    const before = seg.dispatches;
+    for (0..250) |_| for (ranks) |r| {
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const out = (try seg_ffn_in.launch(&sc, r.m, 21, &ly, in.x, in.y, &in.sa)) orelse return error.Declined;
+        try dsv41.evalAll(&.{ out.idx, out.wts });
+        const got = [2][]f32{ try dsv41.hostF32(out.idx), try dsv41.hostF32(out.wts) };
+        if (first) |f| {
+            defer for (got) |a| gpa.free(a);
+            for (f, got) |u, v| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(u), std.mem.sliceAsBytes(v));
+            continue;
+        }
+        first = got;
+        for (got[0][0..5]) |e| try std.testing.expect(e < 5);
+        try std.testing.expectEqual(@as(f32, 7), got[0][5]);
+        for (got[0]) |e| try std.testing.expect(e != 300);
+    };
+    try std.testing.expectEqual(before + 1000, seg.dispatches);
+}
+
+test "dsv41 fused seg: four ranks at level 1 meet at one stream" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var o = tp4;
+    o.ctx = 0;
+    o.seg = .ffn_entry;
+    var probe = try Fixture.init(gpa, o);
+    defer probe.deinit();
+    const in = try fixture.Input.of(probe, 1);
+    defer in.deinit();
+    const before = seg.dispatches;
+    const got = try fixture.tpStreamN(gpa, o, in, 4);
+    defer gpa.free(got);
+    try std.testing.expect(seg.dispatches > before);
+}
+
+test "dsv41 fused seg: level 1 decodes layers 20..23 no further from the f32 model than stock" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    Sums.install();
+    defer Sums.remove();
+    var o = tp4;
+    o.ctx = 601;
+    o.seg = .ffn_entry;
+    const before = seg.dispatches;
+    try decode.layersAgreeOn(std.testing.allocator, o);
+    try std.testing.expect(seg.dispatches > before);
 }

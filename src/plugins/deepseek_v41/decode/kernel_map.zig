@@ -399,7 +399,7 @@ const whole_ratio = 1.15;
 
 const wts_rel_tol = 1e-6;
 
-const LayerStat = struct { layers: usize = 0, engaged: usize = 0, total: usize = 0, ndiff: usize = 0, nonfinite: usize = 0, route_rows: usize = 0, route_bad: usize = 0, num: f64 = 0, den: f64 = 0, worst: f64 = 0, declined: ?[]const u8 = null };
+const LayerStat = struct { layers: usize = 0, engaged: usize = 0, total: usize = 0, ndiff: usize = 0, nonfinite: usize = 0, route_rows: usize = 0, route_bad: usize = 0, wts_rel: f64 = 0, num: f64 = 0, den: f64 = 0, worst: f64 = 0, declined: ?[]const u8 = null };
 
 fn dup(sc: *dsv41.Scope, a: A) !A {
     return sc.keep(sc.out(a));
@@ -407,7 +407,7 @@ fn dup(sc: *dsv41.Scope, a: A) !A {
 
 fn routesOf(sc: *dsv41.Scope, li: usize) ![2]A {
     const c = seg_bounds.heldOf(li) orelse return error.NoCapture;
-    return .{ try sc.astype(c[1], .float32), try sc.astype(c[2], .float32) };
+    return .{ try dup(sc, try sc.astype(c[1], .float32)), try dup(sc, try sc.astype(c[2], .float32)) };
 }
 
 /// Rows of `rows` x `topk` routes where the picks differ in any position (order counts, so a tie that went to the
@@ -423,6 +423,16 @@ pub fn routeRowsBad(idx_a: []const f32, idx_b: []const f32, wts_a: []const f32, 
         if (row_bad) bad += 1;
     }
     return bad;
+}
+
+fn wtsRelWorst(idx_a: []const f32, idx_b: []const f32, wts_a: []const f32, wts_b: []const f32, rows: usize, topk: usize) f64 {
+    var worst: f64 = 0;
+    for (0..rows) |r| {
+        const lo = r * topk;
+        if (!std.mem.eql(f32, idx_a[lo..][0..topk], idx_b[lo..][0..topk])) continue;
+        for (wts_a[lo..][0..topk], wts_b[lo..][0..topk]) |u, v| worst = @max(worst, @abs(@as(f64, v) - u) / @max(@abs(@as(f64, u)), 1e-30));
+    }
+    return worst;
 }
 
 fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize, under: Under) !LayerStat {
@@ -442,12 +452,13 @@ fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize,
         const ya = try dsv41.tpFfn(&sc, m, li, x, ao, &sa, &pre_a);
         const ra = try routesOf(&sc, li);
         setUnder(m, under);
-        const took = switch (under) {
+        const wanted = switch (under) {
             .level => |l| l != .off and seg.on(m, li, .ffn, rows, .ffn_entry),
             .broken, .nan => false,
         };
-        if (took) st.engaged += 1 else if (st.declined == null) st.declined = seg.serves(m, rows) orelse "layer not covered";
+        const launched = seg.dispatches;
         const yb = try dsv41.tpFfn(&sc, m, li, x, ao, &sa, &pre_b);
+        if (wanted and seg.dispatches > launched) st.engaged += 1 else if (st.declined == null) st.declined = seg.serves(m, rows) orelse if (wanted) "the segment kernel declined" else "layer not covered";
         const rb = try routesOf(&sc, li);
         const af = try sc.astype(ya, .float32);
         const bf = try sc.astype(yb, .float32);
@@ -469,6 +480,7 @@ fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize,
         const wts_a = mlx.mlx_array_data_float32(ra[1]).?[0..k];
         const wts_b = mlx.mlx_array_data_float32(rb[1]).?[0..k];
         st.route_bad += routeRowsBad(idx_a, idx_b, wts_a, wts_b, rows, k / rows);
+        st.wts_rel = @max(st.wts_rel, wtsRelWorst(idx_a, idx_b, wts_a, wts_b, rows, k / rows));
         st.route_rows += rows;
         st.total += n;
         st.layers += 1;
@@ -535,7 +547,7 @@ pub fn segCheck(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usi
     }
     const whole = try wholeStep(gpa, fx, lo, hi, under);
     const rms = @sqrt(st.num / @max(st.den, 1e-30));
-    std.debug.print("[kmap] {s} vs stock: {d} layers ({d} on the segment path), {d} of {d} stream values differ ({d} non-finite), rel rms {e:.3}, max abs {e:.3}, route rows differing {d} of {d}; whole step from the f32 model (median of {d} seeds): stock {e:.3}, {s} {e:.3}\n", .{ name, st.layers, st.engaged, st.ndiff, st.total, st.nonfinite, rms, st.worst, st.route_bad, st.route_rows, whole_seeds, whole.stock, name, whole.arm });
+    std.debug.print("[kmap] {s} vs stock: {d} layers ({d} on the segment path), {d} of {d} stream values differ ({d} non-finite), rel rms {e:.3}, max abs {e:.3}, route rows differing {d} of {d} (largest weight difference {e:.2}); whole step from the f32 model (median of {d} seeds): stock {e:.3}, {s} {e:.3}\n", .{ name, st.layers, st.engaged, st.ndiff, st.total, st.nonfinite, rms, st.worst, st.route_bad, st.route_rows, st.wts_rel, whole_seeds, whole.stock, name, whole.arm });
     const why: ?[]const u8 = if (st.layers == 0)
         "no layer captured"
     else if (st.nonfinite != 0)

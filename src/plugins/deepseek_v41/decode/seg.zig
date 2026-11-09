@@ -48,10 +48,20 @@ pub const Counters = struct {
 
     /// The step's generation as a 1-element u32 input; the counters are cleared when the generation would wrap.
     pub fn next(self: *Counters, sc: *dsv41.Scope) !A {
+        const g = [1]u32{try self.advance()};
+        return sc.keep(mlx.mlx_array_new_data(&g, &[_]c_int{1}, 1, .uint32));
+    }
+
+    /// A launch's control words `[generation, first word of its slot]`, one generation a launch.
+    pub fn ctl(self: *Counters, sc: *dsv41.Scope, slot: usize) !A {
+        const g = [2]u32{ try self.advance(), @intCast(slot * slot_words) };
+        return sc.keep(mlx.mlx_array_new_data(&g, &[_]c_int{2}, 1, .uint32));
+    }
+
+    fn advance(self: *Counters) !u32 {
         if (self.gen >= max_gen) try self.reset();
         self.gen += 1;
-        const g = [1]u32{self.gen};
-        return sc.keep(mlx.mlx_array_new_data(&g, &[_]c_int{1}, 1, .uint32));
+        return self.gen;
     }
 
     /// Zero every slot and restart at generation 1, once the GPU has finished what was submitted.
@@ -84,6 +94,7 @@ pub const State = struct {
     status: A,
     protocol: Protocol,
     groups: u32,
+    dep: A = .{ .ctx = null },
 
     pub fn init(n_slots: usize, protocol: Protocol) !State {
         var counters = try Counters.init(n_slots);
@@ -96,6 +107,21 @@ pub const State = struct {
     pub fn deinit(self: *State) void {
         self.counters.deinit();
         _ = mlx.mlx_array_free(self.status);
+        if (self.dep.ctx != null) _ = mlx.mlx_array_free(self.dep);
+    }
+
+    /// The array the previous launch on these counters ended on, or a zero word before the first: the next launch takes it
+    /// as an input, so MLX orders two kernels that share the counters and the status word only through data.
+    pub fn after(self: *const State, sc: *dsv41.Scope) !A {
+        if (self.dep.ctx != null) return self.dep;
+        return sc.keep(mlx.mlx_array_new_data(&[1]u32{0}, &[_]c_int{1}, 1, .uint32));
+    }
+
+    /// `out` is what the launch just built ends on.
+    pub fn chain(self: *State, out: A) void {
+        if (self.dep.ctx != null) _ = mlx.mlx_array_free(self.dep);
+        self.dep = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&self.dep, out);
     }
 
     pub fn code(self: *const State) u32 {
@@ -112,6 +138,18 @@ pub const State = struct {
 /// The model's `State` where its level asks for one and `serves` takes the model; spin needs a probed grid, else ticket.
 pub fn create(m: *Dsv41Model) !?*State {
     if (m.fused_seg == .off or serves(m, 1) != null) return null;
+    return try build(m);
+}
+
+/// The model's `State`, made on first use where the level was set after `init` read it (tests, the kernel map).
+pub fn ensure(m: *Dsv41Model) !*State {
+    if (m.seg) |s| return s;
+    const s = try build(m);
+    m.seg = s;
+    return s;
+}
+
+fn build(m: *Dsv41Model) !*State {
     const s = try m.gpa.create(State);
     errdefer m.gpa.destroy(s);
     s.* = try State.init(m.n_layers * 2, default_protocol);

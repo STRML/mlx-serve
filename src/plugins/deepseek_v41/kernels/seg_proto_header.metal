@@ -71,6 +71,15 @@ inline uint seg_read_peer_output(const device uint* p, uint i) {
 }
 #endif
 
+inline float seg_read_peer_f32(const device float* p, uint i) {
+  return as_type<float>(seg_read_peer_output((const device uint*)p, i));
+}
+
+inline float2 seg_read_peer_bf16x2(const device uint* p, uint i) {
+  const uint v = seg_read_peer_output(p, i);
+  return float2(as_type<float>(v << 16), as_type<float>(v & 0xffff0000u));
+}
+
 inline uint seg_get(device atomic_uint* p, uint i) {
   return atomic_load_explicit(p + i, metal::memory_order_relaxed);
 }
