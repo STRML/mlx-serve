@@ -27,12 +27,16 @@ const max_probe_groups = 8192;
 /// How a probe launch joins its phases.
 pub const Arm = enum(usize) { ticket = 0, spin = 1, last = 2, dispatch = 3, resident = 4, idle = 5 };
 
-/// How the probe's phases move data across groups: relaxed atomics; ordinary loads and stores (the multi-die reproducer);
-/// `coherent(device)` loads and stores; ordinary stores read back by atomic loads; ordinary stores read back by
-/// `seg_read_peer_output`.
-pub const Access = enum(usize) { atomic = 0, plain = 1, coherent = 2, atomic_load = 3, peer_read = 4 };
+/// How the probe's phases move data across groups: relaxed atomics; ordinary loads and stores; `coherent(device)` loads
+/// and stores; ordinary stores read back by atomic loads; ordinary stores read back by `seg_read_peer_output`;
+/// `seg_write_peer_output` read back by `seg_read_peer_output`, the pair a fused kernel uses.
+pub const Access = enum(usize) { atomic = 0, plain = 1, coherent = 2, atomic_load = 3, peer_read = 4, peer = 5 };
 
-pub const reproducer: Access = .plain;
+/// The arms with an ordinary store or load on the cross-group path: on the two-die M5 Ultra a plain load reads a stale
+/// line, and a plain store that fills part of a line is not visible to a coherent load before the launch ends.
+fn reproducer(access: Access) bool {
+    return access == .plain or access == .atomic_load or access == .peer_read;
+}
 
 pub const Launch = struct {
     arm: Arm,
@@ -43,11 +47,28 @@ pub const Launch = struct {
     polls: u32 = 0,
     serial_items: u32 = 0,
     access: Access = .atomic,
+    layout: Layout = .grouped,
 
     fn launched(self: Launch) u32 {
         return if (self.arm == .ticket) self.phases * self.groups else self.groups;
     }
+
+    fn words(self: Launch) usize {
+        return self.phases * self.groups * self.threads;
+    }
+
+    fn spot(self: Launch, p: usize, g: usize, t: usize) usize {
+        const n = self.groups * self.threads;
+        return p * n + switch (self.layout) {
+            .grouped => g * self.threads + t,
+            .interleaved => t * self.groups + g,
+        };
+    }
 };
+
+/// Where a phase's words sit: a group's contiguous, so each simdgroup stores whole 128-byte lines; or interleaved across
+/// groups, so a store fills one word of a line, as a kernel's per-group partials do.
+pub const Layout = enum(usize) { grouped = 0, interleaved = 1 };
 
 pub const Result = struct { us: i64, status: u32 };
 
@@ -105,6 +126,7 @@ const Rig = struct {
             .{ .name = "POLLS", .v = l.polls },
             .{ .name = "ITEMS", .v = l.serial_items },
             .{ .name = "ACCESS", .v = @intFromEnum(l.access) },
+            .{ .name = "LAYOUT", .v = @intFromEnum(l.layout) },
             .{ .name = "TGMEM", .v = l.tgmem },
             .{ .name = "SALT", .v = salt },
             .{ .name = "STEP", .v = step },
@@ -167,7 +189,9 @@ fn debugDump(gpa: std.mem.Allocator, rig: *const Rig, l: Launch) void {
     defer gpa.free(want);
     const n = l.groups * l.threads;
     var shown: usize = 0;
-    for (want, rig.words()[0..want.len], 0..) |w, got, i| {
+    const all = rig.words();
+    for (want, 0..) |w, i| {
+        const got = all[l.spot(i / n, i % n / l.threads, i % l.threads)];
         if (w == got or shown >= 4) continue;
         shown += 1;
         std.debug.print("  phase {d} g {d} t {d}: got {d} want {d}\n", .{ i / n, i % n / l.threads, i % l.threads, got, w });
@@ -178,8 +202,10 @@ fn debugDump(gpa: std.mem.Allocator, rig: *const Rig, l: Launch) void {
 fn bufferMismatches(gpa: std.mem.Allocator, rig: *const Rig, l: Launch, gen: u32) !usize {
     const want = try expectedBuffer(gpa, l, gen);
     defer gpa.free(want);
+    const n = l.groups * l.threads;
+    const all = rig.words();
     var bad: usize = 0;
-    for (want, rig.words()[0..want.len]) |w, got| bad += @intFromBool(w != got);
+    for (want, 0..) |w, i| bad += @intFromBool(w != all[l.spot(i / n, i % n / l.threads, i % l.threads)]);
     return bad;
 }
 
@@ -238,9 +264,9 @@ fn expectedWinners(arm: Arm, boundary: usize) u32 {
     };
 }
 
-fn runChain(gpa: std.mem.Allocator, arm: Arm, access: Access, groups: u32) !ChainResult {
-    const l = Launch{ .arm = arm, .groups = groups, .access = access };
-    var rig = try Rig.init(1, l.phases * l.groups * l.threads);
+fn runChain(gpa: std.mem.Allocator, arm: Arm, access: Access, groups: u32, layout: Layout) !ChainResult {
+    const l = Launch{ .arm = arm, .groups = groups, .access = access, .layout = layout };
+    var rig = try Rig.init(1, l.words());
     defer rig.deinit();
     const total = l.phases * l.groups * l.threads;
     const winners = @constCast(mlx.mlx_array_data_uint32(rig.state.status).?)[1..mlx.mlx_array_size(rig.state.status)];
@@ -262,11 +288,11 @@ const spin_attempts = 4;
 
 const SpinResult = struct { chain: ChainResult, retries: u32 };
 
-fn runSpinChain(gpa: std.mem.Allocator, access: Access, probed: u32) !SpinResult {
+fn runSpinChain(gpa: std.mem.Allocator, access: Access, layout: Layout, probed: u32) !SpinResult {
     var floor = probed;
     var result: SpinResult = .{ .chain = .{}, .retries = 0 };
     for (0..spin_attempts) |retries| {
-        result = .{ .chain = try runChain(gpa, .spin, access, seg.spinGrid(floor)), .retries = @intCast(retries) };
+        result = .{ .chain = try runChain(gpa, .spin, access, seg.spinGrid(floor), layout), .retries = @intCast(retries) };
         if (result.chain.outcome != .timed_out) return result;
         floor = @min(floor, try probeResidency(seg.spin_threads, seg.spin_tgmem));
         if (floor < 2) return result;
@@ -274,30 +300,33 @@ fn runSpinChain(gpa: std.mem.Allocator, access: Access, probed: u32) !SpinResult
     return result;
 }
 
-fn reportChain(arm: Arm, access: Access, r: ChainResult, retries: u32) void {
-    const asserted = if (access == reproducer) "diagnostic, expected to fail on a multi-die GPU" else "asserted";
+fn reportChain(arm: Arm, access: Access, layout: Layout, r: ChainResult, retries: u32) void {
+    const asserted = if (reproducer(access)) "diagnostic, expected to fail on a multi-die GPU" else "asserted";
+    const a = @tagName(arm);
+    const c = @tagName(access);
+    const l = @tagName(layout);
     switch (r.outcome) {
-        .ok => std.debug.print("[seg] {s} access={s}: ok over {d} launches ({s}, spin retries {d})\n", .{ @tagName(arm), @tagName(access), launches_per_arm, asserted, retries }),
-        .wrong_words => std.debug.print("[seg] {s} access={s}: FAIL launch {d}: {d} of {d} words differ ({s})\n", .{ @tagName(arm), @tagName(access), r.launch, r.count, r.total, asserted }),
-        .wrong_winners => std.debug.print("[seg] {s} access={s}: FAIL launch {d}: {d} arrival winners at a boundary ({s})\n", .{ @tagName(arm), @tagName(access), r.launch, r.count, asserted }),
-        .timed_out, .bad_status => std.debug.print("[seg] {s} access={s}: FAIL launch {d}: status {d} ({s}, spin retries {d})\n", .{ @tagName(arm), @tagName(access), r.launch, r.status, asserted, retries }),
+        .ok => std.debug.print("[seg] {s} access={s} layout={s}: ok over {d} launches ({s}, spin retries {d})\n", .{ a, c, l, launches_per_arm, asserted, retries }),
+        .wrong_words => std.debug.print("[seg] {s} access={s} layout={s}: FAIL launch {d}: {d} of {d} words differ ({s})\n", .{ a, c, l, r.launch, r.count, r.total, asserted }),
+        .wrong_winners => std.debug.print("[seg] {s} access={s} layout={s}: FAIL launch {d}: {d} arrival winners at a boundary ({s})\n", .{ a, c, l, r.launch, r.count, asserted }),
+        .timed_out, .bad_status => std.debug.print("[seg] {s} access={s} layout={s}: FAIL launch {d}: status {d} ({s}, spin retries {d})\n", .{ a, c, l, r.launch, r.status, asserted, retries }),
     }
 }
 
-test "dsv41 fused seg proto: last-arriver, ordered tickets and resident spin give every phase all of the previous phase's writes, through atomic, coherent and peer-read accesses (plain is the multi-die reproducer, reported not asserted)" {
+test "dsv41 fused seg proto: last-arriver, ordered tickets and resident spin give every phase all of the previous phase's writes, through atomic, coherent and peer accesses, with a group's words contiguous or interleaved across groups (plain stores or loads are the multi-die reproducers, reported not asserted)" {
     if (!gpuTest()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const resident = @min(try probeResidency(seg.spin_threads, seg.spin_tgmem), try probeResidency(seg.spin_threads, seg.spin_tgmem));
     if (resident < 2) return error.SkipZigTest;
     std.debug.print("[seg] resident tg={d} tgmem={d} groups={d} (least of two probes)\n", .{ seg.spin_threads, seg.spin_tgmem, resident });
     var failures: u32 = 0;
-    const base = try runChain(gpa, .dispatch, .atomic, resident);
-    reportChain(.dispatch, .atomic, base, 0);
+    const base = try runChain(gpa, .dispatch, .atomic, resident, .grouped);
+    reportChain(.dispatch, .atomic, .grouped, base, 0);
     failures += @intFromBool(base.outcome != .ok);
-    for (std.enums.values(Access)) |access| for ([_]Arm{ .last, .ticket, .spin }) |arm| {
-        const run: SpinResult = if (arm == .spin) try runSpinChain(gpa, access, resident) else .{ .chain = try runChain(gpa, arm, access, resident), .retries = 0 };
-        reportChain(arm, access, run.chain, run.retries);
-        if (access == reproducer) continue;
+    for ([_]Layout{ .grouped, .interleaved }) |layout| for (std.enums.values(Access)) |access| for ([_]Arm{ .last, .ticket, .spin }) |arm| {
+        const run: SpinResult = if (arm == .spin) try runSpinChain(gpa, access, layout, resident) else .{ .chain = try runChain(gpa, arm, access, resident, layout), .retries = 0 };
+        reportChain(arm, access, layout, run.chain, run.retries);
+        if (reproducer(access)) continue;
         failures += @intFromBool(run.chain.outcome != .ok or run.retries > 1);
     };
     std.debug.print("[seg] {d} asserted arms failed\n", .{failures});

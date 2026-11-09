@@ -20,7 +20,7 @@ threadgroup float* tgm = (threadgroup float*)tgm4;
 threadgroup uint last;
 const bool is_mix = tg < P;
 
-if (tid == 0 && tg == 0 && gen_v == 0xffffffffu && dep[0] == 0xffffffffu) logits[0] = 0.0f;
+if (tid == 0 && tg == 0 && gen_v == 0xffffffffu && dep[0] == 0xffffffffu) seg_write_peer_f32(logits, 0u, 0.0f);
 
 if (is_mix) {
   const int d = tg * W + 4 * int(lane);
@@ -65,11 +65,11 @@ if (is_mix) {
     }
     for (int a = 0; a < MIX / 8; ++a) {
       const float t = metal::simd_sum(dd[a]);
-      if (lane == 0) parts[((size_t)r * P + tg) * PL + m0 + a] = t;
+      if (lane == 0) seg_write_peer_f32(parts, uint(((size_t)r * P + tg) * PL + m0 + a), t);
     }
     if (sg == 0) {
       const float t = metal::simd_sum(s2);
-      if (lane == 0) parts[((size_t)r * P + tg) * PL + MIX] = t;
+      if (lane == 0) seg_write_peer_f32(parts, uint(((size_t)r * P + tg) * PL + MIX), t);
     }
   }
 } else {
@@ -180,7 +180,7 @@ if (is_mix) {
     const float z = red[8 * RG + sg * RG + rr] + red[8 * RG + (sg + 1) * RG + rr];
     const float ez = metal::exp(-metal::abs(z));
     const float lp = ez < 1e-4f ? ez * (1.0f - ez * (0.5f - ez / 3.0f)) : metal::log(1.0f + ez);
-    logits[(size_t)(r0 + rr) * E + e] = metal::sqrt(metal::max(z, 0.0f) + lp);
+    seg_write_peer_f32(logits, uint((size_t)(r0 + rr) * E + e), metal::sqrt(metal::max(z, 0.0f) + lp));
   }
 }
 

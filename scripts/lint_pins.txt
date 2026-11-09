@@ -137,3 +137,9 @@ src/plugins/qwen4_exp/kernels/qsa_attn_d_kload.metal	!(thread T*)&	a kernel rein
 src/plugins/qwen4_exp/kernels/qsa_attn_d_vload.metal	!(thread T*)&	a kernel reinterprets a uint4 through as_type (msv_unpack8, msv_pack8), never a thread-pointer pun
 src/kernels/quant/norm_rotate.metal	!(thread T*)&	a kernel reinterprets a uint4 through as_type (msv_unpack8, msv_pack8), never a thread-pointer pun
 src/kernels/quant/norm_rotate.metal	!(thread const T*)&	a kernel reinterprets a uint4 through as_type (msv_unpack8, msv_pack8), never a thread-pointer pun
+src/plugins/deepseek_v41/kernels/dec_seg_ffn_in.metal	seg_write_peer_f32(parts, 	the level-1 kernel writes and reads what its last arrivers read through seg_write_peer_* and seg_read_peer_*, never a plain store or load
+src/plugins/deepseek_v41/kernels/dec_seg_ffn_in.metal	seg_write_peer_f32(logits, 	the level-1 kernel writes and reads what its last arrivers read through seg_write_peer_* and seg_read_peer_*, never a plain store or load
+src/plugins/deepseek_v41/kernels/dec_seg_ffn_in.metal	seg_read_peer_f32(parts, 	the level-1 kernel writes and reads what its last arrivers read through seg_write_peer_* and seg_read_peer_*, never a plain store or load
+src/plugins/deepseek_v41/kernels/dec_seg_ffn_in.metal	seg_read_peer_f32(logits, 	the level-1 kernel writes and reads what its last arrivers read through seg_write_peer_* and seg_read_peer_*, never a plain store or load
+src/plugins/deepseek_v41/kernels/dec_seg_ffn_in.metal	!parts[	the level-1 kernel writes and reads what its last arrivers read through seg_write_peer_* and seg_read_peer_*, never a plain store or load
+src/plugins/deepseek_v41/kernels/dec_seg_ffn_in.metal	!logits[	the level-1 kernel writes and reads what its last arrivers read through seg_write_peer_* and seg_read_peer_*, never a plain store or load
