@@ -64,6 +64,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - A decode chunk's Engram rows for every layer are read at once on GCD before its first Engram layer is built
   (`Prefetch.readNow`, `DSV41_ENGRAM_EARLY`); a prompt's stay on the prefetch thread. `MLX_SERVE_DIAG=engram-laps` times
   each host phase of a GPU-token decode step (`Laps`).
+- Under `tp` with `DSV41_DSPARK_PIPE=1` a DSpark round of the live state goes on the bells: the draft with the kept count and
+  first token after the byte, the verify with its row count, each rank's ids from its own draft (`Drafted`). Rank 0 rings
+  one only on what the workers last did (distributed.zig `TpSpec`, cleared by any other message); a copied draft keeps its header.
 - Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
   worker keeps it; a step on another state (`st != &dec_state`) is refused.
 - Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken

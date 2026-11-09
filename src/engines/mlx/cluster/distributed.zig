@@ -268,6 +268,8 @@ const Bell = struct {
 
     const msg_byte: u8 = 1;
     const pipe_byte: u8 = 2;
+    const draft_byte: u8 = 3;
+    const verify_byte: u8 = 4;
 
     /// No connection. `fd_t` is a HANDLE on Windows, where a cluster never forms.
     const none: std.c.fd_t = if (builtin.os.tag == .windows) std.os.windows.INVALID_HANDLE_VALUE else -1;
@@ -353,6 +355,32 @@ const Bell = struct {
     fn ringWith(b: Bell, byte: u8) !void {
         if (!b.open()) return;
         if (std.c.write(b.fd, &[_]u8{byte}, 1) != 1) return error.DistPeerGone;
+    }
+
+    fn say(b: Bell, bytes: []const u8) !void {
+        if (!b.open()) return error.DistPeerGone;
+        return b.writeAll(bytes);
+    }
+
+    fn msgOf(b: Bell, byte: u8) !?Msg {
+        return switch (byte) {
+            pipe_byte => .{ OP_DSV41_TP_PIPE, 0, 0, 0, 0, 0, 0, 0 },
+            draft_byte => try b.draftMsg(),
+            verify_byte => try b.verifyMsg(),
+            else => null,
+        };
+    }
+
+    fn draftMsg(b: Bell) !Msg {
+        var p: [5]u8 = undefined;
+        try b.readAll(&p);
+        return .{ OP_DSV41_TP_DRAFT_PIPE, p[0], @bitCast(std.mem.readInt(u32, p[1..5], .little)), 0, 0, 0, 0, 0 };
+    }
+
+    fn verifyMsg(b: Bell) !Msg {
+        var p: [1]u8 = undefined;
+        try b.readAll(&p);
+        return .{ OP_DSV41_TP_VERIFY_PIPE, p[0], 0, 0, 0, 0, 0, 0 };
     }
 
     /// The byte rank 0 rang (`msg_byte` without a bell: a message follows on the link).
@@ -477,8 +505,8 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC = wire.MAGIC;
-/// 8: a DeepSeek-V4.1 tensor decode step can come as a bell byte alone, its token gathered on the GPU (OP_DSV41_TP_PIPE).
-const VERSION: i32 = 8;
+/// 9: a DeepSeek-V4.1 tensor DSpark draft and verify can come on the bell, their few values after the byte.
+const VERSION: i32 = 9;
 pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
 pub const OP_STOP = wire.OP_STOP;
@@ -500,6 +528,8 @@ const OP_DSV41_TP_LOAD: i32 = 13;
 const OP_DSV41_TP_DRAFT: i32 = 14;
 /// Never sent: what a worker's `recvMsg` returns for a `Bell.pipe_byte` (`dsv41.tpWorkerPipe`).
 const OP_DSV41_TP_PIPE: i32 = 15;
+const OP_DSV41_TP_DRAFT_PIPE: i32 = 16;
+const OP_DSV41_TP_VERIFY_PIPE: i32 = 17;
 pub const OP_RELEASE = wire.OP_RELEASE;
 
 /// `link` as a plugin's split job talks over it (`sdk/util/wire.zig`).
@@ -553,6 +583,7 @@ pub fn recvNow(link: *const Link, shape: []const c_int, dtype: mlx.mlx_dtype, sr
 fn sendMsg(link: *const Link, m: Msg, dst: u32) !void {
     if (link.rank == 0) {
         cluster().tp_live = null;
+        cluster().tp_spec = null;
         try link.bells[dst].ring();
     }
     const shape = [_]c_int{8};
@@ -564,7 +595,7 @@ fn sendMsg(link: *const Link, m: Msg, dst: u32) !void {
 }
 
 fn recvMsg(link: *const Link, src: u32) !Msg {
-    if (link.rank != 0 and try link.bells[0].wait() == Bell.pipe_byte) return .{ OP_DSV41_TP_PIPE, 0, 0, 0, 0, 0, 0, 0 };
+    if (link.rank != 0) if (try link.bells[0].msgOf(try link.bells[0].wait())) |m| return m;
     const r = try link.recv(&.{8}, .int32, src);
     defer _ = mlx.mlx_array_free(r);
     try evalOne(r);
@@ -860,6 +891,7 @@ const ClusterState = struct {
     tp_last: struct { p0: usize = 0, rows: usize = 0 } = .{},
     /// Rank 0: the state the workers last stepped, while no other message has reached them since (`sendMsg` clears it).
     tp_live: ?TpLive = null,
+    tp_spec: ?TpSpec = null,
     /// What each worker (by rank) said about the group's model when it joined: 0 has it, else NOT_FOUND or
     /// MISMATCH (-1 = not asked: no bell connection).
     copies: [max_ranks]std.atomic.Value(i32) = @splat(.init(-1)),
@@ -1243,6 +1275,10 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
             log.info("[dist] tensor: decode steps {s}\n", .{if (dsv41_mod.tpPipeOn()) "keep their token on the GPU, each rung on the bells alone (DSV41_TP_PIPE=0: an id header per step)" else "each send their id in a header"});
             dsv41_mod.clusterHooks().tp_batch = &dsv41TpBatch;
             dsv41_mod.clusterHooks().tp_draft = &dsv41TpDraft;
+            const ds_pipe = dsparkPipeWanted(&self.link);
+            dsv41_mod.clusterHooks().tp_draft_pipe = if (ds_pipe) &dsv41TpDraftPipe else null;
+            dsv41_mod.clusterHooks().tp_verify_pipe = if (ds_pipe) &dsv41TpVerifyPipe else null;
+            log.info("[dist] tensor: DSpark drafts and verifies {s}\n", .{if (ds_pipe) "of the live state rung on the bells, their values after the byte (DSV41_DSPARK_PIPE)" else "each send a header"});
             dsv41_mod.clusterHooks().tp_free = &dsv41TpFree;
             dsv41_mod.clusterHooks().tp_snap = &dsv41TpSnap;
             dsv41_mod.clusterHooks().tp_load = &dsv41TpLoad;
@@ -1309,6 +1345,60 @@ fn dsv41TpStep(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool,
         if (images) |r| try sendNow(&self.link, r, dst);
     }
     cluster().tp_live = TpLive.after(gen, p0 + ids.len, verify);
+    cluster().tp_spec = TpSpec.afterStep(gen, p0, ids.len, verify);
+}
+
+const TpSpec = union(enum) {
+    verify: struct { gen: u64, n0: usize, end: usize },
+    drafted: struct { gen: u64, n: usize },
+
+    fn afterStep(gen: u64, p0: usize, rows: usize, verify: bool) ?TpSpec {
+        return if (verify) .{ .verify = .{ .gen = gen, .n0 = p0, .end = p0 + rows } } else null;
+    }
+
+    fn keep(spec: ?TpSpec, gen: u64, p0: usize) ?u8 {
+        const s = spec orelse return null;
+        if (s != .verify) return null;
+        const v = s.verify;
+        if (v.gen != gen or p0 <= v.n0 or p0 > v.end) return null;
+        return std.math.cast(u8, p0 - v.n0);
+    }
+
+    fn follows(spec: ?TpSpec, gen: u64, n: usize, rows: usize) bool {
+        const s = spec orelse return false;
+        if (s != .drafted or rows == 0 or rows > std.math.maxInt(u8)) return false;
+        return s.drafted.gen == gen and s.drafted.n == n;
+    }
+};
+
+fn dsv41TpDraftPipe(gen: u64, p0: usize, t1: u32) anyerror!bool {
+    const self = peer() orelse return error.DistWorkerNotJoined;
+    const c = cluster();
+    const keep = TpSpec.keep(c.tp_spec, gen, p0) orelse return false;
+    noteTpStep(p0, 0);
+    var bytes: [6]u8 = .{ Bell.draft_byte, keep, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, bytes[2..6], t1, .little);
+    for (1..self.link.size) |k| try self.link.bells[k].say(&bytes);
+    c.tp_spec = .{ .drafted = .{ .gen = gen, .n = p0 } };
+    return true;
+}
+
+fn dsv41TpVerifyPipe(gen: u64, n: usize, rows: usize) anyerror!bool {
+    const self = peer() orelse return error.DistWorkerNotJoined;
+    const c = cluster();
+    if (!TpSpec.follows(c.tp_spec, gen, n, rows)) return false;
+    noteTpStep(n, rows);
+    self.exchanges += 1;
+    const bytes = [_]u8{ Bell.verify_byte, @intCast(rows) };
+    for (1..self.link.size) |k| try self.link.bells[k].say(&bytes);
+    c.tp_spec = TpSpec.afterStep(gen, n, rows, true);
+    return true;
+}
+
+fn dsparkPipeWanted(link: *const Link) bool {
+    if (!env.on(.DSV41_DSPARK_PIPE)) return false;
+    var mb: [64]u8 = undefined;
+    return missingRanks(link.bellMask(), link.size, &mb).len == 0;
 }
 
 /// What rank 0 last told the workers of a DeepSeek-V4.1 tensor state: the one they stepped and where it now stands.
@@ -1338,6 +1428,7 @@ fn dsv41TpPipe(gen: u64, n: usize) anyerror!bool {
     self.exchanges += 1;
     for (1..self.link.size) |k| try self.link.bells[k].pipe();
     c.tp_live = .{ .gen = gen, .n = n + 1 };
+    c.tp_spec = null;
     return true;
 }
 
@@ -1392,6 +1483,7 @@ fn dsv41TpDraft(gens: []const u64, p0s: []const usize, t1s: []const u32) anyerro
         try sendMsg(&self.link, .{ OP_DSV41_TP_DRAFT, @intCast(gens.len), 0, 0, 0, 0, 0, 0 }, @intCast(k));
         try sendNow(&self.link, a, @intCast(k));
     }
+    if (gens.len == 1) cluster().tp_spec = .{ .drafted = .{ .gen = gens[0], .n = p0s[0] } };
 }
 
 /// Host: the state `gen` is gone; the workers drop their copies.
@@ -1624,6 +1716,16 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
             OP_DSV41_TP_PIPE => {
                 noteTpStep(if (m.dec_state) |st| st.n else 0, 1);
                 try dsv41_mod.tpWorkerPipe(m, allocator);
+                steps += 1;
+            },
+            OP_DSV41_TP_DRAFT_PIPE => {
+                noteTpStep(if (m.dec_state) |st| st.n else 0, 0);
+                try dsv41_mod.tpWorkerDraftPipe(m, allocator, &parked, @intCast(msg[1]), @bitCast(msg[2]));
+            },
+            OP_DSV41_TP_VERIFY_PIPE => {
+                const rows: usize = @intCast(msg[1]);
+                noteTpStep(if (m.dec_state) |st| st.n else 0, rows);
+                try dsv41_mod.tpWorkerVerifyPipe(m, allocator, &parked, rows);
                 steps += 1;
             },
             OP_DSV41_TP_BATCH => {
