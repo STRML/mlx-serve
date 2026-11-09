@@ -7,7 +7,6 @@ const env = @import("../../../env.zig");
 const log = @import("../../../sdk/util/log.zig");
 const config = @import("../config.zig");
 const dsv41 = @import("../deepseek_v41.zig");
-const decode = @import("decode.zig");
 const seg_proto = @import("seg_proto.zig");
 
 const A = mlx.mlx_array;
@@ -251,12 +250,14 @@ pub fn serves(m: *const Dsv41Model, rows: usize) ?[]const u8 {
     return null;
 }
 
-const rows_past = std.fmt.comptimePrint("rows > {d}", .{decode.max_rows});
+pub const verify_rows = 3;
+
+const verify_past = std.fmt.comptimePrint("rows > {d}", .{verify_rows});
 
 fn rowsDeclined(m: *const Dsv41Model, rows: usize) ?[]const u8 {
     if (rows == 0) return "no rows";
-    if (rows > decode.max_rows) return rows_past;
     if (rows > 1 and !m.verifying) return "rows > 1 outside a verify";
+    if (rows > verify_rows) return verify_past;
     return null;
 }
 

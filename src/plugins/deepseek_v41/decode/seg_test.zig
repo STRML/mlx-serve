@@ -49,6 +49,8 @@ const Sums = struct {
     }
 };
 
+const verify_rows = 3;
+
 const tp4: fixture.Opts = .{ .lo = 20, .hi = 23, .experts = 8, .ctx = 48, .fused = true, .experts_fp4 = true, .tp = .{ .rank = 0, .size = 4 } };
 
 fn runSteps(gpa: std.mem.Allocator, fx: *Fixture, rows_list: []const usize) ![]u8 {
@@ -116,7 +118,7 @@ test "dsv41 fused seg: DSV41_FUSED_SEG reads 0 to 5 and refuses anything else" {
     for ([_][]const u8{ "6", "-1", "", "on", "1 ", "255", "99999" }) |bad| try std.testing.expectEqual(seg.Level.off, seg.levelOf(bad));
 }
 
-test "dsv41 fused seg: serves declines non-NAX, TP != 4, streamed, rows past 6 or 2..6 outside a verify, affine experts, f32" {
+test "dsv41 fused seg: serves declines non-NAX, TP != 4, streamed, rows past a verify's 3 or 2+ outside one, affine experts, f32" {
     if (!gpuTest()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     Sums.install();
@@ -128,13 +130,12 @@ test "dsv41 fused seg: serves declines non-NAX, TP != 4, streamed, rows past 6 o
     const nax = device.naxAvailable();
     if (nax) {
         try std.testing.expect(seg.serves(fx.m, 1) == null);
-        for (2..decode.max_rows + 1) |rows| try std.testing.expectEqualStrings("rows > 1 outside a verify", seg.serves(fx.m, rows).?);
-        try std.testing.expectEqualStrings("rows > 6", seg.serves(fx.m, decode.max_rows + 1).?);
+        for (2..decode.max_rows + 2) |rows| try std.testing.expectEqualStrings("rows > 1 outside a verify", seg.serves(fx.m, rows).?);
         try std.testing.expectEqualStrings("no rows", seg.serves(fx.m, 0).?);
         fx.m.verifying = true;
         defer fx.m.verifying = false;
-        for (1..decode.max_rows + 1) |rows| try std.testing.expect(seg.serves(fx.m, rows) == null);
-        try std.testing.expectEqualStrings("rows > 6", seg.serves(fx.m, decode.max_rows + 1).?);
+        for (1..verify_rows + 1) |rows| try std.testing.expect(seg.serves(fx.m, rows) == null);
+        for (verify_rows + 1..decode.max_rows + 2) |rows| try std.testing.expectEqualStrings("rows > 3", seg.serves(fx.m, rows).?);
         try std.testing.expectEqualStrings("no rows", seg.serves(fx.m, 0).?);
     }
     var stub = fx.m.*;
@@ -226,7 +227,7 @@ test "dsv41 fused seg: every level makes the same sums in the same order with th
     defer Sums.remove();
     const fx = try Fixture.init(gpa, .{ .lo = 0, .hi = 40, .experts = 8, .ctx = 0, .fused = true, .experts_fp4 = true, .tp = .{ .rank = 0, .size = 4 } });
     defer fx.deinit();
-    for ([_]usize{ 1, decode.max_rows }) |rows| {
+    for ([_]usize{ 1, verify_rows, decode.max_rows }) |rows| {
         var level0: []SumCall = &.{};
         defer gpa.free(level0);
         for (0..6) |n| {
@@ -239,7 +240,7 @@ test "dsv41 fused seg: every level makes the same sums in the same order with th
             const before = seg.dispatches;
             const out = try dsv41.workerStep(fx.m, gpa, x, pre, 0, false, rows > 1);
             for (out) |o| _ = mlx.mlx_array_free(o);
-            if (n == 1 and device.naxAvailable()) try std.testing.expect(seg.dispatches > before);
+            if (n == 1 and device.naxAvailable()) try std.testing.expectEqual(rows <= verify_rows, seg.dispatches > before);
             if (n == 0) {
                 level0 = try gpa.dupe(SumCall, Sums.calls.items);
                 try std.testing.expectEqual(@as(usize, 80), level0.len);
@@ -1039,7 +1040,7 @@ fn expectTiePicks(idx: []const f32, rows: usize) !void {
     }
 }
 
-test "dsv41 fused seg: level 1 decodes verify chunks of 2..6 rows on layers 20..23 no further from the f32 model than stock" {
+test "dsv41 fused seg: level 1 decodes verify chunks of 2..3 rows on layers 20..23 no further from the f32 model than stock" {
     if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
     Sums.install();
     defer Sums.remove();
@@ -1047,16 +1048,16 @@ test "dsv41 fused seg: level 1 decodes verify chunks of 2..6 rows on layers 20..
     o.ctx = 601;
     o.seg = .ffn_entry;
     const before = seg.dispatches;
-    try decode.layersAgreeSteps(std.testing.allocator, o, &.{ 2, 3, 4, 5, 6 });
+    try decode.layersAgreeSteps(std.testing.allocator, o, &.{ 2, 3 });
     try std.testing.expect(seg.dispatches > before);
 }
 
-test "dsv41 fused seg: prompt chunks of 2..6 rows and verify chunks past 6 rows run stock bit for bit at every level, no seg dispatch" {
+test "dsv41 fused seg: prompt chunks of 2..6 rows and verify chunks past 3 rows run stock bit for bit at every level, no seg dispatch" {
     if (!gpuTest()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     Sums.install();
     defer Sums.remove();
-    const plan = [_]Step{ .{ .rows = 2, .verify = false }, .{ .rows = 3, .verify = false }, .{ .rows = 4, .verify = false }, .{ .rows = 5, .verify = false }, .{ .rows = 6, .verify = false }, .{ .rows = 7, .verify = true }, .{ .rows = 8, .verify = true } };
+    const plan = [_]Step{ .{ .rows = 2, .verify = false }, .{ .rows = 3, .verify = false }, .{ .rows = 4, .verify = false }, .{ .rows = 5, .verify = false }, .{ .rows = 6, .verify = false }, .{ .rows = 4, .verify = true }, .{ .rows = 5, .verify = true }, .{ .rows = 6, .verify = true }, .{ .rows = 7, .verify = true }, .{ .rows = 8, .verify = true } };
     var ref: [][]f32 = &.{};
     defer freeAll(gpa, ref);
     const before = seg.dispatches;
@@ -1113,11 +1114,12 @@ test "dsv41 fused seg: a verify forward at level 2 runs level 1's launch, never 
     const two = try Fixture.init(gpa, o);
     defer two.deinit();
     two.m.verifying = true;
-    try std.testing.expect(seg.on(two.m, 21, .ffn, decode.max_rows, .ffn_entry));
-    try std.testing.expect(!seg.on(two.m, 21, .ffn, decode.max_rows, .ffn_seg));
+    try std.testing.expect(seg.on(two.m, 21, .ffn, verify_rows, .ffn_entry));
+    try std.testing.expect(!seg.on(two.m, 21, .ffn, verify_rows, .ffn_seg));
+    try std.testing.expect(!seg.on(two.m, 21, .ffn, verify_rows + 1, .ffn_entry));
     try std.testing.expect(seg.on(two.m, 21, .ffn, 1, .ffn_seg));
     two.m.verifying = false;
-    const in = try fixture.Input.of(one, decode.max_rows);
+    const in = try fixture.Input.of(one, verify_rows);
     defer in.deinit();
     seg_ffn.grid_extra = 1;
     defer seg_ffn.grid_extra = 0;
@@ -1181,10 +1183,10 @@ const Bookkeeping = struct {
 
 const round_plan = [_]struct { rows: usize, verify: bool, keep: usize }{
     .{ .rows = 1, .verify = false, .keep = 0 },
-    .{ .rows = 6, .verify = true, .keep = 0 },
-    .{ .rows = 1, .verify = false, .keep = 3 },
-    .{ .rows = 6, .verify = true, .keep = 0 },
+    .{ .rows = 3, .verify = true, .keep = 0 },
     .{ .rows = 1, .verify = false, .keep = 2 },
+    .{ .rows = 3, .verify = true, .keep = 0 },
+    .{ .rows = 1, .verify = false, .keep = 1 },
 };
 
 test "dsv41 fused seg: DSpark rounds at level 1 keep the state a stock run keeps, kept rows no further from the f32 model" {

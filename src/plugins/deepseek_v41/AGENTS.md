@@ -28,8 +28,9 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   Its ubench times both arms at the per-rank widths 2304 / 1152 / 576 against a streaming read.
 - `decode/seg.zig`: `DSV41_FUSED_SEG=0-5` (unset is 0, the stock path byte for byte) picks the fused decode segment level
   and `serves` / `covers` decide per model, rows and layer: TP4, NAX, resident mxfp4 experts, bf16, one row or a DSpark
-  verify chunk of 2..6 rows (`Dsv41Model.verifying`, set by `runLayers` from the predicate rank 0's step header carries,
-  so every rank agrees; prompt chunks, wider verifies and `extendBatched` stay stock); levels 2 and up serve one row, so a
+  verify chunk of 2..3 rows (`seg.verify_rows`; `Dsv41Model.verifying`, set by `runLayers` from the predicate rank 0's
+  step header carries, so every rank agrees; prompt chunks, verifies of 4+ rows and `extendBatched` stay stock: at 4..6
+  rows level 1 lost to stock on the M5 Ultra, every router group rebuilding h2 for every row); levels 2 and up serve one row, so a
   verify chunk at those levels takes level 1's launch. The attention
   segment skips layers 0 1 2 8 14 20 24 28 32 36 (30 of 40 covered), the FFN segment covers all 40. Every rank logs
   `[dsv41] fused seg level <N> (<tag>) on` at load and, each 1,000 counted forwards at level 1 or above, its segment
