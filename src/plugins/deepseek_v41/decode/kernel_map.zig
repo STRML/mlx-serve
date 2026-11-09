@@ -6,7 +6,8 @@
 //! row count is 3 warm-up steps, 0.5 s, and `DSV41_KMAP_STEPS` timed ones, each on fresh random input rows (so the
 //! routes move). A trace's last stretches are then [warm, timed] for each row count in order.
 //!
-//!   DSV41_KMAP_ROWS (1,6: row counts, one phase each)  DSV41_KMAP_STEPS (32, even)  DSV41_KMAP_CTX (2048)  DSV41_KMAP_TP (4)
+//!   DSV41_KMAP_ROWS (1,6: row counts, one phase each; a step of more than one row is a DSpark verify chunk the next
+//!   keeps whole)  DSV41_KMAP_STEPS (32, even)  DSV41_KMAP_CTX (2048)  DSV41_KMAP_TP (4)
 //!   DSV41_KMAP_LAYERS (0-40)  DSV41_KMAP_EXPERTS (384)  DSV41_KMAP_GO (a file to wait for after the setup)
 //!
 //! Lines start `[kmap]`.
@@ -416,7 +417,7 @@ const whole_ratio = 1.15;
 pub const wts_rel_tol = 1e-6;
 pub const route_wts_rel_tol = 1e-3;
 
-const LayerStat = struct { layers: usize = 0, engaged: usize = 0, total: usize = 0, ndiff: usize = 0, nonfinite: usize = 0, route_rows: usize = 0, route_bad: usize = 0, wts_rel: f64 = 0, num: f64 = 0, den: f64 = 0, worst: f64 = 0, declined: ?[]const u8 = null };
+const LayerStat = struct { layers: usize = 0, engaged: usize = 0, total: usize = 0, ndiff: usize = 0, nonfinite: usize = 0, route_rows: usize = 0, route_bad: usize = 0, wts_rel: f64 = 0, num: f64 = 0, den: f64 = 0, worst: f64 = 0, declined: ?[]const u8 = null, rows: usize = 1, verify: bool = false };
 
 fn dup(sc: *dsv41.Scope, a: A) !A {
     return sc.keep(sc.out(a));
@@ -465,6 +466,10 @@ fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize,
         var pre_a = x;
         var pre_b = x;
         const rows: usize = @intCast(mlx.getShape(x)[0]);
+        st.rows = rows;
+        st.verify = seg_bounds.verifyOf(li);
+        m.verifying = st.verify;
+        defer m.verifying = false;
         setUnder(m, .{ .level = .off });
         const ya = try dsv41.tpFfn(&sc, m, li, x, ao, &sa, &pre_a);
         const ra = try routesOf(&sc, li);
@@ -508,7 +513,7 @@ fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize,
 
 const Whole = struct { stock: f64, arm: f64 };
 
-fn wholeStep(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize, under: Under) !Whole {
+fn wholeStep(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize, under: Under, shape: *const LayerStat) !Whole {
     const captured = seg_bounds.cache_on;
     seg_bounds.cache_on = false;
     defer seg_bounds.cache_on = captured;
@@ -531,15 +536,15 @@ fn wholeStep(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize,
         defer truth.deinit();
         const run = try fixture.Fixture.init(gpa, o);
         defer run.deinit();
-        const in = try fixture.Input.of(run, 1);
+        const in = try fixture.Input.of(run, shape.rows);
         defer in.deinit();
-        const t = try fixture.streamOf(gpa, truth, in);
+        const t = try fixture.streamAs(gpa, truth, in, shape.verify);
         defer gpa.free(t);
         defer setUnder(run.m, .{ .level = .off });
-        const s = try fixture.streamOf(gpa, run, in);
+        const s = try fixture.streamAs(gpa, run, in, shape.verify);
         defer gpa.free(s);
         setUnder(run.m, under);
-        const a = try fixture.streamOf(gpa, run, in);
+        const a = try fixture.streamAs(gpa, run, in, shape.verify);
         defer gpa.free(a);
         e_stock.* = decode.relRms(s, t);
         e_arm.* = decode.relRms(a, t);
@@ -564,7 +569,7 @@ pub fn segCheck(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usi
         std.debug.print("SEG-CHECK-SKIP {s}: no captured layer takes the segment path ({s})\n", .{ name, st.declined.? });
         return error.SegCheckSkipped;
     }
-    const whole = try wholeStep(gpa, fx, lo, hi, under);
+    const whole = try wholeStep(gpa, fx, lo, hi, under, &st);
     const rms = @sqrt(st.num / @max(st.den, 1e-30));
     std.debug.print("[kmap] {s} vs stock: {d} layers ({d} on the segment path), {d} of {d} stream values differ ({d} non-finite), rel rms {e:.3}, max abs {e:.3}, route rows differing {d} of {d} (largest weight difference {e:.2}); whole step from the f32 model (median of {d} seeds): stock {e:.3}, {s} {e:.3}\n", .{ name, st.layers, st.engaged, st.ndiff, st.total, st.nonfinite, rms, st.worst, st.route_bad, st.route_rows, st.wts_rel, whole_seeds, whole.stock, name, whole.arm });
     const why: ?[]const u8 = if (st.layers == 0)
@@ -661,7 +666,7 @@ fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize
             applyArm(fx, a.probe.arm);
         }
         const s0 = nowUs();
-        const out = try dsv41.workerStep(fx.m, gpa, xs[k], pres[k], p0.*, false, false);
+        const out = try dsv41.workerStep(fx.m, gpa, xs[k], pres[k], p0.*, false, rows > 1);
         for (out) |o| _ = mlx.mlx_array_free(o);
         if (k >= warm) {
             us[k - warm] = @floatFromInt(nowUs() - s0);

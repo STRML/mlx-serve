@@ -39,7 +39,7 @@ fn upKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 const max_layers = 64;
-const Held = struct { a: [6]A = @splat(none), in: [5]A = @splat(none) };
+const Held = struct { a: [6]A = @splat(none), in: [5]A = @splat(none), verify: bool = false };
 var held: [max_layers]Held = @splat(.{});
 
 pub var cache_on = false;
@@ -57,9 +57,14 @@ pub fn release() void {
     };
 }
 
-pub fn rememberIn(li: usize, x: A, ao: A, sa: *const dsv41.Split) void {
+pub fn rememberIn(li: usize, x: A, ao: A, sa: *const dsv41.Split, verify: bool) void {
     if (!cache_on) return;
     for (&held[li].in, [_]A{ x, ao, sa.pre, sa.post, sa.comb }) |*slot, v| hold(slot, v);
+    held[li].verify = verify;
+}
+
+pub fn verifyOf(li: usize) bool {
+    return held[li].verify;
 }
 
 pub fn inOf(li: usize) ?*const [5]A {
@@ -112,7 +117,7 @@ fn up(sc: *dsv41.Scope, lim: A, ly: *const dsv41.Layer, h: A, idx: A, wts: A, de
 pub fn tpFfn(sc: *dsv41.Scope, m: *dsv41.Dsv41Model, li: usize, x: A, ao: A, sa: *const dsv41.Split, pre: *A) !?A {
     const a = current();
     if (a == .base) {
-        rememberIn(li, x, ao, sa);
+        rememberIn(li, x, ao, sa, m.verifying);
         return null;
     }
     const c = heldOf(li) orelse return null;

@@ -430,6 +430,7 @@ pub const Dsv41Model = struct {
     probe: ?*const ProjProbe = null,
     fused_seg: dkern.seg.Level = .off,
     seg: ?*dkern.seg.State = null,
+    verifying: bool = false,
     /// The routed experts from a streamed bank (`sdk/weights/streamed.zig`); null = the in-memory banks.
     streamed: ?streamed.Routed = null,
     /// The pack's routed experts live in a streamed bank: the trunk loads none (`InitOpts.streamed_experts`).
@@ -4224,7 +4225,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         if (m.dec_state == null or st != &m.dec_state.?) return error.Dsv41TpStateNotLive;
         // An image's rows exist on this rank only: they ride with the step.
         if (img_rows.ctx != null) try evalAll(&.{img_rows});
-        try step(ids.host, p0, if (st.snap_at) |at| at == p0 + L else false, want == .all, if (st.verify) |v| v.n0 == p0 else false, m.state_gen, if (img_rows.ctx != null) img_rows else null);
+        try step(ids.host, p0, if (st.snap_at) |at| at == p0 + L else false, want == .all, verifyChunk(st, p0), m.state_gen, if (img_rows.ctx != null) img_rows else null);
     };
 
     // Engram row ids for the whole chunk (host hash); the rows themselves are
@@ -4314,7 +4315,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     }
     if (m.pair) |p| {
         try runLayers(m, gpa, st, &sp, held, 0, p.lo);
-        try exchange(m, gpa, &sp, p0, st.snap_at != null and st.snap_at.? == p0 + L, if (st.verify) |v| v.n0 == p0 else false);
+        try exchange(m, gpa, &sp, p0, st.snap_at != null and st.snap_at.? == p0 + L, verifyChunk(st, p0));
         from = p.hi;
     }
     const enc_hi = if (tail != null) m.ced_split.? else m.n_layers;
@@ -4498,9 +4499,16 @@ fn monoUs() i64 {
     return @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).toNanoseconds(), 1000));
 }
 
+fn verifyChunk(st: *const State, p0: usize) bool {
+    const v = st.verify orelse return false;
+    return v.n0 == p0;
+}
+
 /// Layers [lo, hi) over every span of `sp`, one layer at a time; `held` is every array crossing
 /// layers, evaluated per layer when there are several spans.
 pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, held: []A, lo: usize, hi: usize) !void {
+    m.verifying = verifyChunk(st, sp.p0);
+    defer m.verifying = false;
     const n_spans = sp.xs.len;
     // Wide spans run a layer's row-wise stages over the whole chunk, attention's core per span.
     const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;

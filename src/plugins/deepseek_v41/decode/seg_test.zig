@@ -74,6 +74,15 @@ fn runSteps(gpa: std.mem.Allocator, fx: *Fixture, rows_list: []const usize) ![]u
     return all.toOwnedSlice(gpa);
 }
 
+const Step = struct { rows: usize, verify: bool };
+
+fn stepOn(gpa: std.mem.Allocator, fx: *Fixture, s: Step) !void {
+    const in = try fixture.Input.of(fx, s.rows);
+    defer in.deinit();
+    const out = try dsv41.workerStep(fx.m, gpa, in.x, in.pre, fx.state().n, false, s.verify);
+    for (out) |o| _ = mlx.mlx_array_free(o);
+}
+
 test "dsv41 fused seg: level off is stock bit for bit, no seg state, no seg dispatch" {
     if (!gpuTest()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -107,7 +116,7 @@ test "dsv41 fused seg: DSV41_FUSED_SEG reads 0 to 5 and refuses anything else" {
     for ([_][]const u8{ "6", "-1", "", "on", "1 ", "255", "99999" }) |bad| try std.testing.expectEqual(seg.Level.off, seg.levelOf(bad));
 }
 
-test "dsv41 fused seg: serves declines non-NAX, TP != 4, streamed, rows > 1, affine experts, f32" {
+test "dsv41 fused seg: serves declines non-NAX, TP != 4, streamed, rows past 6 or 2..6 outside a verify, affine experts, f32" {
     if (!gpuTest()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     Sums.install();
@@ -119,7 +128,13 @@ test "dsv41 fused seg: serves declines non-NAX, TP != 4, streamed, rows > 1, aff
     const nax = device.naxAvailable();
     if (nax) {
         try std.testing.expect(seg.serves(fx.m, 1) == null);
-        try std.testing.expectEqualStrings("rows > 1", seg.serves(fx.m, 2).?);
+        for (2..decode.max_rows + 1) |rows| try std.testing.expectEqualStrings("rows > 1 outside a verify", seg.serves(fx.m, rows).?);
+        try std.testing.expectEqualStrings("rows > 6", seg.serves(fx.m, decode.max_rows + 1).?);
+        try std.testing.expectEqualStrings("no rows", seg.serves(fx.m, 0).?);
+        fx.m.verifying = true;
+        defer fx.m.verifying = false;
+        for (1..decode.max_rows + 1) |rows| try std.testing.expect(seg.serves(fx.m, rows) == null);
+        try std.testing.expectEqualStrings("rows > 6", seg.serves(fx.m, decode.max_rows + 1).?);
         try std.testing.expectEqualStrings("no rows", seg.serves(fx.m, 0).?);
     }
     var stub = fx.m.*;
@@ -221,8 +236,10 @@ test "dsv41 fused seg: every level makes the same sums in the same order with th
             defer _ = mlx.mlx_array_free(x);
             const pre = try fx.cpre(rows);
             defer _ = mlx.mlx_array_free(pre);
-            const out = try dsv41.workerStep(fx.m, gpa, x, pre, 0, false, false);
+            const before = seg.dispatches;
+            const out = try dsv41.workerStep(fx.m, gpa, x, pre, 0, false, rows > 1);
             for (out) |o| _ = mlx.mlx_array_free(o);
+            if (n == 1 and device.naxAvailable()) try std.testing.expect(seg.dispatches > before);
             if (n == 0) {
                 level0 = try gpa.dupe(SumCall, Sums.calls.items);
                 try std.testing.expectEqual(@as(usize, 80), level0.len);
@@ -250,16 +267,20 @@ test "dsv41 fused seg: kmap: segCheck fails the broken arm and passes seg:N" {
         seg.broken = .none;
     }
     const nax = device.naxAvailable();
-    gpa.free(try runSteps(gpa, fx, &.{ 2, 2 }));
-    try kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = .off });
-    for (1..6) |n| try std.testing.expectError(error.SegCheckSkipped, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = @enumFromInt(n) }));
-    try std.testing.expectError(error.SegCheckFailed, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .broken));
-    try std.testing.expectError(error.SegCheckFailed, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .nan));
-    for (o.lo..o.hi) |li| try std.testing.expectEqual(@as(c_int, 2), mlx.getShape(seg_bounds.inOf(li).?[0])[0]);
-    gpa.free(try runSteps(gpa, fx, &.{ 1, 1 }));
-    for (1..6) |n| {
-        const level: seg.Level = @enumFromInt(n);
-        if (nax) try kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = level }) else try std.testing.expectError(error.SegCheckSkipped, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = level }));
+    for ([_]Step{ .{ .rows = 7, .verify = true }, .{ .rows = 3, .verify = false } }) |s| {
+        try stepOn(gpa, fx, s);
+        try kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = .off });
+        for (1..6) |n| try std.testing.expectError(error.SegCheckSkipped, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = @enumFromInt(n) }));
+        if (s.rows <= decode.max_rows) try std.testing.expectError(error.SegCheckFailed, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .broken));
+        if (s.rows <= decode.max_rows) try std.testing.expectError(error.SegCheckFailed, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .nan));
+        for (o.lo..o.hi) |li| try std.testing.expectEqual(@as(c_int, @intCast(s.rows)), mlx.getShape(seg_bounds.inOf(li).?[0])[0]);
+    }
+    for ([_]Step{ .{ .rows = 1, .verify = false }, .{ .rows = 3, .verify = true } }) |s| {
+        try stepOn(gpa, fx, s);
+        for (1..6) |n| {
+            const level: seg.Level = @enumFromInt(n);
+            if (nax) try kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = level }) else try std.testing.expectError(error.SegCheckSkipped, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = level }));
+        }
     }
     try std.testing.expectError(error.SegCheckFailed, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .broken));
     try std.testing.expectError(error.SegCheckFailed, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .nan));
@@ -833,12 +854,12 @@ test "dsv41 fused seg: a level 2 launch that declines runs level 1's launch, not
     try std.testing.expectEqual(seg.Level.ffn_seg, declined.m.fused_seg);
 }
 
-test "dsv41 fused seg: every rank logs its level at load, nothing at level 0, and counts one-row forwards" {
+test "dsv41 fused seg: every rank logs its level at load, nothing at level 0, and counts one-row and verify forwards" {
     if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     Sums.install();
     defer Sums.remove();
-    var buf: [96]u8 = undefined;
+    var buf: [seg.report_len]u8 = undefined;
     var o = tp4;
     o.seg = .off;
     {
@@ -853,7 +874,9 @@ test "dsv41 fused seg: every rank logs its level at load, nothing at level 0, an
         defer fx.deinit();
         try std.testing.expectEqualStrings(line, seg.loadLine(&buf, fx.m).?);
     }
-    try std.testing.expectEqualStrings("[dsv41] fused seg: 5 segment launches, 2 declines, 1000 one-row forwards", seg.reportLine(&buf, 5, 2, 1000));
+    try std.testing.expectEqualStrings("[dsv41] fused seg: 5 segment launches, 2 declines, 1000 one-row forwards, 7 verify forwards", seg.reportLine(&buf, 5, 2, 1000, 7));
+    const most = std.math.maxInt(u64);
+    try std.testing.expect(std.mem.endsWith(u8, seg.reportLine(&buf, most, most, most, most), "one-row forwards, 18446744073709551615 verify forwards"));
     var state = try seg.State.init(4, .ticket);
     defer state.deinit();
     const m = try gpa.create(dsv41.Dsv41Model);
@@ -866,9 +889,20 @@ test "dsv41 fused seg: every rank logs its level at load, nothing at level 0, an
     try seg.afterStep(m, 2);
     try seg.afterStep(m, 8);
     try std.testing.expectEqual(2 * seg.report_forwards, state.forwards);
-    m.fused_seg = .off;
-    try seg.afterStep(m, 1);
+    try std.testing.expectEqual(@as(u64, 0), state.verify_forwards);
+    seg.dispatches += 3;
+    try seg.afterStep(m, 6);
+    try std.testing.expectEqual(@as(u64, 1), state.verify_forwards);
+    try std.testing.expectEqual(3 * seg.report_forwards + 1, state.next_report);
+    try seg.afterStep(m, 6);
+    try std.testing.expectEqual(@as(u64, 1), state.verify_forwards);
     try std.testing.expectEqual(2 * seg.report_forwards, state.forwards);
+    m.fused_seg = .off;
+    seg.dispatches += 1;
+    try seg.afterStep(m, 1);
+    try seg.afterStep(m, 3);
+    try std.testing.expectEqual(2 * seg.report_forwards, state.forwards);
+    try std.testing.expectEqual(@as(u64, 1), state.verify_forwards);
 }
 
 test "dsv41 fused seg: level 2 writes level 1's whole layer bit for bit on layers 20..23" {
@@ -992,5 +1026,209 @@ fn expectTiePicks(idx: []const f32, rows: usize) !void {
         const row = idx[r * 6 ..][0..6];
         for (row[0..5]) |e| try std.testing.expect(e < 5);
         try std.testing.expectEqual(@as(f32, 7), row[5]);
+    }
+}
+
+test "dsv41 fused seg: level 1 decodes verify chunks of 2..6 rows on layers 20..23 no further from the f32 model than stock" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    Sums.install();
+    defer Sums.remove();
+    var o = tp4;
+    o.ctx = 601;
+    o.seg = .ffn_entry;
+    const before = seg.dispatches;
+    try decode.layersAgreeSteps(std.testing.allocator, o, &.{ 2, 3, 4, 5, 6 });
+    try std.testing.expect(seg.dispatches > before);
+}
+
+test "dsv41 fused seg: prompt chunks of 2..6 rows and verify chunks past 6 rows run stock bit for bit at every level, no seg dispatch" {
+    if (!gpuTest()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    Sums.install();
+    defer Sums.remove();
+    const plan = [_]Step{ .{ .rows = 2, .verify = false }, .{ .rows = 3, .verify = false }, .{ .rows = 4, .verify = false }, .{ .rows = 5, .verify = false }, .{ .rows = 6, .verify = false }, .{ .rows = 7, .verify = true }, .{ .rows = 8, .verify = true } };
+    var ref: [][]f32 = &.{};
+    defer freeAll(gpa, ref);
+    const before = seg.dispatches;
+    for (0..6) |n| {
+        var o = tp4;
+        o.seg = @enumFromInt(n);
+        const fx = try Fixture.init(gpa, o);
+        defer fx.deinit();
+        const got = try runPlan(gpa, fx, &plan);
+        if (n == 0) {
+            ref = got;
+            continue;
+        }
+        defer freeAll(gpa, got);
+        for (ref, got) |u, v| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(u), std.mem.sliceAsBytes(v));
+    }
+    try std.testing.expectEqual(before, seg.dispatches);
+}
+
+fn freeAll(gpa: std.mem.Allocator, xs: []const []f32) void {
+    for (xs) |x| gpa.free(x);
+    gpa.free(xs);
+}
+
+fn runPlan(gpa: std.mem.Allocator, fx: *Fixture, plan: []const Step) ![][]f32 {
+    var out: std.ArrayList([]f32) = .empty;
+    errdefer {
+        for (out.items) |x| gpa.free(x);
+        out.deinit(gpa);
+    }
+    for (plan) |s| {
+        const in = try fixture.Input.of(fx, s.rows);
+        defer in.deinit();
+        const r = try dsv41.workerStep(fx.m, gpa, in.x, in.pre, fx.state().n, false, s.verify);
+        defer for (r) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        try out.append(gpa, try dsv41.hostF32(r[0]));
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "dsv41 fused seg: a verify forward at level 2 runs level 1's launch, never level 2's" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    Sums.install();
+    defer Sums.remove();
+    var o = tp4;
+    o.ctx = 0;
+    o.seg = .ffn_entry;
+    const one = try Fixture.init(gpa, o);
+    defer one.deinit();
+    o.seg = .ffn_seg;
+    const two = try Fixture.init(gpa, o);
+    defer two.deinit();
+    two.m.verifying = true;
+    try std.testing.expect(seg.on(two.m, 21, .ffn, decode.max_rows, .ffn_entry));
+    try std.testing.expect(!seg.on(two.m, 21, .ffn, decode.max_rows, .ffn_seg));
+    try std.testing.expect(seg.on(two.m, 21, .ffn, 1, .ffn_seg));
+    two.m.verifying = false;
+    const in = try fixture.Input.of(one, decode.max_rows);
+    defer in.deinit();
+    seg_ffn.grid_extra = 1;
+    defer seg_ffn.grid_extra = 0;
+    const declined = seg.declines;
+    const t0 = seg.dispatches;
+    const want = try fixture.streamAs(gpa, one, in, true);
+    defer gpa.free(want);
+    const t1 = seg.dispatches;
+    const got = try fixture.streamAs(gpa, two, in, true);
+    defer gpa.free(got);
+    try std.testing.expect(t1 > t0);
+    try std.testing.expectEqual(t1 - t0, seg.dispatches - t1);
+    try std.testing.expectEqual(declined, seg.declines);
+    try std.testing.expectEqual(seg.Level.ffn_seg, two.m.fused_seg);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+}
+
+const Bookkeeping = struct {
+    fn expectSameVerify(gpa: std.mem.Allocator, a: *const dsv41.State, b: *const dsv41.State, lo: usize) !void {
+        const u = a.verify.?;
+        const v = b.verify.?;
+        try std.testing.expectEqual(u.n0, v.n0);
+        try std.testing.expectEqualSlices(usize, u.comp_used, v.comp_used);
+        try std.testing.expectEqualSlices(usize, u.idx_used, v.idx_used);
+        for (u.pend_kv, v.pend_kv) |x, y| try expectSameShape(x, y);
+        for (u.pend_gate, v.pend_gate) |x, y| try expectSameShape(x, y);
+        try expectSameMaybe(gpa, u.pend_kv[lo], v.pend_kv[lo]);
+        try expectSameMaybe(gpa, u.pend_gate[lo], v.pend_gate[lo]);
+    }
+
+    fn expectSameLayers(gpa: std.mem.Allocator, a: *const dsv41.State, b: *const dsv41.State, lo: usize) !void {
+        try std.testing.expectEqual(a.n, b.n);
+        try std.testing.expectEqual(a.verify == null, b.verify == null);
+        for (a.layers, b.layers) |x, y| {
+            try std.testing.expectEqual(x.comp == null, y.comp == null);
+            if (x.comp) |r| try std.testing.expectEqual(r.used, y.comp.?.used);
+            try std.testing.expectEqual(x.idx_k == null, y.idx_k == null);
+            if (x.idx_k) |r| try std.testing.expectEqual(r.used, y.idx_k.?.used);
+            try expectSameShape(x.pend_kv, y.pend_kv);
+            try expectSameShape(x.pend_gate, y.pend_gate);
+        }
+        const x = a.layers[lo];
+        const y = b.layers[lo];
+        try expectSameMaybe(gpa, x.win.buf, y.win.buf);
+        try expectSameMaybe(gpa, x.pend_kv, y.pend_kv);
+        if (x.comp) |r| try expectSameMaybe(gpa, r.buf, y.comp.?.buf);
+    }
+
+    fn expectSameShape(a: A, b: A) !void {
+        try std.testing.expectEqual(a.ctx == null, b.ctx == null);
+        if (a.ctx == null) return;
+        try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+    }
+
+    fn expectSameMaybe(gpa: std.mem.Allocator, a: A, b: A) !void {
+        try expectSameShape(a, b);
+        if (a.ctx == null) return;
+        try expectSameBytes(gpa, "first layer's state", a, b);
+    }
+};
+
+const round_plan = [_]struct { rows: usize, verify: bool, keep: usize }{
+    .{ .rows = 1, .verify = false, .keep = 0 },
+    .{ .rows = 6, .verify = true, .keep = 0 },
+    .{ .rows = 1, .verify = false, .keep = 3 },
+    .{ .rows = 6, .verify = true, .keep = 0 },
+    .{ .rows = 1, .verify = false, .keep = 2 },
+};
+
+test "dsv41 fused seg: DSpark rounds at level 1 keep the state a stock run keeps, kept rows no further from the f32 model" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    Sums.install();
+    defer Sums.remove();
+    const seeds = [_]u64{ 9, 1, 2, 3, 4 };
+    var ratio: [round_plan.len][seeds.len]f64 = undefined;
+    for (seeds, 0..) |seed, si| try roundsOnSeed(gpa, seed, &ratio, si);
+    for (&ratio, round_plan) |*r, s| {
+        std.mem.sort(f64, r, {}, std.sort.asc(f64));
+        std.debug.print("[seg] rounds: {d} rows (verify {any}, keep {d}): level 1/stock distance to the f32 model, median {d:.3} (min {d:.2}, max {d:.2})\n", .{ s.rows, s.verify, s.keep, r[seeds.len / 2], r[0], r[seeds.len - 1] });
+        try std.testing.expect(r[seeds.len / 2] <= 1.15);
+    }
+}
+
+fn roundsOnSeed(gpa: std.mem.Allocator, seed: u64, ratio: *[round_plan.len][5]f64, si: usize) !void {
+    var fxs: [3]*Fixture = undefined;
+    var made: usize = 0;
+    defer for (fxs[0..made]) |f| f.deinit();
+    for (&fxs, [_]seg.Level{ .ffn_entry, .off, .off }, [_]mlx.mlx_dtype{ .bfloat16, .bfloat16, .float32 }) |*f, level, act| {
+        var o = tp4;
+        o.ctx = 66;
+        o.seed = seed;
+        o.seg = level;
+        o.act = act;
+        o.fused = act == .bfloat16;
+        f.* = try Fixture.init(gpa, o);
+        made += 1;
+    }
+    for (round_plan, 0..) |s, k| {
+        const p0 = if (s.keep > 0) fxs[1].state().verify.?.n0 + s.keep else fxs[1].state().n;
+        const in = try fixture.Input.of(fxs[0], s.rows);
+        defer in.deinit();
+        const before = seg.dispatches;
+        var got: [3][]f32 = undefined;
+        var n_got: usize = 0;
+        defer for (got[0..n_got]) |g| gpa.free(g);
+        for (fxs, &got) |f, *g| {
+            var x = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_astype(&x, in.x, f.m.act, mlx.gpuStream()));
+            const out = try dsv41.workerStep(f.m, gpa, x, in.pre, p0, false, s.verify);
+            defer for (out) |o| {
+                _ = mlx.mlx_array_free(o);
+            };
+            g.* = try dsv41.hostF32(out[0]);
+            n_got += 1;
+        }
+        try std.testing.expect(seg.dispatches > before);
+        try Bookkeeping.expectSameLayers(gpa, fxs[0].state(), fxs[1].state(), tp4.lo);
+        if (s.verify) try Bookkeeping.expectSameVerify(gpa, fxs[0].state(), fxs[1].state(), tp4.lo);
+        for (got[0]) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+        ratio[k][si] = decode.relRms(got[0], got[2]) / @max(decode.relRms(got[1], got[2]), 1e-4);
     }
 }

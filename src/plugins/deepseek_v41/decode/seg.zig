@@ -7,6 +7,7 @@ const env = @import("../../../env.zig");
 const log = @import("../../../sdk/util/log.zig");
 const config = @import("../config.zig");
 const dsv41 = @import("../deepseek_v41.zig");
+const decode = @import("decode.zig");
 const seg_proto = @import("seg_proto.zig");
 
 const A = mlx.mlx_array;
@@ -97,6 +98,8 @@ pub const State = struct {
     dep: A = .{ .ctx = null },
     last_failure: u32 = 0,
     forwards: u64 = 0,
+    verify_forwards: u64 = 0,
+    seen_dispatches: u64 = 0,
     next_report: u64 = 1,
 
     pub fn init(n_slots: usize, protocol: Protocol) !State {
@@ -104,7 +107,7 @@ pub const State = struct {
         errdefer counters.deinit();
         const status = mlx.mlx_array_new_data(&std.mem.zeroes([status_words]u32), &[_]c_int{status_words}, 1, .uint32);
         if (status.ctx == null) return error.MlxArrayNew;
-        return .{ .counters = counters, .status = status, .protocol = protocol, .groups = 0 };
+        return .{ .counters = counters, .status = status, .protocol = protocol, .groups = 0, .seen_dispatches = dispatches };
     }
 
     pub fn deinit(self: *State) void {
@@ -135,6 +138,16 @@ pub const State = struct {
     pub fn clear(self: *State) !void {
         try self.counters.reset();
         zeroWords(self.status);
+    }
+
+    fn count(self: *State, level: Level, rows: usize) void {
+        const launched = dispatches > self.seen_dispatches;
+        self.seen_dispatches = dispatches;
+        if (level == .off) return;
+        if (rows == 1) self.forwards += 1 else if (launched) self.verify_forwards += 1 else return;
+        if (self.forwards + self.verify_forwards < self.next_report) return;
+        self.next_report += report_forwards;
+        log.info("{s}\n", .{reportLine(&report_buf, dispatches, declines, self.forwards, self.verify_forwards)});
     }
 };
 
@@ -179,16 +192,7 @@ pub const spin_tgmem: u32 = 16384;
 pub fn afterStep(m: *Dsv41Model, rows: usize) !void {
     const s = m.seg orelse return;
     const code = s.code();
-    if (code == @intFromEnum(Status.ok)) {
-        if (rows == 1 and m.fused_seg != .off) {
-            s.forwards += 1;
-            if (s.forwards >= s.next_report) {
-                s.next_report += report_forwards;
-                log.info("{s}\n", .{reportLine(&report_buf, dispatches, declines, s.forwards)});
-            }
-        }
-        return;
-    }
+    if (code == @intFromEnum(Status.ok)) return s.count(m.fused_seg, rows);
     m.fused_seg = .off;
     s.last_failure = code;
     try s.clear();
@@ -202,10 +206,12 @@ pub var declines: u64 = 0;
 
 pub const report_forwards: u64 = 1000;
 
-var report_buf: [96]u8 = undefined;
+pub const report_len = 192;
 
-pub fn reportLine(buf: []u8, launches: u64, declined: u64, forwards: u64) []const u8 {
-    return std.fmt.bufPrint(buf, "[dsv41] fused seg: {d} segment launches, {d} declines, {d} one-row forwards", .{ launches, declined, forwards }) catch "[dsv41] fused seg: counts";
+var report_buf: [report_len]u8 = undefined;
+
+pub fn reportLine(buf: []u8, launches: u64, declined: u64, forwards: u64, verify_forwards: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "[dsv41] fused seg: {d} segment launches, {d} declines, {d} one-row forwards, {d} verify forwards", .{ launches, declined, forwards, verify_forwards }) catch "[dsv41] fused seg: counts";
 }
 
 pub const Break = enum { none, zero_shared, nan_shared };
@@ -239,9 +245,18 @@ pub fn serves(m: *const Dsv41Model, rows: usize) ?[]const u8 {
     if (m.dec.moe_fp4 == null) return "fused decode kernels off";
     if (m.attn_gather == null) return "no NAX";
     if (m.streamed != null or m.streamed_experts) return "streamed experts";
-    if (rows != 1) return if (rows > 1) "rows > 1" else "no rows";
+    if (rowsDeclined(m, rows)) |why| return why;
     if (m.act != .bfloat16) return "activations not bf16";
     if (!expertsMxfp4(m)) return "affine experts";
+    return null;
+}
+
+const rows_past = std.fmt.comptimePrint("rows > {d}", .{decode.max_rows});
+
+fn rowsDeclined(m: *const Dsv41Model, rows: usize) ?[]const u8 {
+    if (rows == 0) return "no rows";
+    if (rows > decode.max_rows) return rows_past;
+    if (rows > 1 and !m.verifying) return "rows > 1 outside a verify";
     return null;
 }
 
@@ -268,6 +283,7 @@ pub fn coversIn(c: *const config.Config, li: usize, which: Which) bool {
 }
 
 pub fn on(m: *const Dsv41Model, li: usize, which: Which, rows: usize, at: Level) bool {
+    if (at != .ffn_entry and rows != 1) return false;
     return @intFromEnum(m.fused_seg) >= @intFromEnum(at) and serves(m, rows) == null and covers(m, li, which);
 }
 

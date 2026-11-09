@@ -112,13 +112,19 @@ fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
 /// The fused kernels' (and `base.seg`'s level's) distance to the f32 model against today's chain's, median over seeds
 /// of each step, on the fixtures `base` describes.
 pub fn layersAgreeOn(gpa: std.mem.Allocator, base: fixture.Opts) !void {
+    return layersAgreeSteps(gpa, base, &.{ 1, 1, 1, max_rows, 1 });
+}
+
+const max_agree_steps = 8;
+
+pub fn layersAgreeSteps(gpa: std.mem.Allocator, base: fixture.Opts, steps: []const usize) !void {
     const lo = base.lo;
     const hi = base.hi;
     // One seed lands up to 1.6x either side of the chain (five random layers amplify any rounding; under TF32 the f32
     // model itself moves 8% at the verify step), so the bar is each step's median over seeds.
     const seeds = [_]u64{ 9, 1, 2, 3, 4, 5, 6 };
-    const steps = [_]usize{ 1, 1, 1, max_rows, 1 };
-    var ratio: [steps.len][seeds.len]f64 = undefined;
+    std.debug.assert(steps.len <= max_agree_steps);
+    var ratio: [max_agree_steps][seeds.len]f64 = undefined;
     for (seeds, 0..) |seed, si| {
         // Same seed, so the same weights, prefill and step inputs: the fused kernels, today's chain, and the f32 model.
         var fxs: [3]*fixture.Fixture = undefined;
@@ -141,7 +147,7 @@ pub fn layersAgreeOn(gpa: std.mem.Allocator, base: fixture.Opts) !void {
                 defer _ = mlx.mlx_array_free(x);
                 const pre = try fx.cpre(rows);
                 defer _ = mlx.mlx_array_free(pre);
-                const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, false);
+                const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, rows > 1);
                 defer for (out) |o| {
                     _ = mlx.mlx_array_free(o);
                 };
@@ -153,7 +159,7 @@ pub fn layersAgreeOn(gpa: std.mem.Allocator, base: fixture.Opts) !void {
             p0 += rows;
         }
     }
-    for (&ratio, steps) |*r, rows| {
+    for (ratio[0..steps.len], steps) |*r, rows| {
         std.mem.sort(f64, r, {}, std.sort.asc(f64));
         std.debug.print("[dec] layers {d}..{d}, {d} rows: fused/chain distance to the f32 model, median {d:.3} (min {d:.2}, max {d:.2})\n", .{ lo, hi, rows, r[seeds.len / 2], r[0], r[seeds.len - 1] });
         if (r[seeds.len / 2] > 1.15) return error.FurtherFromTruth;

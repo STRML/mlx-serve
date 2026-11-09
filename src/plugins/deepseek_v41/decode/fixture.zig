@@ -826,16 +826,24 @@ pub const Input = struct {
 
     /// One step of `m` over these rows, the stream in `m`'s activation dtype (caller frees both).
     pub fn step(in: Input, gpa: std.mem.Allocator, m: *dsv41.Dsv41Model) ![2]A {
+        return in.stepAs(gpa, m, false);
+    }
+
+    pub fn stepAs(in: Input, gpa: std.mem.Allocator, m: *dsv41.Dsv41Model, verify: bool) ![2]A {
         var x = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x);
         try mlx.check(mlx.mlx_astype(&x, in.x, m.act, mlx.gpuStream()));
-        return dsv41.workerStep(m, gpa, x, in.pre, 0, false, false);
+        return dsv41.workerStep(m, gpa, x, in.pre, 0, false, verify);
     }
 };
 
 /// `fx`'s stream after its layers over `in`, from position 0 (caller frees).
 pub fn streamOf(gpa: std.mem.Allocator, fx: *Fixture, in: Input) ![]f32 {
-    const out = try in.step(gpa, fx.m);
+    return streamAs(gpa, fx, in, false);
+}
+
+pub fn streamAs(gpa: std.mem.Allocator, fx: *Fixture, in: Input, verify: bool) ![]f32 {
+    const out = try in.stepAs(gpa, fx.m, verify);
     defer for (out) |a| {
         _ = mlx.mlx_array_free(a);
     };

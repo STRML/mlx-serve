@@ -27,10 +27,14 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   expert-pruned packs are 2-bit g128). Otherwise `routed` runs. `DSV41_MOE_BW=0` keeps the first launches (bit-equal).
   Its ubench times both arms at the per-rank widths 2304 / 1152 / 576 against a streaming read.
 - `decode/seg.zig`: `DSV41_FUSED_SEG=0-5` (unset is 0, the stock path byte for byte) picks the fused decode segment level
-  and `serves` / `covers` decide per model, rows and layer: TP4, NAX, resident mxfp4 experts, bf16, one row; the attention
+  and `serves` / `covers` decide per model, rows and layer: TP4, NAX, resident mxfp4 experts, bf16, one row or a DSpark
+  verify chunk of 2..6 rows (`Dsv41Model.verifying`, set by `runLayers` from the predicate rank 0's step header carries,
+  so every rank agrees; prompt chunks, wider verifies and `extendBatched` stay stock); levels 2 and up serve one row, so a
+  verify chunk at those levels takes level 1's launch. The attention
   segment skips layers 0 1 2 8 14 20 24 28 32 36 (30 of 40 covered), the FFN segment covers all 40. Every rank logs
-  `[dsv41] fused seg level <N> (<tag>) on` at load and, each 1,000 one-row forwards at level 1 or above, its segment launches
-  (once a layer), declines and forwards (once a whole model step). `seg_bounds.zig` holds
+  `[dsv41] fused seg level <N> (<tag>) on` at load and, each 1,000 counted forwards at level 1 or above, its segment
+  launches (once a layer), declines, one-row forwards (every one at the level) and verify forwards (those a segment
+  launched in). `seg_bounds.zig` holds
   the kernel map's `ffn:nopre` / `ffn:oracle` ceilings; its `seg:<0-5>` and `seg:broken` arms run `segCheck` per phase
   (`SEG-CHECK-OK`).
 - `decode/seg_proto.zig` + `kernels/seg_proto_header.metal`: the phase boundary inside one fused-segment launch.
@@ -58,7 +62,7 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   launch. Every mix and router threadgroup rebuilds the stream expand and collapse from `x`, the summed attention output
   and the attention split; the mixes' last arriver reduces the Sinkhorn split, the router's last arriver takes the top
   K (last-arriver word 0 and 1 of the layer's FFN slot). Its sums are in a fixed order, so the ranks route bit for bit;
-  weights differ from the chain's by summation order only.
+  weights differ from the chain's by summation order only. At 2..6 rows each row's outputs are its one-row launch's bytes.
 - `decode/seg_ffn.zig` + `kernels/dec_seg_ffn.metal` (level 2, `DSV41_FUSED_SEG=2`): the whole FFN at one row in one launch of
   `seg_ffn.Geometry.items` threadgroups of 256 threads. A group takes its item with a generation-stamped ticket (word 0 of the
   layer's FFN slot; the probe's raw ticket arithmetic breaks when a slot sees gaps in the generations): items 0..P-1 the
