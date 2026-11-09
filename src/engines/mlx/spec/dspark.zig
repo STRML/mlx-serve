@@ -305,6 +305,8 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     const verify_watch = io_util.Stopwatch.init(self.timer.io);
     const round = if (self.dspark_stochastic)
         try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)
+    else if (chainNext(self, pol, d.len, cap))
+        try dsv41_mod.dsparkRoundChain(mdl, allocator, st, t1, &d, cap)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
     const verify_ms = msSince(&verify_watch);
@@ -320,6 +322,11 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
         self.xfm.dspark_warm_rounds += 1;
     } else pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, roundWall(d.len + 1, &watch));
     return self.commitDsparkRound(allocator, round, st.n);
+}
+
+fn chainNext(self: *const Generator, pol: anytype, drafts: usize, cap: u32) bool {
+    if (!dsv41_mod.dsparkChainOn() or pol.drafting.owed > 0) return false;
+    return cap > drafts + 1 and self.max_tokens -| self.completion_tokens > drafts + 2;
 }
 
 pub fn sigmoid(x: f32) f32 {
