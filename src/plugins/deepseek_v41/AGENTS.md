@@ -34,7 +34,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   Its ubench times both arms at the per-rank widths 2304 / 1152 / 576 against a streaming read.
 - `decode/seg.zig`: `DSV41_FUSED_SEG=0-5` (unset is 0, the stock path byte for byte) picks the fused decode segment level
   and `serves` / `covers` decide per model, rows and layer: TP4, NAX, resident mxfp4 experts, bf16, one row; the attention
-  segment skips layers 0 1 2 8 14 20 24 28 32 36 (30 of 40 covered), the FFN segment covers all 40. `seg_bounds.zig` holds
+  segment skips layers 0 1 2 8 14 20 24 28 32 36 (30 of 40 covered), the FFN segment covers all 40. Every rank logs
+  `[dsv41] fused seg level <N> (<tag>) on` at load and, each 1,000 one-row forwards at level 1 or above, its segment launches
+  (once a layer), declines and forwards (once a whole model step). `seg_bounds.zig` holds
   the kernel map's `ffn:nopre` / `ffn:oracle` ceilings; its `seg:<0-5>` and `seg:broken` arms run `segCheck` per phase
   (`SEG-CHECK-OK`).
 - `decode/seg_proto.zig` + `kernels/seg_proto_header.metal`: the phase boundary inside one fused-segment launch.
@@ -71,7 +73,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   top K and, per simdgroup, on their slot's activations, words 4 + slot). Cross-group data lives in one `scratch` output (parts,
   scores, h2, idx, wts, act) read and written only through `seg_*_peer_*`; h2 is staged once a group into threadgroup memory
   (`ReadMode.staged`; `peer` and `plain` are kernel-map arms `seg:2c` / `seg:2p`, plain never a service path). The kernel
-  fails `grid_mismatch` when its grid is not its item count. 31 buffers is Metal's limit: inputs under 16 words are bound as
+  fails `grid_mismatch` when its grid is not its item count. A launch that declines (an unusual bank, more than six picks) runs
+  level 1's launch, then stock. 31 buffers is Metal's limit: inputs under 16 words are bound as
   constant memory, so scalars ride in the 16-word `par` input.
 - A MoE ubench routes scattered experts and cycles 80+ weight sets: consecutive expert ids read far slower on M5 Max
   than a router's picks, and one reused set reads from the cache.

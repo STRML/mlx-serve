@@ -4903,12 +4903,15 @@ pub fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Spli
                 pre.* = f.sf.pre;
                 return hcExpand(sc, f.x1, try tpSum(sc, m, f.part), &f.sf);
             }
-        } else if (try dkern.seg_ffn_in.launch(sc, m, li, ly, x, ao, sa)) |f| {
+            dkern.seg.declines += 1;
+        }
+        if (try dkern.seg_ffn_in.launch(sc, m, li, ly, x, ao, sa)) |f| {
             dkern.seg_bounds.remember(li, &.{ f.x1, f.sf.pre, f.sf.post, f.sf.comb, f.h2, f.idx, f.wts });
             pre.* = f.sf.pre;
             const part = try moeFused(sc, m, ly, f.h2, f.idx, f.wts) orelse try moePartial(sc, m, ly, f.h2, f.idx, f.wts);
             return hcExpand(sc, f.x1, try tpSum(sc, m, part), &f.sf);
         }
+        dkern.seg.declines += 1;
     }
     var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
     try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
@@ -5425,7 +5428,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     try mlx.check(mlx.mlx_async_eval(vec));
     Laps.lap(.submit);
     Laps.end(m);
-    try dkern.seg.afterStep(m);
+    try dkern.seg.afterStep(m, L);
     return sc.out(logits);
 }
 
@@ -5924,7 +5927,7 @@ pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usiz
     try ev.appendSlice(gpa, &.{ xo, po });
     for (st.layers[p.lo..p.hi]) |*ls| try appendLayerState(gpa, &ev, ls);
     try evalAll(ev.items);
-    try dkern.seg.afterStep(m);
+    try dkern.seg.afterStep(m, L);
     if (snap) {
         st.snap_at = st.n;
         try snapshotIfDue(m);

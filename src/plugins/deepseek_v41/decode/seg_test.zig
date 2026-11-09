@@ -559,7 +559,7 @@ test "dsv41 fused seg ffn: the segment's MoE rows equal moeFused's on the same h
     const fx = try Fixture.init(gpa, o);
     defer fx.deinit();
     _ = try seg.ensure(fx.m);
-    try std.testing.expectEqual(seg_ffn.ReadMode.staged, seg_ffn.read_mode);
+    try expectServiceDefaults();
     var printed = false;
     for (o.lo..o.hi) |li| for (0..4) |_| {
         const ly = fx.layer(li);
@@ -674,6 +674,22 @@ fn freshState(fx: *Fixture) !void {
     fx.m.dec_state = try dsv41.initState(fx.m, fx.gpa);
 }
 
+fn expectServiceDefaults() !void {
+    try std.testing.expectEqual(seg_ffn.Hook{}, seg_ffn.hook);
+    try std.testing.expectEqual(@as(usize, 0), seg_ffn.grid_extra);
+    try std.testing.expectEqual(@as(u32, 4), seg_ffn.stop_after);
+    try std.testing.expectEqual(seg_ffn.ReadMode.staged, seg_ffn.read_mode);
+}
+
+fn forgetFailure(fx: *Fixture) void {
+    if (fx.m.seg) |st| st.last_failure = 0;
+}
+
+fn expectFailure(fx: *Fixture, want: seg.Status) !void {
+    const st = fx.m.seg orelse return error.NoSegState;
+    try std.testing.expectEqual(@intFromEnum(want), st.last_failure);
+}
+
 fn stepOnce(fx: *Fixture, in: fixture.Input) ![]f32 {
     try freshState(fx);
     return fixture.streamOf(fx.gpa, fx, in);
@@ -700,7 +716,9 @@ test "dsv41 fused seg: an injected abort after phase k leaves the next step equa
     for ([_]u32{ 1, 2, 3, 4 }) |k| {
         seg_ffn.hook = .{ .abort_at = k };
         try freshState(victim);
+        forgetFailure(victim);
         try std.testing.expectError(error.Dsv41FusedSegTimeout, fixture.streamOf(gpa, victim, in));
+        try expectFailure(victim, .injected_abort);
         try std.testing.expectEqual(seg.Level.off, victim.m.fused_seg);
         seg_ffn.hook = .{};
         victim.m.fused_seg = .ffn_seg;
@@ -732,8 +750,10 @@ test "dsv41 fused seg: a spin timeout fails the step by name and latches stock" 
         seg_ffn.hook = .{ .skew_at = k };
         try freshState(fx);
         fx.m.fused_seg = .ffn_seg;
+        forgetFailure(fx);
         const t0 = nowUs();
         try std.testing.expectError(error.Dsv41FusedSegTimeout, fixture.streamOf(gpa, fx, in));
+        try expectFailure(fx, .spin_timeout);
         std.debug.print("[seg] phase {d} wait target +1: timed out, step failed after {d:.1} ms\n", .{ k, @as(f64, @floatFromInt(nowUs() - t0)) / 1e3 });
         try std.testing.expectEqual(seg.Level.off, fx.m.fused_seg);
     }
@@ -754,5 +774,87 @@ test "dsv41 fused seg: a launch whose grid is not the kernel's item count fails 
     seg_ffn.grid_extra = 1;
     defer seg_ffn.grid_extra = 0;
     try std.testing.expectError(error.Dsv41FusedSegTimeout, fixture.streamOf(gpa, fx, in));
+    try expectFailure(fx, .grid_mismatch);
     try std.testing.expectEqual(seg.Level.off, fx.m.fused_seg);
+}
+
+test "dsv41 fused seg: a service launch carries no test hook, no extra group, every phase and staged reads" {
+    try expectServiceDefaults();
+}
+
+test "dsv41 fused seg: kmap: the level 2 read arms print as they parse" {
+    var buf: [16]u8 = undefined;
+    var want: [16]u8 = undefined;
+    for ([_][]const u8{ "2c", "2p", "2s", "0", "1", "2", "broken", "nan" }) |tok| {
+        const name = try std.fmt.bufPrint(&want, "seg:{s}", .{tok});
+        try std.testing.expectEqualStrings(name, kernel_map.underName(&buf, try kernel_map.parseUnder(tok)));
+    }
+}
+
+test "dsv41 fused seg: a level 2 launch that declines runs level 1's launch, not stock" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    Sums.install();
+    defer Sums.remove();
+    var o = tp4;
+    o.ctx = 0;
+    o.seg = .ffn_entry;
+    const level1 = try Fixture.init(gpa, o);
+    defer level1.deinit();
+    o.seg = .ffn_seg;
+    const declined = try Fixture.init(gpa, o);
+    defer declined.deinit();
+    const kernel = declined.m.dec.seg_ffn;
+    declined.m.dec.seg_ffn = null;
+    defer declined.m.dec.seg_ffn = kernel;
+    const in = try fixture.Input.of(level1, 1);
+    defer in.deinit();
+    const t0 = seg.dispatches;
+    const want = try stepOnce(level1, in);
+    defer gpa.free(want);
+    const t1 = seg.dispatches;
+    const got = try stepOnce(declined, in);
+    defer gpa.free(got);
+    try std.testing.expect(t1 > t0);
+    try std.testing.expectEqual(t1 - t0, seg.dispatches - t1);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+    try std.testing.expectEqual(seg.Level.ffn_seg, declined.m.fused_seg);
+}
+
+test "dsv41 fused seg: every rank logs its level at load, nothing at level 0, and counts one-row forwards" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    Sums.install();
+    defer Sums.remove();
+    var buf: [96]u8 = undefined;
+    var o = tp4;
+    o.seg = .off;
+    {
+        const fx = try Fixture.init(gpa, o);
+        defer fx.deinit();
+        try std.testing.expectEqual(@as(?[]const u8, null), seg.loadLine(&buf, fx.m));
+    }
+    const want = [_][]const u8{ "[dsv41] fused seg level 1 (ffn_entry) on", "[dsv41] fused seg level 2 (ffn_seg) on" };
+    for ([_]seg.Level{ .ffn_entry, .ffn_seg }, want) |level, line| {
+        o.seg = level;
+        const fx = try Fixture.init(gpa, o);
+        defer fx.deinit();
+        try std.testing.expectEqualStrings(line, seg.loadLine(&buf, fx.m).?);
+    }
+    try std.testing.expectEqualStrings("[dsv41] fused seg: 5 segment launches, 2 declines, 1000 one-row forwards", seg.reportLine(&buf, 5, 2, 1000));
+    var state = try seg.State.init(4, .ticket);
+    defer state.deinit();
+    const m = try gpa.create(dsv41.Dsv41Model);
+    defer gpa.destroy(m);
+    m.seg = &state;
+    m.fused_seg = .ffn_seg;
+    for (0..2 * seg.report_forwards) |_| try seg.afterStep(m, 1);
+    try std.testing.expectEqual(2 * seg.report_forwards, state.forwards);
+    try std.testing.expectEqual(3 * seg.report_forwards, state.next_report);
+    try seg.afterStep(m, 2);
+    try seg.afterStep(m, 8);
+    try std.testing.expectEqual(2 * seg.report_forwards, state.forwards);
+    m.fused_seg = .off;
+    try seg.afterStep(m, 1);
+    try std.testing.expectEqual(2 * seg.report_forwards, state.forwards);
 }
