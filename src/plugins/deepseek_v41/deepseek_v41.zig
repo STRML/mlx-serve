@@ -8037,7 +8037,8 @@ fn acceptedOf(sc: *Scope, m: *Dsv41Model, best: A, ids: []const u32) !A {
     if (b == 0) return sc.i(0);
     var drafts: [16]i32 = undefined;
     for (drafts[0..b], ids[1..]) |*o, v| o.* = @intCast(v);
-    const miss = try sc.astype(try sc.op2(mlx.mlx_not_equal, try sc.slice(best, 0, 0, b), try sc.ints(drafts[0..b], &.{ci(b)})), .int32);
+    const hit = try sc.astype(try sc.op2(mlx.mlx_equal, try sc.slice(best, 0, 0, b), try sc.ints(drafts[0..b], &.{ci(b)})), .int32);
+    const miss = try sc.op2(mlx.mlx_subtract, try sc.ones(&.{ci(b)}, .int32), hit);
     const stop = try sc.concat(&.{ miss, try sc.ones(&.{1}, .int32) }, 0);
     return sc.astype(try sc.argmax(stop, 0), .int32);
 }
