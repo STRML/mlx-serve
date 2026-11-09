@@ -37,6 +37,7 @@ pub const Opts = struct {
     /// pack's plan (gate/up 2 or 3 bits, down 3, groups of 64).
     experts_affine: ?u32 = null,
     seg: seg.Level = .off,
+    from_env: bool = false,
 };
 
 pub const DraftOpts = struct {
@@ -90,7 +91,7 @@ pub const Fixture = struct {
         }
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
         errdefer fx.m.deinit();
-        fx.m.fused_seg = opts.seg;
+        if (!opts.from_env) fx.m.fused_seg = opts.seg;
         if (!opts.fused) fx.m.dec.deinit();
         var p0: usize = 0;
         while (p0 < opts.ctx) {

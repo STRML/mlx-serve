@@ -126,12 +126,13 @@ test "dsv41 kernel map: a TP rank's full decode step in a loop for a GPU trace (
 const ProjAt = dsv41.ProjAt;
 const Mode = enum { base, ctl, twin, same, pre, precopy, ffn, seg };
 
-pub const Under = union(enum) { level: seg.Level, broken };
+pub const Under = union(enum) { level: seg.Level, broken, nan };
 
 const Arm = struct { mode: Mode = .base, at: ProjAt = .in_proj, index: ?bool = null, ffn: seg_bounds.Arm = .base, under: Under = .{ .level = .off } };
 
 fn parseUnder(tok: []const u8) !Under {
     if (std.mem.eql(u8, tok, "broken")) return .broken;
+    if (std.mem.eql(u8, tok, "nan")) return .nan;
     const n = std.fmt.parseInt(u8, tok, 10) catch return error.BadArm;
     return .{ .level = std.enums.fromInt(seg.Level, n) orelse return error.BadArm };
 }
@@ -367,10 +368,14 @@ fn medianOf(xs: []f64) f64 {
 }
 
 fn setUnder(m: *dsv41.Dsv41Model, u: Under) void {
-    seg.broken = u == .broken;
+    seg.broken = switch (u) {
+        .level => .none,
+        .broken => .zero_shared,
+        .nan => .nan_shared,
+    };
     m.fused_seg = switch (u) {
         .level => |l| l,
-        .broken => .off,
+        .broken, .nan => .off,
     };
 }
 
@@ -383,6 +388,7 @@ fn underName(buf: []u8, u: Under) []const u8 {
     return switch (u) {
         .level => |l| std.fmt.bufPrint(buf, "seg:{d}", .{@intFromEnum(l)}) catch "seg",
         .broken => "seg:broken",
+        .nan => "seg:nan",
     };
 }
 
@@ -391,15 +397,32 @@ const whole_seeds = 3;
 const whole_layers = 6;
 const whole_ratio = 1.15;
 
-const LayerStat = struct { layers: usize = 0, total: usize = 0, ndiff: usize = 0, route_miss: usize = 0, num: f64 = 0, den: f64 = 0, worst: f64 = 0 };
+const wts_rel_tol = 1e-6;
+
+const LayerStat = struct { layers: usize = 0, engaged: usize = 0, total: usize = 0, ndiff: usize = 0, nonfinite: usize = 0, route_rows: usize = 0, route_bad: usize = 0, num: f64 = 0, den: f64 = 0, worst: f64 = 0, declined: ?[]const u8 = null };
 
 fn dup(sc: *dsv41.Scope, a: A) !A {
     return sc.keep(sc.out(a));
 }
 
-fn routesOf(sc: *dsv41.Scope, li: usize) !A {
+fn routesOf(sc: *dsv41.Scope, li: usize) ![2]A {
     const c = seg_bounds.heldOf(li) orelse return error.NoCapture;
-    return sc.astype(c[1], .float32);
+    return .{ try sc.astype(c[1], .float32), try sc.astype(c[2], .float32) };
+}
+
+/// Rows of `rows` x `topk` routes where the picks differ in any position (order counts, so a tie that went to the
+/// higher index shows) or a weight moves by more than `wts_rel_tol` relative.
+pub fn routeRowsBad(idx_a: []const f32, idx_b: []const f32, wts_a: []const f32, wts_b: []const f32, rows: usize, topk: usize) usize {
+    var bad: usize = 0;
+    for (0..rows) |r| {
+        var row_bad = false;
+        for (r * topk..(r + 1) * topk) |i| {
+            const dw = @abs(wts_a[i] - wts_b[i]);
+            row_bad = row_bad or idx_a[i] != idx_b[i] or !(dw <= wts_rel_tol * @max(@abs(wts_a[i]), 1e-30));
+        }
+        if (row_bad) bad += 1;
+    }
+    return bad;
 }
 
 fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize, under: Under) !LayerStat {
@@ -414,31 +437,39 @@ fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize,
         const sa: dsv41.Split = .{ .pre = try dup(&sc, c[2]), .post = try dup(&sc, c[3]), .comb = try dup(&sc, c[4]) };
         var pre_a = x;
         var pre_b = x;
+        const rows: usize = @intCast(mlx.getShape(x)[0]);
         setUnder(m, .{ .level = .off });
         const ya = try dsv41.tpFfn(&sc, m, li, x, ao, &sa, &pre_a);
-        const ia = try routesOf(&sc, li);
+        const ra = try routesOf(&sc, li);
         setUnder(m, under);
+        const took = switch (under) {
+            .level => |l| l != .off and seg.on(m, li, .ffn, rows, .ffn_entry),
+            .broken, .nan => false,
+        };
+        if (took) st.engaged += 1 else if (st.declined == null) st.declined = seg.serves(m, rows) orelse "layer not covered";
         const yb = try dsv41.tpFfn(&sc, m, li, x, ao, &sa, &pre_b);
-        const ib = try routesOf(&sc, li);
+        const rb = try routesOf(&sc, li);
         const af = try sc.astype(ya, .float32);
         const bf = try sc.astype(yb, .float32);
-        try dsv41.evalAll(&.{ af, bf, ia, ib });
+        try dsv41.evalAll(&.{ af, bf, ra[0], ra[1], rb[0], rb[1] });
         const n = mlx.mlx_array_size(af);
         const xa = mlx.mlx_array_data_float32(af).?[0..n];
         const xb = mlx.mlx_array_data_float32(bf).?[0..n];
         for (xa, xb) |u, v| {
+            if (!std.math.isFinite(u) or !std.math.isFinite(v)) st.nonfinite += 1;
             if (u != v) st.ndiff += 1;
             const d = @as(f64, u) - @as(f64, v);
             st.num += d * d;
             st.den += @as(f64, u) * @as(f64, u);
             st.worst = @max(st.worst, @abs(d));
         }
-        const k = mlx.mlx_array_size(ia);
-        const ra = mlx.mlx_array_data_float32(ia).?[0..k];
-        const rb = mlx.mlx_array_data_float32(ib).?[0..k];
-        for (ra) |u| {
-            if (std.mem.indexOfScalar(f32, rb, u) == null) st.route_miss += 1;
-        }
+        const k = mlx.mlx_array_size(ra[0]);
+        const idx_a = mlx.mlx_array_data_float32(ra[0]).?[0..k];
+        const idx_b = mlx.mlx_array_data_float32(rb[0]).?[0..k];
+        const wts_a = mlx.mlx_array_data_float32(ra[1]).?[0..k];
+        const wts_b = mlx.mlx_array_data_float32(rb[1]).?[0..k];
+        st.route_bad += routeRowsBad(idx_a, idx_b, wts_a, wts_b, rows, k / rows);
+        st.route_rows += rows;
         st.total += n;
         st.layers += 1;
     }
@@ -491,19 +522,29 @@ fn wholeStep(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize,
 pub fn segCheck(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize, under: Under) !void {
     defer applyArm(fx, .{});
     seg_bounds.set(.base);
-    const st = try layerStat(gpa, fx, lo, hi, under);
-    const whole = try wholeStep(gpa, fx, lo, hi, under);
-    const rms = @sqrt(st.num / @max(st.den, 1e-30));
     var buf: [16]u8 = undefined;
     const name = underName(&buf, under);
-    std.debug.print("[kmap] {s} vs stock: {d} layers, {d} of {d} stream values differ, rel rms {e:.3}, max abs {e:.3}, routes missed {d}; whole step from the f32 model (median of {d} seeds): stock {e:.3}, {s} {e:.3}\n", .{ name, st.layers, st.ndiff, st.total, rms, st.worst, st.route_miss, whole_seeds, whole.stock, name, whole.arm });
+    const st = try layerStat(gpa, fx, lo, hi, under);
+    const needs_seg = switch (under) {
+        .level => |l| l != .off,
+        .broken, .nan => false,
+    };
+    if (st.layers > 0 and needs_seg and st.engaged == 0) {
+        std.debug.print("SEG-CHECK-SKIP {s}: no captured layer takes the segment path ({s})\n", .{ name, st.declined.? });
+        return error.SegCheckSkipped;
+    }
+    const whole = try wholeStep(gpa, fx, lo, hi, under);
+    const rms = @sqrt(st.num / @max(st.den, 1e-30));
+    std.debug.print("[kmap] {s} vs stock: {d} layers ({d} on the segment path), {d} of {d} stream values differ ({d} non-finite), rel rms {e:.3}, max abs {e:.3}, route rows differing {d} of {d}; whole step from the f32 model (median of {d} seeds): stock {e:.3}, {s} {e:.3}\n", .{ name, st.layers, st.engaged, st.ndiff, st.total, st.nonfinite, rms, st.worst, st.route_bad, st.route_rows, whole_seeds, whole.stock, name, whole.arm });
     const why: ?[]const u8 = if (st.layers == 0)
         "no layer captured"
-    else if (st.route_miss != 0)
-        "routes missed"
-    else if (rms > layer_rms_max)
+    else if (st.nonfinite != 0)
+        "non-finite output"
+    else if (st.route_bad != 0)
+        "route rows differ"
+    else if (!(rms <= layer_rms_max))
         "layer outputs differ from stock"
-    else if (whole.arm > whole_ratio * whole.stock + 1e-4)
+    else if (!(whole.arm <= whole_ratio * whole.stock + 1e-4))
         "whole step further from the f32 model than stock"
     else
         null;
@@ -601,7 +642,9 @@ fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize
     if (ab) |a| {
         applyArm(fx, .{});
         const pair = fx.m.pair.?;
-        for (a.arms[0..a.n]) |arm| if (arm.mode == .seg) try segCheck(gpa, fx, pair.lo, pair.hi, arm.under);
+        for (a.arms[0..a.n]) |arm| if (arm.mode == .seg) segCheck(gpa, fx, pair.lo, pair.hi, arm.under) catch |e| {
+            if (e != error.SegCheckSkipped) return e;
+        };
         printArms(a, rows, us[0 .. steps - steps % a.n]);
         printBuild(a, rows, bus[0 .. steps - steps % a.n]);
     }
