@@ -1142,8 +1142,46 @@ const FpBank = struct {
 };
 
 /// How a step's rows pick: 6 distinct experts each, or 3 every row shares and 3 of their own (a verify block's rows
-/// route alike).
-const Picks = enum { disjoint, half };
+/// route alike), or the share of repeated picks measured on four Studios' verifies (`measured_dup`), or every row the
+/// same 6. A row's own 6 picks are always distinct.
+const Picks = enum { disjoint, half, measured, shared };
+
+/// The share of a verify's (row, expert) picks that repeat an expert, by rows (dsv41-verify-picks, TP4 agent replay,
+/// 2026-11-09; the middle of each measured range).
+const measured_dup = [_]f64{ 0, 0, 0.13, 0.25, 0.275, 0.31, 0.36 };
+
+fn distinctOf(picks: Picks, rows: usize) usize {
+    return switch (picks) {
+        .disjoint => rows * TOPK,
+        .half => TOPK / 2 * (rows + 1),
+        .shared => TOPK,
+        .measured => @max(TOPK, @as(usize, @intFromFloat(@round(@as(f64, @floatFromInt(rows * TOPK)) * (1 - measured_dup[rows]))))),
+    };
+}
+
+/// New experts row `r` brings under `.measured`: the `distinct - TOPK` past row 0's spread evenly over rows 1..R-1.
+fn newBefore(rows: usize, distinct: usize, r: usize) usize {
+    if (r == 0 or rows < 2) return 0;
+    return (distinct - TOPK) * (r - 1) / (rows - 1);
+}
+
+/// Row `r`'s pick `j` as an index into the step's `distinct` experts.
+fn slotOf(picks: Picks, rows: usize, distinct: usize, r: usize, j: usize) usize {
+    return switch (picks) {
+        .disjoint => r * TOPK + j,
+        .half => if (j < TOPK / 2) j else TOPK / 2 * (r + 1) + j - TOPK / 2,
+        .shared => j,
+        .measured => measuredSlot(rows, distinct, r, j),
+    };
+}
+
+fn measuredSlot(rows: usize, distinct: usize, r: usize, j: usize) usize {
+    if (r == 0) return j;
+    const before = newBefore(rows, distinct, r);
+    const fresh = newBefore(rows, distinct, r + 1) - before;
+    if (j < fresh) return TOPK + before + j;
+    return (r + j - fresh) % (TOPK + before);
+}
 
 /// A row count's inputs over a bank: step i takes the next experts of one shuffle of the bank, as scattered as a
 /// router's picks.
@@ -1161,7 +1199,7 @@ const FpRows = struct {
     comb: A = none,
 
     fn init(gpa: std.mem.Allocator, w: usize, rows: usize, hc: usize, picks: Picks) !FpRows {
-        const distinct = if (picks == .disjoint) rows * TOPK else TOPK / 2 * (rows + 1);
+        const distinct = distinctOf(picks, rows);
         var b: FpRows = .{ .rows = rows, .hc = hc, .distinct = distinct, .held = .{ .gpa = gpa } };
         errdefer b.held.deinit();
         const R: c_int = @intCast(rows);
@@ -1174,10 +1212,7 @@ const FpRows = struct {
             var ids: [decode.max_rows * TOPK]u32 = undefined;
             var ws: [decode.max_rows * TOPK]f32 = undefined;
             for (0..rows) |r| for (0..TOPK) |j| {
-                const slot = switch (picks) {
-                    .disjoint => r * TOPK + j,
-                    .half => if (j < TOPK / 2) j else TOPK / 2 * (r + 1) + j - TOPK / 2,
-                };
+                const slot = slotOf(picks, rows, distinct, r, j);
                 ids[r * TOPK + j] = perm[(i * distinct + slot) % bench_experts];
                 ws[r * TOPK + j] = 0.05 + 0.3 * prng.random().float(f32);
             };
@@ -1329,3 +1364,54 @@ test "dsv41 dec moe_fp4: ubench, widths 576 1152 2304, rows 1 2 4 6, both arms a
         };
     }
 }
+
+test "dsv41 dec moe_fp4: verify picks, rows 2-6 under every pick pattern hold 6 distinct experts a row and the pattern's distinct count" {
+    for (2..decode.max_rows + 1) |rows| for ([_]Picks{ .disjoint, .half, .measured, .shared }) |picks| {
+        const distinct = distinctOf(picks, rows);
+        var used = std.StaticBitSet(64).empty;
+        for (0..rows) |r| {
+            var row = std.StaticBitSet(64).empty;
+            for (0..TOPK) |j| {
+                const slot = slotOf(picks, rows, distinct, r, j);
+                try testing.expect(slot < distinct);
+                try testing.expect(!row.isSet(slot));
+                row.set(slot);
+                used.set(slot);
+            }
+        }
+        try testing.expectEqual(distinct, used.count());
+    };
+}
+
+test "dsv41 dec moe_fp4: verify picks ubench, width 576 (one rank of four), rows 2-6, disjoint, measured and shared picks, both arms against the distinct experts' bytes (DSV41_DEC_UBENCH)" {
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const sk = try dsv41.buildKernel("dsv41_dec_stream_read", &.{ "src", "dep" }, &.{"out"}, STREAM_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(sk);
+    const lo = try streamUs(gpa, sk, 40 << 20);
+    const hi = try streamUs(gpa, sk, 80 << 20);
+    const peak = @as(f64, 40 << 20) / (hi - lo);
+    std.debug.print("[verify-picks-ubench] peak streaming read (slope 40 -> 80 MB) {d:.0} GB/s\n", .{peak / 1e3});
+    const arms: [2]Kernels = .{ try buildArm(10, false), try buildArm(10, true) };
+    defer for (arms) |k| k.deinit();
+    const w = 576;
+    var bank = try FpBank.init(gpa, w);
+    defer bank.held.deinit();
+    for (2..decode.max_rows + 1) |rows| {
+        var total: [3][2]f64 = undefined;
+        var floor: [3]f64 = undefined;
+        for ([_]Picks{ .disjoint, .measured, .shared }, &total, &floor) |picks, *t, *f| {
+            var one = try FpRows.init(gpa, w, rows, 1, picks);
+            defer one.held.deinit();
+            var hc4 = try FpRows.init(gpa, w, rows, 4, picks);
+            defer hc4.held.deinit();
+            const a = try armUs(gpa, arms, &bank, &one, &hc4);
+            const bytes = 1.5 * bank.upBytes(one.distinct);
+            f.* = bytes / peak;
+            for (a, t) |arm, *tt| tt.* = arm[0] + arm[2];
+            std.debug.print("[verify-picks-ubench] R={d} {s}: {d} distinct of {d} picks, up + down(hc 4) today {d:.1} us, bw {d:.1} us; the distinct experts' bytes at peak {d:.1} us\n", .{ rows, @tagName(picks), one.distinct, rows * TOPK, t[0], t[1], f.* });
+        }
+        for ([_][]const u8{ "today", "bw" }, 0..) |name, k| std.debug.print("[verify-picks-ubench] R={d} {s}: measured picks save {d:.1} us against disjoint already (the cache); reading each distinct expert once could save at most {d:.1} us more ({d:.0}% of the measured time)\n", .{ rows, name, total[0][k] - total[1][k], @max(total[1][k] - floor[1], 0), 100 * @max(total[1][k] - floor[1], 0) / total[1][k] });
+    }
+}
+
