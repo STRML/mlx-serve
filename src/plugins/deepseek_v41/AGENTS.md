@@ -31,6 +31,13 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   segment skips layers 0 1 2 8 14 20 24 28 32 36 (30 of 40 covered), the FFN segment covers all 40. `seg_bounds.zig` holds
   the kernel map's `ffn:nopre` / `ffn:oracle` ceilings; its `seg:<0-5>` and `seg:broken` arms run `segCheck` per phase
   (`SEG-CHECK-OK`).
+- `decode/seg_proto.zig` + `kernels/seg_proto_header.metal`: the phase boundary inside one fused-segment launch.
+  `seg.Counters` are generation-stamped words (`gen << 16 | arrivals`, 16 a (layer, segment) slot), so a step never zeroes
+  the previous one's and a counter left dirty by an abort cannot satisfy a wait; `seg_wait` is bounded
+  (`SEG_SPIN_POLLS_DEFAULT`) and fails into `State.status`, which `seg.afterStep` reads after the step's evaluation
+  (latches `fused_seg` off, `error.Dsv41FusedSegTimeout`). MLX binds an input of under 16 words as constant memory, so any
+  array a kernel writes (counters, status) keeps 16. The ubench is `MLX_SERVE_DIAG=dsv41-seg-probe` (grids
+  `dsv41-seg-probe-groups=<lo>-<hi>`); `probeResidency` finds the co-resident grid and `seg.spinGrid` derates it.
 - A MoE ubench routes scattered experts and cycles 80+ weight sets: consecutive expert ids read far slower on M5 Max
   than a router's picks, and one reused set reads from the cache.
 - Under `tp` each `tpSum` is a CPU-stream JACCL all_sum, two a layer. With `MLX_METAL_FAST_SYNCH` (on in a group) MLX
