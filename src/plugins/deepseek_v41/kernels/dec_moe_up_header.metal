@@ -100,8 +100,8 @@ inline void dec_up_routed(const device uint32_t* w, const device T* sc, const de
 
 // The shared expert's gate (acc[r][0]) and up (acc[r][1]) of output row n against each of R x rows; its weights are
 // decoded once whatever R is.
-template <int R, int K, int N, typename T>
-inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, uint n, const device T* x, uint lane, thread float (*acc)[2]) {
+template <int R, int K, int N, typename XP>
+inline void dec_up_shared_x(const device uint32_t* sw, const device uint8_t* ss, uint n, XP x, uint lane, thread float (*acc)[2]) {
   constexpr uint KWS = K / 4, KGS = K / 32, UPL = K / 1024;
   const uint wo[2] = {n * KWS + lane * 8, (n + N) * KWS + lane * 8};
   const uint so[2] = {n * KGS + lane, (n + N) * KGS + lane};
@@ -131,7 +131,7 @@ inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, u
       }
 #pragma unroll
       for (int r = 0; r < R; ++r) {
-        const uint4 xq = ((const device uint4*)(x + r * K))[(32 * k + lane) * 4 + c];
+        const uint4 xq = x[r * (K / 8) + (32 * k + lane) * 4 + c];
         const float xf[8] = {dec_up_bf(xq.x, 0), dec_up_bf(xq.x, 1), dec_up_bf(xq.y, 0), dec_up_bf(xq.y, 1), dec_up_bf(xq.z, 0), dec_up_bf(xq.z, 1), dec_up_bf(xq.w, 0), dec_up_bf(xq.w, 1)};
 #pragma unroll
         for (int wr = 0; wr < 2; ++wr) {
@@ -156,6 +156,11 @@ inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, u
     acc[r][0] = simd_sum(acc[r][0]);
     acc[r][1] = simd_sum(acc[r][1]);
   }
+}
+
+template <int R, int K, int N, typename T>
+inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, uint n, const device T* x, uint lane, thread float (*acc)[2]) {
+  dec_up_shared_x<R, K, N>(sw, ss, n, (const device uint4*)x, lane, acc);
 }
 
 // clampedSwiglu(gate, up) * wt with the two sums rounded to T where gather_qmm writes them; a NaN stays NaN

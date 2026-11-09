@@ -12,6 +12,8 @@ const fixture = @import("fixture.zig");
 const kernel_map = @import("kernel_map.zig");
 const seg = @import("seg.zig");
 const seg_ffn_in = @import("seg_ffn_in.zig");
+const seg_ffn = @import("seg_ffn.zig");
+const iou = @import("../../../sdk/util/io_util.zig");
 const seg_bounds = @import("seg_bounds.zig");
 
 const A = mlx.mlx_array;
@@ -366,6 +368,7 @@ test "dsv41 fused seg ffn_in: R = 1 at 384 experts no further from float64 than 
         worst_wts = @max(worst_wts, cmp.wts_rel);
     }
     std.debug.print("[seg] ffn_in route weights vs the chain: largest relative difference {e:.2}\n", .{worst_wts});
+    try std.testing.expect(worst_wts < kernel_map.wts_rel_tol);
 }
 
 fn expectSameBytes(gpa: std.mem.Allocator, label: []const u8, a: A, b: A) !void {
@@ -540,4 +543,216 @@ test "dsv41 fused seg: level 1 decodes layers 20..23 no further from the f32 mod
     const before = seg.dispatches;
     try decode.layersAgreeOn(std.testing.allocator, o);
     try std.testing.expect(seg.dispatches > before);
+}
+
+const fp4_tp4: fixture.Opts = .{ .lo = 20, .hi = 23, .experts = 16, .ctx = 0, .fused = true, .experts_fp4 = true, .tp = .{ .rank = 0, .size = 4 } };
+
+fn hostPair(a: A, b: A) ![2][]f32 {
+    return .{ try dsv41.hostF32(a), try dsv41.hostF32(b) };
+}
+
+test "dsv41 fused seg ffn: the segment's MoE rows equal moeFused's on the same h2 and routes, bit for bit" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var o = fp4_tp4;
+    o.seg = .ffn_seg;
+    const fx = try Fixture.init(gpa, o);
+    defer fx.deinit();
+    _ = try seg.ensure(fx.m);
+    try std.testing.expectEqual(seg_ffn.ReadMode.staged, seg_ffn.read_mode);
+    var printed = false;
+    for (o.lo..o.hi) |li| for (0..4) |_| {
+        const ly = fx.layer(li);
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const in = try inputsOf(&sc, fx, ly, 1);
+        const before = seg.dispatches;
+        const l1 = (try seg_ffn_in.launch(&sc, fx.m, li, ly, in.x, in.y, &in.sa)) orelse return error.Declined;
+        const l2 = (try seg_ffn.launch(&sc, fx.m, ly, li, in.x, in.y, &in.sa)) orelse return error.Declined;
+        try std.testing.expectEqual(before + 2, seg.dispatches);
+        const h2_l2 = try l2.h2(&sc);
+        const idx_l2 = try l2.idx(&sc);
+        const wts_l2 = try l2.wts(&sc);
+        const want = (try dsv41.moeFused(&sc, fx.m, ly, h2_l2, idx_l2, wts_l2)) orelse return error.Declined;
+        const chain = try chainOf(&sc, fx.m, ly, in);
+        try dsv41.evalAll(&.{ l2.x1, h2_l2, l2.sf.pre, l2.sf.post, l2.sf.comb, idx_l2, wts_l2, l2.part, want, l1.x1, l1.h2, l1.sf.pre, l1.sf.post, l1.sf.comb, l1.idx, l1.wts });
+        try evalOut(chain);
+        try std.testing.expectEqualSlices(c_int, &.{ 1, @intCast(fx.m.cfg.hidden_size) }, mlx.getShape(l2.part));
+        try std.testing.expectEqual(mlx.mlx_array_dtype(want), mlx.mlx_array_dtype(l2.part));
+        try expectSameBytes(gpa, "part", want, l2.part);
+        const names = [_][]const u8{ "x1", "h2", "pre", "post", "comb", "idx", "wts" };
+        const a = [_]A{ l1.x1, l1.h2, l1.sf.pre, l1.sf.post, l1.sf.comb, l1.idx, l1.wts };
+        const b = [_]A{ l2.x1, h2_l2, l2.sf.pre, l2.sf.post, l2.sf.comb, idx_l2, wts_l2 };
+        for (names, a, b) |name, u, v| try expectSameBytes(gpa, name, u, v);
+        const ri = try hostPair(chain.idx, idx_l2);
+        const rw = try hostPair(chain.wts, wts_l2);
+        defer for (ri) |h| gpa.free(h);
+        defer for (rw) |h| gpa.free(h);
+        try std.testing.expectEqual(@as(usize, 0), kernel_map.routeRowsBad(ri[0], ri[1], rw[0], rw[1], 1, ly.top_k));
+        if (!printed) {
+            printed = true;
+            const p: ffn_in.Dims = .{ .rows = 1, .d = fx.m.cfg.hidden_size, .e = 16, .top_k = ly.top_k, .iters = fx.m.cfg.dsv4_hc_sinkhorn_iters };
+            const g = seg_ffn.geometryOf(p, 576, p.d, 8);
+            std.debug.print("[seg] ffn level 2 host grid: {d} threadgroups of {d} threads = {d} entry + {d} shared + {d} routed + {d} down\n", .{ g.items, ffn_in.b_threads, g.nin, g.ncb, p.top_k * g.ncb, g.items - g.nin - g.ncb - p.top_k * g.ncb });
+        }
+    };
+}
+
+test "dsv41 fused seg: level 2 decodes layers 20..23 no further from the f32 model than stock" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    Sums.install();
+    defer Sums.remove();
+    var o = tp4;
+    o.ctx = 601;
+    o.seg = .ffn_seg;
+    const before = seg.dispatches;
+    try decode.layersAgreeOn(std.testing.allocator, o);
+    try std.testing.expect(seg.dispatches > before);
+}
+
+test "dsv41 fused seg: four ranks route bit for bit over 1000 launches at level 2, an exact tie to the lower index" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var ranks: [4]*Fixture = undefined;
+    var made: usize = 0;
+    defer for (ranks[0..made]) |r| r.deinit();
+    for (&ranks, 0..) |*r, i| {
+        var o = tp4;
+        o.lo = 21;
+        o.hi = 23;
+        o.experts = 384;
+        o.ctx = 0;
+        o.seg = .ffn_seg;
+        o.tp = .{ .rank = @intCast(i), .size = 4 };
+        r.* = try Fixture.init(gpa, o);
+        made += 1;
+        _ = try seg.ensure(r.*.m);
+    }
+    const w = try ffn_in.randomWeights(79);
+    defer ffn_in.freeWeights(w);
+    const ly = try tieLayer(w, ranks[0].layer(21));
+    defer {
+        _ = mlx.mlx_array_free(ly.gate_w);
+        _ = mlx.mlx_array_free(ly.gate_bias);
+    }
+    var sc0 = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc0.deinit();
+    const in = try inputsOf(&sc0, ranks[0], &ly, 1);
+    var first: ?[3][]f32 = null;
+    defer if (first) |f| for (f) |a| gpa.free(a);
+    const before = seg.dispatches;
+    for (0..250) |n| for (ranks) |r| {
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const li: usize = 21 + (n % 2);
+        const lyi = if (li == 21) ly else ffn_in.layerWith(r.layer(22), w);
+        const out = (try seg_ffn.launch(&sc, r.m, &lyi, li, in.x, in.y, &in.sa)) orelse return error.Declined;
+        const idx_o = try out.idx(&sc);
+        const wts_o = try out.wts(&sc);
+        try dsv41.evalAll(&.{ idx_o, wts_o, out.part });
+        const got = [3][]f32{ try dsv41.hostF32(idx_o), try dsv41.hostF32(wts_o), try dsv41.hostF32(out.part) };
+        if (li != 21) {
+            for (got) |a| gpa.free(a);
+            continue;
+        }
+        if (first) |f| {
+            defer for (got) |a| gpa.free(a);
+            for (f, got) |u, v| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(u), std.mem.sliceAsBytes(v));
+            continue;
+        }
+        first = got;
+        for (got[0][0..5]) |e| try std.testing.expect(e < 5);
+        try std.testing.expectEqual(@as(f32, 7), got[0][5]);
+        for (got[0]) |e| try std.testing.expect(e != 300);
+    };
+    try std.testing.expectEqual(before + 1000, seg.dispatches);
+}
+
+fn freshState(fx: *Fixture) !void {
+    if (fx.m.dec_state) |*st| st.deinit();
+    fx.m.dec_state = null;
+    fx.m.dec_state = try dsv41.initState(fx.m, fx.gpa);
+}
+
+fn stepOnce(fx: *Fixture, in: fixture.Input) ![]f32 {
+    try freshState(fx);
+    return fixture.streamOf(fx.gpa, fx, in);
+}
+
+test "dsv41 fused seg: an injected abort after phase k leaves the next step equal to a clean run" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    Sums.install();
+    defer Sums.remove();
+    var o = tp4;
+    o.ctx = 0;
+    o.seg = .ffn_seg;
+    const clean = try Fixture.init(gpa, o);
+    defer clean.deinit();
+    const victim = try Fixture.init(gpa, o);
+    defer victim.deinit();
+    const in = try fixture.Input.of(clean, 1);
+    defer in.deinit();
+    defer seg_ffn.hook = .{};
+    const want = try stepOnce(clean, in);
+    defer gpa.free(want);
+    const before = seg.dispatches;
+    for ([_]u32{ 1, 2, 3, 4 }) |k| {
+        seg_ffn.hook = .{ .abort_at = k };
+        try freshState(victim);
+        try std.testing.expectError(error.Dsv41FusedSegTimeout, fixture.streamOf(gpa, victim, in));
+        try std.testing.expectEqual(seg.Level.off, victim.m.fused_seg);
+        seg_ffn.hook = .{};
+        victim.m.fused_seg = .ffn_seg;
+        const got = try stepOnce(victim, in);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+    }
+    try std.testing.expect(seg.dispatches > before);
+}
+
+fn nowUs() i64 {
+    return iou.nowUsMonotonic(std.Io.Threaded.global_single_threaded.io());
+}
+
+test "dsv41 fused seg: a spin timeout fails the step by name and latches stock" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    Sums.install();
+    defer Sums.remove();
+    var o = tp4;
+    o.ctx = 0;
+    o.seg = .ffn_seg;
+    const fx = try Fixture.init(gpa, o);
+    defer fx.deinit();
+    const in = try fixture.Input.of(fx, 1);
+    defer in.deinit();
+    defer seg_ffn.hook = .{};
+    for ([_]u32{ 2, 3, 4 }) |k| {
+        seg_ffn.hook = .{ .skew_at = k };
+        try freshState(fx);
+        fx.m.fused_seg = .ffn_seg;
+        const t0 = nowUs();
+        try std.testing.expectError(error.Dsv41FusedSegTimeout, fixture.streamOf(gpa, fx, in));
+        std.debug.print("[seg] phase {d} wait target +1: timed out, step failed after {d:.1} ms\n", .{ k, @as(f64, @floatFromInt(nowUs() - t0)) / 1e3 });
+        try std.testing.expectEqual(seg.Level.off, fx.m.fused_seg);
+    }
+}
+
+test "dsv41 fused seg: a launch whose grid is not the kernel's item count fails by name and latches stock" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    Sums.install();
+    defer Sums.remove();
+    var o = tp4;
+    o.ctx = 0;
+    o.seg = .ffn_seg;
+    const fx = try Fixture.init(gpa, o);
+    defer fx.deinit();
+    const in = try fixture.Input.of(fx, 1);
+    defer in.deinit();
+    seg_ffn.grid_extra = 1;
+    defer seg_ffn.grid_extra = 0;
+    try std.testing.expectError(error.Dsv41FusedSegTimeout, fixture.streamOf(gpa, fx, in));
+    try std.testing.expectEqual(seg.Level.off, fx.m.fused_seg);
 }

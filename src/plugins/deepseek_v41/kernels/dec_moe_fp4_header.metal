@@ -65,8 +65,8 @@ inline float dec_fp4_down_routed(const device uint32_t* w, const device uint8_t*
 }
 
 // A lane's part of the shared expert's down row `row` (mxfp8, K inputs: a unit is 32 bytes) against `x`, as above.
-template <int K, typename T>
-inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t* ss, size_t row, const device T* x, uint first, uint step) {
+template <int K, typename XP>
+inline float dec_fp4_down_shared_x(const device uint32_t* sw, const device uint8_t* ss, size_t row, XP x, uint first, uint step) {
   constexpr uint NU = K / 32;
   const device uint4* wp = (const device uint4*)(sw + row * (K / 4));
   const device uint8_t* sp = ss + row * (K / 32);
@@ -77,7 +77,7 @@ inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t
     float d = 0.0f;
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
-      const uint4 xq = ((const device uint4*)x)[u * 4 + c];
+      const uint4 xq = x[u * 4 + c];
       const float xf[8] = {dec_up_bf(xq.x, 0), dec_up_bf(xq.x, 1), dec_up_bf(xq.y, 0), dec_up_bf(xq.y, 1), dec_up_bf(xq.z, 0), dec_up_bf(xq.z, 1), dec_up_bf(xq.w, 0), dec_up_bf(xq.w, 1)};
       const float4 a = dec_up_e4m3x4(qs[2 * c]), b = dec_up_e4m3x4(qs[2 * c + 1]);
 #pragma unroll
@@ -90,4 +90,9 @@ inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t
     acc = fma(as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f, d, acc);
   }
   return acc;
+}
+
+template <int K, typename T>
+inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t* ss, size_t row, const device T* x, uint first, uint step) {
+  return dec_fp4_down_shared_x<K>(sw, ss, row, (const device uint4*)x, first, step);
 }

@@ -19,6 +19,7 @@ const decode = @import("decode.zig");
 const fixture = @import("fixture.zig");
 const seg = @import("seg.zig");
 const seg_bounds = @import("seg_bounds.zig");
+const seg_ffn = @import("seg_ffn.zig");
 
 const A = mlx.mlx_array;
 
@@ -124,15 +125,18 @@ test "dsv41 kernel map: a TP rank's full decode step in a loop for a GPU trace (
 }
 
 const ProjAt = dsv41.ProjAt;
-const Mode = enum { base, ctl, twin, same, pre, precopy, ffn, seg };
+const Mode = enum { base, ctl, twin, same, pre, precopy, ffn, seg, stop };
 
-pub const Under = union(enum) { level: seg.Level, broken, nan };
+pub const Under = union(enum) { level: seg.Level, read: seg_ffn.ReadMode, broken, nan };
 
-const Arm = struct { mode: Mode = .base, at: ProjAt = .in_proj, index: ?bool = null, ffn: seg_bounds.Arm = .base, under: Under = .{ .level = .off } };
+const Arm = struct { mode: Mode = .base, at: ProjAt = .in_proj, index: ?bool = null, ffn: seg_bounds.Arm = .base, under: Under = .{ .level = .off }, stop: u32 = 4 };
 
 fn parseUnder(tok: []const u8) !Under {
     if (std.mem.eql(u8, tok, "broken")) return .broken;
     if (std.mem.eql(u8, tok, "nan")) return .nan;
+    if (std.mem.eql(u8, tok, "2c")) return .{ .read = .peer };
+    if (std.mem.eql(u8, tok, "2p")) return .{ .read = .plain };
+    if (std.mem.eql(u8, tok, "2s")) return .{ .read = .staged };
     const n = std.fmt.parseInt(u8, tok, 10) catch return error.BadArm;
     return .{ .level = std.enums.fromInt(seg.Level, n) orelse return error.BadArm };
 }
@@ -143,6 +147,7 @@ fn parseArm(tok: []const u8) !Arm {
     if (mode == .base) return .{};
     if (mode == .ffn) return .{ .mode = .ffn, .ffn = std.meta.stringToEnum(seg_bounds.Arm, it.next() orelse return error.BadArm) orelse return error.BadArm };
     if (mode == .seg) return .{ .mode = .seg, .under = try parseUnder(it.next() orelse return error.BadArm) };
+    if (mode == .stop) return .{ .mode = .stop, .under = .{ .level = .ffn_seg }, .stop = std.fmt.parseInt(u32, it.next() orelse return error.BadArm, 10) catch return error.BadArm };
     const at = std.meta.stringToEnum(ProjAt, it.next() orelse return error.BadArm) orelse return error.BadArm;
     const where = it.next() orelse return .{ .mode = mode, .at = at };
     if (std.mem.eql(u8, where, "idx")) return .{ .mode = mode, .at = at, .index = true };
@@ -223,7 +228,7 @@ const Probe = struct {
 
     fn applies(p: *const Probe, li: usize, at: ProjAt) bool {
         switch (p.arm.mode) {
-            .base, .ffn, .seg => return false,
+            .base, .ffn, .seg, .stop => return false,
             else => {},
         }
         if (p.arm.at != at) return false;
@@ -236,7 +241,7 @@ const Probe = struct {
         p.remember(li, at, ins);
         if (!p.applies(li, at)) return ins[0];
         const dep = switch (p.arm.mode) {
-            .base, .ctl, .ffn, .seg => ins[0],
+            .base, .ctl, .ffn, .seg, .stop => ins[0],
             .twin => try twinLaunch(sc, m, &p.copies[li - p.lo], li, at, ins),
             .same => try twinLaunch(sc, m, &m.layers[li], li, at, ins),
             .pre, .precopy => return passAfter(sc, p.pass_after, ins[0], try readLaunch(sc, p.read, weightsOf(if (p.arm.mode == .pre) &m.layers[li] else &p.copies[li - p.lo], at))),
@@ -368,25 +373,32 @@ fn medianOf(xs: []f64) f64 {
 }
 
 fn setUnder(m: *dsv41.Dsv41Model, u: Under) void {
+    seg_ffn.read_mode = switch (u) {
+        .read => |rm| rm,
+        else => .staged,
+    };
     seg.broken = switch (u) {
-        .level => .none,
+        .level, .read => .none,
         .broken => .zero_shared,
         .nan => .nan_shared,
     };
     m.fused_seg = switch (u) {
         .level => |l| l,
+        .read => .ffn_seg,
         .broken, .nan => .off,
     };
 }
 
 fn applyArm(fx: *fixture.Fixture, arm: Arm) void {
-    setUnder(fx.m, if (arm.mode == .seg) arm.under else .{ .level = fx.opts.seg });
+    setUnder(fx.m, if (arm.mode == .seg or arm.mode == .stop) arm.under else .{ .level = fx.opts.seg });
+    seg_ffn.stop_after = if (arm.mode == .stop) arm.stop else 4;
     seg_bounds.set(arm.ffn);
 }
 
 fn underName(buf: []u8, u: Under) []const u8 {
     return switch (u) {
         .level => |l| std.fmt.bufPrint(buf, "seg:{d}", .{@intFromEnum(l)}) catch "seg",
+        .read => |rm| std.fmt.bufPrint(buf, "seg:2{s}", .{@tagName(rm)[0..1]}) catch "seg",
         .broken => "seg:broken",
         .nan => "seg:nan",
     };
@@ -397,7 +409,7 @@ const whole_seeds = 3;
 const whole_layers = 6;
 const whole_ratio = 1.15;
 
-const wts_rel_tol = 1e-6;
+pub const wts_rel_tol = 1e-6;
 
 const LayerStat = struct { layers: usize = 0, engaged: usize = 0, total: usize = 0, ndiff: usize = 0, nonfinite: usize = 0, route_rows: usize = 0, route_bad: usize = 0, wts_rel: f64 = 0, num: f64 = 0, den: f64 = 0, worst: f64 = 0, declined: ?[]const u8 = null };
 
@@ -454,6 +466,7 @@ fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize,
         setUnder(m, under);
         const wanted = switch (under) {
             .level => |l| l != .off and seg.on(m, li, .ffn, rows, .ffn_entry),
+            .read => seg.on(m, li, .ffn, rows, .ffn_entry),
             .broken, .nan => false,
         };
         const launched = seg.dispatches;
@@ -539,6 +552,7 @@ pub fn segCheck(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usi
     const st = try layerStat(gpa, fx, lo, hi, under);
     const needs_seg = switch (under) {
         .level => |l| l != .off,
+        .read => true,
         .broken, .nan => false,
     };
     if (st.layers > 0 and needs_seg and st.engaged == 0) {
