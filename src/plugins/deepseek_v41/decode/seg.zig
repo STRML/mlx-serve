@@ -18,7 +18,7 @@ pub const Which = enum { attn, ffn };
 
 pub const Protocol = enum { ticket, spin };
 
-pub const Status = enum(u32) { ok = 0, spin_timeout = 1, sum_timeout = 2, injected_abort = 3 };
+pub const Status = enum(u32) { ok = 0, spin_timeout = 1, sum_timeout = 2, injected_abort = 3, grid_mismatch = 4 };
 
 /// The protocol a fresh `State` starts with.
 pub const default_protocol: Protocol = .ticket;
@@ -58,7 +58,7 @@ pub const Counters = struct {
         return sc.keep(mlx.mlx_array_new_data(&g, &[_]c_int{2}, 1, .uint32));
     }
 
-    fn advance(self: *Counters) !u32 {
+    pub fn advance(self: *Counters) !u32 {
         if (self.gen >= max_gen) try self.reset();
         self.gen += 1;
         return self.gen;

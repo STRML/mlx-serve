@@ -55,6 +55,14 @@ inline bool seg_wait(device atomic_uint* c, uint target, device atomic_uint* sta
   return false;
 }
 
+inline bool seg_wait_live(device atomic_uint* c, uint target, device atomic_uint* status, uint code) {
+  return seg_wait(c, target, status, code) && atomic_load_explicit(status, metal::memory_order_relaxed) == 0u;
+}
+
+inline void seg_touch(device uint* sink, uint v) {
+  if (v == 0x9e3779b9u) sink[14] = v;
+}
+
 inline uint seg_ticket(device atomic_uint* t) {
   return atomic_fetch_add_explicit(t, 1u, metal::memory_order_relaxed);
 }
@@ -88,6 +96,24 @@ inline void seg_write_peer_f32(device float* p, uint i, float v) {
 inline float2 seg_read_peer_bf16x2(const device uint* p, uint i) {
   const uint v = seg_read_peer_output(p, i);
   return float2(as_type<float>(v << 16), as_type<float>(v & 0xffff0000u));
+}
+
+struct seg_peer4 {
+  const device uint4* p;
+  inline uint4 operator[](uint i) const {
+#if SEG_COHERENT
+    return ((const device coherent(device) uint4*)p)[i];
+#else
+    const device uint* q = (const device uint*)(p + i);
+    return uint4(seg_read_peer_output(q, 0), seg_read_peer_output(q, 1), seg_read_peer_output(q, 2), seg_read_peer_output(q, 3));
+#endif
+  }
+  inline seg_peer4 operator+(uint n) const { return seg_peer4{p + n}; }
+};
+
+inline void seg_write_peer_uint4(device uint4* p, uint i, uint4 v) {
+  device uint* q = (device uint*)(p + i);
+  for (int j = 0; j < 4; ++j) seg_write_peer_output(q, uint(j), v[j]);
 }
 
 inline uint seg_get(device atomic_uint* p, uint i) {

@@ -19,6 +19,7 @@ pub const moe_fp4 = @import("moe_fp4.zig");
 pub const moe_down = @import("moe_down.zig");
 pub const seg = @import("seg.zig");
 pub const seg_ffn_in = @import("seg_ffn_in.zig");
+pub const seg_ffn = @import("seg_ffn.zig");
 pub const seg_bounds = @import("seg_bounds.zig");
 
 const dsv41 = @import("../deepseek_v41.zig");

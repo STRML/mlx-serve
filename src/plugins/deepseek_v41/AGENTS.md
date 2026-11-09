@@ -57,6 +57,16 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   and the attention split; the mixes' last arriver reduces the Sinkhorn split, the router's last arriver takes the top
   K (last-arriver word 0 and 1 of the layer's FFN slot). Its sums are in a fixed order, so the ranks route bit for bit;
   weights differ from the chain's by summation order only.
+- `decode/seg_ffn.zig` + `kernels/dec_seg_ffn.metal` (level 2, `DSV41_FUSED_SEG=2`): the whole FFN at one row in one launch of
+  `seg_ffn.Geometry.items` threadgroups of 256 threads. A group takes its item with a generation-stamped ticket (word 0 of the
+  layer's FFN slot; the probe's raw ticket arithmetic breaks when a slot sees gaps in the generations): items 0..P-1 the
+  mixes, then the router groups (`dec_seg_ffn_phases_header.metal`, the level-1 phases as device functions), then the shared
+  gate/up (waits on all router arrivals, word 2), the routed gate/up (waits on top K, word 3), then the down tiles (wait on the
+  top K and, per simdgroup, on their slot's activations, words 4 + slot). Cross-group data lives in one `scratch` output (parts,
+  scores, h2, idx, wts, act) read and written only through `seg_*_peer_*`; h2 is staged once a group into threadgroup memory
+  (`ReadMode.staged`; `peer` and `plain` are kernel-map arms `seg:2c` / `seg:2p`, plain never a service path). The kernel
+  fails `grid_mismatch` when its grid is not its item count. 31 buffers is Metal's limit: inputs under 16 words are bound as
+  constant memory, so scalars ride in the 16-word `par` input.
 - A MoE ubench routes scattered experts and cycles 80+ weight sets: consecutive expert ids read far slower on M5 Max
   than a router's picks, and one reused set reads from the cache.
 - Under `tp` each `tpSum` is a CPU-stream JACCL all_sum, two a layer. With `MLX_METAL_FAST_SYNCH` (on in a group) MLX
