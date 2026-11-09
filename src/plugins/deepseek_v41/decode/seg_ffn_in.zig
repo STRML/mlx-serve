@@ -64,7 +64,7 @@ pub fn launch(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, li: usize, ly: *cons
         .{ .shape = &.{ ci(p.rows), ci(p.top_k) }, .dt = .float32 },
         .{ .shape = &.{ci(ffn_in.partsLen(p))}, .dt = .float32 },
         .{ .shape = &.{ ci(p.rows), ci(p.e) }, .dt = .float32 },
-    }, ffn_in.gridB(p), ffn_in.b_threads, &ffn_in.bTargs(p));
+    }, ffn_in.gridSeg(p), ffn_in.b_threads, &ffn_in.bTargs(p));
     st.chain(o[5]);
     seg.dispatches += 1;
     return .{ .x1 = o[0], .h2 = o[1], .sf = .{ .pre = o[2], .post = o[3], .comb = o[4] }, .idx = o[5], .wts = o[6] };

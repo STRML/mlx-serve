@@ -128,6 +128,10 @@ pub fn gridB(p: Dims) usize {
     return (slices(p) + routerTgs(p)) * b_threads;
 }
 
+pub fn gridSeg(p: Dims) usize {
+    return (slices(p) + routerGroups(p)) * b_threads;
+}
+
 fn aTargs(p: Dims) [7]TArg {
     return .{
         .{ .name = "R", .v = p.rows }, .{ .name = "NSG", .v = a_nsg }, .{ .name = "NR", .v = aCols(p.rows) }, .{ .name = "U", .v = a_unroll },
