@@ -4505,7 +4505,7 @@ pub const VerifyPicks = struct {
         if (mlx.mlx_array_dtype(a) != .uint32) return;
         try mlx.check(mlx.mlx_array_eval(a));
         const v = (mlx.mlx_array_data_uint32(a) orelse return error.NoData)[0..mlx.mlx_array_size(a)];
-        var seen = std.StaticBitSet(1024).initEmpty();
+        var seen = std.StaticBitSet(1024).empty;
         for (v) |e| if (e < 1024) seen.set(e);
         const rows = dim(a, 0);
         picks[rows] += v.len;
