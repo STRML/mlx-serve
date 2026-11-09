@@ -20,10 +20,15 @@ pub const UP_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_up.
 pub const UP_BW_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_up_bw.metal");
 pub const DOWN_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_down.metal");
 pub const DOWN_BW_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_down_bw.metal");
+pub const UP_RG_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_up_rg.metal");
+pub const DOWN_RG_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_down_rg.metal");
+pub const COMBINE_RG_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_combine_rg.metal");
 pub const HEADER = moe_up.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_header.metal");
 pub const HEADER_BW = HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_bw_header.metal");
 pub const UP_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds", "wts", "lim" };
 pub const DOWN_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds", "res", "post", "comb" };
+pub const DOWN_RG_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds" };
+pub const COMBINE_RG_INS = [_][*:0]const u8{ "part", "res", "post", "comb" };
 
 /// Threads a threadgroup of the gate/up launch: two simdgroups.
 const up_threads = 64;
@@ -35,17 +40,43 @@ pub const Kernels = struct {
     down: mlx.mlx_fast_metal_kernel,
     lim: A,
     bw: bool = false,
+    rg: ?RowGroup = null,
 
     pub fn deinit(self: Kernels) void {
         _ = mlx.mlx_fast_metal_kernel_free(self.up);
         _ = mlx.mlx_fast_metal_kernel_free(self.down);
         _ = mlx.mlx_array_free(self.lim);
+        if (self.rg) |rg| rg.deinit();
+    }
+};
+
+pub const RowGroup = struct {
+    up: mlx.mlx_fast_metal_kernel,
+    down: mlx.mlx_fast_metal_kernel,
+    combine: mlx.mlx_fast_metal_kernel,
+
+    pub fn deinit(self: RowGroup) void {
+        _ = mlx.mlx_fast_metal_kernel_free(self.up);
+        _ = mlx.mlx_fast_metal_kernel_free(self.down);
+        _ = mlx.mlx_fast_metal_kernel_free(self.combine);
     }
 };
 
 pub fn build(limit: f32) !Kernels {
     const v = env.get(.DSV41_MOE_BW);
-    return buildArm(limit, v == null or v.?[0] != '0');
+    var k = try buildArm(limit, v == null or v.?[0] != '0');
+    errdefer k.deinit();
+    if (env.on(.DSV41_MOE_ROWGROUP)) k.rg = try buildRowGroup();
+    return k;
+}
+
+pub fn buildRowGroup() !RowGroup {
+    const up = try dsv41.buildKernel("dsv41_dec_moe_fp4_up_rg", &UP_INS, &.{"out"}, UP_RG_SOURCE, HEADER_BW);
+    errdefer _ = mlx.mlx_fast_metal_kernel_free(up);
+    const down = try dsv41.buildKernel("dsv41_dec_moe_fp4_down_rg", &DOWN_RG_INS, &.{"out"}, DOWN_RG_SOURCE, HEADER_BW);
+    errdefer _ = mlx.mlx_fast_metal_kernel_free(down);
+    const combine = try dsv41.buildKernel("dsv41_dec_moe_fp4_combine_rg", &COMBINE_RG_INS, &.{"out"}, COMBINE_RG_SOURCE, "");
+    return .{ .up = up, .down = down, .combine = combine };
 }
 
 pub fn buildArm(limit: f32, bw: bool) !Kernels {
@@ -89,11 +120,16 @@ pub fn moeUp(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernels, ly: *c
     if (sw.len != 2 or ss.len != 2 or sw[0] != ci(n2) or sw[1] != ci(k / 4) or ss[0] != ci(n2) or ss[1] != ci(k / 32)) return null;
     if (mlx.mlx_array_dtype(sgu.w) != .uint32 or mlx.mlx_array_dtype(sgu.s) != .uint8) return null;
     const vgu = if (ly.experts.views) |v| v[0] else gu;
+    if (kern.rg) |rg| if (rows > 1) return try upLaunch(sc, rg.up, kern.lim, rows, k, n, topk, h2, vgu.w, vgu.s, sgu.w, sgu.s, idx, wts);
     return try runUp(sc, kern, rows, k, n, topk, h2, vgu.w, vgu.s, sgu.w, sgu.s, idx, wts);
 }
 
 /// The gate/up launch over arrays already checked.
 pub fn runUp(sc: *dsv41.Scope, kern: Kernels, rows: usize, k: usize, n: usize, topk: usize, x: A, w: A, scales: A, sw: A, sscales: A, idx: A, wts: A) !A {
+    return upLaunch(sc, kern.up, kern.lim, rows, k, n, topk, x, w, scales, sw, sscales, idx, wts);
+}
+
+pub fn upLaunch(sc: *dsv41.Scope, pipe: mlx.mlx_fast_metal_kernel, lim: A, rows: usize, k: usize, n: usize, topk: usize, x: A, w: A, scales: A, sw: A, sscales: A, idx: A, wts: A) !A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(topk + 1), ci(n) }, 3, .bfloat16));
@@ -101,7 +137,7 @@ pub fn runUp(sc: *dsv41.Scope, kern: Kernels, rows: usize, k: usize, n: usize, t
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, up_threads, 1, 1));
     inline for (.{ .{ "R", rows }, .{ "K", k }, .{ "N", n }, .{ "TOPK", topk } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
-    return apply(sc, kern.up, cfg, &.{ x, w, scales, sw, sscales, idx, wts, kern.lim });
+    return apply(sc, pipe, cfg, &.{ x, w, scales, sw, sscales, idx, wts, lim });
 }
 
 /// `k` over `ins` with `cfg`: its one output.
@@ -149,6 +185,7 @@ pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, 
     if (mlx.getShape(down.w).len != 3 or mlx.getShape(down.s).len != 3 or dims(down.w, 1) != N or dims(down.w, 2) != K / 8 or dims(down.s, 1) != N or dims(down.s, 2) != K / 32) return null;
     if (mlx.getShape(shared.w).len != 2 or mlx.getShape(shared.s).len != 2 or dims(shared.w, 0) != N or dims(shared.w, 1) != K / 4 or dims(shared.s, 0) != N or dims(shared.s, 1) != K / 32) return null;
     const nc = downCols(K, N, hc) orelse return null;
+    if (kern.rg) |rg| if (R > 1 and N % (2 * nc) == 0) return try runDownRg(sc, rg, R, K, N, hc, nc, topk, act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb);
     if (kern.bw and N % (2 * nc) != 0) return null;
     return try runDown(sc, kern, R, K, N, hc, nc, topk, act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb);
 }
@@ -166,6 +203,35 @@ pub fn runDown(sc: *dsv41.Scope, kern: Kernels, R: usize, K: usize, N: usize, hc
     if (kern.bw) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", ci(R)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     return apply(sc, kern.down, cfg, &.{ act, w, scales, sw, sscales, idx, x1, post, comb });
+}
+
+pub fn runDownRg(sc: *dsv41.Scope, rg: RowGroup, R: usize, K: usize, N: usize, hc: usize, nc: usize, topk: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A) !A {
+    const part = try downParts(sc, rg.down, R, K, N, nc, topk, act, w, scales, sw, sscales, idx);
+    return combineParts(sc, rg.combine, R, N, hc, topk, part, x1, post, comb);
+}
+
+fn downParts(sc: *dsv41.Scope, pipe: mlx.mlx_fast_metal_kernel, R: usize, K: usize, N: usize, nc: usize, topk: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A) !A {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const shape = [_]c_int{ ci(R), ci(topk + 1), ci(N) };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / (2 * nc) * (topk + 1) * R * 32), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+    inline for (.{ .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "NC", nc }, .{ "R", R } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    return apply(sc, pipe, cfg, &.{ act, w, scales, sw, sscales, idx });
+}
+
+fn combineParts(sc: *dsv41.Scope, pipe: mlx.mlx_fast_metal_kernel, R: usize, N: usize, hc: usize, topk: usize, part: A, x1: A, post: A, comb: A) !A {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const shape = [_]c_int{ ci(R), ci(hc), ci(N) };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci((R * hc * N + 255) / 256 * 256), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    inline for (.{ .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "R", R } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    return apply(sc, pipe, cfg, &.{ part, x1, post, comb });
 }
 
 // ── the kernel contract ──
@@ -196,6 +262,7 @@ fn depth(s: Shape) usize {
 
 const up_l = cv.launch("dsv41_dec_moe_fp4_up", &UP_INS, &.{"out"}, UP_SOURCE, HEADER, 0, up_threads, false);
 const up_bw_l = cv.launch("dsv41_dec_moe_fp4_up_bw", &UP_INS, &.{"out"}, UP_BW_SOURCE, HEADER_BW, 0, up_threads, false);
+const up_rg_l = cv.launch("dsv41_dec_moe_fp4_up_rg", &UP_INS, &.{"out"}, UP_RG_SOURCE, HEADER_BW, 0, up_threads, false);
 const down_l = cv.launch("dsv41_dec_moe_fp4_down", &DOWN_INS, &.{"out"}, DOWN_SOURCE, HEADER, 4 * (TOPK + 1), 32 * (TOPK + 1), false);
 const down_bw_l = cv.launch("dsv41_dec_moe_fp4_down_bw", &DOWN_INS, &.{"out"}, DOWN_BW_SOURCE, HEADER_BW, 4 * 16 * (TOPK + 1), 32 * (TOPK + 2), false);
 
@@ -614,6 +681,17 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 1, .n = 64, .k = 5120 }, .{ .rows = 3, .n = 17, .k = 5120 }, .{ .rows = decode.max_rows, .n = 64, .k = 5120 } },
         .sums = .{ .f16 = 30, .bf16 = 30, .why = "a wrong sum's activation tends to 0, so a miss tops out near 1 / the bound" },
     });
+    try kit.add(set, UpK, &up_rg_l, .{}, .{
+        .name = "dsv41 dec moe_fp4 up, DSV41_MOE_ROWGROUP (an expert several rows picked read once)",
+        .accum = .f32,
+        .depth = depth,
+        .ops = 8,
+        .mids = 1,
+        .out = .bf16,
+        .tiles = .{ .{}, .{}, .{ .size = 1024, .step = 1024, .min = 1024 } },
+        .served = &.{ .{ .rows = 2, .n = 64, .k = 5120 }, .{ .rows = 3, .n = 17, .k = 5120 }, .{ .rows = decode.max_rows, .n = 64, .k = 5120 } },
+        .sums = .{ .f16 = 30, .bf16 = 30, .why = "a wrong sum's activation tends to 0, so a miss tops out near 1 / the bound" },
+    });
     try kit.add(set, DownK, &down_l, .{}, .{
         .name = "dsv41 dec moe_fp4 down (mxfp4 routed + mxfp8 shared, hc expand)",
         .accum = .f32,
@@ -913,9 +991,13 @@ test "dsv41 dec moe_fp4: the declared launches are the wrappers', byte for byte"
     defer kern.deinit();
     const bw = try buildArm(10, true);
     defer bw.deinit();
+    const rg = try buildRowGroup();
+    defer rg.deinit();
+    const rgk: Kernels = .{ .up = rg.up, .down = bw.down, .lim = bw.lim, .bw = true };
     for ([_]usize{ 1, 2, 6 }) |rows| {
         try upDrift(a, &up_l, kern, rows);
         try upDrift(a, &up_bw_l, bw, rows);
+        try upDrift(a, &up_rg_l, rgk, rows);
         try downDrift(a, DownK, &down_l, kern, rows);
         try downDrift(a, DownBwK, &down_bw_l, bw, rows);
     }
@@ -1033,6 +1115,78 @@ test "dsv41 dec moe_fp4: the DSV41_MOE_BW launches write today's bytes at widths
                 const dn = try runDown(&sc, k, rows, w, bench_hidden, hc, nc, TOPK, act, dw, ds, sdw, sds, idx, x1, post, comb);
                 bits[a] = .{ try moe_up.bitsOf(up), try moe_up.bitsOf(dn) };
             }
+            defer for (bits) |b| for (b) |v| gpa.free(v);
+            try testing.expectEqualSlices(u16, bits[0][0], bits[1][0]);
+            try testing.expectEqualSlices(u16, bits[0][1], bits[1][1]);
+        };
+    }
+}
+
+fn picksIds(pattern: ?Picks, rng: std.Random, rows: usize, experts: u32, ids: []u32, ws: []f32) void {
+    const picks = pattern orelse return moe_up.route(rng, .random, rows, TOPK, experts, ids, ws);
+    var perm: [64]u32 = undefined;
+    for (perm[0..experts], 0..) |*e, i| e.* = @intCast(i);
+    rng.shuffle(u32, perm[0..experts]);
+    const distinct = distinctOf(picks, rows);
+    for (0..rows) |r| for (0..TOPK) |j| {
+        ids[r * TOPK + j] = perm[slotOf(picks, rows, distinct, r, j)];
+        ws[r * TOPK + j] = 0.05 + 0.45 * rng.float(f32);
+    };
+}
+
+test "dsv41 dec moe_fp4: the DSV41_MOE_ROWGROUP launches write the DSV41_MOE_BW launches' bytes at widths 576 1152, rows 2-6, hc 1 and 4, disjoint measured shared and router picks, NaN and Inf" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const bw = try buildArm(10, true);
+    defer bw.deinit();
+    const rg = try buildRowGroup();
+    defer rg.deinit();
+    const H: c_int = bench_hidden;
+    const E = 40;
+    var prng = std.Random.DefaultPrng.init(0x96);
+    for ([_]usize{ 576, 1152 }) |w| {
+        var held: Held = .{ .gpa = gpa };
+        defer held.deinit();
+        const W: c_int = @intCast(w);
+        const gu = try held.hold(try moe_up.randomBits(&.{ E, 2 * W, @divExact(H, 8) }, 4, 61));
+        const gs = try held.hold(try benchScales(&.{ E, 2 * W, @divExact(H, 32) }, 62));
+        const dw = try held.hold(try moe_up.randomBits(&.{ E, H, @divExact(W, 8) }, 4, 63));
+        const ds = try held.hold(try benchScales(&.{ E, H, @divExact(W, 32) }, 64));
+        const sgw = try held.hold(try benchE4m3(&.{ 2 * W, @divExact(H, 4) }, 65));
+        const sgs = try held.hold(try benchScales(&.{ 2 * W, @divExact(H, 32) }, 66));
+        const sdw = try held.hold(try benchE4m3(&.{ H, @divExact(W, 4) }, 67));
+        const sds = try held.hold(try benchScales(&.{ H, @divExact(W, 32) }, 68));
+        try moe_up.evalAll(held.items.items);
+        for (2..decode.max_rows + 1) |rows| for ([_]?Picks{ .disjoint, .measured, .shared, null }) |picks| for ([_]usize{ 1, 4 }) |hc| for ([_]bool{ false, true }) |nonfinite| {
+            var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+            defer sc.deinit();
+            const R: c_int = @intCast(rows);
+            var ids: [decode.max_rows * TOPK]u32 = undefined;
+            var ws: [decode.max_rows * TOPK]f32 = undefined;
+            picksIds(picks, prng.random(), rows, E, &ids, &ws);
+            const idx = try sc.keep(mlx.mlx_array_new_data(&ids, &[_]c_int{ R, TOPK }, 2, .uint32));
+            const wts = try sc.keep(mlx.mlx_array_new_data(&ws, &[_]c_int{ R, TOPK }, 2, .float32));
+            var x = try sc.keep(try benchNormal(&.{ R, H }, rows));
+            var act = try sc.keep(try benchNormal(&.{ R, TOPK + 1, W }, 10 + rows));
+            if (nonfinite) {
+                x = try plantNonfinite(&sc, gpa, x);
+                act = try plantNonfinite(&sc, gpa, act);
+            }
+            const C: c_int = @intCast(hc);
+            const x1 = try sc.keep(try benchNormal(&.{ R, C, H }, 20 + rows));
+            const post = try sc.keep(try benchNormal(&.{ R, C }, 30 + rows));
+            const comb = try sc.keep(try benchNormal(&.{ R, C, C }, 40 + rows));
+            const nc = downCols(w, bench_hidden, hc).?;
+            const ups = [2]A{
+                try runUp(&sc, bw, rows, bench_hidden, w, TOPK, x, gu, gs, sgw, sgs, idx, wts),
+                try upLaunch(&sc, rg.up, bw.lim, rows, bench_hidden, w, TOPK, x, gu, gs, sgw, sgs, idx, wts),
+            };
+            const dns = [2]A{
+                try runDown(&sc, bw, rows, w, bench_hidden, hc, nc, TOPK, act, dw, ds, sdw, sds, idx, x1, post, comb),
+                try runDownRg(&sc, rg, rows, w, bench_hidden, hc, nc, TOPK, act, dw, ds, sdw, sds, idx, x1, post, comb),
+            };
+            var bits: [2][2][]const u16 = undefined;
+            for (0..2) |a| bits[a] = .{ try moe_up.bitsOf(ups[a]), try moe_up.bitsOf(dns[a]) };
             defer for (bits) |b| for (b) |v| gpa.free(v);
             try testing.expectEqualSlices(u16, bits[0][0], bits[1][0]);
             try testing.expectEqualSlices(u16, bits[0][1], bits[1][1]);
@@ -1233,6 +1387,11 @@ const FpRows = struct {
     }
 };
 
+fn benchDown(sc: *dsv41.Scope, kern: Kernels, R: usize, w: usize, hc: usize, nc: usize, act: A, dw: A, ds: A, s: [2]A, idx: A, x1: A, post: A, comb: A) !A {
+    if (kern.rg) |rg| return runDownRg(sc, rg, R, w, bench_hidden, hc, nc, TOPK, act, dw, ds, s[0], s[1], idx, x1, post, comb);
+    return runDown(sc, kern, R, w, bench_hidden, hc, nc, TOPK, act, dw, ds, s[0], s[1], idx, x1, post, comb);
+}
+
 /// The down launch alone, each step's stream fed by the last's output.
 const DownChain = struct {
     kern: Kernels,
@@ -1246,7 +1405,7 @@ const DownChain = struct {
         const r = c.in;
         const s = b.sdn[i % bench_sets];
         const nc = downCols(b.w, bench_hidden, r.hc).?;
-        c.prev = try runDown(c.sc, c.kern, r.rows, b.w, bench_hidden, r.hc, nc, TOPK, r.act0, b.dw, b.ds, s[0], s[1], r.ids[i % bench_sets], c.prev, r.post, r.comb);
+        c.prev = try benchDown(c.sc, c.kern, r.rows, b.w, r.hc, nc, r.act0, b.dw, b.ds, s, r.ids[i % bench_sets], c.prev, r.post, r.comb);
         return c.prev;
     }
 };
@@ -1266,9 +1425,10 @@ const PairChain = struct {
         const sg = b.sgu[i % bench_sets];
         const sd = b.sdn[i % bench_sets];
         const x = try c.sc.reshape(c.prev, &.{ ci(R), bench_hidden });
-        const act = try runUp(c.sc, c.kern, R, bench_hidden, b.w, TOPK, x, b.gu, b.gs, sg[0], sg[1], r.ids[i % bench_sets], r.wts[i % bench_sets]);
+        const pipe = if (c.kern.rg) |rg| rg.up else c.kern.up;
+        const act = try upLaunch(c.sc, pipe, c.kern.lim, R, bench_hidden, b.w, TOPK, x, b.gu, b.gs, sg[0], sg[1], r.ids[i % bench_sets], r.wts[i % bench_sets]);
         const nc = downCols(b.w, bench_hidden, 1).?;
-        c.prev = try runDown(c.sc, c.kern, R, b.w, bench_hidden, 1, nc, TOPK, act, b.dw, b.ds, sd[0], sd[1], r.ids[i % bench_sets], r.x1, r.post, r.comb);
+        c.prev = try benchDown(c.sc, c.kern, R, b.w, 1, nc, act, b.dw, b.ds, sd, r.ids[i % bench_sets], r.x1, r.post, r.comb);
         return c.prev;
     }
 };
@@ -1319,7 +1479,11 @@ fn gbs(bytes: f64, us: f64) f64 {
 
 /// The best of six alternations of the two arms' chains: [arm][up, down hc 1, down hc 4] microseconds.
 fn armUs(gpa: std.mem.Allocator, arms: [2]Kernels, bank: *const FpBank, one: *const FpRows, four: *const FpRows) ![2][3]f64 {
-    var best: [2][3]f64 = @splat(@splat(std.math.inf(f64)));
+    return armsUs(2, gpa, arms, bank, one, four);
+}
+
+fn armsUs(comptime n: usize, gpa: std.mem.Allocator, arms: [n]Kernels, bank: *const FpBank, one: *const FpRows, four: *const FpRows) ![n][3]f64 {
+    var best: [n][3]f64 = @splat(@splat(std.math.inf(f64)));
     for (0..6) |_| for (arms, 0..) |k, a| {
         var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
         defer sc.deinit();
@@ -1383,7 +1547,7 @@ test "dsv41 dec moe_fp4: verify picks, rows 2-6 under every pick pattern hold 6 
     };
 }
 
-test "dsv41 dec moe_fp4: verify picks ubench, width 576 (one rank of four), rows 2-6, disjoint, measured and shared picks, both arms against the distinct experts' bytes (DSV41_DEC_UBENCH)" {
+test "dsv41 dec moe_fp4: verify picks ubench, width 576 (one rank of four), rows 2-6, disjoint, measured and shared picks, today, DSV41_MOE_BW and DSV41_MOE_ROWGROUP against the distinct experts' bytes (DSV41_DEC_UBENCH)" {
     if (!decode.ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const sk = try dsv41.buildKernel("dsv41_dec_stream_read", &.{ "src", "dep" }, &.{"out"}, STREAM_SOURCE, "");
@@ -1392,26 +1556,34 @@ test "dsv41 dec moe_fp4: verify picks ubench, width 576 (one rank of four), rows
     const hi = try streamUs(gpa, sk, 80 << 20);
     const peak = @as(f64, 40 << 20) / (hi - lo);
     std.debug.print("[verify-picks-ubench] peak streaming read (slope 40 -> 80 MB) {d:.0} GB/s\n", .{peak / 1e3});
-    const arms: [2]Kernels = .{ try buildArm(10, false), try buildArm(10, true) };
-    defer for (arms) |k| k.deinit();
+    const today = try buildArm(10, false);
+    defer today.deinit();
+    const bw = try buildArm(10, true);
+    defer bw.deinit();
+    const rg = try buildRowGroup();
+    defer rg.deinit();
+    const arms = [3]Kernels{ today, bw, .{ .up = bw.up, .down = bw.down, .lim = bw.lim, .bw = true, .rg = rg } };
+    const names = [3][]const u8{ "today", "bw", "rowgroup" };
     const w = 576;
     var bank = try FpBank.init(gpa, w);
     defer bank.held.deinit();
     for (2..decode.max_rows + 1) |rows| {
-        var total: [3][2]f64 = undefined;
+        var total: [3][3]f64 = undefined;
         var floor: [3]f64 = undefined;
         for ([_]Picks{ .disjoint, .measured, .shared }, &total, &floor) |picks, *t, *f| {
             var one = try FpRows.init(gpa, w, rows, 1, picks);
             defer one.held.deinit();
             var hc4 = try FpRows.init(gpa, w, rows, 4, picks);
             defer hc4.held.deinit();
-            const a = try armUs(gpa, arms, &bank, &one, &hc4);
-            const bytes = 1.5 * bank.upBytes(one.distinct);
-            f.* = bytes / peak;
+            const a = try armsUs(3, gpa, arms, &bank, &one, &hc4);
+            f.* = 1.5 * bank.upBytes(one.distinct) / peak;
             for (a, t) |arm, *tt| tt.* = arm[0] + arm[2];
-            std.debug.print("[verify-picks-ubench] R={d} {s}: {d} distinct of {d} picks, up + down(hc 4) today {d:.1} us, bw {d:.1} us; the distinct experts' bytes at peak {d:.1} us\n", .{ rows, @tagName(picks), one.distinct, rows * TOPK, t[0], t[1], f.* });
+            std.debug.print("[verify-picks-ubench] R={d} {s}: {d} distinct of {d} picks, up + down(hc 4) today {d:.1} us, bw {d:.1} us, rowgroup {d:.1} us; the distinct experts' bytes at peak {d:.1} us\n", .{ rows, @tagName(picks), one.distinct, rows * TOPK, t[0], t[1], t[2], f.* });
         }
-        for ([_][]const u8{ "today", "bw" }, 0..) |name, k| std.debug.print("[verify-picks-ubench] R={d} {s}: measured picks save {d:.1} us against disjoint already (the cache); reading each distinct expert once could save at most {d:.1} us more ({d:.0}% of the measured time)\n", .{ rows, name, total[0][k] - total[1][k], @max(total[1][k] - floor[1], 0), 100 * @max(total[1][k] - floor[1], 0) / total[1][k] });
+        for (names[0..2], 0..) |name, k| std.debug.print("[verify-picks-ubench] R={d} {s}: measured picks save {d:.1} us against disjoint already (the cache); reading each distinct expert once could save at most {d:.1} us more ({d:.0}% of the measured time)\n", .{ rows, name, total[0][k] - total[1][k], @max(total[1][k] - floor[1], 0), 100 * @max(total[1][k] - floor[1], 0) / total[1][k] });
+        const bound = @max(total[1][1] - floor[1], 0);
+        for ([_]Picks{ .disjoint, .measured, .shared }, total) |picks, t| std.debug.print("[verify-picks-ubench] R={d} {s}: rowgroup against bw {d:.1} us ({d:+.1}%)\n", .{ rows, @tagName(picks), t[1] - t[2], 100 * (t[1] - t[2]) / t[1] });
+        std.debug.print("[verify-picks-ubench] R={d} measured: rowgroup realizes {d:.1} of the {d:.1} us bound ({d:.0}%)\n", .{ rows, total[1][1] - total[1][2], bound, if (bound > 0) 100 * (total[1][1] - total[1][2]) / bound else 0 });
     }
 }
 
