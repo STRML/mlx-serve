@@ -548,6 +548,7 @@ pub const Dsv41Model = struct {
     /// Tensor parallel: every rank holds its slice of the DSpark stages and its rows of the Markov head, and drafts with
     /// rank 0 (`InitOpts.draft_shard`).
     draft_shard: bool = false,
+    tp_drafted: ?Drafted = null,
     /// `moeFused`'s unit expand at rows 1..`dkern.max_rows` (`.pre` the zero stream), made once at load.
     tp_units: [dkern.max_rows]Split = undefined,
     /// `dec_state`'s identity: a snapshot names the state it was taken of. Set from `gens` whenever `dec_state` is
@@ -1678,6 +1679,8 @@ const ClusterHooksState = struct {
     tp_pipe: ?*const fn (gen: u64, n: usize) anyerror!bool = null,
     /// Tensor parallel, rank 0, a sharded draft: the states `gens` at `p0s[k]` draft from `t1s[k]`.
     tp_draft: ?*const fn (gens: []const u64, p0s: []const usize, t1s: []const u32) anyerror!void = null,
+    tp_draft_pipe: ?*const fn (gen: u64, p0: usize, t1: u32) anyerror!bool = null,
+    tp_verify_pipe: ?*const fn (gen: u64, n: usize, rows: usize) anyerror!bool = null,
     /// Tensor parallel, rank 0: one batched step over the states `gens`, each from `p0s[k]` with `chunks[k]`.
     tp_batch: ?*const fn (gens: []const u64, p0s: []const usize, chunks: []const []const u32, verify: bool) anyerror!void = null,
     /// Tensor parallel, rank 0: the state `gen` is gone.
@@ -5063,6 +5066,45 @@ pub fn tpWorkerPipe(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
     _ = mlx.mlx_array_free(try extendIds(m, gpa, st, .{ .gpu = t }, .last, null));
 }
 
+fn tpLead(m: *Dsv41Model, st: *const State, ids: []const u32, want: Want, img_rows: A) !void {
+    const step = clusterHooks().tp_step orelse return error.DsvTpNotJoined;
+    // The other ranks know a state by its gen: only the module's own state steps alone.
+    if (m.dec_state == null or st != &m.dec_state.?) return error.Dsv41TpStateNotLive;
+    const p0 = st.n;
+    const snap = if (st.snap_at) |at| at == p0 + ids.len else false;
+    const verify = if (st.verify) |v| v.n0 == p0 else false;
+    const bare = img_rows.ctx == null and !snap and want == .all;
+    if (bare and verify and try tpVerifyPiped(m, p0, ids)) return;
+    // An image's rows exist on this rank only: they ride with the step.
+    if (img_rows.ctx != null) try evalAll(&.{img_rows});
+    try step(ids, p0, snap, want == .all, verify, m.state_gen, if (img_rows.ctx != null) img_rows else null);
+}
+
+fn tpVerifyPiped(m: *const Dsv41Model, p0: usize, ids: []const u32) !bool {
+    const pipe = clusterHooks().tp_verify_pipe orelse return false;
+    const d = m.tp_drafted orelse return false;
+    if (!d.covers(m.state_gen, p0, ids)) return false;
+    return pipe(m.state_gen, p0, ids.len);
+}
+
+pub const Drafted = struct {
+    gen: u64,
+    n: usize,
+    ids: [16]u32 = undefined,
+    len: usize,
+
+    pub fn of(gen: u64, n: usize, ids: []const u32) ?Drafted {
+        if (ids.len > 16) return null;
+        var d: Drafted = .{ .gen = gen, .n = n, .len = ids.len };
+        @memcpy(d.ids[0..ids.len], ids);
+        return d;
+    }
+
+    pub fn covers(d: Drafted, gen: u64, n: usize, ids: []const u32) bool {
+        return d.gen == gen and d.n == n and ids.len <= d.len and std.mem.eql(u32, ids, d.ids[0..ids.len]);
+    }
+};
+
 fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, want: Want, vision: ?VisionRows) !A {
     const c = &m.cfg;
     const L = switch (given) {
@@ -5120,14 +5162,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         defer sc.deinit();
         if (try chunkImageRows(&sc, m, ids.host, vr)) |r| img_rows = sc.out(r);
     };
-    if (m.tp) |t| if (t.rank == 0 and ids == .host) {
-        const step = clusterHooks().tp_step orelse return error.DsvTpNotJoined;
-        // The other ranks know a state by its gen: only the module's own state steps alone.
-        if (m.dec_state == null or st != &m.dec_state.?) return error.Dsv41TpStateNotLive;
-        // An image's rows exist on this rank only: they ride with the step.
-        if (img_rows.ctx != null) try evalAll(&.{img_rows});
-        try step(ids.host, p0, if (st.snap_at) |at| at == p0 + L else false, want == .all, if (st.verify) |v| v.n0 == p0 else false, m.state_gen, if (img_rows.ctx != null) img_rows else null);
-    };
+    if (m.tp) |t| if (t.rank == 0 and ids == .host) try tpLead(m, st, ids.host, want, img_rows);
 
     // Engram row ids for the whole chunk (host hash); the rows themselves are
     // read span by span at their layer (a prompt chunk's: hashed above).
@@ -7124,15 +7159,34 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
     var ev = [_]A{ g.ids, g.conf, g.logits };
     try evalAll(&ev);
     try readDrafts(m, gpa, g, t1s, wantsConfidence(m), keep_logits, out);
+    m.tp_drafted = if (m.draft_shard and states.len == 1) Drafted.of(gens[0], states[0].n, out[0].ids) else null;
 }
 
 /// Rank 0 of a sharded draft: the states it drafts and their first tokens to every other rank, before its first sum.
 fn tpDraft(m: *const Dsv41Model, states: []const *State, gens: []const u64, t1s: []const u32) !void {
     if (m.tp.?.rank != 0) return;
+    if (states.len == 1 and try tpDraftPiped(gens[0], states[0].n, t1s[0])) return;
     const send = clusterHooks().tp_draft orelse return error.DsvTpNotJoined;
     var p0s: [region_rows]usize = undefined;
     for (states, p0s[0..states.len]) |st, *p| p.* = st.n;
     try send(gens, p0s[0..states.len], t1s);
+}
+
+fn tpDraftPiped(gen: u64, p0: usize, t1: u32) !bool {
+    const pipe = clusterHooks().tp_draft_pipe orelse return false;
+    return pipe(gen, p0, t1);
+}
+
+pub fn tpWorkerDraftPipe(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, keep: usize, t1: u32) !void {
+    const st = if (m.dec_state) |*s| s else return error.DistPeerDiverged;
+    const v = st.verify orelse return error.DistPeerDiverged;
+    return tpWorkerDraft(m, gpa, parked, &.{m.state_gen}, &.{v.n0 + keep}, &.{t1});
+}
+
+pub fn tpWorkerVerifyPipe(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, rows: usize) !void {
+    const d = m.tp_drafted orelse return error.DistPeerDiverged;
+    if (rows == 0 or rows > d.len) return error.DistPeerDiverged;
+    return tpWorkerStep(m, gpa, parked, d.gen, d.ids[0..rows], d.n, false, .all, true, null);
 }
 
 /// Tensor-parallel rank past 0: rank 0's sharded draft over its states `gens`, each first brought to `p0s[k]` as rank
@@ -7150,6 +7204,17 @@ pub fn tpWorkerDraft(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, ge
     defer sc.deinit();
     const g = try draftGraph(&sc, m, gpa, states[0..gens.len], t1s, false);
     try evalAll(&.{g.ids});
+    m.tp_drafted = if (gens.len == 1) try workerDrafted(m, g.ids, gens[0], p0s[0], t1s[0]) else null;
+}
+
+fn workerDrafted(m: *const Dsv41Model, ids: A, gen: u64, n: usize, t1: u32) !?Drafted {
+    const B = m.ds_block;
+    if (B + 1 > 16) return null;
+    const data = mlx.mlx_array_data_int32(ids) orelse return error.NoData;
+    var row: [16]u32 = undefined;
+    row[0] = t1;
+    for (row[1 .. B + 1], data[0..B]) |*o, v| o.* = @intCast(v);
+    return Drafted.of(gen, n, row[0 .. B + 1]);
 }
 
 /// The draft's lazy outputs: `ids` and `conf` `[N, B]`, `logits` `[N, B, vocab]`; each is `ids` where it was not asked for.
