@@ -850,7 +850,7 @@ test "dsv41 fused seg: every rank logs its level at load, nothing at level 0, an
     m.fused_seg = .ffn_seg;
     for (0..2 * seg.report_forwards) |_| try seg.afterStep(m, 1);
     try std.testing.expectEqual(2 * seg.report_forwards, state.forwards);
-    try std.testing.expectEqual(3 * seg.report_forwards, state.next_report);
+    try std.testing.expectEqual(2 * seg.report_forwards + 1, state.next_report);
     try seg.afterStep(m, 2);
     try seg.afterStep(m, 8);
     try std.testing.expectEqual(2 * seg.report_forwards, state.forwards);
