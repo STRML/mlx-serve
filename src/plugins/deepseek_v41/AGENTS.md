@@ -37,7 +37,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other
   live slots in `parked`; decode and DSpark rounds batch through `extendBatched` (rows a state, projections shared,
   attention per state) and `dsparkDraftBatched`. Each State owns its pending capture.
-- `prefix_cache` for every unpaired instance, streamed experts included; `aux.enabled` excludes only Thunderbolt pairs.
+- `prefix_cache` for unpaired instances whose bank holds every expert; a streaming bank (fewer prompt or decode slot
+  rows than `num_experts`, `bankStreams`) and a Thunderbolt pair keep legacy resume.
   Snapshots retain every buffer and restore only at their exact position; the engine owns finished history. Pairs
   keep legacy resume.
 - No spec rollback (DSpark rewinds inside the module); DSpark stages from `native_stages`;
