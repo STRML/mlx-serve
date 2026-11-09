@@ -95,6 +95,9 @@ pub const State = struct {
     protocol: Protocol,
     groups: u32,
     dep: A = .{ .ctx = null },
+    last_failure: u32 = 0,
+    forwards: u64 = 0,
+    next_report: u64 = report_forwards,
 
     pub fn init(n_slots: usize, protocol: Protocol) !State {
         var counters = try Counters.init(n_slots);
@@ -173,17 +176,38 @@ pub const spin_tgmem: u32 = 16384;
 
 /// After a step's evaluation: a status word that is not ok clears the counters and the status, turns the fused segments
 /// off for good and fails the step, whose output the timed-out kernels did not finish.
-pub fn afterStep(m: *Dsv41Model) !void {
+pub fn afterStep(m: *Dsv41Model, rows: usize) !void {
     const s = m.seg orelse return;
     const code = s.code();
-    if (code == @intFromEnum(Status.ok)) return;
+    if (code == @intFromEnum(Status.ok)) {
+        if (rows == 1 and m.fused_seg != .off) {
+            s.forwards += 1;
+            if (s.forwards >= s.next_report) {
+                s.next_report += report_forwards;
+                log.info("{s}\n", .{reportLine(&report_buf, dispatches, declines, s.forwards)});
+            }
+        }
+        return;
+    }
     m.fused_seg = .off;
+    s.last_failure = code;
     try s.clear();
     log.err("[dsv41] fused seg: status {s} ({d}): fused segments off\n", .{ if (std.enums.fromInt(Status, code)) |st| @tagName(st) else "unknown", code });
     return error.Dsv41FusedSegTimeout;
 }
 
 pub var dispatches: u64 = 0;
+
+pub var declines: u64 = 0;
+
+pub const report_forwards: u64 = 1000;
+
+var report_buf: [96]u8 = undefined;
+
+pub fn reportLine(buf: []u8, launches: u64, declined: u64, forwards: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "[dsv41] fused seg: {d} segment launches, {d} declines, {d} one-row forwards", .{ launches, declined, forwards }) catch "[dsv41] fused seg: counts";
+}
+
 
 pub const Break = enum { none, zero_shared, nan_shared };
 
@@ -248,9 +272,15 @@ pub fn on(m: *const Dsv41Model, li: usize, which: Which, rows: usize, at: Level)
     return @intFromEnum(m.fused_seg) >= @intFromEnum(at) and serves(m, rows) == null and covers(m, li, which);
 }
 
+pub fn loadLine(buf: []u8, m: *const Dsv41Model) ?[]const u8 {
+    if (m.fused_seg == .off) return null;
+    if (serves(m, 1)) |why| return std.fmt.bufPrint(buf, "[dsv41] fused seg off: {s}", .{why}) catch "[dsv41] fused seg off";
+    return std.fmt.bufPrint(buf, "[dsv41] fused seg level {d} ({s}) on", .{ @intFromEnum(m.fused_seg), @tagName(m.fused_seg) }) catch "[dsv41] fused seg on";
+}
+
 pub fn announce(m: *const Dsv41Model) void {
-    if (m.fused_seg == .off) return;
-    if (serves(m, 1)) |why| log.info("[dsv41] fused seg off: {s}\n", .{why});
+    var buf: [96]u8 = undefined;
+    if (loadLine(&buf, m)) |line| log.info("{s}\n", .{line});
 }
 
 pub fn breakShared(sc: *dsv41.Scope, act: A) !A {

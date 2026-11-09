@@ -131,7 +131,7 @@ pub const Under = union(enum) { level: seg.Level, read: seg_ffn.ReadMode, broken
 
 const Arm = struct { mode: Mode = .base, at: ProjAt = .in_proj, index: ?bool = null, ffn: seg_bounds.Arm = .base, under: Under = .{ .level = .off }, stop: u32 = 4 };
 
-fn parseUnder(tok: []const u8) !Under {
+pub fn parseUnder(tok: []const u8) !Under {
     if (std.mem.eql(u8, tok, "broken")) return .broken;
     if (std.mem.eql(u8, tok, "nan")) return .nan;
     if (std.mem.eql(u8, tok, "2c")) return .{ .read = .peer };
@@ -395,10 +395,14 @@ fn applyArm(fx: *fixture.Fixture, arm: Arm) void {
     seg_bounds.set(arm.ffn);
 }
 
-fn underName(buf: []u8, u: Under) []const u8 {
+pub fn underName(buf: []u8, u: Under) []const u8 {
     return switch (u) {
         .level => |l| std.fmt.bufPrint(buf, "seg:{d}", .{@intFromEnum(l)}) catch "seg",
-        .read => |rm| std.fmt.bufPrint(buf, "seg:2{s}", .{@tagName(rm)[0..1]}) catch "seg",
+        .read => |rm| switch (rm) {
+            .peer => "seg:2c",
+            .plain => "seg:2p",
+            .staged => "seg:2s",
+        },
         .broken => "seg:broken",
         .nan => "seg:nan",
     };

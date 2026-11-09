@@ -1,3 +1,9 @@
+//! DeepSeek-V4.1 fused decode segments, level 2 (`DSV41_FUSED_SEG=2`): a tensor rank's whole one-row FFN in one launch of
+//! `Geometry.items` threadgroups. The stream expand and collapse, the mixes and the router, the shared and routed gate/up
+//! and the down tiles take their items in dependency order from a generation-stamped ticket, and the data they hand each
+//! other lives in one scratch output read and written through the coherent peer accessors. The test hooks here are zero
+//! in service.
+
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
@@ -85,14 +91,23 @@ pub const Geometry = struct { nin: usize, ncb: usize, items: usize };
 
 const par_words = 16;
 
+const par_gen = 0;
+const par_slot = 1;
+const par_abort_at = 2;
+const par_skew_at = 3;
+const par_eps = 4;
+const par_scal = 6;
+const par_lim = 7;
+const par_unit = 8;
+
 fn parWords(gen: u32, slot: usize, c: *const config.Config) [par_words]u32 {
     const f = [_]f32{ c.rms_norm_eps, c.dsv4_hc_eps, c.router_scaling_factor, c.dsv4_swiglu_limit, 1.0, 0.0, 0.0 };
     var w: [par_words]u32 = @splat(0);
-    w[0] = gen;
-    w[1] = @intCast(slot * seg.slot_words);
-    w[2] = hook.abort_at;
-    w[3] = hook.skew_at;
-    for (f, 4..) |v, i| w[i] = @bitCast(v);
+    w[par_gen] = gen;
+    w[par_slot] = @intCast(slot * seg.slot_words);
+    w[par_abort_at] = hook.abort_at;
+    w[par_skew_at] = hook.skew_at;
+    for (f, par_eps..) |v, i| w[i] = @bitCast(v);
     return w;
 }
 
@@ -183,6 +198,8 @@ pub fn launch(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Lay
     const extra = [_]ffn_in.TArg{
         .{ .name = "K", .v = p.d },          .{ .name = "N", .v = b.n },          .{ .name = "NC", .v = b.nc },         .{ .name = "XM", .v = @intFromEnum(read_mode) }, .{ .name = "STOP", .v = stop_after },
         .{ .name = "OFF_LOGITS", .v = lay.logits }, .{ .name = "OFF_H2", .v = lay.h2 }, .{ .name = "OFF_IDX", .v = lay.idx }, .{ .name = "OFF_WTS", .v = lay.wts }, .{ .name = "OFF_ACT", .v = lay.act },
+        .{ .name = "PAR_GEN", .v = par_gen },       .{ .name = "PAR_SLOT", .v = par_slot }, .{ .name = "PAR_ABORT", .v = par_abort_at }, .{ .name = "PAR_SKEW", .v = par_skew_at },
+        .{ .name = "PAR_EPS", .v = par_eps },       .{ .name = "PAR_SCAL", .v = par_scal }, .{ .name = "PAR_LIM", .v = par_lim },         .{ .name = "PAR_UNIT", .v = par_unit },
     };
     var targs: [bt.len + extra.len]ffn_in.TArg = undefined;
     @memcpy(targs[0..bt.len], &bt);

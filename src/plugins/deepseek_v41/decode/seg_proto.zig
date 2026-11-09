@@ -473,12 +473,12 @@ test "dsv41 fused seg proto: afterStep is a no-op without state or with an ok st
     defer gpa.destroy(m);
     m.seg = null;
     m.fused_seg = .ffn_seg;
-    try seg.afterStep(m);
+    try seg.afterStep(m, 1);
     try std.testing.expectEqual(seg.Level.ffn_seg, m.fused_seg);
     var state = try seg.State.init(4, .ticket);
     defer state.deinit();
     m.seg = &state;
-    try seg.afterStep(m);
+    try seg.afterStep(m, 1);
     try std.testing.expectEqual(seg.Level.ffn_seg, m.fused_seg);
     const sinks = log.sinks_shared.get();
     const stderr_was = sinks.stderr_enabled;
@@ -489,12 +489,12 @@ test "dsv41 fused seg proto: afterStep is a no-op without state or with an ok st
         @constCast(mlx.mlx_array_data_uint32(state.status).?)[0] = @intFromEnum(bad);
         state.counters.gen = 7;
         @constCast(mlx.mlx_array_data_uint32(state.counters.buf).?)[3] = 99;
-        try std.testing.expectError(error.Dsv41FusedSegTimeout, seg.afterStep(m));
+        try std.testing.expectError(error.Dsv41FusedSegTimeout, seg.afterStep(m, 1));
         try std.testing.expectEqual(seg.Level.off, m.fused_seg);
         try std.testing.expectEqual(@as(u32, 0), state.code());
         try std.testing.expectEqual(@as(u32, 0), state.counters.gen);
         try std.testing.expectEqual(@as(u32, 0), mlx.mlx_array_data_uint32(state.counters.buf).?[3]);
-        try seg.afterStep(m);
+        try seg.afterStep(m, 1);
     }
 }
 
