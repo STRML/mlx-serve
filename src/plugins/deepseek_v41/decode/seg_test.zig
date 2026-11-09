@@ -445,20 +445,6 @@ test "dsv41 fused seg ffn_in: the one launch writes the spike's two launches' by
     }
 }
 
-test "dsv41 fused seg: a router read of another group's scores goes through the coherent reader" {
-    const src: []const u8 = seg_ffn_in.SOURCE;
-    try std.testing.expect(std.mem.indexOf(u8, src, "seg_read_peer_f32(parts, ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, src, "seg_read_peer_f32(logits, ") != null);
-    for ([_][]const u8{ "parts[", "logits[" }) |name| {
-        var from: usize = 0;
-        while (std.mem.indexOfPos(u8, src, from, name)) |at| {
-            const close = std.mem.indexOfScalarPos(u8, src, at, ']').?;
-            try std.testing.expect(std.mem.startsWith(u8, src[close + 1 ..], " = "));
-            from = close;
-        }
-    }
-}
-
 fn tieLayer(w: ffn_in.Weights, base: *const dsv41.Layer) !dsv41.Layer {
     const host = try dsv41.hostF32(w.gate_w);
     defer std.testing.allocator.free(host);

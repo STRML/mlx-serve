@@ -28,14 +28,17 @@ threadgroup uint go;
 #define STORE(IDX, V) do { \
   if (ACCESS == 0) seg_put(data, IDX, V); \
   else if (ACCESS == 2) CSTORE(IDX, V); \
+  else if (ACCESS == 5) seg_write_peer_output(pdata, IDX, V); \
   else pdata[IDX] = (V); \
 } while (0)
 
+#define SPOT(P, GG, T) (uint(P) * N + (LAYOUT == 1 ? uint(T) * GROUPS + uint(GG) : uint(GG) * THREADS + uint(T)))
+
 #define ITEM(P, GG) do { \
   const uint gid_ = uint(GG) * THREADS + tid; \
-  const uint at_ = uint(P) * N + gid_; \
+  const uint at_ = SPOT(P, GG, tid); \
   uint v_ = gid_ + gen_v * SALT; \
-  if ((P) > 0) v_ = LOAD((uint(P) - 1) * N + ((uint(GG) + uint(P)) % GROUPS) * THREADS + tid) + uint(P) * STEP + gen_v * SALT; \
+  if ((P) > 0) v_ = LOAD(SPOT(uint(P) - 1, (uint(GG) + uint(P)) % GROUPS, tid)) + uint(P) * STEP + gen_v * SALT; \
   STORE(at_, v_); \
 } while (0)
 
@@ -84,7 +87,7 @@ if (PROTO == 0) {
   const uint p = t / GROUPS;
   const uint g = t % GROUPS;
   if (p > 0) {
-    PRELOAD((p - 1) * N + ((g + p) % GROUPS) * THREADS + tid);
+    PRELOAD(SPOT(p - 1, (g + p) % GROUPS, tid));
     if (tid == 0) go = seg_wait<WAIT_POLLS>(c + p, seg_stamp(gen_v, GROUPS), st, 1u) ? 1u : 0u;
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     if (go == 0u) return;
@@ -99,14 +102,14 @@ if (PROTO == 0) {
   for (int p = 0; p < PHASES; ++p) {
     ITEM(p, grp);
     if (p + 1 < PHASES) {
-      PRELOAD(p * N + ((grp + p + 1) % GROUPS) * THREADS + tid);
+      PRELOAD(SPOT(p, (grp + p + 1) % GROUPS, tid));
       PUBLISH_AND_WAIT(1 + p);
     }
   }
 } else if (PROTO == 2) {
   ITEM(0, grp);
   if (PHASES > 1) {
-    PRELOAD(((grp + 1) % GROUPS) * THREADS + tid);
+    PRELOAD(SPOT(0, (grp + 1) % GROUPS, tid));
     seg_release();
     if (tid == 0) {
       go = seg_arrive_last(c + 1, gen_v, GROUPS) ? 1u : 0u;
