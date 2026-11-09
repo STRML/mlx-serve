@@ -707,13 +707,14 @@ pub const Dec = struct {
     moe_up: ?dkern.moe_up.Kernel = null,
     moe_fp4: ?dkern.moe_fp4.Kernels = null,
     moe_down: ?mlx.mlx_fast_metal_kernel = null,
+    seg_ffn_in: ?mlx.mlx_fast_metal_kernel = null,
     /// `dkern.moe_down.probe`'s output rows a threadgroup on this GPU.
     moe_down_rb: usize = 0,
 
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
         // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.buildArm(dkern.attnBw()), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.buildArm(dkern.attnBw()), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.buildArm(dkern.attnBw()), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.buildArm(dkern.attnBw()), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null, .seg_ffn_in = try dkern.seg_ffn_in.build() };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -734,7 +735,7 @@ pub const Dec = struct {
         if (d.ffn_in) |k| dkern.ffn_in.free(k);
         if (d.wq_b) |k| k.deinit();
         if (d.wo_a) |k| k.deinit();
-        inline for (.{ d.attn, d.moe_down }) |k| if (k) |kern| {
+        inline for (.{ d.attn, d.moe_down, d.seg_ffn_in }) |k| if (k) |kern| {
             _ = mlx.mlx_fast_metal_kernel_free(kern);
         };
         if (d.wo_a_counter.ctx != null) _ = mlx.mlx_array_free(d.wo_a_counter);
@@ -4893,6 +4894,15 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
 pub fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, pre: *A) !A {
     if (try dkern.seg_bounds.tpFfn(sc, m, li, x, ao, sa, pre)) |y| return y;
     const ly = &m.layers[li];
+    if (dkern.seg.on(m, li, .ffn, dim(x, 0), .ffn_entry)) {
+        _ = try dkern.seg.ensure(m);
+        if (try dkern.seg_ffn_in.launch(sc, m, li, ly, x, ao, sa)) |f| {
+            dkern.seg_bounds.remember(li, &.{ f.x1, f.sf.pre, f.sf.post, f.sf.comb, f.h2, f.idx, f.wts });
+            pre.* = f.sf.pre;
+            const part = try moeFused(sc, m, ly, f.h2, f.idx, f.wts) orelse try moePartial(sc, m, ly, f.h2, f.idx, f.wts);
+            return hcExpand(sc, f.x1, try tpSum(sc, m, part), &f.sf);
+        }
+    }
     var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
     try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
     try VerifyPicks.note(m, li, p[5]);

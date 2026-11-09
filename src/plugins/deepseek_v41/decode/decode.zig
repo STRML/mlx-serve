@@ -18,6 +18,7 @@ pub const moe_up = @import("moe_up.zig");
 pub const moe_fp4 = @import("moe_fp4.zig");
 pub const moe_down = @import("moe_down.zig");
 pub const seg = @import("seg.zig");
+pub const seg_ffn_in = @import("seg_ffn_in.zig");
 pub const seg_bounds = @import("seg_bounds.zig");
 
 const dsv41 = @import("../deepseek_v41.zig");
@@ -104,6 +105,14 @@ test "dsv41 dec layers: the fused kernels over mxfp4 experts decode no further f
 }
 
 fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
+    return layersAgreeOn(gpa, .{ .lo = lo, .hi = hi, .ctx = 601, .experts_fp4 = fp4 });
+}
+
+/// The fused kernels' (and `base.seg`'s level's) distance to the f32 model against today's chain's, median over seeds
+/// of each step, on the fixtures `base` describes.
+pub fn layersAgreeOn(gpa: std.mem.Allocator, base: fixture.Opts) !void {
+    const lo = base.lo;
+    const hi = base.hi;
     // One seed lands up to 1.6x either side of the chain (five random layers amplify any rounding; under TF32 the f32
     // model itself moves 8% at the verify step), so the bar is each step's median over seeds.
     const seeds = [_]u64{ 9, 1, 2, 3, 4, 5, 6 };
@@ -115,10 +124,15 @@ fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
         var made: usize = 0;
         defer for (fxs[0..made]) |fx| fx.deinit();
         for (&fxs, [_]mlx.mlx_dtype{ .bfloat16, .bfloat16, .float32 }, [_]bool{ true, false, false }) |*fx, act, fused| {
-            fx.* = try fixture.Fixture.init(gpa, .{ .lo = lo, .hi = hi, .ctx = 601, .seed = seed, .act = act, .fused = fused, .experts_fp4 = fp4 });
+            var o = base;
+            o.seed = seed;
+            o.act = act;
+            o.fused = fused;
+            if (!fused) o.seg = .off;
+            fx.* = try fixture.Fixture.init(gpa, o);
             made += 1;
         }
-        var p0: usize = 601;
+        var p0: usize = base.ctx;
         for (steps, 0..) |rows, k| {
             var got: [3][]f32 = undefined;
             for (fxs, &got) |fx, *g| {
