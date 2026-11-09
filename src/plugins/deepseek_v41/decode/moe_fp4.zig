@@ -1146,8 +1146,8 @@ const FpBank = struct {
 /// same 6. A row's own 6 picks are always distinct.
 const Picks = enum { disjoint, half, measured, shared };
 
-/// The share of a verify's (row, expert) picks that repeat an expert, by rows (dsv41-verify-picks, TP4 agent replay,
-/// 2026-11-09; the middle of each measured range).
+/// The share of a verify's (row, expert) picks that repeat an expert, by rows (dsv41-verify-picks over the TP4 agent
+/// replay; the middle of each measured range).
 const measured_dup = [_]f64{ 0, 0, 0.13, 0.25, 0.275, 0.31, 0.36 };
 
 fn distinctOf(picks: Picks, rows: usize) usize {
