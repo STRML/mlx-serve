@@ -10,6 +10,7 @@ const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const dflash_policy = @import("dflash/policy.zig");
+const log = @import("../../../sdk/util/log.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const testing = std.testing;
@@ -91,6 +92,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
     // A skipped round is a tick of the serial pipeline; the first drafted round after it drains the pipeline.
     if (self.dspark_pol) |*pol| {
+        pinPlain(pol);
         if (!pol.drafting.shouldDraft() and self.dflashCanPipeline()) return try self.dsparkPlainPipelined(allocator);
         pol.plain_watch = null;
         if (self.has_pending_logits or self.has_pending_token) switch (try self.drainPipelineForSpec(allocator)) {
@@ -184,6 +186,7 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     self.dspark_copy_drafted += n;
     self.dspark_copy_accepted += round.accepted;
     if (self.dspark_pol) |*pol| pol.copy.observe(found.?.suffix, @intCast(n), round.accepted);
+    logRound(self, "copy", longest, n + 1, round.accepted);
     return self.commitDsparkRound(allocator, round, st.n);
 }
 
@@ -228,6 +231,7 @@ pub fn dsparkStep(self: *Generator, allocator: std.mem.Allocator, comptime mod: 
 pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
     const tok = (try self.next(allocator)) orelse return null;
     self.dspark_plain += 1;
+    logRound(self, "plain", 0, 1, 0);
     const pol = &self.dspark_pol.?;
     if (pol.plain_watch) |*w| samplePlainMs(self, msSince(w));
     pol.plain_watch = io_util.Stopwatch.init(self.timer.io);
@@ -239,9 +243,31 @@ const DSPARK_WARMUP_ROUNDS: u32 = 16;
 
 /// A plain step's cost, learned per model: the next request starts from it instead of the prior.
 fn samplePlainMs(self: *Generator, ms: f32) void {
+    if (fixedPlainMs() != null) return;
     const pol = &self.dspark_pol.?;
     pol.plain.sample(ms);
     self.xfm.dspark_plain = pol.plain;
+}
+
+var fixed_plain: ?f32 = null;
+fn fixedPlainMs() ?f32 {
+    if (fixed_plain == null) fixed_plain = env.float(.DSV41_DSPARK_FIXED_COST, 0);
+    return if (fixed_plain.? > 0) fixed_plain.? else null;
+}
+
+fn pinPlain(pol: anytype) void {
+    if (fixedPlainMs()) |ms| pol.plain = .{ .ms = ms };
+}
+
+fn roundWall(rows: usize, watch: *const io_util.Stopwatch) f32 {
+    const ms = fixedPlainMs() orelse return msSince(watch);
+    return dflash_policy.priorCosts(ms)[rows];
+}
+
+fn logRound(self: *const Generator, kind: []const u8, offered: usize, rows: usize, accepted: u32) void {
+    if (env.get(.DSV41_DSPARK_ROUND_LOG) == null) return;
+    const plain = if (self.dspark_pol) |p| p.plain.ms else 0;
+    log.info("[dspark-round] at {d} {s} offered {d} rows {d} accepted {d} plain_ms {d:.3}\n", .{ self.generated_ids.items.len, kind, offered, rows, accepted, plain });
 }
 
 /// `DSV41_DSPARK_ROWS=k` verifies k rows (t1 included) every round the draft has them, for measuring the verify
@@ -285,9 +311,10 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
         pol.calib.observe(sigmoid(c), k < round.accepted);
     }
     self.dspark_stats.record(@intCast(d.len), round.accepted);
+    logRound(self, "stage", drafted, d.len + 1, round.accepted);
     if (self.xfm.dspark_warm_rounds < DSPARK_WARMUP_ROUNDS) {
         self.xfm.dspark_warm_rounds += 1;
-    } else pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, msSince(&watch));
+    } else pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, roundWall(d.len + 1, &watch));
     return self.commitDsparkRound(allocator, round, st.n);
 }
 
@@ -504,6 +531,22 @@ pub fn serialAccept(drafts: []const u32, draws: []const i32, cap: u32) Verdict {
 }
 
 // ── tests ──
+
+test "dsv41 dspark fixed cost: a pinned plain ms sizes the rounds and the backoff reads the verify ladder, not the clock" {
+    const saved = fixed_plain;
+    defer fixed_plain = saved;
+    fixed_plain = 15;
+    var pol: struct { plain: dflash_policy.PlainCost = .{} } = .{};
+    pol.plain.sample(40);
+    pinPlain(&pol);
+    try testing.expectEqual(@as(f32, 15), pol.plain.ms);
+    const watch: io_util.Stopwatch = undefined;
+    try testing.expectEqual(dflash_policy.priorCosts(15)[4], roundWall(4, &watch));
+    fixed_plain = 0;
+    pol.plain.ms = 21;
+    pinPlain(&pol);
+    try testing.expectEqual(@as(f32, 21), pol.plain.ms);
+}
 
 test "keyed DSpark: the serial accept keeps drafts while they equal the draws; the next token is the draw after them" {
     try testing.expectEqual(Verdict{ .accepted = 3, .next_token = 9 }, serialAccept(&.{ 4, 5, 6 }, &.{ 4, 5, 6, 9 }, 16));
