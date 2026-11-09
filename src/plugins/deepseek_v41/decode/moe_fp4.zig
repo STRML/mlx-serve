@@ -1582,7 +1582,7 @@ test "dsv41 dec moe_fp4: verify picks ubench, width 576 (one rank of four), rows
         }
         for (names[0..2], 0..) |name, k| std.debug.print("[verify-picks-ubench] R={d} {s}: measured picks save {d:.1} us against disjoint already (the cache); reading each distinct expert once could save at most {d:.1} us more ({d:.0}% of the measured time)\n", .{ rows, name, total[0][k] - total[1][k], @max(total[1][k] - floor[1], 0), 100 * @max(total[1][k] - floor[1], 0) / total[1][k] });
         const bound = @max(total[1][1] - floor[1], 0);
-        for ([_]Picks{ .disjoint, .measured, .shared }, total) |picks, t| std.debug.print("[verify-picks-ubench] R={d} {s}: rowgroup saves {d:.1} us against bw ({d:.1}%; negative = slower)\n", .{ rows, @tagName(picks), t[1] - t[2], 100 * (t[1] - t[2]) / t[1] });
+        for ([_]Picks{ .disjoint, .measured, .shared }, total) |picks, t| std.debug.print("[verify-picks-ubench] R={d} {s}: rowgroup against bw {d:.1} us ({d:+.1}%)\n", .{ rows, @tagName(picks), t[1] - t[2], 100 * (t[1] - t[2]) / t[1] });
         std.debug.print("[verify-picks-ubench] R={d} measured: rowgroup realizes {d:.1} of the {d:.1} us bound ({d:.0}%)\n", .{ rows, total[1][1] - total[1][2], bound, if (bound > 0) 100 * (total[1][1] - total[1][2]) / bound else 0 });
     }
 }
