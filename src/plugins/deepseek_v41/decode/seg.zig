@@ -144,8 +144,10 @@ pub const State = struct {
         self.seen_dispatches = dispatches;
         if (level == .off) return;
         if (rows == 1) self.forwards += 1 else if (launched) self.verify_forwards += 1 else return;
-        if (self.forwards + self.verify_forwards < self.next_report) return;
-        self.next_report += report_forwards;
+        const due = self.forwards + self.verify_forwards >= self.next_report;
+        const first_verify = rows > 1 and self.verify_forwards == 1;
+        if (!due and !first_verify) return;
+        if (due) self.next_report += report_forwards;
         log.info("{s}\n", .{reportLine(&report_buf, dispatches, declines, self.forwards, self.verify_forwards)});
     }
 };
