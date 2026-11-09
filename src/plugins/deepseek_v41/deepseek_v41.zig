@@ -4998,7 +4998,7 @@ fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []
         return a;
     }
     const cur_spec: engram.Prefetch.Spec = .{ .at = p0, .len = L, .ids = rows };
-    if (next.len == 0 and L <= region_rows and engramEarly()) return engram.Prefetch.readNow(gpa, tables, cur_spec, hs.cols(), span);
+    if (next.len == 0 and engramReadsAtOnce(L)) return engram.Prefetch.readNow(gpa, tables, cur_spec, hs.cols(), span);
     const pf = try engram.Prefetch.start(gpa, tables, if (next.len > 0) &.{ cur_spec, ahead_spec } else &.{cur_spec}, hs.cols(), span);
     if (next.len > 0) m.ahead = pf;
     return pf;
@@ -5656,6 +5656,10 @@ pub const Laps = struct {
 /// `DSV41_ENGRAM_EARLY=0` reads a decode chunk's Engram rows on a prefetch thread, its first layer waiting on that
 /// thread's start; otherwise every layer's rows are read at once before the chunk's first Engram layer is built, and
 /// each Engram stage goes to the GPU as soon as it is built, before the rest of its layer.
+pub fn engramReadsAtOnce(rows: usize) bool {
+    return rows == 1 and engramEarly();
+}
+
 fn engramEarly() bool {
     const v = env.get(.DSV41_ENGRAM_EARLY);
     return v == null or v.?[0] != '0';
@@ -6323,7 +6327,7 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
         // An image span's rows get no Engram write (the reference shuts their gate).
         x = if (sp.img.ctx != null) try sc.where(try sc.expand(try sc.expand(try sp.imgSlice(sc, lo, hi), -1), -1), x, y) else y;
         if (m.trace) |t| try t.put("engram_{d}", .{li}, x);
-        if (sp.xs.len == 1 and sp.L <= region_rows and engramEarly()) {
+        if (sp.xs.len == 1 and engramReadsAtOnce(sp.L)) {
             try asyncEval(x);
             Laps.handed(li);
         }
