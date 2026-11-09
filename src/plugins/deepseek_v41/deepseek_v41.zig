@@ -4464,6 +4464,7 @@ pub fn addShared(sc: *Scope, m: *const Dsv41Model, y: A, sy: A) !A {
 pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
     const ly = &m.layers[li];
     const r = try route(sc, m, ly, x, img);
+    try VerifyPicks.note(m, li, r.idx);
     // The DSpark stages' experts stay resident.
     if (li < m.n_layers) if (m.streamed) |src| {
         // A wide call's routed sum and the shared expert in one combine (the same f32 words).
@@ -4823,6 +4824,7 @@ fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, p
     const ly = &m.layers[li];
     var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
     try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
+    try VerifyPicks.note(m, li, p[5]);
     pre.* = p[1];
     const part = try moeFused(sc, m, ly, p[4], p[5], p[6]) orelse try moePartial(sc, m, ly, p[4], p[5], p[6]);
     return hcExpand(sc, p[0], try tpSum(sc, m, part), &.{ .pre = p[1], .post = p[2], .comb = p[3] });
@@ -5411,6 +5413,79 @@ pub const RoundLaps = struct {
             sum[0] / d, sum[1] / d, sum[2] / d, sum[3] / d, sum[4] / d, sum[5] / d, sum[6] / d, sum[7] / d, sum[8] / d,
             copy_engine / c, copy_verify / c,
         });
+    }
+};
+
+pub const VerifyPicks = struct {
+    const Buckets = [region_rows + 1]u64;
+    var held: std.ArrayList(A) = .empty;
+    var picks: Buckets = @splat(0);
+    var distinct: Buckets = @splat(0);
+    var layers: Buckets = @splat(0);
+    var verifies: u32 = 0;
+
+    fn enabled() bool {
+        return env.get(.DSV41_VERIFY_PICKS) != null;
+    }
+
+    fn note(m: *const Dsv41Model, li: usize, idx: A) !void {
+        if (!enabled() or li >= m.n_layers) return;
+        if (m.tp) |t| if (t.rank != 0) return;
+        const rows = dim(idx, 0);
+        if (rows < 2 or rows > region_rows) return;
+        if (held.items.len >= 4 * m.n_layers) drop();
+        var kept = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&kept, idx);
+        try held.append(m.gpa, kept);
+    }
+
+    fn drop() void {
+        for (held.items) |a| _ = mlx.mlx_array_free(a);
+        held.clearRetainingCapacity();
+    }
+
+    fn flush(m: *const Dsv41Model) void {
+        if (!enabled() or held.items.len == 0) return;
+        defer drop();
+        for (held.items) |a| countLayer(a) catch return;
+        verifies += 1;
+        if (verifies < RoundLaps.every) return;
+        report(m);
+    }
+
+    fn countLayer(a: A) !void {
+        if (mlx.mlx_array_dtype(a) != .uint32) return;
+        try mlx.check(mlx.mlx_array_eval(a));
+        const v = (mlx.mlx_array_data_uint32(a) orelse return error.NoData)[0..mlx.mlx_array_size(a)];
+        var seen = std.StaticBitSet(1024).initEmpty();
+        for (v) |e| if (e < 1024) seen.set(e);
+        const rows = dim(a, 0);
+        picks[rows] += v.len;
+        distinct[rows] += seen.count();
+        layers[rows] += 1;
+    }
+
+    fn report(m: *const Dsv41Model) void {
+        var buf: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var all_p: u64 = 0;
+        var all_d: u64 = 0;
+        for (2..region_rows + 1) |r| {
+            all_p += picks[r];
+            all_d += distinct[r];
+            if (layers[r] == 0) continue;
+            w.print(" {d}:{d}:{d:.1}", .{ r, layers[r] / @as(u64, @intCast(@max(m.n_layers, 1))), dupShare(picks[r], distinct[r]) }) catch break;
+        }
+        log.info("[verify-picks] rank 0: {d} verifies, (row, expert) picks a layer duplicated {d:.1}% (distinct {d} of {d}); rows:verifies:dup%{s}\n", .{ verifies, dupShare(all_p, all_d), all_d, all_p, w.buffered() });
+        picks = @splat(0);
+        distinct = @splat(0);
+        layers = @splat(0);
+        verifies = 0;
+    }
+
+    fn dupShare(p: u64, d: u64) f64 {
+        if (p == 0) return 0;
+        return 100 * @as(f64, @floatFromInt(p - d)) / @as(f64, @floatFromInt(p));
     }
 };
 
@@ -7582,6 +7657,23 @@ test "dsv41 streamed phase: a call wider than a decode-phase call's routed ids r
     try testing.expect(!promptPhase(region_rows, 1, 4096));
 }
 
+test "dsv41 verify picks: a layer's (row, expert) picks count each expert once however many rows pick it" {
+    defer {
+        VerifyPicks.picks = @splat(0);
+        VerifyPicks.distinct = @splat(0);
+        VerifyPicks.layers = @splat(0);
+    }
+    const ids = [_]u32{ 1, 2, 2, 3, 1, 9 };
+    const a = mlx.mlx_array_new_data(&ids, &[_]c_int{ 3, 2 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(a);
+    try VerifyPicks.countLayer(a);
+    try std.testing.expectEqual(@as(u64, 6), VerifyPicks.picks[3]);
+    try std.testing.expectEqual(@as(u64, 4), VerifyPicks.distinct[3]);
+    try std.testing.expectEqual(@as(u64, 1), VerifyPicks.layers[3]);
+    try std.testing.expectApproxEqAbs(@as(f64, 100.0 / 3.0), VerifyPicks.dupShare(6, 4), 1e-9);
+    try std.testing.expectEqual(@as(f64, 0), VerifyPicks.dupShare(0, 0));
+}
+
 test "dsv41 verify drafts: a streamed bank's verify (drafts + the committed token, top-k ids each) stays on its decode lane" {
     try std.testing.expectEqual(VERIFY_MAX_DRAFTS, verifyDraftsFor(null, 6));
     const d = verifyDraftsFor(48, 6);
@@ -7658,6 +7750,7 @@ pub fn dsparkFinish(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending:
     const keep_n = accepted + 1;
     RoundLaps.mark(.read);
     defer RoundLaps.finish(m);
+    VerifyPicks.flush(m);
     const t0 = monoUs();
     try finishVerify(m, gpa, st, keep_n);
     const t1 = monoUs();
