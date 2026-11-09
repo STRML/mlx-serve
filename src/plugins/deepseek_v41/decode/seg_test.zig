@@ -341,16 +341,26 @@ fn evalOut(o: ffn_in.Out) !void {
 
 test "dsv41 fused seg ffn_in: R = 1 at 384 experts no further from float64 than today's chain" {
     if (!gpuTest()) return error.SkipZigTest;
+    try expectNumerics(77, &.{ 1, 6 });
+}
+
+test "dsv41 fused seg ffn_in: R = 2..6 at 384 experts no further from float64 than today's chain, every row picking as it does" {
+    if (!gpuTest()) return error.SkipZigTest;
+    try expectNumerics(80, &.{ 2, 3, 4, 5, 6 });
+    try expectNumerics(81, &.{ 2, 3, 4, 5, 6 });
+}
+
+fn expectNumerics(seed: u64, rows_list: []const usize) !void {
     const gpa = std.testing.allocator;
     const fx = try Fixture.init(gpa, .{ .ctx = 0, .fused = true });
     defer fx.deinit();
     _ = try seg.ensure(fx.m);
-    const w = try ffn_in.randomWeights(77);
+    const w = try ffn_in.randomWeights(seed);
     defer ffn_in.freeWeights(w);
     const ly = ffn_in.layerWith(fx.layer(21), w);
     const c = &fx.m.cfg;
     var worst_wts: f64 = 0;
-    for ([_]usize{ 1, 6 }) |rows| {
+    for (rows_list) |rows| {
         var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
         defer sc.deinit();
         const in = try inputsOf(&sc, fx, &ly, rows);
@@ -892,5 +902,95 @@ test "dsv41 fused seg: level 2 writes level 1's whole layer bit for bit on layer
             std.debug.print("layer {d}: level 1 and level 2 first differ at stream value {d} of {d}: {e} against {e}\n", .{ li, i, s1.len, u, v });
             return error.LayerOutputsDiffer;
         }
+    }
+}
+
+fn rowOf(sc: *dsv41.Scope, a: A, r: usize) !A {
+    return sc.slice(a, 0, r, r + 1);
+}
+
+test "dsv41 fused seg ffn_in: each row of an R-row launch writes its own one-row launch's bytes, R = 2..6" {
+    if (!gpuTest()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 0, .fused = true });
+    defer fx.deinit();
+    _ = try seg.ensure(fx.m);
+    const w = try ffn_in.randomWeights(82);
+    defer ffn_in.freeWeights(w);
+    const ly = ffn_in.layerWith(fx.layer(21), w);
+    const names = [_][]const u8{ "x1", "h2", "pre", "post", "comb", "idx", "wts" };
+    for (2..decode.max_rows + 1) |rows| {
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const in = try inputsOf(&sc, fx, &ly, rows);
+        const all = (try seg_ffn_in.launch(&sc, fx.m, 21, &ly, in.x, in.y, &in.sa)) orelse return error.Declined;
+        try evalOut(all);
+        for (0..rows) |r| {
+            const sa: dsv41.Split = .{ .pre = try rowOf(&sc, in.sa.pre, r), .post = try rowOf(&sc, in.sa.post, r), .comb = try rowOf(&sc, in.sa.comb, r) };
+            const one = (try seg_ffn_in.launch(&sc, fx.m, 21, &ly, try rowOf(&sc, in.x, r), try rowOf(&sc, in.y, r), &sa)) orelse return error.Declined;
+            try evalOut(one);
+            const a = [_]A{ one.x1, one.h2, one.sf.pre, one.sf.post, one.sf.comb, one.idx, one.wts };
+            const b = [_]A{ all.x1, all.h2, all.sf.pre, all.sf.post, all.sf.comb, all.idx, all.wts };
+            for (names, a, b) |name, u, v| try expectSameBytes(gpa, name, u, try rowOf(&sc, v, r));
+        }
+    }
+}
+
+test "dsv41 fused seg: four ranks route bit for bit over 1000 launches at each R = 2..6, every row's exact tie to the lower index" {
+    if (!gpuTest()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var ranks: [4]*Fixture = undefined;
+    var made: usize = 0;
+    defer for (ranks[0..made]) |r| r.deinit();
+    for (&ranks, 0..) |*r, i| {
+        var o = tp4;
+        o.lo = 21;
+        o.hi = 22;
+        o.ctx = 0;
+        o.tp = .{ .rank = @intCast(i), .size = 4 };
+        r.* = try Fixture.init(gpa, o);
+        made += 1;
+        _ = try seg.ensure(r.*.m);
+    }
+    const w = try ffn_in.randomWeights(83);
+    defer ffn_in.freeWeights(w);
+    const ly = try tieLayer(w, ranks[0].layer(21));
+    defer {
+        _ = mlx.mlx_array_free(ly.gate_w);
+        _ = mlx.mlx_array_free(ly.gate_bias);
+    }
+    for (2..decode.max_rows + 1) |rows| try expectRanksRoute(gpa, &ranks, &ly, rows);
+}
+
+fn expectRanksRoute(gpa: std.mem.Allocator, ranks: *const [4]*Fixture, ly: *const dsv41.Layer, rows: usize) !void {
+    var sc0 = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc0.deinit();
+    const in = try inputsOf(&sc0, ranks[0], ly, rows);
+    var first: ?[2][]f32 = null;
+    defer if (first) |f| for (f) |a| gpa.free(a);
+    const before = seg.dispatches;
+    for (0..250) |_| for (ranks) |r| {
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const out = (try seg_ffn_in.launch(&sc, r.m, 21, ly, in.x, in.y, &in.sa)) orelse return error.Declined;
+        try dsv41.evalAll(&.{ out.idx, out.wts });
+        const got = [2][]f32{ try dsv41.hostF32(out.idx), try dsv41.hostF32(out.wts) };
+        if (first) |f| {
+            defer for (got) |a| gpa.free(a);
+            for (f, got) |u, v| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(u), std.mem.sliceAsBytes(v));
+            continue;
+        }
+        first = got;
+        try expectTiePicks(got[0], rows);
+    };
+    try std.testing.expectEqual(before + 1000, seg.dispatches);
+}
+
+fn expectTiePicks(idx: []const f32, rows: usize) !void {
+    try std.testing.expectEqual(rows * 6, idx.len);
+    for (0..rows) |r| {
+        const row = idx[r * 6 ..][0..6];
+        for (row[0..5]) |e| try std.testing.expect(e < 5);
+        try std.testing.expectEqual(@as(f32, 7), row[5]);
     }
 }
