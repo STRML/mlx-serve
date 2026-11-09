@@ -5106,6 +5106,32 @@ pub const Drafted = struct {
     }
 };
 
+fn engramLead(m: *const Dsv41Model, ids: Ids, L: usize, tail: ?usize) ?usize {
+    if (m.engrams.len == 0) return null;
+    var first = m.n_layers;
+    for (m.engrams) |e| first = @min(first, e.layer);
+    if (ids == .gpu) return first;
+    if (!engramLeadOn() or first == 0 or m.pair != null or tail != null or L > region_rows) return null;
+    return first;
+}
+
+fn engramLeadOn() bool {
+    const v = env.get(.DSV41_ENGRAM_LEAD);
+    return v == null or v.?[0] != '0';
+}
+
+fn leadLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, held: []A, first: usize) !void {
+    try runLayers(m, gpa, st, sp, held, 0, first);
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+    for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
+    for (st.layers[0..first]) |*ls| try appendLayerState(gpa, &ev, ls);
+    const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_async_eval(vec));
+    if (first == 1) RoundLaps.mark(.handed);
+}
+
 fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, want: Want, vision: ?VisionRows) !A {
     const c = &m.cfg;
     const L = switch (given) {
@@ -5167,14 +5193,15 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
 
     // Engram row ids for the whole chunk (host hash); the rows themselves are
     // read span by span at their layer (a prompt chunk's: hashed above).
-    if (!eng_early and ids == .host) eng_ids = try engramIds(m, gpa, st, ids.host, images);
+    const tail = cedTail(m, st, L, want);
+    const lead = engramLead(m, ids, L, tail);
+    if (!eng_early and ids == .host and lead == null) eng_ids = try engramIds(m, gpa, st, ids.host, images);
     const ncols: usize = if (m.hash) |*hs| hs.cols() else 0;
 
     // What crosses layers: each span's stream and mix, the picks attention
     // layers hand down, and the DSpark main rows; then the same for the
     // replay tail's spans when the chunk has one.
     const n_spans = (L + span - 1) / span;
-    const tail = cedTail(m, st, L, want);
     const n_tail = if (tail) |t| (t + span - 1) / span else 0;
     const targets: usize = if (m.n_mtp > 0) c.dsv4_n_dspark_target_layers else 0;
     // (+ 4: `Spans.whole`'s two slots for the chunk's spans and two for the tail's)
@@ -5225,29 +5252,27 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     // The chunk's Engram rows come off the SSD on a thread while the layers before them run (a
     // decode token's once it is read back), and the prompt's next chunk is read behind them: the
     // previous call already did the same for this one (a prompt chunk's: started above).
-    if (!eng_early and eng_on and ids == .host) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span, images);
+    if (!eng_early and eng_on and ids == .host and lead == null) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span, images);
     sp.prefetch = prefetch;
 
     var from: usize = 0;
-    if (ids == .gpu and m.engrams.len > 0) {
-        var first = m.n_layers;
-        for (m.engrams) |e| first = @min(first, e.layer);
-        Laps.arm(first);
-        try runLayers(m, gpa, st, &sp, held, 0, first);
-        var ev: std.ArrayList(A) = .empty;
-        defer ev.deinit(gpa);
-        for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
-        for (st.layers[0..first]) |*ls| try appendLayerState(gpa, &ev, ls);
-        const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
-        defer _ = mlx.mlx_vector_array_free(vec);
-        try mlx.check(mlx.mlx_async_eval(vec));
+    if (lead) |first| {
+        if (ids == .gpu) Laps.arm(first);
+        try leadLayers(m, gpa, st, &sp, held, first);
         Laps.lap(.lead);
-        const tok = try hostToken(ids.gpu);
+        var tok: [1]u32 = undefined;
+        const chunk: []const u32 = switch (ids) {
+            .host => |h| h,
+            .gpu => |t| blk: {
+                tok[0] = try hostToken(t);
+                break :blk &tok;
+            },
+        };
         Laps.lap(.readback);
-        eng_ids = try engramIds(m, gpa, st, &.{tok}, images);
+        eng_ids = try engramIds(m, gpa, st, chunk, images);
         sp.eng_ids = eng_ids;
         Laps.lap(.hash);
-        prefetch = try engramPrefetch(m, gpa, st, eng_tables, &.{tok}, eng_ids, span, images);
+        if (eng_on) prefetch = try engramPrefetch(m, gpa, st, eng_tables, chunk, eng_ids, span, images);
         sp.prefetch = prefetch;
         Laps.lap(.prefetch);
         from = first;
@@ -5555,7 +5580,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_async_eval(vec));
                 Laps.handed(li);
-                if (li == lo) RoundLaps.mark(.handed);
+                if (li == 0) RoundLaps.mark(.handed);
             }
         }
     }
