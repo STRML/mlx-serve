@@ -320,15 +320,24 @@ test "dsv41 fused seg proto: last-arriver, ordered tickets and resident spin giv
     if (resident < 2) return error.SkipZigTest;
     std.debug.print("[seg] resident tg={d} tgmem={d} groups={d} (least of two probes)\n", .{ seg.spin_threads, seg.spin_tgmem, resident });
     var failures: u32 = 0;
+    var plain_failed: u32 = 0;
+    var plain_arms: u32 = 0;
     const base = try runChain(gpa, .dispatch, .atomic, resident, .grouped);
     reportChain(.dispatch, .atomic, .grouped, base, 0);
     failures += @intFromBool(base.outcome != .ok);
     for ([_]Layout{ .grouped, .interleaved }) |layout| for (std.enums.values(Access)) |access| for ([_]Arm{ .last, .ticket, .spin }) |arm| {
         const run: SpinResult = if (arm == .spin) try runSpinChain(gpa, access, layout, resident) else .{ .chain = try runChain(gpa, arm, access, resident, layout), .retries = 0 };
         reportChain(arm, access, layout, run.chain, run.retries);
-        if (reproducer(access)) continue;
+        if (reproducer(access)) {
+            if (layout == .interleaved) {
+                plain_arms += 1;
+                plain_failed += @intFromBool(run.chain.outcome != .ok);
+            }
+            continue;
+        }
         failures += @intFromBool(run.chain.outcome != .ok or run.retries > 1);
     };
+    std.debug.print("[seg] plain interleaved arms that failed on this device: {d} of {d} (diagnostic, never asserted)\n", .{ plain_failed, plain_arms });
     std.debug.print("[seg] {d} asserted arms failed\n", .{failures});
     try std.testing.expectEqual(@as(u32, 0), failures);
 }
