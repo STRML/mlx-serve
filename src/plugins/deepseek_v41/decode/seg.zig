@@ -97,7 +97,7 @@ pub const State = struct {
     dep: A = .{ .ctx = null },
     last_failure: u32 = 0,
     forwards: u64 = 0,
-    next_report: u64 = report_forwards,
+    next_report: u64 = 1,
 
     pub fn init(n_slots: usize, protocol: Protocol) !State {
         var counters = try Counters.init(n_slots);
@@ -207,7 +207,6 @@ var report_buf: [96]u8 = undefined;
 pub fn reportLine(buf: []u8, launches: u64, declined: u64, forwards: u64) []const u8 {
     return std.fmt.bufPrint(buf, "[dsv41] fused seg: {d} segment launches, {d} declines, {d} one-row forwards", .{ launches, declined, forwards }) catch "[dsv41] fused seg: counts";
 }
-
 
 pub const Break = enum { none, zero_shared, nan_shared };
 
