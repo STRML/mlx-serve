@@ -64,15 +64,25 @@ inline uint seg_ticket(device atomic_uint* t) {
 inline uint seg_read_peer_output(const device uint* p, uint i) {
   return ((const device coherent(device) uint*)p)[i];
 }
+inline void seg_write_peer_output(device uint* p, uint i, uint v) {
+  ((device coherent(device) uint*)p)[i] = v;
+}
 #else
 #define SEG_COHERENT 0
 inline uint seg_read_peer_output(const device uint* p, uint i) {
   return atomic_load_explicit((device atomic_uint*)(p + i), metal::memory_order_relaxed);
 }
+inline void seg_write_peer_output(device uint* p, uint i, uint v) {
+  atomic_store_explicit((device atomic_uint*)(p + i), v, metal::memory_order_relaxed);
+}
 #endif
 
 inline float seg_read_peer_f32(const device float* p, uint i) {
   return as_type<float>(seg_read_peer_output((const device uint*)p, i));
+}
+
+inline void seg_write_peer_f32(device float* p, uint i, float v) {
+  seg_write_peer_output((device uint*)p, i, as_type<uint>(v));
 }
 
 inline float2 seg_read_peer_bf16x2(const device uint* p, uint i) {

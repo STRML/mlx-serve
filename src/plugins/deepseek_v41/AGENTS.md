@@ -44,14 +44,20 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   (latches `fused_seg` off, `error.Dsv41FusedSegTimeout`). MLX binds an input of under 16 words as constant memory, so any
   array a kernel writes (counters, status) keeps 16. The ubench is `MLX_SERVE_DIAG=dsv41-seg-probe` (grids
   `dsv41-seg-probe-groups=<lo>-<hi>`); `probeResidency` finds the co-resident grid and `seg.spinGrid` derates it.
-- Phase data crossing groups inside one fused launch: every cross-group read goes through `seg_read_peer_output`,
-  `seg_read_peer_f32` or `seg_read_peer_bf16x2` (`seg_proto_header.metal`; a `coherent(device)` load from Metal 3.2, a
-  relaxed atomic load below), never a plain `device` load. The tested pairing is plain stores, then `seg_release()` and
-  the arrival, then (after the wait or last-arriver check and `seg_acquire()`) a coherent read. A plain load of a peer's
-  output returned a stale line on the two-die M5 Ultra (every thread of a group read one old value), likely because a
-  fence does not invalidate a group's L1; the M5 Max's one die hides it, so a one-die test cannot catch a plain read and
-  the review must. `seg_proto.zig` test 1 runs every arm with five access modes (`atomic`, `plain` = the reproducer,
-  reported not asserted, `coherent`, `atomic_load`, `peer_read`); a kernel may use only the asserted ones.
+- Phase data crossing groups inside one fused launch: every word another group reads in the same launch is written
+  through `seg_write_peer_output` or `seg_write_peer_f32` and read through `seg_read_peer_output`, `seg_read_peer_f32`
+  or `seg_read_peer_bf16x2` (`seg_proto_header.metal`; `coherent(device)` stores and loads from Metal 3.2, relaxed
+  atomics below), never a plain `device` store or load. The order is the coherent stores, then `seg_release()` and the
+  arrival, then (after the wait or last-arriver check and `seg_acquire()`) the coherent reads. Both halves fail on the
+  two-die M5 Ultra and pass on the M5 Max's one die, so a one-die test cannot catch either and the review must: a plain
+  load of a peer's output returns a stale value, and a plain store from lane 0 of a simdgroup, or one word in each of
+  many lines, is still invisible to another group's coherent or atomic load after the device fence, padded to aligned
+  rows or not. The level-1 kernel's last arrivers read the output buffer's previous bytes in every launch that way while
+  the bytes after the launch were right. A simdgroup storing 32 consecutive aligned words happened to pass, which is
+  how the probe missed it; do not rely on it. `seg_proto.zig` test 1 runs every arm with six access modes (`atomic`,
+  `coherent`, `peer` asserted; `plain`, `atomic_load`, `peer_read` = plain stores or loads, reported not asserted) in
+  two layouts (a group's words contiguous, or interleaved across groups, one word a line a store); a kernel may use only
+  the asserted ones. `scripts/lint_pins.txt` pins the level-1 kernel's partials and scores to the pair.
 - `decode/seg_ffn_in.zig` + `kernels/dec_seg_ffn_in.metal` (level 1, `DSV41_FUSED_SEG=1`): a tensor rank's FFN entry in one
   launch. Every mix and router threadgroup rebuilds the stream expand and collapse from `x`, the summed attention output
   and the attention split; the mixes' last arriver reduces the Sinkhorn split, the router's last arriver takes the top
