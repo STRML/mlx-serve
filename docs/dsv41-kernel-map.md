@@ -84,10 +84,11 @@ the head's all-gather.
 ## A/B arms
 
 `DSV41_KMAP_AB="base/seg:0/seg:1"` (`;` joins experiments) rotates the arms in blocks. Arms: `base`; `ctl|twin|same|pre|precopy:<in_proj|wq_b|wo_a|wo_b>[:idx|plain]`
-(a projection probe); `ffn:nopre|oracle` (FFN ceilings, `seg_bounds.zig`); `seg:<0-5>` (`DSV41_FUSED_SEG` level N); `seg:broken` (the
-stock MoE with the shared expert zeroed, test-only). After each phase a `seg:` arm runs `segCheck`: every captured layer's FFN segment
-against stock (rel rms, routes missed) and a smaller twin's whole step against its f32 twin, printing `SEG-CHECK-OK` or
-`SEG-CHECK-FAIL <what>`; on a failure the A/B lines are not printed.
+(a projection probe); `ffn:nopre|oracle` (FFN ceilings, `seg_bounds.zig`); `seg:<0-5>` (`DSV41_FUSED_SEG` level N); `seg:broken` / `seg:nan`
+(the stock MoE with the shared expert zeroed / set to NaN, test-only). After each phase a `seg:` arm runs `segCheck`: every captured
+layer's FFN segment against stock (rel rms, each row's picks and weights, non-finite values) and a smaller twin's whole step
+against its f32 twin, printing `SEG-CHECK-OK` or `SEG-CHECK-FAIL <what>`; on a failure the A/B lines are not printed. A level >= 1
+whose segment path no captured layer takes (rows != 1, or a model `seg.serves` declines) prints `SEG-CHECK-SKIP <why>` instead of OK.
 
 ## Layers
 

@@ -19,7 +19,9 @@ pub const State = struct {};
 
 pub var dispatches: u64 = 0;
 
-pub var broken = false;
+pub const Break = enum { none, zero_shared, nan_shared };
+
+pub var broken: Break = .none;
 
 pub fn levelFromEnv() Level {
     return levelOf(env.span(.DSV41_FUSED_SEG));
@@ -85,9 +87,11 @@ pub fn announce(m: *const Dsv41Model) void {
     if (serves(m, 1)) |why| log.info("[dsv41] fused seg off: {s}\n", .{why});
 }
 
-pub fn zeroShared(sc: *dsv41.Scope, act: A) !A {
+pub fn breakShared(sc: *dsv41.Scope, act: A) !A {
     const shape = mlx.getShape(act);
+    const dt = mlx.mlx_array_dtype(act);
     const routed = try sc.slice(act, 1, 0, @intCast(shape[1] - 1));
-    const none = try sc.zeros(&.{ shape[0], 1, shape[2] }, mlx.mlx_array_dtype(act));
-    return sc.concat(&.{ routed, none }, 1);
+    const zero = try sc.zeros(&.{ shape[0], 1, shape[2] }, dt);
+    const slot = if (broken == .nan_shared) try sc.astype(try sc.add(zero, try sc.f(std.math.nan(f32))), dt) else zero;
+    return sc.concat(&.{ routed, slot }, 1);
 }

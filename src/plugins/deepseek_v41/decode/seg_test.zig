@@ -3,6 +3,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
+const env = @import("../../../env.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
 const fixture = @import("fixture.zig");
@@ -240,12 +241,61 @@ test "dsv41 fused seg: kmap: segCheck fails the broken arm and passes seg:N" {
         seg_bounds.cache_on = false;
         seg_bounds.release();
         seg_bounds.set(.base);
-        seg.broken = false;
+        seg.broken = .none;
     }
+    const nax = device.naxAvailable();
     gpa.free(try runSteps(gpa, fx, &.{ 2, 2 }));
-    for (0..6) |n| try kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = @enumFromInt(n) });
+    try kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = .off });
+    for (1..6) |n| try std.testing.expectError(error.SegCheckSkipped, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = @enumFromInt(n) }));
     try std.testing.expectError(error.SegCheckFailed, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .broken));
+    try std.testing.expectError(error.SegCheckFailed, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .nan));
     for (o.lo..o.hi) |li| try std.testing.expectEqual(@as(c_int, 2), mlx.getShape(seg_bounds.inOf(li).?[0])[0]);
-    try std.testing.expect(!seg.broken);
+    gpa.free(try runSteps(gpa, fx, &.{ 1, 1 }));
+    for (1..6) |n| {
+        const level: seg.Level = @enumFromInt(n);
+        if (nax) try kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = level }) else try std.testing.expectError(error.SegCheckSkipped, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .{ .level = level }));
+    }
+    try std.testing.expectError(error.SegCheckFailed, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .broken));
+    try std.testing.expectError(error.SegCheckFailed, kernel_map.segCheck(gpa, fx, o.lo, o.hi, .nan));
+    try std.testing.expectEqual(seg.Break.none, seg.broken);
     try std.testing.expectEqual(seg.Level.off, fx.m.fused_seg);
+}
+
+test "dsv41 fused seg: kmap: the route check compares each row's picks in order and its weights" {
+    const topk = 2;
+    const same_idx = [_]f32{ 1, 2, 2, 1 };
+    const w = [_]f32{ 0.6, 0.4, 0.7, 0.3 };
+    try std.testing.expectEqual(@as(usize, 0), kernel_map.routeRowsBad(&same_idx, &same_idx, &w, &w, 2, topk));
+    const swapped_rows = [_]f32{ 2, 1, 1, 2 };
+    try std.testing.expectEqual(@as(usize, 2), kernel_map.routeRowsBad(&same_idx, &swapped_rows, &w, &w, 2, topk));
+    const tie_flipped = [_]f32{ 2, 1, 2, 1 };
+    try std.testing.expectEqual(@as(usize, 1), kernel_map.routeRowsBad(&same_idx, &tie_flipped, &w, &w, 2, topk));
+    const moved = [_]f32{ 0.6, 0.4, 0.7, 0.3001 };
+    try std.testing.expectEqual(@as(usize, 1), kernel_map.routeRowsBad(&same_idx, &same_idx, &w, &moved, 2, topk));
+    const nan_w = [_]f32{ 0.6, 0.4, std.math.nan(f32), 0.3 };
+    try std.testing.expectEqual(@as(usize, 1), kernel_map.routeRowsBad(&same_idx, &same_idx, &w, &nan_w, 2, topk));
+}
+
+test "dsv41 fused seg: init reads DSV41_FUSED_SEG into the model" {
+    if (!gpuTest()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    Sums.install();
+    defer Sums.remove();
+    var o = tp4;
+    o.ctx = 0;
+    o.from_env = true;
+    const expected = [_]struct { raw: ?[*:0]const u8, level: seg.Level }{
+        .{ .raw = "3", .level = .attn_seg },
+        .{ .raw = "0", .level = .off },
+        .{ .raw = "9", .level = .off },
+        .{ .raw = null, .level = .off },
+    };
+    for (expected) |e| {
+        const saved = env.override(.DSV41_FUSED_SEG, e.raw);
+        defer saved.restore();
+        try std.testing.expectEqual(e.level, seg.levelFromEnv());
+        const fx = try Fixture.init(gpa, o);
+        defer fx.deinit();
+        try std.testing.expectEqual(e.level, fx.m.fused_seg);
+    }
 }
