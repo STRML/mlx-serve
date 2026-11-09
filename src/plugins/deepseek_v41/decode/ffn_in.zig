@@ -14,9 +14,9 @@ const decode = @import("decode.zig");
 
 const A = mlx.mlx_array;
 const none: A = .{ .ctx = null };
-const act: mlx.mlx_dtype = .bfloat16;
-const hc: usize = 4;
-const mixes = (2 + hc) * hc;
+pub const act: mlx.mlx_dtype = .bfloat16;
+pub const hc: usize = 4;
+pub const mixes = (2 + hc) * hc;
 
 const A_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in.metal");
 const B_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_post.metal");
@@ -61,7 +61,7 @@ fn aCols(rows: usize) usize {
 /// Launch 2: columns a mix slice, experts a router threadgroup (two simdgroups an expert), threads a threadgroup.
 const slice_cols: usize = 128;
 const experts_tg: usize = 4;
-const b_threads: usize = 256;
+pub const b_threads: usize = 256;
 
 /// What a call is for: `rows` stream rows through a `d`-wide layer with wo_b `[d, k]` and `e` routed experts.
 pub const Dims = struct {
@@ -124,7 +124,7 @@ fn gridA(p: Dims) usize {
     return p.d / aCols(p.rows) * 32;
 }
 
-fn gridB(p: Dims) usize {
+pub fn gridB(p: Dims) usize {
     return (slices(p) + routerTgs(p)) * b_threads;
 }
 
@@ -135,7 +135,7 @@ fn aTargs(p: Dims) [7]TArg {
     };
 }
 
-fn bTargs(p: Dims) [10]TArg {
+pub fn bTargs(p: Dims) [10]TArg {
     return .{
         .{ .name = "R", .v = p.rows },                  .{ .name = "D", .v = p.d },         .{ .name = "E", .v = p.e },       .{ .name = "TOPK", .v = p.top_k },
         .{ .name = "HC", .v = hc },                     .{ .name = "ITERS", .v = p.iters }, .{ .name = "P", .v = slices(p) }, .{ .name = "G", .v = routerGroups(p) },
@@ -161,9 +161,9 @@ pub const Out = struct { x1: A, h2: A, sf: dsv41.Split, idx: A, wts: A };
 pub const AOut = struct { x1: A, hv: A, ctr: A, parts: A, logits: A };
 pub const BOut = struct { h2: A, sf: dsv41.Split, idx: A, wts: A };
 
-const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype };
+pub const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype };
 
-fn run(comptime n: usize, sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, outs: [n]OutSpec, grid: usize, tg: usize, targs: []const TArg) ![n]A {
+pub fn run(comptime n: usize, sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, outs: [n]OutSpec, grid: usize, tg: usize, targs: []const TArg) ![n]A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, o.shape.ptr, o.shape.len, o.dt));
@@ -855,7 +855,7 @@ pub fn weightsOf(ly: *const dsv41.Layer) Weights {
 }
 
 /// `ly` with `w` in the places today's chain reads them.
-fn layerWith(ly: *const dsv41.Layer, w: Weights) dsv41.Layer {
+pub fn layerWith(ly: *const dsv41.Layer, w: Weights) dsv41.Layer {
     var l = ly.*;
     l.wo_b.w = w.wo_w;
     l.wo_b.s = w.wo_s;
@@ -867,7 +867,7 @@ fn layerWith(ly: *const dsv41.Layer, w: Weights) dsv41.Layer {
 }
 
 /// Float64 truth of the launch pair from the f32 views of its inputs: no intermediate rounding anywhere.
-const Truth = struct {
+pub const Truth = struct {
     gpa: std.mem.Allocator,
     e: usize,
     x1: []f32,
@@ -879,14 +879,14 @@ const Truth = struct {
     score: []f64,
     biased: []f64,
 
-    fn deinit(t: *Truth) void {
+    pub fn deinit(t: *Truth) void {
         inline for (.{ t.x1, t.h2, t.sf_pre, t.sf_post, t.sf_comb }) |a| t.gpa.free(a);
         t.gpa.free(t.score);
         t.gpa.free(t.biased);
     }
 
     /// Row `r`'s top-k expert ids by biased score (ties to the lower id).
-    fn picks(t: *const Truth, r: usize, out: []usize) void {
+    pub fn picks(t: *const Truth, r: usize, out: []usize) void {
         var taken: [1024]bool = @splat(false);
         for (out) |*o| {
             var best: usize = 0;
@@ -901,7 +901,7 @@ const Truth = struct {
     }
 
     /// The routed weights of row `r` for the experts `ids`, as the router normalizes and scales them.
-    fn weights(t: *const Truth, r: usize, ids: []const usize, scal: f64, norm: bool, out: []f32) void {
+    pub fn weights(t: *const Truth, r: usize, ids: []const usize, scal: f64, norm: bool, out: []f32) void {
         var sum: f64 = 0;
         for (ids) |ex| sum += t.score[r * t.e + ex];
         const div = if (norm) sum + 1e-20 else 1.0;
@@ -909,7 +909,7 @@ const Truth = struct {
     }
 };
 
-const HostIn = struct {
+pub const HostIn = struct {
     p: Dims,
     /// wo_b dequantized `[D, K]`, the activations, the stream, the attention's split.
     wo: []const f32,
@@ -926,9 +926,11 @@ const HostIn = struct {
     bias: []const f32,
     eps0: f64,
     eps1: f64,
+    /// wo_b's output `[R, D]` where the caller has it (`wo` and `oa` are then unread).
+    y: ?[]const f32 = null,
 };
 
-fn truthOf(gpa: std.mem.Allocator, h: HostIn) !Truth {
+pub fn truthOf(gpa: std.mem.Allocator, h: HostIn) !Truth {
     const R = h.p.rows;
     const D = h.p.d;
     const N = hc * D;
@@ -953,6 +955,10 @@ fn truthOf(gpa: std.mem.Allocator, h: HostIn) !Truth {
     defer gpa.free(h2);
     for (0..R) |r| {
         for (0..D) |n| {
+            if (h.y) |given| {
+                y[n] = given[r * D + n];
+                continue;
+            }
             var acc: f64 = 0;
             for (0..h.p.k) |k| acc += @as(f64, h.wo[n * h.p.k + k]) * h.oa[r * h.p.k + k];
             y[n] = acc;
@@ -1051,9 +1057,21 @@ fn equivalence(gpa: std.mem.Allocator, fx: *Fixture, ks: Kernels, ly: *const dsv
         .eps1 = m.cfg.dsv4_hc_eps,
     });
     defer truth.deinit();
+    const chain: Out = .{ .x1 = pf.x1, .h2 = pf.h, .sf = pf.sp, .idx = rt.idx, .wts = rt.wts };
+    const cmp = try compareToChain(gpa, m, p, &truth, chain, out);
+    try std.testing.expect(cmp.differ <= 1);
+}
+
+pub const Compared = struct { differ: usize, wts_rel: f64 };
+
+/// `new` against today's `chain` and the float64 `truth`: the stream, the normed input and the split no further from truth
+/// than the chain's, the picks equal row by row (`differ` counts the rows that are not), and where all are, the weights no
+/// further from truth too. `wts_rel` is the largest relative weight difference from the chain over the equal rows.
+pub fn compareToChain(gpa: std.mem.Allocator, m: *const dsv41.Dsv41Model, p: Dims, truth: *const Truth, chain: Out, new: Out) !Compared {
+    const rows = p.rows;
     const names = [_][]const u8{ "x1", "h2", "sf.pre", "sf.post", "sf.comb" };
-    const chain_a = [_]A{ pf.x1, pf.h, pf.sp.pre, pf.sp.post, pf.sp.comb };
-    const new_a = [_]A{ out.x1, out.h2, out.sf.pre, out.sf.post, out.sf.comb };
+    const chain_a = [_]A{ chain.x1, chain.h2, chain.sf.pre, chain.sf.post, chain.sf.comb };
+    const new_a = [_]A{ new.x1, new.h2, new.sf.pre, new.sf.post, new.sf.comb };
     const truth_a = [_][]const f32{ truth.x1, truth.h2, truth.sf_pre, truth.sf_post, truth.sf_comb };
     for (names, chain_a, new_a, truth_a) |name, ca, na, tv| {
         const ch = try dsv41.hostF32(ca);
@@ -1064,27 +1082,32 @@ fn equivalence(gpa: std.mem.Allocator, fx: *Fixture, ks: Kernels, ly: *const dsv
         try decode.expectNoWorse(try std.fmt.bufPrint(&label, "ffn_in R={d} E={d} {s}", .{ rows, p.e, name }), nw, ch, tv);
     }
     // Routes: equal to the chain's except at true near-ties of the biased scores.
-    const chain_idx = try dsv41.hostF32(rt.idx);
+    const chain_idx = try dsv41.hostF32(chain.idx);
     defer std.testing.allocator.free(chain_idx);
-    const new_idx = try dsv41.hostF32(out.idx);
+    const new_idx = try dsv41.hostF32(new.idx);
     defer std.testing.allocator.free(new_idx);
-    const chain_wts = try dsv41.hostF32(rt.wts);
+    const chain_wts = try dsv41.hostF32(chain.wts);
     defer std.testing.allocator.free(chain_wts);
-    const new_wts = try dsv41.hostF32(out.wts);
+    const new_wts = try dsv41.hostF32(new.wts);
     defer std.testing.allocator.free(new_wts);
     const K = p.top_k;
     var differ: usize = 0;
     const truth_wts = try gpa.alloc(f32, rows * K);
     defer gpa.free(truth_wts);
     var ids: [16]usize = undefined;
+    var wts_rel: f64 = 0;
     for (0..rows) |r| {
-        if (!std.mem.eql(f32, chain_idx[r * K ..][0..K], new_idx[r * K ..][0..K])) differ += 1;
+        const same = std.mem.eql(f32, chain_idx[r * K ..][0..K], new_idx[r * K ..][0..K]);
+        if (!same) differ += 1;
+        if (same) for (chain_wts[r * K ..][0..K], new_wts[r * K ..][0..K]) |cw, nw| {
+            wts_rel = @max(wts_rel, @abs(@as(f64, nw) - cw) / @max(@abs(@as(f64, cw)), 1e-30));
+        };
         for (new_idx[r * K ..][0..K], ids[0..K]) |v, *o| o.* = @intFromFloat(v);
         truth.weights(r, ids[0..K], m.cfg.router_scaling_factor, p.norm, truth_wts[r * K ..][0..K]);
     }
-    std.debug.print("[dec] ffn_in R={d} E={d}: {d} of {d} rows pick differently from the chain\n", .{ rows, p.e, differ, rows });
+    std.debug.print("[dec] ffn_in R={d} E={d}: {d} of {d} rows pick differently from the chain; largest relative weight difference {e:.2}\n", .{ rows, p.e, differ, rows, wts_rel });
     if (differ == 0) try decode.expectNoWorse("ffn_in wts", new_wts, chain_wts, truth_wts);
-    try std.testing.expect(differ <= 1);
+    return .{ .differ = differ, .wts_rel = wts_rel };
 }
 
 test "dsv41 dec ffn_in: R = 1, 2, 4, 6 on layers 20..25 match today's wo_b, expand, norm, mixes and router, no further from float64" {
@@ -1122,7 +1145,7 @@ fn normal(seed: u64, shape: []const c_int, dt: mlx.mlx_dtype, mean: f32, std_: f
 }
 
 /// The release's shapes over random weights: wo_b `[5120, 8192]` as mxfp8, E = 384 experts.
-fn randomWeights(seed: u64) !Weights {
+pub fn randomWeights(seed: u64) !Weights {
     const q = try quant(try normal(seed, &.{ 5120, 8192 }, act, 0, 0.008));
     return .{
         .wo_w = q[0],
@@ -1136,7 +1159,7 @@ fn randomWeights(seed: u64) !Weights {
     };
 }
 
-fn freeWeights(w: Weights) void {
+pub fn freeWeights(w: Weights) void {
     for ([_]A{ w.wo_w, w.wo_s, w.fn_w, w.fn_scale, w.fn_base, w.norm_w, w.gate_w, w.gate_bias }) |a| _ = mlx.mlx_array_free(a);
 }
 
