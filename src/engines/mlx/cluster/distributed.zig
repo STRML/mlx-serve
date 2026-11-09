@@ -1575,6 +1575,49 @@ test "dist N-rank: rank 0 pipes a decode step only on the state the workers last
     try std.testing.expect(!TpLive.follows(null, 7, 40));
 }
 
+test "dsv41 dspark pipe: rank 0 rings a draft only after the verify the workers opened, and a verify only of the draft they made" {
+    const v = TpSpec.afterStep(7, 40, 6, true);
+    try std.testing.expect(TpSpec.afterStep(7, 40, 6, false) == null);
+    try std.testing.expectEqual(@as(?u8, 1), TpSpec.keep(v, 7, 41));
+    try std.testing.expectEqual(@as(?u8, 6), TpSpec.keep(v, 7, 46));
+    try std.testing.expect(TpSpec.keep(v, 7, 40) == null);
+    try std.testing.expect(TpSpec.keep(v, 7, 47) == null);
+    try std.testing.expect(TpSpec.keep(v, 8, 41) == null);
+    try std.testing.expect(TpSpec.keep(null, 7, 41) == null);
+    try std.testing.expect(!TpSpec.follows(v, 7, 40, 3));
+    const d: ?TpSpec = .{ .drafted = .{ .gen = 7, .n = 44 } };
+    try std.testing.expect(TpSpec.keep(d, 7, 44) == null);
+    try std.testing.expect(TpSpec.follows(d, 7, 44, 6));
+    try std.testing.expect(!TpSpec.follows(d, 7, 44, 0));
+    try std.testing.expect(!TpSpec.follows(d, 7, 45, 6));
+    try std.testing.expect(!TpSpec.follows(d, 9, 44, 6));
+}
+
+test "dsv41 dspark pipe: a worker reads a draft's kept count and first token, and a verify's rows, off its bell" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair));
+    defer for (pair) |fd| {
+        _ = std.c.close(fd);
+    };
+    const host: Bell = .{ .fd = pair[0] };
+    var link: Link = .{ .group = undefined, .rank = 1, .size = 4 };
+    link.bells[0] = .{ .fd = pair[1] };
+    var draft: [6]u8 = .{ Bell.draft_byte, 3, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, draft[2..6], 129279, .little);
+    try host.say(&draft);
+    try host.say(&.{ Bell.verify_byte, 6 });
+    try host.pipe();
+    const a = try recvMsg(&link, 0);
+    try std.testing.expectEqual(OP_DSV41_TP_DRAFT_PIPE, a[0]);
+    try std.testing.expectEqual(@as(i32, 3), a[1]);
+    try std.testing.expectEqual(@as(u32, 129279), @as(u32, @bitCast(a[2])));
+    const b = try recvMsg(&link, 0);
+    try std.testing.expectEqual(OP_DSV41_TP_VERIFY_PIPE, b[0]);
+    try std.testing.expectEqual(@as(i32, 6), b[1]);
+    try std.testing.expectEqual(OP_DSV41_TP_PIPE, (try recvMsg(&link, 0))[0]);
+}
+
 test "tensor batched step body: every state's gen, position and ids come back in order" {
     const gens = [_]u64{ 7, (1 << 35) + 1 };
     const p0s = [_]usize{ 40, (1 << 32) + 9 };

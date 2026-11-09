@@ -59,6 +59,7 @@ pub const WholeOpts = struct {
     /// A pack folder `writeEngramPack` filled: Engram on `engram_layers`, read from there.
     engram_dir: ?[]const u8 = null,
     engram_layers: [2]u8 = .{ 1, 14 },
+    dspark_stages: u32 = 0,
 };
 
 pub const Fixture = struct {
@@ -141,9 +142,25 @@ pub const Fixture = struct {
         try fx.putVec("norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
         for (0..opts.layers) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, true, null);
         for (cfg.dsv41_engram_layers[0..cfg.dsv41_n_engram_layers]) |l| try fx.putEngram(&cfg, l);
-        if (opts.tp) |t| try fx.sliceShard(t);
-        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .tp = opts.tp, .pack_dir = opts.engram_dir });
+        const ds = opts.dspark_stages > 0;
+        if (ds) try fx.putStages(&cfg, opts);
+        if (opts.tp) |t| try fx.sliceShard(.{ .rank = t.rank, .size = t.size, .stages = ds });
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .tp = opts.tp, .pack_dir = opts.engram_dir, .dspark = ds, .head_8bit = ds, .draft_shard = ds and opts.tp != null });
         return fx;
+    }
+
+    fn putStages(fx: *Fixture, cfg: *config.Config, opts: WholeOpts) !void {
+        const tail = cfg.dsv4_n_compress_ratios - opts.dspark_stages;
+        for (0..opts.dspark_stages) |si| cfg.dsv4_compress_ratios[opts.layers + si] = cfg.dsv4_compress_ratios[tail + si];
+        cfg.dsv4_n_compress_ratios = opts.layers + opts.dspark_stages;
+        const targets = @min(opts.layers, cfg.dsv4_dspark_target_layers.len);
+        cfg.dsv4_n_dspark_target_layers = targets;
+        for (0..targets) |k| cfg.dsv4_dspark_target_layers[k] = @intCast(opts.layers - targets + k);
+        cfg.dsv41_dspark_experts = opts.experts;
+        cfg.dsv41_dspark_top_k = @min(cfg.dsv41_dspark_top_k, opts.experts);
+        cfg.dsv4_dspark_noise_token_id = @min(cfg.dsv4_dspark_noise_token_id, opts.vocab - 1);
+        try fx.putStageHeads(cfg);
+        for (0..opts.dspark_stages) |si| try fx.putLayer(cfg, "mtp.{d}.", si, opts.experts, true, null);
     }
 
     /// Layer `l`'s Engram projections: its key and query weights and `wkv` (mxfp8, as the release ships it).
@@ -168,12 +185,18 @@ pub const Fixture = struct {
     fn putDraftHeads(fx: *Fixture, c: *const config.Config) !void {
         const d: c_int = @intCast(c.hidden_size);
         const v: c_int = @intCast(c.vocab_size);
-        const rank: c_int = @intCast(c.dsv4_dspark_markov_rank);
-        const targets: c_int = @intCast(c.dsv4_n_dspark_target_layers);
-        const last = c.dsparkStages() - 1;
         try fx.putVec("embed.weight", .{}, &.{ v, d }, .bfloat16, 0, 0.02);
         try fx.putVec("head.weight", .{}, &.{ v, d }, .bfloat16, 0, 0.02);
         try fx.putVec("norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
+        try fx.putStageHeads(c);
+    }
+
+    fn putStageHeads(fx: *Fixture, c: *const config.Config) !void {
+        const d: c_int = @intCast(c.hidden_size);
+        const v: c_int = @intCast(c.vocab_size);
+        const rank: c_int = @intCast(c.dsv4_dspark_markov_rank);
+        const targets: c_int = @intCast(c.dsv4_n_dspark_target_layers);
+        const last = c.dsparkStages() - 1;
         try fx.putVec("mtp.0.main_proj.weight", .{}, &.{ d, targets * d }, .bfloat16, 0, 0.02);
         try fx.putVec("mtp.0.main_norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
         try fx.putVec("mtp.{d}.norm.weight", .{last}, &.{d}, .bfloat16, 1, 0.1);
@@ -1098,9 +1121,13 @@ const Group = struct {
 /// they last stepped as distributed.zig keeps it (`TpLive`).
 const Ops = struct {
     const Step = struct { ids: []u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64 };
-    const Op = union(enum) { step: Step, pipe };
+    const Draft = struct { gen: u64, p0: usize, t1: u32 };
+    const DraftPipe = struct { keep: usize, t1: u32 };
+    const Op = union(enum) { step: Step, pipe, draft: Draft, draft_pipe: DraftPipe, verify_pipe: usize };
+    const Spec = union(enum) { verify: struct { gen: u64, n0: usize, end: usize }, drafted: struct { gen: u64, n: usize } };
     var list: std.ArrayList(Op) = .empty;
     var live: ?struct { gen: u64, n: usize } = null;
+    var spec: ?Spec = null;
 
     fn step(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?A) anyerror!void {
         if (images != null) return error.TestUnexpectedResult;
@@ -1108,6 +1135,7 @@ const Ops = struct {
         errdefer std.testing.allocator.free(own);
         try list.append(std.testing.allocator, .{ .step = .{ .ids = own, .p0 = p0, .snap = snap, .all = all, .verify = verify, .gen = gen } });
         live = if (verify) null else .{ .gen = gen, .n = p0 + ids.len };
+        spec = if (verify) .{ .verify = .{ .gen = gen, .n0 = p0, .end = p0 + ids.len } } else null;
     }
 
     fn pipe(gen: u64, n: usize) anyerror!bool {
@@ -1115,6 +1143,30 @@ const Ops = struct {
         if (l.gen != gen or l.n != n) return false;
         try list.append(std.testing.allocator, .pipe);
         live = .{ .gen = gen, .n = n + 1 };
+        spec = null;
+        return true;
+    }
+
+    fn draft(gens: []const u64, p0s: []const usize, t1s: []const u32) anyerror!void {
+        if (gens.len != 1) return error.TestUnexpectedResult;
+        try list.append(std.testing.allocator, .{ .draft = .{ .gen = gens[0], .p0 = p0s[0], .t1 = t1s[0] } });
+        live = null;
+        spec = .{ .drafted = .{ .gen = gens[0], .n = p0s[0] } };
+    }
+
+    fn draftPipe(gen: u64, p0: usize, t1: u32) anyerror!bool {
+        const s = spec orelse return false;
+        if (s != .verify or s.verify.gen != gen or p0 <= s.verify.n0 or p0 > s.verify.end) return false;
+        try list.append(std.testing.allocator, .{ .draft_pipe = .{ .keep = p0 - s.verify.n0, .t1 = t1 } });
+        spec = .{ .drafted = .{ .gen = gen, .n = p0 } };
+        return true;
+    }
+
+    fn verifyPipe(gen: u64, n: usize, rows: usize) anyerror!bool {
+        const s = spec orelse return false;
+        if (s != .drafted or s.drafted.gen != gen or s.drafted.n != n) return false;
+        try list.append(std.testing.allocator, .{ .verify_pipe = rows });
+        spec = .{ .verify = .{ .gen = gen, .n0 = n, .end = n + rows } };
         return true;
     }
 
@@ -1128,6 +1180,7 @@ const Ops = struct {
         for (list.items) |op| if (op == .step) std.testing.allocator.free(op.step.ids);
         list.clearRetainingCapacity();
         live = null;
+        spec = null;
     }
 
     fn deinit() void {
@@ -1205,6 +1258,9 @@ fn followDecode(m: *dsv41.Dsv41Model) !void {
     for (Ops.list.items) |op| switch (op) {
         .step => |s| try dsv41.tpWorkerStep(m, gpa, &parked, s.gen, s.ids, s.p0, s.snap, @as(dsv41.Want, if (s.all) .all else .last), s.verify, null),
         .pipe => try dsv41.tpWorkerPipe(m, gpa),
+        .draft => |d| try dsv41.tpWorkerDraft(m, gpa, &parked, &.{d.gen}, &.{d.p0}, &.{d.t1}),
+        .draft_pipe => |d| try dsv41.tpWorkerDraftPipe(m, gpa, &parked, d.keep, d.t1),
+        .verify_pipe => |rows| try dsv41.tpWorkerVerifyPipe(m, gpa, &parked, rows),
     };
 }
 
@@ -1302,6 +1358,344 @@ test "dist N-rank: four ranks decode with the token on the GPU as with its id in
     try std.testing.expectEqual(@as(usize, 2), piped_eos.steps);
     try std.testing.expectEqual(ref_eos.steps - 2, piped_eos.pipes);
     try expectSameF32s(ref_eos.caches, piped_eos.caches);
+}
+
+const Keep = enum { all, none, one, greedy, sampled };
+const Round = struct { drafts: usize, keep: Keep, copy: bool = false };
+
+const pipe_script = [_]Round{
+    .{ .drafts = 5, .keep = .all },
+    .{ .drafts = 3, .keep = .none },
+    .{ .drafts = 0, .keep = .none },
+    .{ .drafts = 3, .keep = .one, .copy = true },
+    .{ .drafts = 4, .keep = .greedy },
+    .{ .drafts = 2, .keep = .sampled },
+};
+
+fn keptOf(keep: Keep, b: usize, best: []const i32, ids: []const u32) usize {
+    return switch (keep) {
+        .all => b,
+        .none => 0,
+        .one, .sampled => @min(1, b),
+        .greedy => blk: {
+            var a: usize = 0;
+            while (a < b and @as(u32, @intCast(best[a])) == ids[a + 1]) a += 1;
+            break :blk a;
+        },
+    };
+}
+
+fn copyDraft(gpa: std.mem.Allocator, t1: u32, drafts: usize) !dsv41.DsparkDraft {
+    const ids = try gpa.alloc(u32, drafts + 1);
+    ids[0] = t1;
+    for (ids[1..], 0..) |*o, k| o.* = @intCast(3 + 5 * k);
+    return .{ .ids = ids, .len = drafts, .logits = &.{}, .confidence = &.{} };
+}
+
+fn verifyBest(vl: A) ![]i32 {
+    var am = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(am);
+    try mlx.check(mlx.mlx_argmax_axis(&am, vl, -1, false, mlx.gpuStream()));
+    var am32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(am32);
+    try mlx.check(mlx.mlx_astype(&am32, am, .int32, mlx.gpuStream()));
+    return dsv41.hostI32(am32);
+}
+
+const Lead = struct {
+    tokens: std.ArrayList(u32) = .empty,
+    kept: std.ArrayList(usize) = .empty,
+    reads: usize = 0,
+
+    fn clear(l: *Lead) void {
+        l.tokens.clearRetainingCapacity();
+        l.kept.clearRetainingCapacity();
+        l.reads = 0;
+    }
+
+    fn deinit(l: *Lead, gpa: std.mem.Allocator) void {
+        l.tokens.deinit(gpa);
+        l.kept.deinit(gpa);
+    }
+};
+
+fn leadRound(m: *dsv41.Dsv41Model, t1: u32, r: Round, lead: *Lead) !u32 {
+    const gpa = std.testing.allocator;
+    const st = &m.dec_state.?;
+    var d = if (r.copy) try copyDraft(gpa, t1, r.drafts) else try dsv41.dsparkDraft(m, gpa, st, t1);
+    defer d.deinit(gpa);
+    lead.reads += @intFromBool(!r.copy);
+    d.len = @min(r.drafts, d.len);
+    var pending = try dsv41.dsparkBeginWith(m, gpa, st, t1, &d);
+    defer pending.deinit();
+    const best = try verifyBest(pending.vl_g);
+    defer gpa.free(best);
+    lead.reads += 1;
+    const kept = keptOf(r.keep, d.len, best, d.ids);
+    const shift: i32 = if (r.keep == .sampled) 7 else 0;
+    const next: u32 = @intCast(@mod(best[kept] + shift, @as(i32, @intCast(m.vocab))));
+    var round = try dsv41.dsparkFinish(m, gpa, st, &pending, kept, next);
+    defer round.deinit(gpa);
+    try lead.tokens.appendSlice(gpa, round.tokens);
+    try lead.kept.append(gpa, round.accepted);
+    return round.next_token;
+}
+
+fn leadRounds(m: *dsv41.Dsv41Model, prompt: []const u32, script: []const Round, lead: *Lead) !void {
+    const gpa = std.testing.allocator;
+    try dsv41.reset(m, gpa);
+    const first = try dsv41.extendResumable(m, gpa, prompt, null);
+    defer _ = mlx.mlx_array_free(first);
+    const am = try argmaxOf(first);
+    defer _ = mlx.mlx_array_free(am);
+    var t1 = try readToken(am);
+    for (script) |r| t1 = try leadRound(m, t1, r, lead);
+    var tail = try dsv41.dsparkDraft(m, gpa, &m.dec_state.?, t1);
+    tail.deinit(gpa);
+    try lead.tokens.append(gpa, t1);
+}
+
+fn stateOf(gpa: std.mem.Allocator, m: *const dsv41.Dsv41Model) ![][]f32 {
+    var out: std.ArrayList([]f32) = .empty;
+    errdefer {
+        for (out.items) |x| gpa.free(x);
+        out.deinit(gpa);
+    }
+    const st = &m.dec_state.?;
+    for (st.layers) |ls| {
+        try out.append(gpa, try dsv41.hostF32(ls.win.buf));
+        if (ls.comp) |c| try out.append(gpa, try dsv41.hostF32(c.buf));
+        if (ls.idx_k) |c| try out.append(gpa, try dsv41.hostF32(c.buf));
+        for ([_]A{ ls.pend_kv, ls.pend_gate }) |p| if (p.ctx != null) try out.append(gpa, try dsv41.hostF32(p));
+    }
+    for (st.ds) |ring| try out.append(gpa, try dsv41.hostF32(ring.buf));
+    const marks = try gpa.alloc(f32, 2 + 2 * st.layers.len);
+    errdefer gpa.free(marks);
+    marks[0] = @floatFromInt(st.n);
+    marks[1] = @floatFromInt(st.hist.items.len);
+    for (st.layers, 0..) |ls, li| {
+        marks[2 + 2 * li] = if (ls.comp) |c| @floatFromInt(c.used) else -1;
+        marks[3 + 2 * li] = if (ls.idx_k) |c| @floatFromInt(c.used) else -1;
+    }
+    try out.append(gpa, marks);
+    return out.toOwnedSlice(gpa);
+}
+
+const Rounds = struct {
+    tokens: []u32,
+    kept: []usize,
+    n: usize,
+    steps: usize,
+    drafts: usize,
+    draft_pipes: usize,
+    verify_pipes: usize,
+    reads: usize,
+    state: [][]f32,
+
+    fn deinit(r: Rounds, gpa: std.mem.Allocator) void {
+        gpa.free(r.tokens);
+        gpa.free(r.kept);
+        freeF32s(gpa, r.state);
+    }
+
+    fn headers(r: Rounds) usize {
+        return r.steps + r.drafts;
+    }
+};
+
+fn dsparkHooks(pipes: bool) void {
+    const h = dsv41.clusterHooks();
+    h.tp_step = &Ops.step;
+    h.tp_draft = &Ops.draft;
+    h.tp_draft_pipe = if (pipes) &Ops.draftPipe else null;
+    h.tp_verify_pipe = if (pipes) &Ops.verifyPipe else null;
+}
+
+fn dropDsparkHooks() void {
+    const h = dsv41.clusterHooks();
+    h.tp_step = null;
+    h.tp_draft = null;
+    h.tp_draft_pipe = null;
+    h.tp_verify_pipe = null;
+}
+
+fn dsparkGroup(ranks: []const *Fixture, prompt: []const u32, script: []const Round, pipes: bool) !Rounds {
+    const gpa = std.testing.allocator;
+    dsparkHooks(pipes);
+    Group.join(ranks.len);
+    defer {
+        dropDsparkHooks();
+        Group.leave();
+        Ops.deinit();
+    }
+    var lead: Lead = .{};
+    defer lead.deinit(gpa);
+    var pass: usize = 0;
+    while (true) : (pass += 1) {
+        if (pass == 600) return error.TestNoFixedPoint;
+        for (ranks, 0..) |r, i| {
+            Group.begin(i);
+            if (i > 0) {
+                try followDecode(r.m);
+                continue;
+            }
+            Ops.reset();
+            lead.clear();
+            try leadRounds(r.m, prompt, script, &lead);
+        }
+        if (pass > 0 and try Group.settled()) break;
+    }
+    const m0 = ranks[0].m;
+    const want = try stateOf(gpa, m0);
+    errdefer freeF32s(gpa, want);
+    for (ranks[1..], 1..) |r, i| {
+        try std.testing.expectEqualSlices(Group.Kind, Group.kinds[0].items, Group.kinds[i].items);
+        for (Group.parts[0].items, Group.parts[i].items) |a, b| try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+        const got = try stateOf(gpa, r.m);
+        defer freeF32s(gpa, got);
+        try expectSameF32s(want, got);
+    }
+    return .{
+        .tokens = try gpa.dupe(u32, lead.tokens.items),
+        .kept = try gpa.dupe(usize, lead.kept.items),
+        .n = m0.dec_state.?.n,
+        .steps = Ops.count(.step),
+        .drafts = Ops.count(.draft),
+        .draft_pipes = Ops.count(.draft_pipe),
+        .verify_pipes = Ops.count(.verify_pipe),
+        .reads = lead.reads,
+        .state = want,
+    };
+}
+
+fn dsparkRanks(gpa: std.mem.Allocator, out: *[4]*Fixture) !void {
+    return dsparkRanksWith(gpa, out, null);
+}
+
+fn dsparkRanksWith(gpa: std.mem.Allocator, out: *[4]*Fixture, engram_dir: ?[]const u8) !void {
+    var made: usize = 0;
+    errdefer for (out[0..made]) |r| r.deinit();
+    for (out, 0..) |*r, i| {
+        r.* = try Fixture.initWhole(gpa, .{ .layers = 3, .dspark_stages = 1, .engram_dir = engram_dir, .engram_layers = .{ 1, 2 }, .tp = .{ .rank = @intCast(i), .size = 4 } });
+        made += 1;
+    }
+}
+
+test "dsv41 dspark pipe: four ranks run DSpark rounds with the draft and verify rung on the bells as with their headers, the same tokens, kept counts and caches" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var ranks: [4]*Fixture = undefined;
+    try dsparkRanks(gpa, &ranks);
+    defer for (ranks) |r| r.deinit();
+    try std.testing.expect(ranks[0].m.draft_shard and ranks[0].m.n_mtp == 1);
+    const prompt = [_]u32{ 11, 400, 7, 901, 55, 3, 18 };
+    const ref = try dsparkGroup(&ranks, &prompt, &pipe_script, false);
+    defer ref.deinit(gpa);
+    const piped = try dsparkGroup(&ranks, &prompt, &pipe_script, true);
+    defer piped.deinit(gpa);
+    try std.testing.expectEqualSlices(u32, ref.tokens, piped.tokens);
+    try std.testing.expectEqualSlices(usize, ref.kept, piped.kept);
+    try std.testing.expectEqual(ref.n, piped.n);
+    try expectSameF32s(ref.state, piped.state);
+    try std.testing.expectEqual(@as(usize, 5), ref.kept[0]);
+    try std.testing.expectEqual(@as(usize, 0), ref.kept[1]);
+    try std.testing.expectEqual(@as(usize, 0), ref.kept[2]);
+    try std.testing.expectEqual(@as(usize, 0), ref.draft_pipes + ref.verify_pipes);
+    try std.testing.expectEqual(@as(usize, 1 + pipe_script.len), ref.steps);
+    try std.testing.expectEqual(@as(usize, pipe_script.len), ref.drafts);
+    try std.testing.expectEqual(@as(usize, 2), piped.steps);
+    try std.testing.expectEqual(@as(usize, 1), piped.drafts);
+    try std.testing.expectEqual(@as(usize, pipe_script.len - 1), piped.verify_pipes);
+    try std.testing.expectEqual(@as(usize, pipe_script.len - 1), piped.draft_pipes);
+}
+
+test "dsv41 dspark pipe: a DSpark round's link waits on rank 0 drop to none when the draft and verify go on the bells" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var ranks: [4]*Fixture = undefined;
+    try dsparkRanks(gpa, &ranks);
+    defer for (ranks) |r| r.deinit();
+    const script = [_]Round{ .{ .drafts = 4, .keep = .one }, .{ .drafts = 4, .keep = .all }, .{ .drafts = 2, .keep = .none }, .{ .drafts = 5, .keep = .greedy } };
+    const prompt = [_]u32{ 9, 81, 729, 655 };
+    const waits_per_header = 2 * (ranks.len - 1);
+    var headers: [2]usize = undefined;
+    for ([_]bool{ false, true }, &headers) |pipes, *h| {
+        const r = try dsparkGroup(&ranks, &prompt, &script, pipes);
+        defer r.deinit(gpa);
+        try std.testing.expectEqual(2 * script.len, r.reads);
+        h.* = r.headers() - 1;
+    }
+    try std.testing.expectEqual(2 * script.len + 1, headers[0]);
+    try std.testing.expectEqual(@as(usize, 1), headers[1]);
+    const off = 2 + waits_per_header * (headers[0] - 1) / script.len;
+    const on = 2 + waits_per_header * (headers[1] - 1) / (script.len - 1);
+    std.debug.print("[dspark-pipe] rank 0 host waits a round past the first, derived from its headers: {d} with headers (2 reads + {d} link waits), {d} piped\n", .{ off, off - 2, on });
+}
+
+test "dsv41 dspark pipe: four ranks with Engram run DSpark rounds rung on the bells as with their headers, the same tokens, kept counts and caches" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeEngramPack(gpa, td.dir, 1024, .{ 1, 2 });
+    const dir = try pathOf(gpa, td.dir);
+    defer gpa.free(dir);
+    var ranks: [4]*Fixture = undefined;
+    try dsparkRanksWith(gpa, &ranks, dir);
+    defer for (ranks) |r| r.deinit();
+    try std.testing.expect(ranks[0].m.engrams.len == 2);
+    const prompt = [_]u32{ 11, 400, 7, 901, 55, 3, 18 };
+    const ref = try dsparkGroup(&ranks, &prompt, &pipe_script, false);
+    defer ref.deinit(gpa);
+    const piped = try dsparkGroup(&ranks, &prompt, &pipe_script, true);
+    defer piped.deinit(gpa);
+    try std.testing.expectEqualSlices(u32, ref.tokens, piped.tokens);
+    try std.testing.expectEqualSlices(usize, ref.kept, piped.kept);
+    try std.testing.expectEqual(ref.n, piped.n);
+    try expectSameF32s(ref.state, piped.state);
+    try std.testing.expectEqual(@as(usize, pipe_script.len - 1), piped.verify_pipes);
+}
+
+fn dsparkRounds(m: *dsv41.Dsv41Model, prompt: []const u32, script: []const Round) !i64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const iou = @import("../../../sdk/util/io_util.zig");
+    var lead: Lead = .{};
+    defer lead.deinit(std.testing.allocator);
+    Ops.reset();
+    const t0 = iou.nowUsMonotonic(io);
+    try leadRounds(m, prompt, script, &lead);
+    return iou.nowUsMonotonic(io) - t0;
+}
+
+test "dsv41 dspark pipe ubench: rank 0's DSpark rounds rung on the bells against headers, stub collectives (DSV41_DSPARK_PIPE_UBENCH)" {
+    if (env.get(.DSV41_DSPARK_PIPE_UBENCH) == null or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.initWhole(gpa, .{ .layers = 8, .experts = 32, .vocab = 32768, .dspark_stages = 3, .tp = .{ .rank = 0, .size = 4 } });
+    defer fx.deinit();
+    dsv41.clusterHooks().tp_sum = &Stub.sum;
+    dsv41.clusterHooks().tp_gather = &Stub.gather;
+    defer {
+        dsv41.clusterHooks().tp_sum = null;
+        dsv41.clusterHooks().tp_gather = null;
+        dropDsparkHooks();
+        Ops.deinit();
+    }
+    const prompt = [_]u32{ 11, 400, 7, 901, 55 };
+    var script: [36]Round = undefined;
+    for (&script, 0..) |*r, k| r.* = .{ .drafts = 5, .keep = if (k % 3 == 0) .all else .one };
+    const short = 4;
+    const arms = [_]bool{ false, true, false };
+    var best: [arms.len][2]i64 = @splat(.{ std.math.maxInt(i64), std.math.maxInt(i64) });
+    for (0..6) |rep| for (arms, &best) |pipes, *b| {
+        dsparkHooks(pipes);
+        for ([_]usize{ short, script.len }, b) |n, *t| {
+            const us = try dsparkRounds(fx.m, &prompt, script[0..n]);
+            if (rep > 0) t.* = @min(t.*, us);
+        }
+    };
+    var per: [arms.len]f64 = undefined;
+    for (best, &per) |b, *p| p.* = @as(f64, @floatFromInt(b[1] - b[0])) / (script.len - short);
+    std.debug.print("[dspark-pipe] rank 0, 8 layers + 3 stages at the release's widths, stub collectives: headers A {d:.0} us/round, headers A' {d:.0} us/round (A/A x{d:.3}), bells {d:.0} us/round (x{d:.3} against A)\n", .{ per[0], per[2], per[0] / per[2], per[1], per[0] / per[1] });
 }
 
 /// Collectives that cost nothing: one rank's timing without the network.
