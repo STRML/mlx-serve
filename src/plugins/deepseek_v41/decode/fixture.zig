@@ -1171,6 +1171,11 @@ const Ops = struct {
         return true;
     }
 
+    fn chained(gen: u64, n: usize) anyerror!void {
+        live = null;
+        spec = .{ .drafted = .{ .gen = gen, .n = n } };
+    }
+
     fn count(tag: std.meta.Tag(Op)) usize {
         var c: usize = 0;
         for (list.items) |op| c += @intFromBool(op == tag);
@@ -1492,10 +1497,12 @@ const Rounds = struct {
     verify_pipes: usize,
     reads: usize,
     state: [][]f32,
+    kinds: []Group.Kind = &.{},
 
     fn deinit(r: Rounds, gpa: std.mem.Allocator) void {
         gpa.free(r.tokens);
         gpa.free(r.kept);
+        gpa.free(r.kinds);
         freeF32s(gpa, r.state);
     }
 
@@ -1546,6 +1553,11 @@ fn dsparkGroup(ranks: []const *Fixture, prompt: []const u32, script: []const Rou
         }
         if (pass > 0 and try Group.settled()) break;
     }
+    return settledRounds(ranks, &lead);
+}
+
+fn settledRounds(ranks: []const *Fixture, lead: *const Lead) !Rounds {
+    const gpa = std.testing.allocator;
     const m0 = ranks[0].m;
     const want = try stateOf(gpa, m0);
     errdefer freeF32s(gpa, want);
@@ -1566,7 +1578,135 @@ fn dsparkGroup(ranks: []const *Fixture, prompt: []const u32, script: []const Rou
         .verify_pipes = Ops.count(.verify_pipe),
         .reads = lead.reads,
         .state = want,
+        .kinds = try gpa.dupe(Group.Kind, Group.kinds[0].items),
     };
+}
+
+const ChainArm = struct { chain: bool, tail: bool };
+
+fn offRound(m: *dsv41.Dsv41Model, st: *dsv41.State, t1: u32, d: *const dsv41.DsparkDraft, keep: u8) !dsv41.DsparkRound {
+    const gpa = std.testing.allocator;
+    var pending = try dsv41.dsparkBeginWith(m, gpa, st, t1, d);
+    defer pending.deinit();
+    const best = try verifyBest(pending.vl_g);
+    defer gpa.free(best);
+    const kept = if (keep == 255) keptOf(.greedy, d.len, best, d.ids) else @min(keep, d.len);
+    return dsv41.dsparkFinish(m, gpa, st, &pending, kept, @intCast(best[kept]));
+}
+
+fn chainRound(m: *dsv41.Dsv41Model, t1: u32, keep: u8, chain: bool, lead: *Lead) !u32 {
+    const gpa = std.testing.allocator;
+    const st = &m.dec_state.?;
+    var d = try dsv41.dsparkDraft(m, gpa, st, t1);
+    defer d.deinit(gpa);
+    lead.reads += 1;
+    var round = if (chain) try dsv41.dsparkRoundChain(m, gpa, st, t1, &d, 1 << 20) else try offRound(m, st, t1, &d, keep);
+    defer round.deinit(gpa);
+    try lead.tokens.appendSlice(gpa, round.tokens);
+    try lead.kept.append(gpa, round.accepted);
+    return round.next_token;
+}
+
+fn leadChain(m: *dsv41.Dsv41Model, prompt: []const u32, keeps: []const u8, arm: ChainArm, lead: *Lead) !void {
+    const gpa = std.testing.allocator;
+    try dsv41.reset(m, gpa);
+    const first = try dsv41.extendResumable(m, gpa, prompt, null);
+    defer _ = mlx.mlx_array_free(first);
+    const am = try argmaxOf(first);
+    defer _ = mlx.mlx_array_free(am);
+    var t1 = try readToken(am);
+    for (keeps) |k| t1 = try chainRound(m, t1, k, arm.chain, lead);
+    if (arm.tail) {
+        var tail = try dsv41.dsparkDraft(m, gpa, &m.dec_state.?, t1);
+        tail.deinit(gpa);
+    }
+    try lead.tokens.append(gpa, t1);
+}
+
+fn chainGroup(ranks: []const *Fixture, prompt: []const u32, keeps: []const u8, arm: ChainArm) !Rounds {
+    const gpa = std.testing.allocator;
+    dsparkHooks(true);
+    dsv41.clusterHooks().tp_chained = &Ops.chained;
+    _ = setenv("DSV41_DSPARK_COMMIT_ALL", "1", 1);
+    _ = setenv("DSV41_DSPARK_CHAIN", if (arm.chain) "1" else "0", 1);
+    dsv41.chain_script = if (arm.chain) keeps else &.{};
+    Group.join(ranks.len);
+    defer {
+        dsv41.chain_script = &.{};
+        _ = unsetenv("DSV41_DSPARK_CHAIN");
+        _ = unsetenv("DSV41_DSPARK_COMMIT_ALL");
+        dsv41.clusterHooks().tp_chained = null;
+        dropDsparkHooks();
+        Group.leave();
+        Ops.deinit();
+    }
+    var lead: Lead = .{};
+    defer lead.deinit(gpa);
+    var pass: usize = 0;
+    while (true) : (pass += 1) {
+        if (pass == 900) return error.TestNoFixedPoint;
+        for (ranks, 0..) |r, i| {
+            Group.begin(i);
+            r.m.chain_rounds = 0;
+            if (i > 0) {
+                try followDecode(r.m);
+                continue;
+            }
+            Ops.reset();
+            lead.clear();
+            try leadChain(r.m, prompt, keeps, arm, &lead);
+        }
+        if (pass > 0 and try Group.settled()) break;
+    }
+    return settledRounds(ranks, &lead);
+}
+
+fn chainPrompt() [130]u32 {
+    var p: [130]u32 = undefined;
+    for (&p, 0..) |*t, i| t.* = @intCast((i * 37 + 11) % 1000);
+    return p;
+}
+
+test "dsv41 dspark chain: four ranks build each next draft behind the verify as the draft after it, the same tokens, kept counts, collectives and caches at keep 1, mid, all and the greedy rule" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var ranks: [4]*Fixture = undefined;
+    try dsparkRanks(gpa, &ranks);
+    defer for (ranks) |r| r.deinit();
+    const prompt = chainPrompt();
+    const keeps = [_]u8{ 0, 2, 5, 255, 1, 5 };
+    const off = try chainGroup(&ranks, &prompt, &keeps, .{ .chain = false, .tail = true });
+    defer off.deinit(gpa);
+    const on = try chainGroup(&ranks, &prompt, &keeps, .{ .chain = true, .tail = true });
+    defer on.deinit(gpa);
+    try std.testing.expectEqualSlices(u32, off.tokens, on.tokens);
+    try std.testing.expectEqualSlices(usize, off.kept, on.kept);
+    try std.testing.expectEqual(off.n, on.n);
+    try std.testing.expectEqualSlices(Group.Kind, off.kinds, on.kinds);
+    try expectSameF32s(off.state, on.state);
+    try std.testing.expectEqual(@as(usize, 0), on.kept[0]);
+    try std.testing.expectEqual(@as(usize, 2), on.kept[1]);
+    try std.testing.expectEqual(@as(usize, 5), on.kept[2]);
+    try std.testing.expectEqual(@as(usize, 1), on.drafts + on.draft_pipes);
+    try std.testing.expectEqual(keeps.len, on.verify_pipes);
+}
+
+test "dsv41 dspark chain: a chained draft the request never takes (an EOS) leaves every rank where the unchained run's last draft does" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var ranks: [4]*Fixture = undefined;
+    try dsparkRanks(gpa, &ranks);
+    defer for (ranks) |r| r.deinit();
+    const prompt = chainPrompt();
+    const keeps = [_]u8{ 2, 5 };
+    const off = try chainGroup(&ranks, &prompt, &keeps, .{ .chain = false, .tail = true });
+    defer off.deinit(gpa);
+    const on = try chainGroup(&ranks, &prompt, &keeps, .{ .chain = true, .tail = false });
+    defer on.deinit(gpa);
+    try std.testing.expectEqualSlices(u32, off.tokens, on.tokens);
+    try std.testing.expectEqual(off.n, on.n);
+    try std.testing.expectEqualSlices(Group.Kind, off.kinds, on.kinds);
+    try expectSameF32s(off.state, on.state);
 }
 
 fn dsparkRanks(gpa: std.mem.Allocator, out: *[4]*Fixture) !void {

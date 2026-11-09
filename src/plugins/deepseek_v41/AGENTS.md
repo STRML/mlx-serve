@@ -68,6 +68,10 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - Under `tp` with `DSV41_DSPARK_PIPE=1` a DSpark round of the live state goes on the bells: the draft with the kept count and
   first token after the byte, the verify with its row count, each rank's ids from its own draft (`Drafted`). Rank 0 rings
   one only on what the workers last did (distributed.zig `TpSpec`, cleared by any other message); a copied draft keeps its header.
+- `DSV41_DSPARK_CHAIN=1` (greedy rounds, `dsparkRoundChain`): the verify's kept count and next token are argmaxes on the
+  GPU, the stage windows take all the verify's rows (`DSV41_DSPARK_COMMIT_ALL`, so the commit's matmuls see one row
+  count), and the next draft is built at the GPU position before the host reads; the next `dsparkDraft` from that token
+  takes it (`Chained`). Workers chain on the verify's flag (`workerChain`) and rank 0 marks them drafted (`tp_chained`).
 - Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
   worker keeps it; a step on another state (`st != &dec_state`) is refused.
 - Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken

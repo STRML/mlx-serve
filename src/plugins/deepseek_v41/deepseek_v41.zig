@@ -549,6 +549,8 @@ pub const Dsv41Model = struct {
     /// rank 0 (`InitOpts.draft_shard`).
     draft_shard: bool = false,
     tp_drafted: ?Drafted = null,
+    ds_chain: ?Chained = null,
+    chain_rounds: usize = 0,
     /// `moeFused`'s unit expand at rows 1..`dkern.max_rows` (`.pre` the zero stream), made once at load.
     tp_units: [dkern.max_rows]Split = undefined,
     /// `dec_state`'s identity: a snapshot names the state it was taken of. Set from `gens` whenever `dec_state` is
@@ -572,6 +574,7 @@ pub const Dsv41Model = struct {
     pub fn deinit(self: *Dsv41Model) void {
         // scratch_x1.zig: the prompt's regions let go with the model.
         sx1.releaseAll();
+        dropChain(self);
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
         self.gpa.free(self.prompt);
@@ -1695,6 +1698,7 @@ const ClusterHooksState = struct {
     tp_draft: ?*const fn (gens: []const u64, p0s: []const usize, t1s: []const u32) anyerror!void = null,
     tp_draft_pipe: ?*const fn (gen: u64, p0: usize, t1: u32) anyerror!bool = null,
     tp_verify_pipe: ?*const fn (gen: u64, n: usize, rows: usize, flags: u8) anyerror!bool = null,
+    tp_chained: ?*const fn (gen: u64, n: usize) anyerror!void = null,
     /// Tensor parallel, rank 0: one batched step over the states `gens`, each from `p0s[k]` with `chunks[k]`.
     tp_batch: ?*const fn (gens: []const u64, p0s: []const usize, chunks: []const []const u32, verify: bool) anyerror!void = null,
     /// Tensor parallel, rank 0: the state `gen` is gone.
@@ -2317,6 +2321,13 @@ pub const Ring = struct {
             self.buf = up;
             done += run;
         }
+    }
+
+    fn readEnd(self: *const Ring, sc: *Scope, end: A, w: usize) !A {
+        std.debug.assert(w <= self.cap);
+        const first = try sc.sub(end, try sc.i(@intCast(w)));
+        const idx = try sc.op2(mlx.mlx_remainder, try sc.add(try sc.arange(0, w), first), try sc.i(@intCast(self.cap)));
+        return sc.take(self.buf, idx, 0);
     }
 
     /// Rows for positions [lo, hi) in order; `hi - lo <= cap`.
@@ -6079,7 +6090,8 @@ pub fn tpWorkerStep(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, gen
     const st = &m.dec_state.?;
     if (verify.open) try armVerifyAs(st, m.n_layers, verify);
     const out = try extendIds(m, gpa, st, .{ .host = ids }, want, if (images) |r| .{ .rows = r, .offset = 0 } else null);
-    _ = mlx.mlx_array_free(out);
+    defer _ = mlx.mlx_array_free(out);
+    if (verify.chain) try workerChain(m, gpa, st, ids, out);
     if (snap) {
         st.snap_at = st.n;
         try snapshotIfDue(m);
@@ -7381,9 +7393,8 @@ fn commitMain(sc: *Scope, m: *Dsv41Model, st: *State, mh: A, p0: usize) !void {
 /// A stage's attention heads for one state's draft rows at [p0, p0 + B) from their projections `rows` (made over every
 /// state's rows), inverse-roped for `attnOutRoped`: every row sees the stage's window of committed main rows and every
 /// draft row.
-fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_keys: A, p0: usize) !A {
+fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_keys: A, pos: A) !A {
     const hd = m.cfg.head_dim;
-    const pos = try sc.i(ci(p0));
     const pj = try ropeProj(sc, m, ly, m.rope_plain.fwd, rows, pos);
     const keys = try sc.astype(try sc.concat(&.{ main_keys, pj.kv }, 0), .float32);
     const qf = try sc.astype(pj.q, .float32);
@@ -7404,6 +7415,7 @@ pub const DsparkPhases = dsv4.DsparkPhases;
 /// bigram bias chained position by position on the GPU (greedy), and the
 /// confidence head's logit per position; it truncates the block only when a threshold is set.
 pub fn dsparkDraft(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) !DsparkDraft {
+    if (try takeChain(m, gpa, st, t1)) |d| return d;
     RoundLaps.mark(.draft);
     const t0 = monoUs();
     defer m.ds_draft_ns = @intCast((monoUs() - t0) * 1000);
@@ -7575,7 +7587,7 @@ pub fn draftGraph(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, states: []
     const emb = try embedIds(m, sc, uids, m.act);
     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(N * B), ci(c.dsv4_hc_mult), ci(c.hidden_size) });
     var pre = try onehotPre(sc, m, N * B);
-    for (0..m.n_mtp) |si| x = try stageBlock(sc, m, states, m.n_layers + si, x, &pre, B);
+    for (0..m.n_mtp) |si| x = try stageBlock(sc, m, states, m.n_layers + si, x, &pre, B, null);
     const firsts = try gpa.alloc(i32, N);
     defer gpa.free(firsts);
     for (firsts, t1s) |*f, t| f.* = @intCast(t);
@@ -7701,7 +7713,7 @@ pub fn vocabArgmax(sc: *Scope, m: *const Dsv41Model, row: A) !A {
 
 /// A DSpark stage over `B` draft rows a state: the mixes, norms and FFN over every row, each state's attention
 /// against its own window of committed main rows. A sharded draft sums the attention's and the MoE's output.
-fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: A, pre: *A, B: usize) !A {
+fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: A, pre: *A, B: usize, at: ?A) !A {
     const ly = &m.layers[li];
     const si = li - m.n_layers;
     const pa = try hcPreNorm(sc, m, x, pre.*, &ly.hc_attn, ly.attn_norm);
@@ -7709,10 +7721,8 @@ fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: 
     const rows = try qkvRows(sc, m, ly, pa.h);
     var heads: [region_rows]A = undefined;
     for (states, heads[0..states.len], 0..) |st, *o, k| {
-        const window = @min(m.cfg.sliding_window, st.n);
-        const keys = try st.ds[si].read(sc, st.n - window, st.n);
         const mine: Proj = if (states.len == 1) rows else .{ .q = try sc.slice(rows.q, 0, k * B, (k + 1) * B), .kv = try sc.slice(rows.kv, 0, k * B, (k + 1) * B), .qr = rows.qr };
-        o.* = try dsparkHeads(sc, m, ly, mine, keys, st.n);
+        o.* = try dsparkHeads(sc, m, ly, mine, try stageKeys(sc, m, st, si, at), at orelse try sc.i(ci(st.n)));
     }
     const ao = try attnOutRoped(sc, m, ly, if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0));
     const h = if (m.draft_shard) try tpSum(sc, m, ao) else ao;
@@ -7886,10 +7896,14 @@ test "dsv41 verify drafts: a streamed bank's verify (drafts + the committed toke
 /// the returned `vl_g` holds every position's logits, lazily. The drafts
 /// may be the stages' block or a copied continuation (`VERIFY_MAX_DRAFTS`).
 pub fn dsparkBeginWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, d: *const DsparkDraft) !DsparkPending {
+    return dsparkBeginAs(m, gpa, st, t1, d, .{ .open = true, .commit_all = commitAllOn(m) });
+}
+
+fn dsparkBeginAs(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, d: *const DsparkDraft, o: VerifyOpts) !DsparkPending {
     const b = d.len;
     if (b > VERIFY_MAX_DRAFTS) return error.TooManyDrafts;
     RoundLaps.mark(.verify);
-    try armVerifyAs(st, m.n_layers, .{ .open = true, .commit_all = commitAllOn(m) });
+    try armVerifyAs(st, m.n_layers, o);
     var ids: [16]u32 = undefined;
     ids[0] = t1;
     @memcpy(ids[1 .. b + 1], d.ids[1 .. b + 1]);
@@ -7908,7 +7922,11 @@ fn armVerifyAs(st: *State, nl: usize, o: VerifyOpts) !void {
 }
 
 fn commitAllOn(m: *const Dsv41Model) bool {
-    return m.n_mtp > 0 and env.on(.DSV41_DSPARK_COMMIT_ALL);
+    return m.n_mtp > 0 and (env.on(.DSV41_DSPARK_COMMIT_ALL) or dsparkChainOn());
+}
+
+pub fn dsparkChainOn() bool {
+    return env.on(.DSV41_DSPARK_CHAIN);
 }
 
 /// The rollback anchors a verify chunk restores to.
@@ -8003,6 +8021,126 @@ pub fn dsparkObserve(m: *Dsv41Model, ph: DsparkPhases) void {
         p.observe(ph);
         if (p.rounds % 16 == 0) p.report();
     }
+}
+
+fn stageKeys(sc: *Scope, m: *const Dsv41Model, st: *const State, si: usize, at: ?A) !A {
+    const end = at orelse {
+        const window = @min(m.cfg.sliding_window, st.n);
+        return st.ds[si].read(sc, st.n - window, st.n);
+    };
+    return st.ds[si].readEnd(sc, end, m.cfg.sliding_window);
+}
+
+fn draftGraphAt(sc: *Scope, m: *Dsv41Model, st: *State, t1: A, end: A) !DraftGraph {
+    const c = &m.cfg;
+    const B = m.ds_block;
+    var noise: [16]i32 = undefined;
+    @memset(noise[0 .. B - 1], @intCast(c.dsv4_dspark_noise_token_id));
+    const ids = try sc.concat(&.{ t1, try sc.ints(noise[0 .. B - 1], &.{ci(B - 1)}) }, 0);
+    const emb = try m.embed.rows(sc, ids, m.act);
+    var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(c.dsv4_hc_mult), ci(c.hidden_size) });
+    var pre = try onehotPre(sc, m, B);
+    for (0..m.n_mtp) |si| x = try stageBlock(sc, m, &.{st}, m.n_layers + si, x, &pre, B, end);
+    return draftTail(sc, m, x, pre, t1, wantsConfidence(m), false);
+}
+
+pub var chain_script: []const u8 = &.{};
+
+fn acceptedOf(sc: *Scope, m: *Dsv41Model, best: A, ids: []const u32) !A {
+    const b = ids.len - 1;
+    if (scriptedKeep(m)) |k| return sc.i(@intCast(@min(k, b)));
+    if (b == 0) return sc.i(0);
+    var drafts: [16]i32 = undefined;
+    for (drafts[0..b], ids[1..]) |*o, v| o.* = @intCast(v);
+    const miss = try sc.astype(try sc.op2(mlx.mlx_not_equal, try sc.slice(best, 0, 0, b), try sc.ints(drafts[0..b], &.{ci(b)})), .int32);
+    const stop = try sc.concat(&.{ miss, try sc.ones(&.{1}, .int32) }, 0);
+    return sc.astype(try sc.argmax(stop, 0), .int32);
+}
+
+fn scriptedKeep(m: *Dsv41Model) ?usize {
+    if (chain_script.len == 0) return null;
+    const k = chain_script[m.chain_rounds % chain_script.len];
+    m.chain_rounds += 1;
+    return if (k == 255) null else k;
+}
+
+const ChainOut = struct { accepted: A, t1: A, g: DraftGraph };
+
+fn chainGraph(sc: *Scope, m: *Dsv41Model, st: *State, vl: A, ids: []const u32) !ChainOut {
+    const best = try sc.astype(try sc.argmax(vl, -1), .int32);
+    const accepted = try acceptedOf(sc, m, best, ids);
+    const t1 = try sc.take(best, try sc.reshape(accepted, &.{1}), 0);
+    const v = &st.verify.?;
+    try commitMain(sc, m, st, v.mh, v.n0);
+    v.committed = true;
+    const end = try sc.add(accepted, try sc.i(@intCast(v.n0 + 1)));
+    return .{ .accepted = accepted, .t1 = t1, .g = try draftGraphAt(sc, m, st, t1, end) };
+}
+
+fn hostInt(a: A) !usize {
+    const v = (mlx.mlx_array_data_int32(a) orelse return error.NoData)[0];
+    return @intCast(v);
+}
+
+pub const Chained = struct { gen: u64, n: usize, t1: u32, draft: DsparkDraft, gpa: std.mem.Allocator };
+
+fn dropChain(m: *Dsv41Model) void {
+    var c = m.ds_chain orelse return;
+    c.draft.deinit(c.gpa);
+    m.ds_chain = null;
+}
+
+fn takeChain(m: *Dsv41Model, gpa: std.mem.Allocator, st: *const State, t1: u32) !?DsparkDraft {
+    const c = m.ds_chain orelse return null;
+    defer dropChain(m);
+    if (c.gen != m.state_gen or c.n != st.n or c.t1 != t1 or m.dec_state == null or st != &m.dec_state.?) return null;
+    const ids = try gpa.dupe(u32, c.draft.ids);
+    errdefer gpa.free(ids);
+    const conf = try gpa.dupe(f32, c.draft.confidence);
+    return .{ .ids = ids, .len = c.draft.len, .logits = &.{}, .confidence = conf };
+}
+
+fn chainable(m: *const Dsv41Model, st: *const State, b: usize, accepted_cap: usize) bool {
+    if (!dsparkChainOn() or m.n_mtp == 0 or m.pair != null or m.streamed != null) return false;
+    if (m.tp != null and !m.draft_shard) return false;
+    if (m.dec_state == null or st != &m.dec_state.? or st.snap_at != null) return false;
+    return accepted_cap >= b and st.n + 1 >= m.cfg.sliding_window;
+}
+
+pub fn dsparkRoundChain(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, d: *const DsparkDraft, accepted_cap: usize) !DsparkRound {
+    if (!chainable(m, st, d.len, accepted_cap)) return dsparkRoundWith(m, gpa, st, t1, d, accepted_cap);
+    var pending = try dsparkBeginAs(m, gpa, st, t1, d, .{ .open = true, .commit_all = true, .chain = true });
+    defer pending.deinit();
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const c = try chainGraph(&sc, m, st, pending.vl_g, pending.verify[0 .. pending.b + 1]);
+    try evalAll(&.{ c.accepted, c.t1, c.g.ids, c.g.conf });
+    const accepted = try hostInt(c.accepted);
+    const next: u32 = @intCast(try hostInt(c.t1));
+    var r = try dsparkFinish(m, gpa, st, &pending, accepted, next);
+    errdefer r.deinit(gpa);
+    r.phases.draft_ns = m.ds_draft_ns;
+    dsparkObserve(m, r.phases);
+    try stashChain(m, gpa, st, next, c.g);
+    return r;
+}
+
+fn stashChain(m: *Dsv41Model, gpa: std.mem.Allocator, st: *const State, next: u32, g: DraftGraph) !void {
+    dropChain(m);
+    var out: [1]DsparkDraft = undefined;
+    try readDrafts(m, gpa, g, &.{next}, false, &out);
+    m.ds_chain = .{ .gen = m.state_gen, .n = st.n, .t1 = next, .draft = out[0], .gpa = gpa };
+    if (m.draft_shard) m.tp_drafted = Drafted.of(m.state_gen, st.n, out[0].ids);
+    if (m.tp) |t| if (t.rank == 0) if (clusterHooks().tp_chained) |f| try f(m.state_gen, st.n);
+}
+
+fn workerChain(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, vl: A) !void {
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const c = try chainGraph(&sc, m, st, vl, ids);
+    try evalAll(&.{ c.accepted, c.t1, c.g.ids });
+    try finishVerify(m, gpa, st, try hostInt(c.accepted) + 1);
+    m.tp_drafted = try workerDrafted(m, c.g.ids, m.state_gen, st.n, @intCast(try hostInt(c.t1)));
 }
 
 /// One greedy round: draft, verify, keep the longest prefix the trunk's own
