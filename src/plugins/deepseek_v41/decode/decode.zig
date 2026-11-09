@@ -605,5 +605,6 @@ test {
     _ = fixture;
     _ = @import("kernel_map.zig");
     _ = @import("seg_test.zig");
+    _ = @import("seg_proto.zig");
     inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;
 }
