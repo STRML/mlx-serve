@@ -264,6 +264,16 @@ fn logRound(self: *const Generator, kind: []const u8, offered: usize, rows: usiz
     log.info("[dspark-round] at {d} {s} offered {d} rows {d} accepted {d} plain_ms {d:.3}\n", .{ self.generated_ids.items.len, kind, offered, rows, accepted, plain });
 }
 
+fn logStage(self: *const Generator, d: *const dsv41_mod.DsparkDraft, drafted: usize, accepted: u32) void {
+    if (env.get(.DSV41_DSPARK_ROUND_LOG) == null) return;
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const n = @min(drafted, d.confidence.len, d.ids.len -| 1);
+    for (d.ids[1 .. n + 1], d.confidence[0..n]) |id, c| w.print(" {d}:{x:0>8}", .{ id, @as(u32, @bitCast(c)) }) catch break;
+    const plain = if (self.dspark_pol) |p| p.plain.ms else 0;
+    log.info("[dspark-round] at {d} stage offered {d} rows {d} accepted {d} plain_ms {d:.3} drafts{s}\n", .{ self.generated_ids.items.len, drafted, d.len + 1, accepted, plain, w.buffered() });
+}
+
 /// `DSV41_DSPARK_ROWS=k` verifies k rows (t1 included) every round the draft has them, for measuring the verify
 /// ladder; unset or 0, the policy chooses.
 var forced_rows: ?usize = null;
@@ -305,7 +315,7 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
         pol.calib.observe(sigmoid(c), k < round.accepted);
     }
     self.dspark_stats.record(@intCast(d.len), round.accepted);
-    logRound(self, "stage", drafted, d.len + 1, round.accepted);
+    logStage(self, &d, drafted, round.accepted);
     if (self.xfm.dspark_warm_rounds < DSPARK_WARMUP_ROUNDS) {
         self.xfm.dspark_warm_rounds += 1;
     } else pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, roundWall(d.len + 1, &watch));

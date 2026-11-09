@@ -4519,7 +4519,7 @@ pub fn tpSum(sc: *Scope, m: *const Dsv41Model, x: A) !A {
     if (m.tp == null) return sc.astype(x, m.act);
     const mode = tpSumMode();
     if (mode == .off) return sc.astype(x, m.act);
-    if (mode == .gather) return gatherSum(sc, m, x);
+    if (mode == .gather) return TpSumCrc.noted(m, 'g', x, try gatherSum(sc, m, x));
     const sum = clusterHooks().tp_sum orelse return error.DsvTpNotJoined;
     // Two ranks' bf16 parts sum as they are: one rounding of their f32 sum, as the cast back makes (JACCL rounds on the
     // CPU, so a tie can land apart). A wider part sums wider at decode width.
@@ -4530,7 +4530,7 @@ pub fn tpSum(sc: *Scope, m: *const Dsv41Model, x: A) !A {
         .f32, .off => pair_rule,
     };
     const part = if (as_is or dim(x, 0) > region_rows) try sc.astype(x, m.act) else try sc.astype(x, .float32);
-    return sc.astype(try sc.keep(try sum(part)), m.act);
+    return TpSumCrc.noted(m, TpSumCrc.pathOf(m, part), x, try sc.astype(try sc.keep(try sum(part)), m.act));
 }
 
 fn gatherSum(sc: *Scope, m: *const Dsv41Model, x: A) !A {
@@ -5440,6 +5440,62 @@ pub const RoundLaps = struct {
             sum[0] / d, sum[1] / d, sum[2] / d, sum[3] / d, sum[4] / d, sum[5] / d, sum[6] / d, sum[7] / d, sum[8] / d,
             copy_engine / c, copy_verify / c,
         });
+    }
+};
+
+pub const TpSumCrc = struct {
+    const Held = struct { sum: A, rows: usize, path: u8 };
+    const rs_bytes = 32 * 1024;
+    var held: std.ArrayList(Held) = .empty;
+
+    fn enabled() bool {
+        return env.get(.DSV41_TP_SUM_CRC) != null;
+    }
+
+    fn pathOf(m: *const Dsv41Model, part: A) u8 {
+        const bytes = mlx.mlx_array_size(part) * mlx.mlx_array_itemsize(part);
+        return if (m.tp.?.size > 2 and bytes > rs_bytes) 'r' else 'f';
+    }
+
+    fn noted(m: *const Dsv41Model, path: u8, x: A, out: A) !A {
+        if (!enabled() or m.tp.?.rank != 0 or dim(x, 0) > region_rows) return out;
+        if (held.items.len >= 1024) drop();
+        var kept = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&kept, out);
+        try held.append(m.gpa, .{ .sum = kept, .rows = dim(x, 0), .path = path });
+        return out;
+    }
+
+    fn drop() void {
+        for (held.items) |h| _ = mlx.mlx_array_free(h.sum);
+        held.clearRetainingCapacity();
+    }
+
+    fn flush(m: *const Dsv41Model, n: usize) void {
+        if (!enabled() or held.items.len == 0) return;
+        defer drop();
+        var buf: [16384]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        for (held.items) |h| {
+            const crc = crcOf(m, h.sum) catch return;
+            w.print(" {d}{c}:{x:0>8}", .{ h.rows, h.path, crc }) catch break;
+        }
+        log.info("[tp-sum-crc] at {d}: {d} sums (rows, f fully connected / r reduce-scatter / g gather, crc32){s}\n", .{ n, held.items.len, w.buffered() });
+    }
+
+    fn crcOf(m: *const Dsv41Model, a: A) !u32 {
+        var c = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_contiguous(&c, a, false, m.s));
+        try mlx.check(mlx.mlx_array_eval(c));
+        const len = mlx.mlx_array_size(c) * mlx.mlx_array_itemsize(c);
+        const p: [*]const u8 = switch (mlx.mlx_array_dtype(c)) {
+            .float32 => @ptrCast(mlx.mlx_array_data_float32(c) orelse return error.NoData),
+            .bfloat16 => @ptrCast(mlx.mlx_array_data_bfloat16(c) orelse return error.NoData),
+            .float16 => @ptrCast(mlx.mlx_array_data_float16(c) orelse return error.NoData),
+            else => return error.NoData,
+        };
+        return std.hash.Crc32.hash(p[0..len]);
     }
 };
 
@@ -7873,6 +7929,7 @@ pub fn dsparkFinish(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending:
     RoundLaps.mark(.read);
     defer RoundLaps.finish(m);
     VerifyPicks.flush(m);
+    TpSumCrc.flush(m, st.n);
     const t0 = monoUs();
     try finishVerify(m, gpa, st, keep_n);
     const t1 = monoUs();
