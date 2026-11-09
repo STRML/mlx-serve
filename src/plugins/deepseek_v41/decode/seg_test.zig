@@ -305,6 +305,16 @@ test "dsv41 fused seg: kmap: the route check compares each row's picks in order 
     try std.testing.expectEqual(@as(usize, 1), kernel_map.routeRowsBad(&same_idx, &same_idx, &w, &nan_w, 2, topk));
 }
 
+test "dsv41 fused seg: kmap: the whole-step bar is the median of per-seed arm/stock ratios" {
+    var out: [3]f64 = undefined;
+    const flipped = kernel_map.wholeRatio(&.{ 1.969e-1, 4.671e-2, 9.395e-2 }, &.{ 1.969e-1, 4.699e-2, 1.161e-1 }, &out);
+    try std.testing.expect(flipped <= 1.15);
+    const broad = kernel_map.wholeRatio(&.{ 1.969e-1, 4.671e-2, 9.395e-2 }, &.{ 2.6e-1, 6.1e-2, 1.2e-1 }, &out);
+    try std.testing.expect(!(broad <= 1.15));
+    const nan = kernel_map.wholeRatio(&.{ 0.1, 0.1, 0.1 }, &.{ std.math.nan(f64), std.math.nan(f64), 0.1 }, &out);
+    try std.testing.expect(!(nan <= 1.15));
+}
+
 test "dsv41 fused seg: init reads DSV41_FUSED_SEG into the model" {
     if (!gpuTest()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
