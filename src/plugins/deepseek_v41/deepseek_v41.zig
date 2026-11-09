@@ -579,6 +579,10 @@ pub const Dsv41Model = struct {
         sx1.releaseAll();
         dropChain(self);
         if (self.dec_state) |*st| st.deinit();
+        if (self.seg) |s| {
+            s.deinit();
+            self.gpa.destroy(s);
+        }
         self.dropAhead();
         self.gpa.free(self.prompt);
         for (self.engrams) |*e| e.table.close();
@@ -1961,6 +1965,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     };
     m.fused_seg = dkern.seg.levelFromEnv();
     dkern.seg.announce(m);
+    m.seg = try dkern.seg.create(m);
     try compileRegions(m);
     if (n_stages > 0) {
         if (m.draft_shard and m.head_part == null) return error.Dsv41DraftShardNeedsVocabHead;
@@ -5403,6 +5408,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     try mlx.check(mlx.mlx_async_eval(vec));
     Laps.lap(.submit);
     Laps.end(m);
+    try dkern.seg.afterStep(m);
     return sc.out(logits);
 }
 
@@ -5901,6 +5907,7 @@ pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usiz
     try ev.appendSlice(gpa, &.{ xo, po });
     for (st.layers[p.lo..p.hi]) |*ls| try appendLayerState(gpa, &ev, ls);
     try evalAll(ev.items);
+    try dkern.seg.afterStep(m);
     if (snap) {
         st.snap_at = st.n;
         try snapshotIfDue(m);
