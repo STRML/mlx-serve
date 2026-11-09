@@ -5429,6 +5429,48 @@ pub const RoundLaps = struct {
     }
 };
 
+pub const WorkerLaps = struct {
+    const Kind = enum { draft, verify };
+    const Mark = enum { wake, followed, handed, built, done };
+    const n = std.enums.values(Mark).len;
+    var at: [n]i64 = @splat(0);
+    var sum: [2][n]u64 = @splat(@splat(0));
+    var count: [2]u32 = @splat(0);
+    var last: i64 = 0;
+
+    fn mark(k: Mark) void {
+        if (RoundLaps.enabled()) at[@intFromEnum(k)] = monoUs();
+    }
+
+    fn end(m: *const Dsv41Model, kind: Kind) void {
+        if (!RoundLaps.enabled()) return;
+        mark(.done);
+        if (kind == .verify) {
+            at[@intFromEnum(Mark.handed)] = RoundLaps.at[@intFromEnum(RoundLaps.Mark.handed)];
+            at[@intFromEnum(Mark.built)] = RoundLaps.at[@intFromEnum(RoundLaps.Mark.layers)];
+        } else at[@intFromEnum(Mark.handed)] = at[@intFromEnum(Mark.built)];
+        const k = @intFromEnum(kind);
+        sum[k][0] += RoundLaps.since(last, at[0]);
+        for (1..n) |j| sum[k][j] += RoundLaps.since(at[j - 1], at[j]);
+        last = at[@intFromEnum(Mark.done)];
+        count[k] += 1;
+        if (count[@intFromEnum(Kind.verify)] < RoundLaps.every) return;
+        report(m);
+    }
+
+    fn report(m: *const Dsv41Model) void {
+        const d: u64 = @max(count[0], 1);
+        const v: u64 = @max(count[1], 1);
+        log.info("[worker-laps] rank {d}: {d} drafts, {d} verifies; us a draft: bell wait {d} follow {d} build {d} run {d} | a verify: bell wait {d} follow {d} to first hand-off {d} rest of build {d} run {d}\n", .{
+            if (m.tp) |t| t.rank else 0, count[0], count[1],
+            sum[0][0] / d, sum[0][1] / d, sum[0][3] / d, sum[0][4] / d,
+            sum[1][0] / v, sum[1][1] / v, sum[1][2] / v, sum[1][3] / v, sum[1][4] / v,
+        });
+        sum = @splat(@splat(0));
+        count = @splat(0);
+    }
+};
+
 pub const Laps = struct {
     pub var every: u32 = 64;
     const Phase = enum { lead, readback, hash, prefetch, first, build, submit };
@@ -5854,8 +5896,11 @@ pub fn tpWorkerBatch(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, ge
 /// step behind it rewinds to the snapshot, `snap` takes one after it, and a `verify` chunk rolls back to where the next
 /// step starts.
 pub fn tpWorkerStep(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, gen: u64, ids: []const u32, p0: usize, snap: bool, want: Want, verify: bool, images: ?A) !void {
+    WorkerLaps.mark(.wake);
     try tpActivate(m, parked, gen);
     try followVerify(m, p0);
+    WorkerLaps.mark(.followed);
+    defer if (verify) WorkerLaps.end(m, .verify);
     if (p0 == 0 or m.dec_state == null) {
         if (m.dec_state) |*old| old.deinit();
         m.dec_state = null;
@@ -7310,6 +7355,7 @@ pub fn tpWorkerVerifyPipe(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parke
 /// 0 kept its open verify; the draft's sums and gathers meet rank 0's and its drafts are dropped.
 pub fn tpWorkerDraft(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, gens: []const u64, p0s: []const usize, t1s: []const u32) !void {
     if (!m.draft_shard or gens.len == 0 or gens.len > region_rows) return error.DistPeerDiverged;
+    WorkerLaps.mark(.wake);
     var states: [region_rows]*State = undefined;
     for (gens, p0s, states[0..gens.len]) |g, p0, *o| {
         const st = try tpStateOf(m, parked, g);
@@ -7317,10 +7363,13 @@ pub fn tpWorkerDraft(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, ge
         if (st.n != p0) return error.DistPeerDiverged;
         o.* = st;
     }
+    WorkerLaps.mark(.followed);
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
     const g = try draftGraph(&sc, m, gpa, states[0..gens.len], t1s, false);
+    WorkerLaps.mark(.built);
     try evalAll(&.{g.ids});
+    WorkerLaps.end(m, .draft);
     m.tp_drafted = if (gens.len == 1) try workerDrafted(m, g.ids, gens[0], p0s[0], t1s[0]) else null;
 }
 
