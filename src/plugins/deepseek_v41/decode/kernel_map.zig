@@ -425,7 +425,7 @@ const whole_ratio = 1.15;
 
 pub const wts_rel_tol = 1e-6;
 
-const LayerStat = struct { layers: usize = 0, engaged: usize = 0, total: usize = 0, ndiff: usize = 0, nonfinite: usize = 0, route_rows: usize = 0, route_bad: usize = 0, wts_rel: f64 = 0, num: f64 = 0, den: f64 = 0, worst: f64 = 0, declined: ?[]const u8 = null };
+const LayerStat = struct { layers: usize = 0, engaged: usize = 0, total: usize = 0, ndiff: usize = 0, nonfinite: usize = 0, route_rows: usize = 0, route_bad: usize = 0, wts_rel: f64 = 0, num: f64 = 0, den: f64 = 0, worst: f64 = 0, rep_stock: usize = 0, rep_arm: usize = 0, declined: ?[]const u8 = null };
 
 fn dup(sc: *dsv41.Scope, a: A) !A {
     return sc.keep(sc.out(a));
@@ -461,6 +461,40 @@ fn wtsRelWorst(idx_a: []const f32, idx_b: []const f32, wts_a: []const f32, wts_b
     return worst;
 }
 
+fn bf16Ulps(a: f32, b: f32) u32 {
+    const ka: i32 = @intCast(@as(u32, @bitCast(a)) >> 16);
+    const kb: i32 = @intCast(@as(u32, @bitCast(b)) >> 16);
+    const oa = if (ka & 0x8000 != 0) 0x8000 - ka else ka;
+    const ob = if (kb & 0x8000 != 0) 0x8000 - kb else kb;
+    return @abs(oa - ob);
+}
+
+fn printUlpGap(a: []const f32, b: []const f32) void {
+    var n: usize = 0;
+    var worst: u32 = 0;
+    var one: usize = 0;
+    for (a, b) |u, v| {
+        const k = bf16Ulps(u, v);
+        if (k == 0) continue;
+        n += 1;
+        if (k == 1) one += 1;
+        worst = @max(worst, k);
+    }
+    std.debug.print("[kmap] route flip: h2 elements differing {d} of {d} ({d} by one bf16 ulp), worst {d} ulp\n", .{ n, a.len, one, worst });
+}
+
+fn countDiff(sc: *dsv41.Scope, a: A, b: A) !usize {
+    const af = try sc.astype(a, .float32);
+    const bf = try sc.astype(b, .float32);
+    try dsv41.evalAll(&.{ af, bf });
+    const n = mlx.mlx_array_size(af);
+    var k: usize = 0;
+    for (mlx.mlx_array_data_float32(af).?[0..n], mlx.mlx_array_data_float32(bf).?[0..n]) |u, v| {
+        if (@as(u32, @bitCast(u)) != @as(u32, @bitCast(v))) k += 1;
+    }
+    return k;
+}
+
 fn dumpRouteGap(gpa: std.mem.Allocator, ly: *const dsv41.Layer, li: usize, h_stock: []const f32, h_fused: []const f32, idx_a: []const f32, idx_b: []const f32, wts_a: []const f32, wts_b: []const f32, rows: usize) !void {
     const gate = try dsv41.hostF32(ly.gate_w);
     defer gpa.free(gate);
@@ -480,6 +514,7 @@ fn dumpRouteGap(gpa: std.mem.Allocator, ly: *const dsv41.Layer, li: usize, h_sto
         std.debug.print("[kmap] route flip layer {d} row {d}: stock picks {any} fused picks {any}; stock weights {any} fused weights {any}\n", .{ li, r, idx_a[lo..][0..topk], idx_b[lo..][0..topk], wts_a[lo..][0..topk], wts_b[lo..][0..topk] });
         const same_h = std.mem.eql(f32, h_stock[r * d ..][0..d], h_fused[r * d ..][0..d]);
         std.debug.print("[kmap] route flip: h2 of the two paths {s}\n", .{if (same_h) "identical" else "differ"});
+        printUlpGap(h_stock[r * d ..][0..d], h_fused[r * d ..][0..d]);
         for ([_][]const f32{ h_stock, h_fused }, [_][]const u8{ "stock h2", "fused h2" }) |h, name| {
             for (0..e) |x| {
                 var z: f64 = 0;
@@ -552,6 +587,11 @@ fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize,
         const bad = routeRowsBad(idx_a, idx_b, wts_a, wts_b, rows, k / rows);
         if (bad != 0) try dumpRouteGap(gpa, &m.layers[li], li, mlx.mlx_array_data_float32(ha).?[0..mlx.mlx_array_size(ha)], mlx.mlx_array_data_float32(hb).?[0..mlx.mlx_array_size(hb)], idx_a, idx_b, wts_a, wts_b, rows);
         st.route_bad += bad;
+        var pre_c = x;
+        setUnder(m, .{ .level = .off });
+        st.rep_stock += try countDiff(&sc, ya, try dsv41.tpFfn(&sc, m, li, x, ao, &sa, &pre_c));
+        setUnder(m, under);
+        st.rep_arm += try countDiff(&sc, yb, try dsv41.tpFfn(&sc, m, li, x, ao, &sa, &pre_c));
         st.wts_rel = @max(st.wts_rel, wtsRelWorst(idx_a, idx_b, wts_a, wts_b, rows, k / rows));
         st.route_rows += rows;
         st.total += n;
@@ -620,6 +660,7 @@ pub fn segCheck(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usi
     }
     const whole = try wholeStep(gpa, fx, lo, hi, under);
     const rms = @sqrt(st.num / @max(st.den, 1e-30));
+    std.debug.print("[kmap] {s} self-repeat on the same inputs: stock {d}, {s} {d} of {d} values differ\n", .{ name, st.rep_stock, name, st.rep_arm, st.total });
     std.debug.print("[kmap] {s} vs stock: {d} layers ({d} on the segment path), {d} of {d} stream values differ ({d} non-finite), rel rms {e:.3}, max abs {e:.3}, route rows differing {d} of {d} (largest weight difference {e:.2}); whole step from the f32 model (median of {d} seeds): stock {e:.3}, {s} {e:.3}\n", .{ name, st.layers, st.engaged, st.ndiff, st.total, st.nonfinite, rms, st.worst, st.route_bad, st.route_rows, st.wts_rel, whole_seeds, whole.stock, name, whole.arm });
     const why: ?[]const u8 = if (st.layers == 0)
         "no layer captured"
@@ -728,6 +769,7 @@ fn phase(gpa: std.mem.Allocator, fx: *fixture.Fixture, rows: usize, steps: usize
         applyArm(fx, .{});
         const pair = fx.m.pair.?;
         for (a.arms[0..a.n]) |arm| if (arm.mode == .seg) segCheck(gpa, fx, pair.lo, pair.hi, arm.under) catch |e| {
+            if (e == error.SegCheckFailed and std.c.getenv("DSV41_KMAP_CHECK_GO") != null) continue;
             if (e != error.SegCheckSkipped) return e;
         };
         printArms(a, rows, us[0 .. steps - steps % a.n]);
