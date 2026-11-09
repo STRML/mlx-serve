@@ -1120,22 +1120,23 @@ const Group = struct {
 /// What rank 0 hands the other ranks in order (its `tp_step` and `tp_pipe` hooks), for them to replay, and the state
 /// they last stepped as distributed.zig keeps it (`TpLive`).
 const Ops = struct {
-    const Step = struct { ids: []u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64 };
+    const Step = struct { ids: []u32, p0: usize, snap: bool, all: bool, verify: dsv41.VerifyOpts, gen: u64 };
+    const VerifyPipe = struct { rows: usize, flags: u8 };
     const Draft = struct { gen: u64, p0: usize, t1: u32 };
     const DraftPipe = struct { keep: usize, t1: u32 };
-    const Op = union(enum) { step: Step, pipe, draft: Draft, draft_pipe: DraftPipe, verify_pipe: usize };
+    const Op = union(enum) { step: Step, pipe, draft: Draft, draft_pipe: DraftPipe, verify_pipe: VerifyPipe };
     const Spec = union(enum) { verify: struct { gen: u64, n0: usize, end: usize }, drafted: struct { gen: u64, n: usize } };
     var list: std.ArrayList(Op) = .empty;
     var live: ?struct { gen: u64, n: usize } = null;
     var spec: ?Spec = null;
 
-    fn step(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?A) anyerror!void {
+    fn step(ids: []const u32, p0: usize, snap: bool, all: bool, verify: dsv41.VerifyOpts, gen: u64, images: ?A) anyerror!void {
         if (images != null) return error.TestUnexpectedResult;
         const own = try std.testing.allocator.dupe(u32, ids);
         errdefer std.testing.allocator.free(own);
         try list.append(std.testing.allocator, .{ .step = .{ .ids = own, .p0 = p0, .snap = snap, .all = all, .verify = verify, .gen = gen } });
-        live = if (verify) null else .{ .gen = gen, .n = p0 + ids.len };
-        spec = if (verify) .{ .verify = .{ .gen = gen, .n0 = p0, .end = p0 + ids.len } } else null;
+        live = if (verify.open) null else .{ .gen = gen, .n = p0 + ids.len };
+        spec = if (verify.open) .{ .verify = .{ .gen = gen, .n0 = p0, .end = p0 + ids.len } } else null;
     }
 
     fn pipe(gen: u64, n: usize) anyerror!bool {
@@ -1162,10 +1163,10 @@ const Ops = struct {
         return true;
     }
 
-    fn verifyPipe(gen: u64, n: usize, rows: usize) anyerror!bool {
+    fn verifyPipe(gen: u64, n: usize, rows: usize, flags: u8) anyerror!bool {
         const s = spec orelse return false;
         if (s != .drafted or s.drafted.gen != gen or s.drafted.n != n) return false;
-        try list.append(std.testing.allocator, .{ .verify_pipe = rows });
+        try list.append(std.testing.allocator, .{ .verify_pipe = .{ .rows = rows, .flags = flags } });
         spec = .{ .verify = .{ .gen = gen, .n0 = n, .end = n + rows } };
         return true;
     }
@@ -1260,7 +1261,7 @@ fn followDecode(m: *dsv41.Dsv41Model) !void {
         .pipe => try dsv41.tpWorkerPipe(m, gpa),
         .draft => |d| try dsv41.tpWorkerDraft(m, gpa, &parked, &.{d.gen}, &.{d.p0}, &.{d.t1}),
         .draft_pipe => |d| try dsv41.tpWorkerDraftPipe(m, gpa, &parked, d.keep, d.t1),
-        .verify_pipe => |rows| try dsv41.tpWorkerVerifyPipe(m, gpa, &parked, rows),
+        .verify_pipe => |v| try dsv41.tpWorkerVerifyPipe(m, gpa, &parked, v.rows, v.flags),
     };
 }
 
@@ -1679,6 +1680,30 @@ test "dsv41 engram lead: four ranks with Engram run DSpark rounds with each veri
     try std.testing.expectEqualSlices(usize, after.kept, before.kept);
     try std.testing.expectEqual(after.n, before.n);
     try expectSameF32s(after.state, before.state);
+}
+
+test "dsv41 dspark commit all: four ranks commit every verify row as the kept rows when a round keeps them all, and follow rank 0's choice on the bells and in headers" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var ranks: [4]*Fixture = undefined;
+    try dsparkRanks(gpa, &ranks);
+    defer for (ranks) |r| r.deinit();
+    defer _ = unsetenv("DSV41_DSPARK_COMMIT_ALL");
+    const prompt = [_]u32{ 11, 400, 7, 901, 55, 3, 18 };
+    const all = [_]Round{ .{ .drafts = 5, .keep = .all }, .{ .drafts = 3, .keep = .all }, .{ .drafts = 0, .keep = .all }, .{ .drafts = 4, .keep = .all } };
+    _ = setenv("DSV41_DSPARK_COMMIT_ALL", "0", 1);
+    const kept = try dsparkGroup(&ranks, &prompt, &all, true);
+    defer kept.deinit(gpa);
+    _ = setenv("DSV41_DSPARK_COMMIT_ALL", "1", 1);
+    const every = try dsparkGroup(&ranks, &prompt, &all, true);
+    defer every.deinit(gpa);
+    try std.testing.expectEqualSlices(u32, kept.tokens, every.tokens);
+    try std.testing.expectEqual(kept.n, every.n);
+    try expectSameF32s(kept.state, every.state);
+    for ([_]bool{ false, true }) |pipes| {
+        const r = try dsparkGroup(&ranks, &prompt, &pipe_script, pipes);
+        r.deinit(gpa);
+    }
 }
 
 fn dsparkRounds(m: *dsv41.Dsv41Model, prompt: []const u32, script: []const Round) !i64 {

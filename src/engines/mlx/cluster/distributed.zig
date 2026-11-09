@@ -378,9 +378,9 @@ const Bell = struct {
     }
 
     fn verifyMsg(b: Bell) !Msg {
-        var p: [1]u8 = undefined;
+        var p: [2]u8 = undefined;
         try b.readAll(&p);
-        return .{ OP_DSV41_TP_VERIFY_PIPE, p[0], 0, 0, 0, 0, 0, 0 };
+        return .{ OP_DSV41_TP_VERIFY_PIPE, p[0], p[1], 0, 0, 0, 0, 0 };
     }
 
     /// The byte rank 0 rang (`msg_byte` without a bell: a message follows on the link).
@@ -505,8 +505,8 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC = wire.MAGIC;
-/// 9: a DeepSeek-V4.1 tensor DSpark draft and verify can come on the bell, their few values after the byte.
-const VERSION: i32 = 9;
+/// 10: a DeepSeek-V4.1 tensor verify carries its options (commit every row, chain the draft) in the header and the bell.
+const VERSION: i32 = 10;
 pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
 pub const OP_STOP = wire.OP_STOP;
@@ -1325,7 +1325,8 @@ fn noteTpStep(p0: usize, rows: usize) void {
 }
 
 /// Host, DeepSeek-V4.1 tensor: one step's ids to the worker, which runs the same forward on its halves.
-fn dsv41TpStep(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?mlx.mlx_array) anyerror!void {
+fn dsv41TpStep(ids: []const u32, p0: usize, snap: bool, all: bool, vo: dsv41_mod.VerifyOpts, gen: u64, images: ?mlx.mlx_array) anyerror!void {
+    const verify = vo.open;
     const self = peer() orelse return error.DistWorkerNotJoined;
     if (!self.ready) try self.awaitReady();
     noteTpStep(p0, ids.len);
@@ -1333,7 +1334,7 @@ fn dsv41TpStep(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool,
     const a = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
     self.exchanges += 1;
-    const flags = @as(i32, @intFromBool(snap)) | @as(i32, @intFromBool(all)) << 1 | @as(i32, @intFromBool(verify)) << 2 | @as(i32, @intFromBool(images != null)) << 3;
+    const flags = @as(i32, @intFromBool(snap)) | @as(i32, @intFromBool(all)) << 1 | @as(i32, @intFromBool(verify)) << 2 | @as(i32, @intFromBool(images != null)) << 3 | @as(i32, vo.bits()) << 4;
     // Sent now, on the CPU stream alone: `sendOrdered` chains its sends through the GPU stream, and a GPU wait on a send
     // that blocks until the worker's receive deadlocked MLX's fast fences. Each worker gets its whole step before the
     // next, and all of them before this rank builds the step's first sum: a worker blocks only in a sum, which needs
@@ -1383,13 +1384,13 @@ fn dsv41TpDraftPipe(gen: u64, p0: usize, t1: u32) anyerror!bool {
     return true;
 }
 
-fn dsv41TpVerifyPipe(gen: u64, n: usize, rows: usize) anyerror!bool {
+fn dsv41TpVerifyPipe(gen: u64, n: usize, rows: usize, flags: u8) anyerror!bool {
     const self = peer() orelse return error.DistWorkerNotJoined;
     const c = cluster();
     if (!TpSpec.follows(c.tp_spec, gen, n, rows)) return false;
     noteTpStep(n, rows);
     self.exchanges += 1;
-    const bytes = [_]u8{ Bell.verify_byte, @intCast(rows) };
+    const bytes = [_]u8{ Bell.verify_byte, @intCast(rows), flags };
     for (1..self.link.size) |k| try self.link.bells[k].say(&bytes);
     c.tp_spec = TpSpec.afterStep(gen, n, rows, true);
     return true;
@@ -1606,7 +1607,7 @@ test "dsv41 dspark pipe: a worker reads a draft's kept count and first token, an
     var draft: [6]u8 = .{ Bell.draft_byte, 3, 0, 0, 0, 0 };
     std.mem.writeInt(u32, draft[2..6], 129279, .little);
     try host.say(&draft);
-    try host.say(&.{ Bell.verify_byte, 6 });
+    try host.say(&.{ Bell.verify_byte, 6, 3 });
     try host.pipe();
     const a = try recvMsg(&link, 0);
     try std.testing.expectEqual(OP_DSV41_TP_DRAFT_PIPE, a[0]);
@@ -1615,6 +1616,7 @@ test "dsv41 dspark pipe: a worker reads a draft's kept count and first token, an
     const b = try recvMsg(&link, 0);
     try std.testing.expectEqual(OP_DSV41_TP_VERIFY_PIPE, b[0]);
     try std.testing.expectEqual(@as(i32, 6), b[1]);
+    try std.testing.expectEqual(@as(i32, 3), b[2]);
     try std.testing.expectEqual(OP_DSV41_TP_PIPE, (try recvMsg(&link, 0))[0]);
 }
 
@@ -1753,7 +1755,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                 };
                 if (msg[4] & 8 != 0) images = try queuedRecv(link, &.{ @intCast(m.imageRows(ids)), @intCast(m.cfg.hidden_size) }, m.act, 0);
                 noteTpStep(p0, L);
-                try dsv41_mod.tpWorkerStep(m, allocator, &parked, joined(msg[6], msg[7]), ids, p0, msg[4] & 1 != 0, if (msg[4] & 2 != 0) .all else .last, msg[4] & 4 != 0, if (images.ctx != null) images else null);
+                try dsv41_mod.tpWorkerStep(m, allocator, &parked, joined(msg[6], msg[7]), ids, p0, msg[4] & 1 != 0, if (msg[4] & 2 != 0) .all else .last, dsv41_mod.VerifyOpts.fromBits(msg[4] & 4 != 0, @intCast((msg[4] >> 4) & 0xff)), if (images.ctx != null) images else null);
                 steps += 1;
             },
             OP_DSV41_TP_PIPE => {
@@ -1768,7 +1770,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
             OP_DSV41_TP_VERIFY_PIPE => {
                 const rows: usize = @intCast(msg[1]);
                 noteTpStep(if (m.dec_state) |st| st.n else 0, rows);
-                try dsv41_mod.tpWorkerVerifyPipe(m, allocator, &parked, rows);
+                try dsv41_mod.tpWorkerVerifyPipe(m, allocator, &parked, rows, @intCast(msg[2] & 0xff));
                 steps += 1;
             },
             OP_DSV41_TP_BATCH => {

@@ -1672,7 +1672,7 @@ const ClusterHooksState = struct {
     /// Tensor parallel, rank 0: one step's ids at `p0` to the other ranks before its forward is built; `snap`: the
     /// step ends at the armed snapshot; `all`: every row's logits; `images`: the rows its image positions take
     /// (`chunkImageRows`, evaluated). Set by distributed.zig.
-    tp_step: ?*const fn (ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?A) anyerror!void = null,
+    tp_step: ?*const fn (ids: []const u32, p0: usize, snap: bool, all: bool, verify: VerifyOpts, gen: u64, images: ?A) anyerror!void = null,
     /// Tensor parallel, rank 0: true once the other ranks will run one more decode step on the state `gen` they last
     /// stepped, standing at `n`, its token rank 0's gathered on the GPU (`tpToken`); false when they cannot follow it
     /// and the step goes with its id (`tp_step`). Set by distributed.zig when every worker has a bell (`DSV41_TP_PIPE`).
@@ -1680,7 +1680,7 @@ const ClusterHooksState = struct {
     /// Tensor parallel, rank 0, a sharded draft: the states `gens` at `p0s[k]` draft from `t1s[k]`.
     tp_draft: ?*const fn (gens: []const u64, p0s: []const usize, t1s: []const u32) anyerror!void = null,
     tp_draft_pipe: ?*const fn (gen: u64, p0: usize, t1: u32) anyerror!bool = null,
-    tp_verify_pipe: ?*const fn (gen: u64, n: usize, rows: usize) anyerror!bool = null,
+    tp_verify_pipe: ?*const fn (gen: u64, n: usize, rows: usize, flags: u8) anyerror!bool = null,
     /// Tensor parallel, rank 0: one batched step over the states `gens`, each from `p0s[k]` with `chunks[k]`.
     tp_batch: ?*const fn (gens: []const u64, p0s: []const usize, chunks: []const []const u32, verify: bool) anyerror!void = null,
     /// Tensor parallel, rank 0: the state `gen` is gone.
@@ -2340,6 +2340,29 @@ pub const Verify = struct {
     pend_kv: []A,
     pend_gate: []A,
     mh: A = none,
+    commit_all: bool = false,
+    chain: bool = false,
+    committed: bool = false,
+};
+
+pub const VerifyOpts = struct {
+    open: bool = false,
+    commit_all: bool = false,
+    chain: bool = false,
+
+    pub fn bits(o: VerifyOpts) u8 {
+        return @as(u8, @intFromBool(o.commit_all)) | @as(u8, @intFromBool(o.chain)) << 1;
+    }
+
+    pub fn fromBits(open: bool, b: u8) VerifyOpts {
+        return .{ .open = open, .commit_all = b & 1 != 0, .chain = b & 2 != 0 };
+    }
+
+    fn of(st: *const State, p0: usize) VerifyOpts {
+        const v = st.verify orelse return .{};
+        if (v.n0 != p0) return .{};
+        return .{ .open = true, .commit_all = v.commit_all, .chain = v.chain };
+    }
 };
 
 pub const State = struct {
@@ -5086,20 +5109,20 @@ fn tpLead(m: *Dsv41Model, st: *const State, ids: []const u32, want: Want, img_ro
     if (m.dec_state == null or st != &m.dec_state.?) return error.Dsv41TpStateNotLive;
     const p0 = st.n;
     const snap = if (st.snap_at) |at| at == p0 + ids.len else false;
-    const verify = if (st.verify) |v| v.n0 == p0 else false;
+    const vo = VerifyOpts.of(st, p0);
     const bare = img_rows.ctx == null and !snap and want == .all;
     defer RoundLaps.mark(.rung);
-    if (bare and verify and try tpVerifyPiped(m, p0, ids)) return RoundLaps.pipedVerify();
+    if (bare and vo.open and try tpVerifyPiped(m, p0, ids, vo.bits())) return RoundLaps.pipedVerify();
     // An image's rows exist on this rank only: they ride with the step.
     if (img_rows.ctx != null) try evalAll(&.{img_rows});
-    try step(ids, p0, snap, want == .all, verify, m.state_gen, if (img_rows.ctx != null) img_rows else null);
+    try step(ids, p0, snap, want == .all, vo, m.state_gen, if (img_rows.ctx != null) img_rows else null);
 }
 
-fn tpVerifyPiped(m: *const Dsv41Model, p0: usize, ids: []const u32) !bool {
+fn tpVerifyPiped(m: *const Dsv41Model, p0: usize, ids: []const u32, flags: u8) !bool {
     const pipe = clusterHooks().tp_verify_pipe orelse return false;
     const d = m.tp_drafted orelse return false;
     if (!d.covers(m.state_gen, p0, ids)) return false;
-    return pipe(m.state_gen, p0, ids.len);
+    return pipe(m.state_gen, p0, ids.len, flags);
 }
 
 pub const Drafted = struct {
@@ -6027,19 +6050,19 @@ pub fn tpWorkerBatch(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, ge
 /// rank's slices. The state follows rank 0's as a pair worker's does (`workerStep`): a step at 0 starts a new one, a
 /// step behind it rewinds to the snapshot, `snap` takes one after it, and a `verify` chunk rolls back to where the next
 /// step starts.
-pub fn tpWorkerStep(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, gen: u64, ids: []const u32, p0: usize, snap: bool, want: Want, verify: bool, images: ?A) !void {
+pub fn tpWorkerStep(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, gen: u64, ids: []const u32, p0: usize, snap: bool, want: Want, verify: VerifyOpts, images: ?A) !void {
     WorkerLaps.mark(.wake);
     try tpActivate(m, parked, gen);
     try followVerify(m, p0);
     WorkerLaps.mark(.followed);
-    defer if (verify) WorkerLaps.end(m, .verify);
+    defer if (verify.open) WorkerLaps.end(m, .verify);
     if (p0 == 0 or m.dec_state == null) {
         if (m.dec_state) |*old| old.deinit();
         m.dec_state = null;
         m.dec_state = try initState(m, gpa);
     } else if (p0 != m.dec_state.?.n and !try restoreAt(m, p0)) return error.DistPeerDiverged;
     const st = &m.dec_state.?;
-    if (verify) try armVerify(st, m.n_layers);
+    if (verify.open) try armVerifyAs(st, m.n_layers, verify);
     const out = try extendIds(m, gpa, st, .{ .host = ids }, want, if (images) |r| .{ .rows = r, .offset = 0 } else null);
     _ = mlx.mlx_array_free(out);
     if (snap) {
@@ -7477,10 +7500,10 @@ pub fn tpWorkerDraftPipe(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked
     return tpWorkerDraft(m, gpa, parked, &.{m.state_gen}, &.{v.n0 + keep}, &.{t1});
 }
 
-pub fn tpWorkerVerifyPipe(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, rows: usize) !void {
+pub fn tpWorkerVerifyPipe(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, rows: usize, flags: u8) !void {
     const d = m.tp_drafted orelse return error.DistPeerDiverged;
     if (rows == 0 or rows > d.len) return error.DistPeerDiverged;
-    return tpWorkerStep(m, gpa, parked, d.gen, d.ids[0..rows], d.n, false, .all, true, null);
+    return tpWorkerStep(m, gpa, parked, d.gen, d.ids[0..rows], d.n, false, .all, VerifyOpts.fromBits(true, flags), null);
 }
 
 /// Tensor-parallel rank past 0: rank 0's sharded draft over its states `gens`, each first brought to `p0s[k]` as rank
@@ -7851,7 +7874,7 @@ pub fn dsparkBeginWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u
     const b = d.len;
     if (b > VERIFY_MAX_DRAFTS) return error.TooManyDrafts;
     RoundLaps.mark(.verify);
-    try armVerify(st, m.n_layers);
+    try armVerifyAs(st, m.n_layers, .{ .open = true, .commit_all = commitAllOn(m) });
     var ids: [16]u32 = undefined;
     ids[0] = t1;
     @memcpy(ids[1 .. b + 1], d.ids[1 .. b + 1]);
@@ -7861,6 +7884,16 @@ pub fn dsparkBeginWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u
         return e;
     };
     return .{ .vl_g = vl, .b = b, .verify = ids, .verify_at = t0 };
+}
+
+fn armVerifyAs(st: *State, nl: usize, o: VerifyOpts) !void {
+    try armVerify(st, nl);
+    st.verify.?.commit_all = o.commit_all;
+    st.verify.?.chain = o.chain;
+}
+
+fn commitAllOn(m: *const Dsv41Model) bool {
+    return m.n_mtp > 0 and env.on(.DSV41_DSPARK_COMMIT_ALL);
 }
 
 /// The rollback anchors a verify chunk restores to.
@@ -7938,7 +7971,16 @@ pub fn finishVerify(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, keep_n: 
     defer st.dropVerify();
     const v = &st.verify.?;
     if (v.n0 + keep_n < st.n) try rollbackVerify(m, st, keep_n);
-    if (v.mh.ctx != null and keep_n > 0) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep_n), v.n0);
+    if (v.mh.ctx == null or keep_n == 0) return;
+    if (v.committed) return keepMainRow(&sc, st, v.mh, keep_n);
+    if (!v.commit_all) return commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep_n), v.n0);
+    try commitMain(&sc, m, st, v.mh, v.n0);
+    try keepMainRow(&sc, st, v.mh, keep_n);
+}
+
+fn keepMainRow(sc: *Scope, st: *State, mh: A, keep_n: usize) !void {
+    if (st.mh.ctx != null) _ = mlx.mlx_array_free(st.mh);
+    st.mh = sc.out(try sc.slice(mh, 0, keep_n - 1, keep_n));
 }
 
 pub fn dsparkObserve(m: *Dsv41Model, ph: DsparkPhases) void {
