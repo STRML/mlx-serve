@@ -4502,8 +4502,10 @@ pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
 /// `x` summed over the tensor-parallel ranks (itself unsplit), in `m.act`: f32 at decode width, so the sum rounds once.
 /// `DSV41_TP_SUM`: `auto` (default) keeps a pair's rule and sums past a pair in the activation dtype (JACCL
 /// accumulates in f32 and rounds once; +5-6% decode at TP4, KLD unchanged); `bf16` does so at any size, `f32` sums
-/// wider past a pair as before, `off` skips the sums (wrong output, timing only).
-const TpSumMode = enum { auto, bf16, off, f32 };
+/// wider past a pair as before, `off` skips the sums (wrong output, timing only), `gather` gathers every rank's part and
+/// adds them in rank order in f32 on the GPU (JACCL's reduce-scatter, which a sum over 32 KiB past a pair takes, adds
+/// parts in arrival order, so its bits vary run to run).
+const TpSumMode = enum { auto, bf16, off, f32, gather };
 var tp_sum_mode: ?TpSumMode = null;
 fn tpSumMode() TpSumMode {
     if (tp_sum_mode) |v| return v;
@@ -4517,6 +4519,7 @@ pub fn tpSum(sc: *Scope, m: *const Dsv41Model, x: A) !A {
     if (m.tp == null) return sc.astype(x, m.act);
     const mode = tpSumMode();
     if (mode == .off) return sc.astype(x, m.act);
+    if (mode == .gather) return gatherSum(sc, m, x);
     const sum = clusterHooks().tp_sum orelse return error.DsvTpNotJoined;
     // Two ranks' bf16 parts sum as they are: one rounding of their f32 sum, as the cast back makes (JACCL rounds on the
     // CPU, so a tie can land apart). A wider part sums wider at decode width.
@@ -4528,6 +4531,15 @@ pub fn tpSum(sc: *Scope, m: *const Dsv41Model, x: A) !A {
     };
     const part = if (as_is or dim(x, 0) > region_rows) try sc.astype(x, m.act) else try sc.astype(x, .float32);
     return sc.astype(try sc.keep(try sum(part)), m.act);
+}
+
+fn gatherSum(sc: *Scope, m: *const Dsv41Model, x: A) !A {
+    const gather = clusterHooks().tp_gather orelse return error.DsvTpNotJoined;
+    const R = dim(x, 0);
+    const all = try sc.keep(try gather(try sc.astype(x, m.act)));
+    var acc = try sc.astype(try sc.slice(all, 0, 0, R), .float32);
+    for (1..m.tp.?.size) |k| acc = try sc.add(acc, try sc.astype(try sc.slice(all, 0, k * R, (k + 1) * R), .float32));
+    return sc.astype(acc, m.act);
 }
 
 /// The routed and shared experts this process holds over routed rows: the whole MoE, or one rank's slice of it. f32
@@ -7674,6 +7686,97 @@ test "dsv41 streamed phase: a call wider than a decode-phase call's routed ids r
     try testing.expect(promptPhase(12, 6, 48));
     try testing.expect(promptPhase(region_rows + 1, 1, 4096));
     try testing.expect(!promptPhase(region_rows, 1, 4096));
+}
+
+const ArrivalLink = struct {
+    var parts: [4]A = undefined;
+    var rank: usize = 0;
+    var order: [4]usize = .{ 0, 1, 2, 3 };
+
+    fn sum(_: A) anyerror!A {
+        var acc = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&acc, parts[rank]);
+        for (order) |r| {
+            if (r == rank) continue;
+            var next = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&next, acc, parts[r], mlx.gpuStream()));
+            _ = mlx.mlx_array_free(acc);
+            acc = next;
+        }
+        return acc;
+    }
+
+    fn gather(x: A) anyerror!A {
+        var xs = parts;
+        xs[rank] = x;
+        const v = mlx.mlx_vector_array_new_data(&xs, xs.len);
+        defer _ = mlx.mlx_vector_array_free(v);
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&o, v, 0, mlx.gpuStream()));
+        return o;
+    }
+};
+
+fn arrivalSum(m: *const Dsv41Model, mode: TpSumMode, rank: usize, order: [4]usize) ![]f32 {
+    const saved = tp_sum_mode;
+    defer tp_sum_mode = saved;
+    tp_sum_mode = mode;
+    ArrivalLink.rank = rank;
+    ArrivalLink.order = order;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    return hostF32(try tpSum(&sc, m, ArrivalLink.parts[rank]));
+}
+
+test "dsv41 tp sum gather: four ranks' parts arriving in any order sum to the same bits on every rank, within bf16 rounding of a rank-order sum" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const D = 8;
+    var host: [4][2 * D]f32 = undefined;
+    for (&host, 0..) |*p, r| for (p, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt((r * 37 + i * 11) % 23)) / 8.0 - 1.4;
+    };
+    for ([_]f32{ 1, 0x1p-8, 0x1p-8, -1 }, &host) |v, *p| p[0] = v;
+    for (&ArrivalLink.parts, &host) |*a, *p| {
+        const f = mlx.mlx_array_new_data(p, &[_]c_int{ 2, D }, 2, .float32);
+        defer _ = mlx.mlx_array_free(f);
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(a, f, .bfloat16, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_array_eval(a.*));
+    }
+    defer for (ArrivalLink.parts) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const hooks = clusterHooks();
+    hooks.tp_sum = &ArrivalLink.sum;
+    hooks.tp_gather = &ArrivalLink.gather;
+    defer {
+        hooks.tp_sum = null;
+        hooks.tp_gather = null;
+    }
+    var m: Dsv41Model = undefined;
+    m.tp = .{ .rank = 0, .size = 4 };
+    m.act = .bfloat16;
+    const in_rank = [4]usize{ 0, 1, 2, 3 };
+    const late = [4]usize{ 0, 3, 1, 2 };
+    const a = try arrivalSum(&m, .auto, 0, in_rank);
+    defer gpa.free(a);
+    const b = try arrivalSum(&m, .auto, 0, late);
+    defer gpa.free(b);
+    try testing.expect(a[0] != b[0]);
+    const want = try arrivalSum(&m, .gather, 0, in_rank);
+    defer gpa.free(want);
+    try testing.expectEqual(@as(f32, 0x1p-7), want[0]);
+    for (0..4) |rank| for ([_][4]usize{ in_rank, late, .{ 3, 2, 1, 0 } }) |order| {
+        const got = try arrivalSum(&m, .gather, rank, order);
+        defer gpa.free(got);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+    };
+    for (want, a, 0..) |g, t, i| {
+        var mag: f32 = 0;
+        for (host) |p| mag += @abs(p[i]);
+        try testing.expect(@abs(g - t) <= 3 * 0x1p-8 * mag);
+    }
 }
 
 test "dsv41 verify picks: a layer's (row, expert) picks count each expert once however many rows pick it" {
