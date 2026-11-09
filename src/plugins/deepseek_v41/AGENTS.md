@@ -31,9 +31,6 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built on
   every GPU (NAX too); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the
   expert-pruned packs are 2-bit g128). Otherwise `routed` runs. `DSV41_MOE_BW=0` keeps the first launches (bit-equal).
-  `DSV41_MOE_ROWGROUP=1` (off) reads an expert several of a 2-6-row call's rows picked once: gate/up in one launch whose
-  first slot per expert runs every such row, down as per-(row, slot) f32 partials in fixed places plus a combine in the
-  slot order; each row's bytes are the BW launches' (moe_fp4.zig's ROWGROUP test). No float atomics.
   Its ubench times both arms at the per-rank widths 2304 / 1152 / 576 against a streaming read.
 - A MoE ubench routes scattered experts and cycles 80+ weight sets: consecutive expert ids read far slower on M5 Max
   than a router's picks, and one reused set reads from the cache.
