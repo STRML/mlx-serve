@@ -5074,7 +5074,8 @@ fn tpLead(m: *Dsv41Model, st: *const State, ids: []const u32, want: Want, img_ro
     const snap = if (st.snap_at) |at| at == p0 + ids.len else false;
     const verify = if (st.verify) |v| v.n0 == p0 else false;
     const bare = img_rows.ctx == null and !snap and want == .all;
-    if (bare and verify and try tpVerifyPiped(m, p0, ids)) return;
+    defer RoundLaps.mark(.rung);
+    if (bare and verify and try tpVerifyPiped(m, p0, ids)) return RoundLaps.pipedVerify();
     // An image's rows exist on this rank only: they ride with the step.
     if (img_rows.ctx != null) try evalAll(&.{img_rows});
     try step(ids, p0, snap, want == .all, verify, m.state_gen, if (img_rows.ctx != null) img_rows else null);
@@ -5317,6 +5318,77 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
 /// `DSV41_ENGRAM_EARLY`, else the whole layer; its rows' wait and dequant inside). Per
 /// Engram layer the rows' read (on whichever thread), wait and dequant; build: the later layers, less the later Engram
 /// layers' waits and dequants; submit: the head and states handed over.
+pub const RoundLaps = struct {
+    const Mark = enum { draft, built, drafted, verify, rung, handed, layers, read, finished };
+    const n = std.enums.values(Mark).len;
+    pub var every: u32 = 32;
+    var at: [n]i64 = @splat(0);
+    var sum: [n]u64 = @splat(0);
+    var copy_engine: u64 = 0;
+    var copy_verify: u64 = 0;
+    var prev: i64 = 0;
+    var rounds: u32 = 0;
+    var copies: u32 = 0;
+    var piped: u32 = 0;
+
+    fn enabled() bool {
+        return env.get(.DSV41_ROUND_LAPS) != null;
+    }
+
+    fn mark(k: Mark) void {
+        if (enabled()) at[@intFromEnum(k)] = monoUs();
+    }
+
+    fn pipedVerify() void {
+        if (enabled()) piped += 1;
+    }
+
+    fn since(a: i64, b: i64) u64 {
+        return @intCast(@max(b - a, 0));
+    }
+
+    fn finish(m: *const Dsv41Model) void {
+        if (!enabled()) return;
+        mark(.finished);
+        if (at[@intFromEnum(Mark.draft)] > prev) addDrafted() else addCopied();
+        prev = at[@intFromEnum(Mark.finished)];
+        rounds += 1;
+        if (rounds < every) return;
+        report(m);
+        clear();
+    }
+
+    fn addDrafted() void {
+        sum[0] += since(prev, at[0]);
+        for (1..n) |k| sum[k] += since(at[k - 1], at[k]);
+    }
+
+    fn addCopied() void {
+        copies += 1;
+        copy_engine += since(prev, at[@intFromEnum(Mark.verify)]);
+        copy_verify += since(at[@intFromEnum(Mark.verify)], at[@intFromEnum(Mark.finished)]);
+    }
+
+    fn clear() void {
+        sum = @splat(0);
+        copy_engine = 0;
+        copy_verify = 0;
+        rounds = 0;
+        copies = 0;
+        piped = 0;
+    }
+
+    fn report(m: *const Dsv41Model) void {
+        const d: u64 = @max(rounds - copies, 1);
+        const c: u64 = @max(copies, 1);
+        log.info("[round-laps] rank {d}: {d} rounds ({d} copied, {d} verifies piped), us a drafted round: engine {d} | draft build {d} wait {d} | read+policy {d} | verify lead {d} engram+layer0 {d} build rest {d} wait+read {d} | finish {d}; a copied round: engine {d} verify {d}\n", .{
+            if (m.tp) |t| t.rank else 0, rounds, copies, piped,
+            sum[0] / d, sum[1] / d, sum[2] / d, sum[3] / d, sum[4] / d, sum[5] / d, sum[6] / d, sum[7] / d, sum[8] / d,
+            copy_engine / c, copy_verify / c,
+        });
+    }
+};
+
 pub const Laps = struct {
     pub var every: u32 = 64;
     const Phase = enum { lead, readback, hash, prefetch, first, build, submit };
@@ -5483,9 +5555,11 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_async_eval(vec));
                 Laps.handed(li);
+                if (li == lo) RoundLaps.mark(.handed);
             }
         }
     }
+    RoundLaps.mark(.layers);
 }
 
 /// Host: every span's stream and mix to the worker, and back as they stand after its layers.
@@ -7075,6 +7149,7 @@ pub const DsparkPhases = dsv4.DsparkPhases;
 /// bigram bias chained position by position on the GPU (greedy), and the
 /// confidence head's logit per position; it truncates the block only when a threshold is set.
 pub fn dsparkDraft(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) !DsparkDraft {
+    RoundLaps.mark(.draft);
     const t0 = monoUs();
     defer m.ds_draft_ns = @intCast((monoUs() - t0) * 1000);
     return draftRows(m, gpa, st, t1, false);
@@ -7157,7 +7232,9 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
     defer sc.deinit();
     const g = try draftGraph(&sc, m, gpa, states, t1s, keep_logits);
     var ev = [_]A{ g.ids, g.conf, g.logits };
+    RoundLaps.mark(.built);
     try evalAll(&ev);
+    RoundLaps.mark(.drafted);
     try readDrafts(m, gpa, g, t1s, wantsConfidence(m), keep_logits, out);
     m.tp_drafted = if (m.draft_shard and states.len == 1) Drafted.of(gens[0], states[0].n, out[0].ids) else null;
 }
@@ -7444,6 +7521,7 @@ test "dsv41 verify drafts: a streamed bank's verify (drafts + the committed toke
 pub fn dsparkBeginWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, d: *const DsparkDraft) !DsparkPending {
     const b = d.len;
     if (b > VERIFY_MAX_DRAFTS) return error.TooManyDrafts;
+    RoundLaps.mark(.verify);
     try armVerify(st, m.n_layers);
     var ids: [16]u32 = undefined;
     ids[0] = t1;
@@ -7504,6 +7582,8 @@ fn rollbackVerify(m: *Dsv41Model, st: *State, keep_n: usize) !void {
 /// the kept positions' main rows go to the DSpark windows.
 pub fn dsparkFinish(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending: *DsparkPending, accepted: usize, next_token: u32) !DsparkRound {
     const keep_n = accepted + 1;
+    RoundLaps.mark(.read);
+    defer RoundLaps.finish(m);
     const t0 = monoUs();
     try finishVerify(m, gpa, st, keep_n);
     const t1 = monoUs();
