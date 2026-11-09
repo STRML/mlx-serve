@@ -961,3 +961,12 @@ test "dsv41 engram at once: a decode token's Engram rows read at once decode as 
     }
     try expectSameF32s(arms[0], arms[1]);
 }
+
+test "dsv41 engram at once: only a 1-row decode step reads at once; verify chunks keep the prefetch thread" {
+    const prior = env.override(.DSV41_ENGRAM_AT_ONCE, "1");
+    defer prior.restore();
+    try std.testing.expect(dsv41.engramReadsAtOnce(1));
+    for ([_]usize{ 2, 4, 16 }) |rows| try std.testing.expect(!dsv41.engramReadsAtOnce(rows));
+    env.set(.DSV41_ENGRAM_AT_ONCE, "0");
+    try std.testing.expect(!dsv41.engramReadsAtOnce(1));
+}

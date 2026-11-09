@@ -313,7 +313,7 @@ pub const vars = struct {
     pub const XDG_CONFIG_HOME: Var = .{ .kind = .public, .type = .text, .default = "~/.config", .owner = "host/launch", .since = "26.9.3", .doc = "opencode CLI config root for `launch`" };
 
     // ── kill switches and opt-in arms ──
-    pub const DSV41_ENGRAM_AT_ONCE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.3", .doc = "DeepSeek-V4.1 decode: a chunk's Engram rows for every layer are read at once on GCD before its first Engram layer is built, no prefetch thread to start and wait on (=0: the prefetch thread); the same rows" };
+    pub const DSV41_ENGRAM_AT_ONCE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.3", .doc = "DeepSeek-V4.1 decode: a 1-row step's Engram rows for every layer are read at once on GCD before its first Engram layer is built, no prefetch thread to start and wait on (=0: the prefetch thread; DSpark verify chunks always use it); the same rows" };
     pub const MINIMAX_H3_GLUE_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 fused glue kernels (=0: the op chain)" };
     pub const MINIMAX_H3_VSA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 trained VSA sparse attention (=0: dense attention, no gate branch)" };
     pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
