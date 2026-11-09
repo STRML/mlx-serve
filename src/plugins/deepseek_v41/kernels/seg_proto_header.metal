@@ -43,8 +43,11 @@ inline int seg_pause(int seed) {
 
 template <int POLLS = SEG_SPIN_POLLS_DEFAULT>
 inline bool seg_wait(device atomic_uint* c, uint target, device atomic_uint* status, uint code) {
+  const uint want_gen = target >> 16;
+  const uint want_n = target & 0xffffu;
   for (int i = 0; i < POLLS; ++i) {
-    if (atomic_load_explicit(c, metal::memory_order_relaxed) >= target) return true;
+    const uint v = atomic_load_explicit(c, metal::memory_order_relaxed);
+    if ((v >> 16) == want_gen && (v & 0xffffu) >= want_n) return true;
     if ((i & 15) == 0 && atomic_load_explicit(status, metal::memory_order_relaxed) != 0u) return false;
     i += seg_pause(i);
   }
