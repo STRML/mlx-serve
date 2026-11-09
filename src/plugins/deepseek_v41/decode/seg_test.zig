@@ -858,3 +858,37 @@ test "dsv41 fused seg: every rank logs its level at load, nothing at level 0, an
     try seg.afterStep(m, 1);
     try std.testing.expectEqual(2 * seg.report_forwards, state.forwards);
 }
+
+test "dsv41 fused seg: level 2 writes level 1's whole layer bit for bit on layers 20..23" {
+    if (!gpuTest() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    Sums.install();
+    defer Sums.remove();
+    for (20..24) |li| {
+        var o = tp4;
+        o.lo = li;
+        o.hi = li + 1;
+        o.ctx = 0;
+        o.seg = .ffn_entry;
+        const one = try Fixture.init(gpa, o);
+        defer one.deinit();
+        o.seg = .ffn_seg;
+        const two = try Fixture.init(gpa, o);
+        defer two.deinit();
+        const in = try fixture.Input.of(one, 1);
+        defer in.deinit();
+        const d0 = seg.dispatches;
+        const s1 = try fixture.streamOf(gpa, one, in);
+        defer gpa.free(s1);
+        const d1 = seg.dispatches;
+        const s2 = try fixture.streamOf(gpa, two, in);
+        defer gpa.free(s2);
+        try std.testing.expect(d1 > d0 and seg.dispatches > d1);
+        try std.testing.expectEqual(s1.len, s2.len);
+        for (s1, s2, 0..) |u, v, i| {
+            if (@as(u32, @bitCast(u)) == @as(u32, @bitCast(v))) continue;
+            std.debug.print("layer {d}: level 1 and level 2 first differ at stream value {d} of {d}: {e} against {e}\n", .{ li, i, s1.len, u, v });
+            return error.LayerOutputsDiffer;
+        }
+    }
+}
