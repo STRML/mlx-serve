@@ -8,15 +8,27 @@ device atomic_uint* c = (device atomic_uint*)cnt;
 device atomic_uint* st = (device atomic_uint*)status;
 device atomic_uint* data = (device atomic_uint*)buf;
 device uint* pdata = (device uint*)buf;
+#if SEG_COHERENT
+device coherent(device) uint* cdata = (device coherent(device) uint*)buf;
+#endif
 threadgroup uint pad[TGMEM >= 4 ? TGMEM / 4 : 1];
 threadgroup uint ticket_slot;
 threadgroup uint go;
 
-#define LOAD(IDX) (PLAIN ? pdata[IDX] : seg_get(data, IDX))
+#if SEG_COHERENT
+#define CLOAD(IDX) cdata[IDX]
+#define CSTORE(IDX, V) cdata[IDX] = (V)
+#else
+#define CLOAD(IDX) seg_get(data, IDX)
+#define CSTORE(IDX, V) seg_put(data, IDX, V)
+#endif
+
+#define LOAD(IDX) (ACCESS == 0 ? seg_get(data, IDX) : ACCESS == 1 ? pdata[IDX] : ACCESS == 2 ? CLOAD(IDX) : ACCESS == 3 ? seg_get(data, IDX) : seg_read_peer_output(pdata, IDX))
 
 #define STORE(IDX, V) do { \
-  if (PLAIN) pdata[IDX] = (V); \
-  else seg_put(data, IDX, V); \
+  if (ACCESS == 0) seg_put(data, IDX, V); \
+  else if (ACCESS == 2) CSTORE(IDX, V); \
+  else pdata[IDX] = (V); \
 } while (0)
 
 #define ITEM(P, GG) do { \
@@ -28,7 +40,7 @@ threadgroup uint go;
 } while (0)
 
 #define PRELOAD(IDX) do { \
-  if (PLAIN) { \
+  if (ACCESS != 0) { \
     const uint pv_ = pdata[IDX]; \
     if (pv_ == 0xA5A5A5A5u) seg_put(st, 14u, pv_); \
   } \

@@ -141,7 +141,7 @@ pub fn afterStep(m: *Dsv41Model) !void {
     if (code == @intFromEnum(Status.ok)) return;
     m.fused_seg = .off;
     try s.clear();
-    log.warn("[dsv41] fused seg: status {s} ({d}): fused segments off\n", .{ if (std.enums.fromInt(Status, code)) |st| @tagName(st) else "unknown", code });
+    log.err("[dsv41] fused seg: status {s} ({d}): fused segments off\n", .{ if (std.enums.fromInt(Status, code)) |st| @tagName(st) else "unknown", code });
     return error.Dsv41FusedSegTimeout;
 }
 
