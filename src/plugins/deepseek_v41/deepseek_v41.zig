@@ -3953,7 +3953,7 @@ pub fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Spli
 pub fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A) !?A {
     const kf = m.dec.moe_fp4 orelse return null;
     const up = try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts) orelse return null;
-    const act = if (dkern.seg.broken) try dkern.seg.zeroShared(sc, up) else up;
+    const act = if (dkern.seg.broken != .none) try dkern.seg.breakShared(sc, up) else up;
     const R = dim(h, 0);
     const one = &m.tp_units[R - 1];
     const y = try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, one.pre, one) orelse return null;
