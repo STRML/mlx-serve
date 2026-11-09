@@ -4527,7 +4527,7 @@ pub fn tpSum(sc: *Scope, m: *const Dsv41Model, x: A) !A {
     const as_is = switch (mode) {
         .bf16 => true,
         .auto => pair_rule or m.tp.?.size > 2,
-        .f32, .off => pair_rule,
+        .f32, .off, .gather => pair_rule,
     };
     const part = if (as_is or dim(x, 0) > region_rows) try sc.astype(x, m.act) else try sc.astype(x, .float32);
     return TpSumCrc.noted(m, TpSumCrc.pathOf(m, part), x, try sc.astype(try sc.keep(try sum(part)), m.act));
