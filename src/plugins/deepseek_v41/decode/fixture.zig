@@ -1656,6 +1656,31 @@ test "dsv41 dspark pipe: four ranks with Engram run DSpark rounds rung on the be
     try std.testing.expectEqual(@as(usize, pipe_script.len - 1), piped.verify_pipes);
 }
 
+test "dsv41 engram lead: four ranks with Engram run DSpark rounds with each verify's first layers handed over before its Engram hash as after it, the same tokens, kept counts and caches" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeEngramPack(gpa, td.dir, 1024, .{ 1, 2 });
+    const dir = try pathOf(gpa, td.dir);
+    defer gpa.free(dir);
+    var ranks: [4]*Fixture = undefined;
+    try dsparkRanksWith(gpa, &ranks, dir);
+    defer for (ranks) |r| r.deinit();
+    defer _ = unsetenv("DSV41_ENGRAM_LEAD");
+    const prompt = [_]u32{ 11, 400, 7, 901, 55, 3, 18 };
+    _ = setenv("DSV41_ENGRAM_LEAD", "0", 1);
+    const after = try dsparkGroup(&ranks, &prompt, &pipe_script, true);
+    defer after.deinit(gpa);
+    _ = setenv("DSV41_ENGRAM_LEAD", "1", 1);
+    const before = try dsparkGroup(&ranks, &prompt, &pipe_script, true);
+    defer before.deinit(gpa);
+    try std.testing.expectEqualSlices(u32, after.tokens, before.tokens);
+    try std.testing.expectEqualSlices(usize, after.kept, before.kept);
+    try std.testing.expectEqual(after.n, before.n);
+    try expectSameF32s(after.state, before.state);
+}
+
 fn dsparkRounds(m: *dsv41.Dsv41Model, prompt: []const u32, script: []const Round) !i64 {
     const io = std.Io.Threaded.global_single_threaded.io();
     const iou = @import("../../../sdk/util/io_util.zig");
