@@ -103,7 +103,7 @@ if (item < DN0) {
     expert = seg_read_peer_output(idx, uint(j));
     wt = seg_read_peer_f32(wts, uint(j));
   }
-  seg_up_item<XM, K, N, TOPK, T>(tid, lane, uint(sg), uint(cb), uint(j), expert, wt, lim, gu_w, gu_s, sgu_w, sgu_s, h2, act, tgm4);
+  seg_up_item<XM, 8, K, N, TOPK, T>(tid, lane, uint(sg), uint(cb), uint(j), expert, wt, lim, gu_w, gu_s, sgu_w, sgu_s, h2, act, tgm4);
   seg_touch((device uint*)status, pf);
   seg_release();
   if (tid == 0) seg_arrive(slot + W_ACT + j, gen_v);

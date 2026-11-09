@@ -32,6 +32,18 @@ pub var grid_extra: usize = 0;
 
 pub var stop_after: u32 = 4;
 
+pub const MOE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_seg_moe.metal");
+const MOE_INS = [_][*:0]const u8{ "h2", "idx", "wts", "gu_w", "gu_s", "sgu_w", "sgu_s", "dn_w", "dn_s", "sdn_w", "sdn_s", "cnt", "par", "status", "dep" };
+const MOE_OUTS = [_][*:0]const u8{ "act", "part" };
+
+pub var moe_only = false;
+
+pub var moe_threads: usize = 256;
+
+pub fn buildMoe() !mlx.mlx_fast_metal_kernel {
+    return dsv41.buildKernel("dsv41_dec_seg_moe", &MOE_INS, &MOE_OUTS, MOE_SOURCE, HEADER);
+}
+
 pub fn build() !mlx.mlx_fast_metal_kernel {
     return dsv41.buildKernel("dsv41_dec_seg_ffn", &INS, &OUTS, SOURCE, HEADER);
 }
@@ -191,4 +203,30 @@ pub fn launch(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Lay
     st.chain(o[5]);
     seg.dispatches += 1;
     return .{ .x1 = o[0], .sf = .{ .pre = o[1], .post = o[2], .comb = o[3] }, .part = o[5], .scratch = o[4], .layout = lay };
+}
+
+pub fn launchMoe(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, li: usize, h2: A, idx: A, wts: A) !?A {
+    const kern = m.dec.seg_moe orelse return null;
+    const st = m.seg orelse return null;
+    if (st.protocol != .ticket or dim(h2, 0) != 1) return null;
+    const c = &m.cfg;
+    const top_k = dim(idx, 1);
+    const b = banksOf(ly, c.hidden_size, top_k) orelse return null;
+    const nsg = moe_threads / 32;
+    if (b.n % nsg != 0) return null;
+    const items = b.n / nsg * (top_k + 1) + c.hidden_size / (2 * b.nc);
+    const par = try sc.keep(mlx.mlx_array_new_data(&parWords(try st.counters.advance(), seg_ffn_in.slotOf(li), c), &[_]c_int{par_words}, 1, .uint32));
+    const ins = [_]A{ h2, idx, wts, b.gu_w, b.gu_s, b.sgu_w, b.sgu_s, b.dn_w, b.dn_s, b.sdn_w, b.sdn_s, st.counters.buf, par, st.status, try st.after(sc) };
+    const outs = [2]ffn_in.OutSpec{
+        .{ .shape = &.{ 1, ci(top_k + 1), ci(b.n) }, .dt = ffn_in.act },
+        .{ .shape = &.{ 1, ci(c.hidden_size) }, .dt = ffn_in.act },
+    };
+    const targs = [_]ffn_in.TArg{
+        .{ .name = "K", .v = c.hidden_size }, .{ .name = "N", .v = b.n },          .{ .name = "NC", .v = b.nc },
+        .{ .name = "TOPK", .v = top_k },      .{ .name = "XM", .v = @intFromEnum(read_mode) }, .{ .name = "TH", .v = moe_threads }, .{ .name = "STOP", .v = stop_after },
+    };
+    const o = try ffn_in.run(2, sc, kern, &ins, outs, items * moe_threads, moe_threads, &targs);
+    st.chain(o[1]);
+    seg.dispatches += 1;
+    return o[1];
 }

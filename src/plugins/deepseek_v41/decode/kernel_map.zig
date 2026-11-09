@@ -125,15 +125,21 @@ test "dsv41 kernel map: a TP rank's full decode step in a loop for a GPU trace (
 }
 
 const ProjAt = dsv41.ProjAt;
-const Mode = enum { base, ctl, twin, same, pre, precopy, ffn, seg, stop };
+const Mode = enum { base, ctl, twin, same, pre, precopy, ffn, seg, stop, stopm };
 
-pub const Under = union(enum) { level: seg.Level, read: seg_ffn.ReadMode, broken, nan };
+pub const Moe = struct { threads: usize, read: seg_ffn.ReadMode };
+
+pub const Under = union(enum) { level: seg.Level, read: seg_ffn.ReadMode, moe: Moe, broken, nan };
 
 const Arm = struct { mode: Mode = .base, at: ProjAt = .in_proj, index: ?bool = null, ffn: seg_bounds.Arm = .base, under: Under = .{ .level = .off }, stop: u32 = 4 };
 
 fn parseUnder(tok: []const u8) !Under {
     if (std.mem.eql(u8, tok, "broken")) return .broken;
     if (std.mem.eql(u8, tok, "nan")) return .nan;
+    if (std.mem.eql(u8, tok, "2m")) return .{ .moe = .{ .threads = 256, .read = .staged } };
+    if (std.mem.eql(u8, tok, "2mp")) return .{ .moe = .{ .threads = 256, .read = .plain } };
+    if (std.mem.eql(u8, tok, "2m64")) return .{ .moe = .{ .threads = 64, .read = .staged } };
+    if (std.mem.eql(u8, tok, "2m64p")) return .{ .moe = .{ .threads = 64, .read = .plain } };
     if (std.mem.eql(u8, tok, "2c")) return .{ .read = .peer };
     if (std.mem.eql(u8, tok, "2p")) return .{ .read = .plain };
     if (std.mem.eql(u8, tok, "2s")) return .{ .read = .staged };
@@ -147,6 +153,7 @@ fn parseArm(tok: []const u8) !Arm {
     if (mode == .base) return .{};
     if (mode == .ffn) return .{ .mode = .ffn, .ffn = std.meta.stringToEnum(seg_bounds.Arm, it.next() orelse return error.BadArm) orelse return error.BadArm };
     if (mode == .seg) return .{ .mode = .seg, .under = try parseUnder(it.next() orelse return error.BadArm) };
+    if (mode == .stopm) return .{ .mode = .stopm, .under = .{ .moe = .{ .threads = 256, .read = .staged } }, .stop = std.fmt.parseInt(u32, it.next() orelse return error.BadArm, 10) catch return error.BadArm };
     if (mode == .stop) return .{ .mode = .stop, .under = .{ .level = .ffn_seg }, .stop = std.fmt.parseInt(u32, it.next() orelse return error.BadArm, 10) catch return error.BadArm };
     const at = std.meta.stringToEnum(ProjAt, it.next() orelse return error.BadArm) orelse return error.BadArm;
     const where = it.next() orelse return .{ .mode = mode, .at = at };
@@ -228,7 +235,7 @@ const Probe = struct {
 
     fn applies(p: *const Probe, li: usize, at: ProjAt) bool {
         switch (p.arm.mode) {
-            .base, .ffn, .seg, .stop => return false,
+            .base, .ffn, .seg, .stop, .stopm => return false,
             else => {},
         }
         if (p.arm.at != at) return false;
@@ -241,7 +248,7 @@ const Probe = struct {
         p.remember(li, at, ins);
         if (!p.applies(li, at)) return ins[0];
         const dep = switch (p.arm.mode) {
-            .base, .ctl, .ffn, .seg, .stop => ins[0],
+            .base, .ctl, .ffn, .seg, .stop, .stopm => ins[0],
             .twin => try twinLaunch(sc, m, &p.copies[li - p.lo], li, at, ins),
             .same => try twinLaunch(sc, m, &m.layers[li], li, at, ins),
             .pre, .precopy => return passAfter(sc, p.pass_after, ins[0], try readLaunch(sc, p.read, weightsOf(if (p.arm.mode == .pre) &m.layers[li] else &p.copies[li - p.lo], at))),
@@ -375,23 +382,29 @@ fn medianOf(xs: []f64) f64 {
 fn setUnder(m: *dsv41.Dsv41Model, u: Under) void {
     seg_ffn.read_mode = switch (u) {
         .read => |rm| rm,
+        .moe => |mo| mo.read,
         else => .staged,
     };
+    seg_ffn.moe_only = u == .moe;
+    seg_ffn.moe_threads = switch (u) {
+        .moe => |mo| mo.threads,
+        else => 256,
+    };
     seg.broken = switch (u) {
-        .level, .read => .none,
+        .level, .read, .moe => .none,
         .broken => .zero_shared,
         .nan => .nan_shared,
     };
     m.fused_seg = switch (u) {
         .level => |l| l,
-        .read => .ffn_seg,
+        .read, .moe => .ffn_seg,
         .broken, .nan => .off,
     };
 }
 
 fn applyArm(fx: *fixture.Fixture, arm: Arm) void {
-    setUnder(fx.m, if (arm.mode == .seg or arm.mode == .stop) arm.under else .{ .level = fx.opts.seg });
-    seg_ffn.stop_after = if (arm.mode == .stop) arm.stop else 4;
+    setUnder(fx.m, if (arm.mode == .seg or arm.mode == .stop or arm.mode == .stopm) arm.under else .{ .level = fx.opts.seg });
+    seg_ffn.stop_after = if (arm.mode == .stop or arm.mode == .stopm) arm.stop else 4;
     seg_bounds.set(arm.ffn);
 }
 
@@ -399,6 +412,7 @@ fn underName(buf: []u8, u: Under) []const u8 {
     return switch (u) {
         .level => |l| std.fmt.bufPrint(buf, "seg:{d}", .{@intFromEnum(l)}) catch "seg",
         .read => |rm| std.fmt.bufPrint(buf, "seg:2{s}", .{@tagName(rm)[0..1]}) catch "seg",
+        .moe => |mo| std.fmt.bufPrint(buf, "seg:2m{d}{s}", .{ mo.threads, @tagName(mo.read)[0..1] }) catch "seg",
         .broken => "seg:broken",
         .nan => "seg:nan",
     };
@@ -447,6 +461,47 @@ fn wtsRelWorst(idx_a: []const f32, idx_b: []const f32, wts_a: []const f32, wts_b
     return worst;
 }
 
+fn dumpRouteGap(gpa: std.mem.Allocator, ly: *const dsv41.Layer, li: usize, h_stock: []const f32, h_fused: []const f32, idx_a: []const f32, idx_b: []const f32, wts_a: []const f32, wts_b: []const f32, rows: usize) !void {
+    const gate = try dsv41.hostF32(ly.gate_w);
+    defer gpa.free(gate);
+    const bias = try dsv41.hostF32(ly.gate_bias);
+    defer gpa.free(bias);
+    const e = bias.len;
+    const d = gate.len / e;
+    const topk = idx_a.len / rows;
+    const order = try gpa.alloc(usize, e);
+    defer gpa.free(order);
+    const score = try gpa.alloc(f64, e);
+    defer gpa.free(score);
+    for (0..rows) |r| {
+        const lo = r * topk;
+        const same = std.mem.eql(f32, idx_a[lo..][0..topk], idx_b[lo..][0..topk]) and @abs(wts_a[lo] - wts_b[lo]) <= wts_rel_tol * @abs(wts_a[lo]);
+        if (same) continue;
+        std.debug.print("[kmap] route flip layer {d} row {d}: stock picks {any} fused picks {any}; stock weights {any} fused weights {any}\n", .{ li, r, idx_a[lo..][0..topk], idx_b[lo..][0..topk], wts_a[lo..][0..topk], wts_b[lo..][0..topk] });
+        const same_h = std.mem.eql(f32, h_stock[r * d ..][0..d], h_fused[r * d ..][0..d]);
+        std.debug.print("[kmap] route flip: h2 of the two paths {s}\n", .{if (same_h) "identical" else "differ"});
+        for ([_][]const f32{ h_stock, h_fused }, [_][]const u8{ "stock h2", "fused h2" }) |h, name| {
+            for (0..e) |x| {
+                var z: f64 = 0;
+                for (0..d) |c| z += @as(f64, h[r * d + c]) * @as(f64, gate[x * d + c]);
+                const sp = if (z > 0) z + @log(1.0 + @exp(-z)) else @log(1.0 + @exp(z));
+                score[x] = @sqrt(sp) + @as(f64, bias[x]);
+                order[x] = x;
+            }
+            std.mem.sort(usize, order, score, struct {
+                fn gt(sc_: []f64, a: usize, b: usize) bool {
+                    return sc_[a] > sc_[b] or (sc_[a] == sc_[b] and a < b);
+                }
+            }.gt);
+            std.debug.print("[kmap] route flip, f64 ranking from {s}:", .{name});
+            for (order[0 .. topk + 3], 0..) |x, rank| std.debug.print(" #{d} e{d} {d:.9}", .{ rank + 1, x, score[x] });
+            const g = score[order[topk - 1]] - score[order[topk]];
+            std.debug.print("\n[kmap] route flip, gap between rank {d} and {d}: {e:.3} absolute, {e:.3} relative to rank {d}\n", .{ topk, topk + 1, g, g / @abs(score[order[topk - 1]]), topk });
+            if (same_h) break;
+        }
+    }
+}
+
 fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize, under: Under) !LayerStat {
     const m = fx.m;
     var st: LayerStat = .{};
@@ -463,19 +518,21 @@ fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize,
         setUnder(m, .{ .level = .off });
         const ya = try dsv41.tpFfn(&sc, m, li, x, ao, &sa, &pre_a);
         const ra = try routesOf(&sc, li);
+        const ha = try dup(&sc, try sc.astype(seg_bounds.heldOf(li).?[0], .float32));
         setUnder(m, under);
         const wanted = switch (under) {
             .level => |l| l != .off and seg.on(m, li, .ffn, rows, .ffn_entry),
-            .read => seg.on(m, li, .ffn, rows, .ffn_entry),
+            .read, .moe => seg.on(m, li, .ffn, rows, .ffn_entry),
             .broken, .nan => false,
         };
         const launched = seg.dispatches;
         const yb = try dsv41.tpFfn(&sc, m, li, x, ao, &sa, &pre_b);
         if (wanted and seg.dispatches > launched) st.engaged += 1 else if (st.declined == null) st.declined = seg.serves(m, rows) orelse if (wanted) "the segment kernel declined" else "layer not covered";
         const rb = try routesOf(&sc, li);
+        const hb = try dup(&sc, try sc.astype(seg_bounds.heldOf(li).?[0], .float32));
         const af = try sc.astype(ya, .float32);
         const bf = try sc.astype(yb, .float32);
-        try dsv41.evalAll(&.{ af, bf, ra[0], ra[1], rb[0], rb[1] });
+        try dsv41.evalAll(&.{ af, bf, ra[0], ra[1], rb[0], rb[1], ha, hb });
         const n = mlx.mlx_array_size(af);
         const xa = mlx.mlx_array_data_float32(af).?[0..n];
         const xb = mlx.mlx_array_data_float32(bf).?[0..n];
@@ -492,7 +549,9 @@ fn layerStat(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usize,
         const idx_b = mlx.mlx_array_data_float32(rb[0]).?[0..k];
         const wts_a = mlx.mlx_array_data_float32(ra[1]).?[0..k];
         const wts_b = mlx.mlx_array_data_float32(rb[1]).?[0..k];
-        st.route_bad += routeRowsBad(idx_a, idx_b, wts_a, wts_b, rows, k / rows);
+        const bad = routeRowsBad(idx_a, idx_b, wts_a, wts_b, rows, k / rows);
+        if (bad != 0) try dumpRouteGap(gpa, &m.layers[li], li, mlx.mlx_array_data_float32(ha).?[0..mlx.mlx_array_size(ha)], mlx.mlx_array_data_float32(hb).?[0..mlx.mlx_array_size(hb)], idx_a, idx_b, wts_a, wts_b, rows);
+        st.route_bad += bad;
         st.wts_rel = @max(st.wts_rel, wtsRelWorst(idx_a, idx_b, wts_a, wts_b, rows, k / rows));
         st.route_rows += rows;
         st.total += n;
@@ -552,7 +611,7 @@ pub fn segCheck(gpa: std.mem.Allocator, fx: *fixture.Fixture, lo: usize, hi: usi
     const st = try layerStat(gpa, fx, lo, hi, under);
     const needs_seg = switch (under) {
         .level => |l| l != .off,
-        .read => true,
+        .read, .moe => true,
         .broken, .nan => false,
     };
     if (st.layers > 0 and needs_seg and st.engaged == 0) {
