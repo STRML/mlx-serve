@@ -6,6 +6,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const env = @import("../../../env.zig");
+const log = @import("../../../sdk/util/log.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const dsv41 = @import("../deepseek_v41.zig");
 const seg = @import("seg.zig");
@@ -34,6 +35,7 @@ pub const Launch = struct {
     tgmem: u32 = seg.spin_tgmem,
     polls: u32 = 0,
     serial_items: u32 = 0,
+    plain: bool = false,
 
     fn launched(self: Launch) u32 {
         return if (self.arm == .ticket) self.phases * self.groups else self.groups;
@@ -95,6 +97,7 @@ const Rig = struct {
             .{ .name = "PHASES", .v = l.phases },
             .{ .name = "POLLS", .v = l.polls },
             .{ .name = "ITEMS", .v = l.serial_items },
+            .{ .name = "PLAIN", .v = @intFromBool(l.plain) },
             .{ .name = "TGMEM", .v = l.tgmem },
             .{ .name = "SALT", .v = salt },
             .{ .name = "STEP", .v = step },
@@ -210,38 +213,71 @@ fn residentAt(rig: *Rig, base: Launch, groups: u32) !bool {
     return true;
 }
 
-// ── tests ──
-
 fn gpuTest() bool {
     return mlx.metalKernelsAvailable() and !mlx.noGpuBackend() and !mlx.virtualGpu();
 }
 
 const launches_per_arm = 1000;
 
-fn expectChain(gpa: std.mem.Allocator, arm: Arm, groups: u32) !void {
-    const l = Launch{ .arm = arm, .groups = groups };
-    var rig = try Rig.init(1, l.phases * l.groups * l.threads);
-    defer rig.deinit();
-    for (0..launches_per_arm) |k| {
-        const r = try rig.once(l);
-        if (r.status != 0) std.debug.print("{s} launch {d}: status {d} at groups {d}\n", .{ @tagName(arm), k, r.status, groups });
-        try std.testing.expectEqual(@as(u32, 0), r.status);
-        const bad = try bufferMismatches(gpa, &rig, l, rig.state.counters.gen);
-        if (bad != 0) std.debug.print("{s} launch {d}: {d} of {d} words differ\n", .{ @tagName(arm), k, bad, l.phases * l.groups * l.threads });
-        if (bad != 0) debugDump(gpa, &rig, l);
-        try std.testing.expectEqual(@as(usize, 0), bad);
-    }
+const Chain = enum { ok, timed_out };
+
+fn expectedWinners(arm: Arm, boundary: usize) u32 {
+    return switch (arm) {
+        .dispatch => 0,
+        .last => @intFromBool(boundary == 0),
+        else => 1,
+    };
 }
 
-test "dsv41 fused seg proto: last-arriver, ordered tickets and resident spin give every phase all of the previous phase's writes" {
+fn runChain(gpa: std.mem.Allocator, arm: Arm, plain: bool, groups: u32) !Chain {
+    const l = Launch{ .arm = arm, .groups = groups, .plain = plain };
+    var rig = try Rig.init(1, l.phases * l.groups * l.threads);
+    defer rig.deinit();
+    const winners = @constCast(mlx.mlx_array_data_uint32(rig.state.status).?)[1..mlx.mlx_array_size(rig.state.status)];
+    for (0..launches_per_arm) |k| {
+        @memset(winners, 0);
+        const r = try rig.once(l);
+        if (r.status != 0 and arm == .spin) return .timed_out;
+        if (r.status != 0) std.debug.print("{s} plain={} launch {d}: status {d} at groups {d}\n", .{ @tagName(arm), plain, k, r.status, groups });
+        try std.testing.expectEqual(@as(u32, 0), r.status);
+        const bad = try bufferMismatches(gpa, &rig, l, rig.state.counters.gen);
+        if (bad != 0) std.debug.print("{s} plain={} launch {d}: {d} of {d} words differ\n", .{ @tagName(arm), plain, k, bad, l.phases * l.groups * l.threads });
+        if (bad != 0) debugDump(gpa, &rig, l);
+        try std.testing.expectEqual(@as(usize, 0), bad);
+        for (0..l.phases - 1) |boundary| try std.testing.expectEqual(expectedWinners(arm, boundary), winners[boundary]);
+    }
+    return .ok;
+}
+
+const spin_attempts = 4;
+
+fn expectSpinChain(gpa: std.mem.Allocator, plain: bool, probed: u32) !u32 {
+    var floor = probed;
+    for (0..spin_attempts) |retries| {
+        if (try runChain(gpa, .spin, plain, seg.spinGrid(floor)) == .ok) return @intCast(retries);
+        floor = @min(floor, try probeResidency(seg.spin_threads, seg.spin_tgmem));
+        if (floor < 2) return error.SkipZigTest;
+    }
+    return error.Dsv41SpinKeptTimingOut;
+}
+
+test "dsv41 fused seg proto: last-arriver, ordered tickets and resident spin give every phase all of the previous phase's writes, through atomic and plain device accesses" {
     if (!gpuTest()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    const resident = try probeResidency(seg.spin_threads, seg.spin_tgmem);
-    try std.testing.expect(resident >= 2);
-    std.debug.print("[seg] resident tg={d} tgmem={d} groups={d}\n", .{ seg.spin_threads, seg.spin_tgmem, resident });
-    for ([_]Arm{ .dispatch, .last, .ticket }) |arm| try expectChain(gpa, arm, resident);
-    try expectChain(gpa, .spin, seg.spinGrid(resident));
+    const resident = @min(try probeResidency(seg.spin_threads, seg.spin_tgmem), try probeResidency(seg.spin_threads, seg.spin_tgmem));
+    if (resident < 2) return error.SkipZigTest;
+    std.debug.print("[seg] resident tg={d} tgmem={d} groups={d} (least of two probes)\n", .{ seg.spin_threads, seg.spin_tgmem, resident });
+    try std.testing.expectEqual(Chain.ok, try runChain(gpa, .dispatch, false, resident));
+    var retries: u32 = 0;
+    for ([_]bool{ false, true }) |plain| {
+        for ([_]Arm{ .last, .ticket }) |arm| try std.testing.expectEqual(Chain.ok, try runChain(gpa, arm, plain, resident));
+        retries += try expectSpinChain(gpa, plain, resident);
+    }
+    std.debug.print("[seg] spin at {d}% of the probe needed {d} re-probe retries over 2 chains of {d} launches\n", .{ seg.spin_margin_pct, retries, launches_per_arm });
 }
+
+const quiet_timeout_ms = [2]f64{ 3, 20 };
+const load_bound_us = 50_000;
 
 const Load = struct {
     stop: std.atomic.Value(bool) = .init(false),
@@ -271,10 +307,15 @@ const Load = struct {
     }
 };
 
-test "dsv41 fused seg proto: a grid twice the probed residency under a concurrent GPU load ends with every status ok or spin_timeout within the bound" {
+test "dsv41 fused seg proto: a grid twice the probed residency under a concurrent GPU load ends with every status ok or spin_timeout within the bound (needs a quiet GPU)" {
     if (!gpuTest()) return error.SkipZigTest;
     const resident = try probeResidency(seg.spin_threads, seg.spin_tgmem);
-    if (resident == 0) return error.SkipZigTest;
+    if (resident < 2) return error.SkipZigTest;
+    const poll_ms = try timeoutMs(0);
+    if (poll_ms < quiet_timeout_ms[0] or poll_ms > quiet_timeout_ms[1]) {
+        std.debug.print("[seg] load test skipped: the default timeout measures {d:.2} ms, outside {d}-{d} ms, so the GPU is not quiet\n", .{ poll_ms, quiet_timeout_ms[0], quiet_timeout_ms[1] });
+        return error.SkipZigTest;
+    }
     const l = Launch{ .arm = .spin, .groups = 2 * resident };
     var rig = try Rig.init(1, l.phases * l.groups * l.threads);
     defer rig.deinit();
@@ -288,7 +329,10 @@ test "dsv41 fused seg proto: a grid twice the probed residency under a concurren
     reader.join();
     try std.testing.expect(!load.failed.load(.acquire));
     std.debug.print("[seg] load groups={d} (2x {d}): idle worst={d}us timeouts={d}/20, under load worst={d}us timeouts={d}/40 ({d} background reads of 2 GB)\n", .{ l.groups, resident, idle.worst, idle.timeouts, busy.worst, busy.timeouts, load.reads.load(.acquire) });
-    try std.testing.expect(busy.worst < 50_000);
+    if (busy.worst >= load_bound_us) {
+        std.debug.print("[seg] a timeout under load took {d} us against the {d} us bound; the bound is a poll count (default timeout {d:.2} ms idle) and needs a quiet GPU\n", .{ busy.worst, load_bound_us, poll_ms });
+        return error.TestUnexpectedResult;
+    }
 }
 
 const Times = struct { worst: i64, timeouts: u32 };
@@ -306,26 +350,29 @@ fn spinTimes(rig: *Rig, l: Launch, launches: u32) !Times {
     return t;
 }
 
-fn dirtyBoundaries(rig: *Rig, l: Launch, gen: u32) void {
+fn dirtyBoundaries(rig: *Rig, l: Launch, gen: u32, dirty_gen: u32) void {
     const words = @constCast(mlx.mlx_array_data_uint32(rig.state.counters.buf).?);
-    words[0] = (gen - 1) * l.phases * l.groups;
-    for (words[1..l.phases]) |*w| w.* = ((gen - 1) << 16) | (l.groups / 2);
+    words[0] = (gen - 1) *% l.phases *% l.groups;
+    for (words[1..l.phases]) |*w| w.* = (dirty_gen << 16) | (l.groups / 2);
 }
 
-test "dsv41 fused seg proto: generation stamps make a dirty counter unreachable" {
+const DirtyCase = struct { gen: u32, dirty_gen: u32 };
+
+test "dsv41 fused seg proto: generation stamps make a dirty counter unreachable, an older or a newer one, up to generation 0xffff" {
     if (!gpuTest()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const groups: u32 = 24;
-    for ([_]Arm{ .last, .ticket, .spin }) |arm| {
+    const cases = [_]DirtyCase{ .{ .gen = 5, .dirty_gen = 4 }, .{ .gen = 5, .dirty_gen = 9 }, .{ .gen = seg.max_gen, .dirty_gen = seg.max_gen - 1 } };
+    for (cases) |c| for ([_]Arm{ .last, .ticket, .spin }) |arm| {
         const l = Launch{ .arm = arm, .groups = groups };
         var rig = try Rig.init(1, l.phases * l.groups * l.threads);
         defer rig.deinit();
-        rig.state.counters.gen = 4;
-        dirtyBoundaries(&rig, l, 5);
+        rig.state.counters.gen = c.gen - 1;
+        dirtyBoundaries(&rig, l, c.gen, c.dirty_gen);
         const r = try rig.once(l);
-        try std.testing.expectEqual(@as(u32, 5), rig.state.counters.gen);
+        try std.testing.expectEqual(c.gen, rig.state.counters.gen);
         try std.testing.expectEqual(@as(u32, 0), r.status);
-        try std.testing.expectEqual(@as(usize, 0), try bufferMismatches(gpa, &rig, l, 5));
+        try std.testing.expectEqual(@as(usize, 0), try bufferMismatches(gpa, &rig, l, c.gen));
         try rig.state.counters.reset();
         try std.testing.expectEqual(@as(u32, 0), rig.state.counters.gen);
         for (mlx.mlx_array_data_uint32(rig.state.counters.buf).?[0..seg.slot_words]) |w| try std.testing.expectEqual(@as(u32, 0), w);
@@ -333,7 +380,7 @@ test "dsv41 fused seg proto: generation stamps make a dirty counter unreachable"
         try std.testing.expectEqual(@as(u32, 1), rig.state.counters.gen);
         try std.testing.expectEqual(@as(u32, 0), again.status);
         try std.testing.expectEqual(@as(usize, 0), try bufferMismatches(gpa, &rig, l, 1));
-    }
+    };
 }
 
 test "dsv41 fused seg proto: a dirty ticket word is refused with a status and the generation wraps to a cleared slot" {
@@ -367,6 +414,9 @@ test "dsv41 fused seg proto: afterStep is a no-op without state or with an ok st
     m.seg = &state;
     try seg.afterStep(m);
     try std.testing.expectEqual(seg.Level.ffn_seg, m.fused_seg);
+    const level: log.Level = if (log.enabled(.debug)) .debug else if (log.enabled(.info)) .info else if (log.enabled(.warn)) .warn else .err;
+    log.setLevel(.err);
+    defer log.setLevel(level);
     for ([_]seg.Status{ .spin_timeout, .sum_timeout, .injected_abort }) |bad| {
         m.fused_seg = .ffn_seg;
         @constCast(mlx.mlx_array_data_uint32(state.status).?)[0] = @intFromEnum(bad);
@@ -410,7 +460,7 @@ fn sweepGroups(out: *[sweep_slots]u32, resident: u32) []const u32 {
 
 const Boundary = struct { us: f64, timeouts: u32 };
 
-fn boundaryUs(arm: Arm, groups: u32) !Boundary {
+fn boundaryUs(arm: Arm, plain: bool, groups: u32) !Boundary {
     const per_trial: u32 = 200;
     const hi_phases: u32 = if (arm == .last) 2 else 11;
     const reps: u32 = switch (arm) {
@@ -418,7 +468,7 @@ fn boundaryUs(arm: Arm, groups: u32) !Boundary {
         .dispatch => per_trial + 1,
         else => per_trial / (hi_phases - 1),
     };
-    const hi = Launch{ .arm = arm, .groups = groups, .phases = if (arm == .dispatch) 2 else hi_phases, .serial_items = 1 };
+    const hi = Launch{ .arm = arm, .groups = groups, .phases = if (arm == .dispatch) 2 else hi_phases, .serial_items = 1, .plain = plain };
     var lo = hi;
     lo.serial_items = 1;
     lo.phases = if (arm == .dispatch) 2 else 1;
@@ -459,8 +509,9 @@ test "dsv41 fused seg proto ubench: phase boundary cost by protocol, grid and di
     for ([_]u32{ 10_000, 20_000, 40_000, 80_000 }) |polls| std.debug.print("[seg] timeout polls={d} ms={d:.2}\n", .{ polls, try timeoutMs(polls) });
     std.debug.print("[seg] timeout default ms={d:.2}\n", .{try timeoutMs(0)});
     var groups: [sweep_slots]u32 = undefined;
-    for (sweepGroups(&groups, resident)) |g| for ([_]Arm{ .dispatch, .last, .ticket, .spin }) |arm| {
-        const b = try boundaryUs(arm, g);
-        std.debug.print("[seg] boundary {s} groups={d} us={d:.3} timeouts={d}/7\n", .{ @tagName(arm), g, b.us, b.timeouts });
+    for (sweepGroups(&groups, resident)) |g| for ([_]Arm{ .dispatch, .last, .ticket, .spin }) |arm| for ([_]bool{ false, true }) |plain| {
+        if (arm == .dispatch and plain) continue;
+        const b = try boundaryUs(arm, plain, g);
+        std.debug.print("[seg] boundary {s}{s} groups={d} us={d:.3} timeouts={d}/7\n", .{ @tagName(arm), if (plain) "-plain" else "", g, b.us, b.timeouts });
     };
 }

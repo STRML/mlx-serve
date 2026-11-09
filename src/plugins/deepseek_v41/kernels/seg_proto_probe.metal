@@ -7,22 +7,41 @@ const uint gen_v = gen[0];
 device atomic_uint* c = (device atomic_uint*)cnt;
 device atomic_uint* st = (device atomic_uint*)status;
 device atomic_uint* data = (device atomic_uint*)buf;
+device uint* pdata = (device uint*)buf;
 threadgroup uint pad[TGMEM >= 4 ? TGMEM / 4 : 1];
 threadgroup uint ticket_slot;
 threadgroup uint go;
+
+#define LOAD(IDX) (PLAIN ? pdata[IDX] : seg_get(data, IDX))
+
+#define STORE(IDX, V) do { \
+  if (PLAIN) pdata[IDX] = (V); \
+  else seg_put(data, IDX, V); \
+} while (0)
 
 #define ITEM(P, GG) do { \
   const uint gid_ = uint(GG) * THREADS + tid; \
   const uint at_ = uint(P) * N + gid_; \
   uint v_ = gid_ + gen_v * SALT; \
-  if ((P) > 0) v_ = seg_get(data, (uint(P) - 1) * N + ((uint(GG) + uint(P)) % GROUPS) * THREADS + tid) + uint(P) * STEP + gen_v * SALT; \
-  seg_put(data, at_, v_); \
+  if ((P) > 0) v_ = LOAD((uint(P) - 1) * N + ((uint(GG) + uint(P)) % GROUPS) * THREADS + tid) + uint(P) * STEP + gen_v * SALT; \
+  STORE(at_, v_); \
+} while (0)
+
+#define PRELOAD(IDX) do { \
+  if (PLAIN) { \
+    const uint pv_ = pdata[IDX]; \
+    if (pv_ == 0xA5A5A5A5u) seg_put(st, 14u, pv_); \
+  } \
+} while (0)
+
+#define ARRIVE_COUNT(SLOT) do { \
+  if (seg_arrive_last(c + (SLOT), gen_v, GROUPS)) atomic_fetch_add_explicit(st + (SLOT), 1u, metal::memory_order_relaxed); \
 } while (0)
 
 #define PUBLISH_AND_WAIT(SLOT) do { \
   seg_release(); \
   if (tid == 0) { \
-    seg_arrive(c + (SLOT), gen_v); \
+    ARRIVE_COUNT(SLOT); \
     go = seg_wait<WAIT_POLLS>(c + (SLOT), seg_stamp(gen_v, GROUPS), st, 1u) ? 1u : 0u; \
   } \
   threadgroup_barrier(metal::mem_flags::mem_threadgroup); \
@@ -53,6 +72,7 @@ if (PROTO == 0) {
   const uint p = t / GROUPS;
   const uint g = t % GROUPS;
   if (p > 0) {
+    PRELOAD((p - 1) * N + ((g + p) % GROUPS) * THREADS + tid);
     if (tid == 0) go = seg_wait<WAIT_POLLS>(c + p, seg_stamp(gen_v, GROUPS), st, 1u) ? 1u : 0u;
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     if (go == 0u) return;
@@ -61,18 +81,25 @@ if (PROTO == 0) {
   ITEM(p, g);
   if (p + 1 < PHASES) {
     seg_release();
-    if (tid == 0) seg_arrive(c + 1 + p, gen_v);
+    if (tid == 0) ARRIVE_COUNT(1 + p);
   }
 } else if (PROTO == 1) {
   for (int p = 0; p < PHASES; ++p) {
     ITEM(p, grp);
-    if (p + 1 < PHASES) PUBLISH_AND_WAIT(1 + p);
+    if (p + 1 < PHASES) {
+      PRELOAD(p * N + ((grp + p + 1) % GROUPS) * THREADS + tid);
+      PUBLISH_AND_WAIT(1 + p);
+    }
   }
 } else if (PROTO == 2) {
   ITEM(0, grp);
   if (PHASES > 1) {
+    PRELOAD(((grp + 1) % GROUPS) * THREADS + tid);
     seg_release();
-    if (tid == 0) go = seg_arrive_last(c + 1, gen_v, GROUPS) ? 1u : 0u;
+    if (tid == 0) {
+      go = seg_arrive_last(c + 1, gen_v, GROUPS) ? 1u : 0u;
+      if (go != 0u) atomic_fetch_add_explicit(st + 1, 1u, metal::memory_order_relaxed);
+    }
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     if (go == 0u) return;
     seg_acquire();
