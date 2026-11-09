@@ -1278,6 +1278,7 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
             const ds_pipe = dsparkPipeWanted(&self.link);
             dsv41_mod.clusterHooks().tp_draft_pipe = if (ds_pipe) &dsv41TpDraftPipe else null;
             dsv41_mod.clusterHooks().tp_verify_pipe = if (ds_pipe) &dsv41TpVerifyPipe else null;
+            dsv41_mod.clusterHooks().tp_chained = &dsv41TpChained;
             log.info("[dist] tensor: DSpark drafts and verifies {s}\n", .{if (ds_pipe) "of the live state rung on the bells, their values after the byte (DSV41_DSPARK_PIPE)" else "each send a header"});
             dsv41_mod.clusterHooks().tp_free = &dsv41TpFree;
             dsv41_mod.clusterHooks().tp_snap = &dsv41TpSnap;
@@ -1394,6 +1395,12 @@ fn dsv41TpVerifyPipe(gen: u64, n: usize, rows: usize, flags: u8) anyerror!bool {
     for (1..self.link.size) |k| try self.link.bells[k].say(&bytes);
     c.tp_spec = TpSpec.afterStep(gen, n, rows, true);
     return true;
+}
+
+fn dsv41TpChained(gen: u64, n: usize) anyerror!void {
+    const c = cluster();
+    c.tp_live = null;
+    c.tp_spec = .{ .drafted = .{ .gen = gen, .n = n } };
 }
 
 fn dsparkPipeWanted(link: *const Link) bool {
