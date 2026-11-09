@@ -276,7 +276,9 @@ test "dsv41 fused seg: kmap: the route check compares each row's picks in order 
     try std.testing.expectEqual(@as(usize, 2), kernel_map.routeRowsBad(&same_idx, &swapped_rows, &w, &w, 2, topk));
     const tie_flipped = [_]f32{ 2, 1, 2, 1 };
     try std.testing.expectEqual(@as(usize, 1), kernel_map.routeRowsBad(&same_idx, &tie_flipped, &w, &w, 2, topk));
-    const moved = [_]f32{ 0.6, 0.4, 0.7, 0.3001 };
+    const rounded = [_]f32{ 0.6, 0.4, 0.70013, 0.29995 };
+    try std.testing.expectEqual(@as(usize, 0), kernel_map.routeRowsBad(&same_idx, &same_idx, &w, &rounded, 2, topk));
+    const moved = [_]f32{ 0.6, 0.4, 0.7, 0.301 };
     try std.testing.expectEqual(@as(usize, 1), kernel_map.routeRowsBad(&same_idx, &same_idx, &w, &moved, 2, topk));
     const nan_w = [_]f32{ 0.6, 0.4, std.math.nan(f32), 0.3 };
     try std.testing.expectEqual(@as(usize, 1), kernel_map.routeRowsBad(&same_idx, &same_idx, &w, &nan_w, 2, topk));
