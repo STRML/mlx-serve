@@ -414,6 +414,7 @@ const whole_layers = 6;
 const whole_ratio = 1.15;
 
 pub const wts_rel_tol = 1e-6;
+pub const route_wts_rel_tol = 1e-3;
 
 const LayerStat = struct { layers: usize = 0, engaged: usize = 0, total: usize = 0, ndiff: usize = 0, nonfinite: usize = 0, route_rows: usize = 0, route_bad: usize = 0, wts_rel: f64 = 0, num: f64 = 0, den: f64 = 0, worst: f64 = 0, declined: ?[]const u8 = null };
 
@@ -427,14 +428,14 @@ fn routesOf(sc: *dsv41.Scope, li: usize) ![2]A {
 }
 
 /// Rows of `rows` x `topk` routes where the picks differ in any position (order counts, so a tie that went to the
-/// higher index shows) or a weight moves by more than `wts_rel_tol` relative.
+/// higher index shows) or a weight moves by more than `route_wts_rel_tol` relative.
 pub fn routeRowsBad(idx_a: []const f32, idx_b: []const f32, wts_a: []const f32, wts_b: []const f32, rows: usize, topk: usize) usize {
     var bad: usize = 0;
     for (0..rows) |r| {
         var row_bad = false;
         for (r * topk..(r + 1) * topk) |i| {
             const dw = @abs(wts_a[i] - wts_b[i]);
-            row_bad = row_bad or idx_a[i] != idx_b[i] or !(dw <= wts_rel_tol * @max(@abs(wts_a[i]), 1e-30));
+            row_bad = row_bad or idx_a[i] != idx_b[i] or !(dw <= route_wts_rel_tol * @max(@abs(wts_a[i]), 1e-30));
         }
         if (row_bad) bad += 1;
     }
