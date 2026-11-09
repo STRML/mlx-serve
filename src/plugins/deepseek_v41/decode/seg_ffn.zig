@@ -101,13 +101,18 @@ const par_lim = 7;
 const par_unit = 8;
 
 fn parWords(gen: u32, slot: usize, c: *const config.Config) [par_words]u32 {
-    const f = [_]f32{ c.rms_norm_eps, c.dsv4_hc_eps, c.router_scaling_factor, c.dsv4_swiglu_limit, 1.0, 0.0, 0.0 };
     var w: [par_words]u32 = @splat(0);
     w[par_gen] = gen;
     w[par_slot] = @intCast(slot * seg.slot_words);
     w[par_abort_at] = hook.abort_at;
     w[par_skew_at] = hook.skew_at;
-    for (f, par_eps..) |v, i| w[i] = @bitCast(v);
+    w[par_eps] = @bitCast(@as(f32, c.rms_norm_eps));
+    w[par_eps + 1] = @bitCast(@as(f32, c.dsv4_hc_eps));
+    w[par_scal] = @bitCast(@as(f32, c.router_scaling_factor));
+    w[par_lim] = @bitCast(@as(f32, c.dsv4_swiglu_limit));
+    w[par_unit] = @bitCast(@as(f32, 1.0));
+    w[par_unit + 1] = @bitCast(@as(f32, 0.0));
+    w[par_unit + 2] = @bitCast(@as(f32, 0.0));
     return w;
 }
 
