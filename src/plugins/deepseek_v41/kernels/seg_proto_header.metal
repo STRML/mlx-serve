@@ -59,6 +59,18 @@ inline uint seg_ticket(device atomic_uint* t) {
   return atomic_fetch_add_explicit(t, 1u, metal::memory_order_relaxed);
 }
 
+#if __METAL_VERSION__ >= 320
+#define SEG_COHERENT 1
+inline uint seg_read_peer_output(const device uint* p, uint i) {
+  return ((const device coherent(device) uint*)p)[i];
+}
+#else
+#define SEG_COHERENT 0
+inline uint seg_read_peer_output(const device uint* p, uint i) {
+  return atomic_load_explicit((device atomic_uint*)(p + i), metal::memory_order_relaxed);
+}
+#endif
+
 inline uint seg_get(device atomic_uint* p, uint i) {
   return atomic_load_explicit(p + i, metal::memory_order_relaxed);
 }
