@@ -1970,3 +1970,12 @@ test "dsv41 engram early ubench: rank 0's host laps with the rows read at once a
         if (rep >= 2) std.debug.print("{s}\n", .{dsv41.Laps.line(fx.m, &buf)});
     }
 }
+
+test "dsv41 engram early: only a 1-row decode step reads at once; verify chunks keep the prefetch thread" {
+    const prior = env.override(.DSV41_ENGRAM_EARLY, "1");
+    defer prior.restore();
+    try std.testing.expect(dsv41.engramReadsAtOnce(1));
+    for ([_]usize{ 2, 4, 16 }) |rows| try std.testing.expect(!dsv41.engramReadsAtOnce(rows));
+    env.set(.DSV41_ENGRAM_EARLY, "0");
+    try std.testing.expect(!dsv41.engramReadsAtOnce(1));
+}

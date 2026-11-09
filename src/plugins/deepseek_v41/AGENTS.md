@@ -53,8 +53,9 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - Under `tp` a plain decode step whose token is still on the GPU goes by bell alone (`DSV41_TP_PIPE`): every rank gathers
   rank 0's token in its graph (`tpToken`). Rank 0 pipes only the state the workers last stepped, where they left it
   (distributed.zig `TpLive`, cleared by any other message), never a step a header carries (snapshot, verify, all rows).
-- A decode chunk's Engram rows for every layer are read at once on GCD before its first Engram layer is built
-  (`Prefetch.readNow`, `DSV41_ENGRAM_EARLY`); a prompt's stay on the prefetch thread. `MLX_SERVE_DIAG=engram-laps` times
+- A 1-row decode step's Engram rows for every layer are read at once on GCD before its first Engram layer is built
+  (`Prefetch.readNow`, `DSV41_ENGRAM_EARLY`); a prompt's and a DSpark verify chunk's stay on the prefetch thread, the
+  verify's layers before the first Engram layer handed to the GPU before the hash (`DSV41_ENGRAM_LEAD`). `MLX_SERVE_DIAG=engram-laps` times
   each host phase of a GPU-token decode step (`Laps`).
 - Under `tp` with `DSV41_DSPARK_PIPE=1` a DSpark round of the live state goes on the bells: the draft with the kept count and
   first token after the byte, the verify with its row count, each rank's ids from its own draft (`Drafted`). Rank 0 rings
