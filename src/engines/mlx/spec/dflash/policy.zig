@@ -688,3 +688,101 @@ test "Calibration: a head prior reads the drafter's confidence as its acceptance
     for (0..60) |_| head.observe(0.93, false);
     try testing.expect(head.probability(0.93) < 0.2);
 }
+
+/// `ticks` rounds of four slots that can all stage-draft, each staged slot verifying `rows` drafts and keeping `kept`, on
+/// the prior's costs and an 8 ms stage pass; returns each slot's drafted rounds.
+fn simulateGroup(mode: GroupBackoff, group: *Drafting, own: *[4]Drafting, ticks: usize, rows: u32, kept: u32) [4]u32 {
+    const cost: GroupCost = .{};
+    const token_ms = cost.ms(4, 4) / 4;
+    var ptrs: [4]?*Drafting = undefined;
+    for (own, &ptrs) |*d, *p| p.* = d;
+    const eligible: [4]bool = @splat(true);
+    var drafted: [4]u32 = @splat(0);
+    for (0..ticks) |_| {
+        var stage: [4]bool = undefined;
+        mode.choose(group, &ptrs, &eligible, &stage);
+        var b: [4]u32 = @splat(0);
+        var a: [4]u32 = @splat(0);
+        for (stage, &b, &a, &drafted) |s, *bk, *ak, *dk| if (s) {
+            bk.* = rows;
+            ak.* = kept;
+            dk.* += 1;
+        };
+        mode.record(group, &ptrs, &stage, &b, &a, token_ms, cost.rowMs(), 8);
+    }
+    return drafted;
+}
+
+test "dspark group backoff: four staggered slots keeping their drafts draft every round together, where alone each probe lost" {
+    var own: [4]Drafting = undefined;
+    for (&own, 0..) |*d, k| d.* = .{ .owed = @intCast(k), .period = 4 };
+    var group: Drafting = .{};
+    try testing.expectEqual([4]u32{ 64, 64, 64, 64 }, simulateGroup(.group, &group, &own, 64, 4, 3));
+    try testing.expect(group.period <= 2 and group.owed == 0);
+    // Each slot's own debt is left for when it ticks alone.
+    for (own, 0..) |d, k| try testing.expect(d.owed == k and d.period == 4);
+    // On their own backoffs the lone prober pays the whole stage pass, and the group decays to plain.
+    var unused: Drafting = .{};
+    for (simulateGroup(.slot, &unused, &own, 64, 4, 3)) |n| try testing.expect(n < 16);
+}
+
+test "dspark group backoff: a group whose drafts buy no row, or keep too few, backs off to the longest wait" {
+    var own: [4]Drafting = @splat(.{});
+    var group: Drafting = .{};
+    for (simulateGroup(.group, &group, &own, 200, 0, 0)) |n| try testing.expect(n <= 12);
+    try testing.expectEqual(Drafting.MAX_PERIOD, group.period);
+    // Each slot's stats count the group's skips and probes.
+    for (own) |d| try testing.expect(d.skipped == group.skipped and d.probes == group.probes and d.skipped > 150);
+    var poor: Drafting = .{};
+    for (simulateGroup(.group, &poor, &own, 200, 4, 1)) |n| try testing.expect(n <= 12);
+    try testing.expectEqual(Drafting.MAX_PERIOD, poor.period);
+}
+
+test "dspark group backoff: a slot bought no row adds no loss to the group's round; per slot it recorded one" {
+    var group: Drafting = .{};
+    var own: [2]Drafting = @splat(.{});
+    const ptrs = [_]?*Drafting{ &own[0], &own[1] };
+    const stage = [_]bool{ true, true };
+    GroupBackoff.group.record(&group, &ptrs, &stage, &.{ 2, 0 }, &.{ 2, 0 }, 10, 4, 6);
+    try testing.expectApproxEqAbs(@as(f32, 20), group.gain, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 14), group.wall, 1e-4);
+    try testing.expectEqual(@as(u32, 0), group.owed);
+    try testing.expect(own[0].wall == 0 and own[1].wall == 0);
+    // `slot` is the old rule: half the stage pass each, the row-less slot a loss.
+    GroupBackoff.slot.record(&group, &ptrs, &stage, &.{ 2, 0 }, &.{ 2, 0 }, 10, 4, 6);
+    try testing.expectApproxEqAbs(@as(f32, 11), own[0].wall, 1e-4);
+    try testing.expectEqual(@as(u32, 0), own[0].owed);
+    try testing.expectEqual(@as(u32, 1), own[1].owed);
+}
+
+test "dspark group backoff: one decision for every eligible slot, counted in each one's stats; a slot without a policy always drafts" {
+    var group: Drafting = .{ .owed = 1 };
+    var own: [3]Drafting = @splat(.{});
+    const ptrs = [_]?*Drafting{ &own[0], null, &own[1], &own[2] };
+    const eligible = [_]bool{ true, true, true, false };
+    var stage: [4]bool = undefined;
+    GroupBackoff.group.choose(&group, &ptrs, &eligible, &stage);
+    try testing.expectEqual([4]bool{ false, true, false, false }, stage);
+    try testing.expect(own[0].skipped == 1 and own[1].skipped == 1 and own[2].skipped == 0);
+    GroupBackoff.group.choose(&group, &ptrs, &eligible, &stage);
+    try testing.expectEqual([4]bool{ true, true, true, false }, stage);
+    try testing.expect(group.probes == 1 and own[0].probes == 1 and own[1].probes == 1 and own[2].probes == 0);
+    // No slot with a policy can draft: the group's backoff is not asked.
+    group.owed = 2;
+    GroupBackoff.group.choose(&group, &ptrs, &[_]bool{ false, true, false, false }, &stage);
+    try testing.expectEqual([4]bool{ false, true, false, false }, stage);
+    try testing.expectEqual(@as(u32, 2), group.owed);
+}
+
+test "dspark group backoff: a solo slot's backoff keeps its ladder, doubling to 32 on losses and halving on wins" {
+    var d: Drafting = .{};
+    const lost = [_][2]u32{ .{ 2, 1 }, .{ 4, 2 }, .{ 8, 4 }, .{ 16, 8 }, .{ 32, 16 }, .{ 32, 32 }, .{ 32, 32 } };
+    for (lost) |want| {
+        d.record(0, 10);
+        try testing.expectEqual(want, [2]u32{ d.period, d.owed });
+    }
+    for ([_]u32{ 16, 8, 4, 2, 1, 1 }) |period| {
+        d.record(100, 10);
+        try testing.expectEqual([2]u32{ period, 0 }, [2]u32{ d.period, d.owed });
+    }
+}
