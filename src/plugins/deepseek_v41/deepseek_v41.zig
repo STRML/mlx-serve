@@ -427,6 +427,9 @@ pub const Dsv41Model = struct {
     trace: ?*Trace = null,
     /// Test-only: skip the QAT round-trips (the reference's plain-math mode).
     qat_off: bool = false,
+    probe: ?*const ProjProbe = null,
+    fused_seg: dkern.seg.Level = .off,
+    seg: ?*dkern.seg.State = null,
     /// The routed experts from a streamed bank (`sdk/weights/streamed.zig`); null = the in-memory banks.
     streamed: ?streamed.Routed = null,
     /// The pack's routed experts live in a streamed bank: the trunk loads none (`InitOpts.streamed_experts`).
@@ -515,6 +518,10 @@ pub const Dsv41Model = struct {
     pub fn deinit(self: *Dsv41Model) void {
         dropChain(self);
         if (self.dec_state) |*st| st.deinit();
+        if (self.seg) |s| {
+            s.deinit();
+            self.gpa.destroy(s);
+        }
         self.dropAhead();
         self.gpa.free(self.prompt);
         for (self.engrams) |*e| e.table.close();
@@ -624,13 +631,15 @@ pub const Dec = struct {
     moe_up: ?dkern.moe_up.Kernel = null,
     moe_fp4: ?dkern.moe_fp4.Kernels = null,
     moe_down: ?mlx.mlx_fast_metal_kernel = null,
+    seg_ffn_in: ?mlx.mlx_fast_metal_kernel = null,
+    seg_ffn: ?mlx.mlx_fast_metal_kernel = null,
     /// `dkern.moe_down.probe`'s output rows a threadgroup on this GPU.
     moe_down_rb: usize = 0,
 
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
         // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.buildArm(dkern.attnBw()), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.buildArm(dkern.attnBw()), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.buildArm(dkern.attnBw()), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.buildArm(dkern.attnBw()), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null, .seg_ffn_in = try dkern.seg_ffn_in.build(), .seg_ffn = try dkern.seg_ffn.build() };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -651,7 +660,7 @@ pub const Dec = struct {
         if (d.ffn_in) |k| dkern.ffn_in.free(k);
         if (d.wq_b) |k| k.deinit();
         if (d.wo_a) |k| k.deinit();
-        inline for (.{ d.attn, d.moe_down }) |k| if (k) |kern| {
+        inline for (.{ d.attn, d.moe_down, d.seg_ffn_in, d.seg_ffn }) |k| if (k) |kern| {
             _ = mlx.mlx_fast_metal_kernel_free(kern);
         };
         if (d.wo_a_counter.ctx != null) _ = mlx.mlx_array_free(d.wo_a_counter);
@@ -1696,6 +1705,9 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         const r = ci(R);
         u.* = .{ .pre = try ownConst(m, &.{ r, 1, ci(cfg.hidden_size) }, .bfloat16, 0), .post = try ownConst(m, &.{ r, 1 }, .float32, 1), .comb = try ownConst(m, &.{ r, 1, 1 }, .float32, 0) };
     };
+    m.fused_seg = dkern.seg.levelFromEnv();
+    dkern.seg.announce(m);
+    m.seg = try dkern.seg.create(m);
     try compileRegions(m);
     if (n_stages > 0) {
         if (m.draft_shard and m.head_part == null) return error.Dsv41DraftShardNeedsVocabHead;
@@ -3925,6 +3937,18 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     return hcExpand(sc, mid.x1, y, &mid.sf);
 }
 
+pub const ProjAt = enum { in_proj, wq_b, wo_a, wo_b };
+
+pub const ProjProbe = struct {
+    ctx: *anyopaque,
+    before: *const fn (ctx: *anyopaque, sc: *Scope, m: *Dsv41Model, li: usize, at: ProjAt, ins: []const A) anyerror!A,
+};
+
+fn probed(sc: *Scope, m: *Dsv41Model, li: usize, at: ProjAt, ins: []const A) !A {
+    const p = m.probe orelse return ins[0];
+    return p.before(p.ctx, sc, m, li, at, ins);
+}
+
 /// `block` for at most `dkern.max_rows` rows on the fused decode kernels (`decode/`), today's stretches where one is
 /// missing; null (before any state moves) where a kernel declines the layer.
 fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !?A {
@@ -3934,8 +3958,9 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const ls = &st.layers[li];
     const L = dim(x, 0);
     const hd = m.cfg.head_dim;
-    const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
-    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, p0, L)) orelse return null;
+    const a = try dkern.in_proj.run(sc, kp, m, ly, try probed(sc, m, li, .in_proj, &.{ x, pre.* }), pre.*) orelse return null;
+    const pos = try dkern.wq_b.rowsAt(sc, p0, L);
+    const w = try dkern.wq_b.run(sc, m, kq, ly, li, try probed(sc, m, li, .wq_b, &.{ a.qa, a.kv, a.z, pos }), a.kv, a.z, pos) orelse return null;
     try ls.win.write(w.kv_row, p0, sc.s);
     var comp_rows = none;
     var topk = none;
@@ -3950,7 +3975,8 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const inv = ropeFor(m, li).inv;
     var oa: ?A = null;
     if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, w.q, ls.win, comp_rows, topk, p0, scale)) |p| {
-        oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, try attnMeta(sc, m, w.q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
+        const meta = try attnMeta(sc, m, w.q, ls.win, comp_rows, topk, p0);
+        oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, meta, try probed(sc, m, li, .wo_a, &.{ p.acc, p.m, p.l, meta }), p.m, p.l);
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &w.sa)) |f| {
@@ -3958,7 +3984,7 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
         return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
     };
     var ao: [1]A = undefined;
-    if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
+    if (oa) |v| ao[0] = try ly.wo_b.apply(sc, try probed(sc, m, li, .wo_b, &.{v})) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
     if (m.tp != null) return try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, pre);
     var out: [2]A = undefined;
     try runRegion(sc, m, li, .ffn, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &out);
@@ -3968,11 +3994,31 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
 
 /// A tensor split's FFN at decode width, from the summed attention output `ao`: this rank's experts over the routes,
 /// summed with the other ranks', then the hc expand. `pre` becomes the FFN's mix.
-fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, pre: *A) !A {
+pub fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, pre: *A) !A {
+    if (try dkern.seg_bounds.tpFfn(sc, m, li, x, ao, sa, pre)) |y| return y;
     const ly = &m.layers[li];
+    if (dkern.seg.on(m, li, .ffn, dim(x, 0), .ffn_entry)) {
+        _ = try dkern.seg.ensure(m);
+        if (dkern.seg.on(m, li, .ffn, dim(x, 0), .ffn_seg)) {
+            if (try dkern.seg_ffn.launch(sc, m, ly, li, x, ao, sa)) |f| {
+                if (dkern.seg_bounds.cache_on) dkern.seg_bounds.remember(li, &.{ f.x1, f.sf.pre, f.sf.post, f.sf.comb, try f.h2(sc), try f.idx(sc), try f.wts(sc) });
+                pre.* = f.sf.pre;
+                return hcExpand(sc, f.x1, try tpSum(sc, m, f.part), &f.sf);
+            }
+            dkern.seg.declines += 1;
+        }
+        if (try dkern.seg_ffn_in.launch(sc, m, li, ly, x, ao, sa)) |f| {
+            dkern.seg_bounds.remember(li, &.{ f.x1, f.sf.pre, f.sf.post, f.sf.comb, f.h2, f.idx, f.wts });
+            pre.* = f.sf.pre;
+            const part = try moeFused(sc, m, ly, f.h2, f.idx, f.wts) orelse try moePartial(sc, m, ly, f.h2, f.idx, f.wts);
+            return hcExpand(sc, f.x1, try tpSum(sc, m, part), &f.sf);
+        }
+        dkern.seg.declines += 1;
+    }
     var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
     try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
     try VerifyPicks.note(m, li, p[5]);
+    dkern.seg_bounds.remember(li, &p);
     pre.* = p[1];
     const part = try moeFused(sc, m, ly, p[4], p[5], p[6]) orelse try moePartial(sc, m, ly, p[4], p[5], p[6]);
     return hcExpand(sc, p[0], try tpSum(sc, m, part), &.{ .pre = p[1], .post = p[2], .comb = p[3] });
@@ -3980,9 +4026,10 @@ fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, p
 
 /// The routed and shared rows this rank holds on the fused mxfp4 launches (`[R, dim]`), or null where they decline:
 /// the down launch's hc expand over one copy with no residual and a unit post is the MoE output itself.
-fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A) !?A {
+pub fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A) !?A {
     const kf = m.dec.moe_fp4 orelse return null;
-    const act = try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts) orelse return null;
+    const up = try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts) orelse return null;
+    const act = if (dkern.seg.broken != .none) try dkern.seg.breakShared(sc, up) else up;
     const R = dim(h, 0);
     const one = &m.tp_units[R - 1];
     const y = try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, one.pre, one) orelse return null;
@@ -4429,6 +4476,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     try mlx.check(mlx.mlx_async_eval(vec));
     Laps.lap(.submit);
     Laps.end(m);
+    try dkern.seg.afterStep(m, L);
     return sc.out(logits);
 }
 
@@ -4902,7 +4950,9 @@ pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usiz
         }
     }
     if (verify) try armVerify(st, m.n_layers);
+    const tb = dkern.seg_bounds.nowUs();
     try runLayers(m, gpa, st, &sp, held, p.lo, p.hi);
+    dkern.seg_bounds.build_us = dkern.seg_bounds.nowUs() - tb;
     st.n = p0 + L;
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
@@ -4913,6 +4963,7 @@ pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usiz
     try ev.appendSlice(gpa, &.{ xo, po });
     for (st.layers[p.lo..p.hi]) |*ls| try appendLayerState(gpa, &ev, ls);
     try evalAll(ev.items);
+    try dkern.seg.afterStep(m, L);
     if (snap) {
         st.snap_at = st.n;
         try snapshotIfDue(m);

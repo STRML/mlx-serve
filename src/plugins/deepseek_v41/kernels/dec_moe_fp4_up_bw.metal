@@ -7,15 +7,14 @@ const uint u = sg % uint(TOPK * R + 1);
 const uint n_col = sg / uint(TOPK * R + 1);
 if (n_col >= uint(N)) return;
 if (u == uint(TOPK * R)) {
-  float acc[R][2];
-  dec_up_shared<R, K, N, T>(sw, sscales, n_col, x, lane, acc);
+  T acts[R];
+  dec_fp4_up_shared_acts<R, K, N, T>(sw, sscales, n_col, (const device uint4*)x, lim[0], lane, acts);
   if (lane == 0) {
 #pragma unroll
-    for (int r = 0; r < R; ++r) out[(r * (TOPK + 1) + TOPK) * N + n_col] = dec_up_act<T>(acc[r][0], acc[r][1], lim[0], 1.0f);
+    for (int r = 0; r < R; ++r) out[(r * (TOPK + 1) + TOPK) * N + n_col] = acts[r];
   }
   return;
 }
 const uint r = u / TOPK;
-float acc[2];
-dec_fp4_up_pair<K, N, T>(w, scales, size_t(inds[u]) * (2 * N) + n_col, x + size_t(r) * K, lane, acc);
-if (lane == 0) out[(r * (TOPK + 1) + u % TOPK) * N + n_col] = dec_up_act<T>(acc[0], acc[1], lim[0], wts[u]);
+const T act = dec_fp4_up_routed_act<K, N, T>(w, scales, inds[u], n_col, (const device uint4*)(x + size_t(r) * K), lim[0], wts[u], lane);
+if (lane == 0) out[(r * (TOPK + 1) + u % TOPK) * N + n_col] = act;

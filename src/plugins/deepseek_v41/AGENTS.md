@@ -26,6 +26,50 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   every GPU (NAX too); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the
   expert-pruned packs are 2-bit g128). Otherwise `routed` runs. `DSV41_MOE_BW=0` keeps the first launches (bit-equal).
   Its ubench times both arms at the per-rank widths 2304 / 1152 / 576 against a streaming read.
+- `decode/seg.zig`: `DSV41_FUSED_SEG=0-5` (unset is 0, the stock path byte for byte) picks the fused decode segment level
+  and `serves` / `covers` decide per model, rows and layer: TP4, NAX, resident mxfp4 experts, bf16, one row; the attention
+  segment skips layers 0 1 2 8 14 20 24 28 32 36 (30 of 40 covered), the FFN segment covers all 40. Every rank logs
+  `[dsv41] fused seg level <N> (<tag>) on` at load and, each 1,000 one-row forwards at level 1 or above, its segment launches
+  (once a layer), declines and forwards (once a whole model step). `seg_bounds.zig` holds
+  the kernel map's `ffn:nopre` / `ffn:oracle` ceilings; its `seg:<0-5>` and `seg:broken` arms run `segCheck` per phase
+  (`SEG-CHECK-OK`).
+- `decode/seg_proto.zig` + `kernels/seg_proto_header.metal`: the phase boundary inside one fused-segment launch.
+  `seg.Counters` are generation-stamped words (`gen << 16 | arrivals`, 16 a (layer, segment) slot), so a step never zeroes
+  the previous one's and a counter left dirty by an abort cannot satisfy a wait; `seg_wait` is bounded
+  (`SEG_SPIN_POLLS_DEFAULT`) and fails into `State.status`, which `seg.afterStep` reads after the step's evaluation
+  (latches `fused_seg` off, `error.Dsv41FusedSegTimeout`). MLX binds an input of under 16 words as constant memory, so any
+  array a kernel writes (counters, status) keeps 16. The ubench is `MLX_SERVE_DIAG=dsv41-seg-probe` (grids
+  `dsv41-seg-probe-groups=<lo>-<hi>`); `probeResidency` finds the co-resident grid and `seg.spinGrid` derates it.
+- Phase data crossing groups inside one fused launch: every word another group reads in the same launch is written
+  through `seg_write_peer_output` or `seg_write_peer_f32` and read through `seg_read_peer_output`, `seg_read_peer_f32`
+  or `seg_read_peer_bf16x2` (`seg_proto_header.metal`; `coherent(device)` stores and loads from Metal 3.2, relaxed
+  atomics below), never a plain `device` store or load. The order is the coherent stores, then `seg_release()` and the
+  arrival, then (after the wait or last-arriver check and `seg_acquire()`) the coherent reads. Both halves fail on the
+  two-die M5 Ultra and pass on the M5 Max's one die, so a one-die test cannot catch either and the review must: a plain
+  load of a peer's output returns a stale value, and a plain store from lane 0 of a simdgroup, or one word in each of
+  many lines, is still invisible to another group's coherent or atomic load after the device fence, padded to aligned
+  rows or not. The level-1 kernel's last arrivers read the output buffer's previous bytes in every launch that way while
+  the bytes after the launch were right. A simdgroup storing 32 consecutive aligned words happened to pass, which is
+  how the probe missed it; do not rely on it. `seg_proto.zig` test 1 runs every arm with six access modes (`atomic`,
+  `coherent`, `peer` asserted; `plain`, `atomic_load`, `peer_read` = plain stores or loads, reported not asserted) in
+  two layouts (a group's words contiguous, or interleaved across groups, one word a line a store); a kernel may use only
+  the asserted ones. `scripts/lint_pins.txt` pins the level-1 kernel's partials and scores to the pair.
+- `decode/seg_ffn_in.zig` + `kernels/dec_seg_ffn_in.metal` (level 1, `DSV41_FUSED_SEG=1`): a tensor rank's FFN entry in one
+  launch. Every mix and router threadgroup rebuilds the stream expand and collapse from `x`, the summed attention output
+  and the attention split; the mixes' last arriver reduces the Sinkhorn split, the router's last arriver takes the top
+  K (last-arriver word 0 and 1 of the layer's FFN slot). Its sums are in a fixed order, so the ranks route bit for bit;
+  weights differ from the chain's by summation order only.
+- `decode/seg_ffn.zig` + `kernels/dec_seg_ffn.metal` (level 2, `DSV41_FUSED_SEG=2`): the whole FFN at one row in one launch of
+  `seg_ffn.Geometry.items` threadgroups of 256 threads. A group takes its item with a generation-stamped ticket (word 0 of the
+  layer's FFN slot; the probe's raw ticket arithmetic breaks when a slot sees gaps in the generations): items 0..P-1 the
+  mixes, then the router groups (`dec_seg_ffn_phases_header.metal`, the level-1 phases as device functions), then the shared
+  gate/up (waits on all router arrivals, word 2), the routed gate/up (waits on top K, word 3), then the down tiles (wait on the
+  top K and, per simdgroup, on their slot's activations, words 4 + slot). Cross-group data lives in one `scratch` output (parts,
+  scores, h2, idx, wts, act) read and written only through `seg_*_peer_*`; h2 is staged once a group into threadgroup memory
+  (`ReadMode.staged`; `peer` and `plain` are kernel-map arms `seg:2c` / `seg:2p`, plain never a service path). The kernel
+  fails `grid_mismatch` when its grid is not its item count. A launch that declines (an unusual bank, more than six picks) runs
+  level 1's launch, then stock. 31 buffers is Metal's limit: inputs under 16 words are bound as
+  constant memory, so scalars ride in the 16-word `par` input.
 - A MoE ubench routes scattered experts and cycles 80+ weight sets: consecutive expert ids read far slower on M5 Max
   than a router's picks, and one reused set reads from the cache.
 - Under `tp` each `tpSum` is a CPU-stream JACCL all_sum, two a layer. With `MLX_METAL_FAST_SYNCH` (on in a group) MLX

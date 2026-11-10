@@ -10,6 +10,7 @@ const sdk_fixture = @import("../../../sdk/testing/fixture.zig");
 const config = @import("../config.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
+const seg = @import("seg.zig");
 const device = @import("../../../mlx/device.zig");
 const Shard = @import("../../../sdk/weights/shard.zig").Shard;
 
@@ -35,6 +36,8 @@ pub const Opts = struct {
     /// Every routed projection affine at this width over groups of 128 (the expert-pruned packs) instead of the iQ
     /// pack's plan (gate/up 2 or 3 bits, down 3, groups of 64).
     experts_affine: ?u32 = null,
+    seg: seg.Level = .off,
+    from_env: bool = false,
 };
 
 pub const DraftOpts = struct {
@@ -70,18 +73,25 @@ pub const Fixture = struct {
     draws: u64 = 0,
     /// The routed experts' affine group.
     group: c_int = 64,
+    opts: Opts = .{},
 
     pub fn init(gpa: std.mem.Allocator, opts: Opts) !*Fixture {
         const fx = try gpa.create(Fixture);
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();
         cfg.num_experts = opts.experts;
-        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64 };
+        // The fixture holds no Engram (a pair worker refuses an Engram layer), so layers 1 and 14 run as plain layers.
+        cfg.dsv41_n_engram_layers = 0;
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64, .opts = opts };
         errdefer fx.w.deinit();
-        for (opts.lo..opts.hi) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
-        if (opts.tp) |t| try fx.sliceShard(t);
+        // Cut a layer as soon as it is made, so a wide bank never stands whole for every layer at once.
+        for (opts.lo..opts.hi) |li| {
+            try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
+            if (opts.tp) |t| try fx.sliceShard(t, li);
+        }
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
         errdefer fx.m.deinit();
+        if (!opts.from_env) fx.m.fused_seg = opts.seg;
         if (!opts.fused) fx.m.dec.deinit();
         var p0: usize = 0;
         while (p0 < opts.ctx) {
@@ -112,7 +122,7 @@ pub const Fixture = struct {
         errdefer fx.w.deinit();
         try fx.putDraftHeads(&cfg);
         for (0..cfg.dsparkStages()) |si| try fx.putLayer(&cfg, "mtp.{d}.", si, opts.experts, true, null);
-        if (opts.tp) |t| try fx.sliceShard(.{ .rank = t.rank, .size = t.size, .stages = true });
+        if (opts.tp) |t| try fx.sliceShard(.{ .rank = t.rank, .size = t.size, .stages = true }, null);
         const holds_nothing: dsv41.Pair = .{ .lo = 0, .hi = cfg.num_hidden_layers, .worker = false };
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = holds_nothing, .act = opts.act, .dspark = true, .head_8bit = true, .tp = opts.tp, .draft_shard = opts.tp != null });
         errdefer fx.m.deinit();
@@ -144,7 +154,7 @@ pub const Fixture = struct {
         for (cfg.dsv41_engram_layers[0..cfg.dsv41_n_engram_layers]) |l| try fx.putEngram(&cfg, l);
         const ds = opts.dspark_stages > 0;
         if (ds) try fx.putStages(&cfg, opts);
-        if (opts.tp) |t| try fx.sliceShard(.{ .rank = t.rank, .size = t.size, .stages = ds });
+        if (opts.tp) |t| try fx.sliceShard(.{ .rank = t.rank, .size = t.size, .stages = ds }, null);
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .tp = opts.tp, .pack_dir = opts.engram_dir, .dspark = ds, .head_8bit = ds, .draft_shard = ds and opts.tp != null });
         return fx;
     }
@@ -206,10 +216,13 @@ pub const Fixture = struct {
     }
 
     /// Every tensor `t.axisOf` names cut to `t`'s part of its axis, in a buffer of its own.
-    fn sliceShard(fx: *Fixture, t: Shard) !void {
+    fn sliceShard(fx: *Fixture, t: Shard, layer_only: ?usize) !void {
         const s = mlx.gpuStream();
+        var pbuf: [32]u8 = undefined;
+        const pfx = if (layer_only) |li| try std.fmt.bufPrint(&pbuf, "layers.{d}.", .{li}) else "";
         var it = fx.w.map.iterator();
         while (it.next()) |kv| {
+            if (!std.mem.startsWith(u8, kv.key_ptr.*, pfx)) continue;
             const axis = t.axisOf(kv.key_ptr.*) orelse continue;
             const shape = mlx.getShape(kv.value_ptr.*);
             const ax = axis.of(shape.len);
@@ -819,23 +832,23 @@ test "dsv41 tensor parallel: a snapshot read from disk reaches the worker as its
 }
 
 /// One step's input rows: a stream and its mix.
-const Input = struct {
+pub const Input = struct {
     x: A,
     pre: A,
 
-    fn of(fx: *Fixture, rows: usize) !Input {
+    pub fn of(fx: *Fixture, rows: usize) !Input {
         const x = try fx.stream(rows);
         errdefer _ = mlx.mlx_array_free(x);
         return .{ .x = x, .pre = try fx.cpre(rows) };
     }
 
-    fn deinit(in: Input) void {
+    pub fn deinit(in: Input) void {
         _ = mlx.mlx_array_free(in.x);
         _ = mlx.mlx_array_free(in.pre);
     }
 
     /// One step of `m` over these rows, the stream in `m`'s activation dtype (caller frees both).
-    fn step(in: Input, gpa: std.mem.Allocator, m: *dsv41.Dsv41Model) ![2]A {
+    pub fn step(in: Input, gpa: std.mem.Allocator, m: *dsv41.Dsv41Model) ![2]A {
         var x = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x);
         try mlx.check(mlx.mlx_astype(&x, in.x, m.act, mlx.gpuStream()));
@@ -844,7 +857,7 @@ const Input = struct {
 };
 
 /// `fx`'s stream after its layers over `in`, from position 0 (caller frees).
-fn streamOf(gpa: std.mem.Allocator, fx: *Fixture, in: Input) ![]f32 {
+pub fn streamOf(gpa: std.mem.Allocator, fx: *Fixture, in: Input) ![]f32 {
     const out = try in.step(gpa, fx.m);
     defer for (out) |a| {
         _ = mlx.mlx_array_free(a);
@@ -861,7 +874,7 @@ fn tpStream(gpa: std.mem.Allocator, base: Opts, in: Input) ![]f32 {
 
 /// The stream `n` ranks give, each on its 1/n of the heads and experts, their sums met by a fixed point: every pass
 /// runs each rank on the others' parts from the pass before, until no sum changes.
-fn tpStreamN(gpa: std.mem.Allocator, base: Opts, in: Input, n: usize) ![]f32 {
+pub fn tpStreamN(gpa: std.mem.Allocator, base: Opts, in: Input, n: usize) ![]f32 {
     const max = 4;
     var ranks: [max]*Fixture = undefined;
     var made: usize = 0;
