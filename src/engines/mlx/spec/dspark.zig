@@ -351,6 +351,12 @@ pub fn dsparkVerifyDrafts(conf_logits: []const f32, calib: *const dflash_policy.
 
 /// A draft round's bookkeeping; the module stands at `position`.
 pub fn commitDsparkRound(self: *Generator, allocator: std.mem.Allocator, round_in: dsv4_mod.DsparkRound, position: usize) !?DrafterStepResult {
+    self.dspark_attempted += 1;
+    return commitDsparkTick(self, allocator, round_in, position);
+}
+
+/// A DSpark tick's bookkeeping, drafted or plain, not counted as an attempt; the module stands at `position`.
+pub fn commitDsparkTick(self: *Generator, allocator: std.mem.Allocator, round_in: dsv4_mod.DsparkRound, position: usize) !?DrafterStepResult {
     var round = round_in;
     errdefer round.deinit(allocator);
     // The round advanced the module state — mirror it on the shell
@@ -358,7 +364,6 @@ pub fn commitDsparkRound(self: *Generator, allocator: std.mem.Allocator, round_i
     // check keying on step==0) sees a consistent position. Generator.step
     // itself moves through advanceStep below (the clear-cadence clock).
     self.ctx.cache.step = position;
-    self.dspark_attempted += 1;
     self.dspark_accepted_tokens += round.accepted;
     try self.generated_ids.appendSlice(allocator, round.tokens);
     self.advanceStep(@intCast(round.tokens.len));

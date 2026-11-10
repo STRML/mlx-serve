@@ -293,7 +293,8 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     for (gens, states[0..n], drafts[0..n], kinds[0..n], 0..) |gen, st, d, kind, k| {
         if (drafted) try dsv41_mod.finishVerify(mdl, gpa, st, accepted[k] + 1);
         const tokens = try allocs[k].dupe(u32, d.ids[0 .. accepted[k] + 1]);
-        out[k] = (try gen.commitDsparkRound(allocs[k], .{ .tokens = tokens, .accepted = accepted[k], .next_token = next[k] }, st.n)).?;
+        if (kind != .plain) gen.dspark_attempted += 1;
+        out[k] = (try gen.commitDsparkTick(allocs[k], .{ .tokens = tokens, .accepted = accepted[k], .next_token = next[k] }, st.n)).?;
         done += 1;
         switch (kind) {
             .stage => {

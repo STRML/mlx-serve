@@ -175,7 +175,8 @@ pub const Generator = struct {
     dspark_pol: ?DflashPol = null,
     dspark_stats: dflash_policy.PositionStats = .{},
     dspark_plain: u64 = 0,
-    /// Rounds run as one slot of a DSpark group round (`spec/dspark_group.zig`), included in `dspark_attempted`.
+    /// Ticks run as one slot of a DSpark group round (`spec/dspark_group.zig`): the drafted ones in `dspark_attempted`,
+    /// the plain ones in `dspark_plain`.
     dspark_group_rounds: u64 = 0,
 
     // ── Gemma 4 assistant drafter state ──
@@ -687,6 +688,7 @@ pub const Generator = struct {
     pub const sigmoid = @import("../spec/dspark.zig").sigmoid;
     pub const dsparkVerifyDrafts = @import("../spec/dspark.zig").dsparkVerifyDrafts;
     pub const commitDsparkRound = @import("../spec/dspark.zig").commitDsparkRound;
+    pub const commitDsparkTick = @import("../spec/dspark.zig").commitDsparkTick;
     pub const nextDraw = @import("../spec/dspark.zig").nextDraw;
     pub const dsparkStochasticRound = @import("../spec/dspark.zig").dsparkStochasticRound;
     pub const rollbackSsmFromCapture = @import("pipeline.zig").rollbackSsmFromCapture;

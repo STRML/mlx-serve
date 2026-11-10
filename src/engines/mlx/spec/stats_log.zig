@@ -60,9 +60,9 @@ pub fn logSpecStats(self: *const Generator) void {
     var rows_buf: [160]u8 = undefined;
     var lookup_buf: [256]u8 = undefined;
     const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
-    if (self.dspark_enabled and self.dspark_attempted > 0) {
+    if (self.dspark_enabled and (self.dspark_attempted > 0 or self.dspark_plain > 0)) {
         const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
-            @as(f64, @floatFromInt(self.dspark_attempted));
+            @as(f64, @floatFromInt(@max(self.dspark_attempted, 1)));
         if (self.xfm.mlx_stream_ext) |m| {
             // The plugin's lane names the mode (DeepSeek-V4.1: dspark, MiMo: mtp).
             const lane = mlx_stream.laneName(m);

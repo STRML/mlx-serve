@@ -1103,6 +1103,7 @@ fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, ou
     }
     const ptrs = [_]*Generator{ &gens[0], &gens[1] };
     const allocs = [_]std.mem.Allocator{ a, a };
+    p.xfm.dspark_group_drafting.owed = 3; // the first rounds plain: a plain tick is no attempt
     var n: [2]usize = .{ 0, 0 };
     while (n[0] < out[0].len or n[1] < out[1].len) {
         var res: [2]@import("../../engines/mlx/spec/drafter.zig").DrafterStepResult = undefined;
@@ -1116,13 +1117,16 @@ fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, ou
             try testing.expectEqual(prompts[k].len + gens[k].generated_ids.items.len, gens[k].ctx.cache.step);
         }
     }
-    // ENGAGEMENT: every round a group round, and some verified drafts.
+    // ENGAGEMENT: every round a group round, a drafted one an attempt and a plain one not, and some verified drafts.
     var drafted: u64 = 0;
+    var plain: u64 = 0;
     for (gens) |gen| {
-        try testing.expect(gen.dspark_group_rounds >= 4 and gen.dspark_group_rounds == gen.dspark_attempted);
-        drafted += gen.dspark_group_rounds - gen.dspark_stats.rows[1];
+        try testing.expect(gen.dspark_group_rounds >= 4);
+        try testing.expectEqual(gen.dspark_group_rounds, gen.dspark_attempted + gen.dspark_plain);
+        drafted += gen.dspark_attempted - gen.dspark_stats.rows[1];
+        plain += gen.dspark_plain;
     }
-    try testing.expect(drafted > 0);
+    try testing.expect(drafted > 0 and plain >= 3);
 }
 
 test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tokens whichever slot shares them" {
