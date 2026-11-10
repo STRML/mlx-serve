@@ -4534,8 +4534,8 @@ pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
 }
 
 /// `x` summed over the tensor-parallel ranks (itself unsplit), in `m.act`: f32 at decode width, so the sum rounds once.
-/// `DSV41_TP_SUM`: `auto` (default) keeps a pair's rule and sums past a pair in the activation dtype (JACCL
-/// accumulates in f32 and rounds once; +5-6% decode at TP4, KLD unchanged); `bf16` does so at any size, `f32` sums
+/// `DSV41_TP_SUM`: `auto` (default) keeps a pair's rule and sums past a pair in the activation dtype (JACCL's
+/// bf16 sum rounds to bf16 after each rank's add; +5-6% decode at TP4, KLD unchanged); `bf16` does so at any size, `f32` sums
 /// wider past a pair as before, `off` skips the sums (wrong output, timing only), `gather` gathers every rank's part and
 /// adds them in rank order in f32 on the GPU (JACCL's reduce-scatter, which a sum over 32 KiB past a pair takes, adds
 /// parts in arrival order, so its bits vary run to run).
@@ -10975,7 +10975,7 @@ test "dsv41 tensor parallel: two ranks sum a bf16 part as it is, a wider part at
         try testing.expectEqual(dt, Seen.dt);
         try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
     }
-    // dist N-rank: past two ranks every part sums in the activation dtype (JACCL accumulates in f32, one rounding).
+    // dist N-rank: past two ranks every part sums in the activation dtype (JACCL rounds to bf16 after each rank's add).
     m.tp = .{ .rank = 0, .size = 4 };
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
         const y = try tpSum(&sc, &m, try sc.zeros(&.{ 2, 64 }, dt));
