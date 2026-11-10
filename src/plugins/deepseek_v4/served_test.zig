@@ -1103,6 +1103,8 @@ fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, ou
     }
     const ptrs = [_]*Generator{ &gens[0], &gens[1] };
     const allocs = [_]std.mem.Allocator{ a, a };
+    const per_group = env.override(.DSV41_DSPARK_GROUP_BACKOFF, null);
+    defer per_group.restore();
     p.xfm.dspark_group_drafting.owed = 3; // the first rounds plain: a plain tick is no attempt
     var n: [2]usize = .{ 0, 0 };
     while (n[0] < out[0].len or n[1] < out[1].len) {
