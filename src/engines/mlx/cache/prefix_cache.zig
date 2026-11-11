@@ -401,6 +401,8 @@ const Entry = struct {
     checkout_donated: bool = false,
     /// ARC list: false = T1 (seen once), true = T2 (a restore hit it, or a later turn of its conversation replaced it).
     frequent: bool = false,
+    /// A module tip its conversation forked away from: nothing extends it any more.
+    forked_off: bool = false,
     /// The write feed has registered this module entry with the SSD tier (landed, declined or still in flight).
     fed: bool = false,
 };
@@ -824,7 +826,7 @@ pub const HotPrefixCache = struct {
     feed_credit: i64 = 0,
     feed_at_ms: i64 = 0,
     feed_now_ms: ?i64 = null,
-    /// SIGTERM's flush began: T1 module tips are fed too, hottest first.
+    /// SIGTERM's flush began: T2 tips are fed hottest first with no idle wait, and a declined record is final.
     feed_shutdown: bool = false,
     /// The admission in progress recognised a B2 ghost: at |T1| == p the REPLACE rule then evicts T1.
     arc_b2_hit: bool = false,
@@ -1531,6 +1533,7 @@ pub const HotPrefixCache = struct {
             e.last_used = self.bumpCounter();
             e.touched_ms = crt.monotonicMs();
             e.frequent = true;
+            e.forked_off = false;
             // Evicting the entry this request runs on frees nothing while the slot shares it.
             self.last_restored_used = e.last_used;
             return payload.n;
@@ -2090,7 +2093,9 @@ pub const HotPrefixCache = struct {
         };
         // Allocate before removing any donor; OOM leaves the resident history intact.
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
-        const adm = self.arcBegin(ids, has_tools, quant_config, self.continuesModule(binding, ids, eff_media, has_tools, quant_config, cache_key));
+        const continues = self.continuesModule(binding, ids, eff_media, has_tools, quant_config, cache_key);
+        const forked = !continues and self.forksModule(binding, ids, eff_media, has_tools, quant_config, cache_key);
+        const adm = self.arcBegin(ids, has_tools, quant_config, continues or forked);
         self.supersedeModuleRungs(binding, ids, eff_media, has_tools, quant_config);
         const room = blk: {
             self.incoming_tip = .{ .binding = binding, .ids = ids, .media = eff_media, .has_tools = has_tools, .quant_config = quant_config };
@@ -2119,6 +2124,9 @@ pub const HotPrefixCache = struct {
         retained = true;
         self.current_kv_bytes += aux_bytes;
         self.arcEnd(ids, has_tools, quant_config, adm, true);
+        if (forked) self.demoteForkedOff(binding, ids, eff_media, has_tools, quant_config, cache_key);
+        const why: []const u8 = if (adm.ghost) "ghost hit" else if (continues) "next turn" else if (forked) "forked turn" else "first seen";
+        log.info("  [hot-cache] module commit {d} tokens key={x} -> {s} ({s})\n", .{ ids.len, cache_key, if (adm.frequent) "T2" else "T1", why });
         self.arcTrimGhosts();
         if (!self.feedMode()) self.registerModuleEntry(&self.entries.items[self.entries.items.len - 1]);
         self.logResident();
@@ -2147,12 +2155,15 @@ pub const HotPrefixCache = struct {
     /// Computed from what is resident, never stored, so a tip that leaves by any path (thinning, a
     /// failed restore, the stale or idle passes) turns its rungs back into ordinary entries.
     fn isModuleRung(self: *const HotPrefixCache, i: usize) bool {
+        if (self.entries.items[i].module == null) return false;
+        return self.incomingRung(i) or self.extendedByResident(i, null);
+    }
+
+    /// A rung of the module commit making room: its tip is about to be resident.
+    fn incomingRung(self: *const HotPrefixCache, i: usize) bool {
         const e = &self.entries.items[i];
-        if (e.module == null) return false;
-        if (self.incoming_tip) |t| {
-            if (t.ids.len > e.tokens.len and moduleRungOf(e, t.binding, t.ids, t.media, t.has_tools, t.quant_config)) return true;
-        }
-        return self.extendedByResident(i, null);
+        const t = self.incoming_tip orelse return false;
+        return e.module != null and t.ids.len > e.tokens.len and moduleRungOf(e, t.binding, t.ids, t.media, t.has_tools, t.quant_config);
     }
 
     /// Whether a longer resident module entry extends entry `i`; a `cache_key` counts only that workload's entries.
@@ -2239,7 +2250,7 @@ pub const HotPrefixCache = struct {
         if (self.residentBytes() > self.max_kv_bytes - bytes) self.cancelPendingModules(.memory_pressure);
         while (self.residentBytes() > self.max_kv_bytes - bytes) {
             const idx = self.lruIndexExcluding(null, cache_key) orelse return false;
-            self.evictForCapacity(idx, "byte budget", .memory_pressure);
+            self.evictForCapacity(idx, "byte budget", .memory_pressure, cache_key);
         }
         return true;
     }
@@ -2832,7 +2843,7 @@ pub const HotPrefixCache = struct {
                     self.entries.items.len > 1)
                 {
                     const victim = self.lruIndexExcluding(updated_used, null) orelse break;
-                    self.evictForCapacity(victim, "byte budget", null);
+                    self.evictForCapacity(victim, "byte budget", null, null);
                 }
                 self.shedCheckpointsToFit();
                 while (self.current_kv_bytes > self.max_kv_bytes and
@@ -3138,7 +3149,7 @@ pub const HotPrefixCache = struct {
         while (idle_bytes > self.ssd_idle_mem) {
             const idx = self.oldestIdleIndex(newest_used, true) orelse break;
             idle_bytes -|= self.entries.items[idx].kv_bytes;
-            self.evictForCapacity(idx, "SSD-first idle spill", null);
+            self.evictForCapacity(idx, "SSD-first idle spill", null, null);
             evicted += 1;
         }
 
@@ -3152,7 +3163,7 @@ pub const HotPrefixCache = struct {
                 @as(f64, @floatFromInt(e.kv_bytes)) / (1024.0 * 1024.0),
             });
             idle_bytes -|= e.kv_bytes;
-            self.evictForCapacity(idx, "SSD-first idle allowance", null);
+            self.evictForCapacity(idx, "SSD-first idle allowance", null, null);
             evicted += 1;
         }
 
@@ -3335,10 +3346,10 @@ pub const HotPrefixCache = struct {
     fn feedable(self: *const HotPrefixCache, i: usize) bool {
         const e = &self.entries.items[i];
         if (e.module == null or e.fed or e.checked_out_by != null or self.isModuleRung(i)) return false;
-        return e.frequent or self.feed_shutdown;
+        return e.frequent;
     }
 
-    /// A conversation's T2 tip the feed has not offered to the tier yet (T1 tips too once a shutdown began).
+    /// A conversation's T2 tip the feed has not offered to the tier yet.
     pub fn feedOwed(self: *const HotPrefixCache) bool {
         return self.feedOwedCount() > 0;
     }
@@ -3369,7 +3380,7 @@ pub const HotPrefixCache = struct {
     }
 
     /// The next entry to hand the tier, credit aside: serving takes the coldest T2 tip idle for the quiet period; a
-    /// shutdown takes T2 tips and then T1 tips, hottest first, with no idle wait.
+    /// shutdown takes T2 tips hottest first, with no idle wait.
     fn feedCandidate(self: *const HotPrefixCache, order: SliceOrder) ?usize {
         if (!self.feedMode() or order == .newest_first) return null;
         if (order == .oldest_quiet) if (self.pressureFeedVictim()) |i| if (self.feedable(i)) return i;
@@ -3383,14 +3394,7 @@ pub const HotPrefixCache = struct {
                 best = i;
                 continue;
             };
-            const o = &self.entries.items[b];
-            const ahead = if (!hottest)
-                e.last_used < o.last_used
-            else if (e.frequent != o.frequent)
-                e.frequent
-            else
-                e.last_used > o.last_used;
-            if (ahead) best = i;
+            if ((e.last_used > self.entries.items[b].last_used) == hottest) best = i;
         }
         return best;
     }
@@ -3415,7 +3419,7 @@ pub const HotPrefixCache = struct {
     }
 
     /// `oldest_quiet` is the idle loop's order: the oldest owed record, module tips only past their quiet period.
-    /// `shutdown_hottest` is a feed-mode shutdown: T2 tips then T1 tips, most recently used first.
+    /// `shutdown_hottest` is a feed-mode shutdown: T2 tips, most recently used first.
     const SliceOrder = enum { newest_first, oldest_first, oldest_quiet, shutdown_hottest };
 
     /// One bounded slice, then `disk_dirty` says whether anything is still owed. A parked
@@ -3840,7 +3844,7 @@ pub const HotPrefixCache = struct {
         while (self.residentBytes() > self.max_kv_bytes) {
             const idx = self.shrinkVictim() orelse break;
             if (self.holdsForFeed(idx)) return;
-            self.evictForCapacity(idx, "budget revised", .memory_pressure);
+            self.evictForCapacity(idx, "budget revised", .memory_pressure, null);
         }
         self.pressure_feed_until_ms = null;
         self.shedCheckpointsToFit();
@@ -3941,7 +3945,7 @@ pub const HotPrefixCache = struct {
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
         const idx = self.lruIndexExcluding(null, incoming_key) orelse return;
-        self.evictForCapacity(idx, reason, null);
+        self.evictForCapacity(idx, reason, null, incoming_key);
     }
 
     /// False when nothing was evictable (every survivor is checked out) — the termination
@@ -4200,13 +4204,14 @@ pub const HotPrefixCache = struct {
             return true;
         };
         const idx = self.lruIndexExcluding(protect, null) orelse return false;
-        self.evictForCapacity(idx, "admitting a long prefill", .memory_pressure);
+        self.evictForCapacity(idx, "admitting a long prefill", .memory_pressure, null);
         return true;
     }
 
     /// The entry to evict next, never the one whose `last_used` is `protect`: one idle past `stale_after_ms` (a
-    /// finished session's lone entry must not shield itself forever), then a module rung (every live conversation keeps
-    /// its newest checkpoint while rungs remain), then ARC's REPLACE: T1's `fairVictim` while T1 outweighs its target.
+    /// finished session's lone entry must not shield itself forever), then a rung of the commit making room, then T1
+    /// while it outweighs its target, then any module rung (every live conversation keeps its newest checkpoint while
+    /// rungs remain), then the rest of ARC's REPLACE.
     fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
@@ -4222,16 +4227,25 @@ pub const HotPrefixCache = struct {
             }
             if (best != null) return best;
         }
+        if (self.oldestRung(protect, true)) |i| return i;
+        const t2_first = !self.arcPrefersT1();
+        if (!t2_first) if (self.fairVictim(protect, incoming_key, false)) |i| return i;
+        if (self.oldestRung(protect, false)) |i| return i;
+        return self.fairVictim(protect, incoming_key, t2_first) orelse self.fairVictim(protect, incoming_key, !t2_first);
+    }
+
+    fn oldestRung(self: *const HotPrefixCache, protect: ?u64, incoming_only: bool) ?usize {
+        var best: ?usize = null;
+        var best_used: u64 = std.math.maxInt(u64);
         for (self.entries.items, 0..) |*e, i| {
             if (e.checked_out_by != null) continue;
             if (protect) |p| if (e.last_used == p) continue;
-            if (e.last_used >= best_used or !self.isModuleRung(i)) continue;
+            if (e.last_used >= best_used) continue;
+            if (!(if (incoming_only) self.incomingRung(i) else self.isModuleRung(i))) continue;
             best_used = e.last_used;
             best = i;
         }
-        if (best != null) return best;
-        const t2_first = !self.arcPrefersT1();
-        return self.fairVictim(protect, incoming_key, t2_first) orelse self.fairVictim(protect, incoming_key, !t2_first);
+        return best;
     }
 
     /// Workload-fair LRU within one ARC list: only entries of the `cache_key` holding the most eligible entries
@@ -4316,7 +4330,7 @@ pub const HotPrefixCache = struct {
         }
     }
 
-    const Admission = struct { frequent: bool, p_before: u64 };
+    const Admission = struct { frequent: bool, p_before: u64, ghost: bool = false };
 
     /// A commit of `tokens` that no resident entry holds, before it makes room: a ghost hit adapts the target at once
     /// (REPLACE then sees it) and the entry joins T2, as does the next turn of a resident conversation (`continues`).
@@ -4326,7 +4340,7 @@ pub const HotPrefixCache = struct {
         self.arc_b2_hit = g.frequent and g.bytes > 0;
         if (g.unfed) self.noteUnfedReturn();
         self.arcAdapt(g);
-        return .{ .frequent = true, .p_before = p_before };
+        return .{ .frequent = true, .p_before = p_before, .ghost = true };
     }
 
     /// The commit finished: a landed entry consumes its ghosts, a declined one gives the target back.
@@ -4363,12 +4377,27 @@ pub const HotPrefixCache = struct {
     }
 
     /// Evict to make room: the entry leaves a ghost.
-    fn evictForCapacity(self: *HotPrefixCache, idx: usize, reason: []const u8, cancellation: ?kv_disk_cache.DiskTier.ModuleCancellation) void {
+    fn evictForCapacity(self: *HotPrefixCache, idx: usize, reason: []const u8, cancellation: ?kv_disk_cache.DiskTier.ModuleCancellation, incoming_key: ?u64) void {
         const unfed = self.unfedT2Tip(idx);
+        var buf: [192]u8 = undefined;
+        const detail = self.evictionDetail(&buf, idx, reason, incoming_key);
         self.arcRecordGhost(idx, unfed);
         if (unfed) self.noteUnfedEviction();
-        self.evictAtWithCancellation(idx, reason, cancellation);
+        self.evictAtWithCancellation(idx, detail, cancellation);
         self.arcTrimGhosts();
+    }
+
+    /// "<reason>; T2 tip, idle 12.3 s, for key=..." for the eviction line.
+    fn evictionDetail(self: *const HotPrefixCache, buf: []u8, idx: usize, reason: []const u8, incoming_key: ?u64) []const u8 {
+        const e = &self.entries.items[idx];
+        const class: []const u8 = if (e.module == null) "entry" else if (self.isModuleRung(idx)) "rung" else if (e.forked_off) "dead same-key tip" else "tip";
+        const idle_s = @as(f64, @floatFromInt(@max(0, crt.monotonicMs() - e.touched_ms))) / 1000.0;
+        const list: []const u8 = if (e.frequent) "T2" else "T1";
+        const out = if (incoming_key) |k|
+            std.fmt.bufPrint(buf, "{s}; {s} {s}, idle {d:.1} s, for key={x}", .{ reason, list, class, idle_s, k })
+        else
+            std.fmt.bufPrint(buf, "{s}; {s} {s}, idle {d:.1} s", .{ reason, list, class, idle_s });
+        return out catch reason;
     }
 
     fn noteUnfedEviction(self: *HotPrefixCache) void {
@@ -4391,14 +4420,49 @@ pub const HotPrefixCache = struct {
         return false;
     }
 
+    /// Tokens `ids` shares with module entry `e` of the same workload, or null for another workload's entry.
+    fn moduleShared(e: *const Entry, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) ?usize {
+        const m = e.module orelse return null;
+        if (e.cache_key != cache_key or !ModuleBinding.same(m.binding, binding) or e.has_tools != has_tools) return null;
+        if (!std.meta.eql(e.quant_config, quant_config)) return null;
+        const lcp = std.mem.indexOfDiff(u32, e.tokens, ids) orelse e.tokens.len;
+        return @min(lcp, mediaSharedBound(e.media, media));
+    }
+
+    /// `ids` comes back to a resident conversation without extending its tip: a turn forked from an earlier rung, or a
+    /// retried turn. The lookup's promotion rule (`arcPromotes`) decides, as on the KV path.
+    fn forksModule(self: *const HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) bool {
+        for (self.entries.items) |*e| {
+            const shared = moduleShared(e, binding, ids, media, has_tools, quant_config, cache_key) orelse continue;
+            if (shared < ids.len and arcPromotes(shared, e.tokens.len)) return true;
+        }
+        return false;
+    }
+
+    /// The fork tip just landed: a same-workload tip it diverged from is dead and must not outlive it in T2.
+    fn demoteForkedOff(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) void {
+        for (self.entries.items, 0..) |*e, i| {
+            const shared = moduleShared(e, binding, ids, media, has_tools, quant_config, cache_key) orelse continue;
+            if (shared >= e.tokens.len or !arcPromotes(shared, e.tokens.len) or self.extendedByResident(i, null)) continue;
+            e.frequent = false;
+            e.forked_off = true;
+        }
+    }
+
     fn logResident(self: *const HotPrefixCache) void {
         const mb = @as(f64, @floatFromInt(self.current_kv_bytes)) / (1024.0 * 1024.0);
         if (self.max_kv_bytes == 0) {
             log.info("  [hot-cache] resident={d:.2} MB ({d}/{d} entries)\n", .{ mb, self.entries.items.len, self.max_entries });
         } else {
-            const cap_mb = @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0);
-            log.info("  [hot-cache] resident={d:.2} / {d:.2} MB ({d}/{d} entries)\n", .{ mb, cap_mb, self.entries.items.len, self.max_entries });
+            const z = self.arcSizes();
+            log.info("  [hot-cache] resident={d:.2} / {d:.2} MB ({d}/{d} entries; T1 {d:.1} T2 {d:.1} B1 {d:.1} B2 {d:.1} MB, p {d:.1} MB)\n", .{
+                mb, toMb(self.max_kv_bytes), self.entries.items.len, self.max_entries, toMb(z.t1), toMb(z.t2), toMb(z.b1), toMb(z.b2), toMb(self.arc_p),
+            });
         }
+    }
+
+    fn toMb(bytes: u64) f64 {
+        return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
     }
 
     /// Drop all entries. Called when the cache is suspect (pad-only generation, image-bearing
@@ -12243,6 +12307,61 @@ test "HotPrefixCache ARC prefix cache: only the next turn of the same workload's
     cache.invalidateAll("test end");
 }
 
+test "HotPrefixCache ARC prefix cache: a forked turn's tip joins T2, the dead tip it left drops to T1, and the live tip outlasts one-shots" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 200);
+    defer cache.deinit();
+    cache.stale_after_ms = 0;
+    const ids = ModuleDiskTest.ids(1000);
+    var fork: [450]u32 = undefined;
+    @memcpy(fork[0..400], ids[0..400]);
+    for (fork[400..], 0..) |*t, i| t.* = @intCast(90_000 + i);
+    var turns = [_]ModuleFake.Snap{ arcSnap(&fake, ids[0..300], 40), arcSnap(&fake, ids[0..400], 40), arcSnap(&fake, ids[0..500], 40) };
+    for (&turns) |*t| try arcPutKey(&cache, binding, t, 7);
+    try testing.expect(arcEntry(&cache, ids[0..500]).?.frequent);
+    var tip = arcSnap(&fake, &fork, 40);
+    try arcPutKey(&cache, binding, &tip, 7);
+    try testing.expect(arcEntry(&cache, &fork).?.frequent);
+    try testing.expect(!arcEntry(&cache, ids[0..500]).?.frequent);
+    var shots: [5]ModuleFake.Snap = undefined;
+    var shot_ids: [5][2]u32 = undefined;
+    for (&shots, &shot_ids, 0..) |*shot, *id, i| {
+        id.* = .{ @intCast(100 + i), @intCast(200 + i) };
+        shot.* = arcSnap(&fake, id, 40);
+        try arcPutKey(&cache, binding, shot, 9);
+    }
+    try testing.expect(arcEntry(&cache, &fork) != null);
+    try testing.expectEqual(@as(usize, 0), tip.frees);
+    cache.invalidateAll("test end");
+}
+
+test "HotPrefixCache ARC prefix cache: a one-shot in T1 goes before a T2 session's rung" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 120);
+    defer cache.deinit();
+    cache.stale_after_ms = 0;
+    const ids = ModuleDiskTest.ids(1000);
+    var rung = arcSnap(&fake, ids[0..300], 40);
+    try arcPutKey(&cache, binding, &rung, 7);
+    (try testEntryFor(&cache, ids[0..300])).frequent = true;
+    var tip = arcSnap(&fake, ids[0..400], 40);
+    try arcPutKey(&cache, binding, &tip, 7);
+    var one_shot = arcSnap(&fake, &.{ 100, 200 }, 40);
+    try arcPutKey(&cache, binding, &one_shot, 9);
+    try testing.expect(!arcEntry(&cache, &.{ 100, 200 }).?.frequent);
+    var next = arcSnap(&fake, &.{ 101, 201 }, 40);
+    try arcPutKey(&cache, binding, &next, 10);
+    try testing.expect(arcEntry(&cache, &.{ 100, 200 }) == null);
+    try testing.expect(arcEntry(&cache, ids[0..300]) != null);
+    cache.invalidateAll("test end");
+}
+
 fn arcKvCommit(hc: *HotPrefixCache, s: mlx.mlx_stream, tokens: []const u32) !void {
     var kv = try KVCache.init(testing.allocator, 1);
     defer kv.deinit();
@@ -12480,7 +12599,7 @@ test "module feed: the byte budget holds over a window and only idle T2 entries 
     try testing.expectEqual(FlushResult.quiet, hc.flushOwedSlice(cpu));
 }
 
-test "module feed: a T1 entry is never fed while serving and is written at shutdown" {
+test "module feed: a T1 entry is never fed, not even at shutdown" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -12503,8 +12622,8 @@ test "module feed: a T1 entry is never fed while serving and is written at shutd
     var now: i64 = 0;
     try testing.expectEqual(@as(u64, 0), hc.disk.?.bytes_persisted);
     const tally = shutdownPersist(&.{.{ .hc = &hc, .s = cpu }}, TestStepClock{ .now = &now, .step = 0 }, 1_000_000);
-    try testing.expectEqual(@as(u32, 2), tally.written);
-    try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
+    try testing.expectEqual(@as(u32, 0), tally.written);
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
 }
 
 test "module feed: a superseded rung is never written, the tip is" {
@@ -12629,7 +12748,7 @@ test "module feed: a shutdown under a declining volume ends and counts the decli
     try testing.expectEqual(@as(u32, 1), tally.left_declined);
 }
 
-test "module feed: shutdown writes T2 tips hottest first, then T1 tips hottest first" {
+test "module feed: shutdown writes only T2 tips, hottest first" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -12647,8 +12766,8 @@ test "module feed: shutdown writes T2 tips hottest first, then T1 tips hottest f
     for (0..4) |i| try FeedTest.put(&hc, &fake, binding, &snaps[i], &ids[i], frequent[i], 1_000_000);
     var now: i64 = 0;
     const tally = shutdownPersist(&.{.{ .hc = &hc, .s = cpu }}, TestStepClock{ .now = &now, .step = 0 }, 1_000_000);
-    try testing.expectEqual(@as(u32, 4), tally.written);
-    const expected = [_]usize{ 3, 1, 2, 0 };
+    try testing.expectEqual(@as(u32, 2), tally.written);
+    const expected = [_]usize{ 3, 1 };
     for (hc.disk.?.entries.items, expected) |e, want| try testing.expectEqualSlices(u32, ids[want][0..512], e.tokens);
 }
 
