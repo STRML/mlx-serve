@@ -1404,9 +1404,9 @@ test "dsv41 engram: a prompt grid read whole past the cache (a streamed bank's t
     for (&pfs, [_]*const Table{ &plain, &direct }) |*pf, t| pf.* = try Prefetch.start(testing.allocator, &.{t}, &.{.{ .at = 0, .len = grid_rows, .ids = ids }}, 2, 256);
     defer for (pfs) |pf| pf.finish();
     for (0..grid_rows / 256) |k| {
-        const a = try pfs[0].take(0, 0, k);
+        const a = (try pfs[0].take(0, 0, k)).raw;
         defer a.deinit(testing.allocator);
-        const b = try pfs[1].take(0, 0, k);
+        const b = (try pfs[1].take(0, 0, k)).raw;
         defer b.deinit(testing.allocator);
         try testing.expectEqualSlices(u8, a.w, b.w);
         try testing.expectEqualSlices(u8, a.s, b.s);
