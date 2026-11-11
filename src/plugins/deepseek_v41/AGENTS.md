@@ -87,8 +87,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.
 
 ## Facts the table declares
-- `owns_decode_state`, `slot_state` + `batches_decode` (any streamed bank: single-flight, since its load bills one
-  request's state and admission bills it none): active state in `dec_state`, other live slots in `parked`; decode and DSpark
+- `owns_decode_state`, `slot_state` + `batches_decode` (any streamed bank: single-flight, narrowed at load by
+  `intree.narrowLoadedCaps`, since its load bills one request's state and admission bills it none): active state in `dec_state`, other live slots in `parked`; decode and DSpark
   rounds batch through `extendBatched` (rows a state, projections shared, attention per state, at most `batchRows`
   rows: 8 on the EXL3 bank's decode lane) and `dsparkDraftBatched`. Each State owns its pending capture.
 - `prefix_cache` for unpaired instances whose bank holds every expert; a streaming bank (fewer prompt or decode slot

@@ -1185,7 +1185,7 @@ test "deepseek_v41 served: a group slot whose drafts the group verifies none of 
     try testing.expect(staged > 0);
 }
 
-test "deepseek_v41 served: a resident instance batches and groups its DSpark slots, one whose bank streams groups none" {
+test "deepseek_v41 served: a resident instance batches and groups its DSpark slots, one whose bank streams serves one request at a time" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1199,7 +1199,8 @@ test "deepseek_v41 served: a resident instance batches and groups its DSpark slo
     const mdl = intree.dsv41(&p.xfm).?;
     mdl.bank_streams = true;
     defer mdl.bank_streams = false;
-    try testing.expect(!dspark_group.groupable(&p.xfm));
+    intree.narrowLoadedCaps(&p.xfm);
+    try testing.expect(!caps.slot_state and !verdict.configBatchesDecode(&p.cfg) and !dspark_group.groupable(&p.xfm));
 }
 
 test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tokens whichever slot shares them" {
