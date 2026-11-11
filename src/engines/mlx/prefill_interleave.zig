@@ -92,9 +92,11 @@ pub fn specYieldTick(active: []const *Slot) void {
 /// Prefill width while other streams decode: a chunk boundary is their only yield point.
 const COMPANY_PREFILL_CHUNK: u32 = 2048;
 
-pub fn companyPrefillChunk(chunk: u32, decoding: usize) u32 {
+/// `beside_decode`: the model's narrowest chunk beside decoders (`ModelConfig.prefillWidths`), 0 = the engine's.
+pub fn companyPrefillChunk(chunk: u32, decoding: usize, beside_decode: u32) u32 {
     if (decoding == 0) return chunk;
-    return if (chunk == 0) COMPANY_PREFILL_CHUNK else @min(chunk, COMPANY_PREFILL_CHUNK);
+    const cap = @max(COMPANY_PREFILL_CHUNK, beside_decode);
+    return if (chunk == 0) cap else @min(chunk, cap);
 }
 
 /// Largest accepted decode share: at 0.9 the decoders own nine times each chunk's time.
@@ -132,9 +134,9 @@ pub fn promptLogprobsWidthCap(echo: bool, cap: u32) u32 {
 /// The width a prefill started beside live decoders may run at, 0 = no cap. Decided when
 /// the prefill starts, after admission, so admission bills the uncapped width. A decoder
 /// that finishes mid-prefill lifts the cap only where the adaptive width hook runs.
-pub fn decodeShareAdmissionCap(decoding: usize, share: f32) u32 {
+pub fn decodeShareAdmissionCap(decoding: usize, share: f32, beside_decode: u32) u32 {
     if (decoding == 0 or share <= 0) return 0;
-    return DECODE_SHARE_PREFILL_CHUNK;
+    return @max(DECODE_SHARE_PREFILL_CHUNK, beside_decode);
 }
 
 /// Decode wall time owed after a prefill chunk of `chunk_ns`: chunk * S / (1 - S).
@@ -152,8 +154,8 @@ pub fn interleaveTickOwed(share: f32, chunk_ns: u64, first_ns: u64, ticks: u32, 
 }
 
 /// The adaptive width hook's pick, capped while a decode share is live and someone decodes.
-pub fn decodeShareWidthCap(width: u32, decoding: usize, share: f32) u32 {
-    const cap = decodeShareAdmissionCap(decoding, share);
+pub fn decodeShareWidthCap(width: u32, decoding: usize, share: f32, beside_decode: u32) u32 {
+    const cap = decodeShareAdmissionCap(decoding, share, beside_decode);
     return if (cap == 0) width else @min(width, cap);
 }
 
@@ -480,7 +482,7 @@ pub fn chunkWidthCb(
     const next = pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
     // Only a live adaptive width may move; elsewhere the admitted width stands.
     if (!adaptiveChunkWidthFor(cfg)) return next;
-    return decodeShareWidthCap(next, scheduler_mod.liveDecodingCount(wc.sch), prefillDecodeShare());
+    return decodeShareWidthCap(next, scheduler_mod.liveDecodingCount(wc.sch), prefillDecodeShare(), cfg.prefillWidths().beside_decode);
 }
 
 /// What the owed-tick loop runs between boundaries: admit what arrived, then tick. Returns the
@@ -736,10 +738,23 @@ test "modelCompany: only another slot on the same model that can join its group 
 }
 
 test "companyPrefillChunk: a prefill narrows only while someone decodes" {
-    try testing.expectEqual(@as(u32, 8192), companyPrefillChunk(8192, 0));
-    try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(8192, 1));
-    try testing.expectEqual(@as(u32, 1024), companyPrefillChunk(1024, 3));
-    try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(0, 1));
+    try testing.expectEqual(@as(u32, 8192), companyPrefillChunk(8192, 0, 0));
+    try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(8192, 1, 0));
+    try testing.expectEqual(@as(u32, 1024), companyPrefillChunk(1024, 3, 0));
+    try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(0, 1, 0));
+}
+
+test "prefill beside decode: a model's declared width holds under company and a decode share, never past admission's" {
+    const v41: model_mod.ModelConfig = .{ .model_type = "deepseek_v41" };
+    const wide = v41.prefillWidths().beside_decode;
+    try testing.expectEqual(@as(u32, 4096), companyPrefillChunk(8192, 1, wide));
+    try testing.expectEqual(@as(u32, 4096), decodeShareWidthCap(8192, 1, 0.25, wide));
+    try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(2048, 1, wide));
+    try testing.expectEqual(@as(u32, 2048), decodeShareWidthCap(2048, 1, 0.25, wide));
+    const other: model_mod.ModelConfig = .{ .model_type = "qwen3_5_moe" };
+    const narrow = other.prefillWidths().beside_decode;
+    try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(8192, 1, narrow));
+    try testing.expectEqual(DECODE_SHARE_PREFILL_CHUNK, decodeShareWidthCap(8192, 1, 0.25, narrow));
 }
 
 test "promptLogprobsWidthCap: an echo prefill narrows to its cap, 0 (uncapped) included" {
@@ -752,13 +767,13 @@ test "promptLogprobsWidthCap: an echo prefill narrows to its cap, 0 (uncapped) i
 
 test "decode share: a live share caps the width only while someone decodes" {
     const w = DECODE_SHARE_PREFILL_CHUNK;
-    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(0, 0.5));
-    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(2, 0));
-    try testing.expectEqual(w, decodeShareAdmissionCap(1, 0.5));
-    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 1, 0));
-    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 0, 0.5));
-    try testing.expectEqual(w, decodeShareWidthCap(8192, 1, 0.5));
-    try testing.expectEqual(@as(u32, 512), decodeShareWidthCap(512, 1, 0.5));
+    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(0, 0.5, 0));
+    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(2, 0, 4096));
+    try testing.expectEqual(w, decodeShareAdmissionCap(1, 0.5, 0));
+    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 1, 0, 0));
+    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 0, 0.5, 0));
+    try testing.expectEqual(w, decodeShareWidthCap(8192, 1, 0.5, 0));
+    try testing.expectEqual(@as(u32, 512), decodeShareWidthCap(512, 1, 0.5, 0));
 }
 
 test "decode share: parse clamps above 0.9 and rejects anything that is not a share" {
