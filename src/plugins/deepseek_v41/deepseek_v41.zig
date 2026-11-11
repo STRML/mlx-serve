@@ -5783,7 +5783,7 @@ pub const Laps = struct {
             build / n,
             ph[@intFromEnum(Phase.submit)] / n,
             total / n,
-            if (engramEarly()) "on" else "off",
+            if (engramEarlyOn()) "on" else "off",
         }) catch out[0..0];
     }
 };
@@ -5792,10 +5792,10 @@ pub const Laps = struct {
 /// thread's start; otherwise every layer's rows are read at once before the chunk's first Engram layer is built, and
 /// each Engram stage goes to the GPU as soon as it is built, before the rest of its layer.
 pub fn engramReadsAtOnce(rows: usize) bool {
-    return rows == 1 and engramEarly();
+    return rows == 1 and engramEarlyOn();
 }
 
-fn engramEarly() bool {
+fn engramEarlyOn() bool {
     const v = env.get(.DSV41_ENGRAM_EARLY);
     return v == null or v.?[0] != '0';
 }
@@ -8165,7 +8165,7 @@ pub fn dsparkRoundChain(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: 
 fn stashChain(m: *Dsv41Model, gpa: std.mem.Allocator, st: *const State, next: u32, g: DraftGraph) !void {
     dropChain(m);
     var out: [1]DsparkDraft = undefined;
-    try readDrafts(m, gpa, g, &.{next}, false, &out);
+    try readDrafts(m, gpa, g, &.{next}, false, false, &out);
     m.ds_chain = .{ .gen = m.state_gen, .n = st.n, .t1 = next, .draft = out[0], .gpa = gpa };
     if (m.draft_shard) m.tp_drafted = Drafted.of(m.state_gen, st.n, out[0].ids);
     if (m.tp) |t| if (t.rank == 0) if (clusterHooks().tp_chained) |f| try f(m.state_gen, st.n);
