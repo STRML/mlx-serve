@@ -459,6 +459,8 @@ pub const DiskTier = struct {
     /// covering the usable prefix, not the whole stored entry. Not persisted.
     chunks_loaded_last: u32 = 0,
     module_context: ?module_record.Context = null,
+    /// The shared lock on `<root>/.claim` that tells a renaming process this module tier is in use.
+    claim: ?std.Io.File = null,
     module_export_losses_total: u64 = 0,
     pending_module: ?PendingModuleFile = null,
     module_materialization_bytes: u64 = 0,
@@ -517,6 +519,7 @@ pub const DiskTier = struct {
             .total_bytes = 0,
             .counter = 0,
             .module_context = context,
+            .claim = if (context != null) claimTierDir(io, root) else null,
         };
         self.scan() catch |err| {
             log.warn("[disk-cache] scan failed: {s} — starting empty\n", .{@errorName(err)});
@@ -892,7 +895,7 @@ pub const DiskTier = struct {
         errdefer self.allocator.free(header);
         if (!std.mem.eql(u8, header, e.module.?.header)) return error.BadModuleHeader;
         const context = self.module_context orelse return error.BadModuleHeader;
-        if (!std.mem.eql(u8, context.identity, e.module.?.manifest.identity)) return error.BadModuleHeader;
+        if (!context.accepts(e.module.?.manifest.identity)) return error.BadModuleHeader;
         if (!context.validate(context.user, header, &e.module.?.manifest)) return error.BadModuleHeader;
         return header;
     }
@@ -948,7 +951,7 @@ pub const DiskTier = struct {
     fn validateModuleFiles(self: *DiskTier, e: *const IndexEntry) !void {
         const m = &e.module.?;
         const context = self.module_context orelse return error.BadModuleHeader;
-        if (!std.mem.eql(u8, context.identity, m.manifest.identity)) return error.BadModuleHeader;
+        if (!context.accepts(m.manifest.identity)) return error.BadModuleHeader;
         if (!context.validate(context.user, m.header, &m.manifest)) return error.BadModuleHeader;
         try self.validateModuleSmallFile(m.directory, "meta.json", m.meta);
         try self.validateModuleSmallFile(m.directory, "module.header", m.header);
@@ -1238,6 +1241,8 @@ pub const DiskTier = struct {
         }
         if (self.base_dir) |b| self.allocator.free(b);
         self.base_dir = null;
+        if (self.claim) |f| f.close(self.io);
+        self.claim = null;
         if (self.writer) |w| {
             // Teardown must never block on a paused writer: lift the pause so the queue drains for real.
             w.setPaused(false);
@@ -3793,7 +3798,7 @@ pub const DiskTier = struct {
         var record = try module_record.Record.parse(self.allocator, meta, header);
         errdefer record.deinit();
         const m = record.manifest;
-        if (!std.mem.eql(u8, context.identity, m.identity)) return error.BadModuleHeader;
+        if (!context.accepts(m.identity)) return error.BadModuleHeader;
         if (!context.validate(context.user, header, &m)) return error.BadModuleHeader;
         const quant = try moduleQuant(m);
         record.directory = try std.fmt.allocPrint(record.arena.allocator(), "{s}/e{d}/", .{ self.root, id });
@@ -4237,6 +4242,35 @@ fn reapStaleTmp(io: std.Io, dir_abs: []const u8) void {
     }
 }
 
+pub const CLAIM_NAME = ".claim";
+
+/// Marks a module tier root as in use for as long as the returned file stays open (a shared advisory lock).
+/// Null when the lock cannot be taken; the tier then runs unmarked.
+pub fn claimTierDir(io: std.Io, root: []const u8) ?std.Io.File {
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{}) catch return null;
+    defer dir.close(io);
+    const file = dir.createFile(io, CLAIM_NAME, .{ .read = true, .truncate = false }) catch return null;
+    const held = file.tryLock(io, .shared) catch false;
+    if (held) return file;
+    file.close(io);
+    return null;
+}
+
+/// Total bytes of every regular file under `dir_abs`.
+pub fn treeBytes(allocator: std.mem.Allocator, io: std.Io, dir_abs: []const u8) u64 {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    var walker = dir.walk(allocator) catch return 0;
+    defer walker.deinit();
+    var total: u64 = 0;
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const st = entry.dir.statFile(io, entry.basename, .{}) catch continue;
+        total += st.size;
+    }
+    return total;
+}
+
 /// Total bytes of the regular files directly inside `dir_abs`.
 fn dirBytes(io: std.Io, dir_abs: []const u8) u64 {
     var d = std.Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return 0;
@@ -4285,12 +4319,24 @@ pub fn modelFingerprintWithLayout(
         const mt: i128 = st.mtime.nanoseconds;
         h.update(std.mem.asBytes(&mt));
     }
+    updateSettings(&h, layout_namespace);
+    return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
+}
+
+/// Fingerprint for tiers whose pack identity already covers every file the model reads, config.json included:
+/// no directory and no mtime, so a byte-identical pack on another box or in another place gets the same name.
+pub fn contentFingerprint(allocator: std.mem.Allocator, layout_namespace: ?[]const u8) ![]u8 {
+    var h = std.hash.XxHash64.init(0x6b76_6361_6368_6532);
+    updateSettings(&h, layout_namespace);
+    return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
+}
+
+fn updateSettings(h: *std.hash.XxHash64, layout_namespace: ?[]const u8) void {
     if (model.getConfigOverrides()) |raw| h.update(raw);
     if (layout_namespace) |layout| {
         h.update("\x00mlx-serve-kv-layout\x00");
         h.update(layout);
     }
-    return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }
 
 /// Default persistence root: `~/.mlx-serve/kv-cache`.

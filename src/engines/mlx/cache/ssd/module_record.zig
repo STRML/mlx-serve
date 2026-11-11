@@ -28,7 +28,7 @@ pub const Envelope = struct {
     scheme: []const u8,
     bits: u8,
     group_size: u32,
-    /// Loaded settings and the sorted pack stat stamp, supplied before scan.
+    /// Loaded settings and the pack stamp, supplied before scan.
     identity: []const u8,
     header_bytes: u64,
     token_bytes: u64,
@@ -44,14 +44,39 @@ pub const Context = struct {
     identity: []const u8,
     user: ?*anyopaque = null,
     validate: *const fn (?*anyopaque, []const u8, *const Envelope) bool,
+    alias_buf: [MAX_ALIAS_BYTES]u8 = @splat(0),
+    alias_len: u8 = 0,
+
+    /// A second identity whose records stay valid: the stat identity of a tier that was renamed to this one.
+    pub fn withAlias(self: Context, alias: []const u8) Context {
+        if (alias.len > MAX_ALIAS_BYTES) return self;
+        var out = self;
+        @memcpy(out.alias_buf[0..alias.len], alias);
+        out.alias_len = @intCast(alias.len);
+        return out;
+    }
+
+    pub fn accepts(self: *const Context, id: []const u8) bool {
+        if (std.mem.eql(u8, self.identity, id)) return true;
+        return self.alias_len > 0 and std.mem.eql(u8, self.alias_buf[0..self.alias_len], id);
+    }
 };
+const MAX_ALIAS_BYTES = 64;
 
 pub const TokenMap = union(enum) { absent, builtin, file: []const u8 };
-const PackFile = struct { name: []const u8, present: bool, bytes: u64 = 0, mtime: i128 = 0 };
+pub const pack_digest = @import("pack_digest.zig");
+const PackFile = struct { name: []const u8, present: bool, bytes: u64 = 0, mtime: i128 = 0, digest: ?[]const u8 = null };
 
-/// Names come from the loaded pack's weight selection, including applicable auxiliary weights.
-/// Only stats enter the identity; token-map absence and the embedded fallback are distinct.
-pub fn packStamp(a: std.mem.Allocator, io: std.Io, root: []const u8, files: []const []const u8, token_map: TokenMap) ![]u8 {
+const Inventory = struct {
+    files: []PackFile,
+    token_map_file: ?PackFile,
+
+    fn deinit(self: Inventory, a: std.mem.Allocator) void {
+        a.free(self.files);
+    }
+};
+
+fn inventory(a: std.mem.Allocator, io: std.Io, root: []const u8, files: []const []const u8, token_map: TokenMap) !Inventory {
     var dir = try std.Io.Dir.openDirAbsolute(io, root, .{});
     defer dir.close(io);
     const names = try a.dupe([]const u8, files);
@@ -62,7 +87,7 @@ pub fn packStamp(a: std.mem.Allocator, io: std.Io, root: []const u8, files: []co
         }
     }.less);
     const stamps = try a.alloc(PackFile, names.len);
-    defer a.free(stamps);
+    errdefer a.free(stamps);
     for (names, 0..) |name, i| {
         if (i > 0 and std.mem.eql(u8, names[i - 1], name)) return error.BadPackStamp;
         stamps[i] = try statPackFile(io, dir, name);
@@ -71,7 +96,41 @@ pub fn packStamp(a: std.mem.Allocator, io: std.Io, root: []const u8, files: []co
         .file => |name| try statPackFile(io, dir, name),
         else => null,
     };
-    return std.json.Stringify.valueAlloc(a, .{ .files = stamps, .token_map = @tagName(token_map), .token_map_file = map_file }, .{});
+    return .{ .files = stamps, .token_map_file = map_file };
+}
+
+/// Names come from the loaded pack's weight selection, including applicable auxiliary weights.
+/// Token-map absence and the embedded fallback are distinct. With `digests` the stamp holds each file's
+/// content digest and no mtime, and fails with PackDigestPending until every present file has one;
+/// without it the stamp holds the file stats.
+pub fn packStamp(a: std.mem.Allocator, io: std.Io, root: []const u8, files: []const []const u8, token_map: TokenMap, digests: ?*const pack_digest.Store) ![]u8 {
+    var inv = try inventory(a, io, root, files, token_map);
+    defer inv.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    if (digests) |store| {
+        for (inv.files) |*f| try sealContent(arena.allocator(), store, f);
+        if (inv.token_map_file) |*f| try sealContent(arena.allocator(), store, f);
+    }
+    return std.json.Stringify.valueAlloc(a, .{ .files = inv.files, .token_map = @tagName(token_map), .token_map_file = inv.token_map_file }, .{});
+}
+
+fn sealContent(aa: std.mem.Allocator, store: *const pack_digest.Store, f: *PackFile) !void {
+    if (!f.present) return;
+    const digest = store.get(f.name, f.bytes, f.mtime) orelse return error.PackDigestPending;
+    f.digest = try aa.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+    f.mtime = 0;
+}
+
+/// Hashes the pack files up to `max_file_bytes` that have no valid sidecar entry and records them. Returns how many it hashed.
+pub fn digestPack(a: std.mem.Allocator, io: std.Io, root: []const u8, cache_dir: []const u8, files: []const []const u8, token_map: TokenMap, max_file_bytes: u64) !usize {
+    var inv = try inventory(a, io, root, files, token_map);
+    defer inv.deinit(a);
+    var targets = std.ArrayList(pack_digest.Target).empty;
+    defer targets.deinit(a);
+    for (inv.files) |f| if (f.present and f.bytes <= max_file_bytes) try targets.append(a, .{ .name = f.name, .size = f.bytes, .mtime_ns = f.mtime });
+    if (inv.token_map_file) |f| if (f.present and f.bytes <= max_file_bytes) try targets.append(a, .{ .name = f.name, .size = f.bytes, .mtime_ns = f.mtime });
+    return pack_digest.fill(a, io, root, cache_dir, targets.items);
 }
 
 fn statPackFile(io: std.Io, dir: std.Io.Dir, name: []const u8) !PackFile {
@@ -360,22 +419,329 @@ test "pack stat stamps sort loaded files and distinguish token map fallback" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.safetensors", .data = "a" });
     var buf: [512]u8 = undefined;
     const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
-    const first = try packStamp(testing.allocator, testing.io, root, &.{ "b.safetensors", "a.safetensors", "dspark.safetensors" }, .builtin);
+    const first = try packStamp(testing.allocator, testing.io, root, &.{ "b.safetensors", "a.safetensors", "dspark.safetensors" }, .builtin, null);
     defer testing.allocator.free(first);
-    const reordered = try packStamp(testing.allocator, testing.io, root, &.{ "dspark.safetensors", "a.safetensors", "b.safetensors" }, .builtin);
+    const reordered = try packStamp(testing.allocator, testing.io, root, &.{ "dspark.safetensors", "a.safetensors", "b.safetensors" }, .builtin, null);
     defer testing.allocator.free(reordered);
     try testing.expectEqualStrings(first, reordered);
-    const absent = try packStamp(testing.allocator, testing.io, root, &.{ "b.safetensors", "a.safetensors", "dspark.safetensors" }, .absent);
+    const absent = try packStamp(testing.allocator, testing.io, root, &.{ "b.safetensors", "a.safetensors", "dspark.safetensors" }, .absent, null);
     defer testing.allocator.free(absent);
     try testing.expect(!std.mem.eql(u8, first, absent));
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.safetensors", .data = "changed" });
-    const changed = try packStamp(testing.allocator, testing.io, root, &.{ "b.safetensors", "a.safetensors", "dspark.safetensors" }, .builtin);
+    const changed = try packStamp(testing.allocator, testing.io, root, &.{ "b.safetensors", "a.safetensors", "dspark.safetensors" }, .builtin, null);
     defer testing.allocator.free(changed);
     try testing.expect(!std.mem.eql(u8, first, changed));
-    const missing_map = try packStamp(testing.allocator, testing.io, root, &.{ "a.safetensors", "b.safetensors" }, .{ .file = "token_map.bin" });
+    const missing_map = try packStamp(testing.allocator, testing.io, root, &.{ "a.safetensors", "b.safetensors" }, .{ .file = "token_map.bin" }, null);
     defer testing.allocator.free(missing_map);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "token_map.bin", .data = "map" });
-    const selected_map = try packStamp(testing.allocator, testing.io, root, &.{ "a.safetensors", "b.safetensors" }, .{ .file = "token_map.bin" });
+    const selected_map = try packStamp(testing.allocator, testing.io, root, &.{ "a.safetensors", "b.safetensors" }, .{ .file = "token_map.bin" }, null);
     defer testing.allocator.free(selected_map);
     try testing.expect(!std.mem.eql(u8, missing_map, selected_map));
+}
+
+const digest_names: []const []const u8 = &.{ "a.safetensors", "b.safetensors" };
+const digest_big = 2 * pack_digest.READ_BYTES + 3;
+
+fn rootOf(tmp: *testing.TmpDir, buf: *[512]u8) ![]const u8 {
+    return buf[0..try tmp.dir.realPath(testing.io, buf)];
+}
+
+fn setMtime(dir: std.Io.Dir, name: []const u8, ns: i96) !void {
+    var file = try dir.openFile(testing.io, name, .{ .mode = .read_write });
+    defer file.close(testing.io);
+    try file.setTimestamps(testing.io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = ns } } });
+}
+
+fn writePack(dir: std.Io.Dir, last_byte: u8, mtime: i96) !void {
+    const big = try testing.allocator.alloc(u8, digest_big);
+    defer testing.allocator.free(big);
+    @memset(big, 7);
+    big[big.len - 1] = last_byte;
+    try dir.writeFile(testing.io, .{ .sub_path = "a.safetensors", .data = big });
+    try dir.writeFile(testing.io, .{ .sub_path = "b.safetensors", .data = "tail shard" });
+    try setMtime(dir, "a.safetensors", mtime);
+    try setMtime(dir, "b.safetensors", mtime);
+}
+
+fn contentStamp(root: []const u8, cache: []const u8) ![]u8 {
+    _ = try digestPack(testing.allocator, testing.io, root, cache, digest_names, .builtin, std.math.maxInt(u64));
+    var store = try pack_digest.Store.open(testing.allocator, testing.io, root, cache);
+    defer store.deinit();
+    return packStamp(testing.allocator, testing.io, root, digest_names, .builtin, &store);
+}
+
+test "module pack digest: same bytes with different mtimes share an identity, one byte changed does not" {
+    var one = testing.tmpDir(.{});
+    defer one.cleanup();
+    var two = testing.tmpDir(.{});
+    defer two.cleanup();
+    var changed = testing.tmpDir(.{});
+    defer changed.cleanup();
+    var cache = testing.tmpDir(.{});
+    defer cache.cleanup();
+    const day: i96 = 86_400 * std.time.ns_per_s;
+    try writePack(one.dir, 1, 1_700_000_000 * std.time.ns_per_s);
+    try writePack(two.dir, 1, 1_700_000_000 * std.time.ns_per_s + 5 * day);
+    try writePack(changed.dir, 2, 1_700_000_000 * std.time.ns_per_s);
+    var b1: [512]u8 = undefined;
+    var b2: [512]u8 = undefined;
+    var b3: [512]u8 = undefined;
+    var bc: [512]u8 = undefined;
+    const r1 = try rootOf(&one, &b1);
+    const r2 = try rootOf(&two, &b2);
+    const r3 = try rootOf(&changed, &b3);
+    const rc = try rootOf(&cache, &bc);
+
+    const s1 = try contentStamp(r1, rc);
+    defer testing.allocator.free(s1);
+    const s2 = try contentStamp(r2, rc);
+    defer testing.allocator.free(s2);
+    const s3 = try contentStamp(r3, rc);
+    defer testing.allocator.free(s3);
+    try testing.expectEqualStrings(s1, s2);
+    try testing.expect(!std.mem.eql(u8, s1, s3));
+
+    const legacy1 = try packStamp(testing.allocator, testing.io, r1, digest_names, .builtin, null);
+    defer testing.allocator.free(legacy1);
+    const legacy2 = try packStamp(testing.allocator, testing.io, r2, digest_names, .builtin, null);
+    defer testing.allocator.free(legacy2);
+    try testing.expect(!std.mem.eql(u8, legacy1, legacy2));
+}
+
+test "module pack digest: a stat stamp needs every digest before it is a content stamp" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = testing.tmpDir(.{});
+    defer cache.cleanup();
+    try writePack(tmp.dir, 1, 1_700_000_000 * std.time.ns_per_s);
+    var b: [512]u8 = undefined;
+    var bc: [512]u8 = undefined;
+    const root = try rootOf(&tmp, &b);
+    const cache_root = try rootOf(&cache, &bc);
+    var empty = try pack_digest.Store.open(testing.allocator, testing.io, root, cache_root);
+    defer empty.deinit();
+    try testing.expectError(error.PackDigestPending, packStamp(testing.allocator, testing.io, root, digest_names, .builtin, &empty));
+}
+
+test "module pack digest: the sidecar is reused while size and mtime match and recomputed when either changes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = testing.tmpDir(.{});
+    defer cache.cleanup();
+    const t0: i96 = 1_700_000_000 * std.time.ns_per_s;
+    try writePack(tmp.dir, 1, t0);
+    var b: [512]u8 = undefined;
+    var bc: [512]u8 = undefined;
+    const root = try rootOf(&tmp, &b);
+    const cache_root = try rootOf(&cache, &bc);
+    const t = testing.allocator;
+    try testing.expectEqual(@as(usize, 2), try digestPack(t, testing.io, root, cache_root, digest_names, .builtin, std.math.maxInt(u64)));
+    _ = try tmp.dir.statFile(testing.io, pack_digest.SIDECAR_NAME, .{});
+    try testing.expectEqual(@as(usize, 0), try digestPack(t, testing.io, root, cache_root, digest_names, .builtin, std.math.maxInt(u64)));
+
+    const before = try contentStamp(root, cache_root);
+    defer t.free(before);
+    const big = try t.alloc(u8, digest_big);
+    defer t.free(big);
+    @memset(big, 7);
+    big[big.len - 1] = 9;
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.safetensors", .data = big });
+    try setMtime(tmp.dir, "a.safetensors", t0);
+    try testing.expectEqual(@as(usize, 0), try digestPack(t, testing.io, root, cache_root, digest_names, .builtin, std.math.maxInt(u64)));
+    const stale = try contentStamp(root, cache_root);
+    defer t.free(stale);
+    try testing.expectEqualStrings(before, stale);
+
+    try setMtime(tmp.dir, "a.safetensors", t0 + std.time.ns_per_s);
+    try testing.expectEqual(@as(usize, 1), try digestPack(t, testing.io, root, cache_root, digest_names, .builtin, std.math.maxInt(u64)));
+    const after_mtime = try contentStamp(root, cache_root);
+    defer t.free(after_mtime);
+    try testing.expect(!std.mem.eql(u8, before, after_mtime));
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.safetensors", .data = "tail shard, longer" });
+    try setMtime(tmp.dir, "b.safetensors", t0);
+    try testing.expectEqual(@as(usize, 1), try digestPack(t, testing.io, root, cache_root, digest_names, .builtin, std.math.maxInt(u64)));
+}
+
+test "module pack digest: an unwritable pack directory keeps its sidecar in the cache directory" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = testing.tmpDir(.{ .iterate = true });
+    defer cache.cleanup();
+    try writePack(tmp.dir, 1, 1_700_000_000 * std.time.ns_per_s);
+    try tmp.dir.createDirPath(testing.io, pack_digest.SIDECAR_NAME);
+    var b: [512]u8 = undefined;
+    var bc: [512]u8 = undefined;
+    const root = try rootOf(&tmp, &b);
+    const cache_root = try rootOf(&cache, &bc);
+    try testing.expectEqual(@as(usize, 2), try digestPack(testing.allocator, testing.io, root, cache_root, digest_names, .builtin, std.math.maxInt(u64)));
+    var found = false;
+    var it = cache.dir.iterate();
+    while (try it.next(testing.io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "pack-digest-")) found = true;
+    }
+    try testing.expect(found);
+    try testing.expectEqual(@as(usize, 0), try digestPack(testing.allocator, testing.io, root, cache_root, digest_names, .builtin, std.math.maxInt(u64)));
+}
+
+test "module pack digest: a garbled or foreign-algorithm sidecar is recomputed, not trusted" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = testing.tmpDir(.{});
+    defer cache.cleanup();
+    try writePack(tmp.dir, 1, 1_700_000_000 * std.time.ns_per_s);
+    var b: [512]u8 = undefined;
+    var bc: [512]u8 = undefined;
+    const root = try rootOf(&tmp, &b);
+    const cache_root = try rootOf(&cache, &bc);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = pack_digest.SIDECAR_NAME, .data = "{not json" });
+    try testing.expectEqual(@as(usize, 2), try digestPack(testing.allocator, testing.io, root, cache_root, digest_names, .builtin, std.math.maxInt(u64)));
+    const sidecar = try tmp.dir.readFileAlloc(testing.io, pack_digest.SIDECAR_NAME, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(sidecar);
+    const foreign = try std.mem.replaceOwned(u8, testing.allocator, sidecar, pack_digest.ALGORITHM, "other-hash");
+    defer testing.allocator.free(foreign);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = pack_digest.SIDECAR_NAME, .data = foreign });
+    try testing.expectEqual(@as(usize, 2), try digestPack(testing.allocator, testing.io, root, cache_root, digest_names, .builtin, std.math.maxInt(u64)));
+}
+
+test "module pack digest: reading with F_NOCACHE gives the same digest as a cached read" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writePack(tmp.dir, 5, 1_700_000_000 * std.time.ns_per_s);
+    const buf = try testing.allocator.alloc(u8, pack_digest.READ_BYTES);
+    defer testing.allocator.free(buf);
+    for (digest_names) |name| {
+        const cached = try pack_digest.hashFile(testing.io, tmp.dir, name, buf, false);
+        const direct = try pack_digest.hashFile(testing.io, tmp.dir, name, buf, true);
+        try testing.expectEqualSlices(u8, &cached, &direct);
+    }
+}
+
+const pinned_digests = [_]struct { name: []const u8, hex: []const u8 }{
+    .{ .name = "empty", .hex = "b4293806c27f92c28202d2797e3a1fa1" },
+    .{ .name = "short", .hex = "1ccd6cc453fbbadb566521675382e495" },
+    .{ .name = "big", .hex = "537d9acad987d8493289aefdd0ff4a18" },
+};
+
+test "module pack digest: known answers pin the hash and its seeds" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const big = try testing.allocator.alloc(u8, 9 * 1024 * 1024 + 5);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*byte, i| byte.* = @intCast((i * 31 + 7) % 251);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "empty", .data = "" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "short", .data = "mlx-serve pack digest" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "big", .data = big });
+    const buf = try testing.allocator.alloc(u8, pack_digest.READ_BYTES);
+    defer testing.allocator.free(buf);
+    for (pinned_digests) |want| {
+        const digest = try pack_digest.hashFile(testing.io, tmp.dir, want.name, buf, true);
+        try testing.expectEqualStrings(want.hex, &std.fmt.bytesToHex(digest, .lower));
+    }
+}
+
+fn targetOf(dir: std.Io.Dir, name: []const u8) !pack_digest.Target {
+    const st = try dir.statFile(testing.io, name, .{});
+    return .{ .name = name, .size = st.size, .mtime_ns = st.mtime.nanoseconds };
+}
+
+test "module pack digest: a persist keeps the sidecar's other entries" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = testing.tmpDir(.{});
+    defer cache.cleanup();
+    try writePack(tmp.dir, 1, 1_700_000_000 * std.time.ns_per_s);
+    var b: [512]u8 = undefined;
+    var bc: [512]u8 = undefined;
+    const root = try rootOf(&tmp, &b);
+    const cache_root = try rootOf(&cache, &bc);
+    const first = try targetOf(tmp.dir, "a.safetensors");
+    const second = try targetOf(tmp.dir, "b.safetensors");
+    try testing.expectEqual(@as(usize, 1), try pack_digest.fill(testing.allocator, testing.io, root, cache_root, &.{first}));
+    try testing.expectEqual(@as(usize, 1), try pack_digest.fill(testing.allocator, testing.io, root, cache_root, &.{second}));
+    var store = try pack_digest.Store.open(testing.allocator, testing.io, root, cache_root);
+    defer store.deinit();
+    try testing.expect(store.get(first.name, first.size, first.mtime_ns) != null);
+    try testing.expect(store.get(second.name, second.size, second.mtime_ns) != null);
+}
+
+const Progress = struct {
+    var root: []const u8 = "";
+    var cache: []const u8 = "";
+    var on_disk: [4]usize = @splat(0);
+    var calls: usize = 0;
+
+    fn hook(_: usize) void {
+        var store = pack_digest.Store.open(testing.allocator, testing.io, root, cache) catch return;
+        defer store.deinit();
+        if (calls < on_disk.len) on_disk[calls] = store.entries.len;
+        calls += 1;
+    }
+};
+
+test "module pack digest: each finished file reaches the sidecar before the next one is hashed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = testing.tmpDir(.{});
+    defer cache.cleanup();
+    try writePack(tmp.dir, 1, 1_700_000_000 * std.time.ns_per_s);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.safetensors", .data = "third shard" });
+    var b: [512]u8 = undefined;
+    var bc: [512]u8 = undefined;
+    Progress.root = try rootOf(&tmp, &b);
+    Progress.cache = try rootOf(&cache, &bc);
+    Progress.calls = 0;
+    const targets = [_]pack_digest.Target{
+        try targetOf(tmp.dir, "a.safetensors"),
+        try targetOf(tmp.dir, "b.safetensors"),
+        try targetOf(tmp.dir, "c.safetensors"),
+    };
+    const hashed = try pack_digest.fillWith(testing.allocator, testing.io, Progress.root, Progress.cache, &targets, .{ .workers = 1, .after_persist = Progress.hook });
+    try testing.expectEqual(@as(usize, 3), hashed);
+    try testing.expectEqualSlices(usize, &.{ 1, 2, 3, 0 }, &Progress.on_disk);
+}
+
+test "module pack digest: a run that lost a file resumes with only that file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = testing.tmpDir(.{});
+    defer cache.cleanup();
+    try writePack(tmp.dir, 1, 1_700_000_000 * std.time.ns_per_s);
+    var b: [512]u8 = undefined;
+    var bc: [512]u8 = undefined;
+    const root = try rootOf(&tmp, &b);
+    const cache_root = try rootOf(&cache, &bc);
+    const ghost: pack_digest.Target = .{ .name = "ghost.safetensors", .size = 5, .mtime_ns = 9 };
+    const targets = [_]pack_digest.Target{ try targetOf(tmp.dir, "a.safetensors"), ghost, try targetOf(tmp.dir, "b.safetensors") };
+    try testing.expectError(error.PackDigestFailed, pack_digest.fillWith(testing.allocator, testing.io, root, cache_root, &targets, .{ .workers = 1 }));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "ghost.safetensors", .data = "ghost" });
+    const found = try targetOf(tmp.dir, "ghost.safetensors");
+    const again = [_]pack_digest.Target{ targets[0], found, targets[2] };
+    try testing.expectEqual(@as(usize, 1), try pack_digest.fillWith(testing.allocator, testing.io, root, cache_root, &again, .{ .workers = 1 }));
+}
+
+test "module pack digest: only one run may claim a pack path at a time" {
+    try testing.expect(pack_digest.claimPack(testing.io, "/packs/one"));
+    try testing.expect(!pack_digest.claimPack(testing.io, "/packs/one"));
+    try testing.expect(pack_digest.claimPack(testing.io, "/packs/two"));
+    pack_digest.releasePack(testing.io, "/packs/one");
+    try testing.expect(pack_digest.claimPack(testing.io, "/packs/one"));
+    pack_digest.releasePack(testing.io, "/packs/one");
+    pack_digest.releasePack(testing.io, "/packs/two");
+}
+
+fn acceptAll(_: ?*anyopaque, _: []const u8, _: *const Envelope) bool {
+    return true;
+}
+
+test "module context: a renamed tier's old identity is accepted, others are not" {
+    const plain: Context = .{ .identity = "fp-c2", .validate = &acceptAll };
+    try testing.expect(!plain.accepts("fp-m1"));
+    const aliased = plain.withAlias("fp-m1");
+    try testing.expect(aliased.accepts("fp-c2"));
+    try testing.expect(aliased.accepts("fp-m1"));
+    try testing.expect(!aliased.accepts("fp-m3"));
+    const long_alias: [65]u8 = @splat('x');
+    const too_long = plain.withAlias(&long_alias);
+    try testing.expect(!too_long.accepts(&long_alias));
 }

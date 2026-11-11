@@ -15,6 +15,7 @@ const model_mod = @import("../../sdk/config/model.zig");
 const vision_mod = @import("vision_encoder.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const kv_disk_cache = @import("cache/ssd/disk_tier.zig");
+const module_record = kv_disk_cache.module_record;
 const tokenize_cache_mod = @import("../../host/tokenizer/cache.zig");
 const model_registry_mod = @import("../../host/registry/registry.zig");
 const log = @import("../../sdk/util/log.zig");
@@ -848,12 +849,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.prefix_cache.?.hybrid = has_ssm_layers;
         const disk_ok = module_binding != null or !has_ssm_layers or enable_ssm_cps;
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
-            const fp = kv_disk_cache.modelFingerprintWithLayout(
-                sch.allocator,
-                sch.io,
-                entry.path,
-                params.config.cacheLayoutNamespace(),
-            ) catch |err| {
+            const layout = params.config.cacheLayoutNamespace();
+            const fp = (if (module_binding != null)
+                kv_disk_cache.contentFingerprint(sch.allocator, layout)
+            else
+                kv_disk_cache.modelFingerprintWithLayout(sch.allocator, sch.io, entry.path, layout)) catch |err| {
                 log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
@@ -873,6 +873,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
+            if (module_binding != null) {
+                if (kv_disk_cache.modelFingerprintWithLayout(sch.allocator, sch.io, entry.path, layout)) |legacy| {
+                    defer sch.allocator.free(legacy);
+                    reportLegacyTiers(sch.allocator, sch.io, base, legacy);
+                } else |_| {}
+                _ = startPackDigest(sch.allocator, sch.io, entry.path, base);
+            }
             entry.prefix_cache.?.disk.?.cp_thin =
                 if (params.config.longCtxGated() or !ram_prefix_cache) .min_span_recency else .oldest;
             entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.longCtxGated() or !ram_prefix_cache)
@@ -933,18 +940,46 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     publishHotCacheResidency(sch);
 }
 
+/// Pack files up to this size are digested on the load path; only larger ones may leave the stat identity pending.
+const SMALL_FILE_BYTES: u64 = 64 << 20;
+
 /// A module tier borrows its loaded transformer and keeps its compatibility identity in its own root.
+/// `base` also holds the pack digest sidecar when the pack directory cannot.
 pub fn initPrefixDisk(a: std.mem.Allocator, io: std.Io, base: []const u8, fingerprint: []const u8, cap: u64, chunk: u32, binding: ?prefix_cache_mod.ModuleBinding, path: []const u8) !kv_disk_cache.DiskTier {
     const b = binding orelse return kv_disk_cache.DiskTier.init(a, io, base, fingerprint, cap, chunk);
-    const identity = try modulePackFingerprint(a, io, path, fingerprint);
-    defer a.free(identity);
-    var tier = try kv_disk_cache.DiskTier.initWithModule(a, io, base, identity, cap, chunk, .{
-        .identity = identity,
+    if (module_record.pack_digest.enabled()) {
+        _ = digestPackDir(a, io, path, base, SMALL_FILE_BYTES) catch |err|
+            log.warn("[disk-cache] small pack files not digested: {s}\n", .{@errorName(err)});
+    }
+    const pack = try modulePackFingerprint(a, io, path, base, fingerprint);
+    defer pack.deinit(a);
+    const adopted = pack.content and adoptStatTier(io, base, pack.stat_id, pack.id);
+    var context: module_record.Context = .{
+        .identity = pack.id,
         .user = @constCast(b.xfm),
         .validate = &validateModuleHeader,
-    });
+    };
+    if (adopted) context = context.withAlias(std.fs.path.basename(pack.stat_id));
+    var tier = try kv_disk_cache.DiskTier.initWithModule(a, io, base, pack.id, cap, chunk, context);
     tier.module_context.?.identity = std.fs.path.basename(tier.root);
     return tier;
+}
+
+/// The first start that names the tier by content takes over the stat-named tier the same files wrote, when
+/// no live process holds it: renaming it keeps its records (the tier accepts the old identity as an alias).
+/// Without a claim file, or with the claim held, it does nothing.
+fn adoptStatTier(io: std.Io, base: []const u8, stat_id: []const u8, content_id: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, base, .{}) catch return false;
+    defer dir.close(io);
+    if (dir.statFile(io, content_id, .{})) |_| return false else |_| {}
+    var claim_path_buf: [256]u8 = undefined;
+    const claim_path = std.fmt.bufPrint(&claim_path_buf, "{s}/{s}", .{ stat_id, kv_disk_cache.CLAIM_NAME }) catch return false;
+    var claim = dir.openFile(io, claim_path, .{ .mode = .read_write }) catch return false;
+    defer claim.close(io);
+    const idle = claim.tryLock(io, .exclusive) catch false;
+    if (!idle) return false;
+    dir.rename(stat_id, dir, content_id, io) catch return false;
+    return true;
 }
 
 fn validateModuleHeader(user: ?*anyopaque, header: []const u8, _: *const kv_disk_cache.module_record.Envelope) bool {
@@ -957,11 +992,42 @@ fn validateModuleHeader(user: ?*anyopaque, header: []const u8, _: *const kv_disk
     return verdict.isOk();
 }
 
-fn modulePackFingerprint(a: std.mem.Allocator, io: std.Io, path: []const u8, fingerprint: []const u8) ![]u8 {
-    if (!std.fs.path.isAbsolute(path)) return error.BadDiskCacheDir;
+const PackIdentity = struct {
+    id: []u8,
+    /// The identity the file stats alone give: what an earlier start of this pack named its tier while some digest was missing.
+    stat_id: []u8,
+    /// False while some file has no digest yet: `id` is then `stat_id` and changes with a copy's mtimes.
+    content: bool,
+
+    fn deinit(self: PackIdentity, a: std.mem.Allocator) void {
+        a.free(self.id);
+        a.free(self.stat_id);
+    }
+};
+
+fn modulePackFingerprint(a: std.mem.Allocator, io: std.Io, path: []const u8, cache_dir: []const u8, fingerprint: []const u8) !PackIdentity {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const aa = arena.allocator();
+    const pack = try selectPackFiles(aa, io, path);
+    var store = try module_record.pack_digest.Store.open(a, io, path, cache_dir);
+    defer store.deinit();
+    const by_content = module_record.packStamp(aa, io, path, pack.names, pack.token_map, &store) catch |err| switch (err) {
+        error.PackDigestPending => null,
+        else => return err,
+    };
+    const by_stat = try module_record.packStamp(aa, io, path, pack.names, pack.token_map, null);
+    const stat_id = try std.fmt.allocPrint(a, "{s}-m{x}", .{ fingerprint, std.hash.Wyhash.hash(0, by_stat) });
+    errdefer a.free(stat_id);
+    const content = by_content orelse return .{ .id = try a.dupe(u8, stat_id), .stat_id = stat_id, .content = false };
+    const id = try std.fmt.allocPrint(a, "{s}-c{x}", .{ fingerprint, std.hash.Wyhash.hash(0, content) });
+    return .{ .id = id, .stat_id = stat_id, .content = true };
+}
+
+const PackSelection = struct { names: []const []const u8, token_map: module_record.TokenMap };
+
+fn selectPackFiles(aa: std.mem.Allocator, io: std.Io, path: []const u8) !PackSelection {
+    if (!std.fs.path.isAbsolute(path)) return error.BadDiskCacheDir;
     var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
     defer dir.close(io);
     const resident = @import("../../sdk/weights/resident.zig");
@@ -980,12 +1046,13 @@ fn modulePackFingerprint(a: std.mem.Allocator, io: std.Io, path: []const u8, fin
         }
     }
     try appendPackFile(aa, &names, "engram/engram-residents.safetensors");
+    try appendPackFile(aa, &names, "config.json");
     const config: []const u8 = dir.readFileAlloc(io, "config.json", aa, .limited(64 << 20)) catch |err| blk: {
         if (err != error.FileNotFound) return err;
         break :blk "{}";
     };
     try configuredPackFiles(aa, &names, try std.json.parseFromSliceLeaky(std.json.Value, aa, config, .{}));
-    const token_map: kv_disk_cache.module_record.TokenMap = blk: {
+    const token_map: module_record.TokenMap = blk: {
         for ([_][]const u8{ "engram-token-map.u32", "engram_token_map.json" }) |name| {
             _ = dir.statFile(io, name, .{}) catch |err| {
                 if (err == error.FileNotFound) continue;
@@ -995,8 +1062,106 @@ fn modulePackFingerprint(a: std.mem.Allocator, io: std.Io, path: []const u8, fin
         }
         break :blk .builtin;
     };
-    const stamp = try kv_disk_cache.module_record.packStamp(aa, io, path, names.items, token_map);
-    return std.fmt.allocPrint(a, "{s}-m{x}", .{ fingerprint, std.hash.Wyhash.hash(0, stamp) });
+    return .{ .names = names.items, .token_map = token_map };
+}
+
+/// Hashes the pack files up to `max_file_bytes` that the sidecar does not cover and returns how many it hashed.
+/// Blocks for as long as the hashing takes.
+pub fn digestPackDir(a: std.mem.Allocator, io: std.Io, path: []const u8, cache_dir: []const u8, max_file_bytes: u64) !usize {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pack = try selectPackFiles(arena.allocator(), io, path);
+    return module_record.digestPack(a, io, path, cache_dir, pack.names, pack.token_map, max_file_bytes);
+}
+
+const DigestJob = struct {
+    a: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    cache_dir: []const u8,
+    key: u64,
+
+    fn run(self: *DigestJob) void {
+        defer self.destroy();
+        module_record.pack_digest.lowerPriority();
+        const hashed = digestPackDir(self.a, self.io, self.path, self.cache_dir, std.math.maxInt(u64)) catch |err| {
+            log.warn("[disk-cache] pack digest failed: {s}; finished files stay recorded, the next start resumes\n", .{@errorName(err)});
+            return;
+        };
+        if (hashed > 0) log.info("[disk-cache] pack digest: hashed {d} files; the next start names the SSD tier by content\n", .{hashed});
+    }
+
+    fn destroy(self: *DigestJob) void {
+        const a = self.a;
+        const io = self.io;
+        const key = self.key;
+        a.free(self.path);
+        a.free(self.cache_dir);
+        a.destroy(self);
+        module_record.pack_digest.releaseKey(io, key);
+    }
+};
+
+const DigestStart = enum { started, disabled, in_flight, failed };
+
+/// Fills the pack digest sidecar on a detached thread so serving never waits for it. One run per pack path in
+/// the process (a reload while it hashes starts nothing). The allocator must be thread-safe.
+fn startPackDigest(a: std.mem.Allocator, io: std.Io, path: []const u8, cache_dir: []const u8) DigestStart {
+    if (!module_record.pack_digest.enabled()) return .disabled;
+    if (!module_record.pack_digest.claimPack(io, path)) return .in_flight;
+    const job = a.create(DigestJob) catch {
+        module_record.pack_digest.releasePack(io, path);
+        return .failed;
+    };
+    job.* = .{ .a = a, .io = io, .path = &.{}, .cache_dir = &.{}, .key = module_record.pack_digest.packKey(path) };
+    job.path = a.dupe(u8, path) catch {
+        module_record.pack_digest.releasePack(io, path);
+        a.destroy(job);
+        return .failed;
+    };
+    job.cache_dir = a.dupe(u8, cache_dir) catch return failStart(job);
+    const thread = std.Thread.spawn(.{}, DigestJob.run, .{job}) catch |err| {
+        log.warn("[disk-cache] pack digest thread failed: {s}\n", .{@errorName(err)});
+        return failStart(job);
+    };
+    thread.detach();
+    return .started;
+}
+
+fn failStart(job: *DigestJob) DigestStart {
+    job.destroy();
+    return .failed;
+}
+
+/// One line about module tiers an older build named by path and config mtime: they are unreachable now, and
+/// nothing deletes them here. Null when none exist under `base`.
+fn legacyTiersLine(a: std.mem.Allocator, io: std.Io, base: []const u8, legacy_fp: []const u8) !?[]u8 {
+    var dir = std.Io.Dir.openDirAbsolute(io, base, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    const prefix = try std.fmt.allocPrint(a, "{s}-m", .{legacy_fp});
+    defer a.free(prefix);
+    var names = std.ArrayList(u8).empty;
+    defer names.deinit(a);
+    var count: usize = 0;
+    var bytes: u64 = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, prefix)) continue;
+        const tier = try std.fs.path.join(a, &.{ base, entry.name });
+        defer a.free(tier);
+        bytes += kv_disk_cache.treeBytes(a, io, tier);
+        if (count > 0) try names.appendSlice(a, ", ");
+        try names.appendSlice(a, entry.name);
+        count += 1;
+    }
+    if (count == 0) return null;
+    return try std.fmt.allocPrint(a, "[disk-cache] {d} older module tier(s) of this model sit unreachable under {s}: {s} ({d} MiB). The tier name now follows pack content; delete them to reclaim the space\n", .{ count, base, names.items, bytes >> 20 });
+}
+
+fn reportLegacyTiers(a: std.mem.Allocator, io: std.Io, base: []const u8, legacy_fp: []const u8) void {
+    const line = (legacyTiersLine(a, io, base, legacy_fp) catch return) orelse return;
+    defer a.free(line);
+    log.info("{s}", .{line});
 }
 
 fn appendPackFile(a: std.mem.Allocator, names: *std.ArrayList([]const u8), name: []const u8) !void {
@@ -1037,45 +1202,229 @@ fn pluginMedia(a: std.mem.Allocator, config: *const model_mod.ModelConfig, xfm: 
 test "module pack identity follows selected weights and token map precedence" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
+    var cache_tmp = testing.tmpDir(.{});
+    defer cache_tmp.cleanup();
+    var cache_buf: [512]u8 = undefined;
+    const cache = cache_buf[0..try cache_tmp.dir.realPath(testing.io, &cache_buf)];
     const io = testing.io;
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "weights" });
     try tmp.dir.writeFile(io, .{ .sub_path = "unused.safetensors", .data = "unused" });
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"model.safetensors\"}}" });
     var buf: [512]u8 = undefined;
     const path = buf[0..try tmp.dir.realPath(io, &buf)];
-    const first = try modulePackFingerprint(testing.allocator, io, path, "root");
+    const first = try settledIdentity(path, cache);
     defer testing.allocator.free(first);
     try tmp.dir.writeFile(io, .{ .sub_path = "unused.safetensors", .data = "changed unused shard" });
-    const same = try modulePackFingerprint(testing.allocator, io, path, "root");
+    const same = try settledIdentity(path, cache);
     defer testing.allocator.free(same);
     try testing.expectEqualStrings(first, same);
     try tmp.dir.writeFile(io, .{ .sub_path = "engram_token_map.json", .data = "[0,1]" });
-    const json = try modulePackFingerprint(testing.allocator, io, path, "root");
+    const json = try settledIdentity(path, cache);
     defer testing.allocator.free(json);
     try testing.expect(!std.mem.eql(u8, first, json));
     try tmp.dir.writeFile(io, .{ .sub_path = "engram-token-map.u32", .data = "binary" });
-    const binary = try modulePackFingerprint(testing.allocator, io, path, "root");
+    const binary = try settledIdentity(path, cache);
     defer testing.allocator.free(binary);
     try testing.expect(!std.mem.eql(u8, json, binary));
     try tmp.dir.writeFile(io, .{ .sub_path = "engram_token_map.json", .data = "[1,2,3]" });
-    const same_binary = try modulePackFingerprint(testing.allocator, io, path, "root");
+    const same_binary = try settledIdentity(path, cache);
     defer testing.allocator.free(same_binary);
     try testing.expectEqualStrings(binary, same_binary);
     try tmp.dir.createDirPath(io, "engram");
     try tmp.dir.writeFile(io, .{ .sub_path = "engram/engram-residents.safetensors", .data = "resident side weights" });
-    const side = try modulePackFingerprint(testing.allocator, io, path, "root");
+    const side = try settledIdentity(path, cache);
     defer testing.allocator.free(side);
     try testing.expect(!std.mem.eql(u8, binary, side));
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"tables\":{\"layer\":{\"weight_file\":\"engram/table.safetensors\"}}}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "engram/table.safetensors", .data = "table" });
-    const table = try modulePackFingerprint(testing.allocator, io, path, "root");
+    const table = try settledIdentity(path, cache);
     defer testing.allocator.free(table);
     try tmp.dir.writeFile(io, .{ .sub_path = "engram/table.safetensors", .data = "changed table weights" });
-    const changed_table = try modulePackFingerprint(testing.allocator, io, path, "root");
+    const changed_table = try settledIdentity(path, cache);
     defer testing.allocator.free(changed_table);
     try testing.expect(!std.mem.eql(u8, table, changed_table));
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "changed selected weights" });
-    const changed = try modulePackFingerprint(testing.allocator, io, path, "root");
+    const changed = try settledIdentity(path, cache);
     defer testing.allocator.free(changed);
     try testing.expect(!std.mem.eql(u8, binary, changed));
+}
+
+fn settledIdentity(path: []const u8, cache: []const u8) ![]u8 {
+    _ = try digestPackDir(testing.allocator, testing.io, path, cache, std.math.maxInt(u64));
+    const pack = try modulePackFingerprint(testing.allocator, testing.io, path, cache, "root");
+    errdefer testing.allocator.free(pack.id);
+    defer testing.allocator.free(pack.stat_id);
+    try testing.expect(pack.content);
+    return pack.id;
+}
+
+fn writeTestPack(dir: std.Io.Dir, mtime_ns: i96) !void {
+    const files = [_][2][]const u8{
+        .{ "model.safetensors", "weights" },
+        .{ "config.json", "{\"model_type\":\"x\"}" },
+        .{ "model.safetensors.index.json", "{\"weight_map\":{\"w\":\"model.safetensors\"}}" },
+    };
+    for (files) |f| {
+        try dir.writeFile(testing.io, .{ .sub_path = f[0], .data = f[1] });
+        var file = try dir.openFile(testing.io, f[0], .{ .mode = .read_write });
+        defer file.close(testing.io);
+        try file.setTimestamps(testing.io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = mtime_ns } } });
+    }
+}
+
+test "module pack identity names a byte-identical pack the same on another path with other mtimes" {
+    var one = testing.tmpDir(.{ .iterate = true });
+    defer one.cleanup();
+    var two = testing.tmpDir(.{ .iterate = true });
+    defer two.cleanup();
+    var cache_tmp = testing.tmpDir(.{});
+    defer cache_tmp.cleanup();
+    try writeTestPack(one.dir, 1_700_000_000 * std.time.ns_per_s);
+    try writeTestPack(two.dir, 1_710_000_000 * std.time.ns_per_s);
+    var b1: [512]u8 = undefined;
+    var b2: [512]u8 = undefined;
+    var bc: [512]u8 = undefined;
+    const p1 = b1[0..try one.dir.realPath(testing.io, &b1)];
+    const p2 = b2[0..try two.dir.realPath(testing.io, &b2)];
+    const cache = bc[0..try cache_tmp.dir.realPath(testing.io, &bc)];
+
+    const pending = try modulePackFingerprint(testing.allocator, testing.io, p1, cache, "root");
+    defer pending.deinit(testing.allocator);
+    try testing.expect(!pending.content);
+
+    const first = try settledIdentity(p1, cache);
+    defer testing.allocator.free(first);
+    const second = try settledIdentity(p2, cache);
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings(first, second);
+
+    try two.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"y\"}" });
+    const edited = try settledIdentity(p2, cache);
+    defer testing.allocator.free(edited);
+    try testing.expect(!std.mem.eql(u8, first, edited));
+}
+
+test "content fingerprint ignores the directory and follows the layout namespace" {
+    const plain = try kv_disk_cache.contentFingerprint(testing.allocator, null);
+    defer testing.allocator.free(plain);
+    const again = try kv_disk_cache.contentFingerprint(testing.allocator, null);
+    defer testing.allocator.free(again);
+    const layout = try kv_disk_cache.contentFingerprint(testing.allocator, "nope-layout");
+    defer testing.allocator.free(layout);
+    try testing.expectEqualStrings(plain, again);
+    try testing.expect(!std.mem.eql(u8, plain, layout));
+}
+
+fn rootOf(tmp: *testing.TmpDir, buf: *[512]u8) ![]const u8 {
+    return buf[0..try tmp.dir.realPath(testing.io, buf)];
+}
+
+test "pack digest: files under the small-file limit are digested on the load path, larger ones stay pending" {
+    var pack = testing.tmpDir(.{ .iterate = true });
+    defer pack.cleanup();
+    var cache = testing.tmpDir(.{});
+    defer cache.cleanup();
+    try writeTestPack(pack.dir, 1_700_000_000 * std.time.ns_per_s);
+    var b1: [512]u8 = undefined;
+    var b2: [512]u8 = undefined;
+    const root = try rootOf(&pack, &b1);
+    const cache_root = try rootOf(&cache, &b2);
+    try testing.expectEqual(@as(usize, 0), try digestPackDir(testing.allocator, testing.io, root, cache_root, 3));
+    const none = try modulePackFingerprint(testing.allocator, testing.io, root, cache_root, "root");
+    defer none.deinit(testing.allocator);
+    try testing.expect(!none.content);
+    try testing.expectEqual(@as(usize, 1), try digestPackDir(testing.allocator, testing.io, root, cache_root, 10));
+    const partial = try modulePackFingerprint(testing.allocator, testing.io, root, cache_root, "root");
+    defer partial.deinit(testing.allocator);
+    try testing.expect(!partial.content);
+    try testing.expectEqual(@as(usize, 1), try digestPackDir(testing.allocator, testing.io, root, cache_root, SMALL_FILE_BYTES));
+    const done = try modulePackFingerprint(testing.allocator, testing.io, root, cache_root, "root");
+    defer done.deinit(testing.allocator);
+    try testing.expect(done.content);
+}
+
+test "pack digest: the first content start renames the stat tier it replaces, unless a live process holds it" {
+    var base_tmp = testing.tmpDir(.{ .iterate = true });
+    defer base_tmp.cleanup();
+    var bb: [512]u8 = undefined;
+    const base = try rootOf(&base_tmp, &bb);
+    try base_tmp.dir.createDirPath(testing.io, "fp-m1");
+    try base_tmp.dir.writeFile(testing.io, .{ .sub_path = "fp-m1/marker", .data = "record" });
+    try testing.expect(!adoptStatTier(testing.io, base, "fp-m1", "fp-c2"));
+    _ = try base_tmp.dir.statFile(testing.io, "fp-m1/marker", .{});
+
+    var tier_buf: [600]u8 = undefined;
+    const tier_root = try std.fmt.bufPrint(&tier_buf, "{s}/fp-m1", .{base});
+    const held = kv_disk_cache.claimTierDir(testing.io, tier_root) orelse return error.TestClaimFailed;
+    try testing.expect(!adoptStatTier(testing.io, base, "fp-m1", "fp-c2"));
+    _ = try base_tmp.dir.statFile(testing.io, "fp-m1/marker", .{});
+    held.close(testing.io);
+
+    try testing.expect(adoptStatTier(testing.io, base, "fp-m1", "fp-c2"));
+    _ = try base_tmp.dir.statFile(testing.io, "fp-c2/marker", .{});
+    try testing.expectError(error.FileNotFound, base_tmp.dir.statFile(testing.io, "fp-m1/marker", .{}));
+
+    try base_tmp.dir.createDirPath(testing.io, "fp-m3");
+    try base_tmp.dir.writeFile(testing.io, .{ .sub_path = "fp-m3/.claim", .data = "" });
+    try testing.expect(!adoptStatTier(testing.io, base, "fp-m3", "fp-c2"));
+}
+
+test "pack digest: the opt-out stops every start and the default leaves it on" {
+    var o = env.override(.MLX_SERVE_PACK_DIGEST, "0");
+    defer o.restore();
+    try testing.expect(!module_record.pack_digest.enabled());
+    try testing.expectEqual(DigestStart.disabled, startPackDigest(testing.allocator, testing.io, "/no/such/pack", "/no/such/cache"));
+    env.set(.MLX_SERVE_PACK_DIGEST, "1");
+    try testing.expect(module_record.pack_digest.enabled());
+    env.unset(.MLX_SERVE_PACK_DIGEST);
+    try testing.expect(module_record.pack_digest.enabled());
+}
+
+test "pack digest: a start while one runs for the pack starts nothing, and a finished run records the digests" {
+    var pack = testing.tmpDir(.{ .iterate = true });
+    defer pack.cleanup();
+    var cache = testing.tmpDir(.{});
+    defer cache.cleanup();
+    try writeTestPack(pack.dir, 1_700_000_000 * std.time.ns_per_s);
+    var b1: [512]u8 = undefined;
+    var b2: [512]u8 = undefined;
+    const root = try rootOf(&pack, &b1);
+    const cache_root = try rootOf(&cache, &b2);
+
+    try testing.expect(module_record.pack_digest.claimPack(testing.io, root));
+    try testing.expectEqual(DigestStart.in_flight, startPackDigest(testing.allocator, testing.io, root, cache_root));
+    module_record.pack_digest.releasePack(testing.io, root);
+
+    try testing.expectEqual(DigestStart.started, startPackDigest(testing.allocator, testing.io, root, cache_root));
+    var waited: usize = 0;
+    while (!module_record.pack_digest.claimPack(testing.io, root)) : (waited += 1) {
+        try testing.expect(waited < 4000);
+        std.Io.sleep(testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    module_record.pack_digest.releasePack(testing.io, root);
+    const pack_id = try modulePackFingerprint(testing.allocator, testing.io, root, cache_root, "root");
+    defer pack_id.deinit(testing.allocator);
+    try testing.expect(pack_id.content);
+}
+
+test "pack digest: tiers an older build named by path are reported with their size and never deleted" {
+    var base_tmp = testing.tmpDir(.{ .iterate = true });
+    defer base_tmp.cleanup();
+    var bb: [512]u8 = undefined;
+    const base = try rootOf(&base_tmp, &bb);
+    try testing.expectEqual(@as(?[]u8, null), try legacyTiersLine(testing.allocator, testing.io, base, "0123456789abcdef"));
+    try base_tmp.dir.createDirPath(testing.io, "0123456789abcdef-m1f/e1");
+    const blob = try testing.allocator.alloc(u8, 3 << 20);
+    defer testing.allocator.free(blob);
+    @memset(blob, 'x');
+    try base_tmp.dir.writeFile(testing.io, .{ .sub_path = "0123456789abcdef-m1f/e1/blob", .data = blob });
+    try base_tmp.dir.createDirPath(testing.io, "0123456789abcdef-m2a");
+    try base_tmp.dir.createDirPath(testing.io, "fedcba9876543210-m1f");
+    const line = (try legacyTiersLine(testing.allocator, testing.io, base, "0123456789abcdef")).?;
+    defer testing.allocator.free(line);
+    try testing.expect(std.mem.indexOf(u8, line, "0123456789abcdef-m1f") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "0123456789abcdef-m2a") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "fedcba9876543210") == null);
+    try testing.expect(std.mem.indexOf(u8, line, "3 MiB") != null);
+    _ = try base_tmp.dir.statFile(testing.io, "0123456789abcdef-m1f/e1/blob", .{});
 }
