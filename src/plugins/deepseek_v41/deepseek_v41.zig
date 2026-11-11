@@ -6538,13 +6538,6 @@ pub fn batchesStates(m: *const Dsv41Model) bool {
     return m.pair == null and !m.bank_streams;
 }
 
-/// Whether `m` serves one request at a time: a bank that streams reads one state's routes, and any streamed bank's rows
-/// fill what one request's state leaves at the load (`bill.streamBudget` bills `context + stream_generation` once) while
-/// admission bills a streamed pack nothing (`prefillMemoryNeeded`), so a second slot's state would be billed nowhere.
-pub fn servesOneRequest(m: *const Dsv41Model) bool {
-    return m.bank_streams or m.streamed != null;
-}
-
 /// Rows one batched forward of `m` carries: the decode regions', and on a streamed bank no more routes than one
 /// decode-phase call takes (`Routed.decode_ids`), so the forward stays on the bank's decode lane.
 pub fn batchRows(m: *const Dsv41Model) usize {

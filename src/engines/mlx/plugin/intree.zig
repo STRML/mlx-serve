@@ -34,7 +34,6 @@ pub fn module(xfm: *const Transformer) ?*anyopaque {
 
 const v4plugin = @import("../../../plugins/deepseek_v4/plugin.zig");
 const v41plugin = @import("../../../plugins/deepseek_v41/plugin.zig");
-const v41mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
 
 /// The DeepSeek-V4 module of the served plugin behind `xfm`; null for any other model.
 pub fn dsv4(xfm: *const Transformer) ?*v4plugin.Module {
@@ -46,16 +45,6 @@ pub fn dsv4(xfm: *const Transformer) ?*v4plugin.Module {
 pub fn dsv41(xfm: *const Transformer) ?*v41plugin.Module {
     const b = xfm.plugin orelse return null;
     return if (served(b.table, @import("../../../plugins/deepseek_v41/config.zig").plugin.name)) v41plugin.moduleOf(b.model) else null;
-}
-
-/// A DeepSeek-V4.1 instance that serves one request at a time (`servesOneRequest`, known once the load sized its bank):
-/// its slots neither keep their own state nor batch, as the parse declared for every V4.1.
-pub fn narrowLoadedCaps(xfm: *const Transformer) void {
-    const m = dsv41(xfm) orelse return;
-    if (!v41mod.servesOneRequest(m)) return;
-    const b = xfm.config.plugin orelse return;
-    b.parsed.caps.slot_state = false;
-    b.parsed.caps.batches_decode = false;
 }
 
 /// The DeepSeek-V4.1 live state of each slot behind `ctxs` and its identity, for a DSpark group round
