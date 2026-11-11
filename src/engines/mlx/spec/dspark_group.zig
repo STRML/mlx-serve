@@ -222,6 +222,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     // step, with nothing to roll back.
     const verify_watch = io_util.Stopwatch.init(gens[0].timer.io);
     var drafted: [MAX_SLOTS]bool = undefined;
+    var full: [MAX_SLOTS]bool = undefined;
     var parts: [MAX_SLOTS]mlx.mlx_array = undefined;
     var n_parts: usize = 0;
     defer for (parts[0..n_parts]) |x| {
@@ -232,6 +233,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         const hi = @min(n, lo + width);
         const d = rowsOfChunks(chunks[lo..hi]) > hi - lo;
         @memset(drafted[lo..hi], d);
+        @memset(full[lo..hi], rowsOfChunks(chunks[lo..hi]) >= dflash_policy.MAX_GROUP_ROWS);
         parts[n_parts] = try dsv41_mod.extendBatched(mdl, gpa, states[lo..hi], ids[lo..hi], chunks[lo..hi], d);
         n_parts += 1;
     }
@@ -317,9 +319,10 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         }
         gen.dspark_group_rounds += 1;
     }
-    // A slot whose drafts the group verified none of has nothing to teach it.
+    // A slot whose drafts were priced out with rows to spare learns the draft cost it lost, as a solo round does; one
+    // that a full verify left no row says nothing about its drafts.
     const token_ms = cost.ms(n, n) / @as(f32, @floatFromInt(n));
-    for (gens, kinds[0..n], accepted[0..n], rows_k[0..n]) |gen, kind, a, b| if (kind == .stage and b > 0) if (gen.dspark_pol) |*pol| {
+    for (gens, kinds[0..n], accepted[0..n], rows_k[0..n], full[0..n]) |gen, kind, a, b, f| if (kind == .stage and (b > 0 or !f)) if (gen.dspark_pol) |*pol| {
         const spent = draft_ms / @as(f32, @floatFromInt(n_stage)) + @as(f32, @floatFromInt(b)) * cost.rowMs();
         pol.drafting.record(@as(f32, @floatFromInt(a)) * token_ms, spent);
     };
