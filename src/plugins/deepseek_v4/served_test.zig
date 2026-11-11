@@ -1156,7 +1156,7 @@ fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, ou
     try testing.expect(drafted > 0);
 }
 
-test "deepseek_v41 served: a group slot whose drafts the group verifies none of is not judged for them" {
+test "deepseek_v41 served: a group slot whose drafts are priced out with rows to spare backs off, as a solo slot does" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1179,8 +1179,9 @@ test "deepseek_v41 served: a group slot whose drafts the group verifies none of 
     for (g.gens) |gen| {
         if (gen.dspark_copies > 0) continue;
         staged += 1;
-        try testing.expectEqual(@as(u32, 0), gen.dspark_pol.?.drafting.owed);
-        try testing.expectEqual(@as(f32, 0), gen.dspark_pol.?.drafting.wall);
+        // The round's draft cost, against no gain: the backoff owes rounds without a draft.
+        try testing.expect(gen.dspark_pol.?.drafting.owed >= 1);
+        try testing.expect(gen.dspark_pol.?.drafting.wall > 0);
     }
     try testing.expect(staged > 0);
 }
