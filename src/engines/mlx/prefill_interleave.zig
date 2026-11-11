@@ -92,11 +92,12 @@ pub fn specYieldTick(active: []const *Slot) void {
 /// Prefill width while other streams decode: a chunk boundary is their only yield point.
 const COMPANY_PREFILL_CHUNK: u32 = 2048;
 
-/// `beside_decode`: the model's narrowest chunk beside decoders (`ModelConfig.prefillWidths`), 0 = the engine's.
+/// `beside_decode`: the model's narrowest chunk beside decoders (`ModelConfig.prefillWidths`), 0 = the engine's. It
+/// widens only a width admission pinned (and billed): an unpinned prefill (0) takes the engine's.
 pub fn companyPrefillChunk(chunk: u32, decoding: usize, beside_decode: u32) u32 {
     if (decoding == 0) return chunk;
-    const cap = @max(COMPANY_PREFILL_CHUNK, beside_decode);
-    return if (chunk == 0) cap else @min(chunk, cap);
+    if (chunk == 0) return COMPANY_PREFILL_CHUNK;
+    return @min(chunk, @max(COMPANY_PREFILL_CHUNK, beside_decode));
 }
 
 /// Largest accepted decode share: at 0.9 the decoders own nine times each chunk's time.
@@ -750,6 +751,7 @@ test "prefill beside decode: a model's declared width holds under company and a 
     try testing.expectEqual(@as(u32, 4096), companyPrefillChunk(8192, 1, wide));
     try testing.expectEqual(@as(u32, 4096), decodeShareWidthCap(8192, 1, 0.25, wide));
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(2048, 1, wide));
+    try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(0, 1, wide));
     try testing.expectEqual(@as(u32, 2048), decodeShareWidthCap(2048, 1, 0.25, wide));
     const other: model_mod.ModelConfig = .{ .model_type = "qwen3_5_moe" };
     const narrow = other.prefillWidths().beside_decode;
