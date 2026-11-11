@@ -222,25 +222,25 @@ pub const Drafting = struct {
     }
 };
 
-/// Rows one DSpark group round verifies in all: the module batches its compiled stretches up to this many.
+/// Rows one batched verify carries at most: the module batches its compiled stretches up to this many.
 pub const MAX_GROUP_ROWS: u32 = 16;
 
 pub const GroupCosts = [MAX_GROUP_ROWS + 1]f32;
 
-/// Verify rows for slots sharing one batched verify. `p[k]` is slot k's per-draft acceptance as `chooseRows` reads it,
-/// `costs[r]` the verify's ms at `r` rows in all, the slots' `t1` rows included. The most tokens any `r` rows buy are the
-/// `r` likeliest drafts (a slot's in order), so the choice is the `r` with the best expected tokens per ms, the fewer
-/// rows on a near tie. Writes slot k's drafts to verify to `drafts[k]`; returns the expected tokens.
-pub fn chooseGroupRows(p: []const []const f32, costs: *const GroupCosts, drafts: []u32) f32 {
+/// Verify rows for slots sharing one batched verify of at most `max_rows` rows. `p[k]` is slot k's per-draft acceptance
+/// as `chooseRows` reads it, `costs[r]` the verify's ms at `r` rows in all, the slots' `t1` rows included. The most tokens
+/// any `r` rows buy are the `r` likeliest drafts (a slot's in order), so the choice is the `r` with the best expected
+/// tokens per ms, the fewer rows on a near tie. Writes slot k's drafts to verify to `drafts[k]`; returns the expected tokens.
+pub fn chooseGroupRows(p: []const []const f32, costs: *const GroupCosts, max_rows: usize, drafts: []u32) f32 {
     const n = p.len;
-    std.debug.assert(n >= 1 and n <= MAX_GROUP_ROWS);
+    std.debug.assert(n >= 1 and n <= max_rows and max_rows <= MAX_GROUP_ROWS);
     var alive: [MAX_GROUP_ROWS]f32 = @splat(1);
     var next: [MAX_GROUP_ROWS]u32 = @splat(0);
     var picks: [MAX_GROUP_ROWS]u8 = undefined;
     var tokens: [MAX_GROUP_ROWS + 1]f32 = undefined;
     tokens[n] = @floatFromInt(n);
     var r = n;
-    while (r < MAX_GROUP_ROWS) {
+    while (r < max_rows) {
         var pick: ?usize = null;
         var gain: f32 = 0;
         for (p, 0..) |pk, k| {
@@ -270,41 +270,118 @@ pub fn chooseGroupRows(p: []const []const f32, costs: *const GroupCosts, drafts:
     return tokens[chosen];
 }
 
-/// What a DSpark group round's verify costs: `base + per_state * states + per_row * (rows - states)` ms, one row a slot
-/// being the group's plain step. Fitted on an M5 Ultra (`DSV41_GROUP`), scaled by what this machine's rounds took: slowly,
-/// and by at most a quarter per sample (`PlainCost`'s rule).
+/// How a round's slots split into verifies of at most `max_rows` rows: consecutive runs of the returned width (the last
+/// takes the rest), each priced by `chooseGroupRows`, the width whose verifies buy the most expected tokens per ms. A
+/// narrower split must beat a wider one by `ROW_TIE`: its extra verify's base is certain where its tokens are not.
+/// Writes slot k's drafts to verify to `drafts[k]`.
+pub fn planGroup(p: []const []const f32, cost: *const GroupCost, max_rows: usize, drafts: []u32) usize {
+    const n = p.len;
+    var best_w: usize = 0;
+    var best_rate: f32 = 0;
+    var w = @min(n, max_rows);
+    while (w >= 1) : (w -= 1) {
+        const rate = splitRate(p, cost, max_rows, w, drafts);
+        if (best_w == 0 or rate > best_rate * (1 + ROW_TIE)) {
+            best_w = w;
+            best_rate = rate;
+        }
+    }
+    _ = splitRate(p, cost, max_rows, best_w, drafts);
+    return best_w;
+}
+
+fn splitRate(p: []const []const f32, cost: *const GroupCost, max_rows: usize, width: usize, drafts: []u32) f32 {
+    var tokens: f32 = 0;
+    var ms: f32 = 0;
+    var lo: usize = 0;
+    while (lo < p.len) : (lo += width) {
+        const hi = @min(p.len, lo + width);
+        const c = cost.costs(hi - lo);
+        tokens += chooseGroupRows(p[lo..hi], &c, max_rows, drafts[lo..hi]);
+        var rows = hi - lo;
+        for (drafts[lo..hi]) |d| rows += d;
+        ms += c[rows];
+    }
+    return tokens / ms;
+}
+
+/// What a DSpark group round's verify costs: a base by its state count (one row a slot, the group's plain step) and one
+/// slope for every row past them, fitted online over this machine's rounds by least squares that forget old rounds. The
+/// slope is every state count's rounds about their own mean, pulled toward the M5 Ultra fit's (`DSV41_GROUP`, `PER_ROW`);
+/// a count's base is its own rounds', pulled toward that fit's (`BASE + PER_STATE * states`) as scaled by every count's
+/// rounds. A count's first rounds only drop a stall; after them a round counts as at most a quarter off the fit.
 pub const GroupCost = struct {
     const BASE: f32 = 12;
     const PER_STATE: f32 = 4.6;
     const PER_ROW: f32 = 4.4;
+    /// Pseudo-rounds the prior base is worth, and the prior slope's weight in squared rows.
+    const PRIOR_ROUNDS: f32 = 2;
+    const PRIOR_SPREAD: f32 = 16;
+    const KEEP: f32 = 0.95;
+    const WARM_ROUNDS: f32 = 4;
+    const MIN_ROW_MS: f32 = 0.05;
+    const N = MAX_GROUP_ROWS + 1;
 
-    scale: f32 = 1,
+    /// By state count: the rounds' weight and their sums of extra rows `x`, ms `y`, `x * x` and `x * y`.
+    w: [N]f32 = @splat(0),
+    sx: [N]f32 = @splat(0),
+    sy: [N]f32 = @splat(0),
+    sxx: [N]f32 = @splat(0),
+    sxy: [N]f32 = @splat(0),
 
-    fn prior(states: usize, rows: usize) f32 {
-        return BASE + PER_STATE * @as(f32, @floatFromInt(states)) + PER_ROW * @as(f32, @floatFromInt(rows -| states));
-    }
-
-    pub fn ms(self: *const GroupCost, states: usize, rows: usize) f32 {
-        return self.scale * prior(states, rows);
+    fn priorBase(states: usize) f32 {
+        return BASE + PER_STATE * @as(f32, @floatFromInt(states));
     }
 
     /// What one more verify row costs.
     pub fn rowMs(self: *const GroupCost) f32 {
-        return self.scale * PER_ROW;
+        var cxy: f32 = PRIOR_SPREAD * PER_ROW;
+        var cxx: f32 = PRIOR_SPREAD;
+        for (self.w, self.sx, self.sy, self.sxx, self.sxy) |w, sx, sy, sxx, sxy| {
+            if (w <= 0) continue;
+            cxy += sxy - sx * sy / w;
+            cxx += @max(0, sxx - sx * sx / w);
+        }
+        return @max(MIN_ROW_MS, cxy / cxx);
+    }
+
+    /// The verify of `states` slots' rows alone, at `slope` ms a further row.
+    fn base(self: *const GroupCost, states: usize, slope: f32) f32 {
+        var num: f32 = PRIOR_ROUNDS * priorBase(2);
+        var den: f32 = num;
+        for (self.w, self.sx, self.sy, 0..) |w, sx, sy, k| {
+            num += sy - slope * sx;
+            den += w * priorBase(k);
+        }
+        const s = @min(states, MAX_GROUP_ROWS);
+        return (self.sy[s] - slope * self.sx[s] + PRIOR_ROUNDS * num / den * priorBase(states)) / (self.w[s] + PRIOR_ROUNDS);
+    }
+
+    pub fn ms(self: *const GroupCost, states: usize, rows: usize) f32 {
+        const slope = self.rowMs();
+        return self.base(states, slope) + slope * @as(f32, @floatFromInt(rows -| states));
     }
 
     /// The verify's ms by rows for a group of `states` slots (index = rows, below `states` unused).
     pub fn costs(self: *const GroupCost, states: usize) GroupCosts {
+        const slope = self.rowMs();
+        const b = self.base(states, slope);
         var out: GroupCosts = @splat(0);
-        for (states..MAX_GROUP_ROWS + 1) |r| out[r] = self.ms(states, r);
+        for (states..MAX_GROUP_ROWS + 1) |r| out[r] = b + slope * @as(f32, @floatFromInt(r - states));
         return out;
     }
 
     /// A verify of `rows` rows over `states` slots took `took` ms.
     pub fn sample(self: *GroupCost, states: usize, rows: usize, took: f32) void {
-        if (!std.math.isFinite(took) or took <= 0) return;
-        const want = took / prior(states, rows);
-        self.scale += 0.1 * (std.math.clamp(want, self.scale * 0.8, self.scale * 1.25) - self.scale);
+        if (!std.math.isFinite(took) or took <= 0 or states == 0 or states > MAX_GROUP_ROWS) return;
+        const fit = self.ms(states, rows);
+        const y = if (self.w[states] >= WARM_ROUNDS) std.math.clamp(took, fit * 0.8, fit * 1.25) else if (took > fit * 4 or took < fit / 4) return else took;
+        const x: f32 = @floatFromInt(rows -| states);
+        self.w[states] = self.w[states] * KEEP + 1;
+        self.sx[states] = self.sx[states] * KEEP + x;
+        self.sy[states] = self.sy[states] * KEEP + y;
+        self.sxx[states] = self.sxx[states] * KEEP + x * x;
+        self.sxy[states] = self.sxy[states] * KEEP + x * y;
     }
 };
 
@@ -587,39 +664,81 @@ test "chooseGroupRows: rows go to the likeliest drafts across slots, none when t
     // A sure copy and an unsure stage draft: the sure slot takes the rows.
     const sure: [8]f32 = @splat(0.97);
     const weak = [_]f32{ 0.2, 0.2, 0.2, 0.2, 0.2 };
-    _ = chooseGroupRows(&.{ &sure, &weak }, &c2, &drafts);
+    _ = chooseGroupRows(&.{ &sure, &weak }, &c2, MAX_GROUP_ROWS, &drafts);
     try testing.expect(drafts[0] >= 6);
     try testing.expectEqual(@as(u32, 0), drafts[1]);
     // Neither pays: the group's plain step.
-    const tokens = chooseGroupRows(&.{ &weak, &weak }, &c2, &drafts);
+    const tokens = chooseGroupRows(&.{ &weak, &weak }, &c2, MAX_GROUP_ROWS, &drafts);
     try testing.expectEqual([2]u32{ 0, 0 }, drafts);
     try approx(tokens, 2);
-    // Two sure slots share the row budget, the total never past it.
+    // Sure slots share the row budget, the total never past it.
     const c4 = cost.costs(4);
     var d4: [4]u32 = undefined;
-    _ = chooseGroupRows(&.{ &sure, &sure, &sure, &sure }, &c4, &d4);
-    var total: u32 = 4;
-    for (d4) |d| total += d;
-    try testing.expect(total <= MAX_GROUP_ROWS);
-    try testing.expect(@max(d4[0], d4[3]) - @min(d4[0], d4[3]) <= 1);
+    for ([_]usize{ MAX_GROUP_ROWS, 8 }) |budget| {
+        _ = chooseGroupRows(&.{ &sure, &sure, &sure, &sure }, &c4, budget, &d4);
+        var total: u32 = 4;
+        for (d4) |d| total += d;
+        try testing.expect(total <= budget);
+        try testing.expect(@max(d4[0], d4[3]) - @min(d4[0], d4[3]) <= 1);
+    }
 }
 
 test "chooseGroupRows: a poisoned probability is no acceptance, and the cut stays a prefix of each slot's drafts" {
     var cost: GroupCost = .{};
     const c = cost.costs(1);
     var drafts: [1]u32 = undefined;
-    _ = chooseGroupRows(&.{&[_]f32{ 0.99, std.math.nan(f32), 0.99, 0.99 }}, &c, &drafts);
+    _ = chooseGroupRows(&.{&[_]f32{ 0.99, std.math.nan(f32), 0.99, 0.99 }}, &c, MAX_GROUP_ROWS, &drafts);
     try testing.expect(drafts[0] <= 1);
 }
 
-test "GroupCost: rows and states cost more, and a slower machine's rounds scale the prior within bounds" {
+/// A verify's rounds on a machine of base `b0 + b1 * states` and `slope` ms a further row, at every width up to 16 rows.
+fn trained(b0: f32, b1: f32, slope: f32) GroupCost {
     var cost: GroupCost = .{};
-    try testing.expect(cost.ms(2, 4) > cost.ms(2, 2) and cost.ms(3, 3) > cost.ms(2, 2));
-    for (0..200) |_| cost.sample(2, 4, 2 * GroupCost.prior(2, 4));
-    try testing.expectApproxEqAbs(@as(f32, 2), cost.scale, 0.05);
-    cost.sample(2, 4, std.math.nan(f32));
-    cost.sample(2, 4, 1e9);
-    try testing.expect(cost.scale <= 2.5);
+    for (0..200) |i| for ([_]usize{ 1, 2, 3, 4 }) |st| {
+        const rows = st + (i * 5) % (MAX_GROUP_ROWS + 1 - st);
+        cost.sample(st, rows, b0 + b1 * @as(f32, @floatFromInt(st)) + slope * @as(f32, @floatFromInt(rows - st)));
+    };
+    return cost;
+}
+
+test "GroupCost: a machine's own base and row slope are learned apart, and its row choice follows them" {
+    var cost = trained(20, 3, 2.45);
+    try testing.expectApproxEqAbs(@as(f32, 4 * 2.45), cost.ms(2, 6) - cost.ms(2, 2), 0.4);
+    try testing.expectApproxEqAbs(@as(f32, 26), cost.ms(2, 2), 1.5);
+    try testing.expectApproxEqAbs(@as(f32, 32), cost.ms(4, 4), 1.5);
+    // Medium drafts: the prior's 4.4 ms rows buy none of them, this machine's 2.45 ms rows do.
+    const medium: [4]f32 = @splat(0.35);
+    var d: [2]u32 = undefined;
+    const fresh: GroupCost = .{};
+    _ = chooseGroupRows(&.{ &medium, &medium }, &fresh.costs(2), MAX_GROUP_ROWS, &d);
+    try testing.expectEqual([2]u32{ 0, 0 }, d);
+    _ = chooseGroupRows(&.{ &medium, &medium }, &cost.costs(2), MAX_GROUP_ROWS, &d);
+    try testing.expect(d[0] + d[1] > 0);
+    // A stall and a NaN move it little.
+    const before = cost.ms(2, 6);
+    cost.sample(2, 6, 1e9);
+    cost.sample(2, 6, std.math.nan(f32));
+    try testing.expect(cost.ms(2, 6) < before * 1.05);
+}
+
+test "planGroup: slots past one verify's rows split into narrower verifies only where the extra base pays" {
+    const cost = trained(2, 6, 1);
+    const sure: [7]f32 = @splat(0.99);
+    const weak: [7]f32 = @splat(0.3);
+    var d: [4]u32 = undefined;
+    // Sure drafts: two verifies of two slots, each slot's whole block.
+    try testing.expectEqual(@as(usize, 2), planGroup(&.{ &sure, &sure, &sure, &sure }, &cost, MAX_GROUP_ROWS, &d));
+    try testing.expectEqual([4]u32{ 7, 7, 7, 7 }, d);
+    // Weak drafts: one verify, a second base buys nothing.
+    try testing.expectEqual(@as(usize, 4), planGroup(&.{ &weak, &weak, &weak, &weak }, &cost, MAX_GROUP_ROWS, &d));
+    // A bank whose decode call takes 8 rows: no verify past them.
+    const w = planGroup(&.{ &sure, &sure, &sure, &sure }, &cost, 8, &d);
+    var lo: usize = 0;
+    while (lo < d.len) : (lo += w) {
+        var rows = @min(d.len, lo + w) - lo;
+        for (d[lo..@min(d.len, lo + w)]) |x| rows += x;
+        try testing.expect(rows <= 8);
+    }
 }
 
 test "Calibration: a head prior reads the drafter's confidence as its acceptance until verifies say otherwise" {
