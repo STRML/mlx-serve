@@ -46,13 +46,35 @@ pub fn reviseHotCacheBudgets(sch: *Scheduler, grow_only: bool) void {
             const config = entry.config orelse continue;
             var idle: u64 = 0;
             const budget = resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle);
-            if (grow_only and prefix_cache_mod.HotPrefixCache.budgetShrinks(hc.max_kv_bytes, budget)) continue;
-            hc.setBudget(budget);
-            hc.ssd_idle_mem = idle;
+            if (grow_only and prefix_cache_mod.HotPrefixCache.budgetShrinks(hc.baseBudget(), budget)) continue;
+            hc.setBaseBudget(budget, idle);
         }
     }
     sch.registry.mutex.unlock(sch.io);
     publishHotCacheResidency(sch);
+}
+
+/// The idle loop's memory-pressure tick: every resident hot cache takes the gauge's step, without re-resolving (the
+/// resolver publishes the budget context sizing reads). True while a cache could still follow the level.
+pub fn followMemoryPressure(sch: *Scheduler, now_ms: i64) bool {
+    const shift = sch.memory_pressure.sample(now_ms);
+    var watched = false;
+    var evicted = false;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        if (entry.state != .ready) continue;
+        const hc = if (entry.prefix_cache) |h| h else continue;
+        if (!hc.ram_enabled) continue;
+        const before = hc.residentBytes();
+        hc.applyPressure(shift);
+        evicted = evicted or hc.residentBytes() != before;
+        watched = watched or (hc.baseBudget() != 0 and (hc.entryCount() > 0 or hc.pressure_shift != 0));
+    }
+    sch.registry.mutex.unlock(sch.io);
+    if (evicted) publishHotCacheResidency(sch);
+    return watched;
 }
 
 /// Active, parked and pending-capture state, counted once per model. Cache-owned snapshots bill separately.
@@ -518,4 +540,115 @@ test "module live residency is counted once per model and cannot be credited as 
         try testing.expectEqual(@as(u64, 64), sch.resident_live_kv_bytes.load(.monotonic));
     }
     try testing.expectEqual(@as(u64, 0), sch.resident_hot_cache_bytes.load(.monotonic));
+}
+
+const PressureGauge = @import("../../../host/gpu_thread/scheduler.zig").PressureGauge;
+
+const FakePressure = struct {
+    var level: u32 = 1;
+    fn read() u32 {
+        return level;
+    }
+};
+
+test "memory pressure gauge: a worse level applies once held 5 s, a better one after 30 s, and a flap restarts the wait" {
+    FakePressure.level = 1;
+    var g: PressureGauge = .{ .read = &FakePressure.read };
+    var t: i64 = 1_000_000;
+    try testing.expectEqual(@as(u2, 0), g.sample(t));
+    FakePressure.level = 2;
+    for ([_]i64{ 1000, 4000 }) |dt| {
+        t += dt;
+        try testing.expectEqual(@as(u2, 0), g.sample(t));
+    }
+    t += 1000;
+    try testing.expectEqual(@as(u2, 1), g.sample(t));
+    FakePressure.level = 4;
+    t += 1000;
+    try testing.expectEqual(@as(u2, 1), g.sample(t));
+    t += 5000;
+    try testing.expectEqual(@as(u2, 2), g.sample(t));
+    FakePressure.level = 1;
+    t += 1000;
+    try testing.expectEqual(@as(u2, 2), g.sample(t));
+    t += 20_000;
+    try testing.expectEqual(@as(u2, 2), g.sample(t));
+    FakePressure.level = 4;
+    t += 1000;
+    try testing.expectEqual(@as(u2, 2), g.sample(t));
+    FakePressure.level = 1;
+    t += 1000;
+    try testing.expectEqual(@as(u2, 2), g.sample(t));
+    t += 29_000;
+    try testing.expectEqual(@as(u2, 2), g.sample(t));
+    t += 1000;
+    try testing.expectEqual(@as(u2, 0), g.sample(t));
+}
+
+test "memory pressure: the idle tick divides every hot-cache budget, uncapped stays uncapped, and a load revise keeps the step" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    const capped = try reg.registerStub("capped", "/m/capped", 64);
+    const open = try reg.registerStub("open", "/m/open", 64);
+    defer for ([_]*LoadedModel{ capped, open }) |e| {
+        e.config = null;
+    };
+    for ([_]*LoadedModel{ capped, open }) |e| {
+        e.config = &cfg;
+        e.state = .ready;
+        e.prefix_cache = try testHotCache();
+    }
+    const hc = capped.prefix_cache.?;
+    hc.max_kv_bytes = 200 << 20;
+    hc.ssd_idle_mem = 64 << 20;
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = reg.io;
+    sch.allocator = testing.allocator;
+    sch.current_model = null;
+    sch.hot_prefix_cache = null;
+    sch.prefix_cache_mem_resolver = budget200Mb;
+    sch.prefix_cache_mem_bytes = 0;
+    sch.metrics = null;
+    sch.digest_mu = .init;
+    sch.hot_cache_digests = &.{};
+    sch.digest_residency = 0;
+    sch.resident_hot_cache_bytes = .init(0);
+    sch.reclaimable_hot_cache_bytes = .init(0);
+    sch.resident_live_kv_bytes = .init(0);
+    sch.queue_mu = .init;
+    sch.decoding = .empty;
+    FakePressure.level = 2;
+    sch.memory_pressure = .{ .read = &FakePressure.read };
+
+    var t: i64 = 1_000_000;
+    for (0..6) |_| {
+        _ = followMemoryPressure(&sch, t);
+        t += 1000;
+    }
+    try testing.expectEqual(@as(u64, 100 << 20), hc.max_kv_bytes);
+    try testing.expectEqual(@as(u64, 32 << 20), hc.ssd_idle_mem);
+    try testing.expectEqual(@as(u64, 0), open.prefix_cache.?.max_kv_bytes);
+    FakePressure.level = 4;
+    for (0..6) |_| {
+        _ = followMemoryPressure(&sch, t);
+        t += 1000;
+    }
+    try testing.expectEqual(@as(u64, 50 << 20), hc.max_kv_bytes);
+    reviseHotCacheBudgets(&sch, true);
+    try testing.expectEqual(@as(u64, 50 << 20), hc.max_kv_bytes);
+    try testing.expectEqual(@as(u64, 0), open.prefix_cache.?.max_kv_bytes);
+    reviseHotCacheBudgets(&sch, false);
+    try testing.expectEqual(@as(u64, 50 << 20), hc.max_kv_bytes);
+    try testing.expectEqual(@as(u64, 200 << 20), hc.baseBudget());
+    try testing.expectEqual(@as(u64, 50 << 20), open.prefix_cache.?.max_kv_bytes);
+    FakePressure.level = 1;
+    for (0..32) |_| {
+        _ = followMemoryPressure(&sch, t);
+        t += 1000;
+    }
+    try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
+    try testing.expectEqual(@as(u64, 0), hc.ssd_idle_mem);
 }

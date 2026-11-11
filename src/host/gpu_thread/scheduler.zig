@@ -51,6 +51,47 @@ pub const BatchVerdict = enum {
 /// Options for re-clamping the hot-cache budgets after residency changed.
 pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
 
+/// The kernel's memory-pressure level as a hot-cache budget shift: warning halves, critical quarters. Read at most
+/// once a second; a worse level applies once it has held 5 s (a prefill's own transient must not shrink the cache),
+/// a better one after 30 s.
+pub const PressureGauge = struct {
+    read: *const fn () u32 = @import("../../sdk/util/system.zig").memoryPressureLevel,
+    shift: u2 = 0,
+    read_ms: ?i64 = null,
+    pending: u2 = 0,
+    since_ms: ?i64 = null,
+
+    pub const WORSE_HOLD_MS: i64 = 5_000;
+    pub const BETTER_HOLD_MS: i64 = 30_000;
+
+    pub fn sample(self: *PressureGauge, now_ms: i64) u2 {
+        if (self.read_ms) |t| if (now_ms - t < 1000) return self.shift;
+        self.read_ms = now_ms;
+        const level = levelShift(self.read());
+        if (level == self.shift) {
+            self.since_ms = null;
+            return self.shift;
+        }
+        const worse = level > self.shift;
+        if (self.since_ms == null or worse != (self.pending > self.shift)) {
+            self.since_ms = now_ms;
+            self.pending = level;
+        }
+        // Only what held for the whole window applies.
+        self.pending = if (worse) @min(self.pending, level) else @max(self.pending, level);
+        const hold: i64 = if (worse) WORSE_HOLD_MS else BETTER_HOLD_MS;
+        if (now_ms - self.since_ms.? < hold) return self.shift;
+        self.shift = self.pending;
+        self.since_ms = null;
+        return self.shift;
+    }
+
+    fn levelShift(level: u32) u2 {
+        if (level >= 4) return 2;
+        return if (level >= 2) 1 else 0;
+    }
+};
+
 /// One hot-cache entry as the connection-thread guard sees it (`Scheduler.hot_cache_digests`).
 pub const HotCacheDigest = struct {
     fingerprint: u64,
@@ -161,6 +202,7 @@ pub const Scheduler = struct {
     /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats
     /// before each prefill batch while this is armed and settles as the ceiling recovers.
     budget_revise_sw: ?io_util.Stopwatch = null,
+    memory_pressure: PressureGauge = .{},
     promise_ledger: PromiseLedger = .{},
     /// Inference thread only. Greater than 0 while a prefill started at a chunk boundary runs: it may
     /// tick decoders at its own boundaries but never admits.

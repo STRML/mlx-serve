@@ -17,6 +17,8 @@ const slotExclusiveDecode = @import("batching/verdict.zig").slotExclusiveDecode;
 const BUDGET_REVISE_WINDOW_NS = @import("cache/budget.zig").BUDGET_REVISE_WINDOW_NS;
 const reviseHotCacheBudgets = @import("cache/budget.zig").reviseHotCacheBudgets;
 const flushOwedDiskSlices = @import("cache/budget.zig").flushOwedDiskSlices;
+const followMemoryPressure = @import("cache/budget.zig").followMemoryPressure;
+const crt = @import("../../sdk/util/crt.zig");
 const holdsSleepWhileParked = @import("cache/budget.zig").holdsSleepWhileParked;
 const runDecodeTick = @import("decode.zig").runDecodeTick;
 const finishSlot = @import("finish.zig").finishSlot;
@@ -38,6 +40,36 @@ const drainSideQueues = @import("runtime/loop.zig").drainSideQueues;
 fn waitForDiskRetryLocked(sch: *Scheduler, ms: u32) void {
     if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) return;
     sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .boot } }) catch {};
+}
+
+/// Caller holds queue_mu. Idle: follow memory pressure and land owed SSD slices before parking, so a later commit
+/// rarely finds one. While a cache can follow the pressure level, park for at most a second.
+fn waitForWorkLocked(sch: *Scheduler) void {
+    var disk_owed = true;
+    while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
+        sch.queue_mu.unlock(sch.io);
+        const watching = followMemoryPressure(sch, crt.monotonicMs());
+        const flushed: prefix_cache_mod.FlushResult = if (disk_owed) flushOwedDiskSlices(sch) else .done;
+        sch.queue_mu.lockUncancelable(sch.io);
+        disk_owed = flushed != .done;
+        switch (flushed) {
+            .busy => waitForDiskRetryLocked(sch, 10),
+            // A tip inside its quiet period is written later: look again once a second, or at the next request.
+            .quiet => waitForDiskRetryLocked(sch, 1000),
+            .progress => {},
+            .done => parkLocked(sch, watching),
+        }
+        // A pressure step can open a shrink that waits on the feed.
+        if (watching) disk_owed = true;
+    }
+}
+
+fn parkLocked(sch: *Scheduler, watching: bool) void {
+    // No later tick runs while parked, so release here.
+    sleep_inhibit.setActive(holdsSleepWhileParked(sch));
+    if (watching) return waitForDiskRetryLocked(sch, 1000);
+    if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) return;
+    sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
 }
 
 const ChatPassMode = enum { main, yield };
@@ -131,23 +163,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         sch.queue_mu.lockUncancelable(sch.io);
         defer sch.queue_mu.unlock(sch.io);
         if (mode == .main) {
-            var disk_owed = true;
-            while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
-                // Idle: land owed SSD slices before parking, so a later commit rarely finds one.
-                if (disk_owed) {
-                    sch.queue_mu.unlock(sch.io);
-                    const flushed = flushOwedDiskSlices(sch);
-                    sch.queue_mu.lockUncancelable(sch.io);
-                    disk_owed = flushed != .done;
-                    if (flushed == .busy) waitForDiskRetryLocked(sch, 10);
-                    // A tip inside its quiet period is written later: look again once a second, or at the next request.
-                    if (flushed == .quiet) waitForDiskRetryLocked(sch, 1000);
-                    continue;
-                }
-                // No later tick runs while parked, so release here.
-                sleep_inhibit.setActive(holdsSleepWhileParked(sch));
-                sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
-            }
+            waitForWorkLocked(sch);
             // Hold until the loop parks again.
             if (!sch.shutdown.load(.acquire)) sleep_inhibit.setActive(true);
         }
