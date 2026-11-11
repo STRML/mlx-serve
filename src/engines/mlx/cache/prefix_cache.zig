@@ -2094,7 +2094,8 @@ pub const HotPrefixCache = struct {
         // Allocate before removing any donor; OOM leaves the resident history intact.
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         const continues = self.continuesModule(binding, ids, eff_media, has_tools, quant_config, cache_key);
-        const forked = !continues and self.forksModule(binding, ids, eff_media, has_tools, quant_config, cache_key);
+        const fork_at = if (continues) null else self.forkPoint(binding, ids, eff_media, has_tools, quant_config, cache_key);
+        const forked = fork_at != null;
         const adm = self.arcBegin(ids, has_tools, quant_config, continues or forked);
         self.supersedeModuleRungs(binding, ids, eff_media, has_tools, quant_config);
         const room = blk: {
@@ -2124,7 +2125,7 @@ pub const HotPrefixCache = struct {
         retained = true;
         self.current_kv_bytes += aux_bytes;
         self.arcEnd(ids, has_tools, quant_config, adm, true);
-        if (forked) self.demoteForkedOff(binding, ids, eff_media, has_tools, quant_config, cache_key);
+        if (fork_at) |at| self.demoteForkedOff(binding, ids, eff_media, has_tools, quant_config, cache_key, at);
         const why: []const u8 = if (adm.ghost) "ghost hit" else if (continues) "next turn" else if (forked) "forked turn" else "first seen";
         log.info("  [hot-cache] module commit {d} tokens key={x} -> {s} ({s})\n", .{ ids.len, cache_key, if (adm.frequent) "T2" else "T1", why });
         self.arcTrimGhosts();
@@ -3879,8 +3880,9 @@ pub const HotPrefixCache = struct {
     fn continuePressureShrink(self: *HotPrefixCache) void {
         if (self.pressure_feed_until_ms == null) return;
         if (!self.pressureFeedOpen()) self.pressure_feed_until_ms = null;
+        const before = self.entries.items.len;
         self.evictToBudget();
-        self.logResident();
+        if (self.entries.items.len != before) self.logResident();
     }
 
     /// Uncapped stays uncapped; an SSD-first budget keeps its live session and divides only the idle allowance.
@@ -4429,21 +4431,25 @@ pub const HotPrefixCache = struct {
         return @min(lcp, mediaSharedBound(e.media, media));
     }
 
-    /// `ids` comes back to a resident conversation without extending its tip: a turn forked from an earlier rung, or a
-    /// retried turn. The lookup's promotion rule (`arcPromotes`) decides, as on the KV path.
-    fn forksModule(self: *const HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) bool {
-        for (self.entries.items) |*e| {
-            const shared = moduleShared(e, binding, ids, media, has_tools, quant_config, cache_key) orelse continue;
-            if (shared < ids.len and arcPromotes(shared, e.tokens.len)) return true;
-        }
-        return false;
-    }
-
-    /// The fork tip just landed: a same-workload tip it diverged from is dead and must not outlive it in T2.
-    fn demoteForkedOff(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) void {
+    /// Where `ids` forks from a resident conversation without extending its tip (a turn restored from an earlier rung,
+    /// or a retried turn): the longest same-workload rung, past the promotion floor, that `ids` extends. A shared
+    /// system prompt is no rung, so parallel conversations under one key never count.
+    fn forkPoint(self: *const HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) ?usize {
+        var at: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
             const shared = moduleShared(e, binding, ids, media, has_tools, quant_config, cache_key) orelse continue;
-            if (shared >= e.tokens.len or !arcPromotes(shared, e.tokens.len) or self.extendedByResident(i, null)) continue;
+            if (shared != e.tokens.len or shared >= ids.len or shared < ARC_PROMOTE_MIN_TOKENS) continue;
+            if (!self.extendedByResident(i, cache_key)) continue;
+            if (at == null or shared > at.?) at = shared;
+        }
+        return at;
+    }
+
+    /// The fork tip just landed: a tip above the fork point it diverged from is dead and must not outlive it in T2.
+    fn demoteForkedOff(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64, fork_at: usize) void {
+        for (self.entries.items, 0..) |*e, i| {
+            const shared = moduleShared(e, binding, ids, media, has_tools, quant_config, cache_key) orelse continue;
+            if (shared < fork_at or shared >= e.tokens.len or self.extendedByResident(i, null)) continue;
             e.frequent = false;
             e.forked_off = true;
         }
@@ -12286,7 +12292,7 @@ test "HotPrefixCache ARC prefix cache: a declined commit leaves the target and t
     cache.invalidateAll("test end");
 }
 
-test "HotPrefixCache ARC prefix cache: only the next turn of the same workload's tip joins T2" {
+test "HotPrefixCache ARC prefix cache: below the promotion floor only the next turn of the same workload's tip joins T2" {
     var fake: ModuleFake = .{};
     var bound: plugin_driver.Bound = undefined;
     var xfm: transformer_mod.Transformer = undefined;
@@ -12335,6 +12341,32 @@ test "HotPrefixCache ARC prefix cache: a forked turn's tip joins T2, the dead ti
     }
     try testing.expect(arcEntry(&cache, &fork) != null);
     try testing.expectEqual(@as(usize, 0), tip.frees);
+    cache.invalidateAll("test end");
+}
+
+test "HotPrefixCache ARC prefix cache: conversations and one-shots under one long shared prompt neither promote nor demote each other" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 0);
+    defer cache.deinit();
+    const system = ModuleDiskTest.ids(1000);
+    var a: [520]u32 = undefined;
+    var b: [450]u32 = undefined;
+    var one: [420]u32 = undefined;
+    for ([_][]u32{ &a, &b, &one }, [_]u32{ 50_000, 60_000, 70_000 }) |conv, seed| {
+        @memcpy(conv[0..400], system[0..400]);
+        for (conv[400..], 0..) |*t, i| t.* = seed + @as(u32, @intCast(i));
+    }
+    var a1 = arcSnap(&fake, a[0..500], 40);
+    var a2 = arcSnap(&fake, &a, 40);
+    var b1 = arcSnap(&fake, &b, 40);
+    var o = arcSnap(&fake, &one, 40);
+    for ([_]*ModuleFake.Snap{ &a1, &a2, &b1, &o }) |snap| try arcPutKey(&cache, binding, snap, 7);
+    try testing.expect(arcEntry(&cache, &a).?.frequent);
+    try testing.expect(!arcEntry(&cache, &b).?.frequent);
+    try testing.expect(!arcEntry(&cache, &one).?.frequent);
     cache.invalidateAll("test end");
 }
 
