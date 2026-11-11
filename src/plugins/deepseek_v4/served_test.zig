@@ -874,8 +874,8 @@ test "deepseek_v41 served: an excluded instance keeps legacy resume through requ
     const p = try Served.open(&P.table, try fixture.v41Files(arena.allocator(), 7), "");
     defer p.close();
     const m: *P.Model = @ptrCast(@alignCast(p.xfm.plugin.?.model));
-    m.bank_streams = true;
-    defer m.bank_streams = false;
+    m.mdl.bank_streams = true;
+    defer m.mdl.bank_streams = false;
     try testing.expect(!prefix_cache.HotPrefixCache.shouldUseInstance(&p.cfg, true, &p.xfm));
     const h = try Requests.open(p);
     defer h.close();
@@ -1183,6 +1183,24 @@ test "deepseek_v41 served: a group slot whose drafts the group verifies none of 
         try testing.expectEqual(@as(f32, 0), gen.dspark_pol.?.drafting.wall);
     }
     try testing.expect(staged > 0);
+}
+
+test "deepseek_v41 served: a resident instance batches and groups its DSpark slots, one whose bank streams serves one request at a time" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
+    defer ds.restore();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41DsparkFiles(arena.allocator(), 7), "");
+    defer p.close();
+    const caps = &p.cfg.plugin.?.parsed.caps;
+    try testing.expect(caps.slot_state and verdict.configBatchesDecode(&p.cfg) and dspark_group.groupable(&p.xfm));
+    const mdl = intree.dsv41(&p.xfm).?;
+    mdl.bank_streams = true;
+    defer mdl.bank_streams = false;
+    intree.narrowLoadedCaps(&p.xfm);
+    try testing.expect(!caps.slot_state and !verdict.configBatchesDecode(&p.cfg) and !dspark_group.groupable(&p.xfm));
 }
 
 test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tokens whichever slot shares them" {
