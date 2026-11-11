@@ -485,8 +485,6 @@ pub const Dsv41Model = struct {
     seg: ?*dkern.seg.State = null,
     /// The routed experts from a streamed bank (`sdk/weights/streamed.zig`); null = the in-memory banks.
     streamed: ?streamed.Routed = null,
-    /// The streamed bank holds fewer slot rows than experts, so it reads from the SSD as routes move.
-    bank_streams: bool = false,
     /// The pack's routed experts live in a streamed bank: the trunk loads none (`InitOpts.streamed_experts`).
     streamed_experts: bool = false,
     dspark: ?DsparkW = null,
@@ -4776,46 +4774,6 @@ pub const ENGRAM_INS = [_][*:0]const u8{ "x", "kv", "qk", "cst" };
 
 pub const Want = enum { last, all };
 
-/// The FFN half of a compiled block whose routed experts come from a streamed bank, `a` the attention's pre, post and
-/// comb: around the source's host barrier, or in the source's fused decode tail. Returns the new stream; `pre` becomes
-/// the next mix.
-fn streamedFfn(sc: *Scope, m: *Dsv41Model, src: streamed.Routed, li: usize, x: A, ao: A, a: *const [4]A, pre: *A) !A {
-    var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
-    try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, a[0], a[1], a[2] }, &p);
-    // the shared expert built first (the source commits it behind the routed call's waves), the
-    // call's joined rows, the shared rows and the hc expand in TAIL_FUSE's kernel: the new stream, the words of the
-    // source's sum and `ffn_post_shared`.
-    // The fused tail serves a decode-phase call alone (`promptPhase`: a 9-16 row prompt routes more ids).
-    const decode_call = dim(p[5], 0) * dim(p[5], 1) <= src.decode_ids;
-    if (src.math == .source and decode_call and mlx.mlx_array_dtype(p[2]) == .float32 and mlx.mlx_array_dtype(p[3]) == .float32) if (src.source_decode_expand) |fx| {
-        var s: [1]A = undefined;
-        try runRegion(sc, m, li, .ffn_shared, &.{p[4]}, &s);
-        const pc = try sc.concat(&.{ p[2], try sc.reshape(p[3], &.{ ci(dim(p[3], 0)), -1 }) }, 1);
-        const yf = try sc.keep(try fx(src.ctx, @intCast(li), p[4], p[5], p[6], s[0], p[0], pc).get());
-        pre.* = p[1];
-        return yf;
-    };
-    const ro = switch (src.math) {
-        .source => |f| try sc.keep(try f(src.ctx, @intCast(li), p[4], p[5], p[6]).get()),
-        .trunk => blk: {
-            const sl = try fetchSlots(sc, m, src, li, p[5]);
-            break :blk try slotRows(sc, m, &sl, p[4], p[6], li);
-        },
-    };
-    var y: [1]A = undefined;
-    // the shared expert committed now queues behind the hit wave.
-    if (src.math == .source) {
-        var s: [1]A = undefined;
-        try runRegion(sc, m, li, .ffn_shared, &.{p[4]}, &s);
-        const v = mlx.mlx_vector_array_new_data(&s, 1);
-        defer _ = mlx.mlx_vector_array_free(v);
-        try mlx.check(mlx.mlx_async_eval(v));
-        try runRegion(sc, m, li, .ffn_post_shared, &.{ p[0], p[2], p[3], ro, s[0] }, &y);
-    } else try runRegion(sc, m, li, .ffn_post, &.{ p[0], p[2], p[3], p[4], ro }, &y);
-    pre.* = p[1];
-    return y[0];
-}
-
 /// One block over one span: the staggered hyper-connections around
 /// attention and the MoE. Returns the new stream; `pre` becomes the FFN's
 /// mix, which the next layer's attention collapses with.
@@ -4826,7 +4784,42 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
         var a: [4]A = undefined; // the attention's pre, post, comb; its input
         try runRegion(sc, m, li, .attn_in, &.{ x, pre.* }, &a);
         const ao = try attention(sc, m, st, li, a[3], p0, sh, null);
-        if (m.streamed) |src| return streamedFfn(sc, m, src, li, x, ao, &a, pre);
+        if (m.streamed) |src| {
+            var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
+            try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, a[0], a[1], a[2] }, &p);
+            // the shared expert built first (the source commits it behind the routed call's waves), the
+            // call's joined rows, the shared rows and the hc expand in TAIL_FUSE's kernel: the new stream, the words of the
+            // source's sum and `ffn_post_shared`.
+            // The fused tail serves a decode-phase call alone (`promptPhase`: a 9-16 row prompt routes more ids).
+            const decode_call = dim(p[5], 0) * dim(p[5], 1) <= src.decode_ids;
+            if (src.math == .source and decode_call and mlx.mlx_array_dtype(p[2]) == .float32 and mlx.mlx_array_dtype(p[3]) == .float32) if (src.source_decode_expand) |fx| {
+                var s: [1]A = undefined;
+                try runRegion(sc, m, li, .ffn_shared, &.{p[4]}, &s);
+                const pc = try sc.concat(&.{ p[2], try sc.reshape(p[3], &.{ ci(dim(p[3], 0)), -1 }) }, 1);
+                const yf = try sc.keep(try fx(src.ctx, @intCast(li), p[4], p[5], p[6], s[0], p[0], pc).get());
+                pre.* = p[1];
+                return yf;
+            };
+            const ro = switch (src.math) {
+                .source => |f| try sc.keep(try f(src.ctx, @intCast(li), p[4], p[5], p[6]).get()),
+                .trunk => blk: {
+                    const sl = try fetchSlots(sc, m, src, li, p[5]);
+                    break :blk try slotRows(sc, m, &sl, p[4], p[6], li);
+                },
+            };
+            var y: [1]A = undefined;
+            // the shared expert committed now queues behind the hit wave.
+            if (src.math == .source) {
+                var s: [1]A = undefined;
+                try runRegion(sc, m, li, .ffn_shared, &.{p[4]}, &s);
+                const v = mlx.mlx_vector_array_new_data(&s, 1);
+                defer _ = mlx.mlx_vector_array_free(v);
+                try mlx.check(mlx.mlx_async_eval(v));
+                try runRegion(sc, m, li, .ffn_post_shared, &.{ p[0], p[2], p[3], ro, s[0] }, &y);
+            } else try runRegion(sc, m, li, .ffn_post, &.{ p[0], p[2], p[3], p[4], ro }, &y);
+            pre.* = p[1];
+            return y[0];
+        }
         if (m.tp != null) return tpFfn(sc, m, li, x, ao, &.{ .pre = a[0], .post = a[1], .comb = a[2] }, pre);
         var o: [2]A = undefined;
         try runRegion(sc, m, li, .ffn, &.{ x, ao, a[0], a[1], a[2] }, &o);
@@ -5262,7 +5255,12 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         eng_ids = try engramIds(m, gpa, st, given.host, images);
         if (eng_on) prefetch = try engramPrefetch(m, gpa, st, eng_tables, given.host, eng_ids, span, images);
     }
-    try enterPass(m, L);
+    // scratch_x1.zig: the prompt's regions let go before a decode forward.
+    if (L <= region_rows) sx1.releaseAll();
+    // the ring's regions let go before the phase change too, so its synchronize and clearCache take them
+    // (not decode's capped cache).
+    if (L <= region_rows) sat.releaseAll();
+    if (m.streamed) |src| try src.phase(promptPhase(L, c.num_experts_per_tok, src.decode_ids));
     var rank0_tok: A = none;
     defer if (rank0_tok.ctx != null) {
         _ = mlx.mlx_array_free(rank0_tok);
@@ -6496,47 +6494,6 @@ const LayerRegions = struct {
     fns: [std.enums.values(Region).len]mlx.mlx_closure = @splat(.{}),
 };
 
-/// Before a forward of `rows` rows: a decode-width one lets the prompt's scratch go (scratch_x1.zig, and the ring's,
-/// before the phase change so its synchronize and clearCache take them, not decode's capped cache), and a streamed bank
-/// is told the pass.
-fn enterPass(m: *Dsv41Model, rows: usize) !void {
-    if (rows <= region_rows) {
-        sx1.releaseAll();
-        sat.releaseAll();
-    }
-    if (m.streamed) |src| try src.phase(promptPhase(rows, m.cfg.num_experts_per_tok, src.decode_ids));
-}
-
-/// `parts`' rows one after another (caller frees).
-pub fn concatRows(parts: []const A, s: mlx.mlx_stream) !A {
-    var o = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(o);
-    const v = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
-    defer _ = mlx.mlx_vector_array_free(v);
-    try mlx.check(mlx.mlx_concatenate_axis(&o, v, 0, s));
-    return o;
-}
-
-/// Whether `m` runs several states' rows as one forward: unpaired, its experts resident (in memory, or a streamed bank
-/// that holds every one). `batchRows` bounds the forward.
-pub fn batchesStates(m: *const Dsv41Model) bool {
-    return m.pair == null and !m.bank_streams;
-}
-
-/// Whether `m` serves one request at a time: a bank that streams reads one state's routes, and any streamed bank's rows
-/// fill what one request's state leaves at the load (`bill.streamBudget` bills `context + stream_generation` once) while
-/// admission bills a streamed pack nothing (`prefillMemoryNeeded`), so a second slot's state would be billed nowhere.
-pub fn servesOneRequest(m: *const Dsv41Model) bool {
-    return m.bank_streams or m.streamed != null;
-}
-
-/// Rows one batched forward of `m` carries: the decode regions', and on a streamed bank no more routes than one
-/// decode-phase call takes (`Routed.decode_ids`), so the forward stays on the bank's decode lane.
-pub fn batchRows(m: *const Dsv41Model) usize {
-    const src = m.streamed orelse return region_rows;
-    return @min(region_rows, src.decode_ids / m.cfg.num_experts_per_tok);
-}
-
 /// Whether a call of `rows` rows runs a streamed bank's prompt phase: past the decode regions, or more routed ids than a
 /// decode-phase call holds (`Routed.decode_ids`).
 pub fn promptPhase(rows: usize, top_k: usize, decode_ids: usize) bool {
@@ -7228,7 +7185,7 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
 pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, chunks: []const []const u32, verify: bool) !A {
     const c = &m.cfg;
     const N = chunks.len;
-    if (N == 0 or N > region_rows or states.len != N or gens.len != N or !batchesStates(m)) return error.Dsv41BatchUnsupported;
+    if (N == 0 or N > region_rows or states.len != N or gens.len != N or m.pair != null or m.streamed != null) return error.Dsv41BatchUnsupported;
     const offs = try gpa.alloc(usize, N + 1);
     defer gpa.free(offs);
     offs[0] = 0;
@@ -7238,13 +7195,11 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
         offs[k + 1] = offs[k] + ch.len;
     }
     const R = offs[N];
-    if (R > batchRows(m)) return error.Dsv41BatchUnsupported;
     for (states, 0..) |st, k| for (states[0..k]) |o| if (o == st) return error.Dsv41BatchUnsupported;
     for (states, gens) |st, g| {
         if (st.verify != null) return error.Dsv41BatchUnsupported;
         try snapshotStateIfDue(st, g);
     }
-    try enterPass(m, R);
     if (verify) for (states, 0..) |st, k| armVerify(st, m.n_layers) catch |e| {
         for (states[0..k]) |s| s.dropVerify();
         return e;
@@ -7395,8 +7350,6 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
     var o: [2]A = undefined; // the new stream, the FFN's mix
     if (m.tp != null) {
         o[0] = try tpFfn(&sc, m, li, x, try tpSum(&sc, m, ao[0]), &.{ .pre = a[0], .post = a[1], .comb = a[2] }, &o[1]);
-    } else if (m.streamed) |src| {
-        o[0] = try streamedFfn(&sc, m, src, li, x, ao[0], &a, &o[1]);
     } else try runRegion(&sc, m, li, .ffn, &.{ x, ao[0], a[0], a[1], a[2] }, &o);
     for (0..N) |k| {
         const lo, const hi = sp.bounds(k);

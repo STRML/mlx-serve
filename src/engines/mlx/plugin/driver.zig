@@ -336,7 +336,6 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     bound.* = .{ .table = b.table, .model = m, .drafters = caps.dflash_capture and trunk, .trunk = trunk };
     bind(bound, &b.parsed);
     xfm.plugin = bound;
-    intree.narrowLoadedCaps(&xfm);
     log.info("[plugin] {s} serves {s} ({d} layers)\n", .{ b.table.name.slice(), config.model_type, config.num_hidden_layers });
     return xfm;
 }

@@ -89,10 +89,12 @@ pub const Model = struct {
     vision_dir: ?[:0]u8,
     caps: abi.Caps,
     s: mlx.mlx_stream,
-    /// A streamed pack's expert bank, and the prompt positions its slot rows were billed for. A bank that streams
-    /// (`Dsv41Model.bank_streams`) plans its rows into the headroom the prefix cache would also spend.
+    /// A streamed pack's expert bank, and the prompt positions its slot rows were billed for.
     bank: ?Bank = null,
     bank_context: u64 = 0,
+    /// The bank holds fewer slot rows than experts, so it reads from the SSD and plans its rows into the headroom the
+    /// prefix cache would also spend.
+    bank_streams: bool = false,
     /// The slot whose state is `mdl.dec_state` (0: none claimed it yet, a resumed state or the module's own); every
     /// other live slot's waits in `parked`. Excluded configurations keep the last finished state in `idle`.
     owner: u32 = 0,
@@ -294,6 +296,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     // The fused Markov chain's kernels compiled now, not in the first draft.
     if (m.mdl.dspark) |*w| if (!m.mdl.draft_shard) try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
     m.bank = null;
+    m.bank_streams = false;
     m.owner = 0;
     m.parked = .empty;
     m.idle = null;
@@ -336,7 +339,7 @@ fn openBank(m: *Model, quant: ?*const outside.Format, ctx_size: ?u64, wired_marg
     std.log.info("deepseek_v41: streamed experts, {s} for a {d}-token context", .{ b.b.about.slice(), context });
     m.bank = .{ .outside = b };
     m.bank_context = context;
-    mdl.bank_streams = bankStreams(rows.prompt, rows.decode, m.cfg.num_experts);
+    m.bank_streams = bankStreams(rows.prompt, rows.decode, m.cfg.num_experts);
     mdl.streamed = b.routed();
 }
 
@@ -349,7 +352,7 @@ fn openPackBank(m: *Model, dir: []const u8, ctx_size: ?u64, settings_json: []con
     errdefer st.close();
     m.bank = .{ .pack = st };
     m.bank_context = ctx_size orelse bill_mod.stream_context_rungs[0];
-    m.mdl.bank_streams = bankStreams(rows, rows, m.cfg.num_experts);
+    m.bank_streams = bankStreams(rows, rows, m.cfg.num_experts);
     m.mdl.streamed = m.bank.?.pack.routedSource();
     std.log.info("deepseek_v41: streamed MLX pack experts, {d} slot rows per layer", .{rows});
 }
@@ -363,7 +366,7 @@ fn closeBank(m: *Model) void {
         .pack => |*x| x.close(),
     }
     m.bank = null;
-    m.mdl.bank_streams = false;
+    m.bank_streams = false;
 }
 
 /// Whether a plugin-streamed bank holds its decode rows now.
@@ -423,16 +426,15 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     return .ok;
 }
 
-/// One decode token per slot, each at its state's position: batches of rows (`extendBatched`, `batchRows` at a time), or
-/// each slot alone where the module runs no batch (a Thunderbolt pair, a bank that streams, an open verify, a slot
-/// starting at 0).
+/// One decode token per slot, each at its state's position: one batch of rows (`extendBatched`), or each slot alone
+/// where the module runs no batch (a Thunderbolt pair, a streamed bank, an open verify, a slot starting at 0).
 fn forwardBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdict {
     const n = f.slots.len;
     if (n == 0 or n > max_batch or f.rows != 1 or f.tokens.len != n or f.logits == .all_rows or f.want_hidden)
         return Verdict.refuse(.unsupported, "deepseek_v41: a batch is one host token per slot");
     var states: [max_batch]*dsv41.State = undefined;
     var gens: [max_batch]u64 = undefined;
-    var alone = !dsv41.batchesStates(m.mdl);
+    var alone = m.mdl.pair != null or m.mdl.streamed != null;
     for (f.slots.slice(), 0..) |slot, k| {
         if (f.positions.len == n and f.positions.slice()[k] == 0) {
             alone = true;
@@ -447,30 +449,12 @@ fn forwardBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdic
     for (f.tokens.slice()) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "deepseek_v41: token id past the vocabulary");
     var chunks: [max_batch][]const u32 = undefined;
     for (chunks[0..n], f.tokens.slice()) |*ch, *t| ch.* = t[0..1];
-    const logits = if (alone) eachAlone(m, f) else inBatches(m, states[0..n], gens[0..n], chunks[0..n]);
+    const logits = if (alone) eachAlone(m, f) else dsv41.extendBatched(m.mdl, gpa, states[0..n], gens[0..n], chunks[0..n], false);
     out.logits = .{ .ctx = (logits catch return Verdict.refuse(.failed, "deepseek_v41: the batched forward failed")).ctx };
     return .ok;
 }
 
 const max_batch = 16;
-
-/// `extendBatched` over `states` in batches of at most `batchRows` states, their logits state by state.
-fn inBatches(m: *Model, states: []const *dsv41.State, gens: []const u64, chunks: []const []const u32) !mlx.mlx_array {
-    const w = dsv41.batchRows(m.mdl);
-    if (states.len <= w) return dsv41.extendBatched(m.mdl, gpa, states, gens, chunks, false);
-    var parts: [max_batch]mlx.mlx_array = undefined;
-    var done: usize = 0;
-    defer for (parts[0..done]) |p| {
-        _ = mlx.mlx_array_free(p);
-    };
-    var lo: usize = 0;
-    while (lo < states.len) : (lo += w) {
-        const hi = @min(states.len, lo + w);
-        parts[done] = try dsv41.extendBatched(m.mdl, gpa, states[lo..hi], gens[lo..hi], chunks[lo..hi], false);
-        done += 1;
-    }
-    return dsv41.concatRows(parts[0..done], m.s);
-}
 
 /// `slot`'s live state and its identity: the module's own when the slot owns it, else the one parked for it.
 fn stateOf(m: *Model, slot: u32) ?struct { st: *dsv41.State, gen: u64 } {
@@ -484,7 +468,7 @@ fn stateOf(m: *Model, slot: u32) ?struct { st: *dsv41.State, gen: u64 } {
 /// hold until a slot is activated or released.
 pub fn slotStates(mp: *anyopaque, slots: []const u32, states: []*dsv41.State, gens: []u64) bool {
     const m: *Model = @ptrCast(@alignCast(mp));
-    if (!dsv41.batchesStates(m.mdl)) return false;
+    if (m.mdl.pair != null or m.mdl.streamed != null) return false;
     for (slots, states, gens) |slot, *st, *g| {
         const live = stateOf(m, slot) orelse return false;
         st.* = live.st;
@@ -506,7 +490,11 @@ fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {
         rows[done] = try run(m, &.{t}, pos, false, null, .{ .ctx = null });
         done += 1;
     }
-    return dsv41.concatRows(rows[0..done], m.s);
+    var o = mlx.mlx_array_new();
+    const v = mlx.mlx_vector_array_new_data(&rows, done);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_concatenate_axis(&o, v, 0, m.s));
+    return o;
 }
 
 /// The legacy seam's arms: position 0 starts a request (a resumed one arrives past 0); a decode token stays on the
@@ -616,7 +604,7 @@ const aux_hooks = abi.AuxHooks{
 
 fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
     const m: *Model = @ptrCast(@alignCast(mp));
-    return m.mdl.pair == null and !m.mdl.bank_streams;
+    return m.mdl.pair == null and !m.bank_streams;
 }
 
 pub fn bankStreams(prompt_rows: u64, decode_rows: u64, experts: u64) bool {

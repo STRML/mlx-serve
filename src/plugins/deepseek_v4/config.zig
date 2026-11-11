@@ -414,10 +414,9 @@ fn facts(c: *const Config) abi.Parsed {
             .streamed_weights = c.dsv41_streamed,
             // A V4.1 MLX pack streams its experts on `stream_experts` (`deepseek_v41/plugin.zig` `openPackBank`).
             .experts_stream = v41 and c.num_experts > 0,
-            // V4.1 keeps a state per slot, and plain decode tokens of several run as one batch; a streamed bank that
-            // turns out at load to stream from the SSD serves one request at a time (`intree.narrowLoadedCaps`).
-            .slot_state = v41,
-            .batches_decode = v41,
+            // V4.1 keeps a state per slot, and plain decode tokens of several run as one batch.
+            .slot_state = v41 and !c.dsv41_streamed,
+            .batches_decode = v41 and !c.dsv41_streamed,
         },
         .chat = .{
             .thinking_default = if (v41) .on else .off,

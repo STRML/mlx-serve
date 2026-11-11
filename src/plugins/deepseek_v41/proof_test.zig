@@ -281,9 +281,9 @@ test "deepseek_v41 aux: candidate image key ignores later rows and eligibility e
     m.cfg.dsv41_streamed = true;
     try testing.expect(aux.enabled(t.m));
     m.cfg.dsv41_streamed = false;
-    m.mdl.bank_streams = true;
+    m.bank_streams = true;
     try testing.expect(!aux.enabled(t.m));
-    m.mdl.bank_streams = false;
+    m.bank_streams = false;
     try testing.expect(v41.bankStreams(146, 183, 384));
     try testing.expect(v41.bankStreams(384, 200, 384));
     try testing.expect(!v41.bankStreams(384, 384, 384));
