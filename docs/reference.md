@@ -695,6 +695,7 @@ The controls are shared with the prefix cache:
 | `--prefix-cache-mem <size>` | Caps retained RAM state, including detached export sources. |
 | `--no-prefix-cache-ram` | Disables module history even with disk configured; module SSD-only retention is unsupported. |
 | `--prefix-cache-disk-write-max <MB/s>` | Module tiers only, with `--prefix-cache-disk`: feed the tier from T2 (hit again) tips idle past the quiet period, coldest first, within the rate; eviction cancels unwritten records; SIGTERM writes T2 tips only, hottest first, within `--shutdown-persist-secs`. Zero or absent writes every quiet tip. |
+| `MLX_SERVE_PREFIX_CACHE_PRESSURE=0` | Every hot-cache budget ignores macOS memory pressure. On by default: warning (held 5 s) halves each budget and critical (two readings) quarters it, read once a second while busy and every 1-5 s while idle; the budget comes back after 30 s at a lower level. An SSD-first budget divides only its idle allowance. Victims under pressure: a T2 tip whose SSD record committed goes before one still unwritten. |
 | `--shutdown-persist-secs <n>` | Gives SIGTERM persistence a deadline (default 45 seconds); zero disables the shutdown flush. |
 
 A disk restore requires an exact boundary strictly inside the new prompt, matching
@@ -705,6 +706,15 @@ compares the loaded inventory before constructing an independent snapshot. Only
 a successful import, restore, and prompt setup reports `n` cached tokens.
 Missing, truncated, or incompatible module files reject the entire record and
 prefill cold; KV's contiguous-chunk salvage remains separate.
+
+RAM eviction is byte-weighted ARC. A commit joins T2 when it is the next turn of a
+resident tip, a ghost's conversation coming back, or a fork: it extends a resident
+rung of at least 256 tokens that a live entry also extends (a turn restored from an
+earlier rung, or a retried turn). The fork demotes the branch it left (tip and rungs)
+to T1, cancels its unwritten records and evicts it first. A shared system prompt is
+not an entry, so parallel sessions under one cache key do not count as forks. Victim
+order: entries idle past the stale floor, the dead branch, the committing turn's own
+rungs, T1 while it outweighs its target, other rungs, then ARC's REPLACE.
 
 The finish path can continue staged work but never starts materializing a module
 part. The idle loop admits that staging memory and exports one file per slice,

@@ -18,7 +18,6 @@ const BUDGET_REVISE_WINDOW_NS = @import("cache/budget.zig").BUDGET_REVISE_WINDOW
 const reviseHotCacheBudgets = @import("cache/budget.zig").reviseHotCacheBudgets;
 const flushOwedDiskSlices = @import("cache/budget.zig").flushOwedDiskSlices;
 const followMemoryPressure = @import("cache/budget.zig").followMemoryPressure;
-const crt = @import("../../sdk/util/crt.zig");
 const holdsSleepWhileParked = @import("cache/budget.zig").holdsSleepWhileParked;
 const runDecodeTick = @import("decode.zig").runDecodeTick;
 const finishSlot = @import("finish.zig").finishSlot;
@@ -43,12 +42,12 @@ fn waitForDiskRetryLocked(sch: *Scheduler, ms: u32) void {
 }
 
 /// Caller holds queue_mu. Idle: follow memory pressure and land owed SSD slices before parking, so a later commit
-/// rarely finds one. While a cache can follow the pressure level, park for at most a second.
+/// rarely finds one. While a cache can follow the pressure level, park only until its next reading.
 fn waitForWorkLocked(sch: *Scheduler) void {
     var disk_owed = true;
     while (!hasWorkPendingLocked(sch) and !sch.shutdown.load(.acquire)) {
         sch.queue_mu.unlock(sch.io);
-        const watching = followMemoryPressure(sch, crt.monotonicMs());
+        const wake_ms = followMemoryPressure(sch);
         const flushed: prefix_cache_mod.FlushResult = if (disk_owed) flushOwedDiskSlices(sch) else .done;
         sch.queue_mu.lockUncancelable(sch.io);
         disk_owed = flushed != .done;
@@ -57,17 +56,15 @@ fn waitForWorkLocked(sch: *Scheduler) void {
             // A tip inside its quiet period is written later: look again once a second, or at the next request.
             .quiet => waitForDiskRetryLocked(sch, 1000),
             .progress => {},
-            .done => parkLocked(sch, watching),
+            .done => parkLocked(sch, wake_ms),
         }
-        // A pressure step can open a shrink that waits on the feed.
-        if (watching) disk_owed = true;
     }
 }
 
-fn parkLocked(sch: *Scheduler, watching: bool) void {
+fn parkLocked(sch: *Scheduler, wake_ms: ?u32) void {
     // No later tick runs while parked, so release here.
     sleep_inhibit.setActive(holdsSleepWhileParked(sch));
-    if (watching) return waitForDiskRetryLocked(sch, 1000);
+    if (wake_ms) |ms| return waitForDiskRetryLocked(sch, ms);
     if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) return;
     sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
 }
@@ -156,6 +153,7 @@ pub fn prefillAdmitted(sch: *Scheduler, slot: *Slot) AdmitOutcome {
 pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     // 1. Wait for work. Drain pending slots into a local list under lock,
     //    run prefills outside the lock.
+    _ = followMemoryPressure(sch);
     var ran = mode == .yield and drainSideQueues(sch);
     var to_prefill: [16]*Slot = undefined;
     var n_prefill: usize = 0;
@@ -506,4 +504,52 @@ test "a busy disk retry parks until its bounded timeout or pending work" {
     try testing.expect(before.read() >= 5 * std.time.ns_per_ms);
     sch.shutdown.store(true, .release);
     waitForDiskRetryLocked(&sch, 10);
+}
+
+/// Answers `level`, then stops the loop that read it.
+const StopAfterRead = struct {
+    var sch: ?*Scheduler = null;
+    var level: u32 = 1;
+    fn read() u32 {
+        sch.?.shutdown.store(true, .release);
+        return level;
+    }
+};
+
+test "memory pressure: a busy pass and the idle wait each follow the level" {
+    const budget = @import("cache/budget.zig");
+    const reg = try @import("../../host/registry/registry.zig").ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    var cfg = @import("../../sdk/config/model.zig").ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    const m = try budget.pressureModel(reg, &cfg, "/m/busy");
+    defer m.config = null;
+    const hc = m.prefix_cache.?;
+    hc.max_kv_bytes = 200 << 20;
+    var sch = budget.pressureScheduler(reg);
+    sch.queue_cond = .init;
+    sch.shutdown = .init(false);
+    sch.pending = .empty;
+    sch.vision_queue = .empty;
+    sch.embed_queue = .empty;
+    sch.cleanup_queue = .empty;
+    sch.load_queue = .empty;
+    sch.gen_queue = .empty;
+    sch.unload_queue = .empty;
+    sch.offloaded = .empty;
+    budget.FakePressure.level = 4;
+    for (0..2) |_| {
+        budget.FakePressure.now_ms += 1000;
+        try testing.expectEqual(ChatPassResult.idle, chatPass(&sch, .yield));
+    }
+    try testing.expectEqual(@as(u64, 50 << 20), hc.max_kv_bytes);
+
+    StopAfterRead.sch = &sch;
+    StopAfterRead.level = 1;
+    sch.memory_pressure = .{ .read = &StopAfterRead.read, .clock = &budget.FakePressure.clock };
+    budget.FakePressure.now_ms += 1000;
+    sch.queue_mu.lockUncancelable(sch.io);
+    waitForWorkLocked(&sch);
+    sch.queue_mu.unlock(sch.io);
+    try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
 }

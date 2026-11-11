@@ -836,8 +836,6 @@ pub const HotPrefixCache = struct {
     base: ?struct { kv: u64, idle: u64 } = null,
     /// Memory pressure divides the base by 2^shift (`applyPressure`). Ghost bounds and `arc_p` stay in base units.
     pressure_shift: u2 = 0,
-    /// A warning shrink stops at a victim with no committed SSD record until then, while the feed writes it.
-    pressure_feed_until_ms: ?i64 = null,
     /// T2 module tips evicted before their SSD record committed, and how many of those conversations came back.
     t2_evicted_unfed: u64 = 0,
     t2_unfed_returned: u64 = 0,
@@ -2093,10 +2091,10 @@ pub const HotPrefixCache = struct {
         };
         // Allocate before removing any donor; OOM leaves the resident history intact.
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
-        const continues = self.continuesModule(binding, ids, eff_media, has_tools, quant_config, cache_key);
-        const fork_at = if (continues) null else self.forkPoint(binding, ids, eff_media, has_tools, quant_config, cache_key);
-        const forked = fork_at != null;
-        const adm = self.arcBegin(ids, has_tools, quant_config, continues or forked);
+        const lineage = self.moduleLineage(binding, ids, eff_media, has_tools, quant_config, cache_key);
+        const adm = self.arcBegin(ids, has_tools, quant_config, lineage != .first_seen);
+        // Before room is made, so the dead branch pays for it and not the fork's own rungs.
+        if (lineage == .forked_turn) self.demoteForkedOff(binding, ids, eff_media, has_tools, quant_config, cache_key, lineage.forked_turn);
         self.supersedeModuleRungs(binding, ids, eff_media, has_tools, quant_config);
         const room = blk: {
             self.incoming_tip = .{ .binding = binding, .ids = ids, .media = eff_media, .has_tools = has_tools, .quant_config = quant_config };
@@ -2125,8 +2123,7 @@ pub const HotPrefixCache = struct {
         retained = true;
         self.current_kv_bytes += aux_bytes;
         self.arcEnd(ids, has_tools, quant_config, adm, true);
-        if (fork_at) |at| self.demoteForkedOff(binding, ids, eff_media, has_tools, quant_config, cache_key, at);
-        const why: []const u8 = if (adm.ghost) "ghost hit" else if (continues) "next turn" else if (forked) "forked turn" else "first seen";
+        const why: []const u8 = if (adm.ghost) "ghost hit" else @tagName(lineage);
         log.info("  [hot-cache] module commit {d} tokens key={x} -> {s} ({s})\n", .{ ids.len, cache_key, if (adm.frequent) "T2" else "T1", why });
         self.arcTrimGhosts();
         if (!self.feedMode()) self.registerModuleEntry(&self.entries.items[self.entries.items.len - 1]);
@@ -2171,7 +2168,7 @@ pub const HotPrefixCache = struct {
     fn extendedByResident(self: *const HotPrefixCache, i: usize, cache_key: ?u64) bool {
         const e = &self.entries.items[i];
         for (self.entries.items, 0..) |*o, j| {
-            if (j == i or o.tokens.len <= e.tokens.len) continue;
+            if (j == i or o.tokens.len <= e.tokens.len or o.forked_off) continue;
             if (cache_key) |k| if (o.cache_key != k) continue;
             const m = o.module orelse continue;
             if (moduleRungOf(e, m.binding, o.tokens, o.media, o.has_tools, o.quant_config)) return true;
@@ -2185,9 +2182,11 @@ pub const HotPrefixCache = struct {
     fn supersedeModuleRungs(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig) void {
         // Only a conversation's latest state is owed to the SSD: what this commit extends or replaces is not written.
         for (self.entries.items) |*e| {
-            const m = e.module orelse continue;
-            if (!moduleRungOf(e, binding, ids, media, has_tools, quant_config) or !self.moduleExportOwed(m)) continue;
-            self.cancelModule(m, .superseded);
+            if (!moduleRungOf(e, binding, ids, media, has_tools, quant_config)) continue;
+            // A branch this commit extends is live again.
+            e.forked_off = false;
+            if (!self.moduleExportOwed(e.module.?)) continue;
+            self.cancelModule(e.module.?, .superseded);
             e.disk_dirty = false;
         }
         var i: usize = self.entries.items.len;
@@ -2292,7 +2291,7 @@ pub const HotPrefixCache = struct {
         const id = m.disk_id orelse return false;
         const d = if (self.disk) |*dd| dd else return false;
         const state = d.moduleState(id) orelse return false;
-        return state == .registered or state == .exporting;
+        return state.owed();
     }
 
     /// A removal moves its bill into a free holder; pressure and holder exhaustion cancel only it.
@@ -2354,7 +2353,7 @@ pub const HotPrefixCache = struct {
             for (d.entries.items) |*e| {
                 if (e.kind != .module) continue;
                 const state = e.module.?.state;
-                if (state == .registered or state == .exporting or state == .submitted) d.cancelModule(e.id, reason);
+                if (state.unfinished()) d.cancelModule(e.id, reason);
             }
         }
         for (self.entries.items) |*e| if (e.module != null) {
@@ -3311,10 +3310,9 @@ pub const HotPrefixCache = struct {
     fn owedEntryIndex(self: *const HotPrefixCache, newest: bool, past_quiet: bool) ?usize {
         var best: ?usize = null;
         const now = if (past_quiet) self.nowMs() else 0;
-        const held: usize = (if (past_quiet) self.pressureFeedVictim() else null) orelse std.math.maxInt(usize);
         for (self.entries.items, 0..) |*e, i| {
             if (!e.disk_dirty or e.checked_out_by != null) continue;
-            if (past_quiet and e.module != null and now - e.touched_ms < self.module_quiet_ms and held != i) continue;
+            if (past_quiet and e.module != null and now - e.touched_ms < self.module_quiet_ms) continue;
             const b = best orelse {
                 best = i;
                 continue;
@@ -3384,7 +3382,6 @@ pub const HotPrefixCache = struct {
     /// shutdown takes T2 tips hottest first, with no idle wait.
     fn feedCandidate(self: *const HotPrefixCache, order: SliceOrder) ?usize {
         if (!self.feedMode() or order == .newest_first) return null;
-        if (order == .oldest_quiet) if (self.pressureFeedVictim()) |i| if (self.feedable(i)) return i;
         const hottest = order == .shutdown_hottest;
         const now = self.nowMs();
         var best: ?usize = null;
@@ -3533,7 +3530,7 @@ pub const HotPrefixCache = struct {
         for (d.entries.items) |e| {
             if (e.kind != .module) continue;
             const state = e.module.?.state;
-            if (state == .registered or state == .exporting or state == .submitted) n += 1;
+            if (state.unfinished()) n += 1;
         }
         return n;
     }
@@ -3844,10 +3841,8 @@ pub const HotPrefixCache = struct {
     fn evictToBudget(self: *HotPrefixCache) void {
         while (self.residentBytes() > self.max_kv_bytes) {
             const idx = self.shrinkVictim() orelse break;
-            if (self.holdsForFeed(idx)) return;
             self.evictForCapacity(idx, "budget revised", .memory_pressure, null);
         }
-        self.pressure_feed_until_ms = null;
         self.shedCheckpointsToFit();
         self.arcTrimGhosts();
     }
@@ -3864,25 +3859,12 @@ pub const HotPrefixCache = struct {
         self.ssd_idle_mem = idle >> self.pressure_shift;
     }
 
-    /// A new memory-pressure step from the idle loop. A warning shrink first lets the feed write the T2 tips it would
-    /// evict, for up to `PRESSURE_FEED_MS`; critical evicts at once. The same step again continues a held shrink.
+    /// A memory-pressure step from the inference loop.
     pub fn applyPressure(self: *HotPrefixCache, shift: u2) void {
-        if (shift == self.pressure_shift) return self.continuePressureShrink();
+        if (shift == self.pressure_shift) return;
         if (self.base == null) self.base = .{ .kv = self.max_kv_bytes, .idle = self.ssd_idle_mem };
-        const worse = shift > self.pressure_shift;
-        self.pressure_feed_until_ms = if (worse and shift < 2 and self.feedMode()) self.nowMs() + PRESSURE_FEED_MS else null;
         self.pressure_shift = shift;
         self.setBaseBudget(self.base.?.kv, self.base.?.idle);
-    }
-
-    pub const PRESSURE_FEED_MS: i64 = 10_000;
-
-    fn continuePressureShrink(self: *HotPrefixCache) void {
-        if (self.pressure_feed_until_ms == null) return;
-        if (!self.pressureFeedOpen()) self.pressure_feed_until_ms = null;
-        const before = self.entries.items.len;
-        self.evictToBudget();
-        if (self.entries.items.len != before) self.logResident();
     }
 
     /// Uncapped stays uncapped; an SSD-first budget keeps its live session and divides only the idle allowance.
@@ -3893,20 +3875,9 @@ pub const HotPrefixCache = struct {
         return @max(1, kept + ((b.kv - kept) >> self.pressure_shift));
     }
 
-    fn pressureFeedOpen(self: *const HotPrefixCache) bool {
-        const until = self.pressure_feed_until_ms orelse return false;
-        return self.nowMs() < until;
-    }
-
-    /// A held shrink waits on a victim whose record the feed can still commit: an unfed T2 tip, or one being written.
-    fn holdsForFeed(self: *const HotPrefixCache, idx: usize) bool {
-        if (!self.pressureFeedOpen() or !self.feedMode()) return false;
-        return self.feedable(idx) or self.exportInFlight(&self.entries.items[idx]);
-    }
-
     fn exportInFlight(self: *const HotPrefixCache, e: *const Entry) bool {
         const state = self.recordState(e) orelse return false;
-        return state == .registered or state == .exporting or state == .submitted;
+        return state.unfinished();
     }
 
     fn recordState(self: *const HotPrefixCache, e: *const Entry) ?kv_disk_cache.module_record.State {
@@ -3916,18 +3887,12 @@ pub const HotPrefixCache = struct {
         return d.moduleState(id);
     }
 
-    /// The victim a held pressure shrink waits on: the feed writes it ahead of the quiet period.
-    fn pressureFeedVictim(self: *const HotPrefixCache) ?usize {
-        if (self.residentBytes() <= self.max_kv_bytes) return null;
-        const i = self.shrinkVictim() orelse return null;
-        return if (self.holdsForFeed(i)) i else null;
-    }
-
-    /// ARC's victim; under pressure, when its record has not committed, the oldest entry of the same list whose record
-    /// has, so a shrink neither wastes a write in flight nor drops a state the SSD does not hold.
+    /// ARC's victim; under pressure, when that is a T2 tip the SSD does not hold yet (unfed, or its write in flight),
+    /// the oldest entry of the same list whose record has committed, which a later turn can still restore.
     fn shrinkVictim(self: *const HotPrefixCache) ?usize {
         const lru = self.lruIndexExcluding(null, null) orelse return null;
-        if (self.pressure_shift == 0 or self.recordState(&self.entries.items[lru]) == .committed) return lru;
+        if (self.pressure_shift == 0) return lru;
+        if (!self.feedable(lru) and !self.exportInFlight(&self.entries.items[lru])) return lru;
         const frequent = self.entries.items[lru].frequent;
         var best: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
@@ -4211,9 +4176,9 @@ pub const HotPrefixCache = struct {
     }
 
     /// The entry to evict next, never the one whose `last_used` is `protect`: one idle past `stale_after_ms` (a
-    /// finished session's lone entry must not shield itself forever), then a rung of the commit making room, then T1
-    /// while it outweighs its target, then any module rung (every live conversation keeps its newest checkpoint while
-    /// rungs remain), then the rest of ARC's REPLACE.
+    /// finished session's lone entry must not shield itself forever), then a forked-off branch, then a rung of the
+    /// commit making room, then T1 while it outweighs its target, then any module rung (every live conversation keeps
+    /// its newest checkpoint while rungs remain), then the rest of ARC's REPLACE.
     fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
@@ -4229,21 +4194,29 @@ pub const HotPrefixCache = struct {
             }
             if (best != null) return best;
         }
-        if (self.oldestRung(protect, true)) |i| return i;
+        if (self.oldestOf(protect, .forked_off)) |i| return i;
+        if (self.oldestOf(protect, .incoming_rung)) |i| return i;
         const t2_first = !self.arcPrefersT1();
         if (!t2_first) if (self.fairVictim(protect, incoming_key, false)) |i| return i;
-        if (self.oldestRung(protect, false)) |i| return i;
+        if (self.oldestOf(protect, .rung)) |i| return i;
         return self.fairVictim(protect, incoming_key, t2_first) orelse self.fairVictim(protect, incoming_key, !t2_first);
     }
 
-    fn oldestRung(self: *const HotPrefixCache, protect: ?u64, incoming_only: bool) ?usize {
+    const VictimClass = enum { forked_off, incoming_rung, rung };
+
+    fn oldestOf(self: *const HotPrefixCache, protect: ?u64, class: VictimClass) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
         for (self.entries.items, 0..) |*e, i| {
             if (e.checked_out_by != null) continue;
             if (protect) |p| if (e.last_used == p) continue;
             if (e.last_used >= best_used) continue;
-            if (!(if (incoming_only) self.incomingRung(i) else self.isModuleRung(i))) continue;
+            const member = switch (class) {
+                .forked_off => e.forked_off,
+                .incoming_rung => self.incomingRung(i),
+                .rung => self.isModuleRung(i),
+            };
+            if (!member) continue;
             best_used = e.last_used;
             best = i;
         }
@@ -4414,14 +4387,6 @@ pub const HotPrefixCache = struct {
 
     /// Does `ids` strictly extend the tip of a resident conversation of the same workload? A rung (another entry
     /// extends it), an equal checkpoint and another workload's entry are not that conversation coming back.
-    fn continuesModule(self: *const HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) bool {
-        for (self.entries.items, 0..) |*e, i| {
-            if (e.cache_key != cache_key or e.tokens.len >= ids.len or self.extendedByResident(i, cache_key)) continue;
-            if (moduleRungOf(e, binding, ids, media, has_tools, quant_config)) return true;
-        }
-        return false;
-    }
-
     /// Tokens `ids` shares with module entry `e` of the same workload, or null for another workload's entry.
     fn moduleShared(e: *const Entry, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) ?usize {
         const m = e.module orelse return null;
@@ -4431,27 +4396,41 @@ pub const HotPrefixCache = struct {
         return @min(lcp, mediaSharedBound(e.media, media));
     }
 
-    /// Where `ids` forks from a resident conversation without extending its tip (a turn restored from an earlier rung,
-    /// or a retried turn): the longest same-workload rung, past the promotion floor, that `ids` extends. A shared
-    /// system prompt is no rung, so parallel conversations under one key never count.
-    fn forkPoint(self: *const HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) ?usize {
-        var at: ?usize = null;
+    const Lineage = union(enum) { first_seen, next_turn, forked_turn: usize };
+
+    /// What `ids` is to its workload's resident conversations. The longest same-key entry it strictly extends is its
+    /// previous tip (the next turn) or, when a live entry extends that one too, a rung past the promotion floor it
+    /// forks from (a turn restored from an earlier rung, or a retried turn); with no such entry, a ghost past the
+    /// floor (a state restored from the SSD or evicted) is the fork point. A shared system prompt is no entry, so
+    /// parallel conversations under one key stay apart.
+    fn moduleLineage(self: *const HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) Lineage {
+        var best: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
             const shared = moduleShared(e, binding, ids, media, has_tools, quant_config, cache_key) orelse continue;
-            if (shared != e.tokens.len or shared >= ids.len or shared < ARC_PROMOTE_MIN_TOKENS) continue;
-            if (!self.extendedByResident(i, cache_key)) continue;
-            if (at == null or shared > at.?) at = shared;
+            if (shared != e.tokens.len or shared >= ids.len) continue;
+            if (best == null or shared > self.entries.items[best.?].tokens.len) best = i;
         }
-        return at;
+        if (best) |i| {
+            if (!self.extendedByResident(i, cache_key)) return .next_turn;
+            const at = self.entries.items[i].tokens.len;
+            if (at >= ARC_PROMOTE_MIN_TOKENS) return .{ .forked_turn = at };
+        }
+        const g = self.ghosts.longestPrefixOf(ids, has_tools, quant_config) orelse return .first_seen;
+        if (g.len < ARC_PROMOTE_MIN_TOKENS or g.len >= ids.len) return .first_seen;
+        return .{ .forked_turn = g.len };
     }
 
-    /// The fork tip just landed: a tip above the fork point it diverged from is dead and must not outlive it in T2.
+    /// Every same-key entry above the fork point that `ids` diverged from (the dead branch, tip and rungs) leaves T2,
+    /// goes first when room is made, and is no longer owed to the SSD.
     fn demoteForkedOff(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64, fork_at: usize) void {
-        for (self.entries.items, 0..) |*e, i| {
+        for (self.entries.items) |*e| {
             const shared = moduleShared(e, binding, ids, media, has_tools, quant_config, cache_key) orelse continue;
-            if (shared < fork_at or shared >= e.tokens.len or self.extendedByResident(i, null)) continue;
+            if (shared < fork_at or shared >= e.tokens.len) continue;
             e.frequent = false;
             e.forked_off = true;
+            if (!self.moduleExportOwed(e.module.?)) continue;
+            self.cancelModule(e.module.?, .superseded);
+            e.disk_dirty = false;
         }
     }
 
@@ -12370,6 +12349,137 @@ test "HotPrefixCache ARC prefix cache: conversations and one-shots under one lon
     cache.invalidateAll("test end");
 }
 
+/// `base[0..at]`, then fresh tokens from `seed` up to `n`.
+fn forkOf(comptime n: usize, base: []const u32, at: usize, seed: u32) [n]u32 {
+    var out: [n]u32 = undefined;
+    @memcpy(out[0..at], base[0..at]);
+    for (out[at..], 0..) |*t, i| t.* = seed + @as(u32, @intCast(i));
+    return out;
+}
+
+/// Ids long enough that every prefix the module tests take reaches the SSD tier's `MIN_PERSIST_TOKENS`.
+fn longIds(seed: u32) [1200]u32 {
+    var out: [1200]u32 = undefined;
+    for (&out, 0..) |*id, i| id.* = seed + @as(u32, @intCast(i));
+    return out;
+}
+
+fn arcCommit(cache: *HotPrefixCache, fake: *ModuleFake, binding: ModuleBinding, snap: *ModuleFake.Snap, ids: []const u32, key: u64) !void {
+    snap.* = arcSnap(fake, ids, 40);
+    try arcPutKey(cache, binding, snap, key);
+}
+
+test "HotPrefixCache ARC prefix cache: a fork makes room from the dead branch, never from its own rungs" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 160);
+    defer cache.deinit();
+    cache.stale_after_ms = 0;
+    const ids = ModuleDiskTest.ids(1000);
+    const fork = forkOf(450, &ids, 400, 90_000);
+    var snaps: [5]ModuleFake.Snap = undefined;
+    for ([_]usize{ 300, 400, 500 }, 0..) |n, i| try arcCommit(&cache, &fake, binding, &snaps[i], ids[0..n], 7);
+    try arcCommit(&cache, &fake, binding, &snaps[3], &.{ 100, 200 }, 9);
+    try arcCommit(&cache, &fake, binding, &snaps[4], &fork, 7);
+    try testing.expect(arcEntry(&cache, ids[0..500]) == null);
+    for ([_]usize{ 300, 400 }) |n| try testing.expect(arcEntry(&cache, ids[0..n]) != null);
+    try testing.expect(arcEntry(&cache, &.{ 100, 200 }) != null);
+    try testing.expect(arcEntry(&cache, &fork).?.frequent);
+    cache.invalidateAll("test end");
+}
+
+test "HotPrefixCache ARC prefix cache: a second fork from an earlier rung demotes the whole dead branch, rungs included" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 0);
+    defer cache.deinit();
+    const ids = ModuleDiskTest.ids(1000);
+    const f1 = forkOf(480, &ids, 400, 90_000);
+    const f2 = forkOf(360, &ids, 300, 95_000);
+    var snaps: [6]ModuleFake.Snap = undefined;
+    for ([_]usize{ 300, 400, 500 }, 0..) |n, i| try arcCommit(&cache, &fake, binding, &snaps[i], ids[0..n], 7);
+    try arcCommit(&cache, &fake, binding, &snaps[3], f1[0..450], 7);
+    try arcCommit(&cache, &fake, binding, &snaps[4], &f1, 7);
+    try testing.expect(arcEntry(&cache, &f1).?.frequent);
+    try arcCommit(&cache, &fake, binding, &snaps[5], &f2, 7);
+    try testing.expect(arcEntry(&cache, &f2).?.frequent);
+    for ([_][]const u32{ ids[0..400], ids[0..500], f1[0..450], &f1 }) |dead| try testing.expect(!arcEntry(&cache, dead).?.frequent);
+    try testing.expect(arcEntry(&cache, ids[0..300]) != null);
+    cache.invalidateAll("test end");
+}
+
+test "HotPrefixCache ARC prefix cache: a fork restored from the SSD tier still demotes the dead tip" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 1000);
+    defer cache.deinit();
+    const ids = ModuleDiskTest.ids(1000);
+    const fork = forkOf(450, &ids, 400, 90_000);
+    var snaps: [2]ModuleFake.Snap = undefined;
+    try arcCommit(&cache, &fake, binding, &snaps[0], ids[0..500], 7);
+    (try testEntryFor(&cache, ids[0..500])).frequent = true;
+    cache.arcNoteRestored(ids[0..400], false, kv_quant.KVQuantConfig.dense);
+    try arcCommit(&cache, &fake, binding, &snaps[1], &fork, 7);
+    try testing.expect(arcEntry(&cache, &fork).?.frequent);
+    try testing.expect(!arcEntry(&cache, ids[0..500]).?.frequent);
+    cache.invalidateAll("test end");
+}
+
+test "HotPrefixCache ARC prefix cache: two sessions over one resident first turn do not demote each other turn after turn" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 0);
+    defer cache.deinit();
+    const first = ModuleDiskTest.ids(1000);
+    const a = forkOf(500, &first, 300, 50_000);
+    const b = forkOf(500, &first, 300, 60_000);
+    var snaps: [7]ModuleFake.Snap = undefined;
+    try arcCommit(&cache, &fake, binding, &snaps[0], first[0..300], 7);
+    var n: usize = 1;
+    for ([_]usize{ 400, 450, 500 }) |len| {
+        for ([_]*const [500]u32{ &a, &b }) |conv| {
+            try arcCommit(&cache, &fake, binding, &snaps[n], conv[0..len], 7);
+            n += 1;
+        }
+        if (len == 400) continue;
+        for ([_]*const [500]u32{ &a, &b }) |conv| {
+            const tip = arcEntry(&cache, conv[0..len]).?;
+            try testing.expect(tip.frequent and !tip.forked_off);
+            try testing.expect(!arcEntry(&cache, conv[0 .. len - 50]).?.forked_off);
+        }
+    }
+    cache.invalidateAll("test end");
+}
+
+test "HotPrefixCache ARC prefix cache: a session's next turn takes its own rung before a one-shot in T1" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 120);
+    defer cache.deinit();
+    cache.stale_after_ms = 0;
+    const ids = ModuleDiskTest.ids(1000);
+    var snaps: [4]ModuleFake.Snap = undefined;
+    try arcCommit(&cache, &fake, binding, &snaps[0], ids[0..300], 7);
+    (try testEntryFor(&cache, ids[0..300])).frequent = true;
+    try arcCommit(&cache, &fake, binding, &snaps[1], ids[0..400], 7);
+    try arcCommit(&cache, &fake, binding, &snaps[2], &.{ 100, 200 }, 9);
+    try arcCommit(&cache, &fake, binding, &snaps[3], ids[0..500], 7);
+    try testing.expect(arcEntry(&cache, &.{ 100, 200 }) != null);
+    try testing.expect(arcEntry(&cache, ids[0..300]) == null);
+    try testing.expect(arcEntry(&cache, ids[0..500]).?.frequent);
+    cache.invalidateAll("test end");
+}
+
 test "HotPrefixCache ARC prefix cache: a one-shot in T1 goes before a T2 session's rung" {
     var fake: ModuleFake = .{};
     var bound: plugin_driver.Bound = undefined;
@@ -12491,7 +12601,7 @@ test "HotPrefixCache ARC prefix cache: a session spilled to the SSD tier comes b
     try testing.expect((try testEntryFor(&hc, &longer)).frequent);
 }
 
-test "HotPrefixCache ARC prefix cache: a pressure step evicts T1 before T2, keeps the full budget's ghosts and target, and gives the budget back" {
+test "HotPrefixCache ARC prefix cache: a pressure step weighs T1 against the divided target, keeps the full budget's ghosts and target, and gives the budget back" {
     var fake: ModuleFake = .{};
     var bound: plugin_driver.Bound = undefined;
     var xfm: transformer_mod.Transformer = undefined;
@@ -12505,18 +12615,16 @@ test "HotPrefixCache ARC prefix cache: a pressure step evicts T1 before T2, keep
         id.* = .{ @intCast(100 + i), @intCast(200 + i) };
         snap.* = arcSnap(&fake, id, 40);
         _ = try snap.put(&cache, binding, &.{});
-        (try testEntryFor(&cache, id)).frequent = i % 2 == 0;
+        (try testEntryFor(&cache, id)).frequent = i >= 3;
     }
+    // p = 160 of the full 400; at half the budget T1 (120) outweighs 80, so it pays once before T2 does.
+    cache.arc_p = 160;
     cache.applyPressure(1);
     try testing.expectEqual(@as(u64, 200), cache.max_kv_bytes);
-    try testing.expectEqual(ArcSizes{ .t1 = 0, .t2 = 200, .b1 = 200 }, cache.arcSizes());
-    cache.arc_p = 160;
+    try testing.expectEqual(ArcSizes{ .t1 = 80, .t2 = 120, .b1 = 40, .b2 = 160 }, cache.arcSizes());
     cache.applyPressure(2);
     try testing.expectEqual(@as(u64, 100), cache.max_kv_bytes);
-    const s = cache.arcSizes();
-    try testing.expectEqual(@as(u64, 80), s.t2);
-    try testing.expectEqual(@as(u64, 200), s.b1);
-    try testing.expectEqual(@as(u64, 120), s.b2);
+    try testing.expectEqual(ArcSizes{ .t1 = 40, .t2 = 40, .b1 = 80, .b2 = 240 }, cache.arcSizes());
     try testing.expectEqual(@as(u64, 160), cache.arc_p);
     cache.applyPressure(0);
     try testing.expectEqual(@as(u64, 400), cache.max_kv_bytes);
@@ -12839,7 +12947,7 @@ fn pressureFeedCache(tmp: *testing.TmpDir, fake: *ModuleFake, binding: ModuleBin
     return hc;
 }
 
-test "module feed: a pressure shrink takes a committed T2 tip first, otherwise writes its victim within the bucket; critical and an expired wait evict at once and count the loss and its return" {
+test "module feed: a pressure shrink takes a written T2 tip before an unwritten one, and counts each unwritten loss and its return" {
     var fake: ModuleFake = .{};
     var bound: plugin_driver.Bound = undefined;
     var xfm: transformer_mod.Transformer = undefined;
@@ -12849,27 +12957,6 @@ test "module feed: a pressure shrink takes a committed T2 tip first, otherwise w
     const base: i64 = 1_000_000;
     var ids: [4][513]u32 = undefined;
     for (&ids, 0..) |*id, i| id.* = ModuleDiskTest.ids(@as(u32, @intCast(i)) * 10_000 + 1000);
-    {
-        var tmp = testing.tmpDir(.{ .iterate = true });
-        defer tmp.cleanup();
-        var snaps: [4]ModuleFake.Snap = undefined;
-        var hc = try pressureFeedCache(&tmp, &fake, binding, &snaps, &ids, base);
-        defer hc.deinit();
-        hc.applyPressure(1);
-        try testing.expectEqual(@as(usize, 3), hc.entryCount());
-        try testing.expect(arcEntry(&hc, ids[0][0..512]) != null);
-        for (0..8) |i| {
-            FeedTest.tick(&hc, cpu, base + @as(i64, @intCast(i)) * 1000);
-            try testing.expect(hc.disk.?.bytes_persisted <= 4096 * (i + 1) + 2048);
-            hc.applyPressure(1);
-        }
-        try testing.expectEqual(@as(usize, 2), hc.entryCount());
-        try testing.expect(FeedTest.onDisk(&hc, &ids[0]));
-        for (ids[1..]) |*id| try testing.expect(!FeedTest.onDisk(&hc, id));
-        try testing.expectEqual(@as(u64, 0), hc.t2_evicted_unfed);
-        const back = hc.findModuleMatch(binding, &ids[0], false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
-        try testing.expectEqual(.disk, back.source);
-    }
     {
         var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -12886,20 +12973,17 @@ test "module feed: a pressure shrink takes a committed T2 tip first, otherwise w
         try testing.expect(arcEntry(&hc, ids[2][0..512]) == null);
         try testing.expectEqual(persisted, hc.disk.?.bytes_persisted);
         try testing.expectEqual(@as(u64, 0), hc.t2_evicted_unfed);
+        const back = hc.findModuleMatch(binding, &ids[2], false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+        try testing.expectEqual(.disk, back.source);
     }
-    for ([_]bool{ false, true }) |critical| {
+    for ([_]u2{ 1, 2 }) |shift| {
         var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         var snaps: [4]ModuleFake.Snap = undefined;
         var hc = try pressureFeedCache(&tmp, &fake, binding, &snaps, &ids, base);
         defer hc.deinit();
-        hc.applyPressure(if (critical) 2 else 1);
-        if (!critical) {
-            try testing.expectEqual(@as(u64, 0), hc.t2_evicted_unfed);
-            hc.feed_now_ms = base + HotPrefixCache.PRESSURE_FEED_MS;
-            hc.applyPressure(1);
-        }
-        try testing.expectEqual(@as(u64, if (critical) 2 else 1), hc.t2_evicted_unfed);
+        hc.applyPressure(shift);
+        try testing.expectEqual(@as(u64, shift), hc.t2_evicted_unfed);
         try testing.expect(!FeedTest.onDisk(&hc, &ids[0]));
         hc.applyPressure(0);
         var back = ModuleDiskTest.snap(&fake, &ids[0]);
@@ -12907,6 +12991,94 @@ test "module feed: a pressure shrink takes a committed T2 tip first, otherwise w
         try testing.expectEqual(@as(u64, 1), hc.t2_unfed_returned);
         hc.disk.?.drainWriter();
     }
+}
+
+test "a fork cancels the dead tip's owed export" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 8);
+    defer hc.deinit();
+    hc.module_quiet_ms = 60_000;
+    const ids = longIds(1000);
+    const fork = forkOf(750, &ids, 700, 90_000);
+    var snaps: [4]ModuleFake.Snap = undefined;
+    for ([_]usize{ 600, 700, 800 }, 0..) |n, i| {
+        snaps[i] = ModuleDiskTest.snap(&fake, ids[0..n]);
+        _ = try snaps[i].put(&hc, binding, &.{});
+    }
+    const dead_id = (try testEntryFor(&hc, ids[0..800])).module.?.disk_id orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(kv_disk_cache.module_record.State.registered, hc.disk.?.moduleState(dead_id).?);
+    snaps[3] = ModuleDiskTest.snap(&fake, &fork);
+    _ = try snaps[3].put(&hc, binding, &.{});
+    // A cancelled record may already be swept from the index.
+    const state = hc.disk.?.moduleState(dead_id);
+    try testing.expect(state == null or state.? == .cancelled);
+    try testing.expect(!(try testEntryFor(&hc, ids[0..800])).disk_dirty);
+    hc.disk.?.drainWriter();
+}
+
+test "module feed: a rung only a dead branch extends is a live tip again, and is fed" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var hc = try FeedTest.init(&tmp, 8);
+    defer hc.deinit();
+    hc.feed_bytes_per_s = 4096;
+    const base: i64 = 1_000_000;
+    const ids = longIds(1000);
+    const fork = forkOf(750, &ids, 700, 90_000);
+    var snaps: [3]ModuleFake.Snap = undefined;
+    for ([_][]const u32{ ids[0..700], ids[0..800], &fork }, 0..) |t, i| {
+        snaps[i] = ModuleDiskTest.snap(&fake, t);
+        _ = try snaps[i].put(&hc, binding, &.{});
+        if (i == 0) (try testEntryFor(&hc, t)).frequent = true;
+    }
+    for (hc.entries.items, 0..) |e, i| if (e.tokens.len == 750) {
+        hc.evictAt(i, "test: the fork leaves");
+        break;
+    };
+    (try testEntryFor(&hc, ids[0..700])).touched_ms = base - 61_000;
+    for (0..4) |i| FeedTest.tick(&hc, cpu, base + @as(i64, @intCast(i)) * 1000);
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    try testing.expectEqual(@as(usize, 700), hc.disk.?.entries.items[0].tokens.len);
+}
+
+test "module feed: a pressure shrink takes a T2 rung before its session's written tip" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var hc = try FeedTest.init(&tmp, 8);
+    defer hc.deinit();
+    hc.max_kv_bytes = 80;
+    hc.stale_after_ms = 0;
+    hc.feed_bytes_per_s = 4096;
+    const base: i64 = 1_000_000;
+    const ids = longIds(1000);
+    var rung = ModuleDiskTest.snap(&fake, ids[0..600]);
+    _ = try rung.put(&hc, binding, &.{});
+    (try testEntryFor(&hc, ids[0..600])).frequent = true;
+    var tip = ModuleDiskTest.snap(&fake, ids[0..700]);
+    _ = try tip.put(&hc, binding, &.{});
+    (try testEntryFor(&hc, ids[0..700])).touched_ms = base - 61_000;
+    for (0..4) |i| FeedTest.tick(&hc, cpu, base + @as(i64, @intCast(i)) * 1000);
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    hc.applyPressure(1);
+    try testing.expect(arcEntry(&hc, ids[0..700]) != null);
+    try testing.expect(arcEntry(&hc, ids[0..600]) == null);
 }
 
 test "HotPrefixCache module: oversized disabled and malformed commits free the whole candidate" {

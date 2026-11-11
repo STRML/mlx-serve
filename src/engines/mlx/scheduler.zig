@@ -97,6 +97,7 @@ pub const configBatchesDecode = @import("batching/verdict.zig").configBatchesDec
 pub const modelBatchable = @import("batching/verdict.zig").modelBatchable;
 pub const liveDecodingCount = @import("batching/verdict.zig").liveDecodingCount;
 pub const BudgetRevise = @import("cache/budget.zig").BudgetRevise;
+const PressureGauge = @import("../../host/gpu_thread/scheduler.zig").PressureGauge;
 pub const reclaimableHotCacheBytesFor = @import("cache/budget.zig").reclaimableHotCacheBytesFor;
 pub const armShutdownDeadline = @import("cache/budget.zig").armShutdownDeadline;
 pub const reviseHotCacheBudgets = @import("cache/budget.zig").reviseHotCacheBudgets;
@@ -265,6 +266,7 @@ pub fn init(
         .prefix_cache_mem_resolver = if (params.prefix_cache_clamp) &@import("admission/hot_cache_plan.zig").prefixCacheMemForLoad else null,
         .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
         .prefix_cache_disk_write_max_bps = params.prefix_cache_disk_write_max_bps,
+        .memory_pressure = if (env.present(.MLX_SERVE_PREFIX_CACHE_PRESSURE) and !env.on(.MLX_SERVE_PREFIX_CACHE_PRESSURE)) .{ .read = &PressureGauge.unread } else .{},
         .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
         .ssm_checkpoint_max = params.ssm_checkpoint_max,
         .mtp_enabled = params.mtp_enabled,

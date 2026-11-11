@@ -52,22 +52,33 @@ pub const BatchVerdict = enum {
 pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
 
 /// The kernel's memory-pressure level as a hot-cache budget shift: warning halves, critical quarters. Read at most
-/// once a second; a worse level applies once it has held 5 s (a prefill's own transient must not shrink the cache),
-/// a better one after 30 s.
+/// once a second. Critical applies on its second reading in a row, warning once it has held 5 s (a prefill's own
+/// transient must not shrink the cache), a better level after 30 s.
 pub const PressureGauge = struct {
     read: *const fn () u32 = @import("../../sdk/util/system.zig").memoryPressureLevel,
+    clock: *const fn () i64 = @import("../../sdk/util/crt.zig").monotonicMs,
     shift: u2 = 0,
     read_ms: ?i64 = null,
     pending: u2 = 0,
     since_ms: ?i64 = null,
+    /// The reader has answered at all: a platform with no reading (0) is never watched.
+    readable: bool = false,
 
-    pub const WORSE_HOLD_MS: i64 = 5_000;
+    pub const WARNING_HOLD_MS: i64 = 5_000;
     pub const BETTER_HOLD_MS: i64 = 30_000;
 
-    pub fn sample(self: *PressureGauge, now_ms: i64) u2 {
+    /// `MLX_SERVE_PREFIX_CACHE_PRESSURE=0`: the reader that never answers.
+    pub fn unread() u32 {
+        return 0;
+    }
+
+    pub fn sample(self: *PressureGauge) u2 {
+        const now_ms = self.clock();
         if (self.read_ms) |t| if (now_ms - t < 1000) return self.shift;
         self.read_ms = now_ms;
-        const level = levelShift(self.read());
+        const raw = self.read();
+        self.readable = self.readable or raw != 0;
+        const level = levelShift(raw);
         if (level == self.shift) {
             self.since_ms = null;
             return self.shift;
@@ -79,11 +90,20 @@ pub const PressureGauge = struct {
         }
         // Only what held for the whole window applies.
         self.pending = if (worse) @min(self.pending, level) else @max(self.pending, level);
-        const hold: i64 = if (worse) WORSE_HOLD_MS else BETTER_HOLD_MS;
-        if (now_ms - self.since_ms.? < hold) return self.shift;
+        if (!self.due(worse, now_ms - self.since_ms.?)) return self.shift;
         self.shift = self.pending;
         self.since_ms = null;
         return self.shift;
+    }
+
+    /// A level change is waiting out its window.
+    pub fn settling(self: *const PressureGauge) bool {
+        return self.since_ms != null;
+    }
+
+    fn due(self: *const PressureGauge, worse: bool, held_ms: i64) bool {
+        if (!worse) return held_ms >= BETTER_HOLD_MS;
+        return if (self.pending == 2) held_ms > 0 else held_ms >= WARNING_HOLD_MS;
     }
 
     fn levelShift(level: u32) u2 {

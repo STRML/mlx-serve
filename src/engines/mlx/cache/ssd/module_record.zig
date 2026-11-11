@@ -7,7 +7,24 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const PART_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_TOKEN_BYTES: u64 = 64 * 1024 * 1024;
 
-pub const State = enum { registered, exporting, submitted, committed, failed, cancelled };
+pub const State = enum {
+    registered,
+    exporting,
+    submitted,
+    committed,
+    failed,
+    cancelled,
+
+    /// Still to be sliced: a cancel drops it before any byte reaches the writer.
+    pub fn owed(s: State) bool {
+        return s == .registered or s == .exporting;
+    }
+
+    /// Not committed, failed or cancelled yet.
+    pub fn unfinished(s: State) bool {
+        return s.owed() or s == .submitted;
+    }
+};
 
 pub const Tensor = struct {
     name: []const u8,

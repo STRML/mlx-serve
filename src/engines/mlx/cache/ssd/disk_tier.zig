@@ -1234,7 +1234,7 @@ pub const DiskTier = struct {
         for (self.entries.items) |*e| {
             if (e.kind != .module) continue;
             const state = e.module.?.state;
-            if (state == .registered or state == .exporting) self.cancelModule(e.id, .unload);
+            if (state.owed()) self.cancelModule(e.id, .unload);
         }
         if (self.base_dir) |b| self.allocator.free(b);
         self.base_dir = null;
