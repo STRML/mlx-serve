@@ -175,6 +175,13 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
     return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
+/// A prefill width no wider than the arch's widest (`ModelConfig.prefillWidths().max`, 0 = none), an explicit
+/// `--prefill-chunk` included: past 8192 rows DeepSeek-V4.1 prefill hung and panicked Macs.
+pub fn archCapped(width: usize, config: *const model_mod.ModelConfig) usize {
+    const max = config.prefillWidths().max;
+    return if (max == 0) width else @min(width, max);
+}
+
 /// A prefill width under the decode share's cap (0 = no cap).
 pub fn decodeShareCapped(width: usize, cap: usize) usize {
     return if (cap == 0) width else @min(width, cap);
@@ -493,6 +500,14 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     try std.testing.expectEqual(@as(usize, 8192), explicit);
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(explicit, 1024));
     try std.testing.expectEqual(@as(usize, 8192), decodeShareCapped(explicit, 0));
+}
+
+test "archCapped: an explicit width past DeepSeek-V4.1's widest runs at 8192, other models' as asked" {
+    const v41: model_mod.ModelConfig = .{ .model_type = "deepseek_v41" };
+    const other: model_mod.ModelConfig = .{ .model_type = "qwen3_5_moe" };
+    try testing.expectEqual(@as(usize, 8192), archCapped(16384, &v41));
+    try testing.expectEqual(@as(usize, 4096), archCapped(4096, &v41));
+    try testing.expectEqual(@as(usize, 16384), archCapped(16384, &other));
 }
 
 test "effectivePrefillChunk: the machine cap bounds every auto width, an explicit width passes" {
