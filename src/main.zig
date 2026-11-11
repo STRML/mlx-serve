@@ -394,6 +394,13 @@ fn printUsage(io: std.Io) void {
         \\                        evictions instead of recomputed. Can use many
         \\                        GB of disk, so it's opt-in; e.g. 10GB. 0/off
         \\                        disables.
+        \\  --prefix-cache-disk-write-max <MB/s>
+        \\                      Module tiers only (DeepSeek-V4.1): feed the SSD
+        \\                        tier from the most-used (second-hit) tips once
+        \\                        they go quiet, at most this many MB per second,
+        \\                        instead of writing every tip. Eviction then
+        \\                        drops an unwritten entry. SIGTERM writes the
+        \\                        hottest first, one-hit tips last. 0/absent: off.
         \\  --shutdown-persist-secs <n>
         \\                      On SIGTERM, finish writing the SSD-tier slices not
         \\                        yet on disk, for at most <n> seconds, then exit
@@ -1044,6 +1051,16 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk-write-max") and i + 1 < args.len) {
+            i += 1;
+            const mb_per_s = std.fmt.parseInt(u64, args[i], 10) catch {
+                log.err("--prefix-cache-disk-write-max: expected whole MB/s (0 = off); got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+            server_mod.launch().prefix_cache_disk_write_max_bps = std.math.mul(u64, mb_per_s, 1024 * 1024) catch {
+                log.err("--prefix-cache-disk-write-max: {s} MB/s overflows a byte rate\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--shutdown-persist-secs") and i + 1 < args.len) {
             i += 1;
             server_mod.shutdown_persist_secs = std.fmt.parseInt(u32, args[i], 10) catch {
@@ -1337,6 +1354,9 @@ pub fn main(init: std.process.Init) !void {
             log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
             log.err("Stop it first (pkill -f mlx-serve) or use a different port (--port {d}).\n", .{port + 1});
             std.process.exit(1);
+        }
+        if (server_mod.launch().prefix_cache_disk_write_max_bps > 0 and server_mod.launch().prefix_cache_disk_bytes == 0) {
+            log.warn("--prefix-cache-disk-write-max has no effect without --prefix-cache-disk.\n", .{});
         }
         // Above every serve dispatch (GGUF/headless/media return early below).
         if (server_mod.shouldWarnOpenBind(host_explicit, server_mod.g_lan_share_spec != null, host)) {
@@ -1675,6 +1695,7 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_mem_bytes = server_mod.launch().prefix_cache_mem_bytes,
             .prefix_cache_clamp = true,
             .prefix_cache_disk_bytes = server_mod.launch().prefix_cache_disk_bytes,
+            .prefix_cache_disk_write_max_bps = server_mod.launch().prefix_cache_disk_write_max_bps,
             .ssm_checkpoint_stride = effectiveSsmCheckpointStride(server_mod.launch().ssm_checkpoint_stride, server_mod.launch().prefix_cache_capacity, server_mod.launch().prefix_cache_ram_enabled, server_mod.launch().prefix_cache_disk_bytes),
             .ssm_checkpoint_max = server_mod.launch().ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
@@ -1964,6 +1985,7 @@ fn runHeadlessServe(
         .prefix_cache_mem_bytes = server_mod.launch().prefix_cache_mem_bytes,
         .prefix_cache_clamp = true,
         .prefix_cache_disk_bytes = server_mod.launch().prefix_cache_disk_bytes,
+        .prefix_cache_disk_write_max_bps = server_mod.launch().prefix_cache_disk_write_max_bps,
         .ssm_checkpoint_stride = effectiveSsmCheckpointStride(server_mod.launch().ssm_checkpoint_stride, server_mod.launch().prefix_cache_capacity, server_mod.launch().prefix_cache_ram_enabled, server_mod.launch().prefix_cache_disk_bytes),
         .ssm_checkpoint_max = server_mod.launch().ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
