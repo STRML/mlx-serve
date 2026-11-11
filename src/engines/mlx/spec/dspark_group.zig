@@ -32,11 +32,11 @@ const sampleRows = @import("../sampling/lazy.zig").sampleRows;
 /// Slots one group round carries.
 pub const MAX_SLOTS: usize = dflash_policy.MAX_GROUP_ROWS;
 
-/// Whether `xfm` runs DSpark group rounds: a DeepSeek-V4.1 module with its stages that batches its states
-/// (`batchesStates`). Its DSpark slots keep drafting beside company instead of yielding to the plain batch.
+/// Whether `xfm` runs DSpark group rounds: a DeepSeek-V4.1 module with its stages that batches its states (resident,
+/// unpaired). Its DSpark slots keep drafting beside company instead of yielding to the plain batch.
 pub fn groupable(xfm: *const Transformer) bool {
     const m = intree.dsv41(xfm) orelse return false;
-    return m.dspark != null and dsv41_mod.batchesStates(m);
+    return m.dspark != null and m.pair == null and m.streamed == null;
 }
 
 /// Whether `slot` ticks DSpark rounds on a groupable model.
@@ -211,7 +211,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     }
     const cost = &xfm.dspark_group_cost;
     var rows_k: [MAX_SLOTS]u32 = undefined;
-    const width = dflash_policy.planGroup(p[0..n], cost, dsv41_mod.batchRows(mdl), rows_k[0..n]);
+    const width = dflash_policy.planGroup(p[0..n], cost, dflash_policy.MAX_GROUP_ROWS, rows_k[0..n]);
     var chunks: [MAX_SLOTS][]const u32 = undefined;
     for (drafts[0..n], rows_k[0..n], chunks[0..n]) |*d, b, *ch| {
         d.len = b;
@@ -235,7 +235,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         parts[n_parts] = try dsv41_mod.extendBatched(mdl, gpa, states[lo..hi], ids[lo..hi], chunks[lo..hi], d);
         n_parts += 1;
     }
-    const logits = if (n_parts == 1) parts[0] else try dsv41_mod.concatRows(parts[0..n_parts], mdl.s);
+    const logits = if (n_parts == 1) parts[0] else try concatRows(parts[0..n_parts], mdl.s);
     defer if (n_parts > 1) {
         _ = mlx.mlx_array_free(logits);
     };
@@ -329,6 +329,16 @@ fn rowsOfChunks(chunks: []const []const u32) usize {
     var rows: usize = 0;
     for (chunks) |ch| rows += ch.len;
     return rows;
+}
+
+/// `parts`' rows one after another (caller frees).
+fn concatRows(parts: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    const v = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_concatenate_axis(&o, v, 0, s));
+    return o;
 }
 
 /// The round's verifies of `width` slots each took `took` ms in all: each its share as the fit prices them.

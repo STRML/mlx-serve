@@ -173,23 +173,18 @@ test "deepseek_v41 streamed: the trunk with its experts streamed from the pack (
     try streamedParity(32);
 }
 
-/// The tiny pack of `n_experts` experts written into `tmp`; returns its path.
-fn writeTiny(a: std.mem.Allocator, tmp: *std.testing.TmpDir, n_experts: u32) ![]const u8 {
-    const io = testing.io;
-    const cfg = try std.mem.replaceOwned(u8, a, config_json, "\"swiglu_limit\": 1.0", "\"swiglu_limit\": 10.0");
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = try std.mem.replaceOwned(u8, a, cfg, "\"n_routed_experts\": 8,", try std.fmt.allocPrint(a, "\"n_routed_experts\": {d},", .{n_experts})) });
-    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = try repackWeights(a, 41, tiny, n_experts) });
-    var buf: [512]u8 = undefined;
-    return a.dupe(u8, buf[0..try tmp.dir.realPath(io, &buf)]);
-}
-
 fn streamedParity(n_experts: u32) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try writeTiny(a, &tmp, n_experts);
+    const cfg = try std.mem.replaceOwned(u8, a, config_json, "\"swiglu_limit\": 1.0", "\"swiglu_limit\": 10.0");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = try std.mem.replaceOwned(u8, a, cfg, "\"n_routed_experts\": 8,", try std.fmt.allocPrint(a, "\"n_routed_experts\": {d},", .{n_experts})) });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = try repackWeights(a, 41, tiny, n_experts) });
+    var buf: [512]u8 = undefined;
+    const dir = try a.dupe(u8, buf[0..try tmp.dir.realPath(io, &buf)]);
     const vocab = 96;
     const s = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(s);
@@ -233,86 +228,4 @@ fn streamedParity(n_experts: u32) !void {
             if (rows != null) try testing.expect(st.expert_cache_evictions > 0);
         }
     }
-}
-
-/// `l`'s rows as host f32 (`[rows, vocab]`), the streamed source settled after the eval.
-fn hostRows(a: std.mem.Allocator, r: *Resident, l: mlx.mlx_array) ![]f32 {
-    var f = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f);
-    try mlx.check(mlx.mlx_astype(&f, l, .float32, r.s));
-    try mlx.check(mlx.mlx_array_eval(f));
-    if (r.m.streamed) |src| try src.settle();
-    return a.dupe(f32, (mlx.mlx_array_data_float32(f) orelse return error.NoData)[0..mlx.mlx_array_size(f)]);
-}
-
-test "deepseek_v41 streamed: a bank holding every expert decodes several states as one batch, as each alone; one that streams batches none" {
-    if (!streamed_w.built or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try writeTiny(a, &tmp, 8);
-    const vocab = 96;
-    const r = try Resident.open(dir, .{ .act = .float32, .qat = true, .head_8bit = true });
-    defer r.close();
-    var sw = try streamed_w.Streamed.openPack(gpa, dir, r.s, null);
-    defer sw.close();
-    r.m.streamed = sw.routedSource();
-    defer r.m.streamed = null;
-    try testing.expect(dsv41.batchesStates(r.m));
-
-    const prompts = [_][]const u32{ &.{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 90, 33, 5, 71, 18, 44, 6, 29, 50, 12 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6, 10, 12, 14 } };
-    var solo: [2]dsv41.State = undefined;
-    var batched: [2]dsv41.State = undefined;
-    var tok: [2]u32 = undefined;
-    for (0..2) |k| {
-        solo[k] = try dsv41.initState(r.m, gpa);
-        batched[k] = try dsv41.initState(r.m, gpa);
-        for ([_]*dsv41.State{ &solo[k], &batched[k] }) |st| {
-            const l = try dsv41.extend(r.m, gpa, st, prompts[k], .last);
-            defer _ = mlx.mlx_array_free(l);
-            tok[k] = topOf(try hostRows(a, r, l));
-        }
-    }
-    defer for (&solo, &batched) |*x, *y| {
-        x.deinit();
-        y.deinit();
-    };
-    const ptrs = [_]*dsv41.State{ &batched[0], &batched[1] };
-    const gens = [_]u64{ 0, 0 };
-    // Greedy decode steps: each state's batched row is its solo step's, within the rows' reduction order.
-    for (0..4) |_| {
-        const l = try dsv41.extendBatched(r.m, gpa, &ptrs, &gens, &.{ tok[0..1], tok[1..2] }, false);
-        defer _ = mlx.mlx_array_free(l);
-        const rows = try hostRows(a, r, l);
-        for (0..2) |k| {
-            const s = try dsv41.extend(r.m, gpa, &solo[k], tok[k .. k + 1], .last);
-            defer _ = mlx.mlx_array_free(s);
-            const want = try hostRows(a, r, s);
-            const got = rows[k * vocab ..][0..vocab];
-            var gap: f32 = 0;
-            var scale: f32 = 0;
-            for (want, got) |x, y| {
-                gap = @max(gap, @abs(x - y));
-                scale = @max(scale, @abs(x));
-            }
-            try testing.expect(gap <= 1e-4 * scale);
-            try testing.expectEqual(topOf(want), topOf(got));
-            tok[k] = topOf(want);
-        }
-    }
-    // A decode call that takes 6 routes holds 2 rows at 3 experts a row: no batch past them.
-    var narrow = sw.routedSource();
-    narrow.decode_ids = 6;
-    r.m.streamed = narrow;
-    try testing.expectEqual(@as(usize, 2), dsv41.batchRows(r.m));
-    try testing.expectError(error.Dsv41BatchUnsupported, dsv41.extendBatched(r.m, gpa, &ptrs, &gens, &.{ &.{ 1, 2 }, &.{3} }, true));
-    r.m.streamed = sw.routedSource();
-    // A bank that reads from the SSD keeps one state's routes at a time.
-    r.m.bank_streams = true;
-    defer r.m.bank_streams = false;
-    try testing.expect(!dsv41.batchesStates(r.m));
-    try testing.expectError(error.Dsv41BatchUnsupported, dsv41.extendBatched(r.m, gpa, &ptrs, &gens, &.{ tok[0..1], tok[1..2] }, false));
 }
