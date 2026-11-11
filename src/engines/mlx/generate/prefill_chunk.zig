@@ -182,6 +182,12 @@ pub fn archCapped(width: usize, config: *const model_mod.ModelConfig) usize {
     return if (max == 0) width else @min(width, max);
 }
 
+/// A chunk from `pos` ending no more than `max_rows` later (0 = no cap), so a merged tail cannot carry it past the
+/// arch's widest (`ModelConfig.prefillWidths().max`).
+pub fn cappedEnd(pos: usize, end: usize, max_rows: usize) usize {
+    return if (max_rows == 0) end else @min(end, pos + max_rows);
+}
+
 /// A prefill width under the decode share's cap (0 = no cap).
 pub fn decodeShareCapped(width: usize, cap: usize) usize {
     return if (cap == 0) width else @min(width, cap);
@@ -457,6 +463,7 @@ pub fn wholePromptPlan(
     allocator: std.mem.Allocator,
     n: usize,
     chunk: usize,
+    max_rows: usize,
     want_ssm_cp: bool,
     ssm_cp_stride: usize,
     ssm_cp_offset: usize,
@@ -471,7 +478,7 @@ pub fn wholePromptPlan(
     const loop_end = prefix_len - ssmSnapshotBackoff(want_ssm_cp, prefix_len, ssm_cp_offset > 0);
     var pos: usize = 0;
     while (pos < loop_end) {
-        const end = nextChunkEnd(pos, loop_end, chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width, dense_low_grid);
+        const end = cappedEnd(pos, nextChunkEnd(pos, loop_end, chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width, dense_low_grid), max_rows);
         try spans.append(allocator, end + ssm_cp_offset);
         if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, end + ssm_cp_offset, dense_low_grid)) try cps.append(allocator, end + ssm_cp_offset);
         pos = end;
@@ -508,6 +515,23 @@ test "archCapped: an explicit width past DeepSeek-V4.1's widest runs at 8192, ot
     try testing.expectEqual(@as(usize, 8192), archCapped(16384, &v41));
     try testing.expectEqual(@as(usize, 4096), archCapped(4096, &v41));
     try testing.expectEqual(@as(usize, 16384), archCapped(16384, &other));
+}
+
+test "cappedEnd: a merged tail never carries a DeepSeek-V4.1 chunk past 8192 rows, in the loop or the whole-prompt plan" {
+    const v41: model_mod.ModelConfig = .{ .model_type = "deepseek_v41" };
+    const max = v41.prefillWidths().max;
+    const end = nextChunkEnd(0, 8192 + 100, 8192, false, 0, 0, false, false);
+    try testing.expectEqual(@as(usize, 8192 + 100), end);
+    try testing.expectEqual(@as(usize, 8192), cappedEnd(0, end, max));
+    try testing.expectEqual(@as(usize, 8192 + 100), cappedEnd(0, end, 0));
+    try testing.expectEqual(@as(usize, 4096 + 8192), cappedEnd(4096, 4096 + 8192 + 100, max));
+    var p = try wholePromptPlan(testing.allocator, 8192 + 101, 8192, max, false, 0, 0, false, false);
+    defer p.deinit(testing.allocator);
+    var prev: u64 = 0;
+    for (p.spans) |s| {
+        try testing.expect(s - prev <= 8192);
+        prev = s;
+    }
 }
 
 test "effectivePrefillChunk: the machine cap bounds every auto width, an explicit width passes" {
@@ -1164,7 +1188,7 @@ test "wholePromptPlan: a whole-prompt prefill's spans are the chunk loop's ends 
         .{ .n = 20_000, .want = true, .stride = 16_384, .offset = 0, .dense = true, .spans = &.{ 4096, 8192, 12_288, 16_384, 19_969, 20_000 }, .cps = &.{ 8192, 16_384, 19_969 } },
     };
     for (cases) |c| {
-        var p = try wholePromptPlan(testing.allocator, c.n, 4096, c.want, c.stride, c.offset, false, c.dense);
+        var p = try wholePromptPlan(testing.allocator, c.n, 4096, 0, c.want, c.stride, c.offset, false, c.dense);
         defer p.deinit(testing.allocator);
         try testing.expectEqualSlices(u64, c.spans, p.spans);
         try testing.expectEqualSlices(u64, c.cps, p.checkpoints);
