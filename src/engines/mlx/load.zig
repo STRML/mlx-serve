@@ -887,9 +887,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             else
                 0;
         }
+        entry.prefix_cache.?.feed_bytes_per_s = params.prefix_cache_disk_write_max_bps;
         // SSD-first: arch + env switch + a live disk tier. Below the attach because the tier
         // is part of the answer; without `--prefix-cache-disk` qwen4_exp takes the RAM arm.
-        entry.prefix_cache.?.feed_bytes_per_s = params.prefix_cache_disk_write_max_bps;
         entry.prefix_cache.?.armDiskTier(params.config);
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;

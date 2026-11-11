@@ -518,7 +518,7 @@ pub fn shutdownPersist(targets: []const FlushTarget, clock: anytype, deadline_ms
         d.pollModuleWrites();
         const unfinished = x.hc.moduleUnfinishedCount();
         const committed = x.hc.moduleCommittedCount();
-        if (cut) t.left_deadline += x.hc.owedKvCount() + x.hc.feedUnstartedCount();
+        if (cut) t.left_deadline += x.hc.owedKvCount() + x.hc.feedOwedCount();
         t.checked_out += x.hc.checkedOutOwed();
         t.dropped_bytes += d.drainWriterUntil(clock, deadline_ms);
         d.pollModuleWrites();
@@ -648,19 +648,93 @@ const Ghost = struct {
     quant_config: kv_quant.KVQuantConfig,
     bytes: u64,
     frequent: bool,
+
+    fn of(tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, bytes: u64, frequent: bool) Ghost {
+        return .{
+            .len = tokens.len,
+            .last = tokens[tokens.len - 1],
+            .hash = tokenHash(tokens),
+            .has_tools = has_tools,
+            .quant_config = quant_config,
+            .bytes = bytes,
+            .frequent = frequent,
+        };
+    }
+
+    fn prefixes(g: *const Ghost, tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig) bool {
+        if (g.len > tokens.len or g.has_tools != has_tools or !std.meta.eql(g.quant_config, quant_config)) return false;
+        return tokens[g.len - 1] == g.last and tokenHash(tokens[0..g.len]) == g.hash;
+    }
+
+    fn tokenHash(tokens: []const u32) u64 {
+        var h: u64 = 0xcbf29ce484222325;
+        for (tokens) |t| {
+            h ^= t;
+            h *%= 0x100000001b3;
+        }
+        return h;
+    }
+};
+
+const ARC_GHOST_MAX: usize = 128;
+
+/// B1 and B2 together, oldest first; past `ARC_GHOST_MAX` the oldest is forgotten.
+const GhostList = struct {
+    items: [ARC_GHOST_MAX]Ghost = undefined,
+    n: usize = 0,
+
+    fn slice(self: *const GhostList) []const Ghost {
+        return self.items[0..self.n];
+    }
+
+    fn removeAt(self: *GhostList, i: usize) void {
+        std.mem.copyForwards(Ghost, self.items[i .. self.n - 1], self.items[i + 1 .. self.n]);
+        self.n -= 1;
+    }
+
+    fn push(self: *GhostList, g: Ghost) void {
+        if (self.n == ARC_GHOST_MAX) self.removeAt(0);
+        self.items[self.n] = g;
+        self.n += 1;
+    }
+
+    /// The longest ghost that is a prefix of `tokens` (an older tip of the same conversation).
+    fn longestPrefixOf(self: *const GhostList, tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig) ?Ghost {
+        var longest: ?Ghost = null;
+        for (self.slice()) |*g| {
+            if (!g.prefixes(tokens, has_tools, quant_config)) continue;
+            if (longest == null or g.len > longest.?.len) longest = g.*;
+        }
+        return longest;
+    }
+
+    fn dropPrefixesOf(self: *GhostList, tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig) void {
+        var i = self.n;
+        while (i > 0) {
+            i -= 1;
+            if (self.items[i].prefixes(tokens, has_tools, quant_config)) self.removeAt(i);
+        }
+    }
+
+    fn dropOldest(self: *GhostList, frequent: bool) bool {
+        for (self.slice(), 0..) |g, i| {
+            if (g.frequent != frequent) continue;
+            self.removeAt(i);
+            return true;
+        }
+        return false;
+    }
 };
 
 /// A lookup hit counts as the conversation coming back when it covers the donor's floor and three quarters of its
 /// tokens: a returning turn differs from its tip only by a stripped tail, a one-shot sharing a system prompt covers a
 /// small part of a long session.
-pub fn arcPromotes(shared: usize, entry_tokens: usize) bool {
+fn arcPromotes(shared: usize, entry_tokens: usize) bool {
     return shared >= MIN_CANCELLED_COMMIT_TOKENS and shared * 4 >= entry_tokens * 3;
 }
 
 /// Resident (T1, T2) and ghost (B1, B2) bytes of the ARC lists.
-pub const ArcSizes = struct { t1: u64 = 0, t2: u64 = 0, b1: u64 = 0, b2: u64 = 0 };
-
-pub const ARC_GHOST_MAX: usize = 128;
+const ArcSizes = struct { t1: u64 = 0, t2: u64 = 0, b1: u64 = 0, b2: u64 = 0 };
 
 pub const HotPrefixCache = struct {
     entries: std.ArrayList(Entry),
@@ -741,7 +815,7 @@ pub const HotPrefixCache = struct {
     restore_pin_min_bytes: u64 = RESTORE_PIN_MIN_BYTES,
     /// ARC target: the bytes T1 may hold before its LRU is evicted ahead of T2's. A B1 ghost hit raises it, a B2 hit lowers it.
     arc_p: u64 = 0,
-    /// `--prefix-cache-disk-write-max` in bytes per second; 0 = every owed module tip is written as before.
+    /// `--prefix-cache-disk-write-max` in bytes per second; 0 = every module tip is written once quiet.
     feed_bytes_per_s: u64 = 0,
     feed_credit: i64 = 0,
     feed_at_ms: i64 = 0,
@@ -750,8 +824,7 @@ pub const HotPrefixCache = struct {
     feed_shutdown: bool = false,
     /// The admission in progress recognised a B2 ghost: at |T1| == p the REPLACE rule then evicts T1.
     arc_b2_hit: bool = false,
-    ghosts: [ARC_GHOST_MAX]Ghost = undefined,
-    ghost_n: usize = 0,
+    ghosts: GhostList = .{},
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -2065,8 +2138,15 @@ pub const HotPrefixCache = struct {
         if (self.incoming_tip) |t| {
             if (t.ids.len > e.tokens.len and moduleRungOf(e, t.binding, t.ids, t.media, t.has_tools, t.quant_config)) return true;
         }
+        return self.extendedByResident(i, null);
+    }
+
+    /// Whether a longer resident module entry extends entry `i`; a `cache_key` counts only that workload's entries.
+    fn extendedByResident(self: *const HotPrefixCache, i: usize, cache_key: ?u64) bool {
+        const e = &self.entries.items[i];
         for (self.entries.items, 0..) |*o, j| {
             if (j == i or o.tokens.len <= e.tokens.len) continue;
+            if (cache_key) |k| if (o.cache_key != k) continue;
             const m = o.module orelse continue;
             if (moduleRungOf(e, m.binding, o.tokens, o.media, o.has_tools, o.quant_config)) return true;
         }
@@ -2737,7 +2817,8 @@ pub const HotPrefixCache = struct {
                 while (self.current_kv_bytes > self.max_kv_bytes and
                     self.entries.items.len > 1)
                 {
-                    if (!self.evictOtherProgress("byte budget", updated_used)) break;
+                    const victim = self.lruIndexExcluding(updated_used, null) orelse break;
+                    self.evictForCapacity(victim, "byte budget", null);
                 }
                 self.shedCheckpointsToFit();
                 while (self.current_kv_bytes > self.max_kv_bytes and
@@ -3244,12 +3325,10 @@ pub const HotPrefixCache = struct {
 
     /// A conversation's T2 tip the feed has not offered to the tier yet (T1 tips too once a shutdown began).
     pub fn feedOwed(self: *const HotPrefixCache) bool {
-        if (!self.feedMode()) return false;
-        for (0..self.entries.items.len) |i| if (self.feedable(i)) return true;
-        return false;
+        return self.feedOwedCount() > 0;
     }
 
-    fn feedUnstartedCount(self: *const HotPrefixCache) u32 {
+    fn feedOwedCount(self: *const HotPrefixCache) u32 {
         if (!self.feedMode()) return 0;
         var n: u32 = 0;
         for (0..self.entries.items.len) |i| n += @intFromBool(self.feedable(i));
@@ -3257,7 +3336,7 @@ pub const HotPrefixCache = struct {
     }
 
     /// Token bucket over the idle loop's calls: credit refills at the configured rate, up to one second's worth, and
-    /// pays for the bytes the tier persisted. A slice that overdraws it is the only overshoot. All saturating.
+    /// pays for the bytes the tier persisted. A slice that overdraws it is the only overshoot.
     fn feedRefill(self: *HotPrefixCache) void {
         if (!self.feedMode()) return;
         const now = self.nowMs();
@@ -3274,13 +3353,8 @@ pub const HotPrefixCache = struct {
         self.feed_at_ms = now;
     }
 
-    fn feedCharge(self: *HotPrefixCache, d: *const kv_disk_cache.DiskTier, persisted_before: u64) void {
-        if (!self.feedMode()) return;
-        self.feed_credit -|= std.math.cast(i64, d.bytes_persisted - persisted_before) orelse std.math.maxInt(i64);
-    }
-
-    /// The next entry to hand the tier, credit aside: the idle loop takes the coldest T2 tip idle for the quiet
-    /// period; a shutdown takes T2 tips and then T1 tips, hottest first, with no idle wait.
+    /// The next entry to hand the tier, credit aside: serving takes the coldest T2 tip idle for the quiet period; a
+    /// shutdown takes T2 tips and then T1 tips, hottest first, with no idle wait.
     fn feedCandidate(self: *const HotPrefixCache, order: SliceOrder) ?usize {
         if (!self.feedMode() or order == .newest_first) return null;
         const hottest = order == .shutdown_hottest;
@@ -3294,15 +3368,15 @@ pub const HotPrefixCache = struct {
                 continue;
             };
             const o = &self.entries.items[b];
-            const ahead = if (hottest and e.frequent != o.frequent) e.frequent else (e.last_used > o.last_used) == hottest;
+            const ahead = if (!hottest)
+                e.last_used < o.last_used
+            else if (e.frequent != o.frequent)
+                e.frequent
+            else
+                e.last_used > o.last_used;
             if (ahead) best = i;
         }
         return best;
-    }
-
-    fn feedIndex(self: *const HotPrefixCache, order: SliceOrder) ?usize {
-        if (order == .oldest_quiet and self.feed_credit <= 0) return null;
-        return self.feedCandidate(order);
     }
 
     /// Offer the entry to the tier. A decline the volume may lift (`store_declined`) retries on a later tick while
@@ -3325,7 +3399,7 @@ pub const HotPrefixCache = struct {
     }
 
     /// `oldest_quiet` is the idle loop's order: the oldest owed record, module tips only past their quiet period.
-    /// `shutdown_hottest` is a feed-mode shutdown: T2 entries, most recently used first.
+    /// `shutdown_hottest` is a feed-mode shutdown: T2 tips then T1 tips, most recently used first.
     const SliceOrder = enum { newest_first, oldest_first, oldest_quiet, shutdown_hottest };
 
     /// One bounded slice, then `disk_dirty` says whether anything is still owed. A parked
@@ -3342,16 +3416,19 @@ pub const HotPrefixCache = struct {
         defer self.disk_dirty = self.diskOwed();
         self.feedRefill();
         const persisted_before = d.bytes_persisted;
-        defer self.feedCharge(d, persisted_before);
+        defer if (self.feedMode()) {
+            self.feed_credit -|= std.math.cast(i64, d.bytes_persisted - persisted_before) orelse std.math.maxInt(i64);
+        };
         if (self.sliceStagedModule(d, s)) |r| return r;
         if (self.finishing_disk != null) return self.slicePending(d, &self.finishing_disk, s);
         // The live state captured at commit, not what the RAM entry kept after its trim.
         if (order == .newest_first and self.pending_disk != null) return self.slicePending(d, &self.pending_disk, s);
+        const feed_spent = order == .oldest_quiet and self.feedMode() and self.feed_credit <= 0;
         if (self.owedEntryIndex(order == .newest_first, order == .oldest_quiet)) |i| {
-            if (order == .oldest_quiet and self.feedMode() and self.feed_credit <= 0) return null;
+            if (feed_spent) return null;
             return self.sliceEntry(d, &self.entries.items[i], s);
         }
-        if (self.feedIndex(order)) |i| return self.sliceFeedStart(d, i, s);
+        if (!feed_spent) if (self.feedCandidate(order)) |i| return self.sliceFeedStart(d, i, s);
         if (self.slicePending(d, &self.pending_disk, s)) |r| return r;
         return if (self.modulePublicationPending()) .busy else null;
     }
@@ -3748,13 +3825,6 @@ pub const HotPrefixCache = struct {
         self.logResident();
     }
 
-    /// Evict the next victim but never the entry whose `last_used` is `protect`; false when nothing else is evictable.
-    fn evictOtherProgress(self: *HotPrefixCache, reason: []const u8, protect: u64) bool {
-        const idx = self.lruIndexExcluding(protect, null) orelse return false;
-        self.evictForCapacity(idx, reason, null);
-        return true;
-    }
-
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
         const idx = self.lruIndexExcluding(null, incoming_key) orelse return;
         self.evictForCapacity(idx, reason, null);
@@ -4020,10 +4090,9 @@ pub const HotPrefixCache = struct {
         return true;
     }
 
-    /// The entry to evict next, skipping the one whose `last_used` equals `protect`. An entry idle past
-    /// `stale_after_ms` goes first (a finished session's lone entry must not shield itself forever), then a module
-    /// rung (every live conversation keeps its newest checkpoint while rungs remain), then ARC's REPLACE: T1's
-    /// victim while T1 outweighs its target, else T2's (`fairVictim`).
+    /// The entry to evict next, never the one whose `last_used` is `protect`: one idle past `stale_after_ms` (a
+    /// finished session's lone entry must not shield itself forever), then a module rung (every live conversation keeps
+    /// its newest checkpoint while rungs remain), then ARC's REPLACE: T1's `fairVictim` while T1 outweighs its target.
     fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
@@ -4047,20 +4116,20 @@ pub const HotPrefixCache = struct {
             best = i;
         }
         if (best != null) return best;
-        const t1_first = self.arcPrefersT1();
-        return self.fairVictim(protect, incoming_key, !t1_first) orelse self.fairVictim(protect, incoming_key, t1_first);
+        const t2_first = !self.arcPrefersT1();
+        return self.fairVictim(protect, incoming_key, t2_first) orelse self.fairVictim(protect, incoming_key, !t2_first);
     }
 
     /// Workload-fair LRU within one ARC list: only entries of the `cache_key` holding the most eligible entries
     /// (`incoming_key` counts as one more) are candidates, so a sweep evicts its own documents before another
     /// workload's conversation. One key = plain LRU.
-    fn fairVictim(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64, frequent: bool) ?usize {
+    fn fairVictim(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64, from_t2: bool) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
         var max_count: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
             // Held by a live slot that owns its buffers: evicting it frees nothing.
-            if (e.checked_out_by != null or e.frequent != frequent) continue;
+            if (e.checked_out_by != null or e.frequent != from_t2) continue;
             if (protect) |p| {
                 if (e.last_used == p) continue;
             }
@@ -4081,12 +4150,12 @@ pub const HotPrefixCache = struct {
         return best;
     }
 
-    pub fn arcSizes(self: *const HotPrefixCache) ArcSizes {
+    fn arcSizes(self: *const HotPrefixCache) ArcSizes {
         var sizes = ArcSizes{};
         for (self.entries.items) |*e| {
             if (e.frequent) sizes.t2 += e.kv_bytes else sizes.t1 += e.kv_bytes;
         }
-        for (self.ghosts[0..self.ghost_n]) |g| {
+        for (self.ghosts.slice()) |g| {
             if (g.frequent) sizes.b2 += g.bytes else sizes.b1 += g.bytes;
         }
         return sizes;
@@ -4099,78 +4168,20 @@ pub const HotPrefixCache = struct {
         return t1 > self.arc_p or (t1 == self.arc_p and self.arc_b2_hit);
     }
 
-    fn ghostPrefixes(g: *const Ghost, tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig) bool {
-        if (g.len > tokens.len or g.has_tools != has_tools or !std.meta.eql(g.quant_config, quant_config)) return false;
-        return tokens[g.len - 1] == g.last and tokenHash(tokens[0..g.len]) == g.hash;
-    }
-
-    fn tokenHash(tokens: []const u32) u64 {
-        var h: u64 = 0xcbf29ce484222325;
-        for (tokens) |t| {
-            h ^= t;
-            h *%= 0x100000001b3;
-        }
-        return h;
-    }
-
-    fn arcDropGhostAt(self: *HotPrefixCache, i: usize) void {
-        std.mem.copyForwards(Ghost, self.ghosts[i .. self.ghost_n - 1], self.ghosts[i + 1 .. self.ghost_n]);
-        self.ghost_n -= 1;
-    }
-
-    fn arcPushGhost(self: *HotPrefixCache, g: Ghost) void {
-        if (self.ghost_n == ARC_GHOST_MAX) self.arcDropGhostAt(0);
-        self.ghosts[self.ghost_n] = g;
-        self.ghost_n += 1;
-    }
-
     /// Remember an entry leaving for capacity. Not a module rung: its conversation's tip is still resident.
     fn arcRecordGhost(self: *HotPrefixCache, idx: usize) void {
         if (self.max_kv_bytes == 0 or self.isModuleRung(idx)) return;
         const e = &self.entries.items[idx];
         if (e.tokens.len == 0) return;
-        self.arcDropPrefixGhosts(e.tokens, e.has_tools, e.quant_config);
-        self.arcPushGhost(.{
-            .len = e.tokens.len,
-            .last = e.tokens[e.tokens.len - 1],
-            .hash = tokenHash(e.tokens),
-            .has_tools = e.has_tools,
-            .quant_config = e.quant_config,
-            .bytes = e.kv_bytes,
-            .frequent = e.frequent,
-        });
+        self.ghosts.dropPrefixesOf(e.tokens, e.has_tools, e.quant_config);
+        self.ghosts.push(Ghost.of(e.tokens, e.has_tools, e.quant_config, e.kv_bytes, e.frequent));
     }
 
     /// An SSD restore served `tokens`: the conversation came back, so its next commit joins T2 even with no ghost left.
     fn arcNoteRestored(self: *HotPrefixCache, tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig) void {
-        if (self.max_kv_bytes == 0 or tokens.len == 0 or self.arcMatch(tokens, has_tools, quant_config) != null) return;
-        self.arcPushGhost(.{
-            .len = tokens.len,
-            .last = tokens[tokens.len - 1],
-            .hash = tokenHash(tokens),
-            .has_tools = has_tools,
-            .quant_config = quant_config,
-            .bytes = 0,
-            .frequent = true,
-        });
-    }
-
-    /// The longest ghost that is a prefix of `tokens` (an older tip of the same conversation).
-    fn arcMatch(self: *const HotPrefixCache, tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig) ?Ghost {
-        var longest: ?Ghost = null;
-        for (self.ghosts[0..self.ghost_n]) |*g| {
-            if (!ghostPrefixes(g, tokens, has_tools, quant_config)) continue;
-            if (longest == null or g.len > longest.?.len) longest = g.*;
-        }
-        return longest;
-    }
-
-    fn arcDropPrefixGhosts(self: *HotPrefixCache, tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig) void {
-        var i = self.ghost_n;
-        while (i > 0) {
-            i -= 1;
-            if (ghostPrefixes(&self.ghosts[i], tokens, has_tools, quant_config)) self.arcDropGhostAt(i);
-        }
+        if (self.max_kv_bytes == 0 or tokens.len == 0) return;
+        if (self.ghosts.longestPrefixOf(tokens, has_tools, quant_config) != null) return;
+        self.ghosts.push(Ghost.of(tokens, has_tools, quant_config, 0, true));
     }
 
     fn arcRatio(num: u64, den: u64) u64 {
@@ -4179,7 +4190,8 @@ pub const HotPrefixCache = struct {
 
     /// Megiddo and Modha's adaptation with bytes for pages: a B1 hit raises the target by max(1, |B2|/|B1|) times the
     /// ghost's size, a B2 hit lowers it by max(1, |B1|/|B2|) times.
-    fn arcAdapt(self: *HotPrefixCache, g: Ghost, sizes: ArcSizes) void {
+    fn arcAdapt(self: *HotPrefixCache, g: Ghost) void {
+        const sizes = self.arcSizes();
         if (g.frequent) {
             self.arc_p -|= arcRatio(sizes.b1, sizes.b2) *| g.bytes;
         } else {
@@ -4192,22 +4204,21 @@ pub const HotPrefixCache = struct {
     /// A commit of `tokens` that no resident entry holds, before it makes room: a ghost hit adapts the target at once
     /// (REPLACE then sees it) and the entry joins T2, as does the next turn of a resident conversation (`continues`).
     fn arcBegin(self: *HotPrefixCache, tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, continues: bool) Admission {
-        const sizes = self.arcSizes();
-        const ghost = self.arcMatch(tokens, has_tools, quant_config);
-        const before = self.arc_p;
-        self.arc_b2_hit = if (ghost) |g| g.frequent else false;
-        if (ghost) |g| self.arcAdapt(g, sizes);
-        return .{ .frequent = continues or ghost != null, .p_before = before };
+        const p_before = self.arc_p;
+        const g = self.ghosts.longestPrefixOf(tokens, has_tools, quant_config) orelse return .{ .frequent = continues, .p_before = p_before };
+        self.arc_b2_hit = g.frequent;
+        self.arcAdapt(g);
+        return .{ .frequent = true, .p_before = p_before };
     }
 
     /// The commit finished: a landed entry consumes its ghosts, a declined one gives the target back.
     fn arcEnd(self: *HotPrefixCache, tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, adm: Admission, landed: bool) void {
         self.arc_b2_hit = false;
-        if (!landed) {
+        if (landed) {
+            self.ghosts.dropPrefixesOf(tokens, has_tools, quant_config);
+        } else {
             self.arc_p = adm.p_before;
-            return;
         }
-        self.arcDropPrefixGhosts(tokens, has_tools, quant_config);
     }
 
     /// B1 + T1 <= c and every list together <= 2c: the oldest B1 ghost goes first, then B2's. A list with nothing left
@@ -4215,54 +4226,36 @@ pub const HotPrefixCache = struct {
     fn arcTrimGhosts(self: *HotPrefixCache) void {
         const c = self.max_kv_bytes;
         self.arc_p = @min(self.arc_p, c);
-        while (self.ghost_n > 0) {
+        while (self.ghosts.n > 0) {
             const s = self.arcSizes();
-            if (s.t1 + s.b1 > c) {
-                if (!self.arcDropOldestGhost(false)) break;
-            } else if (s.t1 + s.t2 + s.b1 + s.b2 > 2 * c) {
-                if (!self.arcDropOldestGhost(true) and !self.arcDropOldestGhost(false)) break;
-            } else break;
+            const dropped = if (s.t1 + s.b1 > c)
+                self.ghosts.dropOldest(false)
+            else if (s.t1 + s.t2 + s.b1 + s.b2 > 2 * c)
+                self.ghosts.dropOldest(true) or self.ghosts.dropOldest(false)
+            else
+                false;
+            if (!dropped) break;
         }
-    }
-
-    fn arcDropOldestGhost(self: *HotPrefixCache, frequent: bool) bool {
-        for (self.ghosts[0..self.ghost_n], 0..) |g, i| {
-            if (g.frequent != frequent) continue;
-            self.arcDropGhostAt(i);
-            return true;
-        }
-        return false;
     }
 
     fn arcReset(self: *HotPrefixCache) void {
         self.arc_p = 0;
         self.arc_b2_hit = false;
-        self.ghost_n = 0;
+        self.ghosts = .{};
     }
 
-    /// Evict for capacity (count cap, byte budget, admission, a revised budget): the entry becomes a ghost.
+    /// Evict to make room: the entry leaves a ghost.
     fn evictForCapacity(self: *HotPrefixCache, idx: usize, reason: []const u8, cancellation: ?kv_disk_cache.DiskTier.ModuleCancellation) void {
         self.arcRecordGhost(idx);
         self.evictAtWithCancellation(idx, reason, cancellation);
         self.arcTrimGhosts();
     }
 
-    /// Another resident entry of the same workload extends entry `i`: it is a rung of that conversation, not its tip.
-    fn extendedWithinKey(self: *const HotPrefixCache, i: usize) bool {
-        const e = &self.entries.items[i];
-        for (self.entries.items, 0..) |*o, j| {
-            if (j == i or o.cache_key != e.cache_key or o.tokens.len <= e.tokens.len) continue;
-            const m = o.module orelse continue;
-            if (moduleRungOf(e, m.binding, o.tokens, o.media, o.has_tools, o.quant_config)) return true;
-        }
-        return false;
-    }
-
     /// Does `ids` strictly extend the tip of a resident conversation of the same workload? A rung (another entry
     /// extends it), an equal checkpoint and another workload's entry are not that conversation coming back.
     fn continuesModule(self: *const HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) bool {
         for (self.entries.items, 0..) |*e, i| {
-            if (e.cache_key != cache_key or e.tokens.len >= ids.len or self.extendedWithinKey(i)) continue;
+            if (e.cache_key != cache_key or e.tokens.len >= ids.len or self.extendedByResident(i, cache_key)) continue;
             if (moduleRungOf(e, binding, ids, media, has_tools, quant_config)) return true;
         }
         return false;
@@ -11907,11 +11900,8 @@ test "HotPrefixCache ARC prefix cache: a B1 ghost hit grows the target and a B2 
     const binding = fake.bind(&bound, &xfm);
     var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 160);
     defer cache.deinit();
-    var snaps: [10]ModuleFake.Snap = undefined;
-    const ids = [10][]const u32{
-        &.{ 1, 2 }, &.{ 10, 1 }, &.{ 11, 1 }, &.{ 12, 1 }, &.{ 13, 1 },
-        &.{ 10, 1, 5 }, &.{ 11, 1, 5 }, &.{ 1, 2, 7 }, &.{}, &.{},
-    };
+    var snaps: [8]ModuleFake.Snap = undefined;
+    const ids = [8][]const u32{ &.{ 1, 2 }, &.{ 10, 1 }, &.{ 11, 1 }, &.{ 12, 1 }, &.{ 13, 1 }, &.{ 10, 1, 5 }, &.{ 11, 1, 5 }, &.{ 1, 2, 7 } };
     // S1 comes back once, so it sits in T2 beside three one-shots.
     snaps[0] = arcSnap(&fake, ids[0], 40);
     _ = try snaps[0].put(&cache, binding, &.{});
@@ -11947,9 +11937,9 @@ test "HotPrefixCache ARC prefix cache: a B1 ghost hit grows the target and a B2 
     try testing.expect(!cache.arc_b2_hit);
     try arcExpectBounds(&cache);
     cache.invalidateAll("test end");
-    try testing.expectEqual(@as(usize, 0), cache.ghost_n);
+    try testing.expectEqual(@as(usize, 0), cache.ghosts.n);
     try testing.expectEqual(@as(u64, 0), cache.arc_p);
-    for (snaps[0..8]) |snap| try testing.expectEqual(@as(usize, 1), snap.frees);
+    for (snaps) |snap| try testing.expectEqual(@as(usize, 1), snap.frees);
 }
 
 test "HotPrefixCache ARC prefix cache: the byte budget and the ghost bounds hold after every operation" {
@@ -12039,7 +12029,7 @@ test "HotPrefixCache ARC prefix cache: the ghost list is bounded and forgets its
         shot.* = arcSnap(&fake, id, 40);
         _ = try shot.put(&cache, binding, &.{});
     }
-    try testing.expectEqual(ARC_GHOST_MAX, cache.ghost_n);
+    try testing.expectEqual(ARC_GHOST_MAX, cache.ghosts.n);
     var forgotten = arcSnap(&fake, &.{ 1000, 5, 9 }, 40);
     _ = try forgotten.put(&cache, binding, &.{});
     try testing.expectEqual(@as(u64, 0), cache.arc_p);
@@ -12065,11 +12055,11 @@ test "HotPrefixCache ARC prefix cache: trimming never discards B2 ghosts to make
     }
     cache.max_kv_bytes = 100;
     for (0..2) |i| {
-        cache.ghosts[i] = .{ .len = 2, .last = 1, .hash = i, .has_tools = false, .quant_config = kv_quant.KVQuantConfig.dense, .bytes = 10, .frequent = true };
+        cache.ghosts.items[i] = .{ .len = 2, .last = 1, .hash = i, .has_tools = false, .quant_config = kv_quant.KVQuantConfig.dense, .bytes = 10, .frequent = true };
     }
-    cache.ghost_n = 2;
+    cache.ghosts.n = 2;
     cache.arcTrimGhosts();
-    try testing.expectEqual(@as(usize, 2), cache.ghost_n);
+    try testing.expectEqual(@as(usize, 2), cache.ghosts.n);
     cache.invalidateAll("test end");
 }
 
@@ -12089,14 +12079,14 @@ test "HotPrefixCache ARC prefix cache: a declined commit leaves the target and t
     _ = try snaps[0].put(&cache, binding, &.{});
     try arcRestore(&cache, binding, &.{ 1, 2 });
     for (snaps[1..]) |*snap| _ = try snap.put(&cache, binding, &.{});
-    try testing.expectEqual(@as(usize, 1), cache.ghost_n);
+    try testing.expectEqual(@as(usize, 1), cache.ghosts.n);
     for (cache.entries.items) |*e| e.checked_out_by = 1;
     var back = arcSnap(&fake, &.{ 3, 4, 9 }, 40);
     const status = try back.put(&cache, binding, &.{});
     try testing.expect(status == .declined);
     try testing.expectEqual(@as(usize, 1), back.frees);
     try testing.expectEqual(@as(u64, 0), cache.arc_p);
-    try testing.expectEqual(@as(usize, 1), cache.ghost_n);
+    try testing.expectEqual(@as(usize, 1), cache.ghosts.n);
     try testing.expect(!cache.arc_b2_hit);
     for (cache.entries.items) |*e| e.checked_out_by = null;
     cache.invalidateAll("test end");
@@ -12210,7 +12200,7 @@ test "HotPrefixCache ARC prefix cache: a session spilled to the SSD tier comes b
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
     try testing.expect(hc.arcSizes().b2 > 0);
 
-    hc.ghost_n = 0;
+    hc.ghosts.n = 0;
     var slot = try KVCache.init(testing.allocator, 1);
     defer slot.deinit();
     var moe_off: usize = 0;
@@ -12254,34 +12244,6 @@ const FeedTest = struct {
         return false;
     }
 };
-
-test "module feed: a quiet conversation writes nothing until the feed picks it" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var fake: ModuleFake = .{};
-    var bound: plugin_driver.Bound = undefined;
-    var xfm: transformer_mod.Transformer = undefined;
-    const binding = fake.bind(&bound, &xfm);
-    var hc = try FeedTest.init(&tmp, 8);
-    defer hc.deinit();
-    const cpu = mlx.weightLoadStream();
-    defer _ = mlx.mlx_stream_free(cpu);
-    const base: i64 = 1_000_000;
-    const one_shot = ModuleDiskTest.ids(1000);
-    const session = ModuleDiskTest.ids(11_000);
-    var snaps: [2]ModuleFake.Snap = undefined;
-    try FeedTest.put(&hc, &fake, binding, &snaps[0], &one_shot, false, base - 61_000);
-    try FeedTest.put(&hc, &fake, binding, &snaps[1], &session, true, base);
-    try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
-    FeedTest.tick(&hc, cpu, base);
-    try testing.expectEqual(@as(u64, 0), hc.disk.?.bytes_persisted);
-    try testing.expectEqual(FlushResult.quiet, hc.flushOwedSlice(cpu));
-    hc.entries.items[1].touched_ms = base - 61_000;
-    for (0..8) |i| FeedTest.tick(&hc, cpu, base + @as(i64, @intCast(i)) * 1000);
-    try testing.expect(FeedTest.onDisk(&hc, &session));
-    try testing.expect(!FeedTest.onDisk(&hc, &one_shot));
-    try testing.expectEqual(FlushResult.done, hc.flushOwedSlice(cpu));
-}
 
 test "module feed: eviction cancels instead of parking a record for the idle loop" {
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -12350,6 +12312,7 @@ test "module feed: the byte budget holds over a window and only idle T2 entries 
     try testing.expect(!FeedTest.onDisk(&hc, &ids[4]));
     try testing.expect(!FeedTest.onDisk(&hc, &ids[5]));
     for (hc.disk.?.entries.items, 0..) |e, i| try testing.expectEqualSlices(u32, ids[i][0..512], e.tokens);
+    try testing.expectEqual(FlushResult.quiet, hc.flushOwedSlice(cpu));
 }
 
 test "module feed: a T1 entry is never fed while serving and is written at shutdown" {
@@ -12501,7 +12464,7 @@ test "module feed: a shutdown under a declining volume ends and counts the decli
     try testing.expectEqual(@as(u32, 1), tally.left_declined);
 }
 
-test "module feed: shutdown writes T2 tips hottest first, then T1 tips hottest first, never a rung" {
+test "module feed: shutdown writes T2 tips hottest first, then T1 tips hottest first" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var fake: ModuleFake = .{};
@@ -12524,32 +12487,6 @@ test "module feed: shutdown writes T2 tips hottest first, then T1 tips hottest f
     for (hc.disk.?.entries.items, expected) |e, want| try testing.expectEqualSlices(u32, ids[want][0..512], e.tokens);
 }
 
-fn feedShutdownFixture(hc: *HotPrefixCache, fake: *ModuleFake, binding: ModuleBinding, snaps: *[3]ModuleFake.Snap, ids: *[3][513]u32) !void {
-    for (ids, 0..) |*id, i| id.* = ModuleDiskTest.ids(@as(u32, @intCast(i)) * 10_000 + 1000);
-    for (0..3) |i| try FeedTest.put(hc, fake, binding, &snaps[i], &ids[i], true, 1_000_000);
-}
-
-test "module feed: shutdown writes the hottest T2 entry first" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var fake: ModuleFake = .{};
-    var bound: plugin_driver.Bound = undefined;
-    var xfm: transformer_mod.Transformer = undefined;
-    const binding = fake.bind(&bound, &xfm);
-    var hc = try FeedTest.init(&tmp, 8);
-    defer hc.deinit();
-    const cpu = mlx.weightLoadStream();
-    defer _ = mlx.mlx_stream_free(cpu);
-    var ids: [3][513]u32 = undefined;
-    var snaps: [3]ModuleFake.Snap = undefined;
-    try feedShutdownFixture(&hc, &fake, binding, &snaps, &ids);
-    var now: i64 = 0;
-    const full = shutdownPersist(&.{.{ .hc = &hc, .s = cpu }}, TestStepClock{ .now = &now, .step = 0 }, 1_000_000);
-    try testing.expectEqual(@as(u32, 3), full.written);
-    try testing.expectEqual(@as(usize, 3), hc.disk.?.entryCount());
-    for (hc.disk.?.entries.items, 0..) |e, i| try testing.expectEqualSlices(u32, ids[2 - i][0..512], e.tokens);
-}
-
 test "module feed: shutdown stops at the deadline with the hottest entry started first" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -12562,8 +12499,9 @@ test "module feed: shutdown stops at the deadline with the hottest entry started
     const cpu = mlx.weightLoadStream();
     defer _ = mlx.mlx_stream_free(cpu);
     var ids: [3][513]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = ModuleDiskTest.ids(@as(u32, @intCast(i)) * 10_000 + 1000);
     var snaps: [3]ModuleFake.Snap = undefined;
-    try feedShutdownFixture(&hc, &fake, binding, &snaps, &ids);
+    for (0..3) |i| try FeedTest.put(&hc, &fake, binding, &snaps[i], &ids[i], true, 1_000_000);
     var now: i64 = 0;
     const cut = shutdownPersist(&.{.{ .hc = &hc, .s = cpu }}, TestStepClock{ .now = &now, .step = 10 }, 50);
     try testing.expect(cut.written < 3);
