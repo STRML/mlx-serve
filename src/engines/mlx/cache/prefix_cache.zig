@@ -729,8 +729,10 @@ const GhostList = struct {
 /// A lookup hit counts as the conversation coming back when it covers the donor's floor and three quarters of its
 /// tokens: a returning turn differs from its tip only by a stripped tail, a one-shot sharing a system prompt covers a
 /// small part of a long session.
+const ARC_PROMOTE_MIN_TOKENS: usize = 256;
+
 fn arcPromotes(shared: usize, entry_tokens: usize) bool {
-    return shared >= MIN_CANCELLED_COMMIT_TOKENS and shared * 4 >= entry_tokens * 3;
+    return shared >= ARC_PROMOTE_MIN_TOKENS and shared * 4 >= entry_tokens * 3;
 }
 
 /// Resident (T1, T2) and ghost (B1, B2) bytes of the ARC lists.
@@ -4206,7 +4208,7 @@ pub const HotPrefixCache = struct {
     fn arcBegin(self: *HotPrefixCache, tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, continues: bool) Admission {
         const p_before = self.arc_p;
         const g = self.ghosts.longestPrefixOf(tokens, has_tools, quant_config) orelse return .{ .frequent = continues, .p_before = p_before };
-        self.arc_b2_hit = g.frequent;
+        self.arc_b2_hit = g.frequent and g.bytes > 0;
         self.arcAdapt(g);
         return .{ .frequent = true, .p_before = p_before };
     }
