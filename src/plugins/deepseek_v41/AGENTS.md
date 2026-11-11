@@ -156,7 +156,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - The model runs in three `-Dunits` units (plugin, engine, modules): a setting or per-prompt region the load sets is
   a `Shared` (`ps()`), never a plain `var`, or the rounds and the streamer run on another unit's defaults.
 - A plugin-streamed bank's greedy DSpark round verifies the whole block (`DflashPol.pin_rows`): its 6-row verify costs
-  about a plain tick, and the adaptive policy's prior ladder cut novel text from 54 to 40 tok/s.
+  about a plain tick, and the adaptive policy's prior ladder cut novel text from 54 to 40 tok/s. A group round prices
+  its rows from this machine's own rounds instead (`GroupCost`: a base by state count, one row slope).
 - A streamed bank's phase follows its decode capacity (`promptPhase`): a call past the decode regions OR past
   `Routed.decode_ids` routed ids runs the prompt phase; a 9-16 token prompt on the EXL3 bank failed `NotPrefill`.
 - Engram tables are read past the page cache only beside a streamed bank (`Table.readDirect`): on a resident MLX pack

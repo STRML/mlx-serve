@@ -1108,53 +1108,110 @@ test "deepseek_v41 served: a batched verify gives each state its solo verify's r
     }
 }
 
-/// Greedy DSpark group rounds for `prompts`, one slot each on one model, until each slot has `out[k].len` tokens.
-fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, out: [][24]u32) !void {
-    const dspark_group = @import("../../engines/mlx/spec/dspark_group.zig");
-    const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var tok: Tokenizer = undefined;
-    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
-    defer p.close();
-    try testing.expect(dspark_group.groupable(&p.xfm));
-    var slots: [2]Slot = undefined;
-    var gens: [2]Generator = undefined;
-    var made: usize = 0;
-    defer for (slots[0..made], gens[0..made]) |*s, *gen| {
-        gen.deinit(a);
-        s.kv.deinit();
-    };
-    for (prompts, slots[0..prompts.len], gens[0..prompts.len]) |prompt, *s, *gen| {
-        try s.init();
-        gen.* = Generator.initWithOptions(io, a, &p.xfm, &tok, prompt, 64, .{ .temperature = 0 }, &.{}, .{ .ctx = s.ctx, .mtp_enabled = true, .skip_lazy_preforward = true, .lookup_prompt = prompt }) catch |e| {
-            s.kv.deinit();
-            return e;
-        };
-        made += 1;
-        try testing.expect(gen.dspark_enabled and gen.dspark_pol.?.calib.head);
-    }
-    const ptrs = [_]*Generator{ &gens[0], &gens[1] };
-    const allocs = [_]std.mem.Allocator{ a, a };
-    var n: [2]usize = .{ 0, 0 };
-    while (n[0] < out[0].len or n[1] < out[1].len) {
-        var res: [2]@import("../../engines/mlx/spec/drafter.zig").DrafterStepResult = undefined;
-        try dspark_group.moduleGroupRound(&ptrs, &allocs, &res);
-        for (res, 0..) |r, k| {
-            defer a.free(r.tokens);
-            for (r.tokens) |t| if (n[k] < out[k].len) {
-                out[k][n[k]] = t;
-                n[k] += 1;
+const dspark_group = @import("../../engines/mlx/spec/dspark_group.zig");
+const DrafterStepResult = @import("../../engines/mlx/spec/drafter.zig").DrafterStepResult;
+
+/// Two greedy DSpark slots on one served model, one per prompt.
+const Group = struct {
+    p: *Served,
+    slots: [2]Slot = undefined,
+    gens: [2]Generator = undefined,
+    made: usize = 0,
+    tok: Tokenizer = undefined,
+
+    fn open(g: *Group, files: []const sdk.fixture.File, prompts: []const []const u32) !void {
+        const a = testing.allocator;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        g.* = .{ .p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "") };
+        errdefer g.close();
+        try testing.expect(dspark_group.groupable(&g.p.xfm));
+        for (prompts, g.slots[0..prompts.len], g.gens[0..prompts.len]) |prompt, *s, *gen| {
+            try s.init();
+            gen.* = Generator.initWithOptions(io, a, &g.p.xfm, &g.tok, prompt, 64, .{ .temperature = 0 }, &.{}, .{ .ctx = s.ctx, .mtp_enabled = true, .skip_lazy_preforward = true, .lookup_prompt = prompt }) catch |e| {
+                s.kv.deinit();
+                return e;
             };
-            try testing.expectEqual(prompts[k].len + gens[k].generated_ids.items.len, gens[k].ctx.cache.step);
+            g.made += 1;
+            try testing.expect(gen.dspark_enabled and gen.dspark_pol.?.calib.head);
         }
     }
+
+    fn close(g: *Group) void {
+        for (g.slots[0..g.made], g.gens[0..g.made]) |*s, *gen| {
+            gen.deinit(testing.allocator);
+            s.kv.deinit();
+        }
+        g.p.close();
+    }
+
+    /// One group round; each slot's committed tokens through `each`.
+    fn round(g: *Group, ctx: anytype, comptime each: anytype) !void {
+        const a = testing.allocator;
+        const ptrs = [_]*Generator{ &g.gens[0], &g.gens[1] };
+        const allocs = [_]std.mem.Allocator{ a, a };
+        var res: [2]DrafterStepResult = undefined;
+        try dspark_group.moduleGroupRound(&ptrs, &allocs, &res);
+        defer for (res) |r| a.free(r.tokens);
+        for (res, 0..) |r, k| try each(ctx, k, r.tokens);
+    }
+};
+
+/// Greedy DSpark group rounds for `prompts`, one slot each on one model, until each slot has `out[k].len` tokens.
+fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, out: [][24]u32) !void {
+    var g: Group = undefined;
+    try g.open(files, prompts);
+    defer g.close();
+    const Fill = struct {
+        out: [][24]u32,
+        n: [2]usize = .{ 0, 0 },
+        g: *Group,
+        prompts: []const []const u32,
+        fn each(f: *@This(), k: usize, tokens: []const u32) !void {
+            for (tokens) |t| if (f.n[k] < f.out[k].len) {
+                f.out[k][f.n[k]] = t;
+                f.n[k] += 1;
+            };
+            try testing.expectEqual(f.prompts[k].len + f.g.gens[k].generated_ids.items.len, f.g.gens[k].ctx.cache.step);
+        }
+    };
+    var fill: Fill = .{ .out = out, .g = &g, .prompts = prompts };
+    while (fill.n[0] < out[0].len or fill.n[1] < out[1].len) try g.round(&fill, Fill.each);
     // ENGAGEMENT: every round a group round, and some verified drafts.
     var drafted: u64 = 0;
-    for (gens) |gen| {
+    for (g.gens) |gen| {
         try testing.expect(gen.dspark_group_rounds >= 4 and gen.dspark_group_rounds == gen.dspark_attempted);
         drafted += gen.dspark_group_rounds - gen.dspark_stats.rows[1];
     }
     try testing.expect(drafted > 0);
+}
+
+test "deepseek_v41 served: a group slot whose drafts the group verifies none of is not judged for them" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
+    defer ds.restore();
+    var g: Group = undefined;
+    try g.open(try fixture.v41DsparkFiles(arena.allocator(), 7), &.{ &.{ 3, 17, 42, 9, 7, 25, 1, 60 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6 } });
+    defer g.close();
+    // Calibrations that say no stage draft lands: the group buys no stage row.
+    for (&g.gens) |*gen| {
+        gen.dspark_pol.?.calib.seen = @splat(1e6);
+        gen.dspark_pol.?.calib.hit = @splat(0);
+    }
+    const Skip = struct {
+        fn each(_: void, _: usize, _: []const u32) !void {}
+    };
+    try g.round({}, Skip.each);
+    var staged: usize = 0;
+    for (g.gens) |gen| {
+        if (gen.dspark_copies > 0) continue;
+        staged += 1;
+        try testing.expectEqual(@as(u32, 0), gen.dspark_pol.?.drafting.owed);
+        try testing.expectEqual(@as(f32, 0), gen.dspark_pol.?.drafting.wall);
+    }
+    try testing.expect(staged > 0);
 }
 
 test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tokens whichever slot shares them" {
