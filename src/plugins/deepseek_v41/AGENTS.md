@@ -199,7 +199,7 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - Without NAX (M4 and older) `attn`, `idx_score` and the `wo_a` / `ffn_in` fusion behind them stay off: decode runs the
   pre-NAX split kernel and the compiled regions. The affine `moe_up` / `moe_down` stay off too (they lose to the
   compiled MoE there); `moe_fp4` is the non-NAX one.
-- Prefill is chunked at 8192 (`prefillWidths`), one MoE call per chunk: each chunk still reads every expert bank
+- Prefill is chunked at 8192 at most (`prefillWidths`, an explicit `--prefill-chunk` included: wider chunks hung Macs), one MoE call per chunk: each chunk still reads every expert bank
   once (the CED replay runs the decoder layers), so a narrower chunk pays that read twice as often. Beside decoders it
   narrows to 4096 (`beside_decode`), not the engine's 2048 / 1024.
 - Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
