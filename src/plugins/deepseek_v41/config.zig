@@ -197,7 +197,8 @@ test "deepseek_v41 config: an experts.bin bank streams, its prompt passed whole"
     try testing.expect(v.isOk());
     defer freeParsed(&p);
     try testing.expect(of(&p).dsv41_streamed and of(&p).dsv41_exl3_bank and p.caps.whole_prompt_prefill and p.caps.streamed_weights);
-    try testing.expect(!p.caps.slot_state and !p.caps.batches_decode);
+    // Every V4.1 declares its slots' own states and their batch; a bank that streams narrows them at load.
+    try testing.expect(p.caps.slot_state and p.caps.batches_decode);
     try testing.expect(!p.caps.prefix_cache);
     var q: abi.Parsed = .{};
     try testing.expect(parseFiles(&.{.{ .name = "config.json", .bytes = iq3 }}, true, &q).isOk());
