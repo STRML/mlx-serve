@@ -1014,11 +1014,13 @@ pub const ModelConfig = struct {
         }
     }
 
-    /// The widest prompt chunk the arch's prompt pass gains from (0 = the ladder's): DeepSeek-V4.1 peaks at 8192 (each
-    /// chunk replays a window through its decoder layers, reading their whole expert banks, and fuller expert tiles
-    /// pay; past 8192 its per-row costs grow).
-    pub fn prefillChunkMax(self: *const ModelConfig) u32 {
-        return if (self.isDsv41()) 8192 else 0;
+    /// The prompt chunk widths the arch's prompt pass wants (0 = the engine's): `max` the widest it gains from,
+    /// `beside_decode` the narrowest it runs while others decode. DeepSeek-V4.1's chunk replays a window through its
+    /// decoder layers and reads their whole expert banks, so it peaks at 8192 and a narrow chunk pays that read again.
+    pub const PrefillWidths = struct { max: u32 = 0, beside_decode: u32 = 0 };
+
+    pub fn prefillWidths(self: *const ModelConfig) PrefillWidths {
+        return if (self.isDsv41()) .{ .max = 8192, .beside_decode = 4096 } else .{};
     }
 
     /// Rows a sliding layer keeps past its window on an arch that caches only the window

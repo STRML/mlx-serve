@@ -137,7 +137,7 @@ pub fn resolvePrefillChunk(
     const cap: u64 = prefillChunkCap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
     for (PREFILL_CHUNK_LADDER) |chunk| {
         if (chunk == generate_mod.WIDE_PREFILL_CHUNK and config.prefillScoreHeadDim() != 0) continue;
-        if (config.prefillChunkMax() != 0 and chunk > config.prefillChunkMax()) continue;
+        if (config.prefillWidths().max != 0 and chunk > config.prefillWidths().max) continue;
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
     }
     // Nothing fits the share — the model barely fits at all. Take the narrowest
