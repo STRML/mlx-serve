@@ -108,6 +108,8 @@ pub const LoadParams = struct {
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
     prefix_cache_disk_bytes: u64 = 0,
+    /// `--prefix-cache-disk-write-max`, bytes per second (module tiers; 0 = write every tip as it goes quiet).
+    prefix_cache_disk_write_max_bps: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
     /// 0 = disabled (hybrid models bypass the hot prefix cache). Non-zero
     /// enables hybrid in `HotPrefixCache.shouldUse` and triggers per-stride

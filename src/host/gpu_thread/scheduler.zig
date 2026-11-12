@@ -96,6 +96,7 @@ pub const Scheduler = struct {
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
+    prefix_cache_disk_write_max_bps: u64 = 0,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
     /// Launch-flag MTP + embedded-llama.cpp settings, retained (same rationale

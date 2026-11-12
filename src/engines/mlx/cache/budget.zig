@@ -236,7 +236,7 @@ fn diskCaches(sch: *Scheduler, out: []prefix_cache_mod.FlushTarget, owed_only: b
         const entry = entry_ptr.*;
         if (entry.state != .ready) continue;
         const hc = if (entry.prefix_cache) |h| h else continue;
-        if (hc.disk == null or (owed_only and !hc.disk_dirty)) continue;
+        if (hc.disk == null or (owed_only and !hc.disk_dirty and hc.feedOwedCount() == 0)) continue;
         const xf = entry.transformer orelse continue;
         out[n] = .{ .hc = hc, .s = xf.s };
         n += 1;

@@ -403,6 +403,8 @@ const Entry = struct {
     frequent: bool = false,
     /// A module tip its conversation forked away from: nothing extends it any more.
     forked_off: bool = false,
+    /// The write feed has offered this module entry to the SSD tier (landed, declined or still in flight).
+    fed: bool = false,
 };
 
 /// What a spec-snap adoption may do, decided before any mlx call.
@@ -483,6 +485,7 @@ pub const FlushTarget = struct { hc: *HotPrefixCache, s: mlx.mlx_stream };
 /// Inference thread only.
 pub fn shutdownPersist(targets: []const FlushTarget, clock: anytype, deadline_ms: i64) ShutdownTally {
     var t: ShutdownTally = .{};
+    for (targets) |x| x.hc.feed_shutdown = true;
     var errors_before: u64 = 0;
     var modules_before: u32 = 0;
     for (targets) |x| {
@@ -517,7 +520,7 @@ pub fn shutdownPersist(targets: []const FlushTarget, clock: anytype, deadline_ms
         d.pollModuleWrites();
         const unfinished = x.hc.moduleUnfinishedCount();
         const committed = x.hc.moduleCommittedCount();
-        if (cut) t.left_deadline += x.hc.owedKvCount();
+        if (cut) t.left_deadline += x.hc.owedKvCount() + x.hc.feedOwedCount();
         t.checked_out += x.hc.checkedOutOwed();
         t.dropped_bytes += d.drainWriterUntil(clock, deadline_ms);
         d.pollModuleWrites();
@@ -647,6 +650,8 @@ const Ghost = struct {
     quant_config: kv_quant.KVQuantConfig,
     bytes: u64,
     frequent: bool,
+    /// A T2 module tip that left RAM with no committed SSD record.
+    unfed: bool = false,
 
     fn of(tokens: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, bytes: u64, frequent: bool) Ghost {
         return .{
@@ -818,6 +823,15 @@ pub const HotPrefixCache = struct {
     /// The admission in progress recognised a B2 ghost: at |T1| == p the REPLACE rule then evicts T1.
     arc_b2_hit: bool = false,
     ghosts: GhostList = .{},
+    /// `--prefix-cache-disk-write-max` in bytes per second; 0 = every module tip is written once quiet.
+    feed_bytes_per_s: u64 = 0,
+    feed_credit: i64 = 0,
+    feed_at_ms: i64 = 0,
+    /// SIGTERM's flush began: T2 tips are fed hottest first with no idle wait, and a declined record is final.
+    feed_shutdown: bool = false,
+    /// T2 module tips evicted before their SSD record committed, and how many of those conversations came back.
+    t2_evicted_unfed: u64 = 0,
+    t2_unfed_returned: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -2105,7 +2119,7 @@ pub const HotPrefixCache = struct {
         const why: []const u8 = if (adm.ghost) "ghost hit" else @tagName(lineage);
         log.info("  [hot-cache] module commit {d} tokens key={x} -> {s} ({s})\n", .{ ids.len, cache_key, if (adm.frequent) "T2" else "T1", why });
         self.arcTrimGhosts();
-        self.registerModuleEntry(&self.entries.items[self.entries.items.len - 1]);
+        if (!self.feedMode()) self.registerModuleEntry(&self.entries.items[self.entries.items.len - 1]);
         self.logResident();
         return .{ .ok = ids.len };
     }
@@ -2278,8 +2292,9 @@ pub const HotPrefixCache = struct {
         defer freeEntryOwnedState(self.allocator, e);
         const m = e.module orelse return;
         if (!self.moduleExportOwed(m)) return;
-        if (cancellation) |reason| {
-            self.cancelModule(m, reason);
+        const reason = cancellation orelse if (self.feedMode()) kv_disk_cache.DiskTier.ModuleCancellation.memory_pressure else null;
+        if (reason) |r| {
+            self.cancelModule(m, r);
             return;
         }
         const holder = self.freePendingHolder() orelse {
@@ -3305,7 +3320,77 @@ pub const HotPrefixCache = struct {
         if (self.disk == null) return false;
         if (self.finishing_disk != null or self.pending_disk != null) return true;
         if (self.owedEntryIndex(false, false) != null) return true;
+        if (self.feedOwedCount() > 0) return true;
         return self.modulePublicationPending();
+    }
+
+    /// `--prefix-cache-disk-write-max` on a module tier: records are written by the feed, never at commit or on the
+    /// quiet timer, and an eviction cancels instead of parking.
+    fn feedMode(self: *const HotPrefixCache) bool {
+        const d = if (self.disk) |*dd| dd else return false;
+        return self.feed_bytes_per_s > 0 and d.module_context != null;
+    }
+
+    /// A conversation's T2 tip the feed has not offered to the tier yet.
+    fn feedable(self: *const HotPrefixCache, i: usize) bool {
+        const e = &self.entries.items[i];
+        if (e.module == null or e.fed or e.checked_out_by != null or self.isModuleRung(i)) return false;
+        return e.frequent;
+    }
+
+    pub fn feedOwedCount(self: *const HotPrefixCache) u32 {
+        if (!self.feedMode()) return 0;
+        var n: u32 = 0;
+        for (0..self.entries.items.len) |i| n += @intFromBool(self.feedable(i));
+        return n;
+    }
+
+    /// Token bucket over the idle loop's calls: credit refills at the configured rate, up to one second's worth, and
+    /// pays for the bytes the tier persisted. A slice that overdraws it is the only overshoot.
+    fn feedRefill(self: *HotPrefixCache) void {
+        if (!self.feedMode()) return;
+        const now = crt.monotonicMs();
+        const cap = std.math.cast(i64, self.feed_bytes_per_s) orelse std.math.maxInt(i64);
+        if (self.feed_at_ms == 0) {
+            self.feed_credit = cap;
+            self.feed_at_ms = now;
+            return;
+        }
+        const dt = std.math.clamp(now -| self.feed_at_ms, 0, 1000);
+        const earned = if (dt >= 1000) cap else @divTrunc(cap *| dt, 1000);
+        if (earned == 0) return;
+        self.feed_credit = @min(self.feed_credit +| earned, cap);
+        self.feed_at_ms = now;
+    }
+
+    /// The next entry to hand the tier, credit aside: serving takes the coldest T2 tip idle for the quiet period; a
+    /// shutdown takes T2 tips hottest first, with no idle wait.
+    fn feedCandidate(self: *const HotPrefixCache, order: SliceOrder) ?usize {
+        if (!self.feedMode() or order == .newest_first) return null;
+        const hottest = order == .shutdown_hottest;
+        const now = crt.monotonicMs();
+        var best: ?usize = null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (!self.feedable(i)) continue;
+            if (!hottest and now - e.touched_ms < self.module_quiet_ms) continue;
+            const b = best orelse {
+                best = i;
+                continue;
+            };
+            if ((e.last_used > self.entries.items[b].last_used) == hottest) best = i;
+        }
+        return best;
+    }
+
+    /// Offer the entry to the tier. A decline the volume may lift (`store_declined`) retries on a later tick while
+    /// serving; any other, and any decline at shutdown, is final.
+    fn sliceFeedStart(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, i: usize, s: mlx.mlx_stream) ?SliceResult {
+        const e = &self.entries.items[i];
+        self.registerModuleEntry(e);
+        if (e.module.?.disk_id == null and d.store_declined and !self.feed_shutdown) return null;
+        e.fed = true;
+        if (e.module.?.disk_id == null) return .skipped;
+        return self.sliceEntry(d, e, s);
     }
 
     fn modulePublicationPending(self: *const HotPrefixCache) bool {
@@ -3317,7 +3402,8 @@ pub const HotPrefixCache = struct {
     }
 
     /// `oldest_quiet` is the idle loop's order: the oldest owed record, module tips only past their quiet period.
-    const SliceOrder = enum { newest_first, oldest_first, oldest_quiet };
+    /// `shutdown_hottest` is a feed-mode shutdown: T2 tips, most recently used first.
+    const SliceOrder = enum { newest_first, oldest_first, oldest_quiet, shutdown_hottest };
 
     /// One bounded slice, then `disk_dirty` says whether anything is still owed. A parked
     /// snapshot goes first: it is an earlier session's, and RAM holds at most a trimmed copy.
@@ -3331,11 +3417,21 @@ pub const HotPrefixCache = struct {
             return null;
         }
         defer self.disk_dirty = self.diskOwed();
+        self.feedRefill();
+        const persisted_before = d.bytes_persisted;
+        defer if (self.feedMode()) {
+            self.feed_credit -|= std.math.cast(i64, d.bytes_persisted - persisted_before) orelse std.math.maxInt(i64);
+        };
         if (self.sliceStagedModule(d, s)) |r| return r;
         if (self.finishing_disk != null) return self.slicePending(d, &self.finishing_disk, s);
         // The live state captured at commit, not what the RAM entry kept after its trim.
         if (order == .newest_first and self.pending_disk != null) return self.slicePending(d, &self.pending_disk, s);
-        if (self.owedEntryIndex(order == .newest_first, order == .oldest_quiet)) |i| return self.sliceEntry(d, &self.entries.items[i], s);
+        const feed_spent = order == .oldest_quiet and self.feedMode() and self.feed_credit <= 0;
+        if (self.owedEntryIndex(order == .newest_first, order == .oldest_quiet)) |i| {
+            if (feed_spent) return null;
+            return self.sliceEntry(d, &self.entries.items[i], s);
+        }
+        if (!feed_spent) if (self.feedCandidate(order)) |i| return self.sliceFeedStart(d, i, s);
         if (self.slicePending(d, &self.pending_disk, s)) |r| return r;
         return if (self.modulePublicationPending()) .busy else null;
     }
@@ -3371,6 +3467,7 @@ pub const HotPrefixCache = struct {
         if (self.finishing_disk) |p| return p.module != null;
         if (order == .newest_first) if (self.pending_disk) |p| return p.module != null;
         if (self.owedEntryIndex(order == .newest_first, false)) |i| return self.entries.items[i].module != null;
+        if (self.feedCandidate(order) != null) return true;
         if (self.pending_disk) |p| return p.module != null;
         return false;
     }
@@ -3388,7 +3485,7 @@ pub const HotPrefixCache = struct {
         const d = if (self.disk) |*dd| dd else return .done;
         self.disk_dirty = true;
         const before = d.bytes_persisted;
-        const r = self.flushSlice(s, .oldest_first) orelse return .done;
+        const r = self.flushSlice(s, if (self.feedMode()) .shutdown_hottest else .oldest_first) orelse return .done;
         const landed = d.bytes_persisted - before;
         t.bytes += landed;
         switch (r) {
@@ -3723,11 +3820,43 @@ pub const HotPrefixCache = struct {
         if (!shrank) return;
         if (self.residentBytes() > max_kv_bytes) self.cancelPendingModules(.memory_pressure);
         while (self.residentBytes() > max_kv_bytes) {
-            const idx = self.lruIndexExcluding(null, null) orelse break;
+            const idx = self.shrinkVictim() orelse break;
             self.evictForCapacity(idx, "budget revised", .memory_pressure, null);
         }
         self.shedCheckpointsToFit();
         self.logResident();
+    }
+
+    fn recordState(self: *const HotPrefixCache, e: *const Entry) ?kv_disk_cache.module_record.State {
+        const m = e.module orelse return null;
+        const id = m.disk_id orelse return null;
+        const d = if (self.disk) |*dd| dd else return null;
+        return d.moduleState(id);
+    }
+
+    /// ARC's victim for a budget shrink; in feed mode, when that is a T2 tip the SSD does not hold yet (unfed, or its
+    /// write in flight), the oldest entry of the same list whose record has committed, which a later turn can restore.
+    fn shrinkVictim(self: *const HotPrefixCache) ?usize {
+        const lru = self.lruIndexExcluding(null, null) orelse return null;
+        if (!self.feedMode()) return lru;
+        const state = self.recordState(&self.entries.items[lru]);
+        const in_flight = state == .registered or state == .exporting or state == .submitted;
+        if (!self.feedable(lru) and !in_flight) return lru;
+        const frequent = self.entries.items[lru].frequent;
+        var best: ?usize = null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.checked_out_by != null or e.frequent != frequent or self.recordState(e) != .committed) continue;
+            if (best == null or e.last_used < self.entries.items[best.?].last_used) best = i;
+        }
+        return best orelse lru;
+    }
+
+    /// A T2 module tip leaving RAM in feed mode with no committed SSD record: its conversation restarts cold if it
+    /// returns. Outside feed mode an owed export parks in a holder and still lands.
+    fn unfedT2Tip(self: *const HotPrefixCache, idx: usize) bool {
+        const e = &self.entries.items[idx];
+        if (!e.frequent or !self.feedMode() or self.isModuleRung(idx)) return false;
+        return self.recordState(e) != .committed;
     }
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
@@ -3824,6 +3953,7 @@ pub const HotPrefixCache = struct {
         if (self.pending_disk) |p| if (p.module) |m| {
             return d.modulePartStagingBytes(m.disk_id orelse return 0);
         };
+        if (self.feedCandidate(.oldest_quiet)) |i| return @as(u64, self.entries.items[i].tokens.len) * 4;
         return 0;
     }
 
@@ -4090,12 +4220,14 @@ pub const HotPrefixCache = struct {
     }
 
     /// Remember an entry leaving for capacity. Not a module rung: its conversation's tip is still resident.
-    fn arcRecordGhost(self: *HotPrefixCache, idx: usize) void {
+    fn arcRecordGhost(self: *HotPrefixCache, idx: usize, unfed: bool) void {
         if (self.max_kv_bytes == 0 or self.isModuleRung(idx)) return;
         const e = &self.entries.items[idx];
         if (e.tokens.len == 0) return;
         self.ghosts.dropPrefixesOf(e.tokens, e.has_tools, e.quant_config);
-        self.ghosts.push(Ghost.of(e.tokens, e.has_tools, e.quant_config, e.kv_bytes, e.frequent));
+        var g = Ghost.of(e.tokens, e.has_tools, e.quant_config, e.kv_bytes, e.frequent);
+        g.unfed = unfed;
+        self.ghosts.push(g);
     }
 
     /// An SSD restore served `tokens`: the conversation came back, so its next commit joins T2 even with no ghost left.
@@ -4128,6 +4260,7 @@ pub const HotPrefixCache = struct {
         const p_before = self.arc_p;
         const g = self.ghosts.longestPrefixOf(tokens, has_tools, quant_config) orelse return .{ .frequent = continues, .p_before = p_before };
         self.arc_b2_hit = g.frequent and g.bytes > 0;
+        if (g.unfed) self.noteUnfedReturn();
         self.arcAdapt(g);
         return .{ .frequent = true, .p_before = p_before, .ghost = true };
     }
@@ -4167,11 +4300,23 @@ pub const HotPrefixCache = struct {
 
     /// Evict to make room: the entry leaves a ghost.
     fn evictForCapacity(self: *HotPrefixCache, idx: usize, reason: []const u8, cancellation: ?kv_disk_cache.DiskTier.ModuleCancellation, incoming_key: ?u64) void {
+        const unfed = self.unfedT2Tip(idx);
         var buf: [192]u8 = undefined;
         const detail = self.evictionDetail(&buf, idx, reason, incoming_key);
-        self.arcRecordGhost(idx);
+        self.arcRecordGhost(idx, unfed);
+        if (unfed) self.noteUnfedEviction();
         self.evictAtWithCancellation(idx, detail, cancellation);
         self.arcTrimGhosts();
+    }
+
+    fn noteUnfedEviction(self: *HotPrefixCache) void {
+        self.t2_evicted_unfed += 1;
+        log.info("  [hot-cache] T2 tip evicted with no SSD record ({d} so far, {d} came back)\n", .{ self.t2_evicted_unfed, self.t2_unfed_returned });
+    }
+
+    fn noteUnfedReturn(self: *HotPrefixCache) void {
+        self.t2_unfed_returned += 1;
+        log.info("  [hot-cache] a T2 tip evicted with no SSD record came back ({d} of {d})\n", .{ self.t2_unfed_returned, self.t2_evicted_unfed });
     }
 
     /// "<reason>; T2 tip, idle 12.3 s, for key=..." for the eviction line.
@@ -12070,6 +12215,186 @@ test "HotPrefixCache ARC: a session restored from the SSD tier commits into T2" 
     try testing.expectEqual(@as(usize, 600), res.matched);
     try arcKvCommit(&hc, s, &longer);
     try testing.expect((try testEntryFor(&hc, &longer)).frequent);
+}
+
+const FeedTest = struct {
+    /// A module tier fed at `rate` bytes per second, with the serving quiet period.
+    fn init(tmp: *testing.TmpDir, count: u32, rate: u64) !HotPrefixCache {
+        var hc = try ModuleDiskTest.init(tmp, count);
+        hc.module_quiet_ms = 60_000;
+        hc.feed_bytes_per_s = rate;
+        return hc;
+    }
+
+    /// Commit `ids[0..512]` as a T1 or T2 tip, last touched `idle_ms` ago.
+    fn put(hc: *HotPrefixCache, fake: *ModuleFake, binding: ModuleBinding, snap: *ModuleFake.Snap, ids: *const [513]u32, frequent: bool, idle_ms: i64) !void {
+        snap.* = ModuleDiskTest.snap(fake, ids[0..512]);
+        _ = try snap.put(hc, binding, &.{});
+        const e = try testEntryFor(hc, ids[0..512]);
+        e.frequent = frequent;
+        e.touched_ms -= idle_ms;
+    }
+
+    /// The idle loop until it has nothing it may write now.
+    fn drain(hc: *HotPrefixCache, s: mlx.mlx_stream) void {
+        var calls: usize = 0;
+        while (calls < 64) : (calls += 1) {
+            const r = hc.flushOwedSlice(s);
+            hc.disk.?.drainWriter();
+            hc.disk.?.pollModuleWrites();
+            if (r != .progress and r != .busy) break;
+        }
+    }
+
+    fn onDisk(hc: *const HotPrefixCache, ids: *const [513]u32) bool {
+        for (hc.disk.?.entries.items) |e| if (std.mem.eql(u32, e.tokens, ids[0..512])) return true;
+        return false;
+    }
+};
+
+test "HotPrefixCache module feed: nothing is written at commit, then only quiet T2 tips, coldest first" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try FeedTest.init(&tmp, 8, 1 << 30);
+    defer hc.deinit();
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var ids: [4][513]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = ModuleDiskTest.ids(@as(u32, @intCast(i)) * 10_000 + 1000);
+    var snaps: [4]ModuleFake.Snap = undefined;
+    // Two quiet T2 tips, a busy T2 tip and a quiet T1 tip.
+    try FeedTest.put(&hc, &fake, binding, &snaps[0], &ids[0], true, 61_000);
+    try FeedTest.put(&hc, &fake, binding, &snaps[1], &ids[1], true, 61_000);
+    try FeedTest.put(&hc, &fake, binding, &snaps[2], &ids[2], true, 0);
+    try FeedTest.put(&hc, &fake, binding, &snaps[3], &ids[3], false, 61_000);
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.bytes_persisted);
+
+    FeedTest.drain(&hc, cpu);
+    try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
+    for (hc.disk.?.entries.items, ids[0..2]) |e, want| try testing.expectEqualSlices(u32, want[0..512], e.tokens);
+    // The busy tip is still owed; the T1 tip never is.
+    try testing.expectEqual(@as(u32, 1), hc.feedOwedCount());
+    try testing.expectEqual(FlushResult.quiet, hc.flushOwedSlice(cpu));
+}
+
+test "HotPrefixCache module feed: the rate cap stops the feed until the bucket refills" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try FeedTest.init(&tmp, 8, 500);
+    defer hc.deinit();
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var ids: [3][513]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = ModuleDiskTest.ids(@as(u32, @intCast(i)) * 10_000 + 1000);
+    var snaps: [3]ModuleFake.Snap = undefined;
+    for (&snaps, &ids) |*snap, *id| try FeedTest.put(&hc, &fake, binding, snap, id, true, 61_000);
+
+    FeedTest.drain(&hc, cpu);
+    try testing.expect(hc.feed_credit <= 0);
+    try testing.expect(hc.moduleCommittedCount() < 3);
+    try testing.expectEqual(FlushResult.quiet, hc.flushOwedSlice(cpu));
+    // Each second the bucket earns its rate again.
+    var seconds: usize = 0;
+    while (hc.moduleCommittedCount() < 3 and seconds < 256) : (seconds += 1) {
+        hc.feed_at_ms -= 1000;
+        FeedTest.drain(&hc, cpu);
+    }
+    try testing.expectEqual(@as(u32, 3), hc.moduleCommittedCount());
+    try testing.expect(seconds > 3);
+}
+
+test "HotPrefixCache module feed: shutdown writes T2 tips only, hottest first" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try FeedTest.init(&tmp, 8, 500);
+    defer hc.deinit();
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var ids: [4][513]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = ModuleDiskTest.ids(@as(u32, @intCast(i)) * 10_000 + 1000);
+    var snaps: [4]ModuleFake.Snap = undefined;
+    const frequent = [_]bool{ false, true, false, true };
+    for (0..4) |i| try FeedTest.put(&hc, &fake, binding, &snaps[i], &ids[i], frequent[i], 0);
+    var now: i64 = 0;
+    const tally = shutdownPersist(&.{.{ .hc = &hc, .s = cpu }}, TestStepClock{ .now = &now, .step = 0 }, 1_000_000);
+    try testing.expectEqual(@as(u32, 2), tally.written);
+    const expected = [_]usize{ 3, 1 };
+    for (hc.disk.?.entries.items, expected) |e, want| try testing.expectEqualSlices(u32, ids[want][0..512], e.tokens);
+}
+
+test "HotPrefixCache module feed: an evicted T2 tip's unwritten record is cancelled, not parked, and its return is counted" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try FeedTest.init(&tmp, 1, 500);
+    defer hc.deinit();
+    hc.max_kv_bytes = 1 << 20;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const a = ModuleDiskTest.ids(1000);
+    const b = ModuleDiskTest.ids(11_000);
+    var snaps: [2]ModuleFake.Snap = undefined;
+    try FeedTest.put(&hc, &fake, binding, &snaps[0], &a, true, 61_000);
+    // The feed starts the record; the rate cap leaves it unfinished.
+    _ = hc.flushOwedSlice(cpu);
+    try testing.expect(hc.entries.items[0].fed);
+    try testing.expectEqual(@as(u32, 1), hc.moduleUnfinishedCount());
+    // The count cap evicts it.
+    try FeedTest.put(&hc, &fake, binding, &snaps[1], &b, false, 0);
+    try testing.expect(hc.finishing_disk == null and hc.pending_disk == null);
+    try testing.expectEqual(@as(u32, 0), hc.moduleUnfinishedCount());
+    try testing.expectEqual(@as(u64, 1), hc.t2_evicted_unfed);
+    var back = ModuleDiskTest.snap(&fake, &a);
+    _ = try back.put(&hc, binding, &.{});
+    try testing.expectEqual(@as(u64, 1), hc.t2_unfed_returned);
+    hc.disk.?.drainWriter();
+}
+
+test "HotPrefixCache module feed: a budget shrink takes a T2 tip the SSD holds before an unwritten one" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try FeedTest.init(&tmp, 8, 1 << 30);
+    defer hc.deinit();
+    hc.max_kv_bytes = 120;
+    hc.stale_after_ms = 0;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var ids: [3][513]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = ModuleDiskTest.ids(@as(u32, @intCast(i)) * 10_000 + 1000);
+    var snaps: [3]ModuleFake.Snap = undefined;
+    // Three T2 tips, oldest first; only the middle one has gone quiet and been written.
+    try FeedTest.put(&hc, &fake, binding, &snaps[0], &ids[0], true, 0);
+    try FeedTest.put(&hc, &fake, binding, &snaps[1], &ids[1], true, 61_000);
+    try FeedTest.put(&hc, &fake, binding, &snaps[2], &ids[2], true, 0);
+    FeedTest.drain(&hc, cpu);
+    try testing.expect(FeedTest.onDisk(&hc, &ids[1]));
+
+    hc.setBudget(80);
+    _ = try testEntryFor(&hc, ids[0][0..512]);
+    try testing.expectError(error.EntryGone, testEntryFor(&hc, ids[1][0..512]));
+    try testing.expectEqual(@as(u64, 0), hc.t2_evicted_unfed);
+    const back = hc.findModuleMatch(binding, &ids[1], false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(.disk, back.source);
 }
 
 test "HotPrefixCache module: oversized disabled and malformed commits free the whole candidate" {

@@ -84,6 +84,7 @@ pub const LoadRequest = struct {
     prefix_cache_mem_bytes: u64 = 0,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
+    prefix_cache_disk_write_max_bps: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
     /// Zero disables (hybrid models bypass the hot prefix cache, as before).
     /// Non-zero enables multi-turn warm reuse on hybrid SSM archs. Plumbed
