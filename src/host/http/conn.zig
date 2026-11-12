@@ -89,6 +89,7 @@ pub const Conn = struct {
     ablation: ?AblationRequest = null,
     ablation_header: [192]u8 = undefined,
     ablation_header_len: usize = 0,
+    cache_export: bool = false,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
@@ -101,6 +102,7 @@ pub const Conn = struct {
         c.ollama_sink = null;
         c.sse_headers_sent = false;
         c.length_framed = false;
+        c.cache_export = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 
@@ -109,6 +111,7 @@ pub const Conn = struct {
         c.client = instr.Client.fromUserAgent(findHeaderValue(headers, "user-agent"));
         c.clearAblation();
         c.ablation_key = findHeaderValue(headers, "x-ablation-key");
+        c.cache_export = if (findHeaderValue(headers, "x-cache-export")) |v| std.mem.eql(u8, v, "1") else false;
     }
 
     pub fn clearAblation(c: *Conn) void {

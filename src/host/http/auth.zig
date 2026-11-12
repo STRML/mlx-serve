@@ -40,6 +40,18 @@ pub fn peerIsLoopback(conn: *const Conn) bool {
     return ipIsLoopback(conn.stream.socket.address);
 }
 
+pub fn peerIsCacheTrusted(addr: std.Io.net.IpAddress) bool {
+    if (ipIsLoopback(addr)) return true;
+    return switch (addr) {
+        .ip4 => |a4| a4.bytes[0] == 10 and a4.bytes[1] == 254,
+        .ip6 => |a6| blk: {
+            const b = a6.bytes;
+            const zeros10: [10]u8 = @splat(0);
+            break :blk std.mem.eql(u8, b[0..10], &zeros10) and b[10] == 0xff and b[11] == 0xff and b[12] == 10 and b[13] == 254;
+        },
+    };
+}
+
 /// Case-insensitive HTTP header lookup in the raw header block. `name_lower`
 /// must be lowercase (e.g. "authorization"). Returns the trimmed value, or null.
 pub fn findHeaderValueCI(headers: []const u8, name_lower: []const u8) ?[]const u8 {
@@ -192,13 +204,13 @@ pub fn loginPageHtml(comptime note: []const u8) []const u8 {
     \\<h1>API key required</h1>
     \\<p>This MLX Serve server requires an API key. Enter the key the server was started with.</p>
     \\
-++ note ++
-    \\<form method="post">
-    \\<input type="password" name="api_key" placeholder="API key" autocomplete="current-password" required autofocus>
-    \\<button type="submit">Continue</button>
-    \\</form>
-    \\</main></body></html>
-    \\
+    ++ note ++
+        \\<form method="post">
+        \\<input type="password" name="api_key" placeholder="API key" autocomplete="current-password" required autofocus>
+        \\<button type="submit">Continue</button>
+        \\</form>
+        \\</main></body></html>
+        \\
     ;
 }
 
@@ -305,4 +317,22 @@ test "ipIsLoopback exempts local addresses only" {
     // IPv4-mapped loopback ::ffff:127.0.0.1
     try std.testing.expect(ipIsLoopback(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, .port = 0 } }));
     try std.testing.expect(!ipIsLoopback(.{ .ip6 = .{ .bytes = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 0 } }));
+}
+
+test "dsv41 peer fetch: peerIsCacheTrusted allows loopback and 10.254.0.0/16 only" {
+    try std.testing.expect(peerIsCacheTrusted(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }));
+    try std.testing.expect(peerIsCacheTrusted(.{ .ip4 = .{ .bytes = .{ 127, 4, 5, 6 }, .port = 0 } }));
+    try std.testing.expect(peerIsCacheTrusted(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 0 } }));
+    try std.testing.expect(peerIsCacheTrusted(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, .port = 0 } }));
+    try std.testing.expect(peerIsCacheTrusted(.{ .ip4 = .{ .bytes = .{ 10, 254, 0, 1 }, .port = 0 } }));
+    try std.testing.expect(peerIsCacheTrusted(.{ .ip4 = .{ .bytes = .{ 10, 254, 13, 3 }, .port = 0 } }));
+    try std.testing.expect(peerIsCacheTrusted(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 254, 13, 3 }, .port = 0 } }));
+
+    try std.testing.expect(!peerIsCacheTrusted(.{ .ip4 = .{ .bytes = .{ 10, 0, 0, 5 }, .port = 0 } }));
+    try std.testing.expect(!peerIsCacheTrusted(.{ .ip4 = .{ .bytes = .{ 10, 253, 255, 255 }, .port = 0 } }));
+    try std.testing.expect(!peerIsCacheTrusted(.{ .ip4 = .{ .bytes = .{ 10, 255, 0, 1 }, .port = 0 } }));
+    try std.testing.expect(!peerIsCacheTrusted(.{ .ip4 = .{ .bytes = .{ 192, 168, 86, 10 }, .port = 0 } }));
+    try std.testing.expect(!peerIsCacheTrusted(.{ .ip4 = .{ .bytes = .{ 100, 100, 1, 2 }, .port = 0 } }));
+    try std.testing.expect(!peerIsCacheTrusted(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 5 }, .port = 0 } }));
+    try std.testing.expect(!peerIsCacheTrusted(.{ .ip6 = .{ .bytes = .{ 0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 0 } }));
 }

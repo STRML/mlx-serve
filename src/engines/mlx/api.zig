@@ -16,6 +16,7 @@ const model_state = @import("runtime/model_state.zig");
 const distributed = @import("cluster/distributed.zig");
 const request_policy = @import("request_policy.zig");
 const configure_mod = @import("configure.zig");
+const peer_transfer = @import("cache/peer_transfer.zig");
 const Scheduler = scheduler.Scheduler;
 const Slot = scheduler.Slot;
 
@@ -40,6 +41,8 @@ pub const table: host.Api = .{
     .run_generation = runGeneration,
     .compute_embeddings = computeEmbeddings,
     .encode_vision = encodeVision,
+    .export_cache = exportCache,
+    .import_cache = importCache,
     .timestamp_classes = timestampClasses,
     .plugin_word_times = pluginWordTimes,
     .plugin_diarize = pluginDiarize,
@@ -86,7 +89,7 @@ fn clusterProbe(io: std.Io, args: []const []const u8) ?[]const u8 {
 }
 
 fn clusterConnect(io: std.Io, gpa: std.mem.Allocator, coordinator: []const u8, device: []const u8, mode: u8, model: []const u8, split: ?u32, size: u32, join_timeout_s: ?u32) ?[]const u8 {
-    distributed.connect(local(io), gpa, .{ .rank = 0, .size = size, .coordinator = coordinator, .device = device }, @enumFromInt(mode), model, split, join_timeout_s) catch |e| return @errorName(e);
+    distributed.connect(local(io), gpa, .{ .rank = 0, .size = size, .coordinator = coordinator, .device = device }, @fromBackingInt(@intCast(mode)), model, split, join_timeout_s) catch |e| return @errorName(e);
     return null;
 }
 
@@ -138,6 +141,16 @@ fn computeEmbeddings(sch: *Scheduler, req: *requests.EmbedRequest, out: *[][]f32
 
 fn encodeVision(sch: *Scheduler, req: *requests.VisionEncodeRequest, out: *mlx.mlx_array) ?[]const u8 {
     out.* = scheduler.encodeVision(sch, req) catch |e| return @errorName(e);
+    return null;
+}
+
+fn exportCache(sch: *Scheduler, req: *requests.CacheExportRequest) ?[]const u8 {
+    peer_transfer.exportCache(sch, req) catch |e| return @errorName(e);
+    return null;
+}
+
+fn importCache(sch: *Scheduler, req: *requests.CacheImportRequest) ?[]const u8 {
+    peer_transfer.importCache(sch, req) catch |e| return @errorName(e);
     return null;
 }
 

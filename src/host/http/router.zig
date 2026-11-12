@@ -46,6 +46,7 @@ const handleTokenize = @import("../api/tokenize.zig").handleTokenize;
 const handleDetokenize = @import("../api/tokenize.zig").handleDetokenize;
 const handleChatCompletions = @import("../api/chat_completions.zig").handleChatCompletions;
 const handleCompletions = @import("../api/completions.zig").handleCompletions;
+const handleCacheImport = @import("../api/cache_transfer.zig").handleCacheImport;
 const sendResponse = @import("respond.zig").sendResponse;
 const sendResponseQuiet = @import("respond.zig").sendResponseQuiet;
 const logHttpRequest = @import("respond.zig").logHttpRequest;
@@ -54,6 +55,7 @@ const logSafeBody = @import("respond.zig").logSafeBody;
 const findHeaderValue = @import("request.zig").findHeaderValue;
 const apiKeyGateApplies = @import("auth.zig").apiKeyGateApplies;
 const peerIsLoopback = @import("auth.zig").peerIsLoopback;
+const peerIsCacheTrusted = @import("auth.zig").peerIsCacheTrusted;
 const lanGateApplies = @import("../lan/http.zig").lanGateApplies;
 const isTunneledRequest = @import("../lan/http.zig").isTunneledRequest;
 const lanShareDenial = @import("../lan/http.zig").lanShareDenial;
@@ -112,6 +114,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/audio/sound-generations",
     "/v1/audio/speech",
     "/v1/audio/transcriptions",
+    "/v1/cache/import",
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/decisions",
@@ -153,6 +156,7 @@ pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
 
 /// A coding agent keeps its screenshots in the history, as base64: chat takes what media takes.
 pub const max_request_bytes: usize = max_media_request_bytes;
+pub const max_cache_export_bytes: usize = max_request_bytes - 16 * 1024;
 
 /// A decision prompt keeps at most `max_len` state tokens, so a larger body only
 /// buys tokenizer work on the inference thread.
@@ -213,11 +217,30 @@ pub fn handleConnection(
     // boundary lets us find (`parseModelFromRequest`).
     const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
     logHttpRequest(method, logSafePath(raw_path), logSafeBody(method, path, request_content_type, request_body));
-    if (multipart.boundaryFromContentType(request_content_type) == null and jsonNestingDepth(request_body) > MAX_JSON_DEPTH) {
+    if (!isRoute(path, "/v1/cache/import") and multipart.boundaryFromContentType(request_content_type) == null and jsonNestingDepth(request_body) > MAX_JSON_DEPTH) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request JSON nests deeper than 4096 levels", 400);
         return;
     }
     stream.noteRequestHeaders(request[0..header_end_pos]);
+    const cache_internal = stream.cache_export or isRoute(path, "/v1/cache/import");
+    if (cache_internal) {
+        if (!peerIsCacheTrusted(stream.stream.socket.address)) {
+            try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", "Cache transfer requires loopback or 10.254.0.0/16 peer", 403);
+            return;
+        }
+        if (http_server.g_api_key != null and !apiKeyAuthorized(request[0..header_end_pos], raw_path)) {
+            try sendUnauthorized(stream);
+            return;
+        }
+        if (stream.cache_export and !(std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/chat/completions"))) {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Cache export requires POST /v1/chat/completions", 404);
+            return;
+        }
+        if (isRoute(path, "/v1/cache/import") and !std.mem.eql(u8, method, "POST")) {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
+            return;
+        }
+    }
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
     //    requires the key (the OpenAI/Anthropic/Ollama APIs AND the index page
@@ -258,7 +281,7 @@ pub fn handleConnection(
     //    (lan.routeClass) on shared models only. With a key set, unauthorized
     //    non-loopback requests already died above and key-holders keep full
     //    access — so this gate only exists in keyless mode.
-    if (lanGateApplies(stream)) {
+    if (!cache_internal and lanGateApplies(stream)) {
         if (lanShareDenial(http_server.g_lan.?, registry, method, path, request_body, request_content_type, isTunneledRequest(request[0..header_end_pos]))) |denial| {
             log.debug("{s} {s} -> 403 (lan: {s})\n", .{ method, path, denial });
             try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", denial, 403);
@@ -442,7 +465,7 @@ pub fn handleConnection(
     var model_id_buf: [512]u8 = undefined;
     var query_model_buf: [512]u8 = undefined;
     // The proxies splice over the value as written, so they also get the raw slice.
-    const body_model = parseModelFromRequest(request_body, request_content_type);
+    const body_model = if (isRoute(path, "/v1/cache/import")) null else parseModelFromRequest(request_body, request_content_type);
     var requested_model_id = lan_mod.unescapeJsonSlashes(
         &model_id_buf,
         body_model orelse queryModel(&query_model_buf, raw_path) orelse "",
@@ -474,7 +497,7 @@ pub fn handleConnection(
     }
     // Counted from here to the response's end: a burst's requests decide their spec mode before any reaches the
     // engine, so the engine's own count misses them (`request_options.requestHasCompany`).
-    const text_gen = isTextGenRoute(method, path);
+    const text_gen = isTextGenRoute(method, path) and !stream.cache_export;
     if (text_gen) _ = request_options.text_gen_live.fetchAdd(1, .monotonic);
     defer if (text_gen) {
         _ = request_options.text_gen_live.fetchSub(1, .monotonic);
@@ -598,6 +621,12 @@ pub fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleChatCompletions(allocator, stream, body, lm);
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/cache/import")) {
+        if (text_gen_reject) |reason| {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+            return;
+        }
+        try handleCacheImport(allocator, stream, request_body, lm);
     } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/completions")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
@@ -734,8 +763,8 @@ fn isStatusRoute(method: []const u8, path: []const u8) bool {
 fn isTextGenRoute(method: []const u8, path: []const u8) bool {
     if (std.mem.eql(u8, method, "POST")) {
         const routes = [_][]const u8{
-            "/v1/chat/completions", "/v1/completions", "/v1/messages",
-            "/v1/responses",        "/api/chat",       "/api/generate",
+            "/v1/chat/completions",     "/v1/completions", "/v1/messages",
+            "/v1/responses",            "/api/chat",       "/api/generate",
             "/v1/audio/transcriptions",
         };
         for (routes) |r| if (std.mem.eql(u8, path, r)) return true;
@@ -815,7 +844,7 @@ test "the index page documents every endpoint the server serves (drift guard)" {
     for (ROUTE_PATHS) |p| {
         // "/" is the page itself — trivially present and not worth documenting
         // as an endpoint row.
-        if (std.mem.eql(u8, p, "/")) continue;
+        if (std.mem.eql(u8, p, "/") or std.mem.eql(u8, p, "/v1/cache/import")) continue;
         if (std.mem.indexOf(u8, page, p) == null) {
             std.debug.print("endpoint missing from the index page: {s}\n", .{p});
             return error.EndpointNotDocumented;
@@ -826,7 +855,7 @@ test "the index page documents every endpoint the server serves (drift guard)" {
 test "the mlx-serve agent skill documents every /v1 endpoint it does not deliberately leave out" {
     // The skill is what an agent reads before writing client code; an endpoint
     // missing there does not exist for it.
-    const left_out = [_][]const u8{ "/v1/completions", "/v1/models/rescan", "/v1/providers", "/v1/providers/reload", "/v1/responses/compact" };
+    const left_out = [_][]const u8{ "/v1/cache/import", "/v1/completions", "/v1/models/rescan", "/v1/providers", "/v1/providers/reload", "/v1/responses/compact" };
     const skills = @import("agent_skills");
     outer: for (ROUTE_PATHS) |p| {
         if (!std.mem.startsWith(u8, p, "/v1/")) continue;
@@ -923,4 +952,10 @@ test "a <id>@<provider> or <id>@<peer> body that asks for ablation is refused be
     const got = buf[0..@intCast(n)];
     try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400"));
     try std.testing.expect(std.mem.indexOf(u8, got, "not forwarded to a provider") != null);
+}
+
+test "dsv41 peer fetch: max_cache_export_bytes leaves 16 KiB head room in max_request_bytes" {
+    try std.testing.expectEqual(max_request_bytes - 16 * 1024, max_cache_export_bytes);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024 - 16 * 1024), max_cache_export_bytes);
+    try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor("/v1/cache/import"));
 }

@@ -666,7 +666,8 @@ const Plan = struct {
 
 /// One copy of a model: its `config.json` and the path and size of every weight file under
 /// it, so two folders of one name in another quantization or revision never pair.
-fn modelIdentity(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !u64 {
+pub fn modelIdentity(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !u64 {
+    if (model_dir.len == 0) return error.BadModelDir;
     var dir = try std.Io.Dir.cwd().openDir(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
     const cfg = try dir.readFileAlloc(io, "config.json", allocator, .limited(16 * 1024 * 1024));
@@ -959,7 +960,7 @@ pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
     const g = cluster().group orelse return allocator.dupe(u8, "");
     var mb: [64]u8 = undefined;
     return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":false,\"worker_ready\":false,\"worker_model\":\"{s}\",\"worker_gone\":{},\"size\":{d},\"missing_ranks\":\"{s}\",\"lost_rank\":{d}}}", .{
-        @tagName(g.mode),                                   std.json.fmt(std.fs.path.basename(g.model), .{}), cluster().joined.load(.acquire), workerCopyName(), worker_gone.load(.acquire), g.size,
+        @tagName(g.mode),                                               std.json.fmt(std.fs.path.basename(g.model), .{}), cluster().joined.load(.acquire), workerCopyName(), worker_gone.load(.acquire), g.size,
         missingRanks(cluster().bells_seen.load(.acquire), g.size, &mb), cluster().lost_rank.load(.acquire),
     });
 }
@@ -992,9 +993,9 @@ fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
     }
     const w = p.worker();
     return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}],\"worker_model\":\"{s}\",\"worker_gone\":{},\"size\":{d},\"lost_rank\":{d},\"workers\":[{s}]}}", .{
-        @tagName(p.mode),                       std.json.fmt(std.fs.path.basename(p.model), .{}),                     cluster().joined.load(.acquire),  p.planned,               p.ready,              sp.total,                  sp.start,                          sp.end,
-        if (p.mode == .pipeline) sp.end else 0, sp.total,                                                             if (p.shard) |sh| sh.size else 0, w.hello.avail_mib,       w.hello.total_mib,    p.exchanges,               std.json.fmt(p.workerName(), .{}), speed,
-        p.link_bytes_per_us / 1000,             std.json.fmt(cluster().last_job_buf[0..cluster().last_job_len], .{}), cluster().last_split[0],          cluster().last_split[1], workerCopyName(),     worker_gone.load(.acquire), p.link.size,                       cluster().lost_rank.load(.acquire),
+        @tagName(p.mode),                       std.json.fmt(std.fs.path.basename(p.model), .{}),                     cluster().joined.load(.acquire),  p.planned,               p.ready,           sp.total,                   sp.start,                          sp.end,
+        if (p.mode == .pipeline) sp.end else 0, sp.total,                                                             if (p.shard) |sh| sh.size else 0, w.hello.avail_mib,       w.hello.total_mib, p.exchanges,                std.json.fmt(p.workerName(), .{}), speed,
+        p.link_bytes_per_us / 1000,             std.json.fmt(cluster().last_job_buf[0..cluster().last_job_len], .{}), cluster().last_split[0],          cluster().last_split[1], workerCopyName(),  worker_gone.load(.acquire), p.link.size,                       cluster().lost_rank.load(.acquire),
         workers.written(),
     });
 }
@@ -1523,14 +1524,14 @@ fn dsv41TpLoad(id: u64, ids: []const u32, tensors: []const mlx.mlx_array) anyerr
         try sendNow(&self.link, a, dst);
         for (tensors) |t| try sendNow(&self.link, t, dst);
     }
-    if (self.link.size > 2) log.info("[dist] snapshot {d}: {d} MiB to {d} workers in {d} ms\n", .{ id, bytes >> 20, self.link.size - 1, @divTrunc(io_util.nowUsMonotonic(cluster().group.?.io) - t0, 1000) });
+    if (self.link.size >= 2) log.info("[dist] snapshot {d}: {d} MiB to {d} workers in {d} ms\n", .{ id, bytes >> 20, self.link.size - 1, @divTrunc(io_util.nowUsMonotonic(cluster().group.?.io) - t0, 1000) });
 }
 
 /// Host: what it did with a snapshot (`dsv41.SnapOp`); the worker does the same with its copy.
 fn dsv41TpSnap(op: dsv41_mod.SnapOp, a: u64, b: u64) void {
     const self = peer() orelse return;
     if (!self.ready) return;
-    sendAll(&self.link, .{ OP_DSV41_TP_SNAP, @intFromEnum(op), @intCast(a & 0x7fffffff), @intCast(a >> 31), @intCast(b & 0x7fffffff), @intCast(b >> 31), 0, 0 });
+    sendAll(&self.link, .{ OP_DSV41_TP_SNAP, @backingInt(op), @intCast(a & 0x7fffffff), @intCast(a >> 31), @intCast(b & 0x7fffffff), @intCast(b >> 31), 0, 0 });
 }
 
 /// A tensor step's header: its rows, position, flags, the state it advances and, for one row, the id itself.

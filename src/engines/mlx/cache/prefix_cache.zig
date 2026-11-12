@@ -209,7 +209,7 @@ pub const ModuleMatch = struct {
 /// `quiet`: the only records owed are module tips still inside their quiet period.
 pub const FlushResult = enum { progress, busy, quiet, done };
 
-const ModulePayload = struct {
+pub const ModulePayload = struct {
     binding: ModuleBinding,
     snapshot: plugin_abi.Handle,
     n: usize,
@@ -221,13 +221,13 @@ const ModulePayload = struct {
 const ModuleRequest = struct { binding: ModuleBinding, media_rows: ?Array };
 
 /// Bounded caller storage; only the selected part transfers references into the tier.
-const ModuleExport = struct {
+pub const ModuleExport = struct {
     tensors: [1024]plugin_abi.AuxTensor = undefined,
     names: [kv_disk_cache.module_record.MAX_ENVELOPE_BYTES]u8 = undefined,
     header: [kv_disk_cache.module_record.MAX_HEADER_BYTES]u8 = undefined,
     out: plugin_abi.AuxExport = .{},
 
-    fn create(a: std.mem.Allocator, m: ModulePayload) !*ModuleExport {
+    pub fn create(a: std.mem.Allocator, m: ModulePayload) !*ModuleExport {
         const self = try a.create(ModuleExport);
         self.* = .{};
         self.out = .{
@@ -246,14 +246,14 @@ const ModuleExport = struct {
         return self;
     }
 
-    fn destroy(self: *ModuleExport, a: std.mem.Allocator) void {
+    pub fn destroy(self: *ModuleExport, a: std.mem.Allocator) void {
         for (self.tensors[0..@min(self.out.tensor_len, self.tensors.len)]) |t| {
             if (t.array.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = t.array.ctx });
         }
         a.destroy(self);
     }
 
-    fn inventory(self: *const ModuleExport, a: std.mem.Allocator) ![]kv_disk_cache.module_record.Tensor {
+    pub fn inventory(self: *const ModuleExport, a: std.mem.Allocator) ![]kv_disk_cache.module_record.Tensor {
         const tensors = try a.alloc(kv_disk_cache.module_record.Tensor, self.out.tensor_len);
         for (self.tensors[0..self.out.tensor_len], tensors) |t, *item| {
             if (t.size != @sizeOf(plugin_abi.AuxTensor) or t.array.ctx == null) return error.BadModuleExport;
@@ -1379,6 +1379,50 @@ pub const HotPrefixCache = struct {
             return .{ .source = .disk, .disk_id = candidate.id, .n = candidate.n, .prefix_key = candidate.prefix_key };
         }
         return best;
+    }
+
+    pub const RamModuleHit = struct {
+        payload: ModulePayload,
+        tokens: []const u32,
+        quant_config: kv_quant.KVQuantConfig,
+        cache_key: u64,
+    };
+
+    pub fn findRamModule(
+        self: *const HotPrefixCache,
+        binding: ModuleBinding,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        quant_config: kv_quant.KVQuantConfig,
+    ) ?RamModuleHit {
+        const m = self.findBestRestorableMatchWithModule(prompt_ids, has_tools, &.{}, quant_config, false, null, .{ .binding = binding, .media_rows = null }) orelse return null;
+        const e = &self.entries.items[m.idx];
+        if (e.media.len != 0) return null;
+        return .{
+            .payload = e.module orelse return null,
+            .tokens = e.tokens,
+            .quant_config = e.quant_config,
+            .cache_key = e.cache_key,
+        };
+    }
+
+    pub fn hasModuleCovering(
+        self: *const HotPrefixCache,
+        binding: ModuleBinding,
+        ids: []const u32,
+        has_tools: bool,
+        quant_config: kv_quant.KVQuantConfig,
+    ) bool {
+        for (self.entries.items) |*e| {
+            if (e.checked_out_by != null) continue;
+            const m = e.module orelse continue;
+            if (!ModuleBinding.same(m.binding, binding) or e.has_tools != has_tools) continue;
+            if (!std.meta.eql(e.quant_config, quant_config) or e.tokens.len < ids.len) continue;
+            if (mediaSharedBound(e.media, &.{}) < ids.len) continue;
+            if (ids.len > 0 and e.tokens[ids.len - 1] != ids[ids.len - 1]) continue;
+            if (std.mem.eql(u32, e.tokens[0..ids.len], ids)) return true;
+        }
+        return false;
     }
 
     /// Re-find by ID after admission. The entry stays: the slot's state shares its buffers until its
@@ -11592,7 +11636,6 @@ test "HotPrefixCache module: loaded instance gate keeps pipeline and streamed pa
     try testing.expect(HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
     cfg.dist_shard = null;
 }
-
 
 test "HotPrefixCache module: incoming workload pays for eviction before an older conversation" {
     var fake: ModuleFake = .{};

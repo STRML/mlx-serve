@@ -245,11 +245,9 @@ pub fn getTimeoutNs() u64 {
 /// serve mode (set by `serve()`); null only before `serve()` runs. Every
 /// inference request handler routes through this; the scheduler's
 /// inference thread is the single mlx-call site.
-
 /// The boot's parsed `--kv-quant`, published by `serve()` before `Scheduler.init` so a
 /// load-time bill sees it (the scheduler does not exist yet during the load; asking it billed
 /// the SSD-first session at bf16, ~8.6 GB of idle allowance lost at 786k).
-
 /// The process-wide kv-quant config at any point: the scheduler's once it exists, the boot's
 /// published value during the load, dense when no flag was given.
 fn configuredKvQuant() kv_quant_mod.KVQuantConfig {
@@ -289,7 +287,6 @@ pub var global_registry: ?*ModelRegistry = null;
 // evicting LRU entries by size. 0 disables.
 
 /// `--no-prefix-cache-ram` keeps the disk tier eligible without idle RAM retention.
-
 pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Wave 1.B — hot prefix cache memory budget. The cache evicts LRU entries on
@@ -299,9 +296,7 @@ pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 /// `--prefix-cache-mem <N>{GB,MB}`. 0 disables the byte budget (count cap
 /// from `--prefix-cache-entries` still applies). On qwen4_exp's RAM-first arm an
 /// unset budget grows to one session at the working context (`defaultPrefixCacheAsk`).
-
 /// Set by `--prefix-cache-mem`: an operator's number is used as given, even when it equals the default.
-
 /// SSD tier for the hot prefix cache (`--prefix-cache-disk`). Committed KV
 /// prefixes persist as chunked safetensors under
 /// `~/.mlx-serve/kv-cache/<model-fingerprint>` and are restored across RAM
@@ -312,7 +307,6 @@ pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 /// DEFAULT OFF (`0`): the tier can hold gigabytes of KV on disk, so it's opt-in
 /// — pass `--prefix-cache-disk <n>{KB,MB,GB}` to enable (10 GB is a sensible
 /// value). The Swift app exposes this as a Settings toggle, default off.
-
 /// `--shutdown-persist-secs`: on SIGTERM, finish the SSD slices the idle flush has not landed,
 /// for at most this long after the signal. 0 turns it off.
 pub var shutdown_persist_secs: u32 = 45;
@@ -339,11 +333,9 @@ pub var shutdown_persist_secs: u32 = 45;
 /// The always-on end-of-prompt snapshot preserves append-growth multi-turn
 /// reuse for MoE regardless. Raise this (e.g. 512/1024) to also coarsen the
 /// non-MoE path; set 0 to disable (hybrid models then bypass the hot cache).
-
 /// Phase 1: cap on the number of checkpoints retained per request. Snapshots
 /// past this drop the oldest (front of list) to keep memory bounded on very
 /// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
-
 /// Iteration 2 (perf-plan Phase 4 #3): LRU capacity of the per-LoadedModel
 /// chat-template tokenize cache. 0 disables (every request re-renders +
 /// re-tokenizes, restoring pre-Iteration-2 behavior). Default 4 is small
@@ -895,6 +887,7 @@ test {
     _ = @import("../api/anthropic_stream.zig");
     _ = @import("../api/audio.zig");
     _ = @import("../api/chat_completions.zig");
+    _ = @import("../api/cache_transfer.zig");
     _ = @import("../api/chat_stream.zig");
     _ = @import("../api/completions.zig");
     _ = @import("../api/embeddings.zig");

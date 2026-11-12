@@ -356,3 +356,76 @@ pub const EmbedRequest = struct {
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
 };
+
+pub const CacheExportOutcome = union(enum) {
+    not_found,
+    too_large: u64,
+    ok: struct {
+        bytes: []u8,
+        n: usize,
+        export_ms: u64,
+    },
+};
+
+pub const CacheExportRequest = struct {
+    model: *LoadedModel,
+    prompt_ids: []const u32,
+    has_tools: bool,
+    kv_quant_override: ?kv_quant.KVQuantConfig = null,
+    variant: u64 = 0,
+    cache_key: u64 = 0,
+    max_bytes: usize,
+    outcome: CacheExportOutcome = .not_found,
+    error_name: ?[]const u8 = null,
+    done: bool = false,
+    allocator: std.mem.Allocator,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
+
+pub const CacheImportRefusal = enum {
+    bad_envelope,
+    unknown_version,
+    truncated_body,
+    bad_dtype,
+    bad_shape,
+    bad_offsets,
+    bad_checksum,
+    bad_quant_config,
+    unsupported_model,
+    layout_key,
+    pack_identity,
+    settings,
+    quant_config,
+    stale,
+    no_memory,
+    import_plan,
+    import_arrays,
+    describe_mismatch,
+    commit_declined,
+};
+
+pub const CacheImportStats = struct {
+    n: usize,
+    bytes: usize,
+    decode_ms: u64,
+    admit_ms: u64,
+    import_ms: u64,
+    commit_ms: u64,
+};
+
+pub const CacheImportOutcome = union(enum) {
+    ok: CacheImportStats,
+    refused: CacheImportRefusal,
+};
+
+pub const CacheImportRequest = struct {
+    model: *LoadedModel,
+    body: []const u8,
+    outcome: CacheImportOutcome = .{ .refused = .bad_envelope },
+    error_name: ?[]const u8 = null,
+    done: bool = false,
+    allocator: std.mem.Allocator,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
