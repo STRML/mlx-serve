@@ -1,7 +1,7 @@
 //! DeepSeek-V4.1 DSpark rounds for several slots of one model at once: each slot drafts (its context's continuation,
 //! or the stages, every slot's block in one pass), the group's verify rows are priced together
-//! (`dflash_policy.chooseGroupRows`), one batched verify runs them, and each slot accepts under its own sampling and
-//! keeps its accepted prefix. A slot alone ticks its solo round (`nextDspark`).
+//! (`dflash_policy.planGroup`), batched verifies of as many slots as pays run them, and each slot accepts under its own
+//! sampling and keeps its accepted prefix. A slot alone ticks its solo round (`nextDspark`).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -133,7 +133,7 @@ fn enter(gen: *Generator, allocator: std.mem.Allocator) !Entry {
 const Kind = enum { plain, copy, stage };
 
 /// One DSpark round for each of `gens` (slots of one DeepSeek-V4.1 model, each at the spec invariant): its drafts, the
-/// verify rows the group's pricing buys, one batched verify, its accept under its own sampling, its kept prefix.
+/// verify rows the group's pricing buys, its batched verify, its accept under its own sampling, its kept prefix.
 /// `out[k]` is `gens[k]`'s committed block, its tokens owned through `allocs[k]`.
 pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Allocator, out: []DrafterStepResult) !void {
     const n = gens.len;
@@ -209,22 +209,38 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         p[k] = probs[k][0..avail];
     }
     const cost = &xfm.dspark_group_cost;
-    const costs = cost.costs(n);
     var rows_k: [MAX_SLOTS]u32 = undefined;
-    _ = dflash_policy.chooseGroupRows(p[0..n], &costs, rows_k[0..n]);
+    const width = dflash_policy.planGroup(p[0..n], cost, rows_k[0..n]);
     var chunks: [MAX_SLOTS][]const u32 = undefined;
-    var rows: usize = 0;
     for (drafts[0..n], rows_k[0..n], chunks[0..n]) |*d, b, *ch| {
         d.len = b;
         ch.* = d.ids[0 .. b + 1];
-        rows += b + 1;
     }
 
-    // One verify: a round that verifies no draft is the group's plain step, with nothing to roll back.
+    // The verifies, `width` slots each, their logits slot after slot: one that verifies no draft is its slots' plain
+    // step, with nothing to roll back.
     const verify_watch = io_util.Stopwatch.init(gens[0].timer.io);
-    const drafted = rows > n;
-    const logits = try dsv41_mod.extendBatched(mdl, gpa, states[0..n], ids[0..n], chunks[0..n], drafted);
-    defer _ = mlx.mlx_array_free(logits);
+    var verify_rows: [MAX_SLOTS]usize = undefined;
+    var drafted: [MAX_SLOTS]bool = undefined;
+    var parts: [MAX_SLOTS]mlx.mlx_array = undefined;
+    var n_parts: usize = 0;
+    defer for (parts[0..n_parts]) |part| {
+        _ = mlx.mlx_array_free(part);
+    };
+    var lo: usize = 0;
+    while (lo < n) : (lo += width) {
+        const hi = @min(n, lo + width);
+        const rows = chunkRows(chunks[lo..hi]);
+        const any = rows > hi - lo;
+        @memset(verify_rows[lo..hi], rows);
+        @memset(drafted[lo..hi], any);
+        parts[n_parts] = try dsv41_mod.extendBatched(mdl, gpa, states[lo..hi], ids[lo..hi], chunks[lo..hi], any);
+        n_parts += 1;
+    }
+    const logits = if (n_parts == 1) parts[0] else try concatRows(parts[0..n_parts], mdl.s);
+    defer if (n_parts > 1) {
+        _ = mlx.mlx_array_free(logits);
+    };
     // Each slot's accept on its own rows. A slot's `t1` alone draws its next token with the others' in one batch, as the
     // plain batched tick does.
     var greedy = false;
@@ -274,14 +290,14 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
             gens[k].sampling.draw = sp.draw;
         }
     }
-    cost.sample(n, rows, msOf(verify_watch.read()));
+    sampleVerifies(cost, chunks[0..n], width, msOf(verify_watch.read()));
 
     // Each slot keeps its prefix, and teaches its drafting backoff what drafting cost the round (its share of the draft,
     // its rows) against what its accepted drafts saved (the group's plain step a token).
     var done: usize = 0;
     errdefer for (out[0..done], allocs[0..done]) |r, a| a.free(r.tokens);
     for (gens, states[0..n], drafts[0..n], kinds[0..n], 0..) |gen, st, d, kind, k| {
-        if (drafted) try dsv41_mod.finishVerify(mdl, gpa, st, accepted[k] + 1);
+        if (drafted[k]) try dsv41_mod.finishVerify(mdl, gpa, st, accepted[k] + 1);
         const tokens = try allocs[k].dupe(u32, d.ids[0 .. accepted[k] + 1]);
         out[k] = (try gen.commitDsparkRound(allocs[k], .{ .tokens = tokens, .accepted = accepted[k], .next_token = next[k] }, st.n)).?;
         done += 1;
@@ -304,10 +320,42 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         gen.dspark_group_rounds += 1;
     }
     const token_ms = cost.ms(n, n) / @as(f32, @floatFromInt(n));
-    for (gens, kinds[0..n], accepted[0..n], rows_k[0..n]) |gen, kind, a, b| if (kind == .stage) if (gen.dspark_pol) |*pol| {
+    for (gens, kinds[0..n], accepted[0..n], rows_k[0..n], verify_rows[0..n]) |gen, kind, a, b, rows| if (kind == .stage) if (gen.dspark_pol) |*pol| {
         const spent = draft_ms / @as(f32, @floatFromInt(n_stage)) + @as(f32, @floatFromInt(b)) * cost.rowMs();
         pol.drafting.recordGroup(@as(f32, @floatFromInt(a)) * token_ms, spent, b, rows);
     };
+}
+
+fn chunkRows(chunks: []const []const u32) usize {
+    var rows: usize = 0;
+    for (chunks) |ch| rows += ch.len;
+    return rows;
+}
+
+/// `parts`' rows one after another (caller frees).
+fn concatRows(parts: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    const v = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_concatenate_axis(&o, v, 0, s));
+    return o;
+}
+
+/// The round's verifies, `width` slots each, took `took` ms in all: each is sampled at its share of the fit's price.
+fn sampleVerifies(cost: *dflash_policy.GroupCost, chunks: []const []const u32, width: usize, took: f32) void {
+    const priced = cost.*;
+    var total: f32 = 0;
+    var lo: usize = 0;
+    while (lo < chunks.len) : (lo += width) {
+        const part = chunks[lo..@min(chunks.len, lo + width)];
+        total += priced.ms(part.len, chunkRows(part));
+    }
+    lo = 0;
+    while (lo < chunks.len) : (lo += width) {
+        const part = chunks[lo..@min(chunks.len, lo + width)];
+        cost.sample(part.len, chunkRows(part), took * priced.ms(part.len, chunkRows(part)) / total);
+    }
 }
 
 /// Rows [lo, lo + n) of `logits` `[R, V]` (caller frees).

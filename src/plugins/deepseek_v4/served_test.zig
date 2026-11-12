@@ -1079,8 +1079,12 @@ test "deepseek_v41 served: a batched verify gives each state its solo verify's r
     }
 }
 
-/// Greedy DSpark group rounds for `prompts`, one slot each on one model, until each slot has `out[k].len` tokens.
-fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, out: [][24]u32) !void {
+const GroupCost = @import("../../engines/mlx/spec/dflash/policy.zig").GroupCost;
+const planGroup = @import("../../engines/mlx/spec/dflash/policy.zig").planGroup;
+
+/// Greedy DSpark group rounds for `prompts`, one slot each on one model whose verifies start priced at `cost`, until
+/// each slot has `out[k].len` tokens. Returns the cost the rounds left.
+fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, cost: GroupCost, out: [][24]u32) !GroupCost {
     const dspark_group = @import("../../engines/mlx/spec/dspark_group.zig");
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1088,6 +1092,7 @@ fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, ou
     const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
     defer p.close();
     try testing.expect(dspark_group.groupable(&p.xfm));
+    p.xfm.dspark_group_cost = cost;
     var slots: [2]Slot = undefined;
     var gens: [2]Generator = undefined;
     var made: usize = 0;
@@ -1126,6 +1131,7 @@ fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, ou
         drafted += gen.dspark_group_rounds - gen.dspark_stats.rows[1];
     }
     try testing.expect(drafted > 0);
+    return p.xfm.dspark_group_cost;
 }
 
 test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tokens whichever slot shares them" {
@@ -1143,9 +1149,39 @@ test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tok
     // partner changes which drafts are verified, never the greedy tokens.
     var x: [2][24]u32 = undefined;
     var y: [2][24]u32 = undefined;
-    try groupRounds(files, &.{ &a_ids, &b_ids }, &x);
-    try groupRounds(files, &.{ &c_ids, &a_ids }, &y);
+    _ = try groupRounds(files, &.{ &a_ids, &b_ids }, .{}, &x);
+    _ = try groupRounds(files, &.{ &c_ids, &a_ids }, .{}, &y);
     try testing.expectEqualSlices(u32, &x[0], &y[1]);
+}
+
+test "deepseek_v41 served: greedy DSpark group rounds emit the same tokens split into a verify a slot" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
+    defer ds.restore();
+    const a_ids = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 30, 31 };
+    const b_ids = [_]u32{ 5, 8, 13, 21, 34, 55, 89, 4, 6, 10, 12, 14, 16, 18 };
+    // A machine whose two-slot verify costs far more than two verifies of one slot: every round splits.
+    const prior: GroupCost = .{};
+    var apart: GroupCost = .{};
+    for (0..200) |i| {
+        apart.sample(1, 1 + i % 8, prior.ms(1, 1 + i % 8));
+        apart.sample(2, 2 + i % 8, prior.ms(2, 2 + i % 8) + 60);
+    }
+    var one: [2][24]u32 = undefined;
+    var split: [2][24]u32 = undefined;
+    _ = try groupRounds(files, &.{ &a_ids, &b_ids }, prior, &one);
+    const after = try groupRounds(files, &.{ &a_ids, &b_ids }, apart, &split);
+    // ENGAGEMENT: the split is planned at the cost the rounds started from and at the one they left.
+    const p: [7]f32 = @splat(0.9);
+    var drafts: [2]u32 = undefined;
+    try testing.expectEqual(@as(usize, 1), planGroup(&.{ &p, &p }, &apart, &drafts));
+    try testing.expectEqual(@as(usize, 1), planGroup(&.{ &p, &p }, &after, &drafts));
+    try testing.expectEqualSlices(u32, &one[0], &split[0]);
+    try testing.expectEqualSlices(u32, &one[1], &split[1]);
 }
 
 test "deepseek_v4 served: mlx-community's withdrawn preview pack is refused by the legacy parse and, at load, by name" {
