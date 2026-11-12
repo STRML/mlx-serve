@@ -191,7 +191,7 @@ pub fn initWithOptions(
     // start at ssm_checkpoint_pos_offset, so the final KV length is that
     // offset plus everything we're about to forward.
     const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-    const PREFILL_CHUNK: usize = decodeShareCapped(effectivePrefillChunk(
+    const PREFILL_CHUNK: usize = decodeShareCapped(xfm.config.cappedPrefillChunk(effectivePrefillChunk(
         xfm.config.prefillScoreHeadDim(),
         xfm.config.num_attention_heads,
         total_ctx_for_chunk,
@@ -199,7 +199,7 @@ pub fn initWithOptions(
         xfm.config.isMoe(),
         xfm.config.longCtxGated(),
         options.pinned_prefill_chunk,
-    ), options.decode_share_width_cap);
+    )), options.decode_share_width_cap);
     // Phase-level prefill instrumentation. Enabled at debug level OR via
     // diag prefill-trace (which forces the trace line at info).
     // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
@@ -353,7 +353,7 @@ pub fn initWithOptions(
         // The scaled tail-merge bound reads the arch predicate, never `chunk_width_hook != null`
         // (installed process-wide).
         const width_is_adaptive = options.adaptive_chunk_width;
-        const cap_adapt: u32 = @intCast(effectivePrefillChunk(
+        const cap_adapt: u32 = @intCast(xfm.config.cappedPrefillChunk(effectivePrefillChunk(
             xfm.config.prefillScoreHeadDim(),
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,
@@ -361,7 +361,7 @@ pub fn initWithOptions(
             xfm.config.isMoe(),
             xfm.config.longCtxGated(),
             0,
-        ));
+        )));
         adapt_state.width_min = @intCast(PREFILL_CHUNK);
         adapt_state.width_max = @intCast(PREFILL_CHUNK);
         var cur_chunk: usize = PREFILL_CHUNK;

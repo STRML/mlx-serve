@@ -1007,6 +1007,12 @@ pub const ModelConfig = struct {
         return if (self.isDsv41()) 8192 else 0;
     }
 
+    /// `width` no wider than `prefillChunkMax`, an explicit `--prefill-chunk` included.
+    pub fn cappedPrefillChunk(self: *const ModelConfig, width: usize) usize {
+        const max = self.prefillChunkMax();
+        return if (max == 0) width else @min(width, max);
+    }
+
     /// Rows a sliding layer keeps past its window on an arch that caches only the window
     /// (`slidingRing`): spec rollback plus the prefix-cache matches that land near an entry's end.
     pub const SLIDING_RING_SLACK: u32 = 2048;
@@ -10256,4 +10262,12 @@ test "applyLayerSpan: the PLE stays at its absolute layer and is local only to t
     try head.applyLayerSpan(.{ .start = 0, .end = 32, .total = 48 });
     try std.testing.expectEqual(@as(u32, 1), head.pleLocalLayer().?);
     try std.testing.expectError(error.DistSplitOffInterval, c.applyLayerSpan(.{ .start = 30, .end = 48, .total = 48 }));
+}
+
+test "cappedPrefillChunk: an explicit width past DeepSeek-V4.1's widest runs at 8192, other models' as asked" {
+    const v41: ModelConfig = .{ .model_type = "deepseek_v41" };
+    const other: ModelConfig = .{ .model_type = "qwen3_5_moe" };
+    try std.testing.expectEqual(@as(usize, 8192), v41.cappedPrefillChunk(16384));
+    try std.testing.expectEqual(@as(usize, 4096), v41.cappedPrefillChunk(4096));
+    try std.testing.expectEqual(@as(usize, 16384), other.cappedPrefillChunk(16384));
 }
