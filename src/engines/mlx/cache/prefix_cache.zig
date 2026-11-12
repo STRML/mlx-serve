@@ -3871,7 +3871,7 @@ pub const HotPrefixCache = struct {
     /// write in flight), the oldest entry of the same list whose record has committed, which a later turn can restore.
     fn shrinkVictim(self: *const HotPrefixCache) ?usize {
         const lru = self.lruIndexExcluding(null, null) orelse return null;
-        if (!self.feedMode()) return lru;
+        if (self.pressure_shift == 0) return lru;
         const state = self.recordState(&self.entries.items[lru]);
         const in_flight = state == .registered or state == .exporting or state == .submitted;
         if (!self.feedable(lru) and !in_flight) return lru;
@@ -4249,7 +4249,8 @@ pub const HotPrefixCache = struct {
     /// brought the admission in.
     fn arcPrefersT1(self: *const HotPrefixCache) bool {
         const t1 = self.arcSizes().t1;
-        return t1 > self.arc_p or (t1 == self.arc_p and self.arc_b2_hit);
+        const p = self.arc_p >> self.pressure_shift;
+        return t1 > p or (t1 == p and self.arc_b2_hit);
     }
 
     /// Remember an entry leaving for capacity. Not a module rung: its conversation's tip is still resident.
@@ -4281,7 +4282,7 @@ pub const HotPrefixCache = struct {
         if (g.frequent) {
             self.arc_p -|= arcRatio(sizes.b1, sizes.b2) *| g.bytes;
         } else {
-            self.arc_p = @min(self.max_kv_bytes, self.arc_p +| arcRatio(sizes.b2, sizes.b1) *| g.bytes);
+            self.arc_p = @min(self.baseBudget(), self.arc_p +| arcRatio(sizes.b2, sizes.b1) *| g.bytes);
         }
     }
 
@@ -4311,7 +4312,7 @@ pub const HotPrefixCache = struct {
     /// B1 + T1 <= c and every list together <= 2c: the oldest B1 ghost goes first, then B2's. A list with nothing left
     /// to drop ends the trim.
     fn arcTrimGhosts(self: *HotPrefixCache) void {
-        const c = self.max_kv_bytes;
+        const c = self.baseBudget();
         self.arc_p = @min(self.arc_p, c);
         while (self.ghosts.n > 0) {
             const s = self.arcSizes();
