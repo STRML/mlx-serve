@@ -223,6 +223,7 @@ pub const Launch = struct {
     prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT,
     prefix_cache_mem_explicit: bool = false,
     prefix_cache_disk_bytes: u64 = 0,
+    prefix_cache_disk_write_max_bps: u64 = 0,
     ssm_checkpoint_stride: u32 = 256,
     ssm_checkpoint_max: u32 = 16,
 };

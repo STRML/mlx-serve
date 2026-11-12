@@ -264,6 +264,7 @@ pub fn init(
         .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = if (params.prefix_cache_clamp) &@import("admission/hot_cache_plan.zig").prefixCacheMemForLoad else null,
         .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
+        .prefix_cache_disk_write_max_bps = params.prefix_cache_disk_write_max_bps,
         .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
         .ssm_checkpoint_max = params.ssm_checkpoint_max,
         .mtp_enabled = params.mtp_enabled,
@@ -968,6 +969,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         .prefix_cache_ram_enabled = self.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
         .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
+        .prefix_cache_disk_write_max_bps = self.prefix_cache_disk_write_max_bps,
         .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
         .ssm_checkpoint_max = self.ssm_checkpoint_max,
         // Cold loads honor the launch-flag MTP + embedded-llama.cpp
