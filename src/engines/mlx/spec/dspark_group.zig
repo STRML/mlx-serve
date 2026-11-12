@@ -306,7 +306,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     const token_ms = cost.ms(n, n) / @as(f32, @floatFromInt(n));
     for (gens, kinds[0..n], accepted[0..n], rows_k[0..n]) |gen, kind, a, b| if (kind == .stage) if (gen.dspark_pol) |*pol| {
         const spent = draft_ms / @as(f32, @floatFromInt(n_stage)) + @as(f32, @floatFromInt(b)) * cost.rowMs();
-        pol.drafting.record(@as(f32, @floatFromInt(a)) * token_ms, spent);
+        pol.drafting.recordGroup(@as(f32, @floatFromInt(a)) * token_ms, spent, b, rows);
     };
 }
 

@@ -4,7 +4,7 @@
 # non-stream, spaced-DSML tool call + round trip, single-flight (a concurrent request queues, byte-equal to solo, no
 # leak), prefix resume (a repeat resumes one token short and keeps the bytes; a fresh prompt starts over),
 # the repack's experts streamed from its bank. DSV41_TEST_DSPARK=1: rounds engaged, a --no-mtp boot keeps the greedy bytes,
-# a sampled seeded request engages the lane and repeats byte-equal from cold, two requests at once run group rounds. [9] with a tower: house.jpeg on the
+# a sampled seeded request engages the lane and repeats byte-equal from cold, four requests at once run group rounds. [9] with a tower: house.jpeg on the
 # release's 35x53 grid as 230 span tokens, the street signs read, a /v1/messages image block, a warm repeat.
 #
 #   DSV41_TEST_MODEL=<pack> ./tests/test_dsv41.sh   # DSV41_TEST_PORT (11353), DSV41_TEST_FLAGS (e.g. --no-mtp)
@@ -253,20 +253,52 @@ if [ "${DSV41_TEST_DSPARK:-0}" = "1" ]; then
     else
         echo "FAIL: seeded sampled repeat differs"; echo "  1: $(echo "$S1" | head -c 200)"; echo "  2: $(echo "$S2" | head -c 200)"; fail=$((fail+1))
     fi
-    # [8b] Two requests at once keep drafting, as one DSpark group round, instead of decoding plain side by side.
-    GROUP='{"model":"mlx-serve","prompt":"<｜begin▁of▁sentence｜><｜User｜>Write a Python function that merges two sorted lists, with a docstring and three asserts.<｜Assistant｜></think>","max_tokens":160,"temperature":0}'
-    G_FILE=$(mktemp /tmp/dsv41_group.XXXXXX)
-    post /v1/completions "$GROUP" > "$G_FILE" &
-    G_PID=$!
-    G2=$(post /v1/completions "$GROUP" | text_of)
-    wait "$G_PID" || true
-    G1=$(text_of < "$G_FILE" 2>/dev/null || echo "")
-    rm -f "$G_FILE"
+    # [8b] Four requests at once keep drafting, as DSpark group rounds, instead of decoding plain side by side: each
+    # verifies a draft in at least half of its draft rounds, and its backoff skips at most a quarter of its tokens.
+    G_TOKENS=700
+    G_TASKS=(
+        "Write a Python function that merges two sorted lists, with a docstring and five asserts."
+        "Write a Python class for an LRU cache with get and put, with docstrings and five asserts."
+        "Write a Python function that parses an ISO 8601 timestamp without the datetime module, with five asserts."
+        "Write a Python function that finds the shortest path through a walled grid, with a docstring and five asserts."
+    )
+    G_HEAD='{"model":"mlx-serve","prompt":"<｜begin▁of▁sentence｜><｜User｜>'
+    G_TAIL='<｜Assistant｜></think>","max_tokens":'"$G_TOKENS"',"temperature":0.7,"seed":'
+    G_DIR=$(mktemp -d /tmp/dsv41_group.XXXXXX)
+    G_FROM=$(($(wc -l < "$LOG") + 1))
+    G_PIDS=()
+    for i in 0 1 2 3; do
+        post /v1/completions "$G_HEAD${G_TASKS[$i]}$G_TAIL$((i + 1))}" > "$G_DIR/$i" &
+        G_PIDS+=($!)
+    done
+    wait "${G_PIDS[@]}" || true
+    G_EMPTY=0
+    for i in 0 1 2 3; do
+        [ -n "$(text_of < "$G_DIR/$i" 2>/dev/null || true)" ] || G_EMPTY=$((G_EMPTY+1))
+    done
+    rm -rf "$G_DIR"
     check "dspark group rounds engaged" "$(grep -o 'group_rounds=[1-9][0-9]*' "$LOG" || true)" 'group_rounds='
-    if [ -n "$G1" ] && [ -n "$G2" ]; then
-        echo "PASS: both grouped requests answered"; pass=$((pass+1))
+    if [ "$G_EMPTY" -eq 0 ]; then
+        echo "PASS: all four grouped requests answered"; pass=$((pass+1))
     else
-        echo "FAIL: a grouped request came back empty"; fail=$((fail+1))
+        echo "FAIL: $G_EMPTY grouped requests came back empty"; fail=$((fail+1))
+    fi
+    if tail -n "+$G_FROM" "$LOG" | python3 -c '
+import re, sys
+tokens = int(sys.argv[1])
+slots = [l for l in sys.stdin if "dspark policy:" in l]
+ok = len(slots) == 4
+for l in slots:
+    skipped = int(re.search(r"skipped=(\d+)", l).group(1))
+    hist = dict(map(int, kv.split(":")) for kv in re.search(r"rows_hist=(\S*)", l).group(1).split(",") if kv)
+    rounds = sum(hist.values())
+    verified = rounds - hist.get(1, 0)
+    print("  slot: %d of %d draft rounds verified a draft, skipped=%d" % (verified, rounds, skipped))
+    ok = ok and rounds > 0 and 2 * verified >= rounds and 4 * skipped <= tokens
+sys.exit(0 if ok else 1)' "$G_TOKENS"; then
+        echo "PASS: four grouped streams keep verifying drafts"; pass=$((pass+1))
+    else
+        echo "FAIL: a grouped stream verified a draft in under half its draft rounds, or skipped over $((G_TOKENS / 4)) rounds"; fail=$((fail+1))
     fi
     refuse "grouped rounds no MLX error" "$(cat "$LOG")" '[mlx]'
     cleanup; SERVER_PID=""

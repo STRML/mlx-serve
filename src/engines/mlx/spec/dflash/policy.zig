@@ -207,6 +207,13 @@ pub const Drafting = struct {
             self.period = @min(self.period * 2, MAX_PERIOD);
         }
     }
+
+    /// A drafted round in a group whose verify of `verify_rows` rows took `bought` of the slot's drafts. A full
+    /// verify that left the slot no row says nothing about its drafts, so it teaches nothing.
+    pub fn recordGroup(self: *Drafting, gain: f32, wall: f32, bought: u32, verify_rows: usize) void {
+        if (bought == 0 and verify_rows >= MAX_GROUP_ROWS) return;
+        self.record(gain, wall);
+    }
 };
 
 /// Rows one DSpark group round verifies in all: the module batches its compiled stretches up to this many.
@@ -562,6 +569,20 @@ test "GroupCost: rows and states cost more, and a slower machine's rounds scale 
     cost.sample(2, 4, std.math.nan(f32));
     cost.sample(2, 4, 1e9);
     try testing.expect(cost.scale <= 2.5);
+}
+
+test "Drafting.recordGroup: a full verify that left the slot no row teaches nothing, rows to spare do" {
+    var starved = Drafting{};
+    var priced_out = Drafting{};
+    for (0..4) |_| {
+        starved.recordGroup(0, 5, 0, MAX_GROUP_ROWS);
+        priced_out.recordGroup(0, 5, 0, 6);
+    }
+    try testing.expect(starved.shouldDraft());
+    try testing.expect(!priced_out.shouldDraft());
+    // Its own rows in a full verify, all rejected: a loss.
+    starved.recordGroup(0, 9, 1, MAX_GROUP_ROWS);
+    try testing.expect(!starved.shouldDraft());
 }
 
 test "Calibration: a head prior reads the drafter's confidence as its acceptance until verifies say otherwise" {
