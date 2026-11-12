@@ -705,6 +705,16 @@ a successful import, restore, and prompt setup reports `n` cached tokens.
 Missing, truncated, or incompatible module files reject the entire record and
 prefill cold; KV's contiguous-chunk salvage remains separate.
 
+RAM eviction keeps two lists: T1 holds entries seen once, T2 entries that were
+reused, and T1 is evicted first. An entry joins T2 when a request restores it, and
+a commit joins T2 when it is the next turn of a resident tip or a fork: it extends
+a resident rung of at least 256 tokens that a live entry also extends (a turn
+restored from an earlier rung, or a retried turn). The fork demotes the branch it
+left (tip and rungs) to T1, cancels its unwritten records and evicts it first. A
+shared system prompt is not an entry, so parallel sessions under one cache key do
+not count as forks. Victim order: entries idle past the stale floor, the dead
+branch, the committing turn's own rungs, T1, other rungs, then T2.
+
 The finish path can continue staged work but never starts materializing a module
 part. The idle loop admits that staging memory and exports one file per slice,
 oldest owed source first. Writer backpressure retains the encoded blob for a

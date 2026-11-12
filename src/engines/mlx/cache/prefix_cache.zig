@@ -399,6 +399,10 @@ const Entry = struct {
     /// Has the slot's append donated these buffers in place (`donateCheckout`)? Until then the
     /// entry's handles are live and a slot that ends hands the entry back; only a donated checkout is dropped.
     checkout_donated: bool = false,
+    /// Eviction list: false = T1 (seen once), true = T2 (a restore hit it, or a later turn of its conversation replaced it).
+    frequent: bool = false,
+    /// A module tip its conversation forked away from: nothing extends it any more.
+    forked_off: bool = false,
 };
 
 /// What a spec-snap adoption may do, decided before any mlx call.
@@ -633,10 +637,20 @@ pub const EvictionReport = struct {
     admitted: bool = false,
 };
 
+/// A lookup hit is the conversation coming back when it covers this floor and three quarters of the donor: a returning
+/// turn differs from its tip only by a stripped tail, a one-shot sharing a system prompt covers a small part of it.
+const PROMOTE_MIN_TOKENS: usize = 256;
+
+fn promotes(shared: usize, entry_tokens: usize) bool {
+    return shared >= PROMOTE_MIN_TOKENS and shared * 4 >= entry_tokens * 3;
+}
+
+const ListBytes = struct { t1: u64 = 0, t2: u64 = 0 };
+
 pub const HotPrefixCache = struct {
     entries: std.ArrayList(Entry),
     max_entries: u32,
-    /// An entry untouched this long is evicted before the workload-fair rule applies.
+    /// An entry untouched this long is evicted before the list order and the workload-fair rule apply.
     stale_after_ms: i64 = 30 * 60 * 1000,
     /// The module commit that is making room: its tip is not resident yet, but the entries it extends are its
     /// rungs already. Without it a count-cap eviction took another conversation's tip on the same cache key (#1125).
@@ -1401,6 +1415,8 @@ pub const HotPrefixCache = struct {
             }
             e.last_used = self.bumpCounter();
             e.touched_ms = crt.monotonicMs();
+            e.frequent = true;
+            e.forked_off = false;
             // Evicting the entry this request runs on frees nothing while the slot shares it.
             self.last_restored_used = e.last_used;
             return payload.n;
@@ -1815,6 +1831,7 @@ pub const HotPrefixCache = struct {
         } else {
             log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d})\n", .{ effective_matched, prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len });
         }
+        e.frequent = e.frequent or promotes(m.shared, e.tokens.len);
         var res: LookupResult = .{
             .matched = matched,
             .full_match = full_match,
@@ -1960,6 +1977,9 @@ pub const HotPrefixCache = struct {
         };
         // Allocate before removing any donor; OOM leaves the resident history intact.
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        const lineage = self.moduleLineage(binding, ids, eff_media, has_tools, quant_config, cache_key);
+        // Before room is made, so the dead branch pays for it and not the fork's own rungs.
+        if (lineage == .forked_turn) self.demoteForkedOff(binding, ids, eff_media, has_tools, quant_config, cache_key, lineage.forked_turn);
         self.supersedeModuleRungs(binding, ids, eff_media, has_tools, quant_config);
         const room = blk: {
             self.incoming_tip = .{ .binding = binding, .ids = ids, .media = eff_media, .has_tools = has_tools, .quant_config = quant_config };
@@ -1980,12 +2000,14 @@ pub const HotPrefixCache = struct {
             .id = self.bumpCounter(),
             .last_used = self.bumpCounter(),
             .touched_ms = crt.monotonicMs(),
+            .frequent = lineage != .first_seen,
             .snapshot = .{ .entries = &.{}, .step = 0, .allocator = self.allocator, .config = quant_config },
             .module = .{ .binding = binding, .snapshot = snapshot, .n = ids.len, .prefix_key = variantKey(prefix_key, binding.variant), .aux_bytes = aux_bytes },
             .kv_bytes = aux_bytes,
         });
         retained = true;
         self.current_kv_bytes += aux_bytes;
+        log.info("  [hot-cache] module commit {d} tokens key={x} -> {s} ({s})\n", .{ ids.len, cache_key, if (lineage != .first_seen) "T2" else "T1", @tagName(lineage) });
         self.registerModuleEntry(&self.entries.items[self.entries.items.len - 1]);
         self.logResident();
         return .{ .ok = ids.len };
@@ -2023,13 +2045,23 @@ pub const HotPrefixCache = struct {
     /// Computed from what is resident, never stored, so a tip that leaves by any path (thinning, a
     /// failed restore, the stale or idle passes) turns its rungs back into ordinary entries.
     fn isModuleRung(self: *const HotPrefixCache, i: usize) bool {
+        if (self.entries.items[i].module == null) return false;
+        return self.incomingRung(i) or self.extendedByResident(i, null);
+    }
+
+    /// A rung of the module commit making room: its tip is about to be resident.
+    fn incomingRung(self: *const HotPrefixCache, i: usize) bool {
         const e = &self.entries.items[i];
-        if (e.module == null) return false;
-        if (self.incoming_tip) |t| {
-            if (t.ids.len > e.tokens.len and moduleRungOf(e, t.binding, t.ids, t.media, t.has_tools, t.quant_config)) return true;
-        }
+        const t = self.incoming_tip orelse return false;
+        return e.module != null and t.ids.len > e.tokens.len and moduleRungOf(e, t.binding, t.ids, t.media, t.has_tools, t.quant_config);
+    }
+
+    /// Whether a longer resident module entry extends entry `i`; a `cache_key` counts only that workload's entries.
+    fn extendedByResident(self: *const HotPrefixCache, i: usize, cache_key: ?u64) bool {
+        const e = &self.entries.items[i];
         for (self.entries.items, 0..) |*o, j| {
-            if (j == i or o.tokens.len <= e.tokens.len) continue;
+            if (j == i or o.tokens.len <= e.tokens.len or o.forked_off) continue;
+            if (cache_key) |k| if (o.cache_key != k) continue;
             const m = o.module orelse continue;
             if (moduleRungOf(e, m.binding, o.tokens, o.media, o.has_tools, o.quant_config)) return true;
         }
@@ -2042,9 +2074,11 @@ pub const HotPrefixCache = struct {
     fn supersedeModuleRungs(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig) void {
         // Only a conversation's latest state is owed to the SSD: what this commit extends or replaces is not written.
         for (self.entries.items) |*e| {
-            const m = e.module orelse continue;
-            if (!moduleRungOf(e, binding, ids, media, has_tools, quant_config) or !self.moduleExportOwed(m)) continue;
-            self.cancelModule(m, .superseded);
+            if (!moduleRungOf(e, binding, ids, media, has_tools, quant_config)) continue;
+            // A branch this commit extends is live again.
+            e.forked_off = false;
+            if (!self.moduleExportOwed(e.module.?)) continue;
+            self.cancelModule(e.module.?, .superseded);
             e.disk_dirty = false;
         }
         var i: usize = self.entries.items.len;
@@ -2108,7 +2142,7 @@ pub const HotPrefixCache = struct {
         if (self.residentBytes() > self.max_kv_bytes - bytes) self.cancelPendingModules(.memory_pressure);
         while (self.residentBytes() > self.max_kv_bytes - bytes) {
             const idx = self.lruIndexExcluding(null, cache_key) orelse return false;
-            self.evictAtWithCancellation(idx, "byte budget", .memory_pressure);
+            self.evictForCapacity(idx, "byte budget", .memory_pressure, cache_key);
         }
         return true;
     }
@@ -2420,6 +2454,7 @@ pub const HotPrefixCache = struct {
                             @as(f64, @floatFromInt(new_bytes)) / (1024.0 * 1024.0),
                             @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
                         });
+                        self.entries.items[idx].frequent = true;
                         return .{ .kept_resident = self.entries.items[idx].tokens.len };
                     }
                 }
@@ -2683,6 +2718,7 @@ pub const HotPrefixCache = struct {
             e.checkout_donated = false;
             e.last_used = self.bumpCounter();
             e.touched_ms = crt.monotonicMs();
+            e.frequent = true;
             e.disk_dirty = self.disk != null;
             self.current_kv_bytes += e.kv_bytes;
             // Inherited SSM checkpoints can make a replacement larger than
@@ -2996,7 +3032,7 @@ pub const HotPrefixCache = struct {
         while (idle_bytes > self.ssd_idle_mem) {
             const idx = self.oldestIdleIndex(newest_used, true) orelse break;
             idle_bytes -|= self.entries.items[idx].kv_bytes;
-            self.evictAt(idx, "SSD-first idle spill");
+            self.evictForCapacity(idx, "SSD-first idle spill", null, null);
             evicted += 1;
         }
 
@@ -3010,7 +3046,7 @@ pub const HotPrefixCache = struct {
                 @as(f64, @floatFromInt(e.kv_bytes)) / (1024.0 * 1024.0),
             });
             idle_bytes -|= e.kv_bytes;
-            self.evictAt(idx, "SSD-first idle allowance");
+            self.evictForCapacity(idx, "SSD-first idle allowance", null, null);
             evicted += 1;
         }
 
@@ -3592,7 +3628,7 @@ pub const HotPrefixCache = struct {
         if (self.residentBytes() > max_kv_bytes) self.cancelPendingModules(.memory_pressure);
         while (self.residentBytes() > max_kv_bytes) {
             const idx = self.lruIndexExcluding(null, null) orelse break;
-            self.evictAtWithCancellation(idx, "budget revised", .memory_pressure);
+            self.evictForCapacity(idx, "budget revised", .memory_pressure, null);
         }
         self.shedCheckpointsToFit();
         self.logResident();
@@ -3600,7 +3636,7 @@ pub const HotPrefixCache = struct {
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
         const idx = self.lruIndexExcluding(null, incoming_key) orelse return;
-        self.evictAt(idx, reason);
+        self.evictForCapacity(idx, reason, null, incoming_key);
     }
 
     /// False when nothing was evictable (every survivor is checked out) — the termination
@@ -3858,19 +3894,16 @@ pub const HotPrefixCache = struct {
             return true;
         };
         const idx = self.lruIndexExcluding(protect, null) orelse return false;
-        self.evictAtWithCancellation(idx, "admitting a long prefill", .memory_pressure);
+        self.evictForCapacity(idx, "admitting a long prefill", .memory_pressure, null);
         return true;
     }
 
-    /// Least-recently-used entry index, skipping the one whose `last_used` equals `protect`.
-    /// Workload-fair: only entries of the `cache_key` holding the most eligible entries
-    /// (`incoming_key` counts as one more) are candidates, so a sweep evicts its own
-    /// documents before another workload's conversation. One key = plain LRU. An entry idle past
-    /// `stale_after_ms` goes first: a finished session's lone entry must not shield itself forever.
+    /// The entry to evict next, never the one whose `last_used` is `protect`: one idle past `stale_after_ms`, a
+    /// forked-off branch, a rung of the commit making room, T1 (seen once), any other module rung (a live conversation
+    /// keeps its tip while rungs remain), then T2 (reused).
     fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
-        var max_count: usize = 0;
         if (self.stale_after_ms > 0) {
             const now = crt.monotonicMs();
             for (self.entries.items, 0..) |*e, i| {
@@ -3883,21 +3916,44 @@ pub const HotPrefixCache = struct {
             }
             if (best != null) return best;
         }
-        // A rung goes before any conversation's tip, so every live conversation keeps its newest
-        // checkpoint while rungs remain.
+        if (self.oldestOf(protect, .forked_off)) |i| return i;
+        if (self.oldestOf(protect, .incoming_rung)) |i| return i;
+        if (self.fairVictim(protect, incoming_key, false)) |i| return i;
+        if (self.oldestOf(protect, .rung)) |i| return i;
+        return self.fairVictim(protect, incoming_key, true);
+    }
+
+    const VictimClass = enum { forked_off, incoming_rung, rung };
+
+    fn oldestOf(self: *const HotPrefixCache, protect: ?u64, class: VictimClass) ?usize {
+        var best: ?usize = null;
+        var best_used: u64 = std.math.maxInt(u64);
         for (self.entries.items, 0..) |*e, i| {
             if (e.checked_out_by != null) continue;
             if (protect) |p| if (e.last_used == p) continue;
-            if (e.last_used >= best_used or !self.isModuleRung(i)) continue;
-            if (e.last_used < best_used) {
-                best_used = e.last_used;
-                best = i;
-            }
+            if (e.last_used >= best_used) continue;
+            const member = switch (class) {
+                .forked_off => e.forked_off,
+                .incoming_rung => self.incomingRung(i),
+                .rung => self.isModuleRung(i),
+            };
+            if (!member) continue;
+            best_used = e.last_used;
+            best = i;
         }
-        if (best != null) return best;
+        return best;
+    }
+
+    /// Workload-fair LRU within one list: only entries of the `cache_key` holding the most eligible entries
+    /// (`incoming_key` counts as one more) are candidates, so a sweep evicts its own documents before another
+    /// workload's conversation. One key = plain LRU.
+    fn fairVictim(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64, from_t2: bool) ?usize {
+        var best: ?usize = null;
+        var best_used: u64 = std.math.maxInt(u64);
+        var max_count: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
             // Held by a live slot that owns its buffers: evicting it frees nothing.
-            if (e.checked_out_by != null) continue;
+            if (e.checked_out_by != null or e.frequent != from_t2) continue;
             if (protect) |p| {
                 if (e.last_used == p) continue;
             }
@@ -3918,14 +3974,88 @@ pub const HotPrefixCache = struct {
         return best;
     }
 
+    fn listBytes(self: *const HotPrefixCache) ListBytes {
+        var sizes = ListBytes{};
+        for (self.entries.items) |*e| {
+            if (e.frequent) sizes.t2 += e.kv_bytes else sizes.t1 += e.kv_bytes;
+        }
+        return sizes;
+    }
+
+    /// Evict to make room; the log line names the victim's list and class.
+    fn evictForCapacity(self: *HotPrefixCache, idx: usize, reason: []const u8, cancellation: ?kv_disk_cache.DiskTier.ModuleCancellation, incoming_key: ?u64) void {
+        var buf: [192]u8 = undefined;
+        self.evictAtWithCancellation(idx, self.evictionDetail(&buf, idx, reason, incoming_key), cancellation);
+    }
+
+    /// "<reason>; T2 tip, idle 12.3 s, for key=..." for the eviction line.
+    fn evictionDetail(self: *const HotPrefixCache, buf: []u8, idx: usize, reason: []const u8, incoming_key: ?u64) []const u8 {
+        const e = &self.entries.items[idx];
+        const class: []const u8 = if (e.module == null) "entry" else if (self.isModuleRung(idx)) "rung" else if (e.forked_off) "dead same-key tip" else "tip";
+        const idle_s = @as(f64, @floatFromInt(@max(0, crt.monotonicMs() - e.touched_ms))) / 1000.0;
+        const list: []const u8 = if (e.frequent) "T2" else "T1";
+        const out = if (incoming_key) |k|
+            std.fmt.bufPrint(buf, "{s}; {s} {s}, idle {d:.1} s, for key={x}", .{ reason, list, class, idle_s, k })
+        else
+            std.fmt.bufPrint(buf, "{s}; {s} {s}, idle {d:.1} s", .{ reason, list, class, idle_s });
+        return out catch reason;
+    }
+
+    /// Tokens `ids` shares with module entry `e` of the same workload, or null for another workload's entry.
+    fn moduleShared(e: *const Entry, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) ?usize {
+        const m = e.module orelse return null;
+        if (e.cache_key != cache_key or !ModuleBinding.same(m.binding, binding) or e.has_tools != has_tools) return null;
+        if (!std.meta.eql(e.quant_config, quant_config)) return null;
+        const lcp = std.mem.indexOfDiff(u32, e.tokens, ids) orelse e.tokens.len;
+        return @min(lcp, mediaSharedBound(e.media, media));
+    }
+
+    const Lineage = union(enum) { first_seen, next_turn, forked_turn: usize };
+
+    /// The longest same-key entry `ids` strictly extends is its previous tip (next turn) or, when a live entry extends
+    /// that one too, a rung past the promotion floor it forks from. A shared system prompt is no entry, so parallel
+    /// conversations under one key stay apart.
+    fn moduleLineage(self: *const HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64) Lineage {
+        var best: ?usize = null;
+        for (self.entries.items, 0..) |*e, i| {
+            const shared = moduleShared(e, binding, ids, media, has_tools, quant_config, cache_key) orelse continue;
+            if (shared != e.tokens.len or shared >= ids.len) continue;
+            if (best == null or shared > self.entries.items[best.?].tokens.len) best = i;
+        }
+        const i = best orelse return .first_seen;
+        if (!self.extendedByResident(i, cache_key)) return .next_turn;
+        const at = self.entries.items[i].tokens.len;
+        return if (at >= PROMOTE_MIN_TOKENS) .{ .forked_turn = at } else .first_seen;
+    }
+
+    /// Every same-key entry above the fork point that `ids` diverged from (the dead branch, tip and rungs) leaves T2,
+    /// goes first when room is made, and is no longer owed to the SSD.
+    fn demoteForkedOff(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, cache_key: u64, fork_at: usize) void {
+        for (self.entries.items) |*e| {
+            const shared = moduleShared(e, binding, ids, media, has_tools, quant_config, cache_key) orelse continue;
+            if (shared < fork_at or shared >= e.tokens.len) continue;
+            e.frequent = false;
+            e.forked_off = true;
+            if (!self.moduleExportOwed(e.module.?)) continue;
+            self.cancelModule(e.module.?, .superseded);
+            e.disk_dirty = false;
+        }
+    }
+
     fn logResident(self: *const HotPrefixCache) void {
         const mb = @as(f64, @floatFromInt(self.current_kv_bytes)) / (1024.0 * 1024.0);
         if (self.max_kv_bytes == 0) {
             log.info("  [hot-cache] resident={d:.2} MB ({d}/{d} entries)\n", .{ mb, self.entries.items.len, self.max_entries });
         } else {
-            const cap_mb = @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0);
-            log.info("  [hot-cache] resident={d:.2} / {d:.2} MB ({d}/{d} entries)\n", .{ mb, cap_mb, self.entries.items.len, self.max_entries });
+            const z = self.listBytes();
+            log.info("  [hot-cache] resident={d:.2} / {d:.2} MB ({d}/{d} entries; T1 {d:.1} T2 {d:.1} MB)\n", .{
+                mb, toMb(self.max_kv_bytes), self.entries.items.len, self.max_entries, toMb(z.t1), toMb(z.t2),
+            });
         }
+    }
+
+    fn toMb(bytes: u64) f64 {
+        return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
     }
 
     /// Drop all entries. Called when the cache is suspect (pad-only generation, image-bearing
@@ -11451,6 +11581,181 @@ test "HotPrefixCache module: a rung whose tip left by another path is a tip agai
     cache.invalidateAll("test end");
     try testing.expectEqual(@as(usize, 1), rung.frees);
     try testing.expectEqual(@as(usize, 1), c.frees);
+}
+
+/// A request whose prompt is `ids` plus one more token: it restores the checkpoint at `ids`.
+fn restoreAt(cache: *HotPrefixCache, binding: ModuleBinding, ids: []const u32) !void {
+    var prompt: [32]u32 = undefined;
+    @memcpy(prompt[0..ids.len], ids);
+    prompt[ids.len] = 999;
+    const hit = cache.findModuleMatch(binding, prompt[0 .. ids.len + 1], false, &.{}, null, kv_quant.KVQuantConfig.dense) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(ids.len, cache.restoreModule(binding, hit.entry_id, 0));
+}
+
+fn putKeyed(cache: *HotPrefixCache, binding: ModuleBinding, snap: *ModuleFake.Snap, cache_key: u64) !void {
+    _ = try cache.commitModule(binding, snap, snap.ids, snap.key, &.{}, false, kv_quant.KVQuantConfig.dense, cache_key);
+}
+
+/// `base[0..at]`, then fresh tokens from `seed` up to `n`.
+fn forkOf(comptime n: usize, base: []const u32, at: usize, seed: u32) [n]u32 {
+    var out: [n]u32 = undefined;
+    @memcpy(out[0..at], base[0..at]);
+    for (out[at..], 0..) |*t, i| t.* = seed + @as(u32, @intCast(i));
+    return out;
+}
+
+test "HotPrefixCache reuse: a stream of one-shot entries does not evict a session that came back" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 200);
+    defer cache.deinit();
+    var first = ModuleDiskTest.snap(&fake, &.{ 1, 2 });
+    _ = try first.put(&cache, binding, &.{});
+    try restoreAt(&cache, binding, &.{ 1, 2 });
+    var tip = ModuleDiskTest.snap(&fake, &.{ 1, 2, 3 });
+    _ = try tip.put(&cache, binding, &.{});
+    var shots: [10]ModuleFake.Snap = undefined;
+    var ids: [10][2]u32 = undefined;
+    for (&shots, &ids, 0..) |*shot, *id, i| {
+        id.* = .{ @intCast(100 + i), @intCast(200 + i) };
+        shot.* = ModuleDiskTest.snap(&fake, id);
+        _ = try shot.put(&cache, binding, &.{});
+    }
+    try testing.expectEqual(@as(usize, 0), tip.frees);
+    try testing.expectEqual(@as(usize, 3), cache.findModuleMatch(binding, &.{ 1, 2, 3, 9 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?.n);
+    cache.invalidateAll("test end");
+    for (shots) |shot| try testing.expectEqual(@as(usize, 1), shot.frees);
+}
+
+test "HotPrefixCache reuse: a later turn replacing its tip joins T2, and T1 is evicted before it" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 400);
+    defer cache.deinit();
+    var turn1 = ModuleDiskTest.snap(&fake, &.{ 1, 2 });
+    var turn2 = ModuleDiskTest.snap(&fake, &.{ 1, 2, 3 });
+    var cold1 = ModuleDiskTest.snap(&fake, &.{ 8, 1 });
+    var cold2 = ModuleDiskTest.snap(&fake, &.{ 8, 2 });
+    _ = try turn1.put(&cache, binding, &.{});
+    try testing.expect(!(try testEntryFor(&cache, &.{ 1, 2 })).frequent);
+    _ = try turn2.put(&cache, binding, &.{});
+    try testing.expect((try testEntryFor(&cache, &.{ 1, 2, 3 })).frequent);
+    _ = try cold1.put(&cache, binding, &.{});
+    _ = try cold2.put(&cache, binding, &.{});
+    const expected = [_][]const u32{ &.{ 1, 2 }, &.{ 8, 1 }, &.{ 8, 2 }, &.{ 1, 2, 3 } };
+    for (expected) |ids| {
+        const victim = cache.lruIndexExcluding(null, null) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u32, ids, cache.entries.items[victim].tokens);
+        cache.evictAt(victim, "test: victim order");
+    }
+}
+
+test "HotPrefixCache reuse: a forked turn joins T2 and makes room from the branch it left, never from its own rungs" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 160);
+    defer cache.deinit();
+    cache.stale_after_ms = 0;
+    const ids = ModuleDiskTest.ids(1000);
+    const fork = forkOf(450, &ids, 400, 90_000);
+    var snaps = [_]ModuleFake.Snap{
+        ModuleDiskTest.snap(&fake, ids[0..300]),
+        ModuleDiskTest.snap(&fake, ids[0..400]),
+        ModuleDiskTest.snap(&fake, ids[0..500]),
+        ModuleDiskTest.snap(&fake, &fork),
+    };
+    var one_shot = ModuleDiskTest.snap(&fake, &.{ 100, 200 });
+    for (snaps[0..3]) |*snap| try putKeyed(&cache, binding, snap, 7);
+    try putKeyed(&cache, binding, &one_shot, 9);
+    try putKeyed(&cache, binding, &snaps[3], 7);
+    try testing.expectError(error.EntryGone, testEntryFor(&cache, ids[0..500]));
+    for ([_]usize{ 300, 400 }) |n| _ = try testEntryFor(&cache, ids[0..n]);
+    _ = try testEntryFor(&cache, &.{ 100, 200 });
+    try testing.expect((try testEntryFor(&cache, &fork)).frequent);
+    cache.invalidateAll("test end");
+}
+
+test "HotPrefixCache reuse: sessions under one shared prompt neither promote nor demote each other" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 0);
+    defer cache.deinit();
+    const system = ModuleDiskTest.ids(1000);
+    const a = forkOf(520, &system, 400, 50_000);
+    const b = forkOf(450, &system, 400, 60_000);
+    const one = forkOf(420, &system, 400, 70_000);
+    var snaps = [_]ModuleFake.Snap{
+        ModuleDiskTest.snap(&fake, a[0..500]),
+        ModuleDiskTest.snap(&fake, &a),
+        ModuleDiskTest.snap(&fake, &b),
+        ModuleDiskTest.snap(&fake, &one),
+    };
+    for (&snaps) |*snap| try putKeyed(&cache, binding, snap, 7);
+    try testing.expect((try testEntryFor(&cache, &a)).frequent);
+    try testing.expect(!(try testEntryFor(&cache, &b)).frequent);
+    try testing.expect(!(try testEntryFor(&cache, &one)).frequent);
+    for (cache.entries.items) |e| try testing.expect(!e.forked_off);
+    cache.invalidateAll("test end");
+}
+
+test "HotPrefixCache reuse: a fork cancels the SSD export the branch it left still owed" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 8);
+    defer hc.deinit();
+    hc.module_quiet_ms = 60_000;
+    const ids = ModuleDiskTest.ids(1000);
+    const fork = forkOf(520, &ids, 300, 90_000);
+    var snaps = [_]ModuleFake.Snap{ ModuleDiskTest.snap(&fake, ids[0..300]), ModuleDiskTest.snap(&fake, &ids), ModuleDiskTest.snap(&fake, &fork) };
+    for (snaps[0..2]) |*snap| _ = try snap.put(&hc, binding, &.{});
+    const dead_id = (try testEntryFor(&hc, &ids)).module.?.disk_id orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(kv_disk_cache.module_record.State.registered, hc.disk.?.moduleState(dead_id).?);
+    _ = try snaps[2].put(&hc, binding, &.{});
+    // A cancelled record may already be swept from the index.
+    const state = hc.disk.?.moduleState(dead_id);
+    try testing.expect(state == null or state.? == .cancelled);
+    try testing.expect(!(try testEntryFor(&hc, &ids)).disk_dirty);
+    hc.disk.?.drainWriter();
+}
+
+fn kvCommit(hc: *HotPrefixCache, s: mlx.mlx_stream, tokens: []const u32) !void {
+    var kv = try KVCache.init(testing.allocator, 1);
+    defer kv.deinit();
+    try testFillCache(&kv, s, 1, @intCast(tokens.len));
+    _ = try hc.commit(&kv, tokens, false);
+}
+
+test "HotPrefixCache reuse: a lookup promotes a donor only when its conversation came back" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var donor: [1000]u32 = undefined;
+    for (&donor, 0..) |*t, i| t.* = @intCast(i + 7);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    defer hc.deinit();
+    try kvCommit(&hc, s, &donor);
+    // A one-shot sharing the first 300 tokens, then the conversation's next turn.
+    const one_shot = forkOf(320, &donor, 300, 50_000);
+    const returning = forkOf(1008, &donor, 1000, 60_000);
+    for ([_][]const u32{ &one_shot, &returning }, [_]usize{ 300, 1000 }, [_]bool{ false, true }) |prompt, matched, frequent| {
+        var slot = try KVCache.init(testing.allocator, 1);
+        defer slot.deinit();
+        var moe_off: usize = 0;
+        const res = try hc.lookupAndRestore(&slot, &moe_off, null, s, prompt, false, &.{}, null, null);
+        try testing.expectEqual(matched, res.matched);
+        try testing.expectEqual(frequent, hc.entries.items[0].frequent);
+    }
 }
 
 test "HotPrefixCache module: oversized disabled and malformed commits free the whole candidate" {
