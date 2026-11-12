@@ -46,13 +46,44 @@ pub fn reviseHotCacheBudgets(sch: *Scheduler, grow_only: bool) void {
             const config = entry.config orelse continue;
             var idle: u64 = 0;
             const budget = resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle);
-            if (grow_only and prefix_cache_mod.HotPrefixCache.budgetShrinks(hc.max_kv_bytes, budget)) continue;
-            hc.setBudget(budget);
-            hc.ssd_idle_mem = idle;
+            if (grow_only and prefix_cache_mod.HotPrefixCache.budgetShrinks(hc.baseBudget(), budget)) continue;
+            hc.setBaseBudget(budget, idle);
         }
     }
     sch.registry.mutex.unlock(sch.io);
     publishHotCacheResidency(sch);
+}
+
+/// Follow the kernel's memory-pressure level; between the gauge's readings this takes no lock. Returns how long the
+/// idle loop may park before the next reading: null (until work arrives) with no reading or no capped cache, 1 s
+/// while the level is high or changing, else 5 s.
+pub fn followMemoryPressure(sch: *Scheduler) ?u32 {
+    const gauge = &sch.memory_pressure;
+    if (gauge.sample()) |shift| gauge.watched = applyPressureStep(sch, shift);
+    if (!gauge.watched) return null;
+    return if (gauge.shift != 0 or gauge.settling()) 1000 else 5000;
+}
+
+/// Every resident hot cache takes the step, without re-resolving (the resolver publishes the budget context sizing
+/// reads). Returns whether any of them has a budget to divide.
+fn applyPressureStep(sch: *Scheduler, shift: u2) bool {
+    var watched = false;
+    var evicted = false;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        if (entry.state != .ready) continue;
+        const hc = if (entry.prefix_cache) |h| h else continue;
+        if (!hc.ram_enabled) continue;
+        const before = hc.residentBytes();
+        hc.applyPressure(shift);
+        evicted = evicted or hc.residentBytes() != before;
+        watched = watched or hc.baseBudget() != 0;
+    }
+    sch.registry.mutex.unlock(sch.io);
+    if (evicted) publishHotCacheResidency(sch);
+    return watched;
 }
 
 /// Active, parked and pending-capture state, counted once per model. Cache-owned snapshots bill separately.

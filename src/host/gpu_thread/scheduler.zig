@@ -5,6 +5,8 @@
 const std = @import("std");
 const handles = @import("../../abi/mlx_handles.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
+const crt = @import("../../sdk/util/crt.zig");
+const system = @import("../../sdk/util/system.zig");
 const metrics_mod = @import("../metrics/metrics.zig");
 const engines_served = @import("../engines/served.zig");
 const model_registry_mod = @import("../registry/registry.zig");
@@ -50,6 +52,72 @@ pub const BatchVerdict = enum {
 
 /// Options for re-clamping the hot-cache budgets after residency changed.
 pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
+
+/// The kernel's memory-pressure level as a hot-cache budget shift: warning halves, critical quarters. Critical applies
+/// on its second reading in a row, warning once it has held `WARNING_HOLD_MS` (a prefill's own transient must not
+/// shrink the cache), a better level after `BETTER_HOLD_MS`.
+pub const PressureGauge = struct {
+    /// False: the level is never read and no cache follows it.
+    enabled: bool = true,
+    shift: u2 = 0,
+    read_ms: ?i64 = null,
+    pending: u2 = 0,
+    since_ms: ?i64 = null,
+    /// The kernel has answered: a platform with no level is never watched.
+    readable: bool = false,
+    /// A capped hot cache took the last reading.
+    watched: bool = false,
+
+    const READ_EVERY_MS: i64 = 1_000;
+    const WARNING_HOLD_MS: i64 = 5_000;
+    const BETTER_HOLD_MS: i64 = 30_000;
+
+    /// The shift to apply, or null when no reading is due: the caller then has nothing to do.
+    pub fn sample(self: *PressureGauge) ?u2 {
+        if (!self.enabled) return null;
+        const now_ms = crt.monotonicMs();
+        if (self.read_ms) |t| if (now_ms - t < READ_EVERY_MS) return null;
+        self.read_ms = now_ms;
+        const level = system.memoryPressureLevel();
+        self.readable = self.readable or level != 0;
+        return if (self.readable) self.observe(level, now_ms) else null;
+    }
+
+    /// One reading of the kernel's level (1 normal, 2 warning, 4 critical) taken at `now_ms`.
+    fn observe(self: *PressureGauge, level: u32, now_ms: i64) u2 {
+        const step = levelShift(level);
+        if (step == self.shift) {
+            self.since_ms = null;
+            return self.shift;
+        }
+        const worse = step > self.shift;
+        if (self.since_ms == null or worse != (self.pending > self.shift)) {
+            self.since_ms = now_ms;
+            self.pending = step;
+        }
+        // Only what held for the whole window applies.
+        self.pending = if (worse) @min(self.pending, step) else @max(self.pending, step);
+        if (!self.due(worse, now_ms - self.since_ms.?)) return self.shift;
+        self.shift = self.pending;
+        self.since_ms = null;
+        return self.shift;
+    }
+
+    /// A level change is waiting out its window.
+    pub fn settling(self: *const PressureGauge) bool {
+        return self.since_ms != null;
+    }
+
+    fn due(self: *const PressureGauge, worse: bool, held_ms: i64) bool {
+        if (!worse) return held_ms >= BETTER_HOLD_MS;
+        return if (self.pending == 2) held_ms > 0 else held_ms >= WARNING_HOLD_MS;
+    }
+
+    fn levelShift(level: u32) u2 {
+        if (level >= 4) return 2;
+        return if (level >= 2) 1 else 0;
+    }
+};
 
 /// One hot-cache entry as the connection-thread guard sees it (`Scheduler.hot_cache_digests`).
 pub const HotCacheDigest = struct {
@@ -160,6 +228,7 @@ pub const Scheduler = struct {
     /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats
     /// before each prefill batch while this is armed and settles as the ceiling recovers.
     budget_revise_sw: ?io_util.Stopwatch = null,
+    memory_pressure: PressureGauge = .{},
     promise_ledger: PromiseLedger = .{},
     /// Inference thread only. Greater than 0 while a prefill started at a chunk boundary runs: it may
     /// tick decoders at its own boundaries but never admits.
@@ -346,3 +415,25 @@ pub const Scheduler = struct {
         return mlx_engine.encodeVision(self, req);
     }
 };
+
+test "memory pressure gauge: critical applies on its second reading, warning and a better level once held, and a flap restarts the wait" {
+    const expectEqual = std.testing.expectEqual;
+    var g: PressureGauge = .{};
+    try expectEqual(@as(u2, 0), g.observe(1, 0));
+    // Warning has to hold.
+    try expectEqual(@as(u2, 0), g.observe(2, 1_000));
+    try expectEqual(@as(u2, 0), g.observe(2, 5_000));
+    try expectEqual(@as(u2, 1), g.observe(2, 6_000));
+    // Critical: the second reading.
+    try expectEqual(@as(u2, 1), g.observe(4, 7_000));
+    try expectEqual(@as(u2, 2), g.observe(4, 8_000));
+    // A better level has to hold too, and one worse reading restarts its wait.
+    try expectEqual(@as(u2, 2), g.observe(1, 9_000));
+    try expectEqual(@as(u2, 2), g.observe(1, 30_000));
+    try expectEqual(@as(u2, 2), g.observe(4, 31_000));
+    try expectEqual(@as(u2, 2), g.observe(1, 32_000));
+    try expectEqual(@as(u2, 2), g.observe(1, 61_000));
+    try std.testing.expect(g.settling());
+    try expectEqual(@as(u2, 0), g.observe(1, 62_000));
+    try std.testing.expect(!g.settling());
+}
