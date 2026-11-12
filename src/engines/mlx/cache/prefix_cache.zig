@@ -809,6 +809,11 @@ pub const HotPrefixCache = struct {
     /// SSD-first: the RAM allowance for idle entries (the resolved `--prefix-cache-mem`).
     /// `spillIdleEntries` evicts only past it; 0 = nothing idle stays resident.
     ssd_idle_mem: u64 = 0,
+    /// The resolver's budget and SSD-first idle allowance before memory pressure divides them; null until the first
+    /// `setBaseBudget` or `applyPressure`, when `max_kv_bytes` is the base.
+    base: ?struct { kv: u64, idle: u64 } = null,
+    /// Memory pressure divides the base by 2^shift (`applyPressure`).
+    pressure_shift: u2 = 0,
     /// The live-cache state of the most recent commit, flushed instead of the (possibly trimmed) RAM entry.
     pending_disk: ?PendingDiskFlush = null,
     /// An earlier session's pending snapshot a newer commit displaced before it landed whole;
@@ -3803,6 +3808,34 @@ pub const HotPrefixCache = struct {
         log.info("  [hot-cache] shed {d} checkpoints to fit the byte budget ({d} kept)\n", .{ shed, n });
     }
 
+    /// The budget before memory pressure divides it.
+    pub fn baseBudget(self: *const HotPrefixCache) u64 {
+        return if (self.base) |b| b.kv else self.max_kv_bytes;
+    }
+
+    /// The resolver's answer: budget and SSD-first idle allowance, divided by the current pressure step.
+    pub fn setBaseBudget(self: *HotPrefixCache, kv: u64, idle: u64) void {
+        self.base = .{ .kv = kv, .idle = idle };
+        self.setBudget(self.pressuredBudget());
+        self.ssd_idle_mem = idle >> self.pressure_shift;
+    }
+
+    /// A memory-pressure step from the inference loop.
+    pub fn applyPressure(self: *HotPrefixCache, shift: u2) void {
+        if (shift == self.pressure_shift) return;
+        if (self.base == null) self.base = .{ .kv = self.max_kv_bytes, .idle = self.ssd_idle_mem };
+        self.pressure_shift = shift;
+        self.setBaseBudget(self.base.?.kv, self.base.?.idle);
+    }
+
+    /// Uncapped stays uncapped; an SSD-first budget keeps its live session and divides only the idle allowance.
+    fn pressuredBudget(self: *const HotPrefixCache) u64 {
+        const b = self.base.?;
+        if (b.kv == 0) return 0;
+        const kept = if (self.ssd_first) b.kv -| b.idle else 0;
+        return @max(1, kept + ((b.kv - kept) >> self.pressure_shift));
+    }
+
     /// Would `next` cap the cache below `current`? 0 is uncapped.
     pub fn budgetShrinks(current: u64, next: u64) bool {
         return next != 0 and (current == 0 or next < current);
@@ -6384,6 +6417,54 @@ test "HotPrefixCache: a revised budget evicts down to fit and a raised one keeps
     hc.setBudget(0);
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
     try testing.expectEqual(@as(u64, 0), hc.max_kv_bytes);
+}
+
+test "HotPrefixCache pressure: a step divides the budget and evicts to it, the resolver's answer stays the base, and the budget comes back" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 400);
+    defer cache.deinit();
+    var snaps: [10]ModuleFake.Snap = undefined;
+    var ids: [10][2]u32 = undefined;
+    for (&snaps, &ids, 0..) |*snap, *id, i| {
+        id.* = .{ @intCast(100 + i), @intCast(200 + i) };
+        snap.* = ModuleDiskTest.snap(&fake, id);
+        _ = try snap.put(&cache, binding, &.{});
+    }
+    try testing.expectEqual(@as(u64, 400), cache.residentBytes());
+    cache.applyPressure(1);
+    try testing.expectEqual(@as(u64, 200), cache.max_kv_bytes);
+    try testing.expectEqual(@as(u64, 200), cache.residentBytes());
+    cache.applyPressure(2);
+    try testing.expectEqual(@as(u64, 100), cache.max_kv_bytes);
+    try testing.expectEqual(@as(u64, 80), cache.residentBytes());
+    // A revise under pressure moves the base and keeps the step.
+    cache.setBaseBudget(800, 0);
+    try testing.expectEqual(@as(u64, 200), cache.max_kv_bytes);
+    try testing.expectEqual(@as(u64, 800), cache.baseBudget());
+    cache.applyPressure(0);
+    try testing.expectEqual(@as(u64, 800), cache.max_kv_bytes);
+    cache.invalidateAll("test end");
+}
+
+test "HotPrefixCache pressure: uncapped stays uncapped, and an SSD-first budget divides only its idle allowance" {
+    var open = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer open.deinit();
+    open.applyPressure(2);
+    try testing.expectEqual(@as(u64, 0), open.max_kv_bytes);
+
+    var spilling = HotPrefixCache.initWithMem(testing.allocator, 4, 1000);
+    defer spilling.deinit();
+    spilling.ssd_first = true;
+    spilling.ssd_idle_mem = 400;
+    spilling.applyPressure(1);
+    try testing.expectEqual(@as(u64, 800), spilling.max_kv_bytes);
+    try testing.expectEqual(@as(u64, 200), spilling.ssd_idle_mem);
+    spilling.applyPressure(0);
+    try testing.expectEqual(@as(u64, 1000), spilling.max_kv_bytes);
+    try testing.expectEqual(@as(u64, 400), spilling.ssd_idle_mem);
 }
 
 test "HotPrefixCache: byte budget rejects an oversized sole entry and preserves a smaller prefix" {

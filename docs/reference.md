@@ -696,6 +696,7 @@ The controls are shared with the prefix cache:
 | `--no-prefix-cache-ram` | Disables module history even with disk configured; module SSD-only retention is unsupported. |
 | `--prefix-cache-disk-write-max <MB/s>` | Module tiers only, with `--prefix-cache-disk`: feed the tier from T2 (hit again) tips idle past the quiet period, coldest first, within the rate; eviction cancels unwritten records, and a budget shrink takes a T2 tip whose record committed before one still unwritten; SIGTERM writes T2 tips only, hottest first, within `--shutdown-persist-secs`. Zero or absent writes every quiet tip. |
 | `--shutdown-persist-secs <n>` | Gives SIGTERM persistence a deadline (default 45 seconds); zero disables the shutdown flush. |
+| `MLX_SERVE_PREFIX_CACHE_PRESSURE=0` | Every hot-cache budget ignores macOS memory pressure. On by default: warning (held 5 s) halves each budget and critical (two readings) quarters it; the level is read at most once a second, and the budget comes back after 30 s at a lower level. An SSD-first budget divides only its idle allowance. |
 
 A disk restore requires an exact boundary strictly inside the new prompt, matching
 IDs, tools, quant settings, covered media, and a recomputed prefix key. The engine
