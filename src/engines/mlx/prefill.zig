@@ -71,7 +71,7 @@ fn restoreModulePrompt(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.M
         try beginModulePrompt(slot, binding, 0);
     };
     if (n > 0) if (selected) |match| {
-        log.info("[hot-cache] module restored source={s} id={d} position={d}\n", .{ @tagName(match.source), if (match.source == .ram) match.entry_id else match.disk_id, n });
+        log.info("[hot-cache] module restored source={s} id={d} position={d} key={x}\n", .{ @tagName(match.source), if (match.source == .ram) match.entry_id else match.disk_id, n, slot.cache_key });
     };
     return n;
 }
