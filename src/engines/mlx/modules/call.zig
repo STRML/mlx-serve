@@ -17,6 +17,7 @@ pub const fns = struct {
     pub const dsv41_vision_deinit = Dsv41Vision.deinit;
     // the Thunderbolt cluster's worker (`mlx-serve dist-worker`): whole models served for rank 0
     pub const cluster_worker = @import("../cluster/distributed.zig").cmdWorker;
+    pub const pp_probe = @import("../../../plugins/deepseek_v41/pp_step1.zig").cmdProbe;
     // Sushi packs' EXL3 routed experts
     pub const exl3_routed = @import("../../../sdk/quant/exl3/format.zig").routed;
     // qwen4_exp's MTP head and grouped verify on the plugin's trunk

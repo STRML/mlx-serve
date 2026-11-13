@@ -871,4 +871,6 @@ test {
     _ = media;
     _ = @import("contract.zig");
     _ = @import("decode/decode.zig");
+    _ = @import("pp_step1.zig");
+    _ = @import("pp_step1_tcp.zig");
 }

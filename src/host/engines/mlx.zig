@@ -72,6 +72,7 @@ pub const Api = struct {
     /// group model's load waits for the workers, null = the size's default).
     cluster_worker: *const fn (std.Io, std.mem.Allocator, []const []const u8) Err,
     cluster_probe: *const fn (std.Io, []const []const u8) Err,
+    pp_probe: *const fn (std.Io, std.mem.Allocator, []const []const u8) Err,
     cluster_connect: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8, u8, []const u8, ?u32, u32, ?u32) Err,
     /// `--prompt` without `--serve`: one generation on the calling thread.
     run_offline: *const fn (*const Offline) Err,

@@ -57,6 +57,7 @@ pub const table: host.Api = .{
     .run_offline = @import("offline.zig").run,
     .cluster_worker = clusterWorker,
     .cluster_probe = clusterProbe,
+    .pp_probe = ppProbe,
     .cluster_connect = clusterConnect,
     .configure = configure_mod.apply,
     .install_admission_hooks = @import("admission/admit.zig").installSchedulerHooks,
@@ -82,6 +83,11 @@ fn clusterWorker(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) ?
 
 fn clusterProbe(io: std.Io, args: []const []const u8) ?[]const u8 {
     distributed.cmdProbe(local(io), args) catch |e| return @errorName(e);
+    return null;
+}
+
+fn ppProbe(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) ?[]const u8 {
+    @import("modules/call.zig").call("pp_probe", .{ local(io), gpa, args }) catch |e| return @errorName(e);
     return null;
 }
 

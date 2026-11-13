@@ -32,6 +32,7 @@ const dsv4 = @import("../deepseek_v4/deepseek_v4.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
 const dkern = @import("decode/decode.zig");
 const device = @import("../../mlx/device.zig");
+const pp_step1 = @import("pp_step1.zig");
 /// A pack an outside quant plugin reads: its linears and resident banks run on the plugin.
 const outside = @import("../../sdk/quant/outside.zig");
 /// the embed_pread.zig (the embedding pread): the embedding table read from the pack per lookup.
@@ -568,6 +569,7 @@ pub const Dsv41Model = struct {
     ds_prof_comp_sync_ns: u64 = 0,
     /// The last draft's time, host sync included (`DsparkProfile`).
     ds_draft_ns: u64 = 0,
+    pp_timing: pp_step1.TimingState = .{},
 
     fn dropAhead(self: *Dsv41Model) void {
         if (self.ahead) |a| a.finish();
@@ -579,6 +581,7 @@ pub const Dsv41Model = struct {
         sx1.releaseAll();
         dropChain(self);
         if (self.dec_state) |*st| st.deinit();
+        self.pp_timing.close();
         if (self.seg) |s| {
             s.deinit();
             self.gpa.destroy(s);
@@ -1889,6 +1892,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         .moe_combine_kernel = try buildKernel("dsv41_moe_combine", &MOE_COMBINE_INS, &.{"out"}, MOE_COMBINE_SOURCE, ""),
     };
     m.pair = opts.pair;
+    m.pp_timing = pp_step1.TimingState.fromEnv();
     m.tp = opts.tp;
     m.draft_shard = opts.draft_shard and opts.tp != null and n_stages > 0;
     m.streamed_experts = opts.streamed_experts;
@@ -3102,7 +3106,20 @@ fn compressed(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, qr: A, p0
     if (ly.ratio == 0) return .{ none, none };
     const clen = (p0 + dim(x, 0)) / ly.ratio;
     if (ly.comp) |*cw| if (sh.floor == null and !sh.compressed) try compress(sc, m, st, li, cw, x, p0);
-    if (ly.idx) |*iw| sh.topk = if (clen == 0) none else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
+    if (ly.idx) |*iw| {
+        if (clen == 0) {
+            sh.topk = none;
+        } else if (m.pp_timing.isDiag()) {
+            const owner = m.latest(li, Dsv41Model.isOwner);
+            try evalAll(&.{ x, qr, st.layers[owner].idx_k.?.buf });
+            const t_idx = monoUs();
+            sh.topk = try indexer(sc, m, st, li, iw, x, qr, p0, sh);
+            if (sh.cand.ctx != null) try evalAll(&.{ sh.topk, sh.cand }) else try evalAll(&.{sh.topk});
+            m.pp_timing.diag_indexer_us += monoUs() - t_idx;
+        } else {
+            sh.topk = try indexer(sc, m, st, li, iw, x, qr, p0, sh);
+        }
+    }
     if (clen == 0 or sh.topk.ctx == null) return .{ none, sh.topk };
     return .{ try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s)), sh.topk };
 }
@@ -5393,18 +5410,23 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         from = p.hi;
     }
     const enc_hi = if (tail != null) m.ced_split.? else m.n_layers;
-    try runLayers(m, gpa, st, &sp, held, from, enc_hi);
-    Laps.lap(.build);
-    if (tail) |tl| {
-        var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
-        tsp.whole = held[held.len - 2 ..][0..2];
-        tsp.floor = tsp.p0;
-        try cedReplayIn(m, gpa, st, &sp, &tsp, enc_hi);
-        m.ced_stats.chunks += 1;
-        m.ced_stats.skipped += L - tl;
-        log.info("[dsv41] CED prefill: {d} rows encoder-only, replay {d} rows\n", .{ L - tl, tl });
-        try runLayers(m, gpa, st, &tsp, held, enc_hi, m.n_layers);
-        sp = tsp;
+    if (m.pp_timing.activeFor(m.pair == null and tail != null and from == 0 and L > region_rows)) {
+        try pp_step1.runTimedStages(m, gpa, st, &sp, held, p0, L, enc_hi, tail.?, n_spans, n_tail, targets, span);
+        Laps.lap(.build);
+    } else {
+        try runLayers(m, gpa, st, &sp, held, from, enc_hi);
+        Laps.lap(.build);
+        if (tail) |tl| {
+            var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
+            tsp.whole = held[held.len - 2 ..][0..2];
+            tsp.floor = tsp.p0;
+            try cedReplayIn(m, gpa, st, &sp, &tsp, enc_hi);
+            m.ced_stats.chunks += 1;
+            m.ced_stats.skipped += L - tl;
+            log.info("[dsv41] CED prefill: {d} rows encoder-only, replay {d} rows\n", .{ L - tl, tl });
+            try runLayers(m, gpa, st, &tsp, held, enc_hi, m.n_layers);
+            sp = tsp;
+        }
     }
     st.n = p0 + L;
 
@@ -5823,6 +5845,10 @@ fn monoUs() i64 {
 /// Layers [lo, hi) over every span of `sp`, one layer at a time; `held` is every array crossing
 /// layers, evaluated per layer when there are several spans.
 pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, held: []A, lo: usize, hi: usize) !void {
+    return runLayersWithDrain(m, gpa, st, sp, held, lo, hi, true);
+}
+
+pub fn runLayersWithDrain(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, held: []A, lo: usize, hi: usize, drain_end: bool) !void {
     const n_spans = sp.xs.len;
     // Wide spans run a layer's row-wise stages over the whole chunk, attention's core per span.
     const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
@@ -5853,7 +5879,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
             try appendLayerState(gpa, &ev, &st.layers[li]);
             // a wide layer with a wide one after it is committed, not waited for: the next layer's start
             // (its graph, its read-ahead's first buffers) runs under this one's tail.
-            if (wide and li + 1 < hi) {
+            if (wide and (li + 1 < hi or !drain_end)) {
                 const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_async_eval(vec));
@@ -6167,6 +6193,11 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     const parts = try gpa.alloc(A, n_spans);
     defer gpa.free(parts);
     for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
+    if (m.pp_timing.isDiag() and m.pp_timing.diag_engram_hit) {
+        const te0 = monoUs();
+        try evalAll(parts);
+        m.pp_timing.diag_engram_eval_us = monoUs() - te0;
+    }
     // The last wide layer's whole stream and mix when every span still holds its rows of them (this layer writes no
     // Engram rows, and nothing replaced a span since): the same words, no copy.
     const whole = sp.whole.len == 2 and sp.whole[0].ctx != null and (for (parts, sp.xs) |p, sx| {
@@ -6470,6 +6501,7 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
             const t1 = monoUs();
             const out = try sc.keep(try e.table.dequant(got.raw, (hi - lo) * nc, sc.s));
             Laps.engram(ek, got.us, t1 - t0, monoUs() - t1);
+            if (m.pp_timing.isDiag()) m.pp_timing.noteEngramSpan(got.us, t1 - t0);
             break :blk out;
         } else blk: {
             const mine = try gpa.alloc(u32, (hi - lo) * nc);
@@ -7012,6 +7044,145 @@ fn ref(x: A) A {
     }
     _ = mlx.mlx_array_set(&o, x);
     return o;
+}
+
+pub const SpansForBench = Spans;
+
+pub fn evalAllForBench(xs: []const A) !void {
+    return evalAll(xs);
+}
+
+pub fn appendLayerStateForBench(gpa: std.mem.Allocator, ev: *std.ArrayList(A), ls: *const LState) !void {
+    return appendLayerState(gpa, ev, ls);
+}
+
+pub fn spansOfForBench(held: []A, n: usize, targets: usize, span: usize, L: usize, p0: usize) Spans {
+    return spansOf(held, n, targets, span, L, p0);
+}
+
+pub fn cedReplayInForBench(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, tsp: *const Spans, li: usize) !void {
+    return cedReplayIn(m, gpa, st, sp, tsp, li);
+}
+
+pub fn importedRowsForBench(used: usize, width: usize, dt: mlx.mlx_dtype, s: S) !Rows {
+    return importedRows(used, width, dt, s);
+}
+
+pub fn fillImportedRowsForBench(rows: *Rows, x: A, s: S) !void {
+    return fillImportedRows(rows, x, s);
+}
+
+pub fn deinitRowsForBench(rows: *Rows) void {
+    rows.deinit();
+}
+
+pub fn refForBench(x: A) A {
+    return ref(x);
+}
+
+pub fn holdForBench(slot: *A, x: A) void {
+    hold(slot, x);
+}
+
+pub fn cacheLayoutForBench(m: *const Dsv41Model) !cache_codec.Layout {
+    return cacheLayout(m);
+}
+
+pub fn extendForBench(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32) !A {
+    return extend(m, gpa, st, ids, .last);
+}
+
+pub fn dropAheadForBench(m: *Dsv41Model) void {
+    m.dropAhead();
+}
+
+pub fn buildInitialSpansForBench(m: *const Dsv41Model, gpa: std.mem.Allocator, L: usize, span_w: usize, out_xs: []A, out_pres: []A) !void {
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const hc = m.cfg.dsv4_hc_mult;
+    const d = m.cfg.hidden_size;
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+    for (0..out_xs.len) |k| {
+        const lo = k * span_w;
+        const hi = @min(L, lo + span_w);
+        const rows = hi - lo;
+        var z = mlx.mlx_array_new();
+        const x = try sc.res(mlx.mlx_ones(&z, &[_]c_int{ ci(rows), ci(hc), ci(d) }, 3, m.act, m.s), &z);
+        const pre = try onehotPre(&sc, m, rows);
+        hold(&out_xs[k], x);
+        hold(&out_pres[k], pre);
+        try ev.append(gpa, out_xs[k]);
+        try ev.append(gpa, out_pres[k]);
+    }
+    try evalAll(ev.items);
+}
+
+pub fn buildSyntheticSnapForBench(m: *const Dsv41Model, gpa: std.mem.Allocator, n_snap: usize) !Snap {
+    const l = try cacheLayout(m);
+    const ids = try gpa.alloc(u32, n_snap);
+    errdefer gpa.free(ids);
+    @memset(ids, 1);
+    const hist = try gpa.alloc(u32, if (l.engram) n_snap else 0);
+    errdefer gpa.free(hist);
+    @memset(hist, 1);
+    const layers = try gpa.alloc(Snap.LSnap, l.layers);
+    errdefer gpa.free(layers);
+    for (layers) |*saved| saved.* = .{ .win = none, .comp = null, .idx_k = null, .pend_kv = none, .pend_gate = none };
+    const ds = try gpa.alloc(A, l.stages);
+    errdefer gpa.free(ds);
+    @memset(ds, none);
+
+    var sn: Snap = .{
+        .gen = 1,
+        .vision_key = 0,
+        .n = n_snap,
+        .ids = ids,
+        .layers = layers,
+        .ds = ds,
+        .mh = none,
+        .hist = hist,
+    };
+    errdefer sn.deinit(gpa);
+
+    for (sn.layers, 0..) |*saved, i| {
+        var win = mlx.mlx_array_new();
+        errdefer if (saved.win.ctx == null) {
+            _ = mlx.mlx_array_free(win);
+        };
+        try mlx.check(mlx.mlx_zeros(&win, &[_]c_int{ ci(l.ring), ci(l.width) }, 2, l.dtype, m.s));
+        try evalImported(win);
+        saved.win = win;
+        if (!l.source(i)) continue;
+        const r = l.ratios[i];
+        const used = n_snap / r;
+        saved.comp = try importedRows(used, l.width, l.dtype, m.s);
+        if (l.owner(i)) saved.idx_k = try importedRows(used, l.index_width, l.dtype, m.s);
+        const pend = n_snap % r;
+        if (pend > 0) {
+            var pkv = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&pkv, &[_]c_int{ ci(pend), ci(l.width) }, 2, .float32, m.s));
+            try evalImported(pkv);
+            saved.pend_kv = pkv;
+            var pg = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&pg, &[_]c_int{ ci(pend), ci(l.width) }, 2, .float32, m.s));
+            try evalImported(pg);
+            saved.pend_gate = pg;
+        }
+    }
+    for (sn.ds) |*d_slot| {
+        var d = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&d, &[_]c_int{ ci(l.ring), ci(l.width) }, 2, l.dtype, m.s));
+        try evalImported(d);
+        d_slot.* = d;
+    }
+    if (l.stages > 0) {
+        var mh = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&mh, &[_]c_int{ 1, ci(l.hidden_width) }, 2, l.dtype, m.s));
+        try evalImported(mh);
+        sn.mh = mh;
+    }
+    return sn;
 }
 
 /// The state `prompt`'s run reaches one token short of its end is kept for

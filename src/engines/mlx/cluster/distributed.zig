@@ -2381,6 +2381,8 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     // `--soak N`: N header + one-row-stream round trips, the shape of a pipeline decode hop.
     var soak: u64 = 0;
     var chain = false;
+    var pp_sizes = false;
+    var json_path: ?[]const u8 = null;
     var rest: [16][]const u8 = undefined;
     var n_rest: usize = 0;
     var ai: usize = 0;
@@ -2390,6 +2392,11 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
             ai += 1;
         } else if (std.mem.eql(u8, args[ai], "--chain")) {
             chain = true;
+        } else if (std.mem.eql(u8, args[ai], "--pp-sizes")) {
+            pp_sizes = true;
+        } else if (std.mem.eql(u8, args[ai], "--json-out") and ai + 1 < args.len) {
+            json_path = args[ai + 1];
+            ai += 1;
         } else if (n_rest < rest.len) {
             rest[n_rest] = args[ai];
             n_rest += 1;
@@ -2404,14 +2411,25 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     if (soak > 0) return soakLink(io, &link, other, soak, s);
     if (chain) return chainProbe(io, &link, s);
 
-    const sizes = [_]c_int{ 1, 5120, 10240, 262144, 6553600 }; // f32 elements: 4 B .. 25 MB
+    var json_fd: c_int = -1;
+    defer if (json_fd >= 0) crt.close(json_fd);
+    if (link.rank == 0) if (json_path) |jp| {
+        var zbuf: [1024]u8 = undefined;
+        const z = try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{jp}, 0);
+        json_fd = crt.openWrite(z, false);
+        if (json_fd < 0) return error.JsonOutOpenFailed;
+    };
+
+    const default_sizes = [_]c_int{ 1, 5120, 10240, 262144, 6553600 }; // f32 elements: 4 B .. 25 MB
+    const pp_seam_sizes = [_]c_int{ 5241920, 20970560, 20979712, 22290432, 41942080, 41959424, 44580864, 83918848, 89161728 };
+    const sizes: []const c_int = if (pp_sizes) &pp_seam_sizes else &default_sizes;
     for (sizes) |n| {
         const shape = [_]c_int{n};
         var x = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_ones(&x, &shape, 1, .float32, s));
         defer _ = mlx.mlx_array_free(x);
         try evalOne(x);
-        const iters: u32 = if (n > 1_000_000) 20 else 200;
+        const iters: u32 = if (pp_sizes) 50 else if (n > 1_000_000) 20 else 200;
         var best: u64 = std.math.maxInt(u64);
         var total: u64 = 0;
         for (0..iters + 5) |i| {
@@ -2437,9 +2455,17 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
                 best = @min(best, ns);
             }
         }
-        const bytes: f64 = @floatFromInt(@as(u64, @intCast(n)) * 4);
+        const byte_count: u64 = @as(u64, @intCast(n)) * 4;
+        const bytes: f64 = @floatFromInt(byte_count);
         const mean_us = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(iters)) / 1000.0;
-        log.info("[dist-probe] round trip {d:>9} B: mean {d:>9.1} us, best {d:>9.1} us, {d:>6.2} GB/s each way\n", .{ n * 4, mean_us, @as(f64, @floatFromInt(best)) / 1000.0, 2.0 * bytes / (mean_us * 1000.0) });
+        const best_us = @as(f64, @floatFromInt(best)) / 1000.0;
+        const gbps = 2.0 * bytes / (mean_us * 1000.0);
+        log.info("[dist-probe] round trip {d:>9} B: mean {d:>9.1} us, best {d:>9.1} us, {d:>6.2} GB/s each way\n", .{ byte_count, mean_us, best_us, gbps });
+        if (link.rank == 0 and (pp_sizes or json_fd >= 0)) {
+            var lbuf: [256]u8 = undefined;
+            const line = try std.fmt.bufPrint(&lbuf, "{{\"kind\":\"rdma_hop\",\"bytes\":{d},\"iters\":{d},\"one_way_mean_us\":{d:.1},\"one_way_best_us\":{d:.1},\"gbps\":{d:.3}}}\n", .{ byte_count, iters, mean_us * 0.5, best_us * 0.5, gbps });
+            if (json_fd >= 0) _ = crt.write(json_fd, line);
+        }
     }
     for ([_]c_int{ 10240, 262144 }) |n| {
         const shape = [_]c_int{n};

@@ -150,6 +150,7 @@ fn printUsage(io: std.Io) void {
         \\                      [--model-dir <dir>]... (default ~/.mlx-serve/models)
         \\  dist-probe          Measure the RDMA link: --rank 0|1 --coordinator
         \\                      <ip:port> --device <rdma_enX> [--soak N]
+        \\  pp-probe            Plan 75 Step 1 bound-measurement probe (recv|tcp-bench|model-bench)
         \\  launch <agent>      Configure + launch a coding agent CLI against the
         \\                      local server (claude, pi, omp, opencode, codex,
         \\                      hermes, aider, zcode); starts the MLX-Serve app if the
@@ -649,6 +650,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "dist-probe")) {
             if (mlx_engine.api().cluster_probe(io, args[2..]) != null) std.process.exit(1);
             return;
+        } else if (std.mem.eql(u8, cmd, "pp-probe")) {
+            if (mlx_engine.api().pp_probe(io, allocator, args[2..]) != null) std.process.exit(1);
+            return;
         } else if (std.mem.eql(u8, cmd, "plugin")) {
             @import("host/plugins/cli.zig").cmdPlugin(allocator, io, args[2..]) catch std.process.exit(1);
             return;
@@ -660,7 +664,7 @@ pub fn main(init: std.process.Init) !void {
             try launch_mod.cmdLaunch(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, serve, plugin, worker, or dist-probe)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, serve, plugin, worker, dist-probe, or pp-probe)\n", .{cmd});
             std.process.exit(1);
         }
     }
