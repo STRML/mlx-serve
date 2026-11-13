@@ -795,6 +795,7 @@ pub fn handleChatCompletions(
             kv_quant_override,
             if (stream.ablation) |a| a.key else 0,
             cache_key,
+            stream.cache_deadline_ms,
         );
     }
     var mm: MultimodalPrompt = .{};

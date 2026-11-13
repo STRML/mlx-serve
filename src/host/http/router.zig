@@ -221,7 +221,7 @@ pub fn handleConnection(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request JSON nests deeper than 4096 levels", 400);
         return;
     }
-    stream.noteRequestHeaders(request[0..header_end_pos]);
+    stream.noteRequestHeadersAt(request[0..header_end_pos], raw.header_read_ms);
     const cache_internal = stream.cache_export or isRoute(path, "/v1/cache/import");
     if (cache_internal) {
         if (!peerIsCacheTrusted(stream.stream.socket.address)) {
@@ -238,6 +238,10 @@ pub fn handleConnection(
         }
         if (isRoute(path, "/v1/cache/import") and !std.mem.eql(u8, method, "POST")) {
             try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
+            return;
+        }
+        if (stream.cache_deadline_invalid) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "X-Cache-Deadline-Ms must be a positive decimal integer", 400);
             return;
         }
     }

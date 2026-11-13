@@ -40,6 +40,7 @@ pub fn handleCacheExport(
     kv_quant_override: ?kv_quant.KVQuantConfig,
     variant: u64,
     cache_key: u64,
+    deadline_ms: ?u64,
 ) !void {
     const scheduler = http_server.launch().global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
@@ -52,6 +53,7 @@ pub fn handleCacheExport(
         .kv_quant_override = kv_quant_override,
         .variant = variant,
         .cache_key = cache_key,
+        .deadline_ms = deadline_ms,
         .max_bytes = effectiveMaxExportBytes(),
         .allocator = allocator,
     };
@@ -61,6 +63,9 @@ pub fn handleCacheExport(
         return;
     };
     switch (outcome) {
+        .deadline_passed => {
+            try sendErrorResponse(allocator, stream, "408 Request Timeout", "timeout_error", "cache export refused: deadline passed before it started", 408);
+        },
         .not_found => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "No matching RAM prefix-cache entry", 404);
         },
@@ -85,6 +90,7 @@ const ImportHttpError = struct {
 
 fn refusalHttp(r: requests.CacheImportRefusal) ImportHttpError {
     return switch (r) {
+        .deadline_passed => .{ .status = "408 Request Timeout", .code = 408, .kind = "timeout_error", .message = "cache import refused: deadline passed before it started" },
         .bad_envelope => .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = "cache import refused: invalid envelope" },
         .unknown_version => .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = "cache import refused: unknown envelope version" },
         .truncated_body => .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = "cache import refused: truncated body" },
@@ -120,6 +126,7 @@ pub fn handleCacheImport(
     var req: requests.CacheImportRequest = .{
         .model = lm,
         .body = body,
+        .deadline_ms = stream.cache_deadline_ms,
         .allocator = allocator,
     };
     const outcome = scheduler.importCache(&req) catch |err| {

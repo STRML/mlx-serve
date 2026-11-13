@@ -15,6 +15,7 @@ const peer_wire = @import("peer_wire.zig");
 const prefill_mod = @import("../prefill.zig");
 const distributed = @import("../cluster/distributed.zig");
 const publishHotCacheResidency = @import("budget.zig").publishHotCacheResidency;
+const nowMsMonotonic = io_util.nowMsMonotonic;
 const requests = @import("../../../host/gpu_thread/requests.zig");
 const LoadedModel = @import("../../../host/registry/registry.zig").LoadedModel;
 const Scheduler = @import("../scheduler.zig").Scheduler;
@@ -390,6 +391,14 @@ pub fn importWireModule(
 }
 
 pub fn runCacheExportRequest(sch: *Scheduler, req: *requests.CacheExportRequest) void {
+    if (deadlinePassed(sch.io, req.deadline_ms)) {
+        req.done_mu.lockUncancelable(sch.io);
+        defer req.done_mu.unlock(sch.io);
+        req.outcome = .deadline_passed;
+        req.done = true;
+        req.done_cond.broadcast(sch.io);
+        return;
+    }
     const out = exportWireModule(
         req.allocator,
         sch.io,
@@ -418,6 +427,14 @@ pub fn runCacheExportRequest(sch: *Scheduler, req: *requests.CacheExportRequest)
 }
 
 pub fn runCacheImportRequest(sch: *Scheduler, req: *requests.CacheImportRequest) void {
+    if (deadlinePassed(sch.io, req.deadline_ms)) {
+        req.done_mu.lockUncancelable(sch.io);
+        defer req.done_mu.unlock(sch.io);
+        req.outcome = .{ .refused = .deadline_passed };
+        req.done = true;
+        req.done_cond.broadcast(sch.io);
+        return;
+    }
     const out = importWireModule(req.allocator, sch.io, sch, req.model, req.body) catch |err| {
         req.done_mu.lockUncancelable(sch.io);
         defer req.done_mu.unlock(sch.io);
@@ -432,6 +449,12 @@ pub fn runCacheImportRequest(sch: *Scheduler, req: *requests.CacheImportRequest)
     req.outcome = out;
     req.done = true;
     req.done_cond.broadcast(sch.io);
+}
+
+fn deadlinePassed(io: std.Io, deadline_ms: ?u64) bool {
+    const deadline = deadline_ms orelse return false;
+    const now: u64 = @intCast(@max(nowMsMonotonic(io), 0));
+    return now > deadline;
 }
 
 pub fn exportCache(sch: *Scheduler, req: *requests.CacheExportRequest) !void {

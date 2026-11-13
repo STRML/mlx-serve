@@ -90,6 +90,8 @@ pub const Conn = struct {
     ablation_header: [192]u8 = undefined,
     ablation_header_len: usize = 0,
     cache_export: bool = false,
+    cache_deadline_ms: ?u64 = null,
+    cache_deadline_invalid: bool = false,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
@@ -103,15 +105,38 @@ pub const Conn = struct {
         c.sse_headers_sent = false;
         c.length_framed = false;
         c.cache_export = false;
+        c.cache_deadline_ms = null;
+        c.cache_deadline_invalid = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 
     /// Replaces the previous request's client, so a request without a User-Agent never inherits it.
     pub fn noteRequestHeaders(c: *Conn, headers: []const u8) void {
+        c.noteRequestHeadersAt(headers, nowMsMonotonic(c.io));
+    }
+
+    pub fn noteRequestHeadersAt(c: *Conn, headers: []const u8, head_read_ms: i64) void {
         c.client = instr.Client.fromUserAgent(findHeaderValue(headers, "user-agent"));
         c.clearAblation();
         c.ablation_key = findHeaderValue(headers, "x-ablation-key");
         c.cache_export = if (findHeaderValue(headers, "x-cache-export")) |v| std.mem.eql(u8, v, "1") else false;
+        c.cache_deadline_ms = null;
+        c.cache_deadline_invalid = false;
+        if (findHeaderValue(headers, "x-cache-deadline-ms")) |v| {
+            const duration = parsePositiveDecimal(v) orelse {
+                c.cache_deadline_invalid = true;
+                return;
+            };
+            const now: u64 = @intCast(@max(head_read_ms, 0));
+            c.cache_deadline_ms = std.math.add(u64, now, duration) catch std.math.maxInt(u64);
+        }
+    }
+
+    fn parsePositiveDecimal(value: []const u8) ?u64 {
+        if (value.len == 0) return null;
+        for (value) |byte| if (byte < '0' or byte > '9') return null;
+        const parsed = std.fmt.parseInt(u64, value, 10) catch return null;
+        return if (parsed > 0) parsed else null;
     }
 
     pub fn clearAblation(c: *Conn) void {
@@ -423,6 +448,33 @@ test "Conn names the client from each request's User-Agent and keeps no header t
     try std.testing.expectEqual(instr.Client.opencode, conn.client);
     conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n");
     try std.testing.expectEqual(instr.Client.other, conn.client);
+}
+
+test "Conn clears X-Cache-Deadline-Ms when the next request omits it" {
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 9 }, .port = 4242 } };
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = -1, .address = peer } }, std.Io.Threaded.global_single_threaded.io());
+
+    conn.noteRequestHeadersAt("POST /v1/cache/import HTTP/1.1\r\nX-Cache-Deadline-Ms: 5000\r\n\r\n", 1000);
+    try testing.expectEqual(@as(?u64, 6000), conn.cache_deadline_ms);
+    try testing.expect(!conn.cache_deadline_invalid);
+
+    conn.noteRequestHeadersAt("POST /v1/cache/import HTTP/1.1\r\nHost: x\r\n\r\n", 1001);
+    try testing.expectEqual(@as(?u64, null), conn.cache_deadline_ms);
+    try testing.expect(!conn.cache_deadline_invalid);
+}
+
+test "Conn accepts only positive decimal X-Cache-Deadline-Ms values" {
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 9 }, .port = 4242 } };
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = -1, .address = peer } }, std.Io.Threaded.global_single_threaded.io());
+
+    for ([_][]const u8{ "abc", "0", "-5", "18446744073709551616" }) |value| {
+        var headers: [128]u8 = undefined;
+        conn.noteRequestHeaders(try std.fmt.bufPrint(&headers, "X-Cache-Deadline-Ms: {s}\r\n\r\n", .{value}));
+        try testing.expect(conn.cache_deadline_invalid);
+        try testing.expectEqual(@as(?u64, null), conn.cache_deadline_ms);
+    }
 }
 
 test "Conn: a request's X-Ablation line rides both response heads, and the next request starts without it or the key" {

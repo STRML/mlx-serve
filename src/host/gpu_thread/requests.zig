@@ -359,6 +359,7 @@ pub const EmbedRequest = struct {
 
 pub const CacheExportOutcome = union(enum) {
     not_found,
+    deadline_passed,
     too_large: u64,
     ok: struct {
         bytes: []u8,
@@ -374,6 +375,7 @@ pub const CacheExportRequest = struct {
     kv_quant_override: ?kv_quant.KVQuantConfig = null,
     variant: u64 = 0,
     cache_key: u64 = 0,
+    deadline_ms: ?u64 = null,
     max_bytes: usize,
     outcome: CacheExportOutcome = .not_found,
     error_name: ?[]const u8 = null,
@@ -384,6 +386,7 @@ pub const CacheExportRequest = struct {
 };
 
 pub const CacheImportRefusal = enum {
+    deadline_passed,
     bad_envelope,
     unknown_version,
     truncated_body,
@@ -422,6 +425,7 @@ pub const CacheImportOutcome = union(enum) {
 pub const CacheImportRequest = struct {
     model: *LoadedModel,
     body: []const u8,
+    deadline_ms: ?u64 = null,
     outcome: CacheImportOutcome = .{ .refused = .bad_envelope },
     error_name: ?[]const u8 = null,
     done: bool = false,

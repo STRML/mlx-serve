@@ -94,6 +94,7 @@ const RawRequest = struct {
     buf: []u8,
     len: usize,
     header_end: usize,
+    header_read_ms: i64,
 };
 
 /// Reads one request: the head (up to 16 KB), then its `Content-Length` body. Null when no
@@ -114,6 +115,7 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
     var total_read: usize = 0;
     var content_length: ?usize = null;
     var header_end_pos: usize = 0;
+    var header_read_ms: i64 = 0;
 
     while (total_read < hdr_buf.len) {
         if (!stream.awaitReadable(head_deadline - nowMsMonotonic(stream.io))) return null;
@@ -123,6 +125,7 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
 
         if (std.mem.indexOf(u8, hdr_buf[0..total_read], "\r\n\r\n")) |he| {
             header_end_pos = he + 4;
+            header_read_ms = nowMsMonotonic(stream.io);
             content_length = findContentLength(hdr_buf[0..he]);
             break;
         }
@@ -180,7 +183,7 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
         }
         total_read += n;
     }
-    return .{ .buf = buf, .len = total_read, .header_end = header_end_pos };
+    return .{ .buf = buf, .len = total_read, .header_end = header_end_pos, .header_read_ms = header_read_ms };
 }
 
 fn findContentLength(headers: []const u8) ?usize {

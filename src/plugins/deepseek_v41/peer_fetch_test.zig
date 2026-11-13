@@ -251,6 +251,18 @@ test "dsv41 peer fetch: export from model A and importWireModule into model B pr
     try testing.expectEqual(@as(u32, 0), turn1.cached);
     try testing.expectEqual(@as(usize, 1), model_a.entry.prefix_cache.?.entries.items.len);
 
+    var expired_export: @import("../../host/gpu_thread/requests.zig").CacheExportRequest = .{
+        .model = model_a.entry,
+        .prompt_ids = &full_prompt,
+        .has_tools = false,
+        .cache_key = 42,
+        .max_bytes = router.max_cache_export_bytes,
+        .deadline_ms = 0,
+        .allocator = testing.allocator,
+    };
+    peer_transfer.runCacheExportRequest(&model_a.sch, &expired_export);
+    try testing.expectEqual(@as(@TypeOf(expired_export.outcome), .deadline_passed), expired_export.outcome);
+
     const exported = try peer_transfer.exportWireModule(
         testing.allocator,
         model_a.sch.io,
@@ -267,6 +279,18 @@ test "dsv41 peer fetch: export from model A and importWireModule into model B pr
     const wire = exported.ok.bytes;
     defer testing.allocator.free(wire);
     try testing.expectEqual(@as(usize, 24), exported.ok.n);
+    var future_export: @import("../../host/gpu_thread/requests.zig").CacheExportRequest = .{
+        .model = model_a.entry,
+        .prompt_ids = &full_prompt,
+        .has_tools = false,
+        .cache_key = 42,
+        .max_bytes = router.max_cache_export_bytes,
+        .deadline_ms = std.math.maxInt(u64),
+        .allocator = testing.allocator,
+    };
+    peer_transfer.runCacheExportRequest(&model_a.sch, &future_export);
+    try testing.expect(future_export.outcome == .ok);
+    testing.allocator.free(future_export.outcome.ok.bytes);
     const capped = try peer_transfer.exportWireModule(
         testing.allocator,
         model_a.sch.io,
@@ -281,13 +305,24 @@ test "dsv41 peer fetch: export from model A and importWireModule into model B pr
     );
     try testing.expectEqual(@as(@TypeOf(capped), .{ .too_large = @intCast(wire.len) }), capped);
 
-    const imported = try peer_transfer.importWireModule(
-        testing.allocator,
-        model_b.sch.io,
-        &model_b.sch,
-        model_b.entry,
-        wire,
-    );
+    var expired_import: @import("../../host/gpu_thread/requests.zig").CacheImportRequest = .{
+        .model = model_b.entry,
+        .body = wire,
+        .deadline_ms = 0,
+        .allocator = testing.allocator,
+    };
+    peer_transfer.runCacheImportRequest(&model_b.sch, &expired_import);
+    try testing.expectEqual(@as(@TypeOf(expired_import.outcome), .{ .refused = .deadline_passed }), expired_import.outcome);
+    try testing.expectEqual(@as(usize, 0), model_b.entry.prefix_cache.?.entries.items.len);
+
+    var future_import: @import("../../host/gpu_thread/requests.zig").CacheImportRequest = .{
+        .model = model_b.entry,
+        .body = wire,
+        .deadline_ms = std.math.maxInt(u64),
+        .allocator = testing.allocator,
+    };
+    peer_transfer.runCacheImportRequest(&model_b.sch, &future_import);
+    const imported = future_import.outcome;
     try testing.expect(imported == .ok);
     try testing.expectEqual(@as(usize, 24), imported.ok.n);
     try testing.expectEqual(@as(usize, 1), model_b.entry.prefix_cache.?.entries.items.len);
@@ -737,6 +772,18 @@ test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 medi
         const node_a = try LiveNode.open(io, files);
         defer node_a.close();
 
+        for ([_][]const u8{ "abc", "0", "-5" }) |deadline| {
+            const export_head = try std.fmt.allocPrint(
+                testing.allocator,
+                "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nAuthorization: Bearer peer-secret-60\r\nX-Cache-Export: 1\r\nX-Cache-Deadline-Ms: {s}\r\n",
+                .{deadline},
+            );
+            defer testing.allocator.free(export_head);
+            var export_reply = try sendHttp(io, node_a, loopback, export_head, turn1_body);
+            defer export_reply.deinit(testing.allocator);
+            try expectStatus("export_invalid_deadline_400", 400, export_reply);
+        }
+
         {
             var r1 = try sendHttp(io, node_a, lan_peer, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nAuthorization: Bearer peer-secret-60\r\nX-Cache-Export: 1\r\n", turn1_body);
             defer r1.deinit(testing.allocator);
@@ -777,7 +824,7 @@ test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 medi
             try testing.expect(saw_done);
         }
 
-        exp_reply = try sendHttp(io, node_a, loopback, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nAuthorization: Bearer peer-secret-60\r\nX-Cache-Export: 1\r\n", turn2_stream_body);
+        exp_reply = try sendHttp(io, node_a, loopback, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nAuthorization: Bearer peer-secret-60\r\nX-Cache-Export: 1\r\nX-Cache-Deadline-Ms: 60000\r\n", turn2_stream_body);
         exp_ready = true;
         try expectStatus("export_warm_200", 200, exp_reply);
         if (exp_reply.body.len <= peer_wire.FIXED_HEADER_BYTES) {
@@ -816,6 +863,18 @@ test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 medi
     {
         const node_b = try LiveNode.open(io, files);
         defer node_b.close();
+
+        for ([_][]const u8{ "abc", "0", "-5" }) |deadline| {
+            const import_head = try std.fmt.allocPrint(
+                testing.allocator,
+                "POST /v1/cache/import HTTP/1.1\r\nContent-Type: application/octet-stream\r\nAuthorization: Bearer peer-secret-60\r\nX-Cache-Deadline-Ms: {s}\r\n",
+                .{deadline},
+            );
+            defer testing.allocator.free(import_head);
+            var import_reply = try sendHttp(io, node_b, tb5_peer, import_head, "abc");
+            defer import_reply.deinit(testing.allocator);
+            try expectStatus("import_invalid_deadline_400", 400, import_reply);
+        }
 
         {
             var r2 = try sendHttp(io, node_b, lan_peer, "POST /v1/cache/import HTTP/1.1\r\nContent-Type: application/octet-stream\r\nAuthorization: Bearer peer-secret-60\r\n", "abc");
