@@ -9,6 +9,7 @@ const cache_codec = @import("cache_codec.zig");
 const config_mod = @import("config.zig");
 const plugin_abi = @import("../../abi/plugin.zig");
 const tcp = @import("pp_step1_tcp.zig");
+const table_bench = @import("pp_step1_table.zig");
 
 const A = mlx.mlx_array;
 const none: A = .{ .ctx = null };
@@ -309,6 +310,24 @@ pub fn formatKvStreamJson(buf: []u8, subtest: []const u8, prompt_tokens: usize, 
         .{ subtest, prompt_tokens, chunk_rows, wire_bytes, rows_bytes, iters, tcp_median_us, fill_rows_median_us, total_median_us, gbps },
     );
 }
+
+pub const TABLE_BENCH_P0 = table_bench.TABLE_BENCH_P0;
+pub const TABLE_BENCH_WIDTHS = table_bench.TABLE_BENCH_WIDTHS;
+pub const TABLE_BENCH_LAYERS = table_bench.TABLE_BENCH_LAYERS;
+pub const MAX_UBC_CACHED_RATIO = table_bench.MAX_UBC_CACHED_RATIO;
+pub const TableBenchSource = table_bench.TableBenchSource;
+pub const TableBenchSpec = table_bench.TableBenchSpec;
+pub const TABLE_BENCH_SPECS = table_bench.TABLE_BENCH_SPECS;
+pub const tableBenchSpecFor = table_bench.tableBenchSpecFor;
+pub const extractSortDedupLayerRows = table_bench.extractSortDedupLayerRows;
+pub const countDistinctInPlace = table_bench.countDistinctInPlace;
+pub const MsStats = table_bench.MsStats;
+pub const sampleMsStats = table_bench.sampleMsStats;
+pub const TableBenchCell = table_bench.TableBenchCell;
+pub const evaluateTableBenchCell = table_bench.evaluateTableBenchCell;
+pub const evaluateTableBenchGate = table_bench.evaluateTableBenchGate;
+pub const formatTableBenchJson = table_bench.formatTableBenchJson;
+pub const readTokenIdsFile = table_bench.readTokenIdsFile;
 
 pub const TimingState = struct {
     schedule: Schedule = .off,
@@ -820,7 +839,7 @@ pub fn verifyKvExportSizes(m: *const dsv41.Dsv41Model, gpa: std.mem.Allocator, j
     }
 }
 
-fn loadPackConfig(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) !config_mod.Config {
+pub fn loadPackConfig(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) !config_mod.Config {
     var fs = try FsPackDir.open(io, dir);
     defer fs.close();
     const pd = fs.packDir();
@@ -834,7 +853,7 @@ fn loadPackConfig(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) !config_m
     return config_mod.of(&p).*;
 }
 
-fn fillDeterministicTokens(dst: []u32, vocab: usize, salt: usize) void {
+pub fn fillDeterministicTokens(dst: []u32, vocab: usize, salt: usize) void {
     const cap = @max(@as(usize, 1), @min(vocab, 100_000));
     for (dst, 0..) |*t, i| {
         t.* = @intCast(((i + 1) *% 7919 +% salt *% 1_000_003 +% 13) % cap);
@@ -860,10 +879,15 @@ pub fn cmdProbe(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !v
     var peer_ep: ?[]const u8 = null;
     var model_dir: ?[]const u8 = null;
     var json_path: ?[]const u8 = null;
+    var tokens_path: ?[]const u8 = null;
+    var in_path: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
     var tcp_iters: usize = 50;
     var stage_warmup: usize = 3;
     var stage_reps: usize = 10;
     var diag_reps: usize = 3;
+    var table_reps: usize = 5;
+    var table_warmup: usize = 1;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -879,6 +903,12 @@ pub fn cmdProbe(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !v
             model_dir = v;
         } else if (std.mem.eql(u8, a, "--json-out")) {
             json_path = v;
+        } else if (std.mem.eql(u8, a, "--tokens-file") or std.mem.eql(u8, a, "--tokens")) {
+            tokens_path = v;
+        } else if (std.mem.eql(u8, a, "--in")) {
+            in_path = v;
+        } else if (std.mem.eql(u8, a, "--out")) {
+            out_path = v;
         } else if (std.mem.eql(u8, a, "--tcp-iters")) {
             tcp_iters = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, a, "--stage-warmup")) {
@@ -887,9 +917,20 @@ pub fn cmdProbe(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !v
             stage_reps = try std.fmt.parseInt(usize, v, 10);
         } else if (std.mem.eql(u8, a, "--diag-reps")) {
             diag_reps = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--reps")) {
+            table_reps = try std.fmt.parseInt(usize, v, 10);
+        } else if (std.mem.eql(u8, a, "--warmup")) {
+            table_warmup = try std.fmt.parseInt(usize, v, 10);
         } else {
             return error.InvalidArgs;
         }
+    }
+
+    if (std.mem.eql(u8, sub, "tokenize-ids")) {
+        const dir = model_dir orelse return error.InvalidArgs;
+        const inp = in_path orelse return error.InvalidArgs;
+        const outp = out_path orelse return error.InvalidArgs;
+        return table_bench.runTokenizeIds(io, gpa, dir, inp, outp);
     }
 
     if (std.mem.eql(u8, sub, "recv")) {
@@ -914,6 +955,12 @@ pub fn cmdProbe(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !v
         try tcp.runKvStreamSuite(&sock, gpa, &json_out, &kv_ns, &widths, 2, 10);
         tcp.sendDone(sock.fd);
         return;
+    }
+
+    if (std.mem.eql(u8, sub, "table-bench")) {
+        const dir = model_dir orelse return error.InvalidArgs;
+        const tpath = tokens_path orelse return error.InvalidArgs;
+        return table_bench.runTableBench(io, gpa, dir, tpath, table_reps, table_warmup, json_path, &json_out);
     }
 
     if (!std.mem.eql(u8, sub, "model-bench")) return error.InvalidArgs;

@@ -519,7 +519,7 @@ pub const Table = struct {
     /// each a contiguous run of them: a row's codes through the blocks that hold them, its scales (and biases) from the
     /// block the run read last when it holds them, so neighbouring rows' scales cost one read. Rows in `ids`'s order.
     /// `cap`: the threads the read may run on (at most `GRID_THREADS`).
-    fn readSorted(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, cap: usize) !Raw {
+    pub fn readSorted(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, cap: usize) !Raw {
         const n = ids.len;
         const w = try gpa.alignedAlloc(u8, .@"4", n * self.wlen);
         errdefer gpa.free(w);
@@ -999,7 +999,7 @@ const PAR_THREADS_DIRECT = 64;
 /// parameter, not the cell's). The table's distinct rows, about 155K on a cold 16K card at about 4 KB each, one direct
 /// pread a row; the first Engram layer otherwise waits on table 0 with the GPU idle. Exact: the same rows into the same
 /// buffers; only how many threads read them.
-const GRID_THREADS = 128;
+pub const GRID_THREADS = 128;
 comptime {
     if (GRID_THREADS < PAR_THREADS_DIRECT) @compileError("GRID_THREADS below the stock 64");
 }

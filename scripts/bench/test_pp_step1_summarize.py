@@ -540,5 +540,61 @@ class PpStep1SummarizeTests(unittest.TestCase):
         md = summ.render_markdown(summary, ds)
         self.assertNotIn("unreachable <= 128k", md)
 
+    def test_make_pp_step1b_tokens_interleaves_prose_and_code_and_writes_le_u32(self) -> None:
+        import make_pp_step1b_tokens as mktok
+
+        with tempfile.TemporaryDirectory() as tmp:
+            docs_dir = os.path.join(tmp, "docs")
+            src_dir = os.path.join(tmp, "src")
+            os.makedirs(docs_dir)
+            os.makedirs(src_dir)
+            for idx in range(4):
+                with open(os.path.join(docs_dir, f"doc_{idx}.md"), "w", encoding="utf-8") as fh:
+                    fh.write((f"# Architecture Note {idx}\nPipeline parallel prefill hides SSD reads.\n") * 40)
+                with open(os.path.join(src_dir, f"mod_{idx}.zig"), "w", encoding="utf-8") as fh:
+                    fh.write((f"pub fn step{idx}(x: u32) u32 {{ return x + {idx}; }}\n") * 40)
+
+            corpus = mktok.collect_mixed_corpus(tmp, target_bytes=4096)
+            self.assertGreaterEqual(len(corpus.encode("utf-8")), 4096)
+            self.assertIn("# Architecture Note 0", corpus)
+            self.assertIn("pub fn step0", corpus)
+
+            fake_stage = os.path.join(tmp, "stage")
+            os.makedirs(os.path.join(fake_stage, "lib"))
+            fake_bin = os.path.join(fake_stage, "mlx-serve")
+            built_env = mktok.build_tokenize_env(fake_bin, {})
+            self.assertTrue(built_env["DYLD_LIBRARY_PATH"].endswith("/stage/lib"))
+            with open(fake_bin, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/usr/bin/env python3\n"
+                    "import struct, sys\n"
+                    "assert sys.argv[1:3] == ['pp-probe', 'tokenize-ids']\n"
+                    "args = sys.argv[3:]\n"
+                    "kv = {args[i]: args[i + 1] for i in range(0, len(args), 2)}\n"
+                    "data = open(kv['--in'], 'rb').read()\n"
+                    "ids = [b % 1000 for b in data]\n"
+                    "with open(kv['--out'], 'wb') as out:\n"
+                    "    out.write(struct.pack(f'<{len(ids)}I', *ids))\n"
+                )
+            os.chmod(fake_bin, 0o755)
+
+            out_u32 = os.path.join(tmp, "tokens.u32")
+            out_txt = os.path.join(tmp, "tokens.txt")
+            rc = mktok.main([
+                "--repo-root", tmp,
+                "--model", tmp,
+                "--mlx-serve", fake_bin,
+                "--out", out_u32,
+                "--text-out", out_txt,
+                "--target-kb", "4",
+                "--min-tokens", "2000",
+            ])
+            self.assertEqual(rc, 0)
+            with open(out_u32, "rb") as fh:
+                raw = fh.read()
+            self.assertEqual(len(raw) % 4, 0)
+            self.assertGreaterEqual(len(raw) // 4, 2000)
+            self.assertTrue(os.path.isfile(out_txt))
+
 if __name__ == "__main__":
     unittest.main()

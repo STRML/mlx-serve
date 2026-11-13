@@ -66,7 +66,7 @@ pub fn unregister(fd: c_int) void {
     }
 }
 
-fn blockOf(fd: c_int) u64 {
+pub fn blockOf(fd: c_int) u64 {
     for (ps().files[0..ps().n_files]) |f| if (f.fd == fd) return f.block;
     return 0;
 }
