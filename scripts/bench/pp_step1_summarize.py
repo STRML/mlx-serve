@@ -41,6 +41,10 @@ SCHEDULES: dict[tuple[str, int], list[tuple[int, int, bool, str]]] = {
 PROMPT_LADDER = [8192, 16384, 32768, 49152, 65536, 131072]
 CHUNK_WIDTHS = [2048, 4096, 8192]
 PP_WIDTHS = [2, 3, 4]
+REQUIRED_COLD_TOKENS = (8192, 32768, 65536, 131072)
+REQUIRED_STAGE_P0 = (0, 32768, 131072)
+REQUIRED_KV_CHECK_TOKENS = (8192, 32768, 65536)
+SEAM_KINDS = ("pair_cut", "mid_group")
 
 
 def seam_payload_bytes(rows: int, seam: str) -> int:
@@ -74,13 +78,17 @@ def plan_pp_chunks(n_snap: int, chunk_c: int) -> list[int]:
     return chunks
 
 
-def interp_1d(points: dict[int, float], x: float) -> float:
+def interp_1d(points: dict[int, float], x: float, *, allow_clamp: bool = False) -> float:
     if not points:
-        raise KeyError("empty interpolation table")
+        raise ValueError("empty interpolation table")
     xs = sorted(points.keys())
-    if x <= xs[0]:
+    if x < xs[0] or x > xs[-1]:
+        if not allow_clamp:
+            raise ValueError(f"interpolation target {x} outside measured range [{xs[0]}, {xs[-1]}]")
+        return points[xs[0]] if x <= xs[0] else points[xs[-1]]
+    if x == xs[0]:
         return points[xs[0]]
-    if x >= xs[-1]:
+    if x == xs[-1]:
         return points[xs[-1]]
     for i in range(len(xs) - 1):
         x0, x1 = xs[i], xs[i + 1]
@@ -122,7 +130,18 @@ REQUIRED_FIELDS: dict[str, set[str]] = {
         "engram_eval_us",
         "indexer_us",
     },
-    "tcp_hop": {"mode", "chunk_rows", "seam", "bytes", "iters", "median_us", "gbps", "mtu"},
+    "tcp_hop": {
+        "mode",
+        "chunk_rows",
+        "seam",
+        "bytes",
+        "iters",
+        "median_us",
+        "uma_memcpy_us",
+        "uma_mlx_new_us",
+        "gbps",
+        "mtu",
+    },
     "rdma_hop": {"bytes", "iters", "one_way_mean_us", "gbps"},
     "tcp_gpu_overlap": {
         "chunk_rows",
@@ -202,6 +221,8 @@ class Dataset:
         self.tail_us: dict[int, float] = {}
         self.tcp_one_way_us: dict[tuple[int, str], float] = {}
         self.tcp_pipelined_us: dict[tuple[int, str], float] = {}
+        self.tcp_uma_memcpy_us: dict[tuple[int, str], float] = {}
+        self.tcp_uma_mlx_new_us: dict[tuple[int, str], float] = {}
         self.tcp_mtu: int = 0
         self.tcp_iface: str = ""
         self.rdma_one_way_us: dict[int, float] = {}
@@ -250,8 +271,12 @@ class Dataset:
                 key2 = (int(r["chunk_rows"]), str(r["seam"]))
                 if r["mode"] == "one_way":
                     self.tcp_one_way_us[key2] = float(r["median_us"])
+                    self.tcp_uma_memcpy_us.setdefault(key2, float(r["uma_memcpy_us"]))
+                    self.tcp_uma_mlx_new_us.setdefault(key2, float(r["uma_mlx_new_us"]))
                 elif r["mode"] == "pipelined":
                     self.tcp_pipelined_us[key2] = float(r["median_us"])
+                    self.tcp_uma_memcpy_us[key2] = float(r["uma_memcpy_us"])
+                    self.tcp_uma_mlx_new_us[key2] = float(r["uma_mlx_new_us"])
                 self.tcp_mtu = max(self.tcp_mtu, int(r.get("mtu", 0)))
                 if r.get("iface"):
                     self.tcp_iface = str(r["iface"])
@@ -283,12 +308,59 @@ class Dataset:
                 "indexer_us": statistics.median(float(x["indexer_us"]) for x in rows),
             }
 
+    def validate_complete(self) -> None:
+        missing: list[str] = []
+        for n_tok in REQUIRED_COLD_TOKENS:
+            if n_tok not in self.single_box_tps:
+                missing.append(f"single_box_cold({n_tok})")
+        for (fam, pp_w), _stages in sorted(SCHEDULES.items()):
+            for c_rows in CHUNK_WIDTHS:
+                for s_idx in range(pp_w):
+                    s_key = (fam, pp_w, c_rows, s_idx)
+                    p0_map = self.stage_us.get(s_key)
+                    if not p0_map:
+                        missing.append(f"stage_timing({fam}{pp_w},C={c_rows},s={s_idx})")
+                        continue
+                    for req_p0 in REQUIRED_STAGE_P0:
+                        if req_p0 not in p0_map:
+                            missing.append(f"stage_timing({fam}{pp_w},C={c_rows},s={s_idx},p0={req_p0})")
+        for req_p0 in REQUIRED_STAGE_P0:
+            if req_p0 not in self.tail_us:
+                missing.append(f"tail_timing(p0={req_p0})")
+        for c_rows in CHUNK_WIDTHS:
+            for seam in SEAM_KINDS:
+                key = (c_rows, seam)
+                if key not in self.tcp_one_way_us:
+                    missing.append(f"tcp_hop(one_way,C={c_rows},{seam})")
+                if key not in self.tcp_pipelined_us:
+                    missing.append(f"tcp_hop(pipelined,C={c_rows},{seam})")
+                if key not in self.tcp_uma_memcpy_us or key not in self.tcp_uma_mlx_new_us:
+                    missing.append(f"tcp_hop_uma(C={c_rows},{seam})")
+            if c_rows not in self.overlap_gpu_ratio or c_rows not in self.overlap_tcp_ratio:
+                missing.append(f"tcp_gpu_overlap(C={c_rows})")
+            if c_rows not in self.kv_drain_us:
+                missing.append(f"kv_stream(final_chunk_drain,C={c_rows})")
+        if missing:
+            raise ValueError("missing required measurements: " + ", ".join(missing))
+
+    def stage_handoff_out_us(self, chunk_rows: int, seam: str) -> float:
+        key = (chunk_rows, seam)
+        if key not in self.tcp_uma_memcpy_us:
+            raise ValueError(f"missing uma_memcpy_us for chunk_rows={chunk_rows}, seam={seam}")
+        return max(0.0, self.tcp_uma_memcpy_us[key])
+
+    def stage_handoff_in_us(self, chunk_rows: int, seam: str) -> float:
+        key = (chunk_rows, seam)
+        if key not in self.tcp_uma_mlx_new_us:
+            raise ValueError(f"missing uma_mlx_new_us for chunk_rows={chunk_rows}, seam={seam}")
+        return max(0.0, self.tcp_uma_mlx_new_us[key])
+
     def hop_solo_us(self, chunk_rows: int, seam: str, transport: str) -> float:
         if transport == "rdma":
             b = seam_payload_bytes(chunk_rows, seam)
             if b in self.rdma_one_way_us:
                 return self.rdma_one_way_us[b]
-            return interp_1d(self.rdma_one_way_us, float(b))
+            return interp_1d(self.rdma_one_way_us, float(b), allow_clamp=True)
         key = (chunk_rows, seam)
         if key in self.tcp_one_way_us:
             return self.tcp_one_way_us[key]
@@ -299,9 +371,12 @@ class Dataset:
         if transport == "rdma":
             return self.hop_solo_us(chunk_rows, seam, "rdma")
         key = (chunk_rows, seam)
-        base = self.tcp_pipelined_us.get(key, self.hop_solo_us(chunk_rows, seam, "tcp"))
-        ratio = self.overlap_tcp_ratio.get(chunk_rows, 1.0)
-        return base * ratio
+        if key not in self.tcp_pipelined_us:
+            raise ValueError(f"missing pipelined tcp_hop for chunk_rows={chunk_rows}, seam={seam}")
+        if chunk_rows not in self.overlap_tcp_ratio:
+            raise ValueError(f"missing tcp_gpu_overlap for chunk_rows={chunk_rows}")
+        base = max(self.tcp_pipelined_us[key], self.stage_handoff_out_us(chunk_rows, seam))
+        return base * self.overlap_tcp_ratio[chunk_rows]
 
     def choose_cut_family(self, chunk_rows: int, p0: int = 32768) -> dict[str, Any]:
         stages_a = [
@@ -344,7 +419,22 @@ class Dataset:
         m_chunks = len(chunks)
         sched = SCHEDULES[(family, pp_width)]
         seams = [s[3] for s in sched[:-1]]
-        gpu_ratio = 1.0 if transport == "rdma" else self.overlap_gpu_ratio.get(chunk_rows, 1.0)
+        if transport == "rdma":
+            if not self.rdma_one_way_us:
+                raise ValueError("missing rdma_hop measurements")
+            gpu_ratio = 1.0
+        else:
+            if chunk_rows not in self.overlap_gpu_ratio:
+                raise ValueError(f"missing tcp_gpu_overlap for chunk_rows={chunk_rows}")
+            gpu_ratio = self.overlap_gpu_ratio[chunk_rows]
+
+        for s in range(pp_width):
+            s_key = (family, pp_width, chunk_rows, s)
+            if s_key not in self.stage_us:
+                raise ValueError(f"missing stage_timing for {s_key}")
+            missing_p0 = [p for p in REQUIRED_STAGE_P0 if p not in self.stage_us[s_key]]
+            if missing_p0:
+                raise ValueError(f"missing stage_timing p0={missing_p0} for {s_key}")
 
         step_times: list[float] = []
         step_nocomm_times: list[float] = []
@@ -358,9 +448,22 @@ class Dataset:
             step_nocomm_times.append(max(solos))
             effs: list[float] = []
             for s in range(pp_width):
-                wire_seam = seams[s] if s < pp_width - 1 else seams[-1]
-                wire_us = w * self.hop_steady_us(chunk_rows, wire_seam, transport)
-                effs.append(max(solos[s] * gpu_ratio, wire_us))
+                in_us = (
+                    w * self.stage_handoff_in_us(chunk_rows, seams[s - 1])
+                    if (transport != "rdma" and s > 0)
+                    else 0.0
+                )
+                out_us = (
+                    w * self.stage_handoff_out_us(chunk_rows, seams[s])
+                    if (transport != "rdma" and s < pp_width - 1)
+                    else 0.0
+                )
+                wire_us = (
+                    w * self.hop_steady_us(chunk_rows, seams[s], transport)
+                    if s < pp_width - 1
+                    else 0.0
+                )
+                effs.append(max(solos[s] * gpu_ratio + in_us + out_us, wire_us))
             step_times.append(max(effs))
             p0 += lc
 
@@ -373,24 +476,24 @@ class Dataset:
         w0 = chunks[0] / float(chunk_rows)
         fill_hops_us = sum(w0 * self.hop_solo_us(chunk_rows, sm, transport) for sm in seams)
 
-        if transport == "rdma" and self.rdma_one_way_us:
+        if transport == "rdma":
             drain_bytes = (
                 2 * 1280 * (chunk_rows // 2)
                 + 1280 * chunk_rows
                 + 15 * WIN_RING_BYTES
                 + CED_TAIL_ROWS * PAIR_SEAM_ROW_BYTES
             )
-            drain_us = interp_1d(self.rdma_one_way_us, float(drain_bytes))
+            drain_us = interp_1d(self.rdma_one_way_us, float(drain_bytes), allow_clamp=True)
         elif chunk_rows in self.kv_drain_us:
             drain_us = self.kv_drain_us[chunk_rows]
-        elif self.kv_full_us:
-            drain_us = interp_1d(self.kv_full_us, float(prompt_n))
         else:
-            drain_us = 0.0
+            raise ValueError(f"missing kv_stream final_chunk_drain for chunk_rows={chunk_rows}")
 
+        missing_tail = [p for p in REQUIRED_STAGE_P0 if p not in self.tail_us]
+        if missing_tail:
+            raise ValueError(f"missing tail_timing p0={missing_tail}")
         tail_p0 = max(0, n_snap - CED_TAIL_ROWS)
-        tail_us = interp_1d(self.tail_us, float(tail_p0)) if self.tail_us else 0.0
-
+        tail_us = interp_1d(self.tail_us, float(tail_p0))
         total_us = pipeline_us + fill_hops_us + drain_us + tail_us
         r_bound = (prompt_n * 1_000_000.0 / total_us) if total_us > 0 else 0.0
         exposed_comm_us = fill_hops_us + overlap_excess_us + drain_us
@@ -413,10 +516,17 @@ class Dataset:
         }
 
 
-def find_10k_threshold(ds: Dataset, chunk_star: int, family_star: str) -> int | None:
+def find_10k_threshold(
+    ds: Dataset,
+    widths: list[int],
+    family_choices: dict[int, dict[str, Any]],
+) -> int | None:
     for n_tok in range(8192, 131072 + 1, 256):
-        res = ds.compute_r_bound(n_tok, 4, chunk_star, family_star, "tcp")
-        if res["r_bound_tok_s"] >= 10_000.0:
+        best = max(
+            ds.compute_r_bound(n_tok, 4, c, family_choices[c]["winner"], "tcp")["r_bound_tok_s"]
+            for c in widths
+        )
+        if best >= 10_000.0:
             return n_tok
     return None
 
@@ -435,7 +545,7 @@ def evaluate_gate(ds: Dataset) -> dict[str, Any]:
             reasons.append(f"load_check_narrowed(prefill_chunk={lc.get('prefill_chunk')})")
     if ds.warm_cold_hits:
         reasons.append(f"warm_hit_in_cold_bench({ds.warm_cold_hits[0][0]}:{ds.warm_cold_hits[0][1]})")
-    for req_n in (8192, 32768, 65536):
+    for req_n in REQUIRED_KV_CHECK_TOKENS:
         if req_n not in ds.kv_checks:
             reasons.append(f"missing_kv_export_check({req_n})")
             continue
@@ -444,13 +554,8 @@ def evaluate_gate(ds: Dataset) -> dict[str, Any]:
         if not chk["match"] or int(chk["export_bytes"]) != want or int(chk["plan_bytes"]) != want:
             reasons.append(f"kv_export_mismatch({req_n})")
 
-    available_widths = [
-        c
-        for c in CHUNK_WIDTHS
-        if ("A", 4, c, 0) in ds.stage_us and ("B", 4, c, 0) in ds.stage_us
-    ]
-    if not available_widths:
-        raise ValueError("no complete PP4 stage_timing measurements found in JSONL")
+    ds.validate_complete()
+    available_widths = list(CHUNK_WIDTHS)
 
     family_choices = {c: ds.choose_cut_family(c) for c in available_widths}
 
@@ -470,8 +575,8 @@ def evaluate_gate(ds: Dataset) -> dict[str, Any]:
     best_32k = pp4_32k[c_star_32k]
     best_64k = pp4_64k[c_star_64k]
 
-    r1_32k = interp_1d(ds.single_box_tps, 32768.0)
-    r1_64k = interp_1d(ds.single_box_tps, 65536.0)
+    r1_32k = ds.single_box_tps[32768]
+    r1_64k = ds.single_box_tps[65536]
 
     speedup_32k = best_32k["r_bound_tok_s"] / r1_32k if r1_32k > 0 else 0.0
     speedup_64k = best_64k["r_bound_tok_s"] / r1_64k if r1_64k > 0 else 0.0
@@ -496,13 +601,13 @@ def evaluate_gate(ds: Dataset) -> dict[str, Any]:
     )
     rdma_gap_64k = (rdma_64k - best_64k["r_bound_tok_s"]) if rdma_64k is not None else None
 
-    n_10k = find_10k_threshold(ds, c_star_32k, family_choices[c_star_32k]["winner"])
+    n_10k = find_10k_threshold(ds, available_widths, family_choices)
 
     table_rows: list[dict[str, Any]] = []
     for n_tok in PROMPT_LADDER:
         row: dict[str, Any] = {
             "prompt_tokens": n_tok,
-            "r1_tok_s": interp_1d(ds.single_box_tps, float(n_tok)) if ds.single_box_tps else 0.0,
+            "r1_tok_s": interp_1d(ds.single_box_tps, float(n_tok)),
         }
         for pp_w in PP_WIDTHS:
             for c_rows in available_widths:

@@ -9,27 +9,35 @@ const is_macos = builtin.os.tag == .macos;
 const is_windows = builtin.os.tag == .windows;
 
 pub const SOCKET_BUF_BYTES: c_int = 4 * 1024 * 1024;
+pub const SocketFd = if (is_windows) c_int else std.c.fd_t;
 
-const Ifaddrs = extern struct {
-    next: ?*Ifaddrs,
-    name: [*:0]u8,
-    flags: c_uint,
-    addr: ?*std.posix.sockaddr,
-    netmask: ?*std.posix.sockaddr,
-    dstaddr: ?*std.posix.sockaddr,
-    data: ?*anyopaque,
+const posix_ffi = struct {
+    const Ifaddrs = extern struct {
+        next: ?*Ifaddrs,
+        name: [*:0]u8,
+        flags: c_uint,
+        addr: ?*std.posix.sockaddr,
+        netmask: ?*std.posix.sockaddr,
+        dstaddr: ?*std.posix.sockaddr,
+        data: ?*anyopaque,
+    };
+
+    extern "c" fn getifaddrs(ifap: *?*Ifaddrs) c_int;
+    extern "c" fn freeifaddrs(ifa: ?*Ifaddrs) void;
+    extern "c" fn if_nametoindex(ifname: [*:0]const u8) c_uint;
+    extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 };
 
-const IfreqMtu = extern struct {
-    name: [16]u8 = @splat(0),
-    mtu: c_int = 0,
-    pad: [12]u8 = @splat(0),
-};
+pub fn IfreqMtuLayout(comptime os_tag: @TypeOf(builtin.os.tag), comptime ptr_bits: u16) type {
+    const union_bytes = if (os_tag != .macos and ptr_bits == 64) 24 else 16;
+    return extern struct {
+        name: [16]u8 align(if (ptr_bits == 64) 8 else 4) = @splat(0),
+        mtu: c_int = 0,
+        pad: [union_bytes - @sizeOf(c_int)]u8 = @splat(0),
+    };
+}
 
-extern "c" fn getifaddrs(ifap: *?*Ifaddrs) c_int;
-extern "c" fn freeifaddrs(ifa: ?*Ifaddrs) void;
-extern "c" fn if_nametoindex(ifname: [*:0]const u8) c_uint;
-extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+const IfreqMtu = IfreqMtuLayout(builtin.os.tag, @bitSizeOf(usize));
 
 const IFF_UP: c_uint = 0x1;
 const DARWIN_IP_BOUND_IF: c_int = 25;
@@ -37,7 +45,7 @@ const DARWIN_SO_NOSIGPIPE: c_int = 0x1022;
 const SIOCGIFMTU_CODE: c_ulong = if (is_macos) 0xc0206933 else 0x8921;
 
 pub const BoundSocketInfo = struct {
-    fd: std.c.fd_t,
+    fd: SocketFd,
     iface_buf: [16]u8 = @splat(0),
     iface_len: usize = 0,
     local_ip: [4]u8 = .{ 0, 0, 0, 0 },
@@ -71,22 +79,22 @@ pub fn parseIp4Port(raw: []const u8) !struct { ip4: [4]u8, port: u16 } {
 }
 
 pub fn queryInterfaceMtu(ifname: []const u8) i32 {
-    if (is_windows or ifname.len == 0 or ifname.len >= 16) return 0;
+    if (comptime (is_windows or (!is_macos and builtin.os.tag != .linux))) return 0;
+    if (ifname.len == 0 or ifname.len >= 16) return 0;
     const s = std.c.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
     if (s < 0) return 0;
     defer _ = std.c.close(s);
     var ifr: IfreqMtu = .{};
     @memcpy(ifr.name[0..ifname.len], ifname);
-    if (ioctl(s, SIOCGIFMTU_CODE, &ifr) != 0) return 0;
+    if (posix_ffi.ioctl(s, SIOCGIFMTU_CODE, &ifr) != 0) return 0;
     return ifr.mtu;
 }
 
 pub fn findSubnetInterface(peer_ip: [4]u8, out_name: *[16]u8) ?struct { len: usize, local_ip: [4]u8 } {
-    if (is_windows) return null;
-    var head: ?*Ifaddrs = null;
-    if (getifaddrs(&head) != 0) return null;
-    defer freeifaddrs(head);
-
+    if (comptime is_windows) return null;
+    var head: ?*posix_ffi.Ifaddrs = null;
+    if (posix_ffi.getifaddrs(&head) != 0) return null;
+    defer posix_ffi.freeifaddrs(head);
     const peer_u32: u32 = @bitCast(peer_ip);
     var cur = head;
     while (cur) |ifa| : (cur = ifa.next) {
@@ -108,9 +116,11 @@ pub fn findSubnetInterface(peer_ip: [4]u8, out_name: *[16]u8) ?struct { len: usi
     return null;
 }
 
-pub fn configureTcpSocket(fd: std.c.fd_t) struct { sndbuf: i32, rcvbuf: i32 } {
+pub fn configureTcpSocket(fd: SocketFd) struct { sndbuf: i32, rcvbuf: i32 } {
+    if (comptime is_windows) return .{ .sndbuf = 0, .rcvbuf = 0 };
     const one: c_int = 1;
     _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &one, @sizeOf(c_int));
+    _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, &one, @sizeOf(c_int));
     if (is_macos) _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, DARWIN_SO_NOSIGPIPE, &one, @sizeOf(c_int));
     const want: c_int = SOCKET_BUF_BYTES;
     _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &want, @sizeOf(c_int));
@@ -125,6 +135,7 @@ pub fn configureTcpSocket(fd: std.c.fd_t) struct { sndbuf: i32, rcvbuf: i32 } {
 }
 
 pub fn bindAndConnectPeer(peer_ip: [4]u8, port: u16, timeout_ms: i32) !BoundSocketInfo {
+    if (comptime is_windows) return error.UnsupportedPlatform;
     const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketCreateFailed;
     errdefer _ = std.c.close(fd);
@@ -143,7 +154,7 @@ pub fn bindAndConnectPeer(peer_ip: [4]u8, port: u16, timeout_ms: i32) !BoundSock
         if (is_macos) {
             var zname: [17]u8 = @splat(0);
             @memcpy(zname[0..found.len], info.iface_buf[0..found.len]);
-            const idx: c_uint = if_nametoindex(@ptrCast(&zname));
+            const idx: c_uint = posix_ffi.if_nametoindex(@ptrCast(&zname));
             if (idx != 0) _ = std.c.setsockopt(fd, std.posix.IPPROTO.IP, DARWIN_IP_BOUND_IF, &idx, @sizeOf(c_uint));
         }
         var local_sa: std.posix.sockaddr.in = .{ .port = 0, .addr = @bitCast(found.local_ip) };
@@ -170,7 +181,8 @@ pub fn bindAndConnectPeer(peer_ip: [4]u8, port: u16, timeout_ms: i32) !BoundSock
     return info;
 }
 
-pub fn listenTcp(bind_ip: [4]u8, port: u16) !struct { fd: std.c.fd_t, port: u16 } {
+pub fn listenTcp(bind_ip: [4]u8, port: u16) !struct { fd: SocketFd, port: u16 } {
+    if (comptime is_windows) return error.UnsupportedPlatform;
     const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketCreateFailed;
     errdefer _ = std.c.close(fd);
@@ -186,7 +198,8 @@ pub fn listenTcp(bind_ip: [4]u8, port: u16) !struct { fd: std.c.fd_t, port: u16 
     return .{ .fd = fd, .port = std.mem.bigToNative(u16, bound_sa.port) };
 }
 
-pub fn writeFull(fd: std.c.fd_t, buf: []const u8) !void {
+pub fn writeFull(fd: SocketFd, buf: []const u8) !void {
+    if (comptime is_windows) return error.UnsupportedPlatform;
     var off: usize = 0;
     while (off < buf.len) {
         const chunk = @min(buf.len - off, 16 * 1024 * 1024);
@@ -197,7 +210,8 @@ pub fn writeFull(fd: std.c.fd_t, buf: []const u8) !void {
     }
 }
 
-pub fn readFull(fd: std.c.fd_t, buf: []u8, timeout_ms: i32) !void {
+pub fn readFull(fd: SocketFd, buf: []u8, timeout_ms: i32) !void {
+    if (comptime is_windows) return error.UnsupportedPlatform;
     var off: usize = 0;
     while (off < buf.len) {
         if (timeout_ms > 0) {
@@ -212,14 +226,23 @@ pub fn readFull(fd: std.c.fd_t, buf: []u8, timeout_ms: i32) !void {
     }
 }
 
+pub fn readFrameHdr(fd: SocketFd, hdr: *FrameHdr, idle_timeout_ms: i32) !void {
+    if (comptime is_windows) return error.UnsupportedPlatform;
+    const raw = std.mem.asBytes(hdr);
+    try readFull(fd, raw[0..1], idle_timeout_ms);
+    try readFull(fd, raw[1..], 30_000);
+}
+
 const WIRE_MAGIC: u32 = 0x5050_3735;
 const CMD_PING: u32 = 1;
 pub const CMD_ONE_WAY: u32 = 2;
 const CMD_PIPELINED: u32 = 3;
 const CMD_KV_PREPARE: u32 = 4;
 const CMD_KV_STREAM: u32 = 5;
+const CMD_PARK: u32 = 8;
 const CMD_DONE: u32 = 9;
 
+pub const ConnEnd = enum { parked, done };
 pub const FrameHdr = extern struct {
     magic: u32 = WIRE_MAGIC,
     cmd: u32,
@@ -304,7 +327,12 @@ const RecvKvSlots = struct {
     }
 };
 
-pub fn serveProbeConn(conn_fd: std.c.fd_t, gpa: std.mem.Allocator) !void {
+pub fn serveProbeConn(conn_fd: SocketFd, gpa: std.mem.Allocator) !void {
+    _ = try serveProbeConnWithIdleTimeout(conn_fd, gpa, 0);
+}
+
+pub fn serveProbeConnWithIdleTimeout(conn_fd: SocketFd, gpa: std.mem.Allocator, idle_timeout_ms: i32) !ConnEnd {
+    if (comptime is_windows) return error.UnsupportedPlatform;
     _ = configureTcpSocket(conn_fd);
     const s = mlx.gpuStream();
     var staging: []u8 = &.{};
@@ -316,7 +344,7 @@ pub fn serveProbeConn(conn_fd: std.c.fd_t, gpa: std.mem.Allocator) !void {
 
     while (true) {
         var hdr: FrameHdr = undefined;
-        try readFull(conn_fd, std.mem.asBytes(&hdr), 300_000);
+        try readFrameHdr(conn_fd, &hdr, idle_timeout_ms);
         if (hdr.magic != WIRE_MAGIC) return error.BadMagic;
         switch (hdr.cmd) {
             CMD_PING => {
@@ -399,24 +427,55 @@ pub fn serveProbeConn(conn_fd: std.c.fd_t, gpa: std.mem.Allocator) !void {
                 const ack: FrameAck = .{ .t0_us = @intCast(@max(tcp_us, 0)), .t1_us = @intCast(@max(fill_us, 0)) };
                 try writeFull(conn_fd, std.mem.asBytes(&ack));
             },
+            CMD_PARK => {
+                const ack: FrameAck = .{};
+                try writeFull(conn_fd, std.mem.asBytes(&ack));
+                return .parked;
+            },
             CMD_DONE => {
                 const ack: FrameAck = .{};
                 try writeFull(conn_fd, std.mem.asBytes(&ack));
-                return;
+                return .done;
             },
             else => return error.UnknownCommand,
         }
     }
 }
 
-pub fn sendDone(fd: std.c.fd_t) void {
+pub fn serveProbeListener(listen_fd: SocketFd, gpa: std.mem.Allocator) !void {
+    if (comptime is_windows) return error.UnsupportedPlatform;
+    while (true) {
+        const conn_fd = std.c.accept(listen_fd, null, null);
+        if (conn_fd < 0) {
+            if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
+            return error.AcceptFailed;
+        }
+        const outcome = blk: {
+            defer _ = std.c.close(conn_fd);
+            break :blk try serveProbeConnWithIdleTimeout(conn_fd, gpa, 0);
+        };
+        if (outcome == .done) return;
+    }
+}
+
+pub fn sendPark(fd: SocketFd) !void {
+    if (comptime is_windows) return error.UnsupportedPlatform;
+    const park_hdr: FrameHdr = .{ .cmd = CMD_PARK };
+    try writeFull(fd, std.mem.asBytes(&park_hdr));
+    var ack: FrameAck = undefined;
+    try readFull(fd, std.mem.asBytes(&ack), 5_000);
+}
+
+pub fn sendDone(fd: SocketFd) void {
+    if (comptime is_windows) return;
     const done_hdr: FrameHdr = .{ .cmd = CMD_DONE };
     writeFull(fd, std.mem.asBytes(&done_hdr)) catch return;
     var ack: FrameAck = undefined;
     readFull(fd, std.mem.asBytes(&ack), 5_000) catch {};
 }
 
-pub fn measureHalfPingUs(fd: std.c.fd_t) !f64 {
+pub fn measureHalfPingUs(fd: SocketFd) !f64 {
+    if (comptime is_windows) return error.UnsupportedPlatform;
     var samples: [11]f64 = undefined;
     for (0..samples.len + 2) |i| {
         const hdr: FrameHdr = .{ .cmd = CMD_PING };
@@ -453,6 +512,7 @@ pub fn runTcpHopSuite(
     warmup: usize,
     iters: usize,
 ) !void {
+    if (comptime is_windows) return error.UnsupportedPlatform;
     const s = mlx.gpuStream();
     const half_ping = try measureHalfPingUs(sock.fd);
     var line_buf: [768]u8 = undefined;
@@ -509,14 +569,16 @@ pub fn runTcpHopSuite(
                 sock.local_ip, sock.peer_ip, sock.mtu, sock.sndbuf, sock.rcvbuf,
             ));
 
-            @memcpy(out_slots[0], raw_ptr[0..nbytes]);
-            @memcpy(out_slots[1], raw_ptr[0..nbytes]);
             {
                 const w_hdr: FrameHdr = .{ .cmd = CMD_PIPELINED, .bytes = nbytes_u64, .count = warmup, .arg0 = 1 };
                 try writeFull(sock.fd, std.mem.asBytes(&w_hdr));
                 var ready: [1]u8 = undefined;
                 try readFull(sock.fd, &ready, 10_000);
-                for (0..warmup) |k| try writeFull(sock.fd, out_slots[k % 2]);
+                for (0..warmup) |k| {
+                    const dst = out_slots[k % 2];
+                    @memcpy(dst, raw_ptr[0..nbytes]);
+                    try writeFull(sock.fd, dst);
+                }
                 var w_ack: FrameAck = undefined;
                 try readFull(sock.fd, std.mem.asBytes(&w_ack), 120_000);
             }
@@ -525,17 +587,25 @@ pub fn runTcpHopSuite(
             try writeFull(sock.fd, std.mem.asBytes(&p_hdr));
             var p_ready: [1]u8 = undefined;
             try readFull(sock.fd, &p_ready, 10_000);
+            var pipe_memcpy_sum: f64 = 0;
             const tp0 = monoUs();
-            for (0..iters) |k| try writeFull(sock.fd, out_slots[k % 2]);
+            for (0..iters) |k| {
+                const dst = out_slots[k % 2];
+                const tc0 = monoUs();
+                @memcpy(dst, raw_ptr[0..nbytes]);
+                pipe_memcpy_sum += @floatFromInt(@max(monoUs() - tc0, 0));
+                try writeFull(sock.fd, dst);
+            }
             var p_ack: FrameAck = undefined;
             try readFull(sock.fd, std.mem.asBytes(&p_ack), 300_000);
             const pipe_wall = @max(0.0, @as(f64, @floatFromInt(monoUs() - tp0)) - half_ping);
             const pipe_per_hop = pipe_wall / n_f;
+            const pipe_memcpy = pipe_memcpy_sum / n_f;
             const pipe_uma = @as(f64, @floatFromInt(p_ack.t1_us)) / n_f;
             json_out.writeLine(try pp_step1.formatTcpHopJson(
                 &line_buf, "pipelined", c_rows, seam, nbytes_u64, iters,
                 pipe_per_hop, pipe_per_hop, pipe_per_hop, pipe_per_hop,
-                memcpy_sum / n_f, pipe_uma, sock.iface(),
+                pipe_memcpy, pipe_uma, sock.iface(),
                 sock.local_ip, sock.peer_ip, sock.mtu, sock.sndbuf, sock.rcvbuf,
             ));
         }
@@ -551,6 +621,7 @@ pub fn runKvStreamSuite(
     warmup: usize,
     iters: usize,
 ) !void {
+    if (comptime is_windows) return error.UnsupportedPlatform;
     var line_buf: [512]u8 = undefined;
 
     for (prompt_ns) |prompt_n| {
@@ -649,9 +720,35 @@ pub fn runKvStreamSuite(
 
 const testing = std.testing;
 
-test "pp_step1_tcp: loopback getifaddrs bindToSubnet, MTU check, TCP hop and KV fillImportedRows roundtrip" {
-    if (is_windows or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+test "pp_step1_tcp: IfreqMtuLayout matches Darwin 32B and LP64 Linux 40B ioctl ABI" {
+    const Darwin64 = IfreqMtuLayout(.macos, 64);
+    const Linux64 = IfreqMtuLayout(.linux, 64);
+    const Linux32 = IfreqMtuLayout(.linux, 32);
+
+    try testing.expectEqual(@as(usize, 32), @sizeOf(Darwin64));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(Darwin64, "name"));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(Darwin64, "mtu"));
+
+    try testing.expectEqual(@as(usize, 40), @sizeOf(Linux64));
+    try testing.expectEqual(@as(usize, 8), @alignOf(Linux64));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(Linux64, "name"));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(Linux64, "mtu"));
+
+    try testing.expectEqual(@as(usize, 32), @sizeOf(Linux32));
+    try testing.expectEqual(@as(usize, 16), @offsetOf(Linux32, "mtu"));
+
+    try testing.expectEqual(@as(i32, 0), queryInterfaceMtu(""));
+    try testing.expectEqual(@as(i32, 0), queryInterfaceMtu("interface_name_16"));
+    const ep = try parseIp4Port("10.254.12.1:29751");
+    try testing.expectEqual([4]u8{ 10, 254, 12, 1 }, ep.ip4);
+    try testing.expectEqual(@as(u16, 29751), ep.port);
+}
+
+test "pp_step1_tcp: loopback getifaddrs bindToSubnet, MTU check, TCP hop staging JSONL and KV fillImportedRows roundtrip" {
+    if (comptime is_windows) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     var ifname: [16]u8 = @splat(0);
     const found = findSubnetInterface(.{ 127, 0, 0, 1 }, &ifname) orelse return error.LoopbackNotFound;
@@ -659,20 +756,21 @@ test "pp_step1_tcp: loopback getifaddrs bindToSubnet, MTU check, TCP hop and KV 
     try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, found.local_ip);
     try testing.expect(queryInterfaceMtu(ifname[0..found.len]) > 0);
 
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    var root_buf: [512]u8 = undefined;
+    const root = root_buf[0..try td.dir.realPath(io, &root_buf)];
+    var jsonl_buf: [600]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&jsonl_buf, "{s}/tcp_hop_test.jsonl", .{root});
+
     const srv = try listenTcp(.{ 127, 0, 0, 1 }, 0);
     defer _ = std.c.close(srv.fd);
 
     const ServerCtx = struct {
-        listen_fd: std.c.fd_t,
+        listen_fd: SocketFd,
         err: ?anyerror = null,
         fn run(ctx: *@This()) void {
-            const cfd = std.c.accept(ctx.listen_fd, null, null);
-            if (cfd < 0) {
-                ctx.err = error.AcceptFailed;
-                return;
-            }
-            defer _ = std.c.close(cfd);
-            serveProbeConn(cfd, std.heap.c_allocator) catch |e| {
+            serveProbeListener(ctx.listen_fd, std.heap.c_allocator) catch |e| {
                 ctx.err = e;
             };
         }
@@ -682,13 +780,109 @@ test "pp_step1_tcp: loopback getifaddrs bindToSubnet, MTU check, TCP hop and KV 
     const sth = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, ServerCtx.run, .{&sctx});
     defer sth.join();
 
-    const sock = try bindAndConnectPeer(.{ 127, 0, 0, 1 }, srv.port, 3000);
-    defer _ = std.c.close(sock.fd);
-    try testing.expect(sock.mtu > 0);
+    var jout = try pp_step1.JsonOut.openPath(jsonl_path);
+    defer jout.close();
 
-    const null_out: pp_step1.JsonOut = .{ .fd = -1 };
-    try runTcpHopSuite(&sock, gpa, &null_out, &.{64}, 1, 2);
-    try runKvStreamSuite(&sock, gpa, &null_out, &.{128}, &.{64}, 1, 2);
-    sendDone(sock.fd);
+    {
+        const sock = try bindAndConnectPeer(.{ 127, 0, 0, 1 }, srv.port, 3000);
+        defer _ = std.c.close(sock.fd);
+        try testing.expect(sock.mtu > 0);
+        try runTcpHopSuite(&sock, gpa, &jout, &.{64}, 1, 2);
+        try runKvStreamSuite(&sock, gpa, &jout, &.{128}, &.{64}, 1, 2);
+        try sendPark(sock.fd);
+    }
+
+    {
+        const sock2 = try bindAndConnectPeer(.{ 127, 0, 0, 1 }, srv.port, 3000);
+        defer _ = std.c.close(sock2.fd);
+        _ = try measureHalfPingUs(sock2.fd);
+        sendDone(sock2.fd);
+    }
+    jout.close();
     if (sctx.err) |e| return e;
+
+    const raw = try td.dir.readFileAlloc(io, "tcp_hop_test.jsonl", gpa, .limited(1 << 20));
+    defer gpa.free(raw);
+    var saw_pipelined = false;
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\t");
+        if (trimmed.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{});
+        defer parsed.deinit();
+        if (std.mem.eql(u8, parsed.value.object.get("kind").?.string, "tcp_hop") and
+            std.mem.eql(u8, parsed.value.object.get("mode").?.string, "pipelined"))
+        {
+            saw_pipelined = true;
+            const memcpy_v = switch (parsed.value.object.get("uma_memcpy_us").?) {
+                .float => |f| f,
+                .integer => |v| @as(f64, @floatFromInt(v)),
+                else => -1.0,
+            };
+            const mlx_new_v = switch (parsed.value.object.get("uma_mlx_new_us").?) {
+                .float => |f| f,
+                .integer => |v| @as(f64, @floatFromInt(v)),
+                else => -1.0,
+            };
+            try testing.expect(memcpy_v >= 0.0);
+            try testing.expect(mlx_new_v >= 0.0);
+        }
+    }
+    try testing.expect(saw_pipelined);
+}
+
+test "pp_step1_tcp: serveProbeConn waits without idle timeout across compute pause while short idle cap times out" {
+    if (comptime is_windows) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    {
+        const srv = try listenTcp(.{ 127, 0, 0, 1 }, 0);
+        defer _ = std.c.close(srv.fd);
+        const TimeoutServer = struct {
+            listen_fd: SocketFd,
+            err: ?anyerror = null,
+            fn run(ctx: *@This()) void {
+                const cfd = std.c.accept(ctx.listen_fd, null, null);
+                if (cfd < 0) return;
+                defer _ = std.c.close(cfd);
+                _ = serveProbeConnWithIdleTimeout(cfd, std.heap.c_allocator, 20) catch |e| {
+                    ctx.err = e;
+                    return;
+                };
+            }
+        };
+        var tctx: TimeoutServer = .{ .listen_fd = srv.fd };
+        const th = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, TimeoutServer.run, .{&tctx});
+        const sock = try bindAndConnectPeer(.{ 127, 0, 0, 1 }, srv.port, 3000);
+        defer _ = std.c.close(sock.fd);
+        th.join();
+        try testing.expectEqual(@as(?anyerror, error.TcpReadTimeout), tctx.err);
+    }
+
+    {
+        const srv = try listenTcp(.{ 127, 0, 0, 1 }, 0);
+        defer _ = std.c.close(srv.fd);
+        const IdleServer = struct {
+            listen_fd: SocketFd,
+            err: ?anyerror = null,
+            fn run(ctx: *@This()) void {
+                const cfd = std.c.accept(ctx.listen_fd, null, null);
+                if (cfd < 0) return;
+                defer _ = std.c.close(cfd);
+                serveProbeConn(cfd, std.heap.c_allocator) catch |e| {
+                    ctx.err = e;
+                };
+            }
+        };
+        var ictx: IdleServer = .{ .listen_fd = srv.fd };
+        const th = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, IdleServer.run, .{&ictx});
+        defer th.join();
+        const sock = try bindAndConnectPeer(.{ 127, 0, 0, 1 }, srv.port, 3000);
+        defer _ = std.c.close(sock.fd);
+        std.Io.sleep(io, .fromMilliseconds(60), .awake) catch {};
+        _ = try measureHalfPingUs(sock.fd);
+        sendDone(sock.fd);
+        if (ictx.err) |e| return e;
+    }
 }

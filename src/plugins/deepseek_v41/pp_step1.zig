@@ -471,7 +471,7 @@ pub fn runTimedStages(
 }
 
 const OverlapWorker = struct {
-    fd: std.c.fd_t,
+    fd: tcp.SocketFd,
     payload: []const u8,
     half_ping: f64,
     req_gen: std.atomic.Value(u32) = .init(0),
@@ -481,6 +481,7 @@ const OverlapWorker = struct {
     last_tcp_us: f64 = 0,
 
     fn run(self: *OverlapWorker) void {
+        if (comptime @import("builtin").os.tag == .windows) return;
         var seen: u32 = 0;
         while (true) {
             while (self.req_gen.load(.acquire) == seen) {
@@ -611,13 +612,27 @@ fn runOverlapBench(
     warmup: usize,
     iters: usize,
 ) !void {
-    const moe_lo: usize = 5;
-    const moe_hi: usize = @min(@as(usize, 10), m.n_layers);
+    return runOverlapBenchRange(m, st, sock, gpa, json_out, widths, 5, @min(@as(usize, 10), m.n_layers), warmup, iters);
+}
+
+fn runOverlapBenchRange(
+    m: *dsv41.Dsv41Model,
+    st: *dsv41.State,
+    sock: *const tcp.BoundSocketInfo,
+    gpa: std.mem.Allocator,
+    json_out: *const JsonOut,
+    widths: []const usize,
+    moe_lo: usize,
+    moe_hi: usize,
+    warmup: usize,
+    iters: usize,
+) !void {
+    if (comptime @import("builtin").os.tag == .windows) return error.UnsupportedPlatform;
     if (moe_lo >= moe_hi) return;
     const half_ping = try tcp.measureHalfPingUs(sock.fd);
     const p0 = st.n;
-    var save = try StateSave.capture(gpa, st);
-    defer save.deinit();
+    var base_save = try StateSave.capture(gpa, st);
+    defer base_save.deinit();
     var line_buf: [512]u8 = undefined;
 
     for (widths) |c_rows| {
@@ -670,18 +685,31 @@ fn runOverlapBench(
             gpa.free(init_pres);
         }
         @memset(init_pres, none);
-        try dsv41.buildInitialSpansForBench(m, gpa, c_rows, span_w, init_xs, init_pres);
+        const init_topks = try gpa.alloc(A, n_spans);
+        defer {
+            for (init_topks) |x| if (x.ctx != null) {
+                _ = mlx.mlx_array_free(x);
+            };
+            gpa.free(init_topks);
+        }
+        @memset(init_topks, none);
+
+        base_save.restore(st);
+        try dsv41.seedMidGroupSeamForBench(m, gpa, st, moe_lo, p0, c_rows, span_w, init_xs, init_pres, init_topks);
+        var iter_save = try StateSave.capture(gpa, st);
+        defer iter_save.deinit();
 
         const gpu_solo_samples = try gpa.alloc(f64, iters);
         defer gpa.free(gpu_solo_samples);
         for (0..warmup + iters) |rep| {
-            save.restore(st);
+            iter_save.restore(st);
             for (held) |*h| dsv41.holdForBench(h, none);
             var sp = dsv41.spansOfForBench(held, n_spans, targets, span_w, c_rows, p0);
             sp.whole = held[held.len - 2 ..][0..2];
             for (0..n_spans) |k| {
                 dsv41.holdForBench(&sp.xs[k], init_xs[k]);
                 dsv41.holdForBench(&sp.pres[k], init_pres[k]);
+                dsv41.holdForBench(&sp.topks[k], init_topks[k]);
             }
             const t0 = monoUs();
             try dsv41.runLayersWithDrain(m, gpa, st, &sp, held, moe_lo, moe_hi, true);
@@ -709,13 +737,14 @@ fn runOverlapBench(
 
         var gen: u32 = 0;
         for (0..warmup + iters) |rep| {
-            save.restore(st);
+            iter_save.restore(st);
             for (held) |*h| dsv41.holdForBench(h, none);
             var sp = dsv41.spansOfForBench(held, n_spans, targets, span_w, c_rows, p0);
             sp.whole = held[held.len - 2 ..][0..2];
             for (0..n_spans) |k| {
                 dsv41.holdForBench(&sp.xs[k], init_xs[k]);
                 dsv41.holdForBench(&sp.pres[k], init_pres[k]);
+                dsv41.holdForBench(&sp.topks[k], init_topks[k]);
             }
             gen += 1;
             const t_wall0 = monoUs();
@@ -733,7 +762,7 @@ fn runOverlapBench(
             }
             _ = mlx.mlx_clear_cache();
         }
-        save.restore(st);
+        base_save.restore(st);
 
         json_out.writeLine(try formatOverlapJson(
             &line_buf, c_rows, .mid_group, nbytes_u64, moe_lo, moe_hi, p0, iters,
@@ -824,9 +853,9 @@ fn advanceStateTo(m: *dsv41.Dsv41Model, gpa: std.mem.Allocator, st: *dsv41.State
 }
 
 pub fn cmdProbe(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !void {
+    if (comptime @import("builtin").os.tag == .windows) return error.UnsupportedPlatform;
     if (args.len == 0) return error.InvalidArgs;
     const sub = args[0];
-
     var listen_ep: ?[]const u8 = null;
     var peer_ep: ?[]const u8 = null;
     var model_dir: ?[]const u8 = null;
@@ -867,10 +896,7 @@ pub fn cmdProbe(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !v
         const ep = try tcp.parseIp4Port(listen_ep orelse return error.InvalidArgs);
         const srv = try tcp.listenTcp(ep.ip4, ep.port);
         defer _ = std.c.close(srv.fd);
-        const conn_fd = std.c.accept(srv.fd, null, null);
-        if (conn_fd < 0) return error.AcceptFailed;
-        defer _ = std.c.close(conn_fd);
-        try tcp.serveProbeConn(conn_fd, gpa);
+        try tcp.serveProbeListener(srv.fd, gpa);
         return;
     }
 
@@ -926,18 +952,23 @@ pub fn cmdProbe(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !v
     const schedules = [_]Schedule{ .A4, .A3, .A2, .B4, .B3, .B2 };
     const depths = [_]usize{ 0, 32768, 131072 };
 
-    var maybe_sock: ?tcp.BoundSocketInfo = null;
-    defer if (maybe_sock) |sk| {
-        tcp.sendDone(sk.fd);
-        _ = std.c.close(sk.fd);
+    const peer_addr = if (peer_ep) |pep| try tcp.parseIp4Port(pep) else null;
+    var peer_done_sent = peer_addr == null;
+    defer if (!peer_done_sent) {
+        if (peer_addr) |ep| {
+            if (tcp.bindAndConnectPeer(ep.ip4, ep.port, 5000)) |sk| {
+                tcp.sendDone(sk.fd);
+                _ = std.c.close(sk.fd);
+            } else |_| {}
+        }
     };
 
-    if (peer_ep) |pep| {
-        const ep = try tcp.parseIp4Port(pep);
+    if (peer_addr) |ep| {
         const sock = try tcp.bindAndConnectPeer(ep.ip4, ep.port, 5000);
-        maybe_sock = sock;
+        defer _ = std.c.close(sock.fd);
         try tcp.runTcpHopSuite(&sock, gpa, &json_out, &widths, 5, tcp_iters);
         try tcp.runKvStreamSuite(&sock, gpa, &json_out, &kv_ns, &widths, 2, 10);
+        try tcp.sendPark(sock.fd);
     }
 
     for (depths) |p0| {
@@ -980,8 +1011,12 @@ pub fn cmdProbe(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !v
         save.restore(&st);
         m.pp_timing.schedule = .off;
         if (p0 == 32768) {
-            if (maybe_sock) |*sock| {
-                try runOverlapBench(m, &st, sock, gpa, &json_out, &widths, 2, stage_reps);
+            if (peer_addr) |ep| {
+                const sock = try tcp.bindAndConnectPeer(ep.ip4, ep.port, 5000);
+                defer _ = std.c.close(sock.fd);
+                try runOverlapBench(m, &st, &sock, gpa, &json_out, &widths, 2, stage_reps);
+                tcp.sendDone(sock.fd);
+                peer_done_sent = true;
             }
         }
     }
@@ -1081,7 +1116,17 @@ test "pp_step1: schedule tables, tbPeerIp4 routing, and JSON line schemas parse 
     try testing.expectEqual(@as(i64, 9000), parsed_hop.value.object.get("mtu").?.integer);
 }
 
+test "pp_step1: cmdProbe rejects invalid invocation cleanly across target OS" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (comptime @import("builtin").os.tag == .windows) {
+        try testing.expectError(error.UnsupportedPlatform, cmdProbe(io, testing.allocator, &.{}));
+    } else {
+        try testing.expectError(error.InvalidArgs, cmdProbe(io, testing.allocator, &.{}));
+    }
+}
+
 test "pp_step1: live DSV41_PP_STAGE_TIMING A4, diag, and verifyKvExportSizes match stock logits and emit valid JSONL" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1167,4 +1212,156 @@ test "pp_step1: live DSV41_PP_STAGE_TIMING A4, diag, and verifyKvExportSizes mat
     try testing.expectEqual(@as(usize, 4), n_stage);
     try testing.expectEqual(@as(usize, 1), n_tail);
     try testing.expectEqual(@as(usize, 9), n_diag);
+}
+
+test "pp_step1: seedMidGroupSeamForBench activates mid-group compressed-KV gather and runOverlapBenchRange emits overlap JSONL" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const v4fixture = @import("../deepseek_v4/fixture.zig");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const files = try v4fixture.v41Files(arena.allocator(), 11);
+
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    for (files) |f| try td.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
+
+    var root_buf: [512]u8 = undefined;
+    const root = root_buf[0..try td.dir.realPath(io, &root_buf)];
+    var jsonl_buf: [600]u8 = undefined;
+    const jsonl_path = try std.fmt.bufPrint(&jsonl_buf, "{s}/pp_overlap_test.jsonl", .{root});
+
+    const cfg = try loadPackConfig(io, gpa, root);
+    var w = try dsv41.loadPack(io, gpa, root, false);
+    defer w.deinit();
+    const m = try dsv41.init(gpa, &cfg, &w, mlx.gpuStream(), .{});
+    defer m.deinit();
+    m.span = 8;
+
+    var st = try dsv41.initState(m, gpa);
+    defer st.deinit();
+    var prefix: [16]u32 = undefined;
+    fillDeterministicTokens(&prefix, m.vocab, 99);
+    try advanceStateTo(m, gpa, &st, prefix.len, &prefix);
+    try testing.expectEqual(@as(usize, 16), st.n);
+    try testing.expectEqual(@as(usize, 8), st.layers[2].comp.?.used);
+
+    var base_save = try StateSave.capture(gpa, &st);
+    defer base_save.deinit();
+
+    const c_rows: usize = 16;
+    const n_spans: usize = 2;
+    var init_xs = [_]A{ none, none };
+    defer for (init_xs) |x| if (x.ctx != null) {
+        _ = mlx.mlx_array_free(x);
+    };
+    var init_pres = [_]A{ none, none };
+    defer for (init_pres) |x| if (x.ctx != null) {
+        _ = mlx.mlx_array_free(x);
+    };
+    var init_topks = [_]A{ none, none };
+    defer for (init_topks) |x| if (x.ctx != null) {
+        _ = mlx.mlx_array_free(x);
+    };
+
+    try dsv41.seedMidGroupSeamForBench(m, gpa, &st, 3, 16, c_rows, m.span, &init_xs, &init_pres, &init_topks);
+    try testing.expect(init_topks[0].ctx != null);
+    try testing.expect(init_topks[1].ctx != null);
+    try testing.expectEqual(@as(usize, 16), st.layers[2].comp.?.used);
+    var seeded_save = try StateSave.capture(gpa, &st);
+    defer seeded_save.deinit();
+
+    const held_a = try gpa.alloc(A, n_spans * 4 + 2);
+    defer {
+        for (held_a) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        gpa.free(held_a);
+    }
+    @memset(held_a, none);
+
+    const held_b = try gpa.alloc(A, n_spans * 4 + 2);
+    defer {
+        for (held_b) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        gpa.free(held_b);
+    }
+    @memset(held_b, none);
+
+    seeded_save.restore(&st);
+    var sp_no_topk = dsv41.spansOfForBench(held_a, n_spans, 0, m.span, c_rows, 16);
+    sp_no_topk.whole = held_a[held_a.len - 2 ..][0..2];
+    for (0..n_spans) |k| {
+        dsv41.holdForBench(&sp_no_topk.xs[k], init_xs[k]);
+        dsv41.holdForBench(&sp_no_topk.pres[k], init_pres[k]);
+    }
+    try dsv41.runLayersWithDrain(m, gpa, &st, &sp_no_topk, held_a, 3, 5, true);
+
+    seeded_save.restore(&st);
+    var sp_with_topk = dsv41.spansOfForBench(held_b, n_spans, 0, m.span, c_rows, 16);
+    sp_with_topk.whole = held_b[held_b.len - 2 ..][0..2];
+    for (0..n_spans) |k| {
+        dsv41.holdForBench(&sp_with_topk.xs[k], init_xs[k]);
+        dsv41.holdForBench(&sp_with_topk.pres[k], init_pres[k]);
+        dsv41.holdForBench(&sp_with_topk.topks[k], init_topks[k]);
+    }
+    try dsv41.runLayersWithDrain(m, gpa, &st, &sp_with_topk, held_b, 3, 5, true);
+
+    var x_no = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_no);
+    try mlx.check(mlx.mlx_astype(&x_no, sp_no_topk.xs[0], .float32, mlx.gpuStream()));
+    var x_tk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_tk);
+    try mlx.check(mlx.mlx_astype(&x_tk, sp_with_topk.xs[0], .float32, mlx.gpuStream()));
+    try dsv41.evalAllForBench(&.{ x_no, x_tk });
+    const p_no = mlx.mlx_array_data_float32(x_no) orelse return error.NoData;
+    const p_tk = mlx.mlx_array_data_float32(x_tk) orelse return error.NoData;
+    var max_diff: f32 = 0.0;
+    for (0..mlx.mlx_array_size(x_no)) |idx| {
+        max_diff = @max(max_diff, @abs(p_no[idx] - p_tk[idx]));
+    }
+    try testing.expect(max_diff > 1e-4);
+
+    base_save.restore(&st);
+
+    const srv = try tcp.listenTcp(.{ 127, 0, 0, 1 }, 0);
+    defer _ = std.c.close(srv.fd);
+    const OverlapSrv = struct {
+        listen_fd: tcp.SocketFd,
+        err: ?anyerror = null,
+        fn run(ctx: *@This()) void {
+            tcp.serveProbeListener(ctx.listen_fd, std.heap.c_allocator) catch |e| {
+                ctx.err = e;
+            };
+        }
+    };
+    var octx: OverlapSrv = .{ .listen_fd = srv.fd };
+    const sth = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, OverlapSrv.run, .{&octx});
+    defer sth.join();
+
+    var jout = try JsonOut.openPath(jsonl_path);
+    defer jout.close();
+    {
+        const sock = try tcp.bindAndConnectPeer(.{ 127, 0, 0, 1 }, srv.port, 3000);
+        defer _ = std.c.close(sock.fd);
+        try runOverlapBenchRange(m, &st, &sock, gpa, &jout, &.{c_rows}, 3, 6, 1, 2);
+        tcp.sendDone(sock.fd);
+    }
+    jout.close();
+    if (octx.err) |e| return e;
+
+    try testing.expectEqual(@as(usize, 16), st.n);
+    try testing.expectEqual(@as(usize, 8), st.layers[2].comp.?.used);
+
+    const raw = try td.dir.readFileAlloc(io, "pp_overlap_test.jsonl", gpa, .limited(1 << 20));
+    defer gpa.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, std.mem.trim(u8, raw, " \r\n\t"), .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("tcp_gpu_overlap", parsed.value.object.get("kind").?.string);
+    try testing.expectEqual(@as(i64, 3), parsed.value.object.get("moe_lo").?.integer);
+    try testing.expectEqual(@as(i64, 6), parsed.value.object.get("moe_hi").?.integer);
 }

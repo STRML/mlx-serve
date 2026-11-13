@@ -7118,6 +7118,72 @@ pub fn buildInitialSpansForBench(m: *const Dsv41Model, gpa: std.mem.Allocator, L
     try evalAll(ev.items);
 }
 
+pub fn seedMidGroupSeamForBench(
+    m: *const Dsv41Model,
+    gpa: std.mem.Allocator,
+    st: *State,
+    moe_lo: usize,
+    p0: usize,
+    L: usize,
+    span_w: usize,
+    out_xs: []A,
+    out_pres: []A,
+    out_topks: []A,
+) !void {
+    try buildInitialSpansForBench(m, gpa, L, span_w, out_xs, out_pres);
+    for (out_topks) |*t| hold(t, none);
+    if (moe_lo >= m.n_layers) return;
+    const ly = &m.layers[moe_lo];
+    if (ly.ratio == 0 or ly.idx != null) return;
+
+    const r: usize = ly.ratio;
+    const total_comp = (p0 + L) / r;
+    if (total_comp == 0) return;
+
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+
+    const kv_owner = m.latest(moe_lo, Dsv41Model.isKvSource);
+    if (st.layers[kv_owner].comp) |*comp_rows| {
+        if (comp_rows.used < total_comp) {
+            const extra = total_comp - comp_rows.used;
+            var z = mlx.mlx_array_new();
+            const pad = try sc.res(mlx.mlx_ones(&z, &[_]c_int{ ci(extra), ci(comp_rows.width) }, 2, comp_rows.dtype, m.s), &z);
+            try comp_rows.append(pad, m.s);
+            try ev.append(gpa, comp_rows.buf);
+        }
+    }
+
+    const idx_topk: usize = m.cfg.dsv4_index_topk;
+    for (0..out_topks.len) |k| {
+        const lo = k * span_w;
+        const hi = @min(L, lo + span_w);
+        const rows = hi - lo;
+        const nb = (p0 + hi) / r;
+        const k_picks = @min(idx_topk, nb);
+        if (k_picks == 0) continue;
+        const host_picks = try gpa.alloc(i32, rows * k_picks);
+        defer gpa.free(host_picks);
+        for (0..rows) |row_i| {
+            const row_nb = (p0 + lo + row_i + 1) / r;
+            for (0..k_picks) |j| {
+                if (row_nb == 0 or j >= row_nb) {
+                    host_picks[row_i * k_picks + j] = -1;
+                } else {
+                    const stride = @max(@as(usize, 1), row_nb / k_picks);
+                    host_picks[row_i * k_picks + j] = @intCast((j * stride + row_i) % row_nb);
+                }
+            }
+        }
+        const tk = try sc.ints(host_picks, &.{ ci(rows), ci(k_picks) });
+        hold(&out_topks[k], tk);
+        try ev.append(gpa, out_topks[k]);
+    }
+    if (ev.items.len > 0) try evalAll(ev.items);
+}
+
 pub fn buildSyntheticSnapForBench(m: *const Dsv41Model, gpa: std.mem.Allocator, n_snap: usize) !Snap {
     const l = try cacheLayout(m);
     const ids = try gpa.alloc(u32, n_snap);

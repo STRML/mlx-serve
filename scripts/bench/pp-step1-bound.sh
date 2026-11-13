@@ -7,7 +7,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="${PP_STEP1_REPO_ROOT:-$(cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd || pwd)}"
 SUMMARIZER="${PP_STEP1_SUMMARIZER:-$SCRIPT_DIR/pp_step1_summarize.py}"
 
 STUDIO1_HOST="${STUDIO1_HOST:-studio1}"
@@ -27,7 +27,7 @@ MLX_SERVE_LOCAL_BIN="${MLX_SERVE_LOCAL_BIN:-$REPO_ROOT/zig-out/bin/mlx-serve}"
 REMOTE_STAGE_DIR="${REMOTE_STAGE_DIR:-/tmp/pp75-step1-bin}"
 RESULTS_DIR="${PP_STEP1_RESULTS_DIR:-$HOME/claude-tmp/pp-step1-$(date +%Y%m%d-%H%M%S)}"
 SUMMARIZE_ONLY=0
-
+STAGE_ONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --results-dir)
@@ -36,6 +36,10 @@ while [ $# -gt 0 ]; do
             ;;
         --summarize-only)
             SUMMARIZE_ONLY=1
+            shift
+            ;;
+        --stage-only)
+            STAGE_ONLY=1
             shift
             ;;
         *)
@@ -113,17 +117,58 @@ if [ ! -x "$MLX_SERVE_LOCAL_BIN" ]; then
     fail_step1 "missing_local_binary:$MLX_SERVE_LOCAL_BIN"
 fi
 
+LOCAL_BIN_DIR="$(cd "$(dirname "$MLX_SERVE_LOCAL_BIN")" && pwd)"
+BIN_REPO_ROOT="$(cd "$LOCAL_BIN_DIR/../.." 2>/dev/null && pwd || true)"
+REQUIRED_RUNTIME_ASSETS=(
+    libmlx.dylib
+    libmlxc.dylib
+    libjaccl.dylib
+    libllama.dylib
+    mlx.metallib
+)
+
+resolve_runtime_asset() {
+    local asset="$1"
+    local cand
+    if [ -n "${MLX_SERVE_LIB_DIR:-}" ] && [ -f "$MLX_SERVE_LIB_DIR/$asset" ]; then
+        printf '%s\n' "$MLX_SERVE_LIB_DIR/$asset"
+        return 0
+    fi
+    for cand in \
+        "$LOCAL_BIN_DIR/lib/$asset" \
+        "$LOCAL_BIN_DIR/../Frameworks/$asset" \
+        "$BIN_REPO_ROOT/lib/mlx/lib/$asset" \
+        "$BIN_REPO_ROOT/lib/llama/lib/$asset" \
+        "$REPO_ROOT/lib/mlx/lib/$asset" \
+        "$REPO_ROOT/lib/llama/lib/$asset"
+    do
+        if [ -f "$cand" ]; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+for asset in "${REQUIRED_RUNTIME_ASSETS[@]}"; do
+    resolve_runtime_asset "$asset" >/dev/null || fail_step1 "missing_runtime_lib:$asset"
+done
+
 for box in "$STUDIO1_HOST" "$STUDIO2_HOST"; do
     run_on "$box" "mkdir -p '$REMOTE_STAGE_DIR/lib'" || fail_step1 "stage_mkdir_failed:$box"
     copy_to "$MLX_SERVE_LOCAL_BIN" "$box" "$REMOTE_STAGE_DIR/mlx-serve" || fail_step1 "stage_bin_failed:$box"
-    if [ -f "$REPO_ROOT/lib/mlx/lib/libmlx.dylib" ]; then
-        copy_to "$REPO_ROOT/lib/mlx/lib/libmlx.dylib" "$box" "$REMOTE_STAGE_DIR/lib/libmlx.dylib" || fail_step1 "stage_dylib_failed:$box"
-    fi
-    if [ -f "$REPO_ROOT/lib/mlx/lib/mlx.metallib" ]; then
-        copy_to "$REPO_ROOT/lib/mlx/lib/mlx.metallib" "$box" "$REMOTE_STAGE_DIR/lib/mlx.metallib" || fail_step1 "stage_metallib_failed:$box"
-    fi
+    for asset in "${REQUIRED_RUNTIME_ASSETS[@]}"; do
+        asset_src="$(resolve_runtime_asset "$asset")" || fail_step1 "missing_runtime_lib:$asset"
+        copy_to "$asset_src" "$box" "$REMOTE_STAGE_DIR/lib/$asset" || fail_step1 "stage_lib_failed:$box:$asset"
+    done
     run_on "$box" "chmod +x '$REMOTE_STAGE_DIR/mlx-serve'" || fail_step1 "stage_chmod_failed:$box"
 done
+
+if [ "$STAGE_ONLY" = "1" ]; then
+    trap - EXIT
+    echo "PP-STEP1-STAGE-OK"
+    exit 0
+fi
 
 # ── 1a (Part 1): Server boot check (--ctx-size 262144 --prefix-cache-mem 8GB) + whole-prompt cold tok/s on studio2 ──
 

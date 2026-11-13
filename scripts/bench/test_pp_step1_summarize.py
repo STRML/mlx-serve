@@ -25,6 +25,8 @@ def make_synthetic_records(
     tcp_overlap_ratio: float = 1.0,
     drain_s: float = 0.05,
     tail_s: float = 0.15,
+    uma_memcpy_us: float = 500.0,
+    uma_mlx_new_us: float = 600.0,
     narrowed: bool = False,
     cache_disabled: bool = False,
     warm_hit: bool = False,
@@ -184,8 +186,8 @@ def make_synthetic_records(
                         "median_us": hop_us,
                         "best_us": hop_us * 0.98,
                         "p95_us": hop_us * 1.03,
-                        "uma_memcpy_us": 500.0,
-                        "uma_mlx_new_us": 600.0,
+                        "uma_memcpy_us": uma_memcpy_us,
+                        "uma_mlx_new_us": uma_mlx_new_us,
                         "gbps": hop_gbps,
                         "iface": "en2",
                         "local_ip": "10.254.12.2",
@@ -268,7 +270,14 @@ class PpStep1SummarizeTests(unittest.TestCase):
         self.assertEqual(summ.plan_pp_chunks(32868, 8192), [8192, 8192, 8192, 7808, 484])
 
     def test_r_bound_matches_spec_section1_table_and_ignores_layer_diag(self) -> None:
-        recs = make_synthetic_records(r1=3300.0, hop_gbps=2.972, drain_s=0.05, tail_s=0.15)
+        recs = make_synthetic_records(
+            r1=3300.0,
+            hop_gbps=2.972,
+            drain_s=0.05,
+            tail_s=0.15,
+            uma_memcpy_us=0.0,
+            uma_mlx_new_us=0.0,
+        )
         ds = summ.Dataset(recs)
         res_32k = ds.compute_r_bound(32768, 4, 2048, "A", "tcp")
         res_64k = ds.compute_r_bound(65536, 4, 2048, "A", "tcp")
@@ -358,6 +367,178 @@ class PpStep1SummarizeTests(unittest.TestCase):
             self.assertEqual(proc_bad.returncode, 1)
             self.assertTrue(proc_bad.stdout.strip().splitlines()[-1].startswith("PP-STEP1-FAIL "))
 
+
+    def test_stage_only_stages_all_rpath_dylibs_from_relocated_script_and_fails_on_missing_lib(self) -> None:
+        sh_src = os.path.join(SCRIPT_DIR, "pp-step1-bound.sh")
+        required = ("libmlx.dylib", "libmlxc.dylib", "libjaccl.dylib", "libllama.dylib", "mlx.metallib")
+        with tempfile.TemporaryDirectory() as tmp:
+            relocated_dir = os.path.join(tmp, "standalone-bench")
+            os.makedirs(relocated_dir, exist_ok=True)
+            relocated_sh = os.path.join(relocated_dir, "pp-step1-bound.sh")
+            with open(sh_src, "r", encoding="utf-8") as f_in, open(relocated_sh, "w", encoding="utf-8") as f_out:
+                f_out.write(f_in.read())
+            os.chmod(relocated_sh, 0o755)
+
+            fake_repo = os.path.join(tmp, "fake-repo")
+            bin_dir = os.path.join(fake_repo, "zig-out", "bin")
+            mlx_lib_dir = os.path.join(fake_repo, "lib", "mlx", "lib")
+            llama_lib_dir = os.path.join(fake_repo, "lib", "llama", "lib")
+            os.makedirs(bin_dir, exist_ok=True)
+            os.makedirs(mlx_lib_dir, exist_ok=True)
+            os.makedirs(llama_lib_dir, exist_ok=True)
+
+            fake_bin = os.path.join(bin_dir, "mlx-serve")
+            with open(fake_bin, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fake_bin, 0o755)
+
+            for name in ("libmlx.dylib", "libmlxc.dylib", "libjaccl.dylib", "mlx.metallib"):
+                with open(os.path.join(mlx_lib_dir, name), "w", encoding="utf-8") as fh:
+                    fh.write(f"payload:{name}")
+            with open(os.path.join(llama_lib_dir, "libllama.dylib"), "w", encoding="utf-8") as fh:
+                fh.write("payload:libllama.dylib")
+
+            stage_dir = os.path.join(tmp, "remote-stage")
+            res_dir = os.path.join(tmp, "results")
+            env = dict(os.environ)
+            env.update(
+                {
+                    "STUDIO1_HOST": "local",
+                    "STUDIO2_HOST": "local",
+                    "MLX_SERVE_LOCAL_BIN": fake_bin,
+                    "REMOTE_STAGE_DIR": stage_dir,
+                    "PP_STEP1_RESULTS_DIR": res_dir,
+                }
+            )
+            proc = subprocess.run(
+                ["bash", relocated_sh, "--stage-only"],
+                cwd=relocated_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines()[-1], "PP-STEP1-STAGE-OK")
+            self.assertTrue(os.access(os.path.join(stage_dir, "mlx-serve"), os.X_OK))
+            for name in required:
+                staged_file = os.path.join(stage_dir, "lib", name)
+                self.assertTrue(os.path.isfile(staged_file), msg=f"missing staged {name}")
+                with open(staged_file, "r", encoding="utf-8") as fh:
+                    self.assertEqual(fh.read(), f"payload:{name}")
+
+            for missing_name, missing_dir in (
+                ("libmlxc.dylib", mlx_lib_dir),
+                ("libjaccl.dylib", mlx_lib_dir),
+                ("libllama.dylib", llama_lib_dir),
+            ):
+                target_path = os.path.join(missing_dir, missing_name)
+                saved_path = target_path + ".bak"
+                os.rename(target_path, saved_path)
+                try:
+                    proc_miss = subprocess.run(
+                        ["bash", relocated_sh, "--stage-only"],
+                        cwd=relocated_dir,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(proc_miss.returncode, 1)
+                    self.assertEqual(
+                        proc_miss.stdout.strip().splitlines()[-1],
+                        f"PP-STEP1-FAIL missing_runtime_lib:{missing_name}",
+                    )
+                finally:
+                    os.rename(saved_path, target_path)
+
+    def test_missing_required_records_rejected_without_zero_fallbacks_or_clamping(self) -> None:
+        base = make_synthetic_records(r1=3300.0)
+        drop_cases = [
+            ("missing_tail", lambda r: r["kind"] != "tail_timing"),
+            ("missing_kv_stream", lambda r: r["kind"] != "kv_stream"),
+            ("missing_overlap", lambda r: r["kind"] != "tcp_gpu_overlap"),
+            ("missing_pipelined_hop", lambda r: not (r["kind"] == "tcp_hop" and r["mode"] == "pipelined")),
+            (
+                "missing_cold_32k_64k",
+                lambda r: not (r["kind"] == "single_box_cold" and r["prompt_tokens"] in (32768, 65536)),
+            ),
+            (
+                "missing_stage_nonzero_idx",
+                lambda r: not (r["kind"] == "stage_timing" and r["stage_idx"] == 2),
+            ),
+            (
+                "missing_stage_high_p0",
+                lambda r: not (r["kind"] == "stage_timing" and r["p0"] in (32768, 131072)),
+            ),
+        ]
+        sh_script = os.path.join(SCRIPT_DIR, "pp-step1-bound.sh")
+        for label, pred in drop_cases:
+            partial = [r for r in base if pred(r)]
+            ds = summ.Dataset(partial)
+            with self.assertRaises(ValueError, msg=label):
+                summ.evaluate_gate(ds)
+            if label in ("missing_tail", "missing_kv_stream", "missing_overlap", "missing_pipelined_hop", "missing_stage_nonzero_idx", "missing_stage_high_p0"):
+                with self.assertRaises(ValueError, msg=f"compute_r_bound:{label}"):
+                    ds.compute_r_bound(32768, 4, 2048, "A", "tcp")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            partial_path = os.path.join(tmp, "measurements.jsonl")
+            with open(partial_path, "w", encoding="utf-8") as fh:
+                for row in [r for r in base if r["kind"] != "kv_stream"]:
+                    fh.write(json.dumps(row) + "\n")
+            proc = subprocess.run(
+                ["bash", sh_script, "--summarize-only", "--results-dir", tmp],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertTrue(proc.stdout.strip().splitlines()[-1].startswith("PP-STEP1-FAIL "))
+
+    def test_host_staging_copies_charged_in_r_bound_and_exposed_comm(self) -> None:
+        ds_zero = summ.Dataset(make_synthetic_records(r1=3300.0, uma_memcpy_us=0.0, uma_mlx_new_us=0.0))
+        ds_staged = summ.Dataset(make_synthetic_records(r1=3300.0, uma_memcpy_us=12_000.0, uma_mlx_new_us=8_000.0))
+
+        res_zero = ds_zero.compute_r_bound(32768, 4, 2048, "A", "tcp")
+        res_staged = ds_staged.compute_r_bound(32768, 4, 2048, "A", "tcp")
+
+        self.assertGreater(res_staged["mean_stage_us"], res_zero["mean_stage_us"] + 19_000.0)
+        self.assertGreater(res_staged["overlap_excess_us"], 350_000.0)
+        self.assertGreater(res_staged["exposed_comm_frac"], res_zero["exposed_comm_frac"])
+        self.assertLess(res_staged["r_bound_tok_s"], res_zero["r_bound_tok_s"])
+
+        heavy_staging = summ.Dataset(make_synthetic_records(r1=3300.0, uma_memcpy_us=30_000.0, uma_mlx_new_us=20_000.0))
+        heavy_summary = summ.evaluate_gate(heavy_staging)
+        self.assertEqual(heavy_summary["verdict"], "NO-GO")
+        self.assertTrue(any("exposed_comm_32k" in r for r in heavy_summary["fail_reasons"]))
+
+    def test_find_10k_threshold_sweeps_max_across_chunk_widths(self) -> None:
+        recs = make_synthetic_records(r1=2450.0, hop_gbps=3.2, uma_memcpy_us=0.0, uma_mlx_new_us=0.0)
+        adjusted: list[dict] = []
+        for r in recs:
+            if r["kind"] == "stage_timing":
+                r = dict(r)
+                if r["chunk_rows"] == 4096:
+                    r["elapsed_us"] = int(round(r["elapsed_us"] * 1.05))
+                elif r["chunk_rows"] == 8192:
+                    r["elapsed_us"] = int(round(r["elapsed_us"] * 0.65))
+            adjusted.append(r)
+
+        ds = summ.Dataset(adjusted)
+        c2k_128k = ds.compute_r_bound(131072, 4, 2048, "A", "tcp")["r_bound_tok_s"]
+        self.assertLess(c2k_128k, 10_000.0)
+
+        summary = summ.evaluate_gate(ds)
+        self.assertEqual(summary["verdict"], "GO")
+        self.assertEqual(summary["best_chunk_32k"], 2048)
+        self.assertEqual(summary["best_chunk_64k"], 8192)
+        self.assertGreaterEqual(summary["r_bound_64k_tok_s"], 10_000.0)
+        self.assertIsNotNone(summary["n_10k_threshold"])
+        self.assertLessEqual(summary["n_10k_threshold"], 65536)
+        self.assertFalse(summary["ask_sam_6_5k_9_5k"])
+        md = summ.render_markdown(summary, ds)
+        self.assertNotIn("unreachable <= 128k", md)
 
 if __name__ == "__main__":
     unittest.main()
