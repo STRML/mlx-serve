@@ -540,7 +540,9 @@ class PpStep1SummarizeTests(unittest.TestCase):
         md = summ.render_markdown(summary, ds)
         self.assertNotIn("unreachable <= 128k", md)
 
-    def test_make_pp_step1b_tokens_interleaves_prose_and_code_and_writes_le_u32(self) -> None:
+    def test_make_pp_step1b_tokens_validates_vocab_and_rejects_byte_level_or_oov_output(self) -> None:
+        import contextlib
+        import io as pyio
         import make_pp_step1b_tokens as mktok
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -548,11 +550,14 @@ class PpStep1SummarizeTests(unittest.TestCase):
             src_dir = os.path.join(tmp, "src")
             os.makedirs(docs_dir)
             os.makedirs(src_dir)
-            for idx in range(4):
+            for idx in range(6):
                 with open(os.path.join(docs_dir, f"doc_{idx}.md"), "w", encoding="utf-8") as fh:
-                    fh.write((f"# Architecture Note {idx}\nPipeline parallel prefill hides SSD reads.\n") * 40)
+                    fh.write((f"# Architecture Note {idx}\nPipeline parallel prefill hides SSD reads.\n") * 60)
                 with open(os.path.join(src_dir, f"mod_{idx}.zig"), "w", encoding="utf-8") as fh:
-                    fh.write((f"pub fn step{idx}(x: u32) u32 {{ return x + {idx}; }}\n") * 40)
+                    fh.write((f"pub fn step{idx}(x: u32) u32 {{ return x + {idx}; }}\n") * 60)
+
+            with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as fh:
+                json.dump({"model_type": "deepseek_v41", "text_config": {"vocab_size": 129280}}, fh)
 
             corpus = mktok.collect_mixed_corpus(tmp, target_bytes=4096)
             self.assertGreaterEqual(len(corpus.encode("utf-8")), 4096)
@@ -564,20 +569,23 @@ class PpStep1SummarizeTests(unittest.TestCase):
             fake_bin = os.path.join(fake_stage, "mlx-serve")
             built_env = mktok.build_tokenize_env(fake_bin, {})
             self.assertTrue(built_env["DYLD_LIBRARY_PATH"].endswith("/stage/lib"))
-            with open(fake_bin, "w", encoding="utf-8") as fh:
-                fh.write(
-                    "#!/usr/bin/env python3\n"
-                    "import struct, sys\n"
-                    "assert sys.argv[1:3] == ['pp-probe', 'tokenize-ids']\n"
-                    "args = sys.argv[3:]\n"
-                    "kv = {args[i]: args[i + 1] for i in range(0, len(args), 2)}\n"
-                    "data = open(kv['--in'], 'rb').read()\n"
-                    "ids = [b % 1000 for b in data]\n"
-                    "with open(kv['--out'], 'wb') as out:\n"
-                    "    out.write(struct.pack(f'<{len(ids)}I', *ids))\n"
-                )
-            os.chmod(fake_bin, 0o755)
 
+            def write_fake_bin(mode_expr: str) -> None:
+                with open(fake_bin, "w", encoding="utf-8") as fh:
+                    fh.write(
+                        "#!/usr/bin/env python3\n"
+                        "import struct, sys\n"
+                        "assert sys.argv[1:3] == ['pp-probe', 'tokenize-ids']\n"
+                        "args = sys.argv[3:]\n"
+                        "kv = {args[i]: args[i + 1] for i in range(0, len(args), 2)}\n"
+                        "data = open(kv['--in'], 'rb').read()\n"
+                        f"ids = {mode_expr}\n"
+                        "with open(kv['--out'], 'wb') as out:\n"
+                        "    out.write(struct.pack(f'<{len(ids)}I', *ids))\n"
+                    )
+                os.chmod(fake_bin, 0o755)
+
+            write_fake_bin("[int.from_bytes(data[i:i+4], 'little') % 129280 for i in range(0, len(data), 4)]")
             out_u32 = os.path.join(tmp, "tokens.u32")
             out_txt = os.path.join(tmp, "tokens.txt")
             rc = mktok.main([
@@ -586,7 +594,7 @@ class PpStep1SummarizeTests(unittest.TestCase):
                 "--mlx-serve", fake_bin,
                 "--out", out_u32,
                 "--text-out", out_txt,
-                "--target-kb", "4",
+                "--target-kb", "12",
                 "--min-tokens", "2000",
             ])
             self.assertEqual(rc, 0)
@@ -596,5 +604,52 @@ class PpStep1SummarizeTests(unittest.TestCase):
             self.assertGreaterEqual(len(raw) // 4, 2000)
             self.assertTrue(os.path.isfile(out_txt))
 
+            write_fake_bin("[b for b in data]")
+            err_byte = pyio.StringIO()
+            with contextlib.redirect_stderr(err_byte):
+                rc_byte = mktok.main([
+                    "--repo-root", tmp,
+                    "--model", tmp,
+                    "--mlx-serve", fake_bin,
+                    "--out", out_u32,
+                    "--target-kb", "12",
+                    "--min-tokens", "2000",
+                ])
+            self.assertNotEqual(rc_byte, 0)
+            self.assertIn("0.6", err_byte.getvalue())
+
+            write_fake_bin(
+                "[int.from_bytes(data[i:i+4], 'little') % 129280 for i in range(0, len(data) - 8, 4)] + [129280]"
+            )
+            err_oov = pyio.StringIO()
+            with contextlib.redirect_stderr(err_oov):
+                rc_oov = mktok.main([
+                    "--repo-root", tmp,
+                    "--model", tmp,
+                    "--mlx-serve", fake_bin,
+                    "--out", out_u32,
+                    "--target-kb", "12",
+                    "--min-tokens", "2000",
+                ])
+            self.assertNotEqual(rc_oov, 0)
+            self.assertIn("129280", err_oov.getvalue())
+
+            bad_model_dir = os.path.join(tmp, "bad-pack")
+            os.makedirs(bad_model_dir)
+            with open(os.path.join(bad_model_dir, "config.json"), "w", encoding="utf-8") as fh:
+                json.dump({"model_type": "deepseek_v41", "text_config": {"vocab_size": 32000}}, fh)
+            write_fake_bin("[int.from_bytes(data[i:i+4], 'little') % 32000 for i in range(0, len(data), 4)]")
+            err_cfg = pyio.StringIO()
+            with contextlib.redirect_stderr(err_cfg):
+                rc_cfg = mktok.main([
+                    "--repo-root", tmp,
+                    "--model", bad_model_dir,
+                    "--mlx-serve", fake_bin,
+                    "--out", out_u32,
+                    "--target-kb", "12",
+                    "--min-tokens", "2000",
+                ])
+            self.assertNotEqual(rc_cfg, 0)
+            self.assertIn("129280", err_cfg.getvalue())
 if __name__ == "__main__":
     unittest.main()

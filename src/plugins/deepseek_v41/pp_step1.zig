@@ -314,7 +314,9 @@ pub fn formatKvStreamJson(buf: []u8, subtest: []const u8, prompt_tokens: usize, 
 pub const TABLE_BENCH_P0 = table_bench.TABLE_BENCH_P0;
 pub const TABLE_BENCH_WIDTHS = table_bench.TABLE_BENCH_WIDTHS;
 pub const TABLE_BENCH_LAYERS = table_bench.TABLE_BENCH_LAYERS;
+pub const MIN_TABLE_BENCH_REPS = table_bench.MIN_TABLE_BENCH_REPS;
 pub const MAX_UBC_CACHED_RATIO = table_bench.MAX_UBC_CACHED_RATIO;
+pub const MIN_REAL_TEXT_DISTINCT_RATIO = table_bench.MIN_REAL_TEXT_DISTINCT_RATIO;
 pub const TableBenchSource = table_bench.TableBenchSource;
 pub const TableBenchSpec = table_bench.TableBenchSpec;
 pub const TABLE_BENCH_SPECS = table_bench.TABLE_BENCH_SPECS;
@@ -328,6 +330,9 @@ pub const evaluateTableBenchCell = table_bench.evaluateTableBenchCell;
 pub const evaluateTableBenchGate = table_bench.evaluateTableBenchGate;
 pub const formatTableBenchJson = table_bench.formatTableBenchJson;
 pub const readTokenIdsFile = table_bench.readTokenIdsFile;
+pub const mapCompressedIds = table_bench.mapCompressedIds;
+pub const describeTableLayout = table_bench.describeTableLayout;
+pub const isSpecIqTableLayout = table_bench.isSpecIqTableLayout;
 
 pub const TimingState = struct {
     schedule: Schedule = .off,
@@ -888,10 +893,15 @@ pub fn cmdProbe(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !v
     var diag_reps: usize = 3;
     var table_reps: usize = 5;
     var table_warmup: usize = 1;
+    var ubc_control: bool = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
+        if (std.mem.eql(u8, a, "--ubc-control")) {
+            ubc_control = true;
+            continue;
+        }
         if (i + 1 >= args.len) return error.InvalidArgs;
         const v = args[i + 1];
         i += 1;
@@ -960,7 +970,7 @@ pub fn cmdProbe(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !v
     if (std.mem.eql(u8, sub, "table-bench")) {
         const dir = model_dir orelse return error.InvalidArgs;
         const tpath = tokens_path orelse return error.InvalidArgs;
-        return table_bench.runTableBench(io, gpa, dir, tpath, table_reps, table_warmup, json_path, &json_out);
+        return table_bench.runTableBench(io, gpa, dir, tpath, table_reps, table_warmup, ubc_control, json_path, &json_out);
     }
 
     if (!std.mem.eql(u8, sub, "model-bench")) return error.InvalidArgs;
