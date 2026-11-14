@@ -14,6 +14,7 @@ const prefix_cache_mod = @import("prefix_cache.zig");
 const peer_wire = @import("peer_wire.zig");
 const prefill_mod = @import("../prefill.zig");
 const pack_identity_mod = @import("pack_identity.zig");
+const dsv41_numerics = @import("../../../plugins/deepseek_v41/numerics.zig");
 const publishHotCacheResidency = @import("budget.zig").publishHotCacheResidency;
 const stagedHostBytes = @import("budget.zig").stagedHostBytes;
 const prefillHeadroomNow = @import("../admission/prefill_chunk.zig").prefillHeadroomNow;
@@ -89,6 +90,7 @@ pub fn modelSettingsKey(lm: *const LoadedModel, cfg: *const ModelConfig, xfm: *c
     } else {
         std.hash.autoHash(&h, @as(u8, 0));
     }
+    std.hash.autoHash(&h, dsv41_numerics.resolved());
     if (model_mod.getConfigOverrides()) |raw| {
         h.update("\x00");
         h.update(raw);

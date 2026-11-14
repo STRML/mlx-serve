@@ -11,6 +11,7 @@
 //! experts are read once per chunk.
 const std = @import("std");
 const env = @import("../../env.zig");
+const numerics = @import("numerics.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const resident = @import("../../sdk/weights/resident.zig");
@@ -856,10 +857,7 @@ fn headLogits(sc: *Scope, m: *const Dsv41Model, h: A) !A {
 var ced_env: ?bool = null;
 /// `MLX_SERVE_DSV41_CED=0` keeps every prefill chunk on the full forward.
 fn cedEnabled() bool {
-    if (ced_env == null) {
-        const v = env.get(.MLX_SERVE_DSV41_CED);
-        ced_env = v == null or v.?[0] != '0';
-    }
+    if (ced_env == null) ced_env = numerics.ced();
     return ced_env.?;
 }
 
@@ -1867,7 +1865,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         .attn_split_kernel = try buildKernel("dsv41_attn_split", &ATTN_INS, &.{ "pacc", "pm", "pl" }, ATTN_SPLIT_SOURCE, ""),
         .attn_merge_kernel = try buildKernel("dsv41_attn_merge", &ATTN_MERGE_INS, &.{"out"}, ATTN_MERGE_SOURCE, UNROPE_HEADER),
         .attn_softmax_kernel = try buildKernel("dsv41_attn_softmax", &ATTN_SOFTMAX_INS, &.{ "pw", "pc" }, ATTN_SOFTMAX_SOURCE, ""),
-        .attn_f16 = if (env.get(.MLX_SERVE_DSV41_ATTN_F16)) |v| v[0] != '0' else true,
+        .attn_f16 = numerics.attnF16(),
         .idx_score_kernel = try buildIdxScoreKernel(),
         .idx_tile_kernel = try buildKernel("dsv41_index_tile", &IDX_INS, &.{"scores"}, IDX_TILE_SOURCE, ""),
         .gate_kernel = try buildKernel("dsv41_gate", &.{ "x", "w" }, &.{"logits"}, GATE_SOURCE, ""),

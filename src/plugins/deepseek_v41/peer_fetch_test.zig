@@ -12,6 +12,7 @@ const prefix_cache = @import("../../engines/mlx/cache/prefix_cache.zig");
 const peer_wire = @import("../../engines/mlx/cache/peer_wire.zig");
 const peer_transfer = @import("../../engines/mlx/cache/peer_transfer.zig");
 const pack_identity = @import("../../engines/mlx/cache/pack_identity.zig");
+const env = @import("../../env.zig");
 const prefill_request = @import("../../engines/mlx/prefill.zig");
 const decode_request = @import("../../engines/mlx/decode.zig");
 const commit_request = @import("../../engines/mlx/commit.zig");
@@ -781,6 +782,78 @@ test "dsv41 peer fetch: a failed transfer keeps its error name without allocatin
     defer testing.allocator.free(text);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "peer cache export failed: OutOfMemory\n"));
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "peer cache import failed: OutOfMemory\n"));
+}
+
+fn expectLeverRefusesImport(comptime lever: @EnumLiteral(), value: [*:0]const u8) !void {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const model_a = try PeerHarness.open(files);
+    defer model_a.close();
+    const model_b = try PeerHarness.open(files);
+    defer model_b.close();
+
+    const prompt = buildPrompt(25);
+    const seeded = try model_a.runGreedy(prompt[0..17], 2, true);
+    defer testing.allocator.free(seeded.tokens);
+    const exp = try peer_transfer.exportWireModule(testing.allocator, model_a.sch.io, &model_a.sch, model_a.entry, &prompt, false, null, 0, 0, router.max_cache_export_bytes);
+    const wire = exp.ok.bytes;
+    defer testing.allocator.free(wire);
+
+    const base = peer_transfer.modelSettingsKey(model_b.entry, &model_b.cfg, &model_b.xfm);
+    const saved = env.override(lever, value);
+    defer saved.restore();
+    try testing.expect(base != peer_transfer.modelSettingsKey(model_b.entry, &model_b.cfg, &model_b.xfm));
+    const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+    try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .settings }), out);
+}
+
+test "dsv41 peer fetch: MLX_SERVE_DSV41_ATTN_F16 off refuses an import as settings" {
+    try expectLeverRefusesImport(.MLX_SERVE_DSV41_ATTN_F16, "0");
+}
+
+test "dsv41 peer fetch: MLX_SERVE_DSV41_CED off refuses an import as settings" {
+    try expectLeverRefusesImport(.MLX_SERVE_DSV41_CED, "0");
+}
+
+test "dsv41 peer fetch: MLX_SERVE_DSV41_FLASH_ATTN off refuses an import as settings" {
+    try expectLeverRefusesImport(.MLX_SERVE_DSV41_FLASH_ATTN, "0");
+}
+
+test "dsv41 peer fetch: a DSV41_FUSED_SEG level refuses an import as settings" {
+    try expectLeverRefusesImport(.DSV41_FUSED_SEG, "2");
+}
+
+test "dsv41 peer fetch: each numerics lever unset or at its default gives one settings key" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const h = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
+    defer h.close();
+    const s0 = env.override(.MLX_SERVE_DSV41_ATTN_F16, null);
+    defer s0.restore();
+    const s1 = env.override(.MLX_SERVE_DSV41_CED, null);
+    defer s1.restore();
+    const s2 = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, null);
+    defer s2.restore();
+    const s3 = env.override(.DSV41_FUSED_SEG, null);
+    defer s3.restore();
+    const unset = peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm);
+    inline for (.{
+        .{ .MLX_SERVE_DSV41_ATTN_F16, "1" },
+        .{ .MLX_SERVE_DSV41_CED, "1" },
+        .{ .MLX_SERVE_DSV41_FLASH_ATTN, "1" },
+        .{ .MLX_SERVE_DSV41_FLASH_ATTN, "" },
+        .{ .DSV41_FUSED_SEG, "0" },
+    }) |d| {
+        const saved = env.override(d[0], d[1]);
+        defer saved.restore();
+        try testing.expectEqual(unset, peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm));
+    }
 }
 
 test "dsv41 peer fetch: a commit declined after import_arrays frees the imported snapshot once" {
