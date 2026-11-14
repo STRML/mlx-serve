@@ -83,9 +83,29 @@ test "deepseek_v41 plugin: trunk_weight hands out the loaded embedding and head"
 
 /// The plugin's logits `[rows, V]` (host f32, caller frees) for `toks` of `slots` at `positions`.
 fn slotForward(t: *Twin, mode: abi.Mode, slots: []const u32, toks: []const u32, positions: []const u32) ![]f32 {
+    return slotForwardWithMedia(t, mode, slots, toks, positions, null, 0);
+}
+
+fn slotForwardWithMedia(
+    t: *Twin,
+    mode: abi.Mode,
+    slots: []const u32,
+    toks: []const u32,
+    positions: []const u32,
+    media_rows: ?mlx.mlx_array,
+    media_offset: u32,
+) ![]f32 {
     var out: abi.ForwardOut = .{};
     const rows: u32 = if (mode == .batched_rows) 1 else @intCast(toks.len);
-    const v = v41.table.forward(t.m, &.{ .mode = mode, .rows = rows, .tokens = .of(toks), .slots = .of(slots), .positions = .of(positions) }, &out);
+    const v = v41.table.forward(t.m, &.{
+        .mode = mode,
+        .rows = rows,
+        .tokens = .of(toks),
+        .slots = .of(slots),
+        .positions = .of(positions),
+        .media = if (media_rows) |x| .{ .ctx = x.ctx } else .{},
+        .media_offset = media_offset,
+    }, &out);
     if (!v.isOk()) {
         std.debug.print("forward: {s}\n", .{v.why.slice()});
         return error.PluginForward;
@@ -97,6 +117,23 @@ fn slotForward(t: *Twin, mode: abi.Mode, slots: []const u32, toks: []const u32, 
     try mlx.check(mlx.mlx_astype(&f, l, .float32, t.s));
     try mlx.check(mlx.mlx_array_eval(f));
     return testing.allocator.dupe(f32, (mlx.mlx_array_data_float32(f) orelse return error.NoData)[0..mlx.mlx_array_size(f)]);
+}
+
+fn syntheticImageRows(seed: u32) mlx.mlx_array {
+    var values: [4 * 128]f32 = undefined;
+    for (&values, 0..) |*value, i| {
+        const bits = @as(u32, @intCast(i)) *% 73 +% seed *% 29 +% 19;
+        value.* = @as(f32, @floatFromInt(bits % 251)) / 125.0 - 1.0;
+    }
+    return mlx.mlx_array_new_data(&values, &[_]c_int{ 1, 4, 128 }, 3, .float32);
+}
+
+fn greedyToken(logits: []const f32) u32 {
+    var best: usize = 0;
+    for (logits[1..], 1..) |value, i| if (value > logits[best]) {
+        best = i;
+    };
+    return @intCast(best);
 }
 
 /// Three batched ticks of two slots (prompts `a` and `b`, decode tokens `da` and `db`), each tick's `[2, V]` logits.
@@ -295,6 +332,7 @@ test "deepseek_v41 aux: candidate image key ignores later rows and eligibility e
 
 const codec = @import("cache_codec.zig");
 const dsv41 = @import("deepseek_v41.zig");
+const media_span = @import("../../sdk/kv/media_span.zig");
 
 const Exported = struct {
     tensors: [codec.max_tensors]abi.AuxTensor = undefined,
@@ -303,11 +341,18 @@ const Exported = struct {
     out: abi.AuxExport = .{},
 
     fn capture(self: *Exported, t: *Twin, p: []const u32) !void {
+        return self.captureWithMedia(t, p, null);
+    }
+
+    fn captureWithMedia(self: *Exported, t: *Twin, p: []const u32, media_rows: ?mlx.mlx_array) !void {
         const aux = v41.table.cache.aux.?;
-        try testing.expect(aux.begin_prompt(t.m, 1, .of(p), .{}, 0, true).isOk());
+        const model: *v41.Model = @ptrCast(@alignCast(t.m));
+        const image_token = model.mdl.cfg.image_token_id;
+        const media = if (media_rows) |x| abi.Array{ .ctx = x.ctx } else .{};
+        try testing.expect(aux.begin_prompt(t.m, 1, .of(p), media, 0, true).isOk());
         const first = @min(2, p.len - 1);
-        testing.allocator.free(try slotForward(t, .prefill, &.{1}, p[0..first], &.{0}));
-        if (first < p.len - 1) testing.allocator.free(try slotForward(t, .prefill, &.{1}, p[first .. p.len - 1], &.{@intCast(first)}));
+        testing.allocator.free(try slotForwardWithMedia(t, .prefill, &.{1}, p[0..first], &.{0}, media_rows, 0));
+        if (first < p.len - 1) testing.allocator.free(try slotForwardWithMedia(t, .prefill, &.{1}, p[first .. p.len - 1], &.{@intCast(first)}, media_rows, @intCast(std.mem.count(u32, p[0..first], &.{image_token}))));
         var sn: abi.Handle = null;
         try testing.expect(aux.snapshot(t.m, 1, &sn).isOk());
         defer aux.free(t.m, sn);
@@ -352,6 +397,118 @@ fn expectInvalidImport(t: *Twin, e: *Exported, ids: []const u32, arrays: []const
     unexpected.deinit(failing.allocator());
     failing.allocator().destroy(unexpected);
     return error.InvalidTensorAccepted;
+}
+
+fn setImageToken(t: *Twin, id: u32) void {
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    m.cfg.image_token_id = id;
+    m.mdl.cfg.image_token_id = id;
+}
+
+test "deepseek_v41 plugin: image session snapshot imports and resumes equal to cold with the same rows" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const image_rows = syntheticImageRows(11);
+    defer _ = mlx.mlx_array_free(image_rows);
+    try testing.expect(image_rows.ctx != null);
+
+    const image_token: u32 = 17;
+    const first_prompt = [_]u32{ 3, 17, 17, 17, 17, 42, 9, 7 };
+    var exported: Exported = .{};
+    defer exported.deinit();
+    {
+        const origin = try Twin.open(files, "");
+        defer origin.close();
+        setImageToken(origin, image_token);
+        try exported.captureWithMedia(origin, &first_prompt, image_rows);
+    }
+
+    const cold_first = try Twin.open(files, "");
+    defer cold_first.close();
+    setImageToken(cold_first, image_token);
+    const first_logits = try slotForwardWithMedia(cold_first, .prefill, &.{1}, &first_prompt, &.{0}, image_rows, 0);
+    defer testing.allocator.free(first_logits);
+    const turn_one_token = greedyToken(first_logits);
+    const second_prompt = first_prompt ++ [_]u32{ turn_one_token, 11, 2, 90 };
+    const boundary = first_prompt.len - 1;
+
+    const cold_second = try Twin.open(files, "");
+    defer cold_second.close();
+    setImageToken(cold_second, image_token);
+    const cold_logits = try slotForwardWithMedia(cold_second, .prefill, &.{1}, &second_prompt, &.{0}, image_rows, 0);
+    defer testing.allocator.free(cold_logits);
+
+    const imported = try Twin.open(files, "");
+    defer imported.close();
+    setImageToken(imported, image_token);
+    const aux = v41.table.cache.aux.?;
+    const ids = first_prompt[0..boundary];
+    var snapshot: abi.Handle = null;
+    try testing.expect(aux.import_arrays(imported.m, .of(ids), exported.bytes(), .of(exported.arrays()), &snapshot).isOk());
+    defer aux.free(imported.m, snapshot);
+    var info: abi.AuxSnapshotInfo = .{};
+    try testing.expect(aux.describe(imported.m, snapshot, &info).isOk());
+    try testing.expectEqual(boundary, info.n);
+    try testing.expectEqualSlices(u32, ids, info.ids.slice());
+    var same_key: u64 = 0;
+    try testing.expect(aux.prefix_key(imported.m, .of(ids), .{ .ctx = image_rows.ctx }, &same_key).isOk());
+    try testing.expectEqual(info.prefix_key, same_key);
+
+    try testing.expect(aux.restore_at(imported.m, 1, snapshot, info.n).isOk());
+    try testing.expect(aux.begin_prompt(imported.m, 1, .of(&second_prompt), .{ .ctx = image_rows.ctx }, info.n, false).isOk());
+    const prefix_media_rows = std.mem.count(u32, ids, &.{image_token});
+    const warm_logits = try slotForwardWithMedia(imported, .prefill, &.{1}, second_prompt[boundary..], &.{@intCast(boundary)}, image_rows, @intCast(prefix_media_rows));
+    defer testing.allocator.free(warm_logits);
+    try testing.expectEqualSlices(f32, cold_logits, warm_logits);
+    try testing.expectEqual(greedyToken(cold_logits), greedyToken(warm_logits));
+    try testing.expectEqual(@as(u64, @intCast(boundary)), info.n);
+}
+
+test "deepseek_v41 plugin: image session snapshot prefix clamps at a changed image span" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const image_rows = syntheticImageRows(11);
+    defer _ = mlx.mlx_array_free(image_rows);
+    const changed_rows = syntheticImageRows(97);
+    defer _ = mlx.mlx_array_free(changed_rows);
+    try testing.expect(image_rows.ctx != null and changed_rows.ctx != null);
+
+    const image_token: u32 = 17;
+    const first_prompt = [_]u32{ 3, 17, 17, 17, 17, 42, 9, 7 };
+    const boundary = first_prompt.len - 1;
+    var exported: Exported = .{};
+    defer exported.deinit();
+    {
+        const origin = try Twin.open(files, "");
+        defer origin.close();
+        setImageToken(origin, image_token);
+        try exported.captureWithMedia(origin, &first_prompt, image_rows);
+    }
+
+    const imported = try Twin.open(files, "");
+    defer imported.close();
+    setImageToken(imported, image_token);
+    const aux = v41.table.cache.aux.?;
+    const ids = first_prompt[0..boundary];
+    var snapshot: abi.Handle = null;
+    try testing.expect(aux.import_arrays(imported.m, .of(ids), exported.bytes(), .of(exported.arrays()), &snapshot).isOk());
+    defer aux.free(imported.m, snapshot);
+    var info: abi.AuxSnapshotInfo = .{};
+    try testing.expect(aux.describe(imported.m, snapshot, &info).isOk());
+    try testing.expectEqual(boundary, info.n);
+
+    var changed_key: u64 = 0;
+    try testing.expect(aux.prefix_key(imported.m, .of(ids), .{ .ctx = changed_rows.ctx }, &changed_key).isOk());
+    try testing.expect(changed_key != info.prefix_key);
+    const saved_span = [_]media_span.MediaSpan{.{ .start = 1, .key = info.prefix_key }};
+    const request_span = [_]media_span.MediaSpan{.{ .start = 1, .key = changed_key }};
+    const shared = media_span.mediaSharedBound(&saved_span, &request_span);
+    try testing.expectEqual(@as(usize, 1), shared);
+    try testing.expect(shared < info.n);
 }
 
 test "codec rejects duplicate, missing, unexpected and malformed tensors before construction" {
