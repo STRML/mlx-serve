@@ -450,6 +450,8 @@ pub const Dsv41Model = struct {
     gpa: std.mem.Allocator,
     s: S,
     cfg: Config,
+    /// The pack's config before the tensor split slices heads and expert widths: the cache identity hashes this one.
+    whole_cfg: Config,
     act: mlx.mlx_dtype,
     embed: Lin,
     /// the embedding rows read from the pack at each lookup (`embed` unset).
@@ -1854,6 +1856,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         .gpa = gpa,
         .s = s,
         .cfg = cfg.*,
+        .whole_cfg = whole.*,
         .act = opts.act,
         .embed = undefined,
         .head = undefined,
@@ -6807,7 +6810,7 @@ fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
     if (m.n_layers > 64) return error.Dsv41CacheGeometry;
     var h = std.hash.Wyhash.init(0x4141);
     // Hash values rather than struct padding or the model_type slice's process-local address.
-    cacheSetting(&h, m.cfg);
+    cacheSetting(&h, m.whole_cfg);
     std.hash.autoHash(&h, .{ m.n_mtp, m.ds_block, m.span, m.moe_rows, m.ced_split, m.ced_min_skip, m.hc_tg, m.topk_tg, m.qat_off, m.attn_f16, m.head.qp });
     var l: cache_codec.Layout = .{
         .layers = m.n_layers,

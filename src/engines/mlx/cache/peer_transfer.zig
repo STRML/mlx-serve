@@ -50,16 +50,14 @@ pub fn modelLayoutKey(cfg: *const ModelConfig, xfm: *const Transformer) u64 {
         cfg.num_attention_heads,
         cfg.num_key_value_heads,
         cfg.head_dim,
-        cfg.moe_intermediate_size,
+        // The pack's expert width: a tensor split divides it per rank, and the replicated KV does not depend on it.
+        cfg.moe_intermediate_size * (if (cfg.dist_shard) |sh| sh.size else 1),
         cfg.num_experts,
         cfg.vocab_size,
         cfg.sliding_window,
     });
-    if (cfg.dist_shard) |sh| {
-        std.hash.autoHash(&h, .{ @as(u8, 1), sh.rank, sh.size });
-    } else {
-        std.hash.autoHash(&h, @as(u8, 0));
-    }
+    // TP rank and width stay out: every rank holds the same KV, so an entry moves between widths. The byte keeps TP1 keys unchanged.
+    std.hash.autoHash(&h, @as(u8, 0));
     return h.final();
 }
 
