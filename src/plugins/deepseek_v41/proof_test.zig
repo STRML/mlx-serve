@@ -402,10 +402,10 @@ test "cache pack keeps sentinel scales nonzero after exhaustive bf16 decode" {
         var bits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(bits);
         try mlx.check(mlx.mlx_view(&bits, original, .uint16, stream));
-        const packed = try cache_pack.encode(&kernels, stream, bits, encoding);
-        defer _ = mlx.mlx_array_free(packed);
+        const packed_bits = try cache_pack.encode(&kernels, stream, bits, encoding);
+        defer _ = mlx.mlx_array_free(packed_bits);
         const spec: codec.Spec = .{ .kind = if (encoding == .fp4_e4m3_g16) .comp else if (encoding == .fp4_ue8m0_g32) .index else .win, .rows = rows, .width = width, .dtype = .bfloat16 };
-        const decoded = try cache_pack.decode(&kernels, stream, packed, spec, encoding);
+        const decoded = try cache_pack.decode(&kernels, stream, packed_bits, spec, encoding);
         defer _ = mlx.mlx_array_free(decoded.bits);
         defer _ = mlx.mlx_array_free(decoded.status);
         const repacked = try cache_pack.encode(&kernels, stream, decoded.bits, encoding);
