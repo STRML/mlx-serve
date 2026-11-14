@@ -362,10 +362,12 @@ pub const CacheExportOutcome = union(enum) {
     transfer_unsupported,
     deadline_passed,
     too_large: u64,
+    no_memory,
     ok: struct {
         bytes: []u8,
         n: usize,
         export_ms: u64,
+        planned_peak: u64,
     },
 };
 
@@ -378,6 +380,7 @@ pub const CacheExportRequest = struct {
     cache_key: u64 = 0,
     deadline_ms: ?u64 = null,
     max_bytes: usize,
+    admit_transfer_budget: bool = false,
     outcome: CacheExportOutcome = .not_found,
     /// A static `@errorName` or literal: allocation must not be able to hide a failure.
     error_name: ?[]const u8 = null,

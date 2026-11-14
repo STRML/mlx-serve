@@ -96,10 +96,11 @@ pub const ModuleImportProbe = struct {
     sch: *Scheduler,
     cfg: *const model_mod.ModelConfig,
     peak: u64,
+    body_bytes: u64 = 0,
 
     pub fn fits(ctx: ?*anyopaque) bool {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
-        const staged = @import("cache/budget.zig").stagedHostBytes(self.sch);
+        const staged = @import("cache/budget.zig").stagedHostBytes(self.sch) -| self.body_bytes;
         return self.peak <= @import("admission/prefill_chunk.zig").prefillHeadroomNow(self.cfg, staged);
     }
 };

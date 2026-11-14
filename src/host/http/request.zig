@@ -6,6 +6,8 @@ const io_util = @import("../../sdk/util/io_util.zig");
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const testing = std.testing;
 const http_server = @import("server.zig");
+const mlx = @import("../../mlx/ffi.zig");
+const memory_ceiling = @import("../registry/memory_ceiling.zig");
 
 const Conn = @import("conn.zig").Conn;
 const max_request_bytes = @import("router.zig").max_request_bytes;
@@ -14,6 +16,9 @@ const payloadTooLargeMessage = @import("router.zig").payloadTooLargeMessage;
 const handleConnection = @import("router.zig").handleConnection;
 const logSafePath = @import("respond.zig").logSafePath;
 const sendErrorResponse = @import("errors.zig").sendErrorResponse;
+const sendErrorResponseWithReason = @import("errors.zig").sendErrorResponseWithReason;
+
+pub var import_headroom_override: ?u64 = null;
 
 /// Per-connection thread arguments. Heap-allocated so the spawned thread
 /// owns its lifetime; freed in `handleConnectionThread` after the handler
@@ -23,6 +28,25 @@ pub const ConnThreadArgs = struct {
     allocator: std.mem.Allocator,
     accepted_stream: std.Io.net.Stream,
     io: std.Io,
+};
+
+pub const RawRequest = struct {
+    buf: []u8,
+    len: usize,
+    header_end: usize,
+    header_read_ms: i64,
+
+    pub fn deinit(self: RawRequest, allocator: std.mem.Allocator) void {
+        const line_end = std.mem.indexOf(u8, self.buf[0..self.header_end], "\r\n") orelse self.header_end;
+        var it = std.mem.splitScalar(u8, self.buf[0..line_end], ' ');
+        _ = it.next();
+        const target = it.next() orelse "";
+        const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+        if (std.mem.eql(u8, path, "/v1/cache/import")) {
+            http_server.releaseCacheImportBytes(self.len - self.header_end);
+        }
+        allocator.free(self.buf);
+    }
 };
 
 pub fn handleConnectionThread(args: *ConnThreadArgs) void {
@@ -89,14 +113,6 @@ pub fn jsonNestingDepth(body: []const u8) usize {
     return max;
 }
 
-const RawRequest = struct {
-    /// Owned; `buf[0..len]` is the head plus as much of the body as arrived.
-    buf: []u8,
-    len: usize,
-    header_end: usize,
-    header_read_ms: i64,
-};
-
 /// Reads one request: the head (up to 16 KB), then its `Content-Length` body. Null when no
 /// complete head arrived, the client stalled, or the body is over the route's cap (the 413 is
 /// already sent).
@@ -142,20 +158,53 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
         break :blk it.next() orelse "";
     };
     const max_request_size = maxRequestBytesFor(req_path);
-    if (total_size > max_request_size) {
+    const cache_import = isCacheImportPath(req_path);
+    const content_bytes = content_length orelse 0;
+    const transfer_body_too_large = cache_import and content_bytes > @import("router.zig").max_cache_transfer_body_bytes;
+    if (total_size > max_request_size or transfer_body_too_large) {
         var msg_buf: [128]u8 = undefined;
-        const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_size);
+        const got = if (transfer_body_too_large) content_bytes else total_size;
+        const cap = if (transfer_body_too_large) @import("router.zig").max_cache_transfer_body_bytes else max_request_size;
+        const msg = payloadTooLargeMessage(&msg_buf, got, cap);
         log.warn("[http] 413 {s}: {s}\n", .{ logSafePath(req_path), msg });
-        try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
+        if (isCacheImportPath(req_path)) {
+            try sendErrorResponseWithReason(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413, "cache_transfer_too_large");
+        } else {
+            try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
+        }
         // Closing with body bytes unread resets the connection, and the client
         // can lose the 413 before reading it: read what is left, up to the chat cap.
-        var left = @min(total_size, max_request_bytes) -| total_read;
-        while (left > 0 and stream.awaitReadable(limit_ms)) {
-            const n = stream.read(hdr_buf[0..@min(left, hdr_buf.len)]) catch break;
-            if (n == 0) break;
-            left -= n;
+        if (!transfer_body_too_large) {
+            var left = @min(total_size, max_request_bytes) -| total_read;
+            while (left > 0 and stream.awaitReadable(limit_ms)) {
+                const n = stream.read(hdr_buf[0..@min(left, hdr_buf.len)]) catch break;
+                if (n == 0) break;
+                left -= n;
+            }
         }
         return null;
+    }
+
+    const reserved_bytes: u64 = if (cache_import) @intCast(content_length orelse 0) else 0;
+    if (reserved_bytes > 0 and !http_server.reserveCacheImportBytes(reserved_bytes)) {
+        try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "insufficient_memory", "cache import refused: inbound transfer byte budget is full", 503, "cache_import_busy");
+        return null;
+    }
+    var reservation_in_reader = reserved_bytes > 0;
+    defer if (reservation_in_reader) http_server.releaseCacheImportBytes(reserved_bytes);
+
+    if (cache_import) {
+        const headers = hdr_buf[0 .. header_end_pos - 4];
+        if (findHeaderValue(headers, "x-cache-import-peak")) |value| {
+            const peak = std.fmt.parseInt(u64, value, 10) catch {
+                try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "X-Cache-Import-Peak must be a positive decimal integer", 400, "cache_import_peak_invalid");
+                return null;
+            };
+            if (peak > 0 and !cacheImportPeakFits(peak)) {
+                try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "insufficient_memory", "cache import refused: source planned peak exceeds current headroom", 503, "cache_import_peak_no_memory");
+                return null;
+            }
+        }
     }
 
     // curl asks before a body over 1 MB and otherwise waits a second for the answer.
@@ -166,7 +215,10 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
         }
     };
 
-    const buf = try allocator.alloc(u8, total_size);
+    const buf = allocator.alloc(u8, total_size) catch |err| {
+        if (cache_import) try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "insufficient_memory", "cache import refused: request body allocation failed", 503, "cache_import_no_memory");
+        return err;
+    };
     errdefer allocator.free(buf);
     total_read = @min(total_read, total_size);
     @memcpy(buf[0..total_read], hdr_buf[0..total_read]);
@@ -183,7 +235,25 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
         }
         total_read += n;
     }
+    reservation_in_reader = false;
     return .{ .buf = buf, .len = total_read, .header_end = header_end_pos, .header_read_ms = header_read_ms };
+}
+
+fn isCacheImportPath(target: []const u8) bool {
+    const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+    return std.mem.eql(u8, path, "/v1/cache/import");
+}
+
+fn cacheImportPeakFits(peak: u64) bool {
+    if (import_headroom_override) |headroom| return peak <= headroom;
+    const scheduler = http_server.launch().global_scheduler orelse return true;
+    const model = scheduler.current_model orelse return true;
+    const config = model.config orelse return true;
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    const headroom = memory_ceiling.currentGpuMemoryCeiling(config, active_mem) -| active_mem -| http_server.cacheTransferReservedBytes();
+    const reclaimable = if (model.prefix_cache) |cache| cache.residentBytes() else 0;
+    return peak <= headroom +| reclaimable;
 }
 
 fn findContentLength(headers: []const u8) ?usize {
@@ -246,7 +316,7 @@ pub fn readRequestOver(request: []const u8, body_out: []u8, reply_out: []u8) !st
     const got = std.c.recv(sv[1], reply_out.ptr, reply_out.len, std.c.MSG.DONTWAIT);
     const reply = reply_out[0..@intCast(@max(got, 0))];
     const r = raw orelse return .{ .body = null, .reply = reply };
-    defer testing.allocator.free(r.buf);
+    defer r.deinit(testing.allocator);
     const body = r.buf[r.header_end..r.len];
     @memcpy(body_out[0..body.len], body);
     return .{ .body = body_out[0..body.len], .reply = reply };
@@ -265,7 +335,7 @@ fn readerGivesUp(sent: []const u8, limit_ms: i64, drip_ms: u64) !bool {
     var done = std.atomic.Value(bool).init(false);
     const reader = try std.Thread.spawn(.{}, struct {
         fn run(c: *Conn, limit: i64, d: *std.atomic.Value(bool)) void {
-            if (readRequestWithin(testing.allocator, c, limit) catch null) |r| testing.allocator.free(r.buf);
+            if (readRequestWithin(testing.allocator, c, limit) catch null) |r| r.deinit(testing.allocator);
             d.store(true, .release);
         }
     }.run, .{ &conn, limit_ms, &done });
@@ -305,6 +375,58 @@ test "readRequest: bytes past Content-Length are dropped, a short body is no req
     const huge = try readRequestOver("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 18446744073709551615\r\n\r\n{}", &body_buf, &reply_buf);
     try testing.expect(huge.body == null);
     try testing.expect(std.mem.startsWith(u8, huge.reply, "HTTP/1.1 413"));
+}
+
+test "cache import above 4 GiB is refused at the header before body allocation" {
+    var body_buf: [1]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    const result = try readRequestOver("POST /v1/cache/import HTTP/1.1\r\nContent-Length: 4294967297\r\nExpect: 100-continue\r\n\r\n", &body_buf, &reply_buf);
+    try testing.expect(result.body == null);
+    try testing.expect(std.mem.startsWith(u8, result.reply, "HTTP/1.1 413"));
+    try testing.expect(std.mem.indexOf(u8, result.reply, "cache_transfer_too_large") != null);
+    try testing.expect(std.mem.indexOf(u8, result.reply, "100 Continue") == null);
+    try testing.expectEqual(@as(u64, 0), http_server.serverState().cache_transfer_inbound_reserved.load(.acquire));
+}
+
+test "cache import byte reservations reject an aggregate overflow before allocating the next body" {
+    const held: u64 = http_server.CACHE_TRANSFER_BUDGET_BYTES - (1 << 30);
+    try testing.expect(http_server.reserveCacheImportBytes(held));
+    defer http_server.releaseCacheImportBytes(held);
+
+    var body_buf: [1]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    const result = try readRequestOver("POST /v1/cache/import HTTP/1.1\r\nContent-Length: 1073741825\r\nExpect: 100-continue\r\n\r\n", &body_buf, &reply_buf);
+    try testing.expect(result.body == null);
+    try testing.expect(std.mem.startsWith(u8, result.reply, "HTTP/1.1 503"));
+    try testing.expect(std.mem.indexOf(u8, result.reply, "cache_import_busy") != null);
+    try testing.expect(std.mem.indexOf(u8, result.reply, "100 Continue") == null);
+    try testing.expectEqual(held, http_server.serverState().cache_transfer_inbound_reserved.load(.acquire));
+}
+
+test "cache import source planned peak refuses before body allocation" {
+    import_headroom_override = 100;
+    defer import_headroom_override = null;
+    var body_buf: [1]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    const result = try readRequestOver("POST /v1/cache/import HTTP/1.1\r\nContent-Length: 1\r\nX-Cache-Import-Peak: 101\r\nExpect: 100-continue\r\n\r\n", &body_buf, &reply_buf);
+    try testing.expect(result.body == null);
+    try testing.expect(std.mem.startsWith(u8, result.reply, "HTTP/1.1 503"));
+    try testing.expect(std.mem.indexOf(u8, result.reply, "cache_import_peak_no_memory") != null);
+    try testing.expect(std.mem.indexOf(u8, result.reply, "100 Continue") == null);
+    try testing.expectEqual(@as(u64, 0), http_server.serverState().cache_transfer_inbound_reserved.load(.acquire));
+}
+
+test "cache import reservation returns to zero after success and a mid-body disconnect" {
+    try testing.expectEqual(@as(u64, 0), http_server.serverState().cache_transfer_inbound_reserved.load(.acquire));
+    var body_buf: [16]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    const complete = try readRequestOver("POST /v1/cache/import HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}", &body_buf, &reply_buf);
+    try testing.expectEqualStrings("{}", complete.body.?);
+    try testing.expectEqual(@as(u64, 0), http_server.serverState().cache_transfer_inbound_reserved.load(.acquire));
+
+    const disconnected = try readRequestOver("POST /v1/cache/import HTTP/1.1\r\nContent-Length: 100\r\n\r\n{}", &body_buf, &reply_buf);
+    try testing.expect(disconnected.body == null);
+    try testing.expectEqual(@as(u64, 0), http_server.serverState().cache_transfer_inbound_reserved.load(.acquire));
 }
 
 test "jsonNestingDepth: brackets inside strings never count" {

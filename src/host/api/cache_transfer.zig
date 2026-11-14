@@ -7,17 +7,12 @@ const http_server = @import("../http/server.zig");
 const Conn = @import("../http/conn.zig").Conn;
 const router = @import("../http/router.zig");
 const sendResponse = @import("../http/respond.zig").sendResponse;
-const sendResponseQuiet = @import("../http/respond.zig").sendResponseQuiet;
 const sendErrorResponse = @import("../http/errors.zig").sendErrorResponse;
 const sendErrorResponseWithReason = @import("../http/errors.zig").sendErrorResponseWithReason;
 const requests = @import("../gpu_thread/requests.zig");
 const LoadedModel = @import("../registry/registry.zig").LoadedModel;
 
 pub var max_export_bytes_override: ?usize = null;
-
-/// Each export's buffer lives until the client has read it; past this many the next export is refused.
-pub const max_exports_in_flight = 8;
-pub var exports_in_flight = std.atomic.Value(u32).init(0);
 
 fn effectiveMaxExportBytes() usize {
     return max_export_bytes_override orelse router.max_cache_export_bytes;
@@ -51,11 +46,6 @@ pub fn handleCacheExport(
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
-    defer _ = exports_in_flight.fetchSub(1, .acq_rel);
-    if (exports_in_flight.fetchAdd(1, .acq_rel) >= max_exports_in_flight) {
-        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "insufficient_memory", "cache export refused: exports busy, too many export buffers in flight", 503);
-        return;
-    }
     var req: requests.CacheExportRequest = .{
         .model = lm,
         .prompt_ids = prompt_ids,
@@ -65,6 +55,7 @@ pub fn handleCacheExport(
         .cache_key = cache_key,
         .deadline_ms = deadline_ms,
         .max_bytes = effectiveMaxExportBytes(),
+        .admit_transfer_budget = true,
         .allocator = allocator,
     };
     const outcome = scheduler.exportCache(&req) catch |err| {
@@ -85,13 +76,23 @@ pub fn handleCacheExport(
         .too_large => |got| {
             var msg_buf: [128]u8 = undefined;
             const msg = router.payloadTooLargeMessage(&msg_buf, @intCast(@min(got, std.math.maxInt(usize))), effectiveMaxExportBytes());
-            try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
+            try sendErrorResponseWithReason(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413, "cache_transfer_too_large");
         },
+        .no_memory => try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "insufficient_memory", "cache export refused: planned export peak exceeds available headroom", 503, "cache_export_no_memory"),
         .ok => |res| {
+            defer http_server.releaseCacheExportBytes(@intCast(res.bytes.len));
             defer allocator.free(res.bytes);
-            try sendResponseQuiet(stream, "200 OK", "application/octet-stream", res.bytes);
+            try sendExportResponse(stream, res.bytes, res.planned_peak);
         },
     }
+}
+
+fn sendExportResponse(stream: *Conn, body: []const u8, planned_peak: u64) !void {
+    var header_buf: [256]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nX-Cache-Import-Peak: {d}\r\nConnection: close\r\n\r\n", .{ body.len, planned_peak });
+    try stream.writeAll(header);
+    stream.length_framed = true;
+    try stream.writeAll(body);
 }
 
 const ImportHttpError = struct {

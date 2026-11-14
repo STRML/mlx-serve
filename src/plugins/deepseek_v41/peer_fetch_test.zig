@@ -27,6 +27,7 @@ const Conn = @import("../../host/http/conn.zig").Conn;
 const router = @import("../../host/http/router.zig");
 const HostScheduler = @import("../../host/gpu_thread/scheduler.zig").Scheduler;
 const mlx_engine = @import("../../host/engines/mlx.zig");
+const env = @import("../../env.zig");
 
 const testing = std.testing;
 
@@ -692,6 +693,34 @@ test "dsv41 peer fetch: a failed transfer keeps its error name without allocatin
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "peer cache import failed: OutOfMemory\n"));
 }
 
+test "dsv41 peer fetch: export peak refusal releases its byte reservation before materialization" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_ceiling = memory_ceiling.overrides().static_ceiling;
+    defer memory_ceiling.overrides().static_ceiling = old_ceiling;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const h = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
+    defer h.close();
+    const prompt = buildPrompt(25);
+    const seed = try h.runGreedy(prompt[0..17], 2, true);
+    defer testing.allocator.free(seed.tokens);
+
+    memory_ceiling.overrides().static_ceiling = 1;
+    var exp: @import("../../host/gpu_thread/requests.zig").CacheExportRequest = .{
+        .model = h.entry,
+        .prompt_ids = &prompt,
+        .has_tools = false,
+        .max_bytes = router.max_cache_export_bytes,
+        .admit_transfer_budget = true,
+        .allocator = testing.allocator,
+    };
+    peer_transfer.runCacheExportRequest(&h.sch, &exp);
+
+    try testing.expect(exp.outcome == .no_memory);
+    try testing.expectEqual(@as(u64, 0), http_server.serverState().cache_transfer_outbound_reserved.load(.acquire));
+}
+
 test "dsv41 peer fetch: a commit declined after import_arrays frees the imported snapshot once" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const old_fits = scheduler.prefill_admission_fits;
@@ -981,41 +1010,6 @@ test "dsv41 peer fetch: HTTP export and import of a file-backed model answer 409
     try testing.expect(std.mem.indexOf(u8, imp.body, "\"reason\":\"transfer_unsupported\"") != null);
 }
 
-test "dsv41 peer fetch: an export past the in-flight cap answers 503 busy" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const node = try LiveNode.open(io, try fixture.v41ServableFiles(arena.allocator(), 7));
-    defer node.close();
-    const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 50000 } };
-    const head = "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nX-Cache-Export: 1\r\n";
-    const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}";
-
-    // The held exports are counted directly: a fixture-sized buffer drains into the socket before a test could hold it.
-    cache_transfer.exports_in_flight.store(cache_transfer.max_exports_in_flight, .release);
-    defer cache_transfer.exports_in_flight.store(0, .release);
-    {
-        var busy = try sendHttp(io, node, loopback, head, body);
-        defer busy.deinit(testing.allocator);
-        try expectStatus("export_busy_503", 503, busy);
-        try testing.expect(std.mem.indexOf(u8, busy.body, "busy") != null);
-        try testing.expect(std.mem.indexOf(u8, busy.body, "insufficient_memory") != null);
-    }
-    try testing.expectEqual(@as(u32, cache_transfer.max_exports_in_flight), cache_transfer.exports_in_flight.load(.acquire));
-
-    _ = cache_transfer.exports_in_flight.fetchSub(1, .acq_rel);
-    {
-        var miss = try sendHttp(io, node, loopback, head, body);
-        defer miss.deinit(testing.allocator);
-        try expectStatus("export_under_cap_404", 404, miss);
-    }
-    try testing.expectEqual(@as(u32, cache_transfer.max_exports_in_flight - 1), cache_transfer.exports_in_flight.load(.acquire));
-}
-
 test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 media/speech, 413 cap, 404 miss and warm B turn" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -1106,9 +1100,24 @@ test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 medi
             try testing.expect(saw_done);
         }
 
-        exp_reply = try sendHttp(io, node_a, loopback, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nAuthorization: Bearer peer-secret-60\r\nX-Cache-Export: 1\r\nX-Cache-Deadline-Ms: 60000\r\n", turn2_stream_body);
+        const export_head = "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nAuthorization: Bearer peer-secret-60\r\nX-Cache-Export: 1\r\nX-Cache-Deadline-Ms: 60000\r\n";
+        const inbound_before = http_server.serverState().cache_transfer_inbound_reserved.load(.acquire);
+        const old_outbound = http_server.serverState().cache_transfer_outbound_reserved.load(.acquire);
+        http_server.serverState().cache_transfer_outbound_reserved.store(http_server.CACHE_TRANSFER_BUDGET_BYTES - 1, .release);
+        defer http_server.serverState().cache_transfer_outbound_reserved.store(old_outbound, .release);
+        var aggregate_refusal = try sendHttp(io, node_a, loopback, export_head, turn2_stream_body);
+        defer aggregate_refusal.deinit(testing.allocator);
+        try expectStatus("export_aggregate_bytes_busy_503", 503, aggregate_refusal);
+        try testing.expect(std.mem.indexOf(u8, aggregate_refusal.raw, "cache_export_no_memory") != null);
+        try testing.expectEqual(http_server.CACHE_TRANSFER_BUDGET_BYTES - 1, http_server.serverState().cache_transfer_outbound_reserved.load(.acquire));
+        http_server.serverState().cache_transfer_outbound_reserved.store(old_outbound, .release);
+        try testing.expectEqual(inbound_before, http_server.serverState().cache_transfer_inbound_reserved.load(.acquire));
+
+        exp_reply = try sendHttp(io, node_a, loopback, export_head, turn2_stream_body);
         exp_ready = true;
         try expectStatus("export_warm_200", 200, exp_reply);
+        try testing.expect(std.mem.indexOf(u8, exp_reply.raw, "X-Cache-Import-Peak: ") != null);
+        try testing.expectEqual(@as(u64, 0), http_server.cacheTransferReservedBytes());
         if (exp_reply.body.len <= peer_wire.FIXED_HEADER_BYTES) {
             std.debug.print("check export_wire_len: got {d} want > {d}\n", .{ exp_reply.body.len, peer_wire.FIXED_HEADER_BYTES });
         }
@@ -1172,17 +1181,23 @@ test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 medi
             const oversize_head = try std.fmt.allocPrint(
                 testing.allocator,
                 "POST /v1/cache/import HTTP/1.1\r\nContent-Type: application/octet-stream\r\nAuthorization: Bearer peer-secret-60\r\nContent-Length: {d}\r\n\r\n",
-                .{router.max_request_bytes},
+                .{router.max_cache_transfer_body_bytes + 1},
             );
             defer testing.allocator.free(oversize_head);
             var r2 = try sendHttpRaw(io, node_b, tb5_peer, oversize_head, "", true);
             defer r2.deinit(testing.allocator);
             try expectStatus("import_over_cap_413", 413, r2);
+            try testing.expect(std.mem.indexOf(u8, r2.raw, "cache_transfer_too_large") != null);
         }
 
-        var imp_reply = try sendHttp(io, node_b, tb5_peer, "POST /v1/cache/import HTTP/1.1\r\nContent-Type: application/octet-stream\r\nAuthorization: Bearer peer-secret-60\r\n", exp_reply.body);
+        const peak_start = (std.mem.indexOf(u8, exp_reply.raw, "X-Cache-Import-Peak: ") orelse return error.MissingPlannedPeakHeader) + "X-Cache-Import-Peak: ".len;
+        const peak_end = peak_start + (std.mem.indexOfScalar(u8, exp_reply.raw[peak_start..], '\r') orelse return error.MalformedPlannedPeakHeader);
+        const import_head = try std.fmt.allocPrint(testing.allocator, "POST /v1/cache/import HTTP/1.1\r\nContent-Type: application/octet-stream\r\nAuthorization: Bearer peer-secret-60\r\nX-Cache-Import-Peak: {s}\r\n", .{exp_reply.raw[peak_start..peak_end]});
+        defer testing.allocator.free(import_head);
+        var imp_reply = try sendHttp(io, node_b, tb5_peer, import_head, exp_reply.body);
         defer imp_reply.deinit(testing.allocator);
         try expectStatus("import_tb5_200", 200, imp_reply);
+        try testing.expectEqual(@as(u64, 0), http_server.cacheTransferReservedBytes());
         const imp_json = try std.json.parseFromSlice(std.json.Value, testing.allocator, imp_reply.body, .{});
         defer imp_json.deinit();
         const got_imp_n = imp_json.value.object.get("n").?.integer;
@@ -1223,4 +1238,36 @@ test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 medi
         std.debug.print("check warm_b_reasoning: got '{s}' want '{s}'\n", .{ b_reason, a_reason });
     }
     try testing.expectEqualStrings(a_reason, b_reason);
+}
+
+test "dsv41 peer fetch: HTTP cache import accepts a body above 512 MiB when slow gate is enabled" {
+    if (!env.on(.CACHE_TRANSFER_SLOW_E2E)) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const prev_key = http_server.g_api_key;
+    const prev_strict = http_server.g_api_key_strict;
+    defer {
+        http_server.g_api_key = prev_key;
+        http_server.g_api_key_strict = prev_strict;
+    }
+    http_server.g_api_key = "peer-secret-60";
+    http_server.g_api_key_strict = false;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41ServableFiles(arena.allocator(), 7);
+    const node = try LiveNode.open(io, files);
+    defer node.close();
+
+    const body = try testing.allocator.alloc(u8, (512 * 1024 * 1024) + 1);
+    defer testing.allocator.free(body);
+    @memset(body, 0);
+    var reply = try sendHttp(io, node, .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 50000 } }, "POST /v1/cache/import HTTP/1.1\r\nContent-Type: application/octet-stream\r\nAuthorization: Bearer peer-secret-60\r\n", body);
+    defer reply.deinit(testing.allocator);
+    try expectStatus("import_over_512m_reaches_transfer_decoder", 400, reply);
+    try testing.expect(std.mem.indexOf(u8, reply.raw, "cache_transfer_too_large") == null);
+    try testing.expectEqual(@as(u64, 0), http_server.cacheTransferReservedBytes());
 }

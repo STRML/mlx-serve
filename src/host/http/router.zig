@@ -153,10 +153,11 @@ pub fn isRoute(path: []const u8, comptime p: []const u8) bool {
 }
 
 pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
+pub const max_cache_transfer_body_bytes: usize = 4 * 1024 * 1024 * 1024;
 
 /// A coding agent keeps its screenshots in the history, as base64: chat takes what media takes.
 pub const max_request_bytes: usize = max_media_request_bytes;
-pub const max_cache_export_bytes: usize = max_request_bytes - 16 * 1024;
+pub const max_cache_export_bytes: usize = max_cache_transfer_body_bytes;
 
 /// A decision prompt keeps at most `max_len` state tokens, so a larger body only
 /// buys tokenizer work on the inference thread.
@@ -168,6 +169,7 @@ pub const max_decision_request_bytes: usize = 4 * 1024 * 1024;
 /// history carries its screenshots the same way. Only a decision prompt is small.
 pub fn maxRequestBytesFor(target: []const u8) usize {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+    if (isRoute(path, "/v1/cache/import")) return max_cache_transfer_body_bytes + 16 * 1024;
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
         if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
     if (isRoute(path, "/v1/decisions") or isRoute(path, "/v1/systemone")) return max_decision_request_bytes;
@@ -197,7 +199,7 @@ pub fn handleConnection(
         return;
     };
     const raw = (try readRequest(allocator, stream)) orelse return;
-    defer allocator.free(raw.buf);
+    defer raw.deinit(allocator);
     // The request's ablation key points into `raw.buf`.
     defer stream.clearAblation();
     const total_read = raw.len;
@@ -958,8 +960,15 @@ test "a <id>@<provider> or <id>@<peer> body that asks for ablation is refused be
     try std.testing.expect(std.mem.indexOf(u8, got, "not forwarded to a provider") != null);
 }
 
-test "dsv41 peer fetch: max_cache_export_bytes leaves 16 KiB head room in max_request_bytes" {
-    try std.testing.expectEqual(max_request_bytes - 16 * 1024, max_cache_export_bytes);
-    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024 - 16 * 1024), max_cache_export_bytes);
-    try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor("/v1/cache/import"));
+test "cache transfer routes accept bodies above 512 MiB under the 4 GiB ceiling" {
+    const body_size: usize = 768 * 1024 * 1024;
+    try std.testing.expect(body_size <= max_cache_export_bytes);
+    try std.testing.expect(body_size <= maxRequestBytesFor("/v1/cache/import"));
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), maxRequestBytesFor("/v1/chat/completions"));
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), maxRequestBytesFor("/v1/images/generations"));
+}
+
+test "cache import route allows bounded headers around a 4 GiB body" {
+    try std.testing.expectEqual(max_cache_transfer_body_bytes + 16 * 1024, maxRequestBytesFor("/v1/cache/import"));
+    try std.testing.expectEqual(max_cache_transfer_body_bytes, max_cache_export_bytes);
 }
