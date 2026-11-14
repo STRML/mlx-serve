@@ -9,6 +9,7 @@ const queryDecoded = @import("../api/request_model.zig").queryDecoded;
 const pairValue = @import("../api/request_model.zig").pairValue;
 const percentDecoded = @import("../api/request_model.zig").percentDecoded;
 const logHttpResponse = @import("respond.zig").logHttpResponse;
+const sendErrorResponse = @import("errors.zig").sendErrorResponse;
 
 /// True if the connection's peer is a loopback address (127.0.0.0/8, ::1, or an
 /// IPv4-mapped-IPv6 loopback). Loopback is the local machine → trusted and
@@ -228,6 +229,10 @@ pub fn sendUnauthorized(stream: *Conn) !void {
     try stream.writeAll(hdr);
     stream.length_framed = true;
     try stream.writeAll(body);
+}
+
+pub fn sendCacheTransferForbidden(allocator: std.mem.Allocator, stream: *Conn) !void {
+    try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", "Cache transfer requires loopback or 10.254.0.0/16 peer", 403);
 }
 
 // ── tests ──
