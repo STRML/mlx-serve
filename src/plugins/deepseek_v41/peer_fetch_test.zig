@@ -828,6 +828,33 @@ test "dsv41 peer fetch: a DSV41_FUSED_SEG level refuses an import as settings" {
     try expectLeverRefusesImport(.DSV41_FUSED_SEG, "2");
 }
 
+test "dsv41 peer fetch: LAYER_CAP refuses an import as settings" {
+    try expectLeverRefusesImport(.MLX_SERVE_DIAG, "layer-cap=3");
+}
+
+test "dsv41 peer fetch: DSV4_SKIP_MOE refuses an import as settings" {
+    try expectLeverRefusesImport(.MLX_SERVE_DIAG, "dsv4-skip-moe");
+}
+
+test "dsv41 peer fetch: FORCE_GPU_FAMILY_FALLBACK refuses an import as settings" {
+    try expectLeverRefusesImport(.MLX_SERVE_DIAG, "force-gpu-family-fallback");
+}
+
+test "dsv41 peer fetch: MLX_SERVE_KERNEL_DIR set answers transfer_unsupported on export and import" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const h = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
+    defer h.close();
+    const saved = env.override(.MLX_SERVE_KERNEL_DIR, "/nonexistent-kernel-dir");
+    defer saved.restore();
+    const prompt = buildPrompt(25);
+    const exp = try peer_transfer.exportWireModule(testing.allocator, h.sch.io, &h.sch, h.entry, &prompt, false, null, 0, 0, router.max_cache_export_bytes);
+    try testing.expectEqual(@as(@TypeOf(exp), .transfer_unsupported), exp);
+    const imp = try peer_transfer.importWireModule(testing.allocator, h.sch.io, &h.sch, h.entry, "abc");
+    try testing.expectEqual(@as(@TypeOf(imp), .{ .refused = .transfer_unsupported }), imp);
+}
+
 test "dsv41 peer fetch: each numerics lever unset or at its default gives one settings key" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -842,6 +869,8 @@ test "dsv41 peer fetch: each numerics lever unset or at its default gives one se
     defer s2.restore();
     const s3 = env.override(.DSV41_FUSED_SEG, null);
     defer s3.restore();
+    const s4 = env.override(.MLX_SERVE_DIAG, null);
+    defer s4.restore();
     const unset = peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm);
     inline for (.{
         .{ .MLX_SERVE_DSV41_ATTN_F16, "1" },
@@ -849,6 +878,7 @@ test "dsv41 peer fetch: each numerics lever unset or at its default gives one se
         .{ .MLX_SERVE_DSV41_FLASH_ATTN, "1" },
         .{ .MLX_SERVE_DSV41_FLASH_ATTN, "" },
         .{ .DSV41_FUSED_SEG, "0" },
+        .{ .MLX_SERVE_DIAG, "layer-cap=0,dsv4-skip-moe=0,force-gpu-family-fallback=0" },
     }) |d| {
         const saved = env.override(d[0], d[1]);
         defer saved.restore();

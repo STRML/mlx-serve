@@ -15,6 +15,8 @@ const peer_wire = @import("peer_wire.zig");
 const prefill_mod = @import("../prefill.zig");
 const pack_identity_mod = @import("pack_identity.zig");
 const dsv41_numerics = @import("../../../plugins/deepseek_v41/numerics.zig");
+const env_vars = @import("../../../env.zig");
+const forceGpuFamilyFallback = @import("../../../mlx/device.zig").forceGpuFamilyFallback;
 const publishHotCacheResidency = @import("budget.zig").publishHotCacheResidency;
 const stagedHostBytes = @import("budget.zig").stagedHostBytes;
 const prefillHeadroomNow = @import("../admission/prefill_chunk.zig").prefillHeadroomNow;
@@ -91,6 +93,7 @@ pub fn modelSettingsKey(lm: *const LoadedModel, cfg: *const ModelConfig, xfm: *c
         std.hash.autoHash(&h, @as(u8, 0));
     }
     std.hash.autoHash(&h, dsv41_numerics.resolved());
+    std.hash.autoHash(&h, .{ env_vars.int(.LAYER_CAP, usize, 0), env_vars.on(.DSV4_SKIP_MOE), forceGpuFamilyFallback() });
     if (model_mod.getConfigOverrides()) |raw| {
         h.update("\x00");
         h.update(raw);

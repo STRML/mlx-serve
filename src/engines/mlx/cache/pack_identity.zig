@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const log = @import("../../../sdk/util/log.zig");
 const gguf_files = @import("../../../sdk/quant/gguf/files.zig");
+const env = @import("../../../env.zig");
 
 const chunk_bytes = 8 * 1024 * 1024;
 const f_nocache: c_int = 48;
@@ -70,8 +71,10 @@ pub fn start(io: std.Io, allocator: std.mem.Allocator, slot: *?*Job, path: []con
     slot.* = job;
 }
 
-/// Never blocks. A load that started no hash, or whose hash failed, cannot transfer its cache.
+/// Never blocks. A load that started no hash, whose hash failed, or that runs replaced kernel sources
+/// (MLX_SERVE_KERNEL_DIR) cannot transfer its cache.
 pub fn status(job: ?*const Job) Status {
+    if (env.present(.MLX_SERVE_KERNEL_DIR)) return .unsupported;
     const j = job orelse return .unsupported;
     return switch (j.state.load(.acquire)) {
         .pending => .pending,
