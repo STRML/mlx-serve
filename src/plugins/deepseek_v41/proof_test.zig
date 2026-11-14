@@ -375,6 +375,37 @@ test "cache pack kernels round trip signed bf16 rows and mark one off-grid group
     try testing.expectEqual(@as(u32, 1), mlx.mlx_array_data_uint32(rejected.status).?[0]);
 }
 
+// Two l20.comp groups from a live 32k export (rows 8 and 71). The writer took the scale from the max before rounding
+// (about 4.5-5.0 x 2^-8, E4M3 subnormal 2^-8), so the stored max is 4 x scale, and re-deriving the scale from it gives
+// 2^-9, which puts 0.015625 at 8 x scale, off the grid.
+test "cache pack keeps comp groups whose stored max rounded down to 4 x a subnormal scale" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const stream = mlx.gpuStream();
+    var kernels = try cache_pack.Kernels.init();
+    defer kernels.deinit();
+    const values = [_]u16{
+        0x3c00, 0x3b80, 0x3b00, 0xbb00, 0xbc00, 0x3b00, 0x3c00, 0xbbc0, 0x3b80, 0xbc40, 0x3c40, 0xbbc0, 0x3c40, 0x3c80, 0x3c80, 0xbc40,
+        0x3c80, 0x3b00, 0xbb00, 0xbb00, 0x3c40, 0xbc00, 0x3c00, 0x3b00, 0x0000, 0x3c00, 0xbb00, 0x3b80, 0x3bc0, 0xbb00, 0x3b00, 0x3b80,
+    };
+    const shape = [_]c_int{ 2, 16 };
+    const input = mlx.mlx_array_new_data(&values, &shape, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(input);
+    var bits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bits);
+    try mlx.check(mlx.mlx_view(&bits, input, .uint16, stream));
+    const output = try cache_pack.encode(&kernels, stream, bits, .fp4_e4m3_g16);
+    defer _ = mlx.mlx_array_free(output);
+    try mlx.check(mlx.mlx_array_eval(output));
+    const encoded = mlx.mlx_array_data_uint8(output) orelse return error.NoData;
+    const spec: codec.Spec = .{ .kind = .comp, .rows = 2, .width = 16, .dtype = .bfloat16 };
+    const row_bytes = codec.packedRowBytes(.fp4_e4m3_g16, 16).?;
+    // E4M3 subnormal 2 x 2^-9 = 2^-8.
+    for (0..2) |row| try testing.expectEqual(@as(u8, 0x02), encoded[row * row_bytes + 8]);
+    var decoded: [32]u16 = undefined;
+    try codec.unpackBf16(spec, encoded[0 .. 2 * row_bytes], &decoded);
+    try testing.expectEqualSlices(u16, &values, &decoded);
+}
+
 test "cache pack keeps sentinel scales nonzero after exhaustive bf16 decode" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const stream = mlx.gpuStream();
