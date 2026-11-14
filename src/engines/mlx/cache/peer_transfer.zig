@@ -13,7 +13,7 @@ const transformer_mod = @import("../transformer.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const peer_wire = @import("peer_wire.zig");
 const prefill_mod = @import("../prefill.zig");
-const distributed = @import("../cluster/distributed.zig");
+const pack_identity_mod = @import("pack_identity.zig");
 const publishHotCacheResidency = @import("budget.zig").publishHotCacheResidency;
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const requests = @import("../../../host/gpu_thread/requests.zig");
@@ -127,7 +127,7 @@ pub fn exportWireModule(
     allocator: std.mem.Allocator,
     io: std.Io,
     sch: *const Scheduler,
-    lm: *const LoadedModel,
+    lm: *LoadedModel,
     prompt_ids: []const u32,
     has_tools: bool,
     kv_quant_override: ?kv_quant.KVQuantConfig,
@@ -143,6 +143,7 @@ pub fn exportWireModule(
     const cfg = lm.config orelse return .not_found;
     const hc = lm.prefix_cache orelse return .not_found;
     const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, variant) orelse return .not_found;
+    const pack_identity = try pack_identity_mod.cached(io, allocator, &lm.pack_identity, lm.path) orelse return .transfer_unsupported;
     const quant_config = kv_quant_override orelse cfg.kv_quant_override orelse sch.kv_quant_config;
 
     const hit = hc.findRamModule(binding, prompt_ids, has_tools, quant_config) orelse return .not_found;
@@ -171,7 +172,6 @@ pub fn exportWireModule(
     }
 
     const layout_key = modelLayoutKey(cfg, xfm);
-    const pack_identity = try distributed.modelIdentity(io, allocator, lm.path);
     const settings_key = modelSettingsKey(lm, cfg, xfm);
 
     try materializeExportTensors(exp.tensors[0..exp.out.tensor_len], xfm.s);
@@ -237,6 +237,14 @@ pub fn importWireModule(
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
 
+    const local_pack_id = pack_identity_mod.cached(io, allocator, &lm.pack_identity, lm.path) catch {
+        logRefusal(.pack_identity, 0);
+        return .{ .refused = .pack_identity };
+    } orelse {
+        logRefusal(.transfer_unsupported, 0);
+        return .{ .refused = .transfer_unsupported };
+    };
+
     var env = peer_wire.decode(allocator, body) catch |err| {
         const r = try mapDecodeError(err);
         logRefusal(r, 0);
@@ -266,10 +274,6 @@ pub fn importWireModule(
         logRefusal(.layout_key, env.ids.len);
         return .{ .refused = .layout_key };
     }
-    const local_pack_id = distributed.modelIdentity(io, allocator, lm.path) catch {
-        logRefusal(.pack_identity, env.ids.len);
-        return .{ .refused = .pack_identity };
-    };
     if (env.pack_identity != local_pack_id) {
         logRefusal(.pack_identity, env.ids.len);
         return .{ .refused = .pack_identity };

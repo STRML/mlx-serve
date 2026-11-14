@@ -442,14 +442,17 @@ test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, sett
         const alt_cfg = try std.fmt.allocPrint(testing.allocator, "{s} ", .{orig_cfg});
         defer testing.allocator.free(alt_cfg);
         try model_b.tmp.dir.writeFile(model_b.sch.io, .{ .sub_path = "config.json", .data = alt_cfg });
+        model_b.entry.pack_identity = null;
         const out_cfg = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long);
         try testing.expectEqual(@as(@TypeOf(out_cfg), .{ .refused = .pack_identity }), out_cfg);
         try model_b.tmp.dir.writeFile(model_b.sch.io, .{ .sub_path = "config.json", .data = orig_cfg });
 
         try model_b.tmp.dir.writeFile(model_b.sch.io, .{ .sub_path = "extra.safetensors", .data = "extra" });
+        model_b.entry.pack_identity = null;
         const out_size = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long);
         try testing.expectEqual(@as(@TypeOf(out_size), .{ .refused = .pack_identity }), out_size);
         try model_b.tmp.dir.deleteFile(model_b.sch.io, "extra.safetensors");
+        model_b.entry.pack_identity = null;
     }
 
     // 3. settings refusal (changed model flag)
@@ -491,6 +494,51 @@ test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, sett
         const stale_short = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_short);
         try testing.expectEqual(@as(@TypeOf(stale_short), .{ .refused = .stale }), stale_short);
     }
+}
+
+test "dsv41 peer fetch: a pack with the same config, names and sizes but other weights refuses the import as pack_identity" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files_a = try fixture.v41Files(arena.allocator(), 7);
+    const files_b = try fixture.v41Files(arena.allocator(), 8);
+    try testing.expectEqual(files_a[1].bytes.len, files_b[1].bytes.len);
+    const model_a = try PeerHarness.open(files_a);
+    defer model_a.close();
+    const model_b = try PeerHarness.open(files_b);
+    defer model_b.close();
+
+    const prompt = buildPrompt(25);
+    const seeded = try model_a.runGreedy(prompt[0..17], 2, true);
+    defer testing.allocator.free(seeded.tokens);
+    const exp = try peer_transfer.exportWireModule(testing.allocator, model_a.sch.io, &model_a.sch, model_a.entry, &prompt, false, null, 0, 0, router.max_cache_export_bytes);
+    const wire = exp.ok.bytes;
+    defer testing.allocator.free(wire);
+    const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+    try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .pack_identity }), out);
+}
+
+test "dsv41 peer fetch: a file-backed model answers transfer_unsupported on export and import" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const h = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
+    defer h.close();
+    try h.tmp.dir.writeFile(h.sch.io, .{ .sub_path = "model.gguf", .data = "GGUF" });
+    const gguf = try std.fmt.allocPrint(arena.allocator(), "{s}/model.gguf", .{h.path_buf[0..h.path_len]});
+    const dir_path = h.entry.path;
+    h.entry.path = gguf;
+    defer h.entry.path = dir_path;
+
+    const prompt = buildPrompt(25);
+    const exp = try peer_transfer.exportWireModule(testing.allocator, h.sch.io, &h.sch, h.entry, &prompt, false, null, 0, 0, router.max_cache_export_bytes);
+    try testing.expectEqual(@as(@TypeOf(exp), .transfer_unsupported), exp);
+    const imp = try peer_transfer.importWireModule(testing.allocator, h.sch.io, &h.sch, h.entry, "abc");
+    try testing.expectEqual(@as(@TypeOf(imp), .{ .refused = .transfer_unsupported }), imp);
 }
 
 test "dsv41 peer fetch: a commit declined after import_arrays frees the imported snapshot once" {
@@ -732,6 +780,43 @@ fn sendAllFd(fd: std.posix.fd_t, data: []const u8) !void {
         if (sent <= 0) return error.SendFailed;
         off += @intCast(sent);
     }
+}
+
+test "dsv41 peer fetch: HTTP export and import of a file-backed model answer 409 transfer_unsupported" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const prev_key = http_server.g_api_key;
+    const prev_strict = http_server.g_api_key_strict;
+    defer {
+        http_server.g_api_key = prev_key;
+        http_server.g_api_key_strict = prev_strict;
+    }
+    http_server.g_api_key = "peer-secret-60";
+    http_server.g_api_key_strict = false;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const node = try LiveNode.open(io, try fixture.v41ServableFiles(arena.allocator(), 7));
+    defer node.close();
+    try node.tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "GGUF" });
+    const dir_path = node.entry.path;
+    node.entry.path = try std.fmt.allocPrint(arena.allocator(), "{s}/model.gguf", .{node.path_buf[0..node.path_len]});
+    defer node.entry.path = dir_path;
+
+    const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 50000 } };
+    const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"temperature\":0,\"max_tokens\":4}";
+    var exp = try sendHttp(io, node, loopback, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nAuthorization: Bearer peer-secret-60\r\nX-Cache-Export: 1\r\n", body);
+    defer exp.deinit(testing.allocator);
+    try expectStatus("export_transfer_unsupported_409", 409, exp);
+    try testing.expect(std.mem.indexOf(u8, exp.body, "\"reason\":\"transfer_unsupported\"") != null);
+
+    var imp = try sendHttp(io, node, loopback, "POST /v1/cache/import HTTP/1.1\r\nContent-Type: application/octet-stream\r\nAuthorization: Bearer peer-secret-60\r\n", "abc");
+    defer imp.deinit(testing.allocator);
+    try expectStatus("import_transfer_unsupported_409", 409, imp);
+    try testing.expect(std.mem.indexOf(u8, imp.body, "\"reason\":\"transfer_unsupported\"") != null);
 }
 
 test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 media/speech, 413 cap, 404 miss and warm B turn" {

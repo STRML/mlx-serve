@@ -9,6 +9,7 @@ const router = @import("../http/router.zig");
 const sendResponse = @import("../http/respond.zig").sendResponse;
 const sendResponseQuiet = @import("../http/respond.zig").sendResponseQuiet;
 const sendErrorResponse = @import("../http/errors.zig").sendErrorResponse;
+const sendErrorResponseWithReason = @import("../http/errors.zig").sendErrorResponseWithReason;
 const requests = @import("../gpu_thread/requests.zig");
 const LoadedModel = @import("../registry/registry.zig").LoadedModel;
 
@@ -69,6 +70,9 @@ pub fn handleCacheExport(
         .not_found => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "No matching RAM prefix-cache entry", 404);
         },
+        .transfer_unsupported => {
+            try sendErrorResponseWithReason(allocator, stream, "409 Conflict", "conflict", transfer_unsupported_message, 409, "transfer_unsupported");
+        },
         .too_large => |got| {
             var msg_buf: [128]u8 = undefined;
             const msg = router.payloadTooLargeMessage(&msg_buf, @intCast(@min(got, std.math.maxInt(usize))), effectiveMaxExportBytes());
@@ -86,7 +90,10 @@ const ImportHttpError = struct {
     code: u32,
     kind: []const u8,
     message: []const u8,
+    reason: ?[]const u8 = null,
 };
+
+const transfer_unsupported_message = "cache transfer unsupported: the model is not a directory pack with config.json";
 
 fn refusalHttp(r: requests.CacheImportRefusal) ImportHttpError {
     return switch (r) {
@@ -110,6 +117,7 @@ fn refusalHttp(r: requests.CacheImportRefusal) ImportHttpError {
         .stale => .{ .status = "409 Conflict", .code = 409, .kind = "conflict", .message = "cache import refused: stale or duplicate entry" },
         .commit_declined => .{ .status = "409 Conflict", .code = 409, .kind = "conflict", .message = "cache import refused: commit declined" },
         .no_memory => .{ .status = "503 Service Unavailable", .code = 503, .kind = "insufficient_memory", .message = "cache import refused: insufficient memory headroom" },
+        .transfer_unsupported => .{ .status = "409 Conflict", .code = 409, .kind = "conflict", .message = transfer_unsupported_message, .reason = "transfer_unsupported" },
     };
 }
 
@@ -146,7 +154,7 @@ pub fn handleCacheImport(
         },
         .refused => |r| {
             const e = refusalHttp(r);
-            try sendErrorResponse(allocator, stream, e.status, e.kind, e.message, e.code);
+            try sendErrorResponseWithReason(allocator, stream, e.status, e.kind, e.message, e.code, e.reason);
         },
     }
 }

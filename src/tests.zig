@@ -264,6 +264,7 @@ test {
     _ = @import("engines/mlx/cache/restore_dump.zig");
     _ = @import("engines/mlx/cache/peer_wire.zig");
     _ = @import("engines/mlx/cache/peer_transfer.zig");
+    _ = @import("engines/mlx/cache/pack_identity.zig");
     _ = @import("host/metrics/metrics.zig");
     _ = @import("sdk/util/system.zig");
     _ = @import("engines/mlx/runtime/sleep_inhibit.zig");

@@ -74,6 +74,7 @@ pub fn unloadResident(self: *LoadedModel) void {
         self.media_plugin = null;
     }
     self.gen_busy = false;
+    self.pack_identity = null;
     freeMlx(self);
     if (self.drafter_path.len > 0) {
         self.allocator.free(self.drafter_path);
