@@ -134,6 +134,7 @@ const Hasher = struct {
 
 /// The identity covers every byte the loader reads, for each way a model can be registered: a folder (recursively),
 /// a file (its folder's direct children), and the DSpark/MTP stage GGUF the loader finds beside or above a GGUF.
+/// The GGUF the loader selects (`resolveGgufFile`) and the stage it picks are named in it, so a sibling choice differs.
 /// A folder holding several quantizations of one model hashes all of them, so two boxes must hold the same set to
 /// exchange entries: a refusal, not an error.
 fn hashPack(job: *Job, bytes_read: *u64) !u64 {
@@ -151,6 +152,13 @@ fn hashPack(job: *Job, bytes_read: *u64) !u64 {
     const dir_path = if (recursive) job.path else std.fs.path.dirname(job.path) orelse return error.UnsupportedPackPath;
     var dir = try cwd.openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
+    const model = gguf_files.resolveGgufFile(io, job.allocator, job.path) catch null;
+    defer if (model) |m| job.allocator.free(m);
+    if (model) |m| {
+        hasher.h.update("selected-gguf\x00");
+        hasher.h.update(relativeTo(dir_path, m));
+        hasher.h.update("\x00");
+    }
     hasher.file(dir, "config.json", "config.json") catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -161,18 +169,18 @@ fn hashPack(job: *Job, bytes_read: *u64) !u64 {
         job.allocator.free(paths);
     }
     for (paths) |p| try hasher.file(dir, p, p);
-    if (try stageSidecar(io, job.allocator, job.path)) |stage| {
+    if (model) |m| if (gguf_files.findMtpSidecar(io, job.allocator, m)) |stage| {
         defer job.allocator.free(stage);
-        try hasher.file(cwd, stage, "stage.gguf");
-    }
+        const above = std.fs.path.dirname(dir_path) orelse dir_path;
+        try hasher.file(cwd, stage, relativeTo(above, stage));
+    };
     bytes_read.* = hasher.bytes_read;
     return hasher.h.final();
 }
 
-fn stageSidecar(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
-    const model = gguf_files.resolveGgufFile(io, allocator, path) catch return null;
-    defer allocator.free(model);
-    return gguf_files.findMtpSidecar(io, allocator, model);
+fn relativeTo(base: []const u8, path: []const u8) []const u8 {
+    if (path.len > base.len and std.mem.startsWith(u8, path, base) and path[base.len] == '/') return path[base.len + 1 ..];
+    return std.fs.path.basename(path);
 }
 
 fn packPaths(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, recursive: bool) ![][]u8 {
@@ -331,6 +339,45 @@ test "pack identity: single GGUF file: its bytes decide it, and folders below it
     try a.tmp.dir.createDirPath(testing.io, "nested");
     try a.write("nested/other.gguf", 4096, null);
     try testing.expectEqual(before, try identityOf(file_a));
+}
+
+test "pack identity: single GGUF file: two GGUFs in one folder registered by file differ" {
+    var d = try TestDir.init();
+    defer d.tmp.cleanup();
+    try d.write("a.gguf", 4096, null);
+    try d.write("b.gguf", 4096, null);
+    const a = try d.sub("a.gguf");
+    defer testing.allocator.free(a);
+    const b = try d.sub("b.gguf");
+    defer testing.allocator.free(b);
+    try testing.expect(try identityOf(a) != try identityOf(b));
+}
+
+test "pack identity: single GGUF file: a split GGUF by its first shard and a single GGUF in one folder differ" {
+    var d = try TestDir.init();
+    defer d.tmp.cleanup();
+    try d.write("m-00001-of-00002.gguf", 4096, null);
+    try d.write("m-00002-of-00002.gguf", 4096, 5);
+    try d.write("single.gguf", 4096, null);
+    const shard = try d.sub("m-00001-of-00002.gguf");
+    defer testing.allocator.free(shard);
+    const single = try d.sub("single.gguf");
+    defer testing.allocator.free(single);
+    try testing.expect(try identityOf(shard) != try identityOf(single));
+}
+
+test "pack identity: folder of GGUF: it equals the file it resolves to, not that file's sibling" {
+    var d = try TestDir.init();
+    defer d.tmp.cleanup();
+    try d.write("a.gguf", 4096, null);
+    try d.write("b.gguf", 4096, null);
+    const a = try d.sub("a.gguf");
+    defer testing.allocator.free(a);
+    const b = try d.sub("b.gguf");
+    defer testing.allocator.free(b);
+    const folder = try identityOf(d.path());
+    try testing.expectEqual(folder, try identityOf(a));
+    try testing.expect(folder != try identityOf(b));
 }
 
 test "pack identity: GGUF with a stage file beside it: the MTP folder above it counts" {
