@@ -250,6 +250,17 @@ fn gpuTest() bool {
     return mlx.metalKernelsAvailable() and !mlx.noGpuBackend() and !mlx.virtualGpu();
 }
 
+/// A test that sizes its grid from probeResidency measures the whole GPU, so it cannot share it with other test
+/// processes: under `MLX_SERVE_TEST_SHARD=k/n` with n > 1 the probe reads anywhere from 384 to 711 groups on one box.
+fn skipInParallelShard() bool {
+    const raw = env.span(.MLX_SERVE_TEST_SHARD) orelse return false;
+    const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return false;
+    const n = std.fmt.parseUnsigned(usize, raw[slash + 1 ..], 10) catch return false;
+    if (n <= 1) return false;
+    std.debug.print("[seg] skipped: runs only outside a parallel shard run (shard {s})\n", .{raw});
+    return true;
+}
+
 const launches_per_arm = 1000;
 
 const Outcome = enum { ok, timed_out, bad_status, wrong_words, wrong_winners };
@@ -315,6 +326,7 @@ fn reportChain(arm: Arm, access: Access, layout: Layout, r: ChainResult, retries
 
 test "dsv41 fused seg proto: last-arriver, ordered tickets and resident spin give every phase all of the previous phase's writes, through atomic, coherent and peer accesses, with a group's words contiguous or interleaved across groups (plain stores or loads are the multi-die reproducers, reported not asserted)" {
     if (!gpuTest()) return error.SkipZigTest;
+    if (skipInParallelShard()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const resident = @min(try probeResidency(seg.spin_threads, seg.spin_tgmem), try probeResidency(seg.spin_threads, seg.spin_tgmem));
     if (resident < 2) return error.SkipZigTest;
@@ -375,6 +387,7 @@ const Load = struct {
 
 test "dsv41 fused seg proto: a grid twice the probed residency under a concurrent GPU load ends with every status ok or spin_timeout within the bound (needs a quiet GPU)" {
     if (!gpuTest()) return error.SkipZigTest;
+    if (skipInParallelShard()) return error.SkipZigTest;
     const resident = try probeResidency(seg.spin_threads, seg.spin_tgmem);
     if (resident < 2) return error.SkipZigTest;
     const poll_ms = try timeoutMs(0);
