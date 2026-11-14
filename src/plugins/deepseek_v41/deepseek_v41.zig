@@ -6901,7 +6901,7 @@ pub fn exportSnapshot(m: *const Dsv41Model, sn: *const Snap, out: *cache_abi.Aux
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
     if (had_error) return error.Dsv41CacheMlxErrorPending;
-    const packing = env.on(.DSV41_CACHE_PACK);
+    const packing = if (env.get(.DSV41_CACHE_PACK)) |v| v[0] != '0' else true;
     const p = try snapshotPlan(m, sn, packing);
     const names_len = try exportStorage(&p, out);
     const header = try p.encode(out.header.?[0..out.header_cap]);
