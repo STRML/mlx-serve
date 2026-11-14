@@ -20,6 +20,8 @@ float scale;
 uchar scale_byte;
 if (ENC == 1) {
   scale = dsv41_fp8_roundtrip(metal::max(amax, 6.0f * 0.001953125f) / 6.0f);
+  // The writer scales by the max before rounding; under a subnormal scale that max can round down to 4 x scale.
+  if (amax > 6.0f * scale) scale = amax * 0.25f;
   scale_byte = dsv41_cache_e4m3_bits(scale);
 } else if (ENC == 2) {
   scale = dsv41_pow2ceil(metal::max(amax, 6.0f * 1.17549435e-38f) * (1.0f / 6.0f));
