@@ -10,6 +10,8 @@ const metrics = @import("../status.zig");
 const ane_mod = @import("../../sdk/ane/offload.zig");
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
+const ceiling_terms = @import("memory_ceiling_terms.zig");
+pub const Components = ceiling_terms.Components;
 
 extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
 
@@ -207,15 +209,24 @@ fn ceilingFor(config: ?*const model_mod.ModelConfig, active_mem: u64, holder: Ho
     // SAME build (measured 5,120 / 10,240 / 55,296 tokens, 27B iQ on a 32 GB
     // M1 Pro). Add them back and subtract the known figure once. Zero — and so
     // exactly the old expression — whenever no offload is resident.
+    return ceilingComponentsFor(config, active_mem, holder).ceiling;
+}
+
+pub fn currentGpuMemoryCeilingComponents(config: ?*const model_mod.ModelConfig, active_mem: u64) Components {
+    return ceilingComponentsFor(config, active_mem, .request);
+}
+
+fn ceilingComponentsFor(config: ?*const model_mod.ModelConfig, active_mem: u64, holder: Holder) ceiling_terms.Components {
     const ane_bytes = ane_mod.aneState().live_int8_bytes.load(.monotonic);
     var cache_mem: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache_mem);
-    return gpuCeilingWithWiredFloor(
+    return ceiling_terms.calculate(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
         freeFor(holder) +| ane_bytes,
         wiredCeilingFloorFor(config),
-    ) -| ane_bytes;
+        ane_bytes,
+    );
 }
 
 // ── tests ──

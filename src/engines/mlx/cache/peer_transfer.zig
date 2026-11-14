@@ -18,6 +18,8 @@ const pack_identity_mod = @import("pack_identity.zig");
 const publishHotCacheResidency = @import("budget.zig").publishHotCacheResidency;
 const stagedHostBytes = @import("budget.zig").stagedHostBytes;
 const prefillHeadroomNow = @import("../admission/prefill_chunk.zig").prefillHeadroomNow;
+const prefillHeadroomFrom = @import("../admission/prefill_chunk.zig").prefillHeadroomFrom;
+const memory_ceiling = @import("../../../host/registry/memory_ceiling.zig");
 const module_record = @import("ssd/module_record.zig");
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const requests = @import("../../../host/gpu_thread/requests.zig");
@@ -329,13 +331,25 @@ pub fn importWireModule(
     }
     var peak = try prefill_mod.moduleImportPeak(plan.peak, env.tensors);
     peak = try std.math.add(u64, peak, @intCast(body.len));
-    if (peak > prefillHeadroomNow(cfg, stagedHostBytes(sch)) +| hc.residentBytes()) {
+    const staged_host = stagedHostBytes(sch);
+    const diagnostic = import_peak.enabled();
+    var ceiling_components: ?memory_ceiling.Components = null;
+    const headroom = if (diagnostic) blk: {
+        var active_mem: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active_mem);
+        const components = memory_ceiling.currentGpuMemoryCeilingComponents(cfg, active_mem);
+        ceiling_components = components;
+        break :blk prefillHeadroomFrom(components.ceiling, @intCast(active_mem), staged_host) +| hc.residentBytes();
+    } else prefillHeadroomNow(cfg, staged_host) +| hc.residentBytes();
+    if (peak > headroom) {
+        if (ceiling_components) |components| logPeerAdmission(components, headroom, peak, body.len, false);
         import_peak.finish(import_started, "peer", env.ids.len, entry_bytes, plan, "no_memory");
         logRefusal(.no_memory, env.ids.len);
         return .{ .refused = .no_memory };
     }
     var probe: prefill_mod.ModuleImportProbe = .{ .sch = sch, .cfg = cfg, .peak = peak };
     const admitted = hc.evictLruToAdmit(@intCast(env.ids.len), &probe, prefill_mod.ModuleImportProbe.fits, false).admitted;
+    if (ceiling_components) |components| logPeerAdmission(components, headroom, peak, body.len, admitted);
     publishHotCacheResidency(sch);
     if (!admitted) {
         import_peak.finish(import_started, "peer", env.ids.len, entry_bytes, plan, "no_memory");
@@ -430,6 +444,26 @@ pub fn importWireModule(
             return .{ .refused = .commit_declined };
         },
     }
+}
+
+fn logPeerAdmission(
+    components: memory_ceiling.Components,
+    headroom: u64,
+    peak_with_body: u64,
+    body_bytes: usize,
+    admitted: bool,
+) void {
+    log.info("[import-peak] admission path=peer working_set_limit={d} mlx_footprint={d} free_system={d} ceiling={d} binds={s} headroom={d} peak_with_body={d} body_bytes={d} admitted={s}\n", .{
+        components.working_set_limit,
+        components.mlx_footprint,
+        components.free_system,
+        components.ceiling,
+        @tagName(components.binds),
+        headroom,
+        peak_with_body,
+        body_bytes,
+        if (admitted) "true" else "false",
+    });
 }
 
 pub fn runCacheExportRequest(sch: *Scheduler, req: *requests.CacheExportRequest) void {
