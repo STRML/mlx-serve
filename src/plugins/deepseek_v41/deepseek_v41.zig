@@ -6946,10 +6946,15 @@ fn evalImported(x: A) !void {
     if (mlx.errorPending()) return error.MlxError;
 }
 
-pub fn failedCacheGroups(status: []const u32) usize {
+fn failedCacheGroups(status: []const u32) usize {
     var count: usize = 0;
     for (status) |failure| count += @intFromBool(failure != 0);
     return count;
+}
+
+test "failedCacheGroups counts every non-zero group status" {
+    try std.testing.expectEqual(@as(usize, 0), failedCacheGroups(&.{ 0, 0, 0 }));
+    try std.testing.expectEqual(@as(usize, 2), failedCacheGroups(&.{ 0, 1, 0, 7 }));
 }
 
 fn copyImported(x: A, s: S) !A {
