@@ -244,7 +244,7 @@ test "safeAutoContext leaves headroom below the memory ceiling and rounds to 102
     }
 }
 
-test "autoContextFor: the safety margin applies to MEMORY, never to the model's own max" {
+test "autoContextFrom: the safety margin applies to MEMORY, never to the model's own max" {
     const original = http_server.serverState().server_config.max_context_size;
     defer http_server.serverState().server_config.max_context_size = original;
     http_server.serverState().server_config.max_context_size = 0;
