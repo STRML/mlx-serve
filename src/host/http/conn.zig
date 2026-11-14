@@ -92,6 +92,8 @@ pub const Conn = struct {
     cache_export: bool = false,
     cache_deadline_ms: ?u64 = null,
     cache_deadline_invalid: bool = false,
+    import_footprint_before_body: ?u64 = null,
+    import_body_bytes: ?u64 = null,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
@@ -107,6 +109,8 @@ pub const Conn = struct {
         c.cache_export = false;
         c.cache_deadline_ms = null;
         c.cache_deadline_invalid = false;
+        c.import_footprint_before_body = null;
+        c.import_body_bytes = null;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 

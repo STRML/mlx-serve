@@ -23,6 +23,8 @@ pub const Start = struct {
     active: u64,
     cache: u64,
     footprint: u64,
+    footprint_before_body: ?u64 = null,
+    body_bytes: ?u64 = null,
 };
 
 var initialized = false;
@@ -62,6 +64,13 @@ pub fn begin(io: std.Io) ?Start {
     };
 }
 
+pub fn beginPeer(io: std.Io, footprint_before_body: ?u64, body_bytes: ?u64) ?Start {
+    var start = begin(io) orelse return null;
+    start.footprint_before_body = footprint_before_body;
+    start.body_bytes = body_bytes;
+    return start;
+}
+
 pub fn finish(start: ?Start, path: []const u8, n_tokens: usize, entry_bytes: u64, plan: anytype, refused: ?[]const u8) void {
     const s = start orelse return;
     if (refused) |reason| {
@@ -72,11 +81,25 @@ pub fn finish(start: ?Start, path: []const u8, n_tokens: usize, entry_bytes: u64
         _ = mlx.mlx_get_active_memory(&active);
         _ = mlx.mlx_get_cache_memory(&cache);
         write(.{
-            .path = path, .n_tokens = n_tokens, .entry_bytes = entry_bytes, .estimate = plan.peak,
-            .mlx_peak = null, .peak_over_active_before = null, .active_before = s.active, .active_after = active,
-            .cache_before = s.cache, .cache_after = cache, .footprint_before = s.footprint,
-            .footprint_after = system.getAppMemFootprintBytes(), .footprint_peak = intervalPeak(), .loaded_bytes = plan.loaded,
-            .destination_bytes = plan.destination, .ms = elapsed, .refused = reason,
+            .path = path,
+            .n_tokens = n_tokens,
+            .entry_bytes = entry_bytes,
+            .estimate = plan.peak,
+            .mlx_peak = null,
+            .peak_over_active_before = null,
+            .active_before = s.active,
+            .active_after = active,
+            .cache_before = s.cache,
+            .cache_after = cache,
+            .footprint_before = s.footprint,
+            .footprint_after = system.getAppMemFootprintBytes(),
+            .footprint_peak = intervalPeak(),
+            .loaded_bytes = plan.loaded,
+            .destination_bytes = plan.destination,
+            .ms = elapsed,
+            .refused = reason,
+            .footprint_before_body = s.footprint_before_body,
+            .body_bytes = s.body_bytes,
         });
         return;
     }
@@ -91,11 +114,24 @@ pub fn finish(start: ?Start, path: []const u8, n_tokens: usize, entry_bytes: u64
     const footprint = system.getAppMemFootprintBytes();
     const interval = intervalPeak();
     write(.{
-        .path = path, .n_tokens = n_tokens, .entry_bytes = entry_bytes, .estimate = plan.peak,
-        .mlx_peak = peak, .peak_over_active_before = @as(u64, @intCast(peak)) -| s.active,
-        .active_before = s.active, .active_after = active, .cache_before = s.cache, .cache_after = cache,
-        .footprint_before = s.footprint, .footprint_after = footprint, .footprint_peak = interval,
-        .loaded_bytes = plan.loaded, .destination_bytes = plan.destination, .ms = elapsed,
+        .path = path,
+        .n_tokens = n_tokens,
+        .entry_bytes = entry_bytes,
+        .estimate = plan.peak,
+        .mlx_peak = peak,
+        .peak_over_active_before = @as(u64, @intCast(peak)) -| s.active,
+        .active_before = s.active,
+        .active_after = active,
+        .cache_before = s.cache,
+        .cache_after = cache,
+        .footprint_before = s.footprint,
+        .footprint_after = footprint,
+        .footprint_peak = interval,
+        .loaded_bytes = plan.loaded,
+        .destination_bytes = plan.destination,
+        .ms = elapsed,
+        .footprint_before_body = s.footprint_before_body,
+        .body_bytes = s.body_bytes,
     });
 }
 

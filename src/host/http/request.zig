@@ -6,6 +6,8 @@ const io_util = @import("../../sdk/util/io_util.zig");
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const testing = std.testing;
 const http_server = @import("server.zig");
+const env = @import("../../env.zig");
+const system = @import("../../sdk/util/system.zig");
 
 const Conn = @import("conn.zig").Conn;
 const max_request_bytes = @import("router.zig").max_request_bytes;
@@ -95,6 +97,8 @@ const RawRequest = struct {
     len: usize,
     header_end: usize,
     header_read_ms: i64,
+    footprint_before_body: ?u64,
+    body_bytes: ?u64,
 };
 
 /// Reads one request: the head (up to 16 KB), then its `Content-Length` body. Null when no
@@ -158,6 +162,13 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
         return null;
     }
 
+    const first_line_end = std.mem.indexOf(u8, hdr_buf[0..header_end_pos], "\r\n") orelse 0;
+    const request_line = hdr_buf[0..first_line_end];
+    const is_peer_import = env.on(.DSV41_IMPORT_PEAK_LOG) and
+        std.mem.startsWith(u8, request_line, "POST /v1/cache/import ");
+    const footprint_before_body: ?u64 = if (is_peer_import) system.getAppMemFootprintBytes() else null;
+    const body_bytes: ?u64 = if (is_peer_import) if (content_length) |n| @intCast(n) else null else null;
+
     // curl asks before a body over 1 MB and otherwise waits a second for the answer.
     if (total_read < total_size) if (findHeaderValue(hdr_buf[0 .. header_end_pos - 4], "expect")) |v| {
         if (std.ascii.eqlIgnoreCase(v, "100-continue")) {
@@ -183,7 +194,14 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
         }
         total_read += n;
     }
-    return .{ .buf = buf, .len = total_read, .header_end = header_end_pos, .header_read_ms = header_read_ms };
+    return .{
+        .buf = buf,
+        .len = total_read,
+        .header_end = header_end_pos,
+        .header_read_ms = header_read_ms,
+        .footprint_before_body = footprint_before_body,
+        .body_bytes = body_bytes,
+    };
 }
 
 fn findContentLength(headers: []const u8) ?usize {

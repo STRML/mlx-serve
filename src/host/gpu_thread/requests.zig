@@ -428,6 +428,8 @@ pub const CacheImportOutcome = union(enum) {
 pub const CacheImportRequest = struct {
     model: *LoadedModel,
     body: []const u8,
+    footprint_before_body: ?u64 = null,
+    body_bytes: ?u64 = null,
     deadline_ms: ?u64 = null,
     outcome: CacheImportOutcome = .{ .refused = .bad_envelope },
     /// A static `@errorName` or literal: allocation must not be able to hide a failure.

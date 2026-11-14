@@ -253,7 +253,7 @@ pub fn importWireModule(
     body: []const u8,
 ) !requests.CacheImportOutcome {
     const t0 = io_util.nowUsMonotonic(io);
-    const import_started = import_peak.begin(io);
+    const import_started = import_peak.beginPeer(io, req.footprint_before_body, req.body_bytes);
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
 

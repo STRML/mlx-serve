@@ -17,6 +17,8 @@ pub const Values = struct {
     loaded_bytes: u64,
     destination_bytes: u64,
     ms: u64,
+    footprint_before_body: ?u64 = null,
+    body_bytes: ?u64 = null,
     refused: ?[]const u8 = null,
 };
 
@@ -35,6 +37,14 @@ pub fn format(buf: []u8, v: Values) ![]const u8 {
     try b.append(" footprint_peak=", .{});
     try b.optional(v.footprint_peak);
     try b.append(" loaded_bytes={d} destination_bytes={d} ms={d}", .{ v.loaded_bytes, v.destination_bytes, v.ms });
+    if (std.mem.eql(u8, v.path, "peer")) {
+        try b.append(" footprint_before_body=", .{});
+        try b.optional(v.footprint_before_body);
+        try b.append(" body_bytes=", .{});
+        try b.optional(v.body_bytes);
+    } else {
+        try b.append(" footprint_before_body=NA body_bytes=NA", .{});
+    }
     if (v.refused) |reason| try b.append(" refused={s}", .{reason});
     return b.buf[0..b.used];
 }
@@ -74,7 +84,7 @@ test "format renders one measured import peak line" {
         .destination_bytes = 2_000_000_000,
         .ms = 12_345,
     });
-    try std.testing.expectEqualStrings("[import-peak] path=ssd n_tokens=1000000 entry_bytes=3367160524 estimate=17664435168 mlx_peak=8589934592 peak_over_active_before=2147483648 active_before=6442450944 active_after=7516192768 cache_before=536870912 cache_after=268435456 footprint_before=80000000000 footprint_after=82000000000 footprint_peak=83000000000 loaded_bytes=3000000000 destination_bytes=2000000000 ms=12345", line);
+    try std.testing.expectEqualStrings("[import-peak] path=ssd n_tokens=1000000 entry_bytes=3367160524 estimate=17664435168 mlx_peak=8589934592 peak_over_active_before=2147483648 active_before=6442450944 active_after=7516192768 cache_before=536870912 cache_after=268435456 footprint_before=80000000000 footprint_after=82000000000 footprint_peak=83000000000 loaded_bytes=3000000000 destination_bytes=2000000000 ms=12345 footprint_before_body=NA body_bytes=NA", line);
 }
 
 test "format marks an admission refusal without a measured MLX peak" {
@@ -96,7 +106,9 @@ test "format marks an admission refusal without a measured MLX peak" {
         .loaded_bytes = 4096,
         .destination_bytes = 2048,
         .ms = 1,
+        .footprint_before_body = 900,
+        .body_bytes = 8192,
         .refused = "no_memory",
     });
-    try std.testing.expectEqualStrings("[import-peak] path=peer n_tokens=8 entry_bytes=4096 estimate=16384 mlx_peak=NA peak_over_active_before=NA active_before=100 active_after=100 cache_before=20 cache_after=20 footprint_before=1000 footprint_after=1000 footprint_peak=NA loaded_bytes=4096 destination_bytes=2048 ms=1 refused=no_memory", line);
+    try std.testing.expectEqualStrings("[import-peak] path=peer n_tokens=8 entry_bytes=4096 estimate=16384 mlx_peak=NA peak_over_active_before=NA active_before=100 active_after=100 cache_before=20 cache_after=20 footprint_before=1000 footprint_after=1000 footprint_peak=NA loaded_bytes=4096 destination_bytes=2048 ms=1 footprint_before_body=900 body_bytes=8192 refused=no_memory", line);
 }

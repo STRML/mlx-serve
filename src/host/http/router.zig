@@ -630,6 +630,8 @@ pub fn handleConnection(
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
         }
+        stream.import_footprint_before_body = raw.footprint_before_body;
+        stream.import_body_bytes = raw.body_bytes;
         try handleCacheImport(allocator, stream, request_body, lm);
     } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/completions")) {
         if (text_gen_reject) |reason| {

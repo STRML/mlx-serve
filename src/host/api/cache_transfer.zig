@@ -143,6 +143,8 @@ pub fn handleCacheImport(
     var req: requests.CacheImportRequest = .{
         .model = lm,
         .body = body,
+        .footprint_before_body = stream.import_footprint_before_body,
+        .body_bytes = stream.import_body_bytes,
         .deadline_ms = stream.cache_deadline_ms,
         .allocator = allocator,
     };
