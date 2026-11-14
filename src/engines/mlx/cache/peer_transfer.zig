@@ -25,14 +25,32 @@ const Scheduler = @import("../scheduler.zig").Scheduler;
 
 const Transformer = transformer_mod.Transformer;
 const ModelConfig = model_mod.ModelConfig;
+const LayerLayoutFn = *const fn (
+    p: *const plugin_abi.Parsed,
+    span: ?*const plugin_abi.LayerSpan,
+    out: [*]plugin_abi.LayerCache,
+    cap: u32,
+) callconv(.c) u32;
 
 pub fn modelLayoutKey(cfg: *const ModelConfig, xfm: *const Transformer) u64 {
+    const plugin_name = if (xfm.plugin) |b| b.table.name.slice() else null;
+    const layout_fn = if (xfm.plugin) |b| if (b.table.cache) |cache| cache.layout else null else null;
+    const parsed = if (cfg.plugin) |b| &b.parsed else null;
+    return layoutKeyFrom(cfg, plugin_name, layout_fn, parsed);
+}
+
+fn layoutKeyFrom(
+    cfg: *const ModelConfig,
+    plugin_name: ?[]const u8,
+    layout_fn: ?LayerLayoutFn,
+    parsed: ?*const plugin_abi.Parsed,
+) u64 {
     var h = std.hash.Wyhash.init(0x6c61_796f_7574_3630);
-    if (xfm.plugin) |b| {
-        h.update(b.table.name.slice());
-        if (b.table.cache.layout) |layout_fn| if (cfg.plugin) |pb| {
+    if (plugin_name) |name| {
+        h.update(name);
+        if (layout_fn) |layout| if (parsed) |p| {
             var layers: [128]plugin_abi.LayerCache = undefined;
-            const n = layout_fn(&pb.parsed, null, &layers, layers.len);
+            const n = layout(p, null, &layers, layers.len);
             for (layers[0..n]) |lc| {
                 std.hash.autoHash(&h, .{ @backingInt(lc.kind), lc.nope, lc.kv_source, lc.window, lc.kv_heads, lc.k_dim, lc.v_dim });
             }
@@ -59,6 +77,45 @@ pub fn modelLayoutKey(cfg: *const ModelConfig, xfm: *const Transformer) u64 {
     // TP rank and width stay out: every rank holds the same KV, so an entry moves between widths. The byte keeps TP1 keys unchanged.
     std.hash.autoHash(&h, @as(u8, 0));
     return h.final();
+}
+
+test "modelLayoutKey: iQ DeepSeek V4.1 key is equal across TP widths and ranks" {
+    const sdk_fixture = @import("../../../sdk/testing/fixture.zig");
+    const plugin_config = @import("../plugin/config.zig");
+    const deepseek_v41 = @import("../../../plugins/deepseek_v41/plugin.zig");
+    const json = @embedFile("../../../fixtures/model-configs/deepseek_v41-iq-mlx-3.0bpw.json");
+    const mem: sdk_fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
+    const dir = mem.packDir();
+    var binding: plugin_config.Binding = .{ .table = &deepseek_v41.table };
+    try std.testing.expect(binding.table.parse(&dir, .of(json), .{}, null, true, &binding.parsed).isOk());
+    defer binding.table.free_parsed(&binding.parsed);
+
+    var base = plugin_config.modelConfig(&binding.parsed);
+    plugin_config.applyLayout(&base, binding.table, &binding.parsed);
+    base.plugin = &binding;
+    const layout_fn = binding.table.cache.?.layout.?;
+    const base_key = layoutKeyFrom(&base, binding.table.name.slice(), layout_fn, &binding.parsed);
+
+    var tp2_rank0 = base;
+    try tp2_rank0.applyShard(.{ .rank = 0, .size = 2 });
+    var tp2_rank1 = base;
+    try tp2_rank1.applyShard(.{ .rank = 1, .size = 2 });
+    var tp4_rank0 = base;
+    try tp4_rank0.applyShard(.{ .rank = 0, .size = 4 });
+    var tp4_rank3 = base;
+    try tp4_rank3.applyShard(.{ .rank = 3, .size = 4 });
+
+    try std.testing.expectEqual(base_key, layoutKeyFrom(&tp2_rank0, binding.table.name.slice(), layout_fn, &binding.parsed));
+    try std.testing.expectEqual(base_key, layoutKeyFrom(&tp2_rank1, binding.table.name.slice(), layout_fn, &binding.parsed));
+    try std.testing.expectEqual(base_key, layoutKeyFrom(&tp4_rank0, binding.table.name.slice(), layout_fn, &binding.parsed));
+    try std.testing.expectEqual(base_key, layoutKeyFrom(&tp4_rank3, binding.table.name.slice(), layout_fn, &binding.parsed));
+
+    var changed_experts = base;
+    changed_experts.num_experts += 1;
+    try std.testing.expect(base_key != layoutKeyFrom(&changed_experts, binding.table.name.slice(), layout_fn, &binding.parsed));
+    var changed_window = base;
+    changed_window.sliding_window += 1;
+    try std.testing.expect(base_key != layoutKeyFrom(&changed_window, binding.table.name.slice(), layout_fn, &binding.parsed));
 }
 
 fn optBoolTag(v: ?bool) u8 {
