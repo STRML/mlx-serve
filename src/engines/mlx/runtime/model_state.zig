@@ -3,11 +3,13 @@
 const std = @import("std");
 const registry = @import("../../../host/registry/registry.zig");
 const distributed = @import("../cluster/distributed.zig");
+const pack_identity = @import("../cache/pack_identity.zig");
 const LoadedModel = registry.LoadedModel;
 
 /// Frees the entry's MLX objects (MTP head, drafters, vision tower, transformer, weights, prefix cache), in
 /// dependency order. Null fields are skipped.
 pub fn freeMlx(self: *LoadedModel) void {
+    pack_identity.drop(&self.pack_identity);
     // Cache snapshots call into their plugin binding, which the transformer owns.
     if (self.prefix_cache) |hc| {
         hc.deinit();
@@ -74,7 +76,6 @@ pub fn unloadResident(self: *LoadedModel) void {
         self.media_plugin = null;
     }
     self.gen_busy = false;
-    self.pack_identity = null;
     freeMlx(self);
     if (self.drafter_path.len > 0) {
         self.allocator.free(self.drafter_path);

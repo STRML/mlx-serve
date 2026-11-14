@@ -82,6 +82,9 @@ pub fn handleCacheExport(
         .transfer_unsupported => {
             try sendErrorResponseWithReason(allocator, stream, "409 Conflict", "conflict", transfer_unsupported_message, 409, "transfer_unsupported");
         },
+        .identity_pending => {
+            try sendErrorResponseWithReason(allocator, stream, "409 Conflict", "conflict", identity_pending_message, 409, "identity_pending");
+        },
         .too_large => |got| {
             var msg_buf: [128]u8 = undefined;
             const msg = router.payloadTooLargeMessage(&msg_buf, @intCast(@min(got, std.math.maxInt(usize))), effectiveMaxExportBytes());
@@ -102,7 +105,8 @@ const ImportHttpError = struct {
     reason: ?[]const u8 = null,
 };
 
-const transfer_unsupported_message = "cache transfer unsupported: the model is not a directory pack with config.json";
+const transfer_unsupported_message = "cache transfer unsupported: the model path is neither a file nor a folder, or could not be read";
+const identity_pending_message = "cache transfer refused: the model's pack identity is still being hashed, retry later";
 
 fn refusalHttp(r: requests.CacheImportRefusal) ImportHttpError {
     return switch (r) {
@@ -127,6 +131,7 @@ fn refusalHttp(r: requests.CacheImportRefusal) ImportHttpError {
         .commit_declined => .{ .status = "409 Conflict", .code = 409, .kind = "conflict", .message = "cache import refused: commit declined" },
         .no_memory => .{ .status = "503 Service Unavailable", .code = 503, .kind = "insufficient_memory", .message = "cache import refused: insufficient memory headroom" },
         .transfer_unsupported => .{ .status = "409 Conflict", .code = 409, .kind = "conflict", .message = transfer_unsupported_message, .reason = "transfer_unsupported" },
+        .identity_pending => .{ .status = "409 Conflict", .code = 409, .kind = "conflict", .message = identity_pending_message, .reason = "identity_pending" },
     };
 }
 

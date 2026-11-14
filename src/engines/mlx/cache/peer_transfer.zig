@@ -146,7 +146,11 @@ pub fn exportWireModule(
     const cfg = lm.config orelse return .not_found;
     const hc = lm.prefix_cache orelse return .not_found;
     const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, variant) orelse return .not_found;
-    const pack_identity = try pack_identity_mod.cached(io, allocator, &lm.pack_identity, lm.path) orelse return .transfer_unsupported;
+    const pack_identity = switch (pack_identity_mod.status(lm.pack_identity)) {
+        .ready => |id| id,
+        .pending => return .identity_pending,
+        .unsupported => return .transfer_unsupported,
+    };
     const quant_config = kv_quant_override orelse cfg.kv_quant_override orelse sch.kv_quant_config;
 
     const hit = hc.findRamModule(binding, prompt_ids, has_tools, quant_config) orelse return .not_found;
@@ -255,12 +259,16 @@ pub fn importWireModule(
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
 
-    const local_pack_id = pack_identity_mod.cached(io, allocator, &lm.pack_identity, lm.path) catch {
-        logRefusal(.pack_identity, 0);
-        return .{ .refused = .pack_identity };
-    } orelse {
-        logRefusal(.transfer_unsupported, 0);
-        return .{ .refused = .transfer_unsupported };
+    const local_pack_id = switch (pack_identity_mod.status(lm.pack_identity)) {
+        .ready => |id| id,
+        .pending => {
+            logRefusal(.identity_pending, 0);
+            return .{ .refused = .identity_pending };
+        },
+        .unsupported => {
+            logRefusal(.transfer_unsupported, 0);
+            return .{ .refused = .transfer_unsupported };
+        },
     };
 
     var env = peer_wire.decode(allocator, body) catch |err| {

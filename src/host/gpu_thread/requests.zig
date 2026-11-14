@@ -360,6 +360,7 @@ pub const EmbedRequest = struct {
 pub const CacheExportOutcome = union(enum) {
     not_found,
     transfer_unsupported,
+    identity_pending,
     deadline_passed,
     too_large: u64,
     ok: struct {
@@ -409,6 +410,7 @@ pub const CacheImportRefusal = enum {
     describe_mismatch,
     commit_declined,
     transfer_unsupported,
+    identity_pending,
 };
 
 pub const CacheImportStats = struct {
