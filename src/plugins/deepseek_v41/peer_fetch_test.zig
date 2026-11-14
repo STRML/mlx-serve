@@ -587,7 +587,7 @@ test "dsv41 peer fetch: export and import answer identity_pending until the hash
     defer arena.deinit();
     const h = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
     defer h.close();
-    pack_identity.hold_for_test.store(true, .release);
+    pack_identity.holdForTest();
     defer pack_identity.hold_for_test.store(false, .release);
     try pack_identity.start(h.sch.io, testing.allocator, &h.entry.pack_identity, h.entry.path);
 
@@ -620,10 +620,10 @@ test "dsv41 peer fetch: a read error during the hash answers transfer_unsupporte
     defer arena.deinit();
     const h = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
     defer h.close();
-    pack_identity.hold_for_test.store(true, .release);
+    pack_identity.holdForTest();
     defer pack_identity.hold_for_test.store(false, .release);
     try pack_identity.start(h.sch.io, testing.allocator, &h.entry.pack_identity, h.entry.path);
-    try h.sch.io.sleep(.fromMilliseconds(20), .awake);
+    pack_identity.waitParkedForTest(h.sch.io);
     try h.tmp.dir.writeFile(h.sch.io, .{ .sub_path = "config.json", .data = "" });
     pack_identity.hold_for_test.store(false, .release);
     try testing.expectError(error.PackIdentityUnsupported, pack_identity.waitReady(h.sch.io, h.entry.pack_identity));
@@ -1059,7 +1059,7 @@ test "dsv41 peer fetch: HTTP export and import answer 409 identity_pending while
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    pack_identity.hold_for_test.store(true, .release);
+    pack_identity.holdForTest();
     defer pack_identity.hold_for_test.store(false, .release);
     const node = try LiveNode.openHashing(io, try fixture.v41ServableFiles(arena.allocator(), 7));
     defer node.close();
@@ -1085,7 +1085,7 @@ test "dsv41 peer fetch: unloading while the load's hash runs joins it" {
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    pack_identity.hold_for_test.store(true, .release);
+    pack_identity.holdForTest();
     defer pack_identity.hold_for_test.store(false, .release);
     const node = try LiveNode.openHashing(io, try fixture.v41ServableFiles(arena.allocator(), 7));
     defer node.close();

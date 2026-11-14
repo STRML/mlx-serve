@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const log = @import("../../../sdk/util/log.zig");
+const gguf_files = @import("../../../sdk/quant/gguf/files.zig");
 
 const chunk_bytes = 8 * 1024 * 1024;
 const f_nocache: c_int = 48;
@@ -12,6 +13,17 @@ const qos_class_utility: c_uint = 0x11;
 extern "c" fn pthread_set_qos_class_self_np(qos: c_uint, relative_priority: c_int) c_int;
 
 pub var hold_for_test: std.atomic.Value(bool) = .init(false);
+pub var parked_for_test: std.atomic.Value(bool) = .init(false);
+
+/// Holds every hash at its next block; `waitParkedForTest` returns once one is parked there.
+pub fn holdForTest() void {
+    parked_for_test.store(false, .release);
+    hold_for_test.store(true, .release);
+}
+
+pub fn waitParkedForTest(io: std.Io) void {
+    while (!parked_for_test.load(.acquire)) io.sleep(.fromMilliseconds(1), .awake) catch {};
+}
 
 pub const Status = union(enum) { pending, unsupported, ready: u64 };
 
@@ -107,6 +119,7 @@ const Hasher = struct {
         var off: u64 = 0;
         while (off < size) {
             while (hold_for_test.load(.acquire) and !self.job.cancel.load(.acquire)) {
+                parked_for_test.store(true, .release);
                 io.sleep(.fromMilliseconds(1), .awake) catch {};
             }
             if (self.job.cancel.load(.acquire)) return error.Canceled;
@@ -119,6 +132,10 @@ const Hasher = struct {
     }
 };
 
+/// The identity covers every byte the loader reads, for each way a model can be registered: a folder (recursively),
+/// a file (its folder's direct children), and the DSpark/MTP stage GGUF the loader finds beside or above a GGUF.
+/// A folder holding several quantizations of one model hashes all of them, so two boxes must hold the same set to
+/// exchange entries: a refusal, not an error.
 fn hashPack(job: *Job, bytes_read: *u64) !u64 {
     const io = job.io;
     const buf = try job.allocator.alloc(u8, chunk_bytes);
@@ -126,50 +143,70 @@ fn hashPack(job: *Job, bytes_read: *u64) !u64 {
     var hasher: Hasher = .{ .job = job, .buf = buf };
     const cwd = std.Io.Dir.cwd();
     const st = try cwd.statFile(io, job.path, .{});
-    switch (st.kind) {
-        .file => try hasher.file(cwd, job.path, ""),
-        .directory => {
-            var dir = try cwd.openDir(io, job.path, .{ .iterate = true });
-            defer dir.close(io);
-            hasher.file(dir, "config.json", "config.json") catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return err,
-            };
-            const paths = try weightPaths(io, job.allocator, dir);
-            defer {
-                for (paths) |p| job.allocator.free(p);
-                job.allocator.free(paths);
-            }
-            for (paths) |p| try hasher.file(dir, p, p);
-        },
+    const recursive = switch (st.kind) {
+        .file => false,
+        .directory => true,
         else => return error.UnsupportedPackPath,
+    };
+    const dir_path = if (recursive) job.path else std.fs.path.dirname(job.path) orelse return error.UnsupportedPackPath;
+    var dir = try cwd.openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    hasher.file(dir, "config.json", "config.json") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    const paths = try packPaths(io, job.allocator, dir, recursive);
+    defer {
+        for (paths) |p| job.allocator.free(p);
+        job.allocator.free(paths);
+    }
+    for (paths) |p| try hasher.file(dir, p, p);
+    if (try stageSidecar(io, job.allocator, job.path)) |stage| {
+        defer job.allocator.free(stage);
+        try hasher.file(cwd, stage, "stage.gguf");
     }
     bytes_read.* = hasher.bytes_read;
     return hasher.h.final();
 }
 
-fn weightPaths(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ![][]u8 {
+fn stageSidecar(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const model = gguf_files.resolveGgufFile(io, allocator, path) catch return null;
+    defer allocator.free(model);
+    return gguf_files.findMtpSidecar(io, allocator, model);
+}
+
+fn packPaths(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, recursive: bool) ![][]u8 {
     var out: std.ArrayList([]u8) = .empty;
     errdefer {
         for (out.items) |p| allocator.free(p);
         out.deinit(allocator);
     }
-    var walker = try dir.walk(allocator);
-    defer walker.deinit();
-    while (try walker.next(io)) |e| {
-        if (e.kind != .file and e.kind != .sym_link) continue;
-        if (!isWeightFile(e.basename)) continue;
-        const p = try allocator.dupe(u8, e.path);
-        errdefer allocator.free(p);
-        try out.append(allocator, p);
+    if (recursive) {
+        var walker = try dir.walk(allocator);
+        defer walker.deinit();
+        while (try walker.next(io)) |e| try appendPackFile(allocator, &out, e.kind, e.basename, e.path);
+    } else {
+        var it = dir.iterate();
+        while (try it.next(io)) |e| try appendPackFile(allocator, &out, e.kind, e.name, e.name);
     }
     std.mem.sort([]u8, out.items, {}, pathLess);
     return out.toOwnedSlice(allocator);
 }
 
-fn isWeightFile(name: []const u8) bool {
+fn appendPackFile(allocator: std.mem.Allocator, out: *std.ArrayList([]u8), kind: std.Io.File.Kind, basename: []const u8, path: []const u8) !void {
+    if (kind != .file and kind != .sym_link) return;
+    if (!isPackFile(basename)) return;
+    const p = try allocator.dupe(u8, path);
+    errdefer allocator.free(p);
+    try out.append(allocator, p);
+}
+
+fn isPackFile(name: []const u8) bool {
     inline for (.{ ".safetensors", ".bin", ".gguf" }) |ext| {
         if (std.mem.endsWith(u8, name, ext)) return true;
+    }
+    inline for (.{ "model.safetensors.index.json", "engram-manifest.json", "engram-token-map.u32", "engram_token_map.json" }) |exact| {
+        if (std.mem.eql(u8, name, exact)) return true;
     }
     return false;
 }
@@ -225,7 +262,7 @@ fn safetensorsPack(flip: ?usize) !TestDir {
     return d;
 }
 
-test "pack identity: two 5 MiB packs that differ only at byte 65536 differ" {
+test "pack identity: folder of safetensors: two 5 MiB packs that differ only at byte 65536 differ" {
     var a = try safetensorsPack(null);
     defer a.tmp.cleanup();
     var b = try safetensorsPack(65536);
@@ -233,7 +270,7 @@ test "pack identity: two 5 MiB packs that differ only at byte 65536 differ" {
     try testing.expect(try identityOf(a.path()) != try identityOf(b.path()));
 }
 
-test "pack identity: GGUF folders with config.json and different .gguf files differ" {
+test "pack identity: folder of GGUF: config.json and different .gguf files differ" {
     var dirs: [2]TestDir = .{ try TestDir.init(), try TestDir.init() };
     defer for (&dirs) |*d| d.tmp.cleanup();
     var ids: [2]u64 = undefined;
@@ -246,16 +283,80 @@ test "pack identity: GGUF folders with config.json and different .gguf files dif
     try testing.expect(ids[0] != ids[1]);
 }
 
-test "pack identity: a file path gets one, and its content decides it" {
+fn splitPack(second_flip: ?usize, companion: []const u8) !TestDir {
     var d = try TestDir.init();
-    defer d.tmp.cleanup();
-    try d.write("a.gguf", 4096, null);
-    try d.write("b.gguf", 4096, 7);
-    const a = try d.sub("a.gguf");
-    defer testing.allocator.free(a);
-    const b = try d.sub("b.gguf");
-    defer testing.allocator.free(b);
-    try testing.expect(try identityOf(a) != try identityOf(b));
+    errdefer d.tmp.cleanup();
+    try d.write("model-00001-of-00002.gguf", 4096, null);
+    try d.write(companion, 4096, second_flip);
+    return d;
+}
+
+test "pack identity: split GGUF by first shard: a different second shard differs" {
+    var a = try splitPack(null, "model-00002-of-00002.gguf");
+    defer a.tmp.cleanup();
+    var b = try splitPack(9, "model-00002-of-00002.gguf");
+    defer b.tmp.cleanup();
+    const first_a = try a.sub("model-00001-of-00002.gguf");
+    defer testing.allocator.free(first_a);
+    const first_b = try b.sub("model-00001-of-00002.gguf");
+    defer testing.allocator.free(first_b);
+    try testing.expect(try identityOf(first_a) != try identityOf(first_b));
+}
+
+test "pack identity: GGUF with an engram file beside it: a different engram file differs" {
+    var a = try splitPack(null, "engram.gguf");
+    defer a.tmp.cleanup();
+    var b = try splitPack(9, "engram.gguf");
+    defer b.tmp.cleanup();
+    const first_a = try a.sub("model-00001-of-00002.gguf");
+    defer testing.allocator.free(first_a);
+    const first_b = try b.sub("model-00001-of-00002.gguf");
+    defer testing.allocator.free(first_b);
+    try testing.expect(try identityOf(first_a) != try identityOf(first_b));
+}
+
+test "pack identity: single GGUF file: its bytes decide it, and folders below it are not walked" {
+    var a = try TestDir.init();
+    defer a.tmp.cleanup();
+    var b = try TestDir.init();
+    defer b.tmp.cleanup();
+    try a.write("model.gguf", 4096, null);
+    try b.write("model.gguf", 4096, 3);
+    const file_a = try a.sub("model.gguf");
+    defer testing.allocator.free(file_a);
+    const file_b = try b.sub("model.gguf");
+    defer testing.allocator.free(file_b);
+    const before = try identityOf(file_a);
+    try testing.expect(before != try identityOf(file_b));
+    try a.tmp.dir.createDirPath(testing.io, "nested");
+    try a.write("nested/other.gguf", 4096, null);
+    try testing.expectEqual(before, try identityOf(file_a));
+}
+
+test "pack identity: GGUF with a stage file beside it: the MTP folder above it counts" {
+    var dirs: [2]TestDir = .{ try TestDir.init(), try TestDir.init() };
+    defer for (&dirs) |*d| d.tmp.cleanup();
+    var ids: [2]u64 = undefined;
+    for (&dirs, &ids, 0..) |*d, *id, i| {
+        try d.tmp.dir.createDirPath(testing.io, "quant");
+        try d.tmp.dir.createDirPath(testing.io, "MTP");
+        try d.write("quant/model.gguf", 4096, null);
+        try d.write("MTP/DSpark-support.gguf", 4096, if (i == 0) null else 11);
+        const model = try d.sub("quant/model.gguf");
+        defer testing.allocator.free(model);
+        id.* = try identityOf(model);
+    }
+    try testing.expect(ids[0] != ids[1]);
+}
+
+test "pack identity: folder of safetensors: the engram token map counts" {
+    var a = try safetensorsPack(null);
+    defer a.tmp.cleanup();
+    var b = try safetensorsPack(null);
+    defer b.tmp.cleanup();
+    try a.tmp.dir.writeFile(testing.io, .{ .sub_path = "engram-token-map.u32", .data = "\x01\x00\x00\x00" });
+    try b.tmp.dir.writeFile(testing.io, .{ .sub_path = "engram-token-map.u32", .data = "\x02\x00\x00\x00" });
+    try testing.expect(try identityOf(a.path()) != try identityOf(b.path()));
 }
 
 test "pack identity: a path that does not open is unsupported" {
@@ -281,12 +382,12 @@ test "pack identity: a second read of the status touches no file" {
 test "pack identity: it stays pending while the test seam holds it" {
     var d = try safetensorsPack(null);
     defer d.tmp.cleanup();
-    hold_for_test.store(true, .release);
+    holdForTest();
     defer hold_for_test.store(false, .release);
     var slot: ?*Job = null;
     defer drop(&slot);
     try start(testing.io, testing.allocator, &slot, d.path());
-    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    waitParkedForTest(testing.io);
     try testing.expectEqual(Status.pending, status(slot));
     hold_for_test.store(false, .release);
     _ = try waitReady(testing.io, slot);
@@ -295,11 +396,11 @@ test "pack identity: it stays pending while the test seam holds it" {
 test "pack identity: dropping a job mid-hash joins its thread and frees it" {
     var d = try safetensorsPack(null);
     defer d.tmp.cleanup();
-    hold_for_test.store(true, .release);
+    holdForTest();
     defer hold_for_test.store(false, .release);
     var slot: ?*Job = null;
     try start(testing.io, testing.allocator, &slot, d.path());
-    try testing.io.sleep(.fromMilliseconds(20), .awake);
+    waitParkedForTest(testing.io);
     drop(&slot);
     try testing.expectEqual(@as(?*Job, null), slot);
     try testing.expectEqual(Status.unsupported, status(slot));
@@ -308,12 +409,12 @@ test "pack identity: dropping a job mid-hash joins its thread and frees it" {
 test "pack identity: a file that shrinks while it is read fails the hash" {
     var d = try safetensorsPack(null);
     defer d.tmp.cleanup();
-    hold_for_test.store(true, .release);
+    holdForTest();
     defer hold_for_test.store(false, .release);
     var slot: ?*Job = null;
     defer drop(&slot);
     try start(testing.io, testing.allocator, &slot, d.path());
-    try testing.io.sleep(.fromMilliseconds(20), .awake);
+    waitParkedForTest(testing.io);
     try d.tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "" });
     hold_for_test.store(false, .release);
     try testing.expectError(error.PackIdentityUnsupported, waitReady(testing.io, slot));
