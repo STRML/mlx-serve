@@ -1345,7 +1345,6 @@ test "absent and short auxiliary tables refuse without calling hooks" {
         try t.expectEqual(abi.Verdict.Code.unsupported, auxDescribe(&x, &fake, &info).code);
         try t.expectEqual(abi.Verdict.Code.unsupported, auxPrefixKey(&x, &fake.ids, null, &key).code);
         try t.expectEqual(abi.Verdict.Code.unsupported, auxBeginPrompt(&x, 7, &.{ 4, 8, 15, 16 }, null, 0, false).code);
-        var peak: u64 = 0;
         try t.expectEqual(abi.Verdict.Code.unsupported, auxImportPlan(&x, "codec", &peak).code);
         try t.expectEqual(abi.Verdict.Code.unsupported, auxExportArrays(&x, &fake, &exported).code);
         try t.expectEqual(abi.Verdict.Code.unsupported, auxImportArrays(&x, &fake.ids, "codec", &.{}, &imported).code);
