@@ -695,6 +695,7 @@ test "dsv41 peer fetch: a failed transfer keeps its error name without allocatin
 
 test "dsv41 peer fetch: export peak refusal releases its byte reservation before materialization" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try testing.expectEqual(@as(u64, 0), http_server.serverState().cache_transfer_outbound_reserved.load(.acquire));
     const old_ceiling = memory_ceiling.overrides().static_ceiling;
     defer memory_ceiling.overrides().static_ceiling = old_ceiling;
 
@@ -1012,6 +1013,7 @@ test "dsv41 peer fetch: HTTP export and import of a file-backed model answer 409
 
 test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 media/speech, 413 cap, 404 miss and warm B turn" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try testing.expectEqual(@as(u64, 0), http_server.cacheTransferReservedBytes());
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
