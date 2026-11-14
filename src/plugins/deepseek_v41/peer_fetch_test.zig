@@ -431,6 +431,7 @@ test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, sett
         const bad_layout = try testing.allocator.dupe(u8, wire_long);
         defer testing.allocator.free(bad_layout);
         bad_layout[32] ^= 1;
+        peer_wire.stampChecksum(bad_layout);
         const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, bad_layout);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .layout_key }), out);
     }

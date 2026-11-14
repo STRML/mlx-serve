@@ -201,7 +201,7 @@ pub fn exportWireModule(
         @memcpy(out[cursor..][0..nb], src[0..nb]);
         cursor += nb;
     }
-    peer_wire.stampPayloadChecksum(out, payload_off);
+    peer_wire.stampChecksum(out);
 
     const elapsed_ms: u64 = @intCast(@max(@divTrunc(io_util.nowUsMonotonic(io) - t0, 1000), 0));
     log.info("[hot-cache] peer module export: n={d} bytes={d} ({d} ms)\n", .{ hit.tokens.len, out.len, elapsed_ms });

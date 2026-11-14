@@ -132,7 +132,7 @@ pub fn encodedSize(n_tokens: usize, header_len: usize, tensors: []const module_r
 }
 
 /// Writes everything up to the tensor payload into `out` and returns the byte offset where payload bytes begin.
-/// Call `stampPayloadChecksum(out, payload_offset)` once the payload bytes are written.
+/// Call `stampChecksum(out)` once the payload bytes are written.
 pub fn writeEnvelopePrefix(out: []u8, in: EnvelopeInput) !usize {
     const meta_len = try encodedMetaSize(in.ids.len, in.plugin_header.len, in.tensors);
     var payload_bytes: u64 = 0;
@@ -219,9 +219,15 @@ pub fn writeEnvelopePrefix(out: []u8, in: EnvelopeInput) !usize {
     return meta_len;
 }
 
-pub fn stampPayloadChecksum(out: []u8, payload_offset: usize) void {
-    const sum = std.hash.Wyhash.hash(0, out[payload_offset..]);
-    std.mem.writeInt(u64, out[88..96], sum, .little);
+fn envelopeChecksum(body: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(body[0..88]);
+    h.update(body[96..]);
+    return h.final();
+}
+
+pub fn stampChecksum(out: []u8) void {
+    std.mem.writeInt(u64, out[88..96], envelopeChecksum(out), .little);
 }
 
 pub fn encodeAlloc(a: std.mem.Allocator, in: EnvelopeInput, tensor_payloads: []const []const u8) ![]u8 {
@@ -236,7 +242,7 @@ pub fn encodeAlloc(a: std.mem.Allocator, in: EnvelopeInput, tensor_payloads: []c
         @memcpy(out[cursor..][0..bytes.len], bytes);
         cursor += bytes.len;
     }
-    stampPayloadChecksum(out, payload_off);
+    stampChecksum(out);
     return out;
 }
 
@@ -277,7 +283,7 @@ pub fn decode(a: std.mem.Allocator, body: []const u8) DecodeError!DecodedEnvelop
     const cache_key = std.mem.readInt(u64, body[64..72], .little);
     const variant = std.mem.readInt(u64, body[72..80], .little);
     const payload_bytes = std.mem.readInt(u64, body[80..88], .little);
-    const payload_wyhash = std.mem.readInt(u64, body[88..96], .little);
+    const checksum = std.mem.readInt(u64, body[88..96], .little);
 
     var cursor: usize = FIXED_HEADER_BYTES;
     const token_bytes: usize = n_tokens * 4;
@@ -367,7 +373,7 @@ pub fn decode(a: std.mem.Allocator, body: []const u8) DecodeError!DecodedEnvelop
     if (body.len - cursor < pay_len) return error.TruncatedEnvelope;
     if (body.len - cursor > pay_len) return error.BadTensorOffsets;
     const payload = body[cursor..][0..pay_len];
-    if (std.hash.Wyhash.hash(0, payload) != payload_wyhash) return error.BadChecksum;
+    if (envelopeChecksum(body) != checksum) return error.BadChecksum;
 
     return .{
         .arena = arena,
@@ -465,6 +471,21 @@ test "dsv41 peer fetch: envelope rejects unknown version, short body and bad che
     defer testing.allocator.free(bad_sum);
     bad_sum[bad_sum.len - 1] ^= 0xff;
     try testing.expectError(error.BadChecksum, decode(testing.allocator, bad_sum));
+}
+
+test "dsv41 peer fetch: the checksum covers token ids and flags, not only the payload" {
+    const wire = try sampleEnvelope(testing.allocator);
+    defer testing.allocator.free(wire);
+
+    const other_id = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(other_id);
+    std.mem.writeInt(u32, other_id[FIXED_HEADER_BYTES..][0..4], 11, .little);
+    try testing.expectError(error.BadChecksum, decode(testing.allocator, other_id));
+
+    const no_tools = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(no_tools);
+    no_tools[12] = 0;
+    try testing.expectError(error.BadChecksum, decode(testing.allocator, no_tools));
 }
 
 test "dsv41 peer fetch: envelope rejects bad tensor dtype, shape and payload offsets" {
