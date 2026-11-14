@@ -312,9 +312,11 @@ pub fn findHeaderValue(headers: []const u8, comptime name_lower: []const u8) ?[]
 
 // ── tests ──
 
+pub const ReadOverResult = struct { body: ?[]const u8, reply: []const u8 };
+
 /// Sends `request` (then EOF) over a socketpair and runs `readRequest` on the server end;
 /// returns the body it read, or null, plus whatever the server wrote back.
-pub fn readRequestOver(request: []const u8, body_out: []u8, reply_out: []u8) !struct { body: ?[]const u8, reply: []const u8 } {
+pub fn readRequestOver(request: []const u8, body_out: []u8, reply_out: []u8) !ReadOverResult {
     return readRequestOverFrom(request, body_out, reply_out, .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } });
 }
 
@@ -323,7 +325,7 @@ fn readRequestOverFrom(
     body_out: []u8,
     reply_out: []u8,
     peer: std.Io.net.IpAddress,
-) !struct { body: ?[]const u8, reply: []const u8 } {
+) !ReadOverResult {
     return readRequestOverFromWithAllocator(request, body_out, reply_out, peer, testing.allocator);
 }
 
@@ -333,7 +335,7 @@ fn readRequestOverFromWithAllocator(
     reply_out: []u8,
     peer: std.Io.net.IpAddress,
     allocator: std.mem.Allocator,
-) !struct { body: ?[]const u8, reply: []const u8 } {
+) !ReadOverResult {
     var sv: [2]std.posix.fd_t = undefined;
     try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
     defer _ = std.c.close(sv[1]);
