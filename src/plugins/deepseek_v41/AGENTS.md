@@ -123,6 +123,7 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   asserts it), so the SSD tier writes rank 0's and a disk import sends the worker its tensors (`tpLoad`).
 - Under `tp` rank 0 alone holds the vision tower: a chunk's image rows ride with its step (`tp_step` `images`), the
   worker splices them at offset 0, so a rank's splice must depend only on the chunk's own rows (`chunkImageRows`).
+- Packed v2 snapshot entries are readable by this plugin; older binaries drop them during SSD scan.
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.
 - Metal only: a CPU host stream loads on this thread's GPU stream; no GPU = refused by name.
 
