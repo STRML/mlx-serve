@@ -379,6 +379,7 @@ pub const CacheExportRequest = struct {
     deadline_ms: ?u64 = null,
     max_bytes: usize,
     outcome: CacheExportOutcome = .not_found,
+    /// A static `@errorName` or literal: allocation must not be able to hide a failure.
     error_name: ?[]const u8 = null,
     done: bool = false,
     allocator: std.mem.Allocator,
@@ -429,6 +430,7 @@ pub const CacheImportRequest = struct {
     body: []const u8,
     deadline_ms: ?u64 = null,
     outcome: CacheImportOutcome = .{ .refused = .bad_envelope },
+    /// A static `@errorName` or literal: allocation must not be able to hide a failure.
     error_name: ?[]const u8 = null,
     done: bool = false,
     allocator: std.mem.Allocator,

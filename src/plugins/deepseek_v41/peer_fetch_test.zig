@@ -654,6 +654,44 @@ test "dsv41 peer fetch: an import_arrays failure on a memory latch answers no_me
     }
 }
 
+test "dsv41 peer fetch: a failed transfer keeps its error name without allocating and logs it once" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+    const log = @import("../../sdk/util/log.zig");
+    const requests = @import("../../host/gpu_thread/requests.zig");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const h = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
+    defer h.close();
+    const prompt = buildPrompt(25);
+    const seed = try h.runGreedy(prompt[0..17], 2, true);
+    defer testing.allocator.free(seed.tokens);
+    const wire = try peer_transfer.exportWireModule(testing.allocator, h.sch.io, &h.sch, h.entry, &prompt, false, null, 0, 0, router.max_cache_export_bytes);
+    defer testing.allocator.free(wire.ok.bytes);
+
+    var log_buf: [512]u8 = undefined;
+    const log_path = try std.fmt.bufPrint(&log_buf, "{s}/transfer.log", .{h.path_buf[0..h.path_len]});
+    try log.openFile(log_path, 0);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+
+    var exp: requests.CacheExportRequest = .{ .model = h.entry, .prompt_ids = &prompt, .has_tools = false, .max_bytes = router.max_cache_export_bytes, .allocator = failing.allocator() };
+    peer_transfer.runCacheExportRequest(&h.sch, &exp);
+    var imp: requests.CacheImportRequest = .{ .model = h.entry, .body = wire.ok.bytes, .allocator = failing.allocator() };
+    peer_transfer.runCacheImportRequest(&h.sch, &imp);
+    log.closeFile();
+
+    try testing.expect(exp.done and imp.done);
+    try testing.expectEqualStrings("OutOfMemory", exp.error_name orelse "");
+    try testing.expectEqualStrings("OutOfMemory", imp.error_name orelse "");
+    const text = try h.tmp.dir.readFileAlloc(h.sch.io, "transfer.log", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(text);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "peer cache export failed: OutOfMemory\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "peer cache import failed: OutOfMemory\n"));
+}
+
 test "dsv41 peer fetch: a commit declined after import_arrays frees the imported snapshot once" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const old_fits = scheduler.prefill_admission_fits;

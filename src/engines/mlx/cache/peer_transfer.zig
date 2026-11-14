@@ -444,10 +444,10 @@ pub fn runCacheExportRequest(sch: *Scheduler, req: *requests.CacheExportRequest)
         req.cache_key,
         req.max_bytes,
     ) catch |err| {
+        log.warn("[hot-cache] peer cache export failed: {s}\n", .{@errorName(err)});
         req.done_mu.lockUncancelable(sch.io);
         defer req.done_mu.unlock(sch.io);
-        if (req.error_name) |old| req.allocator.free(old);
-        req.error_name = req.allocator.dupe(u8, @errorName(err)) catch null;
+        req.error_name = @errorName(err);
         req.done = true;
         req.done_cond.broadcast(sch.io);
         return;
@@ -469,10 +469,10 @@ pub fn runCacheImportRequest(sch: *Scheduler, req: *requests.CacheImportRequest)
         return;
     }
     const out = importWireModule(req.allocator, sch.io, sch, req.model, req.body) catch |err| {
+        log.warn("[hot-cache] peer cache import failed: {s}\n", .{@errorName(err)});
         req.done_mu.lockUncancelable(sch.io);
         defer req.done_mu.unlock(sch.io);
-        if (req.error_name) |old| req.allocator.free(old);
-        req.error_name = req.allocator.dupe(u8, @errorName(err)) catch null;
+        req.error_name = @errorName(err);
         req.done = true;
         req.done_cond.broadcast(sch.io);
         return;
@@ -504,8 +504,7 @@ pub fn exportCache(sch: *Scheduler, req: *requests.CacheExportRequest) !void {
     while (!req.done) {
         req.done_cond.waitUncancelable(sch.io, &req.done_mu);
     }
-    if (req.error_name) |err_str| {
-        req.allocator.free(err_str);
+    if (req.error_name != null) {
         req.error_name = null;
         return error.CacheExportFailed;
     }
@@ -525,8 +524,7 @@ pub fn importCache(sch: *Scheduler, req: *requests.CacheImportRequest) !void {
     while (!req.done) {
         req.done_cond.waitUncancelable(sch.io, &req.done_mu);
     }
-    if (req.error_name) |err_str| {
-        req.allocator.free(err_str);
+    if (req.error_name != null) {
         req.error_name = null;
         return error.CacheImportFailed;
     }

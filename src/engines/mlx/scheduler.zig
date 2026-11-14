@@ -418,7 +418,7 @@ pub fn deinit(self: *Scheduler) void {
     self.embed_queue.deinit(self.allocator);
     for (self.cache_export_queue.items) |req| {
         req.done_mu.lockUncancelable(self.io);
-        if (req.error_name == null) req.error_name = req.allocator.dupe(u8, "Shutdown") catch null;
+        if (req.error_name == null) req.error_name = "Shutdown";
         req.done = true;
         req.done_cond.broadcast(self.io);
         req.done_mu.unlock(self.io);
@@ -426,7 +426,7 @@ pub fn deinit(self: *Scheduler) void {
     self.cache_export_queue.deinit(self.allocator);
     for (self.cache_import_queue.items) |req| {
         req.done_mu.lockUncancelable(self.io);
-        if (req.error_name == null) req.error_name = req.allocator.dupe(u8, "Shutdown") catch null;
+        if (req.error_name == null) req.error_name = "Shutdown";
         req.done = true;
         req.done_cond.broadcast(self.io);
         req.done_mu.unlock(self.io);
