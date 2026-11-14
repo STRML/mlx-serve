@@ -29,7 +29,6 @@ const Conn = @import("../../host/http/conn.zig").Conn;
 const router = @import("../../host/http/router.zig");
 const HostScheduler = @import("../../host/gpu_thread/scheduler.zig").Scheduler;
 const mlx_engine = @import("../../host/engines/mlx.zig");
-const env = @import("../../env.zig");
 
 const testing = std.testing;
 
