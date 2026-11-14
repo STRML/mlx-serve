@@ -122,12 +122,16 @@ pub fn getAppRssMb() u32 {
 /// On Linux the honest analog is VmRSS (unified-memory footprint has no
 /// equivalent); swap-paged-out pages are invisible to it.
 pub fn getAppMemFootprintMb() u32 {
+    return @intCast(getAppMemFootprintBytes() / (1024 * 1024));
+}
+
+pub fn getAppMemFootprintBytes() u64 {
     if (comptime !builtin.os.tag.isDarwin())
-        return @intCast(linuxProcStatusKib("VmRSS:") / 1024);
+        return linuxProcStatusKib("VmRSS:") * 1024;
     var info = std.mem.zeroes(TaskVmInfo);
     var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32); // 38 = TASK_VM_INFO_REV1_COUNT
     if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
-    return @intCast(info.phys_footprint / (1024 * 1024));
+    return info.phys_footprint;
 }
 
 /// Bytes the OS will grant a new wiring: free (less speculative — free_count

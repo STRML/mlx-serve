@@ -557,6 +557,7 @@ fn printUsage(io: std.Io) void {
 pub fn main(init: std.process.Init) !void {
     crt.exportHomeDefault();
     env.init();
+    @import("engines/mlx/cache/import_peak.zig").init();
     // Referenced, or the linker strips the unreferenced section.
     if (@import("builtin").os.tag == .macos) std.mem.doNotOptimizeAway(&info_plist);
     const allocator = init.gpa;

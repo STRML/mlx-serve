@@ -13,6 +13,7 @@ const transformer_mod = @import("../transformer.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const peer_wire = @import("peer_wire.zig");
 const prefill_mod = @import("../prefill.zig");
+const import_peak = @import("import_peak.zig");
 const pack_identity_mod = @import("pack_identity.zig");
 const publishHotCacheResidency = @import("budget.zig").publishHotCacheResidency;
 const stagedHostBytes = @import("budget.zig").stagedHostBytes;
@@ -252,6 +253,7 @@ pub fn importWireModule(
     body: []const u8,
 ) !requests.CacheImportOutcome {
     const t0 = io_util.nowUsMonotonic(io);
+    const import_started = import_peak.begin(io);
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
 
@@ -269,6 +271,8 @@ pub fn importWireModule(
         return .{ .refused = r };
     };
     defer env.deinit();
+    var entry_bytes: u64 = 0;
+    for (env.tensors) |tensor| entry_bytes = try std.math.add(u64, entry_bytes, tensor.bytes);
     const t_decode = io_util.nowUsMonotonic(io);
 
     const xfm = lm.transformer orelse {
@@ -316,14 +320,15 @@ pub fn importWireModule(
         return .{ .refused = r };
     }
 
-    var planned_peak: u64 = 0;
-    if (!plugin_driver.auxImportPlan(binding.xfm, env.plugin_header, &planned_peak).isOk()) {
+    var plan: plugin_abi.AuxImportPlan = .{};
+    if (!plugin_driver.auxImportPlanDetails(binding.xfm, env.plugin_header, &plan).isOk()) {
         logRefusal(.import_plan, env.ids.len);
         return .{ .refused = .import_plan };
     }
-    var peak = try prefill_mod.moduleImportPeak(planned_peak, env.tensors);
+    var peak = try prefill_mod.moduleImportPeak(plan.peak, env.tensors);
     peak = try std.math.add(u64, peak, @intCast(body.len));
     if (peak > prefillHeadroomNow(cfg, stagedHostBytes(sch)) +| hc.residentBytes()) {
+        import_peak.finish(import_started, "peer", env.ids.len, entry_bytes, plan, "no_memory");
         logRefusal(.no_memory, env.ids.len);
         return .{ .refused = .no_memory };
     }
@@ -331,10 +336,12 @@ pub fn importWireModule(
     const admitted = hc.evictLruToAdmit(@intCast(env.ids.len), &probe, prefill_mod.ModuleImportProbe.fits, false).admitted;
     publishHotCacheResidency(sch);
     if (!admitted) {
+        import_peak.finish(import_started, "peer", env.ids.len, entry_bytes, plan, "no_memory");
         logRefusal(.no_memory, env.ids.len);
         return .{ .refused = .no_memory };
     }
     const t_admit = io_util.nowUsMonotonic(io);
+    defer import_peak.finish(import_started, "peer", env.ids.len, entry_bytes, plan, null);
 
     const wrappers = try allocator.alloc(mlx.mlx_array, env.tensors.len);
     for (wrappers) |*w| w.* = .{ .ctx = null };

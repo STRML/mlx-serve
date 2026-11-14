@@ -13,6 +13,7 @@ const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const plugin_driver = @import("plugin/driver.zig");
 const plugin_abi = @import("../../abi/plugin.zig");
+const import_peak = @import("cache/import_peak.zig");
 const plugin_settle = @import("plugin/settle.zig");
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -113,19 +114,27 @@ fn restoreDiskModule(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.Mod
     errdefer d.retireModule(match.disk_id);
     const header = try d.readModuleHeader(match.disk_id);
     defer d.allocator.free(header);
-    var peak: u64 = 0;
-    if (!plugin_driver.auxImportPlan(binding.xfm, header, &peak).isOk()) return error.ModuleImportPlanFailed;
+    var plan: plugin_abi.AuxImportPlan = .{};
+    if (!plugin_driver.auxImportPlanDetails(binding.xfm, header, &plan).isOk()) return error.ModuleImportPlanFailed;
     const inventory = d.moduleInventory(match.disk_id) orelse return false;
-    peak = try moduleImportPeak(peak, inventory);
+    const peak = try moduleImportPeak(plan.peak, inventory);
     var probe: ModuleImportProbe = .{ .sch = sch, .cfg = slot.model.config orelse return false, .peak = peak };
+    const admission_started = import_peak.begin(sch.io);
     const admitted = hc.evictLruToAdmit(slot.full_prompt.len, &probe, ModuleImportProbe.fits, false).admitted;
     publishHotCacheResidency(sch);
     if (!admitted) {
+        import_peak.finish(admission_started, "ssd", match.n, inventoryBytes(inventory), plan, "no_memory");
         log.info("[disk-cache] module import id={d} skipped: peak {d} bytes does not fit\n", .{ match.disk_id, peak });
         return false;
     }
-    try importModuleSnapshot(slot, binding, match, id, d, header);
+    try importModuleSnapshot(sch.io, slot, binding, match, id, d, header, plan, inventoryBytes(inventory));
     return true;
+}
+
+fn inventoryBytes(inventory: []const kv_disk_cache.module_record.Tensor) u64 {
+    var total: u64 = 0;
+    for (inventory) |tensor| total +|= tensor.bytes;
+    return total;
 }
 
 /// A matching inventory uses the planner's full peak; a mismatching one must be rejected
@@ -138,7 +147,9 @@ pub fn moduleImportPeak(planned: u64, inventory: []const kv_disk_cache.module_re
     return @max(planned, load_peak);
 }
 
-fn importModuleSnapshot(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, match: prefix_cache_mod.ModuleMatch, id: u32, d: *kv_disk_cache.DiskTier, header: []const u8) !void {
+fn importModuleSnapshot(io: std.Io, slot: *Slot, binding: prefix_cache_mod.ModuleBinding, match: prefix_cache_mod.ModuleMatch, id: u32, d: *kv_disk_cache.DiskTier, header: []const u8, plan: plugin_abi.AuxImportPlan, entry_bytes: u64) !void {
+    const started = import_peak.begin(io);
+    defer import_peak.finish(started, "ssd", match.n, entry_bytes, plan, null);
     // Admission can evict and swap-remove disk entries. Re-find the immutable ID.
     var arrays = try d.loadModuleParts(match.disk_id);
     defer d.freeNamed(&arrays);

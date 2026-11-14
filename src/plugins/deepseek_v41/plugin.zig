@@ -590,6 +590,7 @@ const aux_hooks = abi.AuxHooks{
     .prefix_key = &auxPrefixKey,
     .begin_prompt = &auxBeginPrompt,
     .import_plan = &auxImportPlan,
+    .import_plan_details = &auxImportPlanDetails,
     .export_arrays = &auxExportArrays,
     .import_arrays = &auxImportArrays,
     .reserve = &auxReserve,
@@ -749,9 +750,23 @@ fn auxBytes(_: *anyopaque, handle: abi.Handle) callconv(.c) u64 {
 
 fn auxImportPlan(mp: *anyopaque, header: abi.Str, out: *u64) callconv(.c) Verdict {
     out.* = 0;
+    var details: abi.AuxImportPlan = .{};
+    const verdict = auxImportPlanDetails(mp, header, &details);
+    if (verdict.isOk()) out.* = details.peak;
+    return verdict;
+}
+
+fn auxImportPlanDetails(mp: *anyopaque, header: abi.Str, out: *abi.AuxImportPlan) callconv(.c) Verdict {
+    if (out.size < @sizeOf(abi.AuxImportPlan)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary import plan storage is too short");
+    out.peak = 0;
+    out.loaded = 0;
+    out.destination = 0;
     if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
-    out.* = dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    const plan = dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    out.peak = plan.peak;
+    out.loaded = plan.loaded;
+    out.destination = plan.destination;
     return .ok;
 }
 
