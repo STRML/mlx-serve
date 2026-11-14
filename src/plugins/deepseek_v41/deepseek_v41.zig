@@ -7043,6 +7043,16 @@ pub fn importSnapshot(m: *const Dsv41Model, gpa: std.mem.Allocator, ids: []const
             var name_buf: [40]u8 = undefined;
             const name = try spec.name(&name_buf);
             log.warn("[dsv41] cache import refused: tensor {s}, {d} of {d} groups failed\n", .{ name, failure_count, group_count });
+            const groups_per_row = if (spec.rows > 0) group_count / spec.rows else 0;
+            var shown: usize = 0;
+            for (failures[0..group_count], 0..) |failure, g| {
+                if (failure == 0) continue;
+                const row = if (groups_per_row > 0) g / groups_per_row else 0;
+                const in_row = if (groups_per_row > 0) g % groups_per_row else g;
+                log.warn("[dsv41]   failed group {d}: row {d} of {d}, group {d} of {d} in the row, status {d}\n", .{ g, row, spec.rows, in_row, groups_per_row, failure });
+                shown += 1;
+                if (shown == 8) break;
+            }
             return error.Dsv41CacheCorrupt;
         }
         var bf16 = mlx.mlx_array_new();
