@@ -25,6 +25,7 @@ Loading + residency:
 - **One port, one server** (`listenExclusive`): std's `reuse_address` also sets SO_REUSEPORT (a second instance stole the port); macOS clears it after bind, Linux (which joins the reuseport group AT bind) never sets it (`listenExclusiveLinux`).
 
 Memory bills + admission:
+- **Peer module imports are budgeted by planned destination residency before LRU eviction** (`AuxImportPlan.destination`); packed wire bytes understate the restored cache size. Guard: `peer import budget uses resident size before evicting cache entries`.
 - **KV is billed per CACHING LAYER at the arch's OWN K/V widths** (`kvBytesPerToken` ← `attnCacheLayerCount`; only `.attention` blocks of a `layer_block_types` hybrid; sliding rings in `slotFixedKvBytes`); STORED and SCORED widths are two parameters (`prefillScoreHeadDim`).
 - **The prefill working set includes the arch's OWN streams** (`prefillStreamBytesPerToken`: GDN q/k/v across cadence layers, MoE `top_k` replication) plus a RUNTIME floor (`PREFILL_RUNTIME_FLOOR_BYTES`); a lazily copied side-channel state must be NAMED in the cadence eval (`evalCadencePoint`, #366).
 - **The guard bills what the ARCH reads** (`prefillAttnKeys`, `prefillFfnWidth`, dsv4 own term); a bill follows its buffer (QSA ring once per slot, `qsaRingBytes`); qwen4 MTP head KV billed at its effective width (`--mtp-head-kv-quant` opt-in).
