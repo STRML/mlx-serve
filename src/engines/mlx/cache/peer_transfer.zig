@@ -239,12 +239,10 @@ fn logRefusal(refusal: requests.CacheImportRefusal, tokens: usize) void {
 }
 
 /// The refusals `commitModule` would give, asked on the envelope's own byte counts before anything is evicted.
-fn budgetRefusal(hc: *const prefix_cache_mod.HotPrefixCache, tensors: []const module_record.Tensor) !?requests.CacheImportRefusal {
+fn budgetRefusal(hc: *const prefix_cache_mod.HotPrefixCache, destination_bytes: u64) ?requests.CacheImportRefusal {
     if (!hc.ram_enabled or hc.max_entries == 0) return .commit_declined;
     if (hc.max_kv_bytes == 0) return null;
-    var bytes: u64 = 0;
-    for (tensors) |t| bytes = try std.math.add(u64, bytes, t.bytes);
-    if (bytes > hc.max_kv_bytes) return .commit_declined;
+    if (destination_bytes > hc.max_kv_bytes) return .commit_declined;
     return null;
 }
 
@@ -324,17 +322,21 @@ pub fn importWireModule(
         return .{ .refused = .stale };
     }
 
-    if (try budgetRefusal(hc, env.tensors)) |r| {
-        logRefusal(r, env.ids.len);
-        return .{ .refused = r };
-    }
-
-    var planned_peak: u64 = 0;
-    if (!plugin_driver.auxImportPlan(binding.xfm, env.plugin_header, &planned_peak).isOk()) {
+    var plan: plugin_abi.AuxImportPlan = .{};
+    if (!plugin_driver.auxImportPlanDetails(binding.xfm, env.plugin_header, &plan).isOk()) {
         logRefusal(.import_plan, env.ids.len);
         return .{ .refused = .import_plan };
     }
-    var peak = try prefill_mod.moduleImportPeak(planned_peak, env.tensors);
+    const destination_bytes = if (plan.destination == 0) blk: {
+        var bytes: u64 = 0;
+        for (env.tensors) |tensor| bytes = try std.math.add(u64, bytes, tensor.bytes);
+        break :blk bytes;
+    } else plan.destination;
+    if (budgetRefusal(hc, destination_bytes)) |r| {
+        logRefusal(r, env.ids.len);
+        return .{ .refused = r };
+    }
+    var peak = try prefill_mod.moduleImportPeak(plan.peak, env.tensors);
     peak = try std.math.add(u64, peak, @intCast(body.len));
     if (peak > prefillHeadroomNow(cfg, stagedHostBytes(sch)) +| hc.residentBytes()) {
         logRefusal(.no_memory, env.ids.len);
@@ -541,4 +543,19 @@ pub fn importCache(sch: *Scheduler, req: *requests.CacheImportRequest) !void {
         req.error_name = null;
         return error.CacheImportFailed;
     }
+}
+
+test "peer import budget uses resident size before evicting cache entries" {
+    const testing = std.testing;
+    var hc = prefix_cache_mod.HotPrefixCache.initWithMem(testing.allocator, 4, 128);
+    defer hc.deinit();
+    hc.current_kv_bytes = 64;
+    const wire_tensors = [_]module_record.Tensor{.{ .name = "state", .dtype = "bf16", .shape = &.{4}, .bytes = 32 }};
+
+    const wire_bytes = wire_tensors[0].bytes;
+    try testing.expect(wire_bytes < 128);
+    const refusal = budgetRefusal(&hc, 160);
+
+    try testing.expectEqual(@as(?requests.CacheImportRefusal, .commit_declined), refusal);
+    try testing.expectEqual(@as(u64, 64), hc.residentBytes());
 }
