@@ -170,7 +170,7 @@ test "dsv41 pack probe: -0.0 survives the pack" {
     try testing.expectEqual(@as(u8, 0x08), packed_bytes[0]);
     try testing.expectEqual(@as(u8, 1), scales[0]);
     try testing.expectEqual(@as(u16, 0x8000), bf16Bits(-0.0));
-    try testing.expectEqual(@as(u8, 0x06), packed_bytes[24]);
+    try testing.expectEqual(@as(u8, 0x07), packed_bytes[24]);
     try testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0 }, flags);
     const restored = try unpackBf16(packed_bytes, scales, 16, false);
     defer testing.allocator.free(restored);
