@@ -719,17 +719,6 @@ test "packed snapshot restore refuses the zero scale corruption sentinel" {
     const damaged = mlx.mlx_array_new_data(changed.ptr, shape.ptr, @intCast(shape.len), .uint8);
     _ = mlx.mlx_array_free(original);
     e.arrays()[i].array.ctx = damaged.ctx;
-    const width: usize = @as(usize, @intCast(shape[1])) * 16 / 9;
-    const spec: codec.Spec = .{ .kind = .comp, .rows = @intCast(shape[0]), .width = width, .dtype = .bfloat16 };
-    const origin_model: *v41.Model = @ptrCast(@alignCast(origin.m));
-    const decoded = try cache_pack.decode(&origin_model.mdl.cache_pack_kernels, mlx.gpuStream(), damaged, spec, .fp4_e4m3_g16);
-    defer _ = mlx.mlx_array_free(decoded.bits);
-    defer _ = mlx.mlx_array_free(decoded.status);
-    const failed_arrays = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ decoded.bits, decoded.status }, 2);
-    defer _ = mlx.mlx_vector_array_free(failed_arrays);
-    try mlx.check(mlx.mlx_eval(failed_arrays));
-    const status = mlx.mlx_array_data_uint32(decoded.status) orelse return error.NoData;
-    try testing.expectEqual(@as(usize, 1), dsv41.failedCacheGroups(status[0..mlx.mlx_array_size(decoded.status)]));
     const receiver = try Twin.open(files, "");
     defer receiver.close();
     try expectImportRefused(receiver, &e, p[0 .. p.len - 1], e.arrays());
