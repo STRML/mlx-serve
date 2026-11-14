@@ -15,6 +15,10 @@ const LoadedModel = @import("../registry/registry.zig").LoadedModel;
 
 pub var max_export_bytes_override: ?usize = null;
 
+/// Each export's buffer lives until the client has read it; past this many the next export is refused.
+pub const max_exports_in_flight = 8;
+pub var exports_in_flight = std.atomic.Value(u32).init(0);
+
 fn effectiveMaxExportBytes() usize {
     return max_export_bytes_override orelse router.max_cache_export_bytes;
 }
@@ -47,6 +51,11 @@ pub fn handleCacheExport(
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
+    defer _ = exports_in_flight.fetchSub(1, .acq_rel);
+    if (exports_in_flight.fetchAdd(1, .acq_rel) >= max_exports_in_flight) {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "insufficient_memory", "cache export refused: exports busy, too many export buffers in flight", 503);
+        return;
+    }
     var req: requests.CacheExportRequest = .{
         .model = lm,
         .prompt_ids = prompt_ids,

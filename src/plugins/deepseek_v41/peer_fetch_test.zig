@@ -943,6 +943,41 @@ test "dsv41 peer fetch: HTTP export and import of a file-backed model answer 409
     try testing.expect(std.mem.indexOf(u8, imp.body, "\"reason\":\"transfer_unsupported\"") != null);
 }
 
+test "dsv41 peer fetch: an export past the in-flight cap answers 503 busy" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const node = try LiveNode.open(io, try fixture.v41ServableFiles(arena.allocator(), 7));
+    defer node.close();
+    const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 50000 } };
+    const head = "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nX-Cache-Export: 1\r\n";
+    const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}";
+
+    // The held exports are counted directly: a fixture-sized buffer drains into the socket before a test could hold it.
+    cache_transfer.exports_in_flight.store(cache_transfer.max_exports_in_flight, .release);
+    defer cache_transfer.exports_in_flight.store(0, .release);
+    {
+        var busy = try sendHttp(io, node, loopback, head, body);
+        defer busy.deinit(testing.allocator);
+        try expectStatus("export_busy_503", 503, busy);
+        try testing.expect(std.mem.indexOf(u8, busy.body, "busy") != null);
+        try testing.expect(std.mem.indexOf(u8, busy.body, "insufficient_memory") != null);
+    }
+    try testing.expectEqual(@as(u32, cache_transfer.max_exports_in_flight), cache_transfer.exports_in_flight.load(.acquire));
+
+    _ = cache_transfer.exports_in_flight.fetchSub(1, .acq_rel);
+    {
+        var miss = try sendHttp(io, node, loopback, head, body);
+        defer miss.deinit(testing.allocator);
+        try expectStatus("export_under_cap_404", 404, miss);
+    }
+    try testing.expectEqual(@as(u32, cache_transfer.max_exports_in_flight - 1), cache_transfer.exports_in_flight.load(.acquire));
+}
+
 test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 media/speech, 413 cap, 404 miss and warm B turn" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
