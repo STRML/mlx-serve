@@ -6946,6 +6946,12 @@ fn evalImported(x: A) !void {
     if (mlx.errorPending()) return error.MlxError;
 }
 
+pub fn failedCacheGroups(status: []const u32) usize {
+    var count: usize = 0;
+    for (status) |failure| count += @intFromBool(failure != 0);
+    return count;
+}
+
 fn copyImported(x: A, s: S) !A {
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -7027,7 +7033,14 @@ pub fn importSnapshot(m: *const Dsv41Model, gpa: std.mem.Allocator, ids: []const
         defer _ = mlx.mlx_vector_array_free(ready);
         try mlx.check(mlx.mlx_eval(ready));
         const failures = mlx.mlx_array_data_uint32(unpacked.status) orelse return error.NoData;
-        for (0..mlx.mlx_array_size(unpacked.status)) |j| if (failures[j] != 0) return error.Dsv41CacheCorrupt;
+        const group_count = mlx.mlx_array_size(unpacked.status);
+        const failure_count = failedCacheGroups(failures[0..group_count]);
+        if (failure_count != 0) {
+            var name_buf: [40]u8 = undefined;
+            const name = try spec.name(&name_buf);
+            log.warn("[dsv41] cache import refused: tensor {s}, {d} of {d} groups failed\n", .{ name, failure_count, group_count });
+            return error.Dsv41CacheCorrupt;
+        }
         var bf16 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(bf16);
         try mlx.check(mlx.mlx_view(&bf16, unpacked.bits, .bfloat16, m.s));
