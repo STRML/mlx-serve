@@ -599,6 +599,61 @@ test "dsv41 peer fetch: an import that cannot fit is refused before it evicts a 
     }
 }
 
+test "dsv41 peer fetch: an import_arrays failure on a memory latch answers no_memory and inserts nothing" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const model_a = try PeerHarness.open(files);
+    defer model_a.close();
+    const model_b = try PeerHarness.open(files);
+    defer model_b.close();
+
+    const full_prompt = buildPrompt(25);
+    const turn1 = try model_a.runGreedy(full_prompt[0..17], 2, true);
+    defer testing.allocator.free(turn1.tokens);
+    const exp = try peer_transfer.exportWireModule(testing.allocator, model_a.sch.io, &model_a.sch, model_a.entry, &full_prompt, false, null, 0, 0, router.max_cache_export_bytes);
+    const wire = exp.ok.bytes;
+    defer testing.allocator.free(wire);
+
+    const Probe = struct {
+        var latch_msg: [:0]const u8 = "";
+
+        fn importArrays(_: *anyopaque, _: abi.Span(u32), _: abi.Str, _: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) abi.Verdict {
+            out.* = null;
+            mlx.latchErrorForTest(latch_msg);
+            return abi.Verdict.refuse(.unsupported, "forced import failure");
+        }
+    };
+
+    const bound = model_b.xfm.plugin.?;
+    const old_table = bound.table;
+    defer bound.table = old_table;
+    var hooks = old_table.cache.aux.?.*;
+    hooks.import_arrays = &Probe.importArrays;
+    var cache_hooks = old_table.cache.*;
+    cache_hooks.aux = &hooks;
+    var table = old_table.*;
+    table.cache = &cache_hooks;
+    bound.table = &table;
+
+    const cases = [_]struct { msg: [:0]const u8, want: @import("../../host/gpu_thread/requests.zig").CacheImportRefusal }{
+        .{ .msg = "[METAL] Command buffer execution failed: Insufficient Memory", .want = .no_memory },
+        .{ .msg = "[broadcast_shapes] Shapes cannot be broadcast", .want = .import_arrays },
+    };
+    for (cases) |c| {
+        Probe.latch_msg = c.msg;
+        defer mlx.dropLatchedErrorUnless(false);
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+        try testing.expectEqual(@as(@TypeOf(out), .{ .refused = c.want }), out);
+        try testing.expectEqual(@as(usize, 0), model_b.entry.prefix_cache.?.entries.items.len);
+    }
+}
+
 test "dsv41 peer fetch: a commit declined after import_arrays frees the imported snapshot once" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const old_fits = scheduler.prefill_admission_fits;

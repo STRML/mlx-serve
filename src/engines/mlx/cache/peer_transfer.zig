@@ -239,6 +239,11 @@ fn budgetRefusal(hc: *const prefix_cache_mod.HotPrefixCache, tensors: []const mo
     return null;
 }
 
+/// A failed import on an out-of-memory latch is the receiver's memory, not a bad pair of boxes.
+fn importArraysRefusal() requests.CacheImportRefusal {
+    return if (mlx.latchedErrorIs(mlx.mlxErrorIsMemory)) .no_memory else .import_arrays;
+}
+
 pub fn importWireModule(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -348,8 +353,9 @@ pub fn importWireModule(
         const slice = env.payload[@intCast(desc.offset)..@intCast(desc.end)];
         w.* = mlx.mlx_array_new_data(slice.ptr, &c_shape, @intCast(t.shape.len), desc.mlx_dtype);
         if (w.ctx == null) {
-            logRefusal(.import_arrays, env.ids.len);
-            return .{ .refused = .import_arrays };
+            const r = importArraysRefusal();
+            logRefusal(r, env.ids.len);
+            return .{ .refused = r };
         }
         aux.* = .{ .name = .of(t.name), .array = .{ .ctx = w.ctx } };
     }
@@ -360,8 +366,9 @@ pub fn importWireModule(
         mlx.errorPending())
     {
         if (snapshot != null) plugin_driver.auxFree(binding.xfm, snapshot);
-        logRefusal(.import_arrays, env.ids.len);
-        return .{ .refused = .import_arrays };
+        const r = importArraysRefusal();
+        logRefusal(r, env.ids.len);
+        return .{ .refused = r };
     }
     const t_import = io_util.nowUsMonotonic(io);
 
