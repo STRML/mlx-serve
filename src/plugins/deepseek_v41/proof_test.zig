@@ -348,7 +348,7 @@ const Exported = struct {
         const aux = v41.table.cache.aux.?;
         const model: *v41.Model = @ptrCast(@alignCast(t.m));
         const image_token = model.mdl.cfg.image_token_id;
-        const media = if (media_rows) |x| abi.Array{ .ctx = x.ctx } else .{};
+        const media = if (media_rows) |x| abi.Array{ .ctx = x.ctx } else abi.Array{};
         try testing.expect(aux.begin_prompt(t.m, 1, .of(p), media, 0, true).isOk());
         const first = @min(2, p.len - 1);
         testing.allocator.free(try slotForwardWithMedia(t, .prefill, &.{1}, p[0..first], &.{0}, media_rows, 0));
