@@ -25,6 +25,7 @@ const nowMsMonotonic = io_util.nowMsMonotonic;
 const requests = @import("../../../host/gpu_thread/requests.zig");
 const LoadedModel = @import("../../../host/registry/registry.zig").LoadedModel;
 const Scheduler = @import("../scheduler.zig").Scheduler;
+const http_server = @import("../../../host/http/server.zig");
 
 const Transformer = transformer_mod.Transformer;
 const ModelConfig = model_mod.ModelConfig;
@@ -143,6 +144,22 @@ pub fn exportWireModule(
     cache_key: u64,
     max_bytes: usize,
 ) !requests.CacheExportOutcome {
+    return exportWireModuleWithBudget(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, max_bytes, false);
+}
+
+fn exportWireModuleWithBudget(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sch: *const Scheduler,
+    lm: *LoadedModel,
+    prompt_ids: []const u32,
+    has_tools: bool,
+    kv_quant_override: ?kv_quant.KVQuantConfig,
+    variant: u64,
+    cache_key: u64,
+    max_bytes: usize,
+    admit_transfer_budget: bool,
+) !requests.CacheExportOutcome {
     const t0 = io_util.nowUsMonotonic(io);
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
@@ -182,6 +199,21 @@ pub fn exportWireModule(
     if (total_len > max_bytes) {
         return .{ .too_large = @intCast(total_len) };
     }
+    var planned_peak: u64 = 0;
+    if (admit_transfer_budget) {
+        var plugin_import_peak: u64 = 0;
+        if (!plugin_driver.auxImportPlan(binding.xfm, exp.header[0..exp.out.header_len], &plugin_import_peak).isOk()) return .no_memory;
+        planned_peak = try std.math.add(u64, try prefill_mod.moduleImportPeak(plugin_import_peak, inv), @intCast(total_len));
+    }
+
+    var transfer_reserved = false;
+    if (admit_transfer_budget) {
+        const amount: u64 = @intCast(total_len);
+        if (!http_server.reserveCacheExportBytes(amount)) return .no_memory;
+        transfer_reserved = true;
+        if (amount > prefillHeadroomNow(cfg, stagedHostBytes(@constCast(sch))) +| hc.residentBytes()) return .no_memory;
+    }
+    defer if (transfer_reserved) http_server.releaseCacheExportBytes(@intCast(total_len));
 
     const layout_key = modelLayoutKey(cfg, xfm);
     const settings_key = modelSettingsKey(lm, cfg, xfm);
@@ -217,7 +249,8 @@ pub fn exportWireModule(
 
     const elapsed_ms: u64 = @intCast(@max(@divTrunc(io_util.nowUsMonotonic(io) - t0, 1000), 0));
     log.info("[hot-cache] peer module export: n={d} bytes={d} ({d} ms)\n", .{ hit.tokens.len, out.len, elapsed_ms });
-    return .{ .ok = .{ .bytes = out, .n = hit.tokens.len, .export_ms = elapsed_ms } };
+    transfer_reserved = false;
+    return .{ .ok = .{ .bytes = out, .n = hit.tokens.len, .export_ms = elapsed_ms, .planned_peak = planned_peak } };
 }
 
 fn mapDecodeError(err: peer_wire.DecodeError) error{OutOfMemory}!requests.CacheImportRefusal {
@@ -335,12 +368,14 @@ pub fn importWireModule(
         return .{ .refused = .import_plan };
     }
     var peak = try prefill_mod.moduleImportPeak(planned_peak, env.tensors);
-    peak = try std.math.add(u64, peak, @intCast(body.len));
-    if (peak > prefillHeadroomNow(cfg, stagedHostBytes(sch)) +| hc.residentBytes()) {
+    const body_bytes: u64 = @intCast(body.len);
+    peak = try std.math.add(u64, peak, body_bytes);
+    const staged = stagedHostBytes(sch) -| body_bytes;
+    if (peak > prefillHeadroomNow(cfg, staged) +| hc.residentBytes()) {
         logRefusal(.no_memory, env.ids.len);
         return .{ .refused = .no_memory };
     }
-    var probe: prefill_mod.ModuleImportProbe = .{ .sch = sch, .cfg = cfg, .peak = peak };
+    var probe: prefill_mod.ModuleImportProbe = .{ .sch = sch, .cfg = cfg, .peak = peak, .body_bytes = body_bytes };
     const admitted = hc.evictLruToAdmit(@intCast(env.ids.len), &probe, prefill_mod.ModuleImportProbe.fits, false).admitted;
     publishHotCacheResidency(sch);
     if (!admitted) {
@@ -445,7 +480,7 @@ pub fn runCacheExportRequest(sch: *Scheduler, req: *requests.CacheExportRequest)
         req.done_cond.broadcast(sch.io);
         return;
     }
-    const out = exportWireModule(
+    const out = exportWireModuleWithBudget(
         req.allocator,
         sch.io,
         sch,
@@ -456,6 +491,7 @@ pub fn runCacheExportRequest(sch: *Scheduler, req: *requests.CacheExportRequest)
         req.variant,
         req.cache_key,
         req.max_bytes,
+        req.admit_transfer_budget,
     ) catch |err| {
         log.warn("[hot-cache] peer cache export failed: {s}\n", .{@errorName(err)});
         req.done_mu.lockUncancelable(sch.io);
