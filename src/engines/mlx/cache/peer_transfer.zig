@@ -34,7 +34,7 @@ const LayerLayoutFn = *const fn (
 
 pub fn modelLayoutKey(cfg: *const ModelConfig, xfm: *const Transformer) u64 {
     const plugin_name = if (xfm.plugin) |b| b.table.name.slice() else null;
-    const layout_fn = if (xfm.plugin) |b| if (b.table.cache) |cache| cache.layout else null else null;
+    const layout_fn = if (xfm.plugin) |b| b.table.cache.layout else null;
     const parsed = if (cfg.plugin) |b| &b.parsed else null;
     return layoutKeyFrom(cfg, plugin_name, layout_fn, parsed);
 }
@@ -93,7 +93,7 @@ test "modelLayoutKey: iQ DeepSeek V4.1 key is equal across TP widths and ranks" 
     var base = plugin_config.modelConfig(&binding.parsed);
     plugin_config.applyLayout(&base, binding.table, &binding.parsed);
     base.plugin = &binding;
-    const layout_fn = binding.table.cache.?.layout.?;
+    const layout_fn = binding.table.cache.layout.?;
     const base_key = layoutKeyFrom(&base, binding.table.name.slice(), layout_fn, &binding.parsed);
 
     var tp2_rank0 = base;
