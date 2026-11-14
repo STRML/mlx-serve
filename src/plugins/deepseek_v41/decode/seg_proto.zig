@@ -251,7 +251,7 @@ fn gpuTest() bool {
 }
 
 /// A test that sizes its grid from probeResidency measures the whole GPU, so it cannot share it with other test
-/// processes: under `MLX_SERVE_TEST_SHARD=k/n` with n > 1 the probe reads anywhere from 384 to 711 groups on one box.
+/// processes: under `MLX_SERVE_TEST_SHARD=k/n` with n > 1 the probe read 411 to 711 groups on one box, and 384 alone.
 fn skipInParallelShard() bool {
     const raw = env.span(.MLX_SERVE_TEST_SHARD) orelse return false;
     const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return false;
