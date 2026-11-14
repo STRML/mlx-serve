@@ -8,11 +8,13 @@ pub const max_tensors = 512;
 const fixed_bytes = 48;
 const spec_bytes = 56;
 const magic = "DV41A001";
-// SSD restore measured Nov 14, 2026; tokens: loaded / footprint delta bytes.
-// 32,791: 111,444,060 / 321,896,520; 131,095: 426,410,076 / 1,267,482,912.
-// 262,167: 846,364,764 / 2,524,856,896.
-const import_peak_factor_num: u64 = 33;
-const import_peak_factor_den: u64 = 10;
+// SSD restores measured 2026-11-14 (M5 Ultra): footprint high-water = loaded + destination + a transient of
+// 0.53-0.59 x destination (tokens: loaded / destination / measured bytes):
+// 32,791: 111,444,060 / 137,672,540 / 321,896,520; 131,095: 426,410,076 / 531,281,756 / 1,267,482,912;
+// 262,167: 846,364,764 / 1,056,094,044 / 2,524,856,896. Peak = 1.10 x (loaded + 1.6 x destination): the transient is
+// charged to destination, which a packed (smaller) loaded size does not shrink. 1M is unmeasured.
+const import_peak_loaded_pct: u64 = 110;
+const import_peak_destination_pct: u64 = 176;
 
 pub const Layout = struct {
     layers: usize,
@@ -111,7 +113,7 @@ pub const Plan = struct {
         if (l.engram) try p.add(.{ .kind = .hist, .rows = n, .width = 1, .dtype = .uint32 });
         // 4 KiB per tensor/state entry covers maps, descriptors and loaded/snapshot/restore wrappers.
         const host = try checkedAdd(try checkedMul(n, 12), try checkedAdd(2 * max_header, try checkedMul(p.len + l.layers + l.stages + 1, 4096)));
-        p.peak = try importPeak(p.loaded, host);
+        p.peak = try importPeak(p.loaded, p.destination, host);
         return p;
     }
 
@@ -228,10 +230,9 @@ fn checkedMul(a: u64, b: u64) !u64 {
     return std.math.mul(u64, a, b) catch return error.Dsv41CacheGeometry;
 }
 
-fn importPeak(loaded: u64, host: u64) !u64 {
-    const scaled = try checkedMul(loaded, import_peak_factor_num);
-    const rounded = try checkedAdd(scaled, import_peak_factor_den - 1);
-    return checkedAdd(rounded / import_peak_factor_den, host);
+fn importPeak(loaded: u64, destination: u64, host: u64) !u64 {
+    const scaled = try checkedAdd(try checkedMul(loaded, import_peak_loaded_pct), try checkedMul(destination, import_peak_destination_pct));
+    return checkedAdd((try checkedAdd(scaled, 99)) / 100, host);
 }
 
 fn put(buf: []u8, off: usize, n: u64) void {
@@ -293,7 +294,7 @@ test "codec peak retains destination accounting and host storage" {
     try testing.expectEqual(loaded, p.loaded);
     try testing.expectEqual(destination, p.destination);
     const host: u64 = 3 * 9 * 4 + 2 * max_header + (12 + 3 + 2 + 1) * 4096;
-    try testing.expectEqual(try importPeak(loaded, host), p.peak);
+    try testing.expectEqual(try importPeak(loaded, destination, host), p.peak);
     try testing.expectEqual(@as(usize, 64), try rowCapacity(0, 1));
     try testing.expectEqual(@as(usize, 80), try rowCapacity(64, 65));
     try testing.expectEqual(@as(usize, 100), try rowCapacity(80, 81));
@@ -301,7 +302,7 @@ test "codec peak retains destination accounting and host storage" {
     try testing.expectError(error.Dsv41CacheGeometry, rowCapacity(0, @as(usize, std.math.maxInt(c_int)) + 1));
 }
 
-test "cache import estimate covers measured SSD restore peaks within 3.5x loaded bytes" {
+test "cache import estimate covers measured SSD restore peaks within 1.15x and a packed entry's destination" {
     const cases = .{
         .{ .n = 32_791, .loaded = 111_444_060, .destination = 137_672_540, .measured = 321_896_520 },
         .{ .n = 131_095, .loaded = 426_410_076, .destination = 531_281_756, .measured = 1_267_482_912 },
@@ -309,8 +310,12 @@ test "cache import estimate covers measured SSD restore peaks within 3.5x loaded
     };
     inline for (cases) |c| {
         const host = c.n * 12 + 2 * max_header + 100 * 4096;
-        const peak = try importPeak(c.loaded, host);
+        const peak = try importPeak(c.loaded, c.destination, host);
         try testing.expect(peak >= c.measured);
-        try testing.expect(peak <= c.loaded * 3 + c.loaded / 2);
+        try testing.expect(peak <= c.measured + c.measured * 15 / 100 + host);
+        // A packed entry loads ~894/3204 of the raw bytes into the same destination: never below loaded + destination.
+        const packed_loaded = c.loaded * 894 / 3204;
+        const packed_peak = try importPeak(packed_loaded, c.destination, host);
+        try testing.expect(packed_peak >= packed_loaded + c.destination);
     }
 }
