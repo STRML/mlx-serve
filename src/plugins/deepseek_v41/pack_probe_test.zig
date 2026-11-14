@@ -53,7 +53,7 @@ fn gpuUnavailable() bool {
     return !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu();
 }
 
-fn applyKernel(sc: *Scope, kernel: mlx.mlx_fast_metal_kernel, ins: []const A, outs: []const Output, grid: c_int, group: c_int, gs: c_int, qk: c_int) ![]A {
+fn applyKernel(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, outs: []const Output, grid: c_int, group: c_int, gs: c_int, qk: c_int) ![]A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, o.shape.ptr, o.shape.len, o.dtype));
@@ -66,7 +66,7 @@ fn applyKernel(sc: *Scope, kernel: mlx.mlx_fast_metal_kernel, ins: []const A, ou
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel, iv, cfg, sc.s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, sc.s));
     const result = try testing.allocator.alloc(A, outs.len);
     errdefer testing.allocator.free(result);
     for (result, 0..) |*a, i| {
