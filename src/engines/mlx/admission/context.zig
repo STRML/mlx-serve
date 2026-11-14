@@ -265,16 +265,19 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     small.head_dim = 64;
     small.hidden_size = 512;
     small.intermediate_size = 1024;
-    // Free RAM is shared with the other test shards: a box too short for the margined 4096 proves nothing here.
-    if (safeAutoContext(computeMemoryContext(&small)) < 4096) return error.SkipZigTest;
-    try testing.expectEqual(@as(u32, 4096), autoContextFor(&small));
+    // Free RAM moves under the other test shards, so read it once and feed that
+    // one reading through `autoContextFrom` (all `autoContextFor` adds is the read).
+    const small_mem = computeMemoryContext(&small);
+    if (safeAutoContext(small_mem) < 4096) return error.SkipZigTest;
+    try testing.expectEqual(@as(u32, 4096), autoContextFrom(small_mem, small.contextCap()));
 
     // No declared max: fall back to the margined memory ceiling.
     var unbounded = small;
     unbounded.max_position_embeddings = 0;
-    const got = autoContextFor(&unbounded);
+    const unbounded_mem = computeMemoryContext(&unbounded);
+    const got = autoContextFrom(unbounded_mem, unbounded.contextCap());
     try testing.expect(got > 0);
-    try testing.expectEqual(safeAutoContext(computeMemoryContext(&unbounded)), got);
+    try testing.expectEqual(safeAutoContext(unbounded_mem), got);
 }
 
 test "getEffectiveContextLength returns the PINNED value, not a fresh memory reading" {
