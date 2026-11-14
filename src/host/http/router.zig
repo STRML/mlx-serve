@@ -56,6 +56,7 @@ const findHeaderValue = @import("request.zig").findHeaderValue;
 const apiKeyGateApplies = @import("auth.zig").apiKeyGateApplies;
 const peerIsLoopback = @import("auth.zig").peerIsLoopback;
 const peerIsCacheTrusted = @import("auth.zig").peerIsCacheTrusted;
+const sendCacheTransferForbidden = @import("auth.zig").sendCacheTransferForbidden;
 const lanGateApplies = @import("../lan/http.zig").lanGateApplies;
 const isTunneledRequest = @import("../lan/http.zig").isTunneledRequest;
 const lanShareDenial = @import("../lan/http.zig").lanShareDenial;
@@ -227,7 +228,7 @@ pub fn handleConnection(
     const cache_internal = stream.cache_export or isRoute(path, "/v1/cache/import");
     if (cache_internal) {
         if (!peerIsCacheTrusted(stream.stream.socket.address)) {
-            try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", "Cache transfer requires loopback or 10.254.0.0/16 peer", 403);
+            try sendCacheTransferForbidden(allocator, stream);
             return;
         }
         if (http_server.g_api_key != null and !apiKeyAuthorized(request[0..header_end_pos], raw_path)) {

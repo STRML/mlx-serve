@@ -17,6 +17,7 @@ const handleConnection = @import("router.zig").handleConnection;
 const logSafePath = @import("respond.zig").logSafePath;
 const sendErrorResponse = @import("errors.zig").sendErrorResponse;
 const sendErrorResponseWithReason = @import("errors.zig").sendErrorResponseWithReason;
+const auth = @import("auth.zig");
 
 pub var import_headroom_override: ?u64 = null;
 
@@ -159,6 +160,8 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
     };
     const max_request_size = maxRequestBytesFor(req_path);
     const cache_import = isCacheImportPath(req_path);
+    const headers = hdr_buf[0 .. header_end_pos - 4];
+    const cache_export = if (findHeaderValue(headers, "x-cache-export")) |value| std.mem.eql(u8, value, "1") else false;
     const content_bytes = content_length orelse 0;
     const transfer_body_too_large = cache_import and content_bytes > @import("router.zig").max_cache_transfer_body_bytes;
     if (total_size > max_request_size or transfer_body_too_large) {
@@ -185,6 +188,17 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
         return null;
     }
 
+    if (cache_import or cache_export) {
+        if (!auth.peerIsCacheTrusted(stream.stream.socket.address)) {
+            try auth.sendCacheTransferForbidden(allocator, stream);
+            return null;
+        }
+        if (http_server.g_api_key != null and !auth.apiKeyAuthorized(headers, req_path)) {
+            try auth.sendUnauthorized(stream);
+            return null;
+        }
+    }
+
     const reserved_bytes: u64 = if (cache_import) @intCast(content_length orelse 0) else 0;
     if (reserved_bytes > 0 and !http_server.reserveCacheImportBytes(reserved_bytes)) {
         try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "insufficient_memory", "cache import refused: inbound transfer byte budget is full", 503, "cache_import_busy");
@@ -194,7 +208,6 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
     defer if (reservation_in_reader) http_server.releaseCacheImportBytes(reserved_bytes);
 
     if (cache_import) {
-        const headers = hdr_buf[0 .. header_end_pos - 4];
         if (findHeaderValue(headers, "x-cache-import-peak")) |value| {
             const peak = std.fmt.parseInt(u64, value, 10) catch {
                 try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "X-Cache-Import-Peak must be a positive decimal integer", 400, "cache_import_peak_invalid");
@@ -302,21 +315,40 @@ pub fn findHeaderValue(headers: []const u8, comptime name_lower: []const u8) ?[]
 /// Sends `request` (then EOF) over a socketpair and runs `readRequest` on the server end;
 /// returns the body it read, or null, plus whatever the server wrote back.
 pub fn readRequestOver(request: []const u8, body_out: []u8, reply_out: []u8) !struct { body: ?[]const u8, reply: []const u8 } {
+    return readRequestOverFrom(request, body_out, reply_out, .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } });
+}
+
+fn readRequestOverFrom(
+    request: []const u8,
+    body_out: []u8,
+    reply_out: []u8,
+    peer: std.Io.net.IpAddress,
+) !struct { body: ?[]const u8, reply: []const u8 } {
+    return readRequestOverFromWithAllocator(request, body_out, reply_out, peer, testing.allocator);
+}
+
+fn readRequestOverFromWithAllocator(
+    request: []const u8,
+    body_out: []u8,
+    reply_out: []u8,
+    peer: std.Io.net.IpAddress,
+    allocator: std.mem.Allocator,
+) !struct { body: ?[]const u8, reply: []const u8 } {
     var sv: [2]std.posix.fd_t = undefined;
     try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
     defer _ = std.c.close(sv[1]);
     var conn: Conn = undefined;
-    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = peer } }, testing.io);
     defer conn.close();
     try testing.expectEqual(@as(isize, @intCast(request.len)), std.c.send(sv[1], request.ptr, request.len, 0));
     _ = std.c.shutdown(sv[1], 1);
 
-    const raw = try readRequest(testing.allocator, &conn);
+    const raw = try readRequest(allocator, &conn);
     try conn.flush();
     const got = std.c.recv(sv[1], reply_out.ptr, reply_out.len, std.c.MSG.DONTWAIT);
     const reply = reply_out[0..@intCast(@max(got, 0))];
     const r = raw orelse return .{ .body = null, .reply = reply };
-    defer r.deinit(testing.allocator);
+    defer r.deinit(allocator);
     const body = r.buf[r.header_end..r.len];
     @memcpy(body_out[0..body.len], body);
     return .{ .body = body_out[0..body.len], .reply = reply };
@@ -386,6 +418,87 @@ test "cache import above 4 GiB is refused at the header before body allocation" 
     try testing.expect(std.mem.indexOf(u8, result.reply, "cache_transfer_too_large") != null);
     try testing.expect(std.mem.indexOf(u8, result.reply, "100 Continue") == null);
     try testing.expectEqual(@as(u64, 0), http_server.serverState().cache_transfer_inbound_reserved.load(.acquire));
+}
+
+test "cache import trust: an untrusted peer is refused before a 1 GiB reservation" {
+    var body_buf: [1]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    var allocation_buf: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocation_buf);
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 168, 1, 9 }, .port = 0 } };
+    const result = try readRequestOverFromWithAllocator(
+        "POST /v1/cache/import HTTP/1.1\r\nContent-Length: 1073741824\r\nExpect: 100-continue\r\n\r\n",
+        &body_buf,
+        &reply_buf,
+        peer,
+        fba.allocator(),
+    );
+    try testing.expect(result.body == null);
+    try testing.expect(std.mem.startsWith(u8, result.reply, "HTTP/1.1 403 Forbidden"));
+    try testing.expect(std.mem.indexOf(u8, result.reply, "Cache transfer requires loopback or 10.254.0.0/16 peer") != null);
+    try testing.expect(std.mem.indexOf(u8, result.reply, "100 Continue") == null);
+    try testing.expectEqual(@as(u64, 0), http_server.serverState().cache_transfer_inbound_reserved.load(.acquire));
+}
+
+test "cache import trust: a trusted peer with the wrong key is refused before reservation" {
+    const prev_key = http_server.g_api_key;
+    defer http_server.g_api_key = prev_key;
+    http_server.g_api_key = "correct-key";
+    var body_buf: [1]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    var allocation_buf: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocation_buf);
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 254, 1, 9 }, .port = 0 } };
+    const result = try readRequestOverFromWithAllocator(
+        "POST /v1/cache/import HTTP/1.1\r\nContent-Length: 1073741824\r\nAuthorization: Bearer wrong-key\r\nExpect: 100-continue\r\n\r\n",
+        &body_buf,
+        &reply_buf,
+        peer,
+        fba.allocator(),
+    );
+    try testing.expect(result.body == null);
+    try testing.expect(std.mem.startsWith(u8, result.reply, "HTTP/1.1 401 Unauthorized"));
+    try testing.expect(std.mem.indexOf(u8, result.reply, "missing or invalid API key") != null);
+    try testing.expect(std.mem.indexOf(u8, result.reply, "100 Continue") == null);
+    try testing.expectEqual(@as(u64, 0), http_server.serverState().cache_transfer_inbound_reserved.load(.acquire));
+}
+
+test "cache import trust: a trusted peer with the right key continues to the body" {
+    const prev_key = http_server.g_api_key;
+    defer http_server.g_api_key = prev_key;
+    http_server.g_api_key = "correct-key";
+    var body_buf: [1]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 254, 1, 9 }, .port = 0 } };
+    const result = try readRequestOverFrom(
+        "POST /v1/cache/import HTTP/1.1\r\nContent-Length: 1\r\nAuthorization: Bearer correct-key\r\nExpect: 100-continue\r\n\r\n",
+        &body_buf,
+        &reply_buf,
+        peer,
+    );
+    try testing.expect(result.body == null);
+    try testing.expect(std.mem.startsWith(u8, result.reply, "HTTP/1.1 100 Continue"));
+    try testing.expect(std.mem.indexOf(u8, result.reply, "401 Unauthorized") == null);
+    try testing.expect(std.mem.indexOf(u8, result.reply, "403 Forbidden") == null);
+    try testing.expectEqual(@as(u64, 0), http_server.serverState().cache_transfer_inbound_reserved.load(.acquire));
+}
+
+test "cache export trust: an untrusted peer is refused before chat body allocation" {
+    var body_buf: [1]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    var allocation_buf: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocation_buf);
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 168, 1, 9 }, .port = 0 } };
+    const result = try readRequestOverFromWithAllocator(
+        "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 1048576\r\nX-Cache-Export: 1\r\nExpect: 100-continue\r\n\r\n",
+        &body_buf,
+        &reply_buf,
+        peer,
+        fba.allocator(),
+    );
+    try testing.expect(result.body == null);
+    try testing.expect(std.mem.startsWith(u8, result.reply, "HTTP/1.1 403 Forbidden"));
+    try testing.expect(std.mem.indexOf(u8, result.reply, "100 Continue") == null);
 }
 
 test "cache import byte reservations reject an aggregate overflow before allocating the next body" {
