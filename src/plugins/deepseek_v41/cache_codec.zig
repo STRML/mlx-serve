@@ -8,6 +8,11 @@ pub const max_tensors = 512;
 const fixed_bytes = 48;
 const spec_bytes = 56;
 const magic = "DV41A001";
+// SSD restore measured Nov 14, 2026; tokens: loaded / footprint delta bytes.
+// 32,791: 111,444,060 / 321,896,520; 131,095: 426,410,076 / 1,267,482,912.
+// 262,167: 846,364,764 / 2,524,856,896.
+const import_peak_factor_num: u64 = 33;
+const import_peak_factor_den: u64 = 10;
 
 pub const Layout = struct {
     layers: usize,
@@ -104,12 +109,9 @@ pub const Plan = struct {
         for (0..l.stages) |i| try p.add(.{ .kind = .ds, .layer = i, .rows = l.ring, .width = l.width, .dtype = l.dtype });
         if (l.stages > 0) try p.add(.{ .kind = .mh, .rows = 1, .width = l.hidden_width, .dtype = l.dtype });
         if (l.engram) try p.add(.{ .kind = .hist, .rows = n, .width = 1, .dtype = .uint32 });
-        // Each copy/update is evaluated before the next. Allow a whole destination for non-donated
-        // update scratch, and two input sets for file materialization and loader-copy overlap.
-        const gpu = try checkedAdd(try checkedMul(p.loaded, 3), try checkedMul(p.destination, 2));
         // 4 KiB per tensor/state entry covers maps, descriptors and loaded/snapshot/restore wrappers.
         const host = try checkedAdd(try checkedMul(n, 12), try checkedAdd(2 * max_header, try checkedMul(p.len + l.layers + l.stages + 1, 4096)));
-        p.peak = try checkedAdd(gpu, host);
+        p.peak = try importPeak(p.loaded, host);
         return p;
     }
 
@@ -226,6 +228,12 @@ fn checkedMul(a: u64, b: u64) !u64 {
     return std.math.mul(u64, a, b) catch return error.Dsv41CacheGeometry;
 }
 
+fn importPeak(loaded: u64, host: u64) !u64 {
+    const scaled = try checkedMul(loaded, import_peak_factor_num);
+    const rounded = try checkedAdd(scaled, import_peak_factor_den - 1);
+    return checkedAdd(rounded / import_peak_factor_den, host);
+}
+
 fn put(buf: []u8, off: usize, n: u64) void {
     std.mem.writeInt(u64, buf[off..][0..8], n, .little);
 }
@@ -277,7 +285,7 @@ test "codec planning rejects malformed headers, geometry, settings and overflowi
     try testing.expectError(error.Dsv41CacheGeometry, Plan.init(changed, 9, 0));
 }
 
-test "codec peak includes all inputs, padded destinations, scratch and host storage" {
+test "codec peak retains destination accounting and host storage" {
     const p = try Plan.init(testLayout(), 9, 0);
     // Source buffers grow to 64 rows; rings, pending f32 rows, DSpark and history all coexist.
     const loaded: u64 = 3 * 24 * 64 * 2 + (4 * 64 + 9 * 64 + 4 * 32) * 2 + 2 * 64 * 4 + 2 * 24 * 64 * 2 + 256 * 2 + 9 * 4;
@@ -285,10 +293,24 @@ test "codec peak includes all inputs, padded destinations, scratch and host stor
     try testing.expectEqual(loaded, p.loaded);
     try testing.expectEqual(destination, p.destination);
     const host: u64 = 3 * 9 * 4 + 2 * max_header + (12 + 3 + 2 + 1) * 4096;
-    try testing.expect(p.peak >= 3 * loaded + 2 * destination + host);
+    try testing.expectEqual(try importPeak(loaded, host), p.peak);
     try testing.expectEqual(@as(usize, 64), try rowCapacity(0, 1));
     try testing.expectEqual(@as(usize, 80), try rowCapacity(64, 65));
     try testing.expectEqual(@as(usize, 100), try rowCapacity(80, 81));
     try testing.expectError(error.Dsv41CacheGeometry, rowCapacity(std.math.maxInt(usize), 1));
     try testing.expectError(error.Dsv41CacheGeometry, rowCapacity(0, @as(usize, std.math.maxInt(c_int)) + 1));
+}
+
+test "cache import estimate covers measured SSD restore peaks within 3.5x loaded bytes" {
+    const cases = .{
+        .{ .n = 32_791, .loaded = 111_444_060, .destination = 137_672_540, .measured = 321_896_520 },
+        .{ .n = 131_095, .loaded = 426_410_076, .destination = 531_281_756, .measured = 1_267_482_912 },
+        .{ .n = 262_167, .loaded = 846_364_764, .destination = 1_056_094_044, .measured = 2_524_856_896 },
+    };
+    inline for (cases) |c| {
+        const host = c.n * 12 + 2 * max_header + 100 * 4096;
+        const peak = try importPeak(c.loaded, host);
+        try testing.expect(peak >= c.measured);
+        try testing.expect(peak <= c.loaded * 3 + c.loaded / 2);
+    }
 }
