@@ -211,9 +211,9 @@ fn exportWireModuleWithBudget(
         const amount: u64 = @intCast(total_len);
         if (!http_server.reserveCacheExportBytes(amount)) return .no_memory;
         transfer_reserved = true;
-        if (amount > prefillHeadroomNow(cfg, stagedHostBytes(@constCast(sch))) +| hc.residentBytes()) return .no_memory;
     }
     defer if (transfer_reserved) http_server.releaseCacheExportBytes(@intCast(total_len));
+    if (admit_transfer_budget and planned_peak > prefillHeadroomNow(cfg, stagedHostBytes(@constCast(sch))) +| hc.residentBytes()) return .no_memory;
 
     const layout_key = modelLayoutKey(cfg, xfm);
     const settings_key = modelSettingsKey(lm, cfg, xfm);
