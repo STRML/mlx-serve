@@ -542,6 +542,63 @@ test "dsv41 peer fetch: a file-backed model answers transfer_unsupported on expo
     try testing.expectEqual(@as(@TypeOf(imp), .{ .refused = .transfer_unsupported }), imp);
 }
 
+test "dsv41 peer fetch: an import that cannot fit is refused before it evicts a resident" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const model_a = try PeerHarness.open(files);
+    defer model_a.close();
+    const model_b = try PeerHarness.open(files);
+    defer model_b.close();
+
+    const full_prompt = buildPrompt(33);
+    const seed = try model_a.runGreedy(full_prompt[0..25], 2, true);
+    defer testing.allocator.free(seed.tokens);
+    const exp = try peer_transfer.exportWireModule(testing.allocator, model_a.sch.io, &model_a.sch, model_a.entry, &full_prompt, false, null, 0, 0, router.max_cache_export_bytes);
+    const wire = exp.ok.bytes;
+    defer testing.allocator.free(wire);
+
+    var other: [25]u32 = undefined;
+    for (&other, 0..) |*id, i| id.* = @intCast(5 + (i * 11) % 70);
+    const r1 = try model_b.runGreedy(other[0..17], 2, true);
+    defer testing.allocator.free(r1.tokens);
+    other[0] = 90;
+    const r2 = try model_b.runGreedy(other[0..17], 2, true);
+    defer testing.allocator.free(r2.tokens);
+    const hc = model_b.entry.prefix_cache.?;
+    try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
+
+    {
+        const limits = memory_ceiling.overrides();
+        const prev = limits.*;
+        defer limits.* = prev;
+        limits.* = .{ .static_ceiling = 1, .wired_limit_mb = 0 };
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+        try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .no_memory }), out);
+        try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
+    }
+    {
+        const prev = hc.max_kv_bytes;
+        defer hc.max_kv_bytes = prev;
+        hc.max_kv_bytes = 1;
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+        try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .commit_declined }), out);
+        try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
+    }
+    {
+        hc.ram_enabled = false;
+        defer hc.ram_enabled = true;
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+        try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .commit_declined }), out);
+        try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
+    }
+}
+
 test "dsv41 peer fetch: a commit declined after import_arrays frees the imported snapshot once" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const old_fits = scheduler.prefill_admission_fits;
@@ -577,8 +634,10 @@ test "dsv41 peer fetch: a commit declined after import_arrays frees the imported
     const Probe = struct {
         var real_free: *const fn (*anyopaque, abi.Handle) callconv(.c) void = undefined;
         var real_describe: *const fn (*anyopaque, abi.Handle, *abi.AuxSnapshotInfo) callconv(.c) abi.Verdict = undefined;
+        var real_bytes: *const fn (*anyopaque, abi.Handle) callconv(.c) u64 = undefined;
         var free_calls: usize = 0;
         var corrupt_describe: bool = false;
+        var inflate_bytes: bool = false;
 
         fn free(mp: *anyopaque, h: abi.Handle) callconv(.c) void {
             free_calls += 1;
@@ -590,6 +649,11 @@ test "dsv41 peer fetch: a commit declined after import_arrays frees the imported
             if (corrupt_describe and v.isOk()) out.n += 1;
             return v;
         }
+
+        fn bytes(mp: *anyopaque, h: abi.Handle) callconv(.c) u64 {
+            const b = real_bytes(mp, h);
+            return if (inflate_bytes) b << 20 else b;
+        }
     };
 
     const bound = model_b.xfm.plugin.?;
@@ -598,18 +662,21 @@ test "dsv41 peer fetch: a commit declined after import_arrays frees the imported
     var hooks = old_table.cache.aux.?.*;
     Probe.real_free = hooks.free;
     Probe.real_describe = hooks.describe;
+    Probe.real_bytes = hooks.bytes;
     hooks.free = &Probe.free;
     hooks.describe = &Probe.describe;
+    hooks.bytes = &Probe.bytes;
     var cache_hooks = old_table.cache.*;
     cache_hooks.aux = &hooks;
     var table = old_table.*;
     table.cache = &cache_hooks;
     bound.table = &table;
 
-    // Declined inside commitModule (budget = 1 byte) -> commitModule's defer frees once.
+    // Declined inside commitModule (the snapshot outgrows the budget the wire fit) -> commitModule's defer frees once.
     Probe.free_calls = 0;
     Probe.corrupt_describe = false;
-    model_b.entry.prefix_cache.?.max_kv_bytes = 1;
+    Probe.inflate_bytes = true;
+    model_b.entry.prefix_cache.?.max_kv_bytes = wire.len << 4;
     const declined = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
     try testing.expectEqual(@as(@TypeOf(declined), .{ .refused = .commit_declined }), declined);
     try testing.expectEqual(@as(usize, 1), Probe.free_calls);
@@ -618,6 +685,7 @@ test "dsv41 peer fetch: a commit declined after import_arrays frees the imported
     // Mismatch in step 3(e) before commitModule -> freed directly once.
     Probe.free_calls = 0;
     Probe.corrupt_describe = true;
+    Probe.inflate_bytes = false;
     model_b.entry.prefix_cache.?.max_kv_bytes = 0;
     const bad_desc = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
     try testing.expectEqual(@as(@TypeOf(bad_desc), .{ .refused = .describe_mismatch }), bad_desc);
