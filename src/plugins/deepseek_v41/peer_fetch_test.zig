@@ -432,7 +432,7 @@ test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, sett
         defer testing.allocator.free(bad_layout);
         bad_layout[32] ^= 1;
         peer_wire.stampChecksum(bad_layout);
-        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, bad_layout);
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, bad_layout, null, null);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .layout_key }), out);
     }
 
@@ -444,13 +444,13 @@ test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, sett
         defer testing.allocator.free(alt_cfg);
         try model_b.tmp.dir.writeFile(model_b.sch.io, .{ .sub_path = "config.json", .data = alt_cfg });
         model_b.entry.pack_identity = null;
-        const out_cfg = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long);
+        const out_cfg = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long, null, null);
         try testing.expectEqual(@as(@TypeOf(out_cfg), .{ .refused = .pack_identity }), out_cfg);
         try model_b.tmp.dir.writeFile(model_b.sch.io, .{ .sub_path = "config.json", .data = orig_cfg });
 
         try model_b.tmp.dir.writeFile(model_b.sch.io, .{ .sub_path = "extra.safetensors", .data = "extra" });
         model_b.entry.pack_identity = null;
-        const out_size = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long);
+        const out_size = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long, null, null);
         try testing.expectEqual(@as(@TypeOf(out_size), .{ .refused = .pack_identity }), out_size);
         try model_b.tmp.dir.deleteFile(model_b.sch.io, "extra.safetensors");
         model_b.entry.pack_identity = null;
@@ -460,7 +460,7 @@ test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, sett
     {
         model_b.cfg.lm_head_mxfp8_override = true;
         defer model_b.cfg.lm_head_mxfp8_override = null;
-        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long);
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long, null, null);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .settings }), out);
     }
 
@@ -468,7 +468,7 @@ test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, sett
     {
         model_b.sch.kv_quant_config = KVQuantConfig.affine(8);
         defer model_b.sch.kv_quant_config = KVQuantConfig.dense;
-        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long);
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long, null, null);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .quant_config }), out);
     }
 
@@ -478,21 +478,21 @@ test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, sett
         const prev = limits.*;
         defer limits.* = prev;
         limits.* = .{ .static_ceiling = 1, .wired_limit_mb = 0 };
-        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long);
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long, null, null);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .no_memory }), out);
         try testing.expectEqual(@as(usize, 0), model_b.entry.prefix_cache.?.entries.items.len);
     }
 
     // 6. stale check: shorter resident rung accepts a longer tip; duplicate and shorter incoming tips refuse
     {
-        const ok_short = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_short);
+        const ok_short = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_short, null, null);
         try testing.expect(ok_short == .ok);
-        const dup_short = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_short);
+        const dup_short = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_short, null, null);
         try testing.expectEqual(@as(@TypeOf(dup_short), .{ .refused = .stale }), dup_short);
 
-        const ok_long = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long);
+        const ok_long = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_long, null, null);
         try testing.expect(ok_long == .ok);
-        const stale_short = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_short);
+        const stale_short = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire_short, null, null);
         try testing.expectEqual(@as(@TypeOf(stale_short), .{ .refused = .stale }), stale_short);
     }
 }
@@ -519,7 +519,7 @@ test "dsv41 peer fetch: a pack with the same config, names and sizes but other w
     const exp = try peer_transfer.exportWireModule(testing.allocator, model_a.sch.io, &model_a.sch, model_a.entry, &prompt, false, null, 0, 0, router.max_cache_export_bytes);
     const wire = exp.ok.bytes;
     defer testing.allocator.free(wire);
-    const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+    const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire, null, null);
     try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .pack_identity }), out);
 }
 
@@ -538,7 +538,7 @@ test "dsv41 peer fetch: a file-backed model answers transfer_unsupported on expo
     const prompt = buildPrompt(25);
     const exp = try peer_transfer.exportWireModule(testing.allocator, h.sch.io, &h.sch, h.entry, &prompt, false, null, 0, 0, router.max_cache_export_bytes);
     try testing.expectEqual(@as(@TypeOf(exp), .transfer_unsupported), exp);
-    const imp = try peer_transfer.importWireModule(testing.allocator, h.sch.io, &h.sch, h.entry, "abc");
+    const imp = try peer_transfer.importWireModule(testing.allocator, h.sch.io, &h.sch, h.entry, "abc", null, null);
     try testing.expectEqual(@as(@TypeOf(imp), .{ .refused = .transfer_unsupported }), imp);
 }
 
@@ -578,7 +578,7 @@ test "dsv41 peer fetch: an import that cannot fit is refused before it evicts a 
         const prev = limits.*;
         defer limits.* = prev;
         limits.* = .{ .static_ceiling = 1, .wired_limit_mb = 0 };
-        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire, null, null);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .no_memory }), out);
         try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
     }
@@ -586,14 +586,14 @@ test "dsv41 peer fetch: an import that cannot fit is refused before it evicts a 
         const prev = hc.max_kv_bytes;
         defer hc.max_kv_bytes = prev;
         hc.max_kv_bytes = 1;
-        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire, null, null);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .commit_declined }), out);
         try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
     }
     {
         hc.ram_enabled = false;
         defer hc.ram_enabled = true;
-        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire, null, null);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .commit_declined }), out);
         try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
     }
@@ -648,7 +648,7 @@ test "dsv41 peer fetch: an import_arrays failure on a memory latch answers no_me
     for (cases) |c| {
         Probe.latch_msg = c.msg;
         defer mlx.dropLatchedErrorUnless(false);
-        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+        const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire, null, null);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = c.want }), out);
         try testing.expectEqual(@as(usize, 0), model_b.entry.prefix_cache.?.entries.items.len);
     }
@@ -770,7 +770,7 @@ test "dsv41 peer fetch: a commit declined after import_arrays frees the imported
     Probe.corrupt_describe = false;
     Probe.inflate_bytes = true;
     model_b.entry.prefix_cache.?.max_kv_bytes = wire.len << 4;
-    const declined = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+    const declined = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire, null, null);
     try testing.expectEqual(@as(@TypeOf(declined), .{ .refused = .commit_declined }), declined);
     try testing.expectEqual(@as(usize, 1), Probe.free_calls);
     try testing.expectEqual(@as(usize, 0), model_b.entry.prefix_cache.?.entries.items.len);
@@ -780,7 +780,7 @@ test "dsv41 peer fetch: a commit declined after import_arrays frees the imported
     Probe.corrupt_describe = true;
     Probe.inflate_bytes = false;
     model_b.entry.prefix_cache.?.max_kv_bytes = 0;
-    const bad_desc = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
+    const bad_desc = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire, null, null);
     try testing.expectEqual(@as(@TypeOf(bad_desc), .{ .refused = .describe_mismatch }), bad_desc);
     try testing.expectEqual(@as(usize, 1), Probe.free_calls);
     try testing.expectEqual(@as(usize, 0), model_b.entry.prefix_cache.?.entries.items.len);

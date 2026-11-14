@@ -251,9 +251,11 @@ pub fn importWireModule(
     sch: *Scheduler,
     lm: *LoadedModel,
     body: []const u8,
+    footprint_before_body: ?u64,
+    body_bytes: ?u64,
 ) !requests.CacheImportOutcome {
     const t0 = io_util.nowUsMonotonic(io);
-    const import_started = import_peak.beginPeer(io, req.footprint_before_body, req.body_bytes);
+    const import_started = import_peak.beginPeer(io, footprint_before_body, body_bytes);
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
 
@@ -475,7 +477,7 @@ pub fn runCacheImportRequest(sch: *Scheduler, req: *requests.CacheImportRequest)
         req.done_cond.broadcast(sch.io);
         return;
     }
-    const out = importWireModule(req.allocator, sch.io, sch, req.model, req.body) catch |err| {
+    const out = importWireModule(req.allocator, sch.io, sch, req.model, req.body, req.footprint_before_body, req.body_bytes) catch |err| {
         log.warn("[hot-cache] peer cache import failed: {s}\n", .{@errorName(err)});
         req.done_mu.lockUncancelable(sch.io);
         defer req.done_mu.unlock(sch.io);
