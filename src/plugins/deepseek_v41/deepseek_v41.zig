@@ -26,6 +26,7 @@ const log = @import("../../sdk/util/log.zig");
 const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 const engram = @import("engram.zig");
 const cache_codec = @import("cache_codec.zig");
+const cache_pack = @import("cache_pack.zig");
 const cache_abi = @import("../../abi/plugin.zig");
 const glm5 = @import("../glm5_next/glm5_next.zig");
 const mxfp8_qmv = @import("../../sdk/blocks/qmm/mxfp8_qmv.zig");
@@ -522,6 +523,7 @@ pub const Dsv41Model = struct {
     /// The query tail: `rope_kernel`'s roped channels alone.
     rope_tail_only_kernel: mlx.mlx_fast_metal_kernel,
     kv_row_kernel: mlx.mlx_fast_metal_kernel,
+    cache_pack_kernels: cache_pack.Kernels,
     engram_kernel: mlx.mlx_fast_metal_kernel,
     moe_gu_kernel: mlx.mlx_fast_metal_kernel,
     moe_dn_kernel: mlx.mlx_fast_metal_kernel,
@@ -618,6 +620,7 @@ pub const Dsv41Model = struct {
         _ = mlx.mlx_fast_metal_kernel_free(self.rope_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.rope_tail_only_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.kv_row_kernel);
+        self.cache_pack_kernels.deinit();
         _ = mlx.mlx_fast_metal_kernel_free(self.engram_kernel);
         self.dec.deinit();
         gtwin.deinit();
@@ -1643,6 +1646,9 @@ pub const ROPE_TAIL_SOURCE = kernelSource("plugins/deepseek_v41/kernels/rope_tai
 /// e4m3 encode/decode exactly as MLX's `fp8_e4m3` (which takes it from
 /// PyTorch's `Float8_e4m3fn`): saturating, round to nearest even.
 pub const FP8_HEADER = kernelSource("plugins/deepseek_v41/kernels/fp8_header.metal");
+pub const CACHE_CODEC_HEADER = kernelSource("plugins/deepseek_v41/kernels/cache_codec_header.metal");
+pub const CACHE_PACK_SOURCE = kernelSource("plugins/deepseek_v41/kernels/cache_pack.metal");
+pub const CACHE_UNPACK_SOURCE = kernelSource("plugins/deepseek_v41/kernels/cache_unpack.metal");
 
 /// `kvRow` after its projection, one threadgroup (D threads) a row: MLX's
 /// rms_norm, the tail rope, then (QAT) the fp8 / 32 / ue8m0 round trip.
@@ -1880,6 +1886,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         .rope_kernel = try buildKernel("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, ROPE_TAIL_SOURCE, FP8_HEADER),
         .rope_tail_only_kernel = try buildKernel("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, ""),
         .kv_row_kernel = try buildKernel("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, KV_ROW_SOURCE, FP8_HEADER),
+        .cache_pack_kernels = try cache_pack.Kernels.init(),
         .engram_kernel = try buildKernel("dsv41_engram", &ENGRAM_INS, &.{"out"}, ENGRAM_SOURCE, ""),
         .moe_gu_kernel = try buildKernel("dsv41_moe_gu", &MOE_GU_INS, &.{"out"}, MOE_GU_SOURCE, MOE_HEADER),
         .moe_dn_kernel = try buildKernel("dsv41_moe_dn", &MOE_DN_INS, &.{"out"}, MOE_DN_SOURCE, MOE_HEADER),
@@ -6497,9 +6504,9 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
 /// projections, and the FFN half of the block.
 pub const region_rows = 16;
 
+
 /// With a streamed bank the FFN stretch runs as three (`ffn_pre`, `ffn_act`, `ffn_post`) around the source's host
 /// barrier, cut where `ffn` has no fusable op across the cut.
-
 pub const Region = enum { attn_in, q_kv, q_rows, attn_out, ffn, ffn_pre, ffn_act, ffn_post, ffn_shared, ffn_post_shared };
 const LayerRegions = struct {
     m: *Dsv41Model,
@@ -6825,7 +6832,7 @@ fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
 }
 
 pub fn snapshotImportPlan(m: *const Dsv41Model, header: []const u8) !u64 {
-    const p = try cache_codec.Plan.decode(try cacheLayout(m), header);
+    const p = try cache_codec.Plan.decodeWithPacking(try cacheLayout(m), header, !m.qat_off);
     return p.peak;
 }
 
@@ -6835,10 +6842,15 @@ fn checkSnapshotRows(r: ?Rows, expected: bool, used: usize, width: usize, dt: ml
     if (rows.used != used or rows.width != width or rows.dtype != dt or rows.cap < used) return error.Dsv41CacheGeometry;
 }
 
-fn snapshotPlan(m: *const Dsv41Model, sn: *const Snap) !cache_codec.Plan {
+fn snapshotPlan(m: *const Dsv41Model, sn: *const Snap, packing: bool) !cache_codec.Plan {
     if (sn.n != sn.ids.len) return error.Dsv41CacheBoundary;
     const l = try cacheLayout(m);
-    const p = try cache_codec.Plan.init(l, sn.n, sn.vision_key);
+    var p = try cache_codec.Plan.initWithPacking(l, sn.n, sn.vision_key, packing and !m.qat_off);
+    p.version = if (packing) 2 else 1;
+    if (!packing) {
+        @memset(p.encodings[0..p.len], .raw);
+        try p.reprice();
+    }
     if (sn.layers.len != l.layers or sn.ds.len != l.stages) return error.Dsv41CacheGeometry;
     if (sn.hist.len != (if (l.engram) sn.n else @as(usize, 0))) return error.Dsv41CacheGeometry;
     for (sn.layers, 0..) |saved, i| {
@@ -6887,7 +6899,8 @@ pub fn exportSnapshot(m: *const Dsv41Model, sn: *const Snap, out: *cache_abi.Aux
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
     if (had_error) return error.Dsv41CacheMlxErrorPending;
-    const p = try snapshotPlan(m, sn);
+    const packing = env.on(.DSV41_CACHE_PACK);
+    const p = try snapshotPlan(m, sn, packing);
     const names_len = try exportStorage(&p, out);
     const header = try p.encode(out.header.?[0..out.header_cap]);
     errdefer {
@@ -6895,13 +6908,21 @@ pub fn exportSnapshot(m: *const Dsv41Model, sn: *const Snap, out: *cache_abi.Aux
         out.tensor_len = 0;
     }
     var cursor: usize = 0;
-    for (p.specs()) |spec| {
+    for (p.specs(), 0..) |spec, i| {
         var buf: [40]u8 = undefined;
         const name = try spec.name(&buf);
         @memcpy(out.names.?[cursor..][0..name.len], name);
-        const x = try snapshotTensor(m, sn, spec);
+        var x = try snapshotTensor(m, sn, spec);
         errdefer _ = mlx.mlx_array_free(x);
-        try cache_codec.validateArray(spec, x);
+        if (p.encodings[i] != .raw) {
+            var bits = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(bits);
+            try mlx.check(mlx.mlx_view(&bits, x, .uint16, m.s));
+            const encoded = try cache_pack.encode(&m.cache_pack_kernels, m.s, bits, p.encodings[i]);
+            _ = mlx.mlx_array_free(x);
+            x = encoded;
+        }
+        try cache_codec.validateEncodedArray(spec, p.encodings[i], x);
         out.tensors.?[out.tensor_len] = .{ .name = .of(out.names.?[cursor..][0..name.len]), .array = .{ .ctx = x.ctx } };
         out.tensor_len += 1;
         cursor += name.len;
@@ -6971,7 +6992,7 @@ pub fn importSnapshot(m: *const Dsv41Model, gpa: std.mem.Allocator, ids: []const
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
     if (had_error) return error.Dsv41CacheMlxErrorPending;
-    const p = try cache_codec.Plan.decode(try cacheLayout(m), header);
+    const p = try cache_codec.Plan.decodeWithPacking(try cacheLayout(m), header, !m.qat_off);
     if (ids.len != p.n) return error.Dsv41CacheBoundary;
     for (ids) |id| if (id >= m.vocab) return error.TokenPastVocabulary;
     const order = try p.validateArrays(arrays);
@@ -6992,7 +7013,26 @@ pub fn importSnapshot(m: *const Dsv41Model, gpa: std.mem.Allocator, ids: []const
         saved.comp = try importedRows(used, p.layout.width, p.layout.dtype, m.s);
         if (p.layout.owner(i)) saved.idx_k = try importedRows(used, p.layout.index_width, p.layout.dtype, m.s);
     }
-    for (p.specs(), 0..) |spec, i| try importTensor(sn, spec, .{ .ctx = arrays[order[i]].array.ctx }, gpa, m.s);
+    for (p.specs(), 0..) |spec, i| {
+        const source = A{ .ctx = arrays[order[i]].array.ctx };
+        const encoding = p.encodings[i];
+        if (encoding == .raw) {
+            try importTensor(sn, spec, source, gpa, m.s);
+            continue;
+        }
+        const unpacked = try cache_pack.decode(&m.cache_pack_kernels, m.s, source, spec, encoding);
+        defer _ = mlx.mlx_array_free(unpacked.bits);
+        defer _ = mlx.mlx_array_free(unpacked.status);
+        const ready = mlx.mlx_vector_array_new_data(&[_]A{ unpacked.bits, unpacked.status }, 2);
+        defer _ = mlx.mlx_vector_array_free(ready);
+        try mlx.check(mlx.mlx_eval(ready));
+        const failures = mlx.mlx_array_data_uint32(unpacked.status) orelse return error.NoData;
+        for (0..mlx.mlx_array_size(unpacked.status)) |j| if (failures[j] != 0) return error.Dsv41CacheCorrupt;
+        var bf16 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bf16);
+        try mlx.check(mlx.mlx_view(&bf16, unpacked.bits, .bfloat16, m.s));
+        try importTensor(sn, spec, bf16, gpa, m.s);
+    }
     return sn;
 }
 
