@@ -810,7 +810,7 @@ pub fn auxBinding(xfm: *const Transformer) ?AuxBinding {
     const cache = b.table.cache;
     if (cache.size < @sizeOf(abi.CacheHooks)) return null;
     const hooks = cache.aux orelse return null;
-    if (hooks.size < @sizeOf(abi.AuxHooks)) return null;
+    if (hooks.size < @offsetOf(abi.AuxHooks, "import_plan_details")) return null;
     return .{ .model = b.model, .hooks = hooks };
 }
 
@@ -848,6 +848,16 @@ pub fn auxImportPlan(xfm: *const Transformer, header: []const u8, out_peak_bytes
     out_peak_bytes.* = 0;
     const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
     return b.hooks.import_plan(b.model, .of(header), out_peak_bytes);
+}
+
+pub fn auxImportPlanDetails(xfm: *const Transformer, header: []const u8, out: *abi.AuxImportPlan) abi.Verdict {
+    out.* = .{};
+    const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
+    const details_end = @offsetOf(abi.AuxHooks, "import_plan_details") + @sizeOf(@FieldType(abi.AuxHooks, "import_plan_details"));
+    if (b.hooks.size >= details_end) {
+        if (b.hooks.import_plan_details) |f| return f(b.model, .of(header), out);
+    }
+    return b.hooks.import_plan(b.model, .of(header), &out.peak);
 }
 
 pub fn auxExportArrays(xfm: *const Transformer, snap: abi.Handle, out: *abi.AuxExport) abi.Verdict {
