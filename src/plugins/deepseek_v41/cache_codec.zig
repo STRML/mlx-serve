@@ -400,7 +400,8 @@ test "codec planning rejects malformed headers, geometry, settings and overflowi
     // The media key varies by boundary; the remaining assertions match the loaded instance.
     for ([_]usize{ 0, 8, 16, 32, 40, 48, 56, 64, 72, 80, 88, 96 }) |off| {
         buf[off] ^= 0x80;
-        try testing.expectError(error.Dsv41CacheHeader, Plan.decode(l, bytes));
+        const want = if (off == 0) error.Dsv41CacheHeaderVersion else error.Dsv41CacheHeader;
+        try testing.expectError(want, Plan.decode(l, bytes));
         buf[off] ^= 0x80;
     }
     var changed = l;
