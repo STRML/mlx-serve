@@ -424,7 +424,7 @@ const Bell = struct {
 };
 
 fn idleTimeoutMs() u32 {
-    return @max(1, env.intValue(u32, env.get(.MLX_SERVE_DIST_IDLE_MS), 30_000));
+    return @max(1, env.intValue(u32, env.get(.MLX_SERVE_DIST_IDLE_MS), 3_000));
 }
 
 fn setBellTimeout(fd: std.c.fd_t, ms: u32) void {
@@ -433,10 +433,9 @@ fn setBellTimeout(fd: std.c.fd_t, ms: u32) void {
 }
 
 fn followerExit(reason: dist_watchdog.BellFailure) noreturn {
-    log.err("[dist-watchdog] stall: step=0 op=bell waited_ms={d} peer=0 attempt=1\n", .{idleTimeoutMs()});
+    log.err("[dist-watchdog] leader gone: bell {s} (idle timeout {d} ms); this worker exits\n", .{ @tagName(reason), idleTimeoutMs() });
     log.syncFile();
-    dist_watchdog.followerFailure(reason, &dist_watchdog.exitProcess);
-    unreachable;
+    std.c._exit(1);
 }
 
 /// Rank 0's side of the bells while the group forms: files each connection under the rank it names, a
@@ -959,7 +958,7 @@ inline fn cluster() *ClusterState {
 fn beginDistStep(op: u8) void {
     const c = cluster();
     c.watchdog_op.store(op, .monotonic);
-    c.watchdog.begin(c.watchdog.steps.load(.monotonic) + 1, @intCast(crt.monotonicMs()));
+    c.watchdog.begin(@intCast(crt.monotonicMs()));
 }
 
 const Heartbeat = struct { state: *ClusterState, bells: [max_ranks]Bell, size: u32, interval_ms: u32 };
@@ -979,20 +978,12 @@ fn watchdogLoop(c: *ClusterState, deadline_ms: u64) void {
     while (true) {
         crt.sleepMs(250);
         if (c.watchdog_stop.load(.acquire)) return;
-        _ = dist_watchdog.fireIfStalled(&c.watchdog, @intCast(crt.monotonicMs()), deadline_ms, c, &reportDistStall);
+        const waited = c.watchdog.stalledMs(@intCast(crt.monotonicMs()), deadline_ms) orelse continue;
+        const op = if (c.watchdog_op.load(.monotonic) == 2) "tpLoad" else "all_sum";
+        log.err("[dist-watchdog] stall: step={d} op={s} waited_ms={d}; this rank exits\n", .{ c.watchdog.step.load(.monotonic), op, waited });
+        log.syncFile();
+        std.c._exit(1);
     }
-}
-
-fn reportDistStall(ctx: ?*anyopaque, event: dist_watchdog.Event) void {
-    const c: *ClusterState = @ptrCast(@alignCast(ctx.?));
-    const op = switch (c.watchdog_op.load(.monotonic)) {
-        1 => "all_sum",
-        2 => "tpLoad",
-        else => "forward",
-    };
-    log.err("[dist-watchdog] stall: step={d} op={s} waited_ms={d} peer=unknown attempt={d}\n", .{ event.step, op, event.waited_ms, event.attempt });
-    log.syncFile();
-    dist_watchdog.exitProcess(1);
 }
 
 fn startWatchdog(link: *const Link) void {
@@ -1417,7 +1408,7 @@ fn dsv41TpSum(x: mlx.mlx_array) anyerror!mlx.mlx_array {
 }
 
 fn dsv41TpEvalDone() void {
-    _ = cluster().watchdog.completeIfInFlight();
+    cluster().watchdog.done();
 }
 
 /// DeepSeek-V4.1 tensor, every rank: every rank's `x` stacked on axis 0 in rank order, lazily on this thread's CPU
@@ -1623,7 +1614,7 @@ fn dsv41TpLoad(id: u64, ids: []const u32, tensors: []const mlx.mlx_array) anyerr
     const self = peer() orelse return error.DistWorkerNotJoined;
     if (!self.ready) try self.awaitReady();
     beginDistStep(2);
-    defer cluster().watchdog.complete();
+    defer cluster().watchdog.done();
     const a = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
     const t0 = io_util.nowUsMonotonic(cluster().group.?.io);
@@ -1941,7 +1932,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
             },
             OP_DSV41_TP_LOAD => {
                 beginDistStep(2);
-                defer cluster().watchdog.complete();
+                defer cluster().watchdog.done();
                 const n: usize = @intCast(joined(msg[3], msg[4]));
                 const sent = try queuedRecv(link, &.{@intCast(n)}, .int32, 0);
                 defer _ = mlx.mlx_array_free(sent);
