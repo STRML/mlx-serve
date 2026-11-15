@@ -2757,7 +2757,7 @@ fn relinkProbe(io: std.Io, cfg: Config, n: u64, formation_ms: u64) !void {
         var c = cfg;
         if (formation_ms > 0) c.formation_deadline_ms = @as(u64, @intCast(crt.monotonicMs())) + formation_ms;
         var link = Link.open(io, c) catch |e| {
-            log.err("[dist-probe] relink {d}: open failed: {s}\n", .{ k, @errorName(e) });
+            log.err("[dist-probe] relink {d}: open failed after {d} ms: {s}\n", .{ k, sw_open.read() / std.time.ns_per_ms, @errorName(e) });
             return e;
         };
         const open_us = sw_open.read() / std.time.ns_per_us;
