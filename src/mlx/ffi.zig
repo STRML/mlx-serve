@@ -286,6 +286,25 @@ pub fn setCudaGraphs(on: bool) bool {
     return was;
 }
 
+var jaccl_deadline_fn: ?*const fn (i64) callconv(.c) void = null;
+var jaccl_deadline_looked = false;
+
+/// Bounds the next JACCL group formation by `deadline_ms` (CLOCK_MONOTONIC, `crt.monotonicMs`; 0 = none): every
+/// accept, send, recv and connect retry inside the group's init throws once it passes, so a missing peer fails the
+/// init instead of blocking it. `jaccl_set_formation_deadline_ms` exists only in the side MLX's patched JACCL
+/// (local-llm bench/studio-cluster/jaccl-deadline-patch.py); with a stock libjaccl this does nothing and formation
+/// waits as before. One formation at a time.
+pub fn setJacclFormationDeadline(deadline_ms: u64) void {
+    if (!jaccl_deadline_looked) {
+        jaccl_deadline_looked = true;
+        if (std.c.dlopen(null, .{ .LAZY = true })) |self| {
+            if (std.c.dlsym(self, "jaccl_set_formation_deadline_ms")) |f| jaccl_deadline_fn = @ptrCast(@alignCast(f));
+        }
+    }
+    const f = jaccl_deadline_fn orelse return;
+    f(@intCast(deadline_ms));
+}
+
 pub fn cudaAvailable() bool {
     if (cuda_cache == null) {
         var cuda = false;
