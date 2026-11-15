@@ -1420,6 +1420,7 @@ fn dsv41TpGather(x: mlx.mlx_array) anyerror!mlx.mlx_array {
 /// The sums the step before this one built, logged where a prompt step ends or the count is not a decode step's.
 fn noteTpStep(p0: usize, rows: usize) void {
     const c = cluster();
+    c.watchdog.progress(@intCast(crt.monotonicMs()));
     if (c.tp_last.rows > 0 and (c.tp_last.rows > 1 or c.tp_sums != 80)) log.info("[dist] tensor step at {d}: {d} rows, {d} sums of {d} values\n", .{ c.tp_last.p0, c.tp_last.rows, c.tp_sums, c.tp_values });
     c.tp_sums = 0;
     c.tp_values = 0;

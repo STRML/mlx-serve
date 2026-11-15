@@ -14,6 +14,11 @@ pub const State = struct {
         self.in_flight.store(true, .release);
     }
 
+    /// A forward inside the step started: the deadline counts from here, so a long prefill of many chunks never trips it.
+    pub fn progress(self: *State, now_ms: u64) void {
+        if (self.in_flight.load(.acquire)) self.started_ms.store(now_ms, .monotonic);
+    }
+
     pub fn done(self: *State) void {
         self.in_flight.store(false, .release);
     }
@@ -52,6 +57,18 @@ test "a step in flight past the deadline is a stall; idle and finished steps are
     try std.testing.expectEqual(@as(?u64, null), s.stalledMs(10_000, 10));
     s.begin(10_000);
     try std.testing.expectEqual(@as(u64, 2), s.step.load(.monotonic));
+}
+
+test "a step of many forwards survives while each forward is within the deadline; a hung forward fires" {
+    var s: State = .{};
+    s.begin(0);
+    var now: u64 = 0;
+    for (0..20) |_| {
+        now += 2_000;
+        try std.testing.expectEqual(@as(?u64, null), s.stalledMs(now, 10_000));
+        s.progress(now);
+    }
+    try std.testing.expectEqual(@as(?u64, 10_000), s.stalledMs(now + 10_000, 10_000));
 }
 
 test "a bell read: timeout and EOF end the follower, data and EINTR do not" {
