@@ -186,6 +186,8 @@ pub const Link = struct {
             log.err("[dist] rank {d}: no bell connection to rank 0 at {s} (port + 1) by the formation deadline\n", .{ cfg.rank, cfg.coordinator });
             return error.DistNoBell;
         }
+        mlx.setJacclFormationDeadline(deadline);
+        defer mlx.setJacclFormationDeadline(0);
         var g = mlx.mlx_distributed_group_new();
         mlx.check(mlx.mlx_distributed_init(&g, true, "jaccl")) catch {
             var eb: [512]u8 = undefined;
