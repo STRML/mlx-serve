@@ -165,6 +165,12 @@ pub fn closeFile() void {
     sinks().sink_path_len = 0;
 }
 
+pub fn syncFile() void {
+    lockSink();
+    defer unlockSink();
+    if (sinks().sink_fd >= 0) _ = std.c.fsync(sinks().sink_fd);
+}
+
 /// Path of the live log file, or null when no sink is open.
 pub fn filePath() ?[]const u8 {
     if (!@atomicLoad(bool, &sinks().sink_active, .acquire)) return null;

@@ -20,6 +20,7 @@ const h3_split = @import("../../../plugins/minimax_h3/cluster.zig");
 const wire = @import("../../../sdk/util/wire.zig");
 const lan = @import("../../../host/lan/lan.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
+const dist_watchdog = @import("watchdog.zig");
 
 pub const Mode = enum {
     /// Each rank owns a contiguous range of layers; the hidden stream hops at the seams.
@@ -199,11 +200,13 @@ pub const Link = struct {
             }
             if (missing.len > 0) log.warn("[dist] no bell connection: the worker waits on the RDMA link, one core busy\n", .{});
         }
+        startWatchdog(&link);
         log.info("[dist] joined: rank {d} of {d}\n", .{ link.rank, link.size });
         return link;
     }
 
     pub fn deinit(self: *Link) void {
+        cluster().watchdog_stop.store(true, .release);
         for (&self.bells) |*b| if (b.open()) {
             _ = std.c.close(b.fd);
             b.* = .{};
@@ -265,11 +268,13 @@ pub const Link = struct {
 /// follows it (`OP_DSV41_TP_PIPE`).
 const Bell = struct {
     fd: std.c.fd_t = none,
+    follower: bool = false,
 
     const msg_byte: u8 = 1;
     const pipe_byte: u8 = 2;
     const draft_byte: u8 = 3;
     const verify_byte: u8 = 4;
+    const heartbeat_byte: u8 = 5;
 
     /// No connection. `fd_t` is a HANDLE on Windows, where a cluster never forms.
     const none: std.c.fd_t = if (builtin.os.tag == .windows) std.os.windows.INVALID_HANDLE_VALUE else -1;
@@ -311,7 +316,8 @@ const Bell = struct {
     /// A worker's bell: connected, then its rank.
     fn connect(coord: Coordinator, rank: u32) Bell {
         const fd = lan.connectTimeout(coord.ip4, coord.port +% 1, 3000) catch return .{};
-        const b: Bell = .{ .fd = noDelay(fd) };
+        const b: Bell = .{ .fd = noDelay(fd), .follower = true };
+        setBellTimeout(fd, idleTimeoutMs());
         b.writeAll(&[_]u8{@intCast(rank)}) catch {
             _ = std.c.close(fd);
             return .{};
@@ -326,10 +332,16 @@ const Bell = struct {
     }
 
     fn writeAll(b: Bell, bytes: []const u8) !void {
+        const mu = &cluster().bell_mu;
+        while (!mu.tryLock()) std.atomic.spinLoopHint();
+        defer mu.unlock();
         var off: usize = 0;
         while (off < bytes.len) {
             const n = std.c.write(b.fd, bytes.ptr + off, bytes.len - off);
-            if (n <= 0) return error.DistPeerGone;
+            if (n <= 0) {
+                if (b.follower) followerExit(.eof);
+                return error.DistPeerGone;
+            }
             off += @intCast(n);
         }
     }
@@ -338,8 +350,12 @@ const Bell = struct {
         var off: usize = 0;
         while (off < out.len) {
             const n = std.c.read(b.fd, out.ptr + off, out.len - off);
-            if (n < 0 and std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
-            if (n <= 0) return error.DistPeerGone;
+            const failure = dist_watchdog.classifyBellFailure(n, std.c._errno().*, @backingInt(std.c.E.INTR), @backingInt(std.c.E.AGAIN));
+            if (failure) |f| {
+                if (b.follower) followerExit(f);
+                return error.DistPeerGone;
+            }
+            if (n < 0) continue;
             off += @intCast(n);
         }
     }
@@ -395,12 +411,33 @@ const Bell = struct {
         var x: [1]u8 = undefined;
         while (true) {
             const n = std.c.read(b.fd, &x, 1);
+            if (n == 1 and x[0] == heartbeat_byte) continue;
             if (n == 1) return x[0];
-            if (n < 0 and std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
-            return error.DistPeerGone;
+            const failure = dist_watchdog.classifyBellFailure(n, std.c._errno().*, @backingInt(std.c.E.INTR), @backingInt(std.c.E.AGAIN));
+            if (failure) |f| {
+                if (b.follower) followerExit(f);
+                return error.DistPeerGone;
+            }
+            if (n < 0) continue;
         }
     }
 };
+
+fn idleTimeoutMs() u32 {
+    return @max(1, env.intValue(u32, env.get(.MLX_SERVE_DIST_IDLE_MS), 30_000));
+}
+
+fn setBellTimeout(fd: std.c.fd_t, ms: u32) void {
+    const timeout = std.c.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
+    _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout, @sizeOf(@TypeOf(timeout)));
+}
+
+fn followerExit(reason: dist_watchdog.BellFailure) noreturn {
+    log.err("[dist-watchdog] stall: step=0 op=bell waited_ms={d} peer=0 attempt=1\n", .{idleTimeoutMs()});
+    log.syncFile();
+    dist_watchdog.followerFailure(reason, &dist_watchdog.exitProcess);
+    unreachable;
+}
 
 /// Rank 0's side of the bells while the group forms: files each connection under the rank it names, a
 /// restarted worker's replacing the one before it, until stopped.
@@ -837,6 +874,7 @@ pub const Peer = struct {
                 },
             }
         }
+        cluster().heartbeat_active.store(true, .release);
         self.ready = true;
     }
 };
@@ -906,10 +944,76 @@ const ClusterState = struct {
     worker_us: std.atomic.Value(u32) = .init(0),
     /// Receives from the worker in progress on the inference thread (`queuedRecv`).
     recvs: std.atomic.Value(u32) = .init(0),
+    watchdog: dist_watchdog.State = .{},
+    watchdog_started: std.atomic.Value(bool) = .init(false),
+    watchdog_stop: std.atomic.Value(bool) = .init(false),
+    watchdog_op: std.atomic.Value(u8) = .init(0),
+    heartbeat_active: std.atomic.Value(bool) = .init(false),
+    bell_mu: std.atomic.Mutex = .unlocked,
 };
 pub const cluster_shared = @import("../../../sdk/util/shared.zig").Shared(ClusterState, "cluster_state", .{});
 inline fn cluster() *ClusterState {
     return cluster_shared.get();
+}
+
+fn beginDistStep(op: u8) void {
+    const c = cluster();
+    c.watchdog_op.store(op, .monotonic);
+    c.watchdog.begin(c.watchdog.steps.load(.monotonic) + 1, @intCast(crt.monotonicMs()));
+}
+
+const Heartbeat = struct { state: *ClusterState, bells: [max_ranks]Bell, size: u32, interval_ms: u32 };
+
+fn heartbeatLoop(h: Heartbeat) void {
+    while (true) {
+        crt.sleepMs(h.interval_ms);
+        if (h.state.watchdog_stop.load(.acquire)) return;
+        if (!h.state.heartbeat_active.load(.acquire)) continue;
+        for (1..h.size) |rank| if (h.bells[rank].open()) {
+            h.bells[rank].writeAll(&.{Bell.heartbeat_byte}) catch {};
+        };
+    }
+}
+
+fn watchdogLoop(c: *ClusterState, deadline_ms: u64) void {
+    while (true) {
+        crt.sleepMs(250);
+        if (c.watchdog_stop.load(.acquire)) return;
+        _ = dist_watchdog.fireIfStalled(&c.watchdog, @intCast(crt.monotonicMs()), deadline_ms, c, &reportDistStall);
+    }
+}
+
+fn reportDistStall(ctx: ?*anyopaque, event: dist_watchdog.Event) void {
+    const c: *ClusterState = @ptrCast(@alignCast(ctx.?));
+    const op = switch (c.watchdog_op.load(.monotonic)) {
+        1 => "all_sum",
+        2 => "tpLoad",
+        else => "forward",
+    };
+    log.err("[dist-watchdog] stall: step={d} op={s} waited_ms={d} peer=unknown attempt={d}\n", .{ event.step, op, event.waited_ms, event.attempt });
+    log.syncFile();
+    dist_watchdog.exitProcess(1);
+}
+
+fn startWatchdog(link: *const Link) void {
+    const c = cluster();
+    if (c.watchdog_started.swap(true, .acq_rel)) return;
+    const deadline: u64 = env.intValue(u32, env.get(.MLX_SERVE_DIST_STALL_MS), 10_000);
+    const watcher = std.Thread.spawn(.{ .stack_size = 1 << 16 }, watchdogLoop, .{ c, deadline }) catch {
+        log.err("[dist-watchdog] cannot start watchdog thread\n", .{});
+        log.syncFile();
+        std.c._exit(1);
+    };
+    watcher.detach();
+    if (link.rank == 0) {
+        const interval = @max(1, idleTimeoutMs() / 3);
+        const heartbeat = std.Thread.spawn(.{ .stack_size = 1 << 16 }, heartbeatLoop, .{Heartbeat{ .state = c, .bells = link.bells, .size = link.size, .interval_ms = interval }}) catch {
+            log.err("[dist-watchdog] cannot start heartbeat thread\n", .{});
+            log.syncFile();
+            std.c._exit(1);
+        };
+        heartbeat.detach();
+    }
 }
 
 /// The group this server leads (`--dist`): set at startup, while a thread waits
@@ -1270,6 +1374,7 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
             self.planned = true;
             cluster().tp_link = &self.link;
             dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
+            dsv41_mod.clusterHooks().tp_eval_done = &dsv41TpEvalDone;
             dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
             dsv41_mod.clusterHooks().tp_step = &dsv41TpStep;
             dsv41_mod.clusterHooks().tp_pipe = if (tpPipeWanted(&self.link)) &dsv41TpPipe else null;
@@ -1305,9 +1410,14 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
 /// DeepSeek-V4.1 tensor, every rank: `x` summed over the group, lazily on this thread's CPU stream.
 fn dsv41TpSum(x: mlx.mlx_array) anyerror!mlx.mlx_array {
     const link = cluster().tp_link orelse return error.DistWorkerNotJoined;
+    beginDistStep(1);
     cluster().tp_sums += 1;
     cluster().tp_values += mlx.mlx_array_size(x);
     return link.allSum(x);
+}
+
+fn dsv41TpEvalDone() void {
+    _ = cluster().watchdog.completeIfInFlight();
 }
 
 /// DeepSeek-V4.1 tensor, every rank: every rank's `x` stacked on axis 0 in rank order, lazily on this thread's CPU
@@ -1512,6 +1622,8 @@ fn sendAll(link: *const Link, m: Msg) void {
 fn dsv41TpLoad(id: u64, ids: []const u32, tensors: []const mlx.mlx_array) anyerror!void {
     const self = peer() orelse return error.DistWorkerNotJoined;
     if (!self.ready) try self.awaitReady();
+    beginDistStep(2);
+    defer cluster().watchdog.complete();
     const a = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
     const t0 = io_util.nowUsMonotonic(cluster().group.?.io);
@@ -1702,9 +1814,11 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     }
     cluster().tp_link = link;
     dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
+    dsv41_mod.clusterHooks().tp_eval_done = &dsv41TpEvalDone;
     dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
     defer {
         dsv41_mod.clusterHooks().tp_sum = null;
+        dsv41_mod.clusterHooks().tp_eval_done = null;
         dsv41_mod.clusterHooks().tp_gather = null;
         cluster().tp_link = null;
     }
@@ -1826,6 +1940,8 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                 try dsv41_mod.tpWorkerSnap(m, allocator, &parked, &snaps, op, joined(msg[2], msg[3]), joined(msg[4], msg[5]));
             },
             OP_DSV41_TP_LOAD => {
+                beginDistStep(2);
+                defer cluster().watchdog.complete();
                 const n: usize = @intCast(joined(msg[3], msg[4]));
                 const sent = try queuedRecv(link, &.{@intCast(n)}, .int32, 0);
                 defer _ = mlx.mlx_array_free(sent);
@@ -1965,7 +2081,7 @@ fn watchWorker(link: *const Link) void {
     log.err("[dist] a step waits on worker rank {d}, which left; its requests end and this server exits\n", .{lost});
     if (@import("../../../host/http/server.zig").launch().global_scheduler) |sch| @import("../scheduler.zig").failInFlight(sch, "DistWorkerLeft");
     crt.sleepMs(2000);
-    std.process.exit(1);
+    std.c._exit(1);
 }
 
 /// Right after the worker joins, over the bell connection (no MLX off the inference thread):
@@ -2128,8 +2244,7 @@ fn watchHost(b: Bell) void {
         if (n == 0) break;
         crt.sleepMs(20); // a ring the inference thread has yet to read
     }
-    log.err("[dist] rank 0 left; this worker exits\n", .{});
-    std.process.exit(1);
+    followerExit(.eof);
 }
 
 /// One plan: finds and loads this Mac's part, then serves until rank 0 stops it (false) or

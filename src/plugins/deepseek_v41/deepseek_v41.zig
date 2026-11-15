@@ -1699,6 +1699,7 @@ const ClusterHooksState = struct {
     pair_exchange: ?*const fn (x: A, pre: A, p0: usize, snap: bool, verify: bool) anyerror![2]A = null,
     /// Tensor parallel: every rank's partial `x` summed, lazily (caller frees). Set by distributed.zig on every rank.
     tp_sum: ?*const fn (x: A) anyerror!A = null,
+    tp_eval_done: ?*const fn () void = null,
     /// Tensor parallel: every rank's `x` stacked on axis 0 in rank order, lazily (caller frees); the shapes match. Set
     /// by distributed.zig on every rank.
     tp_gather: ?*const fn (x: A) anyerror!A = null,
@@ -5029,6 +5030,7 @@ pub fn evalAll(xs: []const A) !void {
     const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_eval(vec));
+    if (clusterHooks().tp_eval_done) |done| done();
 }
 
 /// `evalAll` committed, not waited for.
