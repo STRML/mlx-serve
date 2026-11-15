@@ -206,7 +206,7 @@ pub const Link = struct {
     }
 
     pub fn deinit(self: *Link) void {
-        cluster().watchdog_stop.store(true, .release);
+        stopWatchdog();
         for (&self.bells) |*b| if (b.open()) {
             _ = std.c.close(b.fd);
             b.* = .{};
@@ -967,6 +967,8 @@ const ClusterState = struct {
     watchdog: dist_watchdog.State = .{},
     watchdog_started: std.atomic.Value(bool) = .init(false),
     watchdog_stop: std.atomic.Value(bool) = .init(false),
+    /// The watchdog and (rank 0) heartbeat threads of the open link; `Link.deinit` joins them.
+    watchdog_threads: [2]?std.Thread = .{ null, null },
     heartbeat_active: std.atomic.Value(bool) = .init(false),
     /// Set once this worker has sent READY: from then on a silent or closed bell ends the process.
     follower_ready: std.atomic.Value(bool) = .init(false),
@@ -1002,10 +1004,21 @@ pub fn parkInferenceLoop() void {
 
 const Heartbeat = struct { state: *ClusterState, bells: [max_ranks]Bell, size: u32, interval_ms: u32 };
 
+/// Sleeps `ms` in short steps; true once the link's watchdog is told to stop, so `Link.deinit` joins within ~50 ms.
+fn sleepUnlessStopped(c: *ClusterState, ms: u32) bool {
+    var left = ms;
+    while (left > 0) {
+        if (c.watchdog_stop.load(.acquire)) return true;
+        const step = @min(left, 50);
+        crt.sleepMs(step);
+        left -= step;
+    }
+    return c.watchdog_stop.load(.acquire);
+}
+
 fn heartbeatLoop(h: Heartbeat) void {
     while (true) {
-        crt.sleepMs(h.interval_ms);
-        if (h.state.watchdog_stop.load(.acquire)) return;
+        if (sleepUnlessStopped(h.state, h.interval_ms)) return;
         if (!h.state.heartbeat_active.load(.acquire)) continue;
         const now_ms: u64 = @intCast(crt.monotonicMs());
         if (!dist_watchdog.loopAlive(now_ms, h.state.loop_tick_ms.load(.acquire), h.state.watchdog.in_flight.load(.acquire), 1_000)) continue;
@@ -1017,8 +1030,7 @@ fn heartbeatLoop(h: Heartbeat) void {
 
 fn watchdogLoop(c: *ClusterState, deadline_ms: u64, leader: bool) void {
     while (true) {
-        crt.sleepMs(250);
-        if (c.watchdog_stop.load(.acquire)) return;
+        if (sleepUnlessStopped(c, 250)) return;
         const now_ms: u64 = @intCast(crt.monotonicMs());
         const last_tick_ms = c.loop_tick_ms.load(.acquire);
         const in_flight = c.watchdog.in_flight.load(.acquire);
@@ -1033,23 +1045,53 @@ fn watchdogLoop(c: *ClusterState, deadline_ms: u64, leader: bool) void {
     }
 }
 
+/// Starts the open link's watchdog (and, on rank 0, its heartbeat). Once per link: `Link.deinit` stops and joins
+/// them, so a group formed again in the same process gets its own.
 fn startWatchdog(link: *const Link) void {
     const c = cluster();
     if (c.watchdog_started.swap(true, .acq_rel)) return;
+    c.watchdog_stop.store(false, .release);
     const deadline: u64 = env.intValue(u32, env.get(.MLX_SERVE_DIST_STALL_MS), 30_000);
-    const watcher = std.Thread.spawn(.{ .stack_size = 1 << 16 }, watchdogLoop, .{ c, deadline, link.rank == 0 and link.size > 1 }) catch {
+    c.watchdog_threads[0] = std.Thread.spawn(.{ .stack_size = 1 << 16 }, watchdogLoop, .{ c, deadline, link.rank == 0 and link.size > 1 }) catch {
         log.err("[dist-watchdog] cannot start watchdog thread\n", .{});
         distExit(.watchdog_thread, null, null);
     };
-    watcher.detach();
     if (link.rank == 0) {
         const interval = @max(1, idleTimeoutMs() / 3);
-        const heartbeat = std.Thread.spawn(.{ .stack_size = 1 << 16 }, heartbeatLoop, .{Heartbeat{ .state = c, .bells = link.bells, .size = link.size, .interval_ms = interval }}) catch {
+        c.watchdog_threads[1] = std.Thread.spawn(.{ .stack_size = 1 << 16 }, heartbeatLoop, .{Heartbeat{ .state = c, .bells = link.bells, .size = link.size, .interval_ms = interval }}) catch {
             log.err("[dist-watchdog] cannot start heartbeat thread\n", .{});
             distExit(.heartbeat_thread, null, null);
         };
-        heartbeat.detach();
     }
+}
+
+/// Stops and joins the link's watchdog threads before its bells close (the heartbeat writes to them), and clears the
+/// per-link state, so the next link starts with nothing in flight and its loop not yet ticked.
+fn stopWatchdog() void {
+    const c = cluster();
+    if (!c.watchdog_started.load(.acquire)) return;
+    c.watchdog_stop.store(true, .release);
+    for (&c.watchdog_threads) |*slot| if (slot.*) |t| {
+        t.join();
+        slot.* = null;
+    };
+    c.heartbeat_active.store(false, .release);
+    c.loop_tick_ms.store(0, .release);
+    c.watchdog.done();
+    c.watchdog_started.store(false, .release);
+}
+
+test "a link formed again after a deinit gets its own running watchdog" {
+    var link: Link = .{ .group = .{}, .rank = 1, .size = 2 };
+    startWatchdog(&link);
+    try std.testing.expect(cluster().watchdog_threads[0] != null);
+    stopWatchdog();
+    try std.testing.expect(cluster().watchdog_threads[0] == null);
+    try std.testing.expect(!cluster().watchdog_started.load(.acquire));
+    startWatchdog(&link);
+    try std.testing.expect(cluster().watchdog_threads[0] != null);
+    try std.testing.expect(!cluster().watchdog_stop.load(.acquire));
+    stopWatchdog();
 }
 
 /// The group this server leads (`--dist`): set at startup, while a thread waits
