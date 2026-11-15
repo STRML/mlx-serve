@@ -2,4 +2,5 @@
 # which build/config.zig checks against this same list. Format: `<submodule> <patch>` from the repo root; `#` comments.
 lib/mlxc-src patches/mlxc-gather-qmm-global-scale.patch
 lib/mlx-src patches/mlx-jaccl-group-abort.patch
+lib/mlx-src patches/mlx-jaccl-ordered-rs.patch
 lib/mlxc-src patches/mlxc-group-abort.patch
