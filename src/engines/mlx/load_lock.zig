@@ -18,9 +18,11 @@ pub const Lock = struct {
 
     pub fn acquire(path: []const u8) !Lock {
         if (comptime builtin.os.tag != .macos) return .{};
-        const zpath = try std.heap.page_allocator.dupeZ(u8, path);
-        defer std.heap.page_allocator.free(zpath);
-        const fd = std.c.open(zpath, .{ .ACCMODE = .RDWR, .CREAT = true }, @as(std.c.mode_t, 0o600));
+        var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        if (path.len >= buf.len) return error.LoadLockPathTooLong;
+        @memcpy(buf[0..path.len], path);
+        buf[path.len] = 0;
+        const fd = std.c.open(buf[0..path.len :0], .{ .ACCMODE = .RDWR, .CREAT = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.LoadLockOpenFailed;
         errdefer _ = close(fd);
         if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
