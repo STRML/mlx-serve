@@ -1,0 +1,88 @@
+diff --git a/mlx/c/distributed_group.cpp b/mlx/c/distributed_group.cpp
+index d0db5d5..a59f516 100644
+--- a/mlx/c/distributed_group.cpp
++++ b/mlx/c/distributed_group.cpp
+@@ -59,6 +59,45 @@ extern "C" int mlx_distributed_group_size(mlx_distributed_group group) {
+   }
+ }
+ 
++extern "C" int
++mlx_distributed_group_abort(mlx_distributed_group group, const char* reason) {
++  try {
++    if (!reason) {
++      throw std::invalid_argument("expected a non-null abort reason");
++    }
++    mlx_distributed_group_get_(group).abort(reason);
++    return 0;
++  } catch (std::exception& e) {
++    mlx_error("%s", e.what());
++    return 1;
++  }
++}
++
++extern "C" int mlx_distributed_group_progress(
++    mlx_distributed_group group,
++    uint64_t* output) {
++  try {
++    if (!output) {
++      throw std::invalid_argument("expected a non-null progress output");
++    }
++    *output = mlx_distributed_group_get_(group).progress();
++    return 0;
++  } catch (std::exception& e) {
++    mlx_error("%s", e.what());
++    return 1;
++  }
++}
++
++extern "C" int mlx_distributed_clear_backends(void) {
++  try {
++    mlx::core::distributed::clear_backends();
++    return 0;
++  } catch (std::exception& e) {
++    mlx_error("%s", e.what());
++    return 1;
++  }
++}
++
+ extern "C" int mlx_distributed_group_split(
+     mlx_distributed_group* res,
+     mlx_distributed_group group,
+diff --git a/mlx/c/distributed_group.h b/mlx/c/distributed_group.h
+index bfbaa80..e7bc9fd 100644
+--- a/mlx/c/distributed_group.h
++++ b/mlx/c/distributed_group.h
+@@ -4,6 +4,7 @@
+ #define MLX_DISTRIBUTED_GROUP_H
+ 
+ #include <stdbool.h>
++#include <stdint.h>
+ 
+ #include "mlx/c/stream.h"
+ 
+@@ -51,6 +52,25 @@ int mlx_distributed_group_rank(mlx_distributed_group group);
+  */
+ int mlx_distributed_group_size(mlx_distributed_group group);
+ 
++/**
++ * Abort a JACCL group with the supplied non-null reason.
++ */
++int mlx_distributed_group_abort(
++    mlx_distributed_group group,
++    const char* reason);
++
++/**
++ * Read completed JACCL operations into output; unchanged on error.
++ */
++int mlx_distributed_group_progress(
++    mlx_distributed_group group,
++    uint64_t* output);
++
++/**
++ * Clear cached backends after all group operations have drained.
++ */
++int mlx_distributed_clear_backends(void);
++
+ /**
+  * Split the group.
+  */

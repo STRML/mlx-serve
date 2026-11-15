@@ -1,0 +1,975 @@
+diff --git a/mlx/backend/cpu/encoder.h b/mlx/backend/cpu/encoder.h
+index eb45d64ca..e7ef41c8c 100644
+--- a/mlx/backend/cpu/encoder.h
++++ b/mlx/backend/cpu/encoder.h
+@@ -44,15 +44,7 @@ struct MLX_API CommandEncoder {
+   void dispatch(F&& f, Args&&... args) {
+     num_ops_ = (num_ops_ + 1) % DISPATCHES_PER_TASK;
+     auto task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+-    if (num_ops_ == 0) {
+-      scheduler::notify_new_task(stream_);
+-      scheduler::enqueue(stream_, std::move(task));
+-      // Notify completion separately as |task| may throw exception.
+-      scheduler::enqueue(
+-          stream_, [s = stream_] { scheduler::notify_task_completion(s); });
+-    } else {
+-      scheduler::enqueue(stream_, std::move(task));
+-    }
++    scheduler::enqueue(stream_, std::move(task), num_ops_ == 0);
+   }
+ 
+  private:
+diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
+index d8fca8b16..ba98dd295 100644
+--- a/mlx/distributed/distributed.cpp
++++ b/mlx/distributed/distributed.cpp
+@@ -134,6 +134,14 @@ int Group::size() const {
+   return group_->size();
+ }
+ 
++void Group::abort(const std::string& reason) const {
++  group_->abort(reason);
++}
++
++uint64_t Group::progress() const {
++  return group_->progress();
++}
++
+ Group Group::split(int color, int key /* = -1 */) const {
+   return Group(group_->split(color, key));
+ }
+diff --git a/mlx/distributed/distributed.h b/mlx/distributed/distributed.h
+index 0d6e4d41e..d1adc4a1d 100644
+--- a/mlx/distributed/distributed.h
++++ b/mlx/distributed/distributed.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <cstdint>
+ #include <functional>
+ #include <memory>
+ 
+@@ -51,6 +52,12 @@ struct MLX_API Group {
+   int rank() const;
+   int size() const;
+ 
++  /** Abort JACCL communication. Other backends throw an unsupported error. */
++  void abort(const std::string& reason) const;
++
++  /** Number of completed JACCL collectives. Other backends throw. */
++  uint64_t progress() const;
++
+   /**
+    * Split the group according to the provided color. Namely processes that use
+    * the same color will go to the same group.
+diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
+index d889587ab..ae5b51978 100644
+--- a/mlx/distributed/distributed_impl.h
++++ b/mlx/distributed/distributed_impl.h
+@@ -19,6 +19,14 @@ class GroupImpl {
+   // Group operations
+   virtual int rank() = 0;
+   virtual int size() = 0;
++  virtual void abort(const std::string&) {
++    throw std::runtime_error(
++        "[distributed] Group abort is only supported by JACCL.");
++  }
++  virtual uint64_t progress() const {
++    throw std::runtime_error(
++        "[distributed] Group progress is only supported by JACCL.");
++  }
+   virtual std::shared_ptr<GroupImpl> split(int color, int key = -1) = 0;
+ 
+   // Actual communication operations
+diff --git a/mlx/distributed/jaccl/jaccl.cpp b/mlx/distributed/jaccl/jaccl.cpp
+index 99a4ac3be..b46d5be10 100644
+--- a/mlx/distributed/jaccl/jaccl.cpp
++++ b/mlx/distributed/jaccl/jaccl.cpp
+@@ -78,6 +78,14 @@ class JACCLGroup : public GroupImpl {
+     return group_->size();
+   }
+ 
++  void abort(const std::string& reason) override {
++    group_->abort(reason);
++  }
++
++  uint64_t progress() const override {
++    return group_->progress();
++  }
++
+   void all_sum(const array& input, array& output, Stream stream) override {
+     auto in_ptr = input.data<char>();
+     auto out_ptr = output.data<char>();
+diff --git a/mlx/distributed/jaccl/lib/jaccl/group.h b/mlx/distributed/jaccl/lib/jaccl/group.h
+index 603765a51..599a5f467 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/group.h
++++ b/mlx/distributed/jaccl/lib/jaccl/group.h
+@@ -2,11 +2,41 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <cstddef>
++#include <cstdint>
+ #include <memory>
++#include <mutex>
++#include <stdexcept>
++#include <string>
+ 
+ namespace jaccl {
+ 
++struct FailureState {
++  void set(const std::string& reason) {
++    std::call_once(once_, [this, &reason] {
++      reason_ = "[jaccl] " + reason;
++      failed_.store(true, std::memory_order_release);
++    });
++  }
++
++  void check() const {
++    if (failed_.load(std::memory_order_acquire)) {
++      throw std::runtime_error(reason_);
++    }
++  }
++
++  [[noreturn]] void fail(const std::string& reason) {
++    set(reason);
++    throw std::runtime_error(reason_);
++  }
++
++ private:
++  std::atomic<bool> failed_{false};
++  std::once_flag once_;
++  std::string reason_;
++};
++
+ /**
+  * Abstract base class for a JACCL communication group.
+  */
+@@ -17,6 +47,14 @@ class Group {
+   virtual int rank() = 0;
+   virtual int size() = 0;
+ 
++  void abort(const std::string& reason) const {
++    failure_->set(reason);
++  }
++
++  uint64_t progress() const {
++    return completed_.load(std::memory_order_relaxed);
++  }
++
+   virtual void
+   all_sum(const void* input, void* output, size_t n_bytes, int dtype) = 0;
+ 
+@@ -41,6 +79,17 @@ class Group {
+   virtual void send(const void* input, size_t n_bytes, int dst) = 0;
+   virtual void recv(void* output, size_t n_bytes, int src) = 0;
+   virtual void barrier() = 0;
++
++ protected:
++  void collective_completed() {
++    failure_->check();
++    completed_.fetch_add(1, std::memory_order_relaxed);
++  }
++
++  std::shared_ptr<FailureState> failure_ = std::make_shared<FailureState>();
++
++ private:
++  std::atomic<uint64_t> completed_{0};
+ };
+ 
+ /**
+diff --git a/mlx/distributed/jaccl/lib/jaccl/mesh.cpp b/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
+index cdc991ff6..73031cc43 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
+@@ -30,9 +30,7 @@ MeshGroup::MeshGroup(
+   }
+   std::ranges::for_each(
+       connections_ | std::views::join,
+-      [failure = std::make_shared<FailureState>()](Connection& c) {
+-        c.share_failure(failure);
+-      });
++      [failure = failure_](Connection& c) { c.share_failure(failure); });
+ 
+   // Initialize all the connections and allocate buffers
+   initialize();
+@@ -47,6 +45,12 @@ MeshGroup::MeshGroup(
+   }
+ }
+ 
++MeshGroup::~MeshGroup() {
++  for (auto& connection : connections_ | std::views::join) {
++    connection.close_queue_pair();
++  }
++}
++
+ void MeshGroup::initialize() {
+   // Create the queue pairs
+   for (auto& wire : connections_) {
+@@ -166,10 +170,12 @@ void MeshGroup::all_sum(
+     void* output,
+     size_t n_bytes,
+     int dtype) {
++  failure_->check();
+   dispatch_all_types(dtype, [&](auto type_tag) {
+     using T = JACCL_GET_TYPE(type_tag);
+     all_reduce<T>(input, output, n_bytes, SumOp<T>{});
+   });
++  collective_completed();
+ }
+ 
+ void MeshGroup::all_max(
+@@ -177,10 +183,12 @@ void MeshGroup::all_max(
+     void* output,
+     size_t n_bytes,
+     int dtype) {
++  failure_->check();
+   dispatch_all_types(dtype, [&](auto type_tag) {
+     using T = JACCL_GET_TYPE(type_tag);
+     all_reduce<T>(input, output, n_bytes, MaxOp<T>{});
+   });
++  collective_completed();
+ }
+ 
+ void MeshGroup::all_min(
+@@ -188,18 +196,22 @@ void MeshGroup::all_min(
+     void* output,
+     size_t n_bytes,
+     int dtype) {
++  failure_->check();
+   dispatch_all_types(dtype, [&](auto type_tag) {
+     using T = JACCL_GET_TYPE(type_tag);
+     all_reduce<T>(input, output, n_bytes, MinOp<T>{});
+   });
++  collective_completed();
+ }
+ 
+ void MeshGroup::all_gather(const void* input, void* output, size_t n_bytes) {
++  failure_->check();
+   auto in_ptr = static_cast<const char*>(input);
+   auto out_ptr = static_cast<char*>(output);
+   split_wires(n_bytes, n_bytes, [&](int w, int64_t offset, int64_t n) {
+     meshes_[w].all_gather(in_ptr + offset, out_ptr + offset, n, n_bytes);
+   });
++  collective_completed();
+ }
+ 
+ void MeshGroup::sum_scatter(
+@@ -207,13 +219,16 @@ void MeshGroup::sum_scatter(
+     void* output,
+     size_t n_bytes,
+     int dtype) {
++  failure_->check();
+   dispatch_all_types(dtype, [&](auto type_tag) {
+     using T = JACCL_GET_TYPE(type_tag);
+     reduce_scatter<T>(input, output, n_bytes, SumOp<T>{});
+   });
++  collective_completed();
+ }
+ 
+ void MeshGroup::send(const void* input, size_t n_bytes, int dst) {
++  failure_->check();
+   auto in_ptr = static_cast<const char*>(input);
+   split_wires(n_bytes, n_bytes, [&](int w, int64_t offset, int64_t n) {
+     meshes_[w].send(in_ptr + offset, n, dst);
+@@ -221,6 +236,7 @@ void MeshGroup::send(const void* input, size_t n_bytes, int dst) {
+ }
+ 
+ void MeshGroup::recv(void* output, size_t n_bytes, int src) {
++  failure_->check();
+   auto out_ptr = static_cast<char*>(output);
+   split_wires(n_bytes, n_bytes, [&](int w, int64_t offset, int64_t n) {
+     meshes_[w].recv(out_ptr + offset, n, src);
+diff --git a/mlx/distributed/jaccl/lib/jaccl/mesh.h b/mlx/distributed/jaccl/lib/jaccl/mesh.h
+index aa19fddb8..739109390 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/mesh.h
++++ b/mlx/distributed/jaccl/lib/jaccl/mesh.h
+@@ -25,6 +25,8 @@ class MeshGroup : public Group {
+       const std::vector<std::vector<std::string>>& device_names,
+       SideChannel sc);
+ 
++  ~MeshGroup() override;
++
+   int rank() override {
+     return rank_;
+   }
+diff --git a/mlx/distributed/jaccl/lib/jaccl/rdma.cpp b/mlx/distributed/jaccl/lib/jaccl/rdma.cpp
+index 8fbf82f71..e3ade5f7f 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/rdma.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/rdma.cpp
+@@ -131,9 +131,7 @@ Connection::Connection(Connection&& c) : Connection(nullptr) {
+ }
+ 
+ Connection::~Connection() {
+-  if (queue_pair != nullptr) {
+-    ibv().destroy_qp(queue_pair);
+-  }
++  close_queue_pair();
+   if (completion_queue != nullptr) {
+     ibv().destroy_cq(completion_queue);
+   }
+@@ -145,6 +143,13 @@ Connection::~Connection() {
+   }
+ }
+ 
++void Connection::close_queue_pair() {
++  if (queue_pair != nullptr) {
++    ibv().destroy_qp(queue_pair);
++    queue_pair = nullptr;
++  }
++}
++
+ void Connection::check_stalled() const {
+   throw_if_failed();
+   auto now = std::chrono::steady_clock::now();
+diff --git a/mlx/distributed/jaccl/lib/jaccl/rdma.h b/mlx/distributed/jaccl/lib/jaccl/rdma.h
+index 950b15183..edb2451b6 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/rdma.h
++++ b/mlx/distributed/jaccl/lib/jaccl/rdma.h
+@@ -17,6 +17,7 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++#include "jaccl/group.h"
+ #include "jaccl/tcp.h"
+ 
+ constexpr const char* IBV_TAG = "[jaccl]";
+@@ -156,13 +157,6 @@ class SharedBuffer {
+   std::unordered_map<ibv_pd*, ibv_mr*> memory_regions_;
+ };
+ 
+-// Shared by all connections of a group. The first failure wins.
+-struct FailureState {
+-  std::atomic<bool> failed{false};
+-  std::once_flag once;
+-  std::string reason;
+-};
+-
+ /**
+  * Manipulates an RDMA connection. Enables (among other things)
+  *
+@@ -184,6 +178,7 @@ struct Connection {
+   Connection& operator=(Connection&) = delete;
+ 
+   ~Connection();
++  void close_queue_pair();
+   void allocate_protection_domain();
+   void create_completion_queue(int num_entries);
+   void create_queue_pair();
+@@ -236,6 +231,7 @@ struct Connection {
+   }
+ 
+   int poll(int num_completions, ibv_wc* work_completions) const {
++    throw_if_failed();
+     int n = ibv_poll_cq(completion_queue, num_completions, work_completions);
+     if (n > 0) {
+       check_completions({work_completions, static_cast<size_t>(n)});
+@@ -255,17 +251,11 @@ struct Connection {
+ 
+  private:
+   [[noreturn]] void fail(const std::string& reason) const {
+-    std::call_once(failure_->once, [this, &reason] {
+-      failure_->reason = "[jaccl] " + reason;
+-      failure_->failed.store(true, std::memory_order_release);
+-    });
+-    throw std::runtime_error(failure_->reason);
++    failure_->fail(reason);
+   }
+ 
+   void throw_if_failed() const {
+-    if (failure_->failed.load(std::memory_order_acquire)) {
+-      throw std::runtime_error(failure_->reason);
+-    }
++    failure_->check();
+   }
+ 
+   static constexpr int severity(const ibv_wc& wc) {
+diff --git a/mlx/distributed/jaccl/lib/jaccl/ring.cpp b/mlx/distributed/jaccl/lib/jaccl/ring.cpp
+index 551df3931..4cc498723 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/ring.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/ring.cpp
+@@ -28,7 +28,7 @@ RingGroup::RingGroup(
+     throw std::runtime_error(msg.str());
+   }
+ 
+-  auto share = [failure = std::make_shared<FailureState>()](Connection& c) {
++  auto share = [failure = failure_](Connection& c) {
+     c.share_failure(failure);
+   };
+   std::ranges::for_each(left_, share);
+@@ -45,6 +45,15 @@ RingGroup::RingGroup(
+       rank_, size_, left_, right_, send_buffers_, recv_buffers_, &pool_);
+ }
+ 
++RingGroup::~RingGroup() {
++  for (auto& connection : left_) {
++    connection.close_queue_pair();
++  }
++  for (auto& connection : right_) {
++    connection.close_queue_pair();
++  }
++}
++
+ void RingGroup::initialize() {
+   // Create the queue pairs
+   for (auto& conn : left_) {
+@@ -140,10 +149,12 @@ void RingGroup::all_sum(
+     void* output,
+     size_t n_bytes,
+     int dtype) {
++  failure_->check();
+   dispatch_all_types(dtype, [&](auto type_tag) {
+     using T = JACCL_GET_TYPE(type_tag);
+     all_reduce<T>(input, output, n_bytes, SumOp<T>{});
+   });
++  collective_completed();
+ }
+ 
+ void RingGroup::all_max(
+@@ -151,10 +162,12 @@ void RingGroup::all_max(
+     void* output,
+     size_t n_bytes,
+     int dtype) {
++  failure_->check();
+   dispatch_all_types(dtype, [&](auto type_tag) {
+     using T = JACCL_GET_TYPE(type_tag);
+     all_reduce<T>(input, output, n_bytes, MaxOp<T>{});
+   });
++  collective_completed();
+ }
+ 
+ void RingGroup::all_min(
+@@ -162,18 +175,22 @@ void RingGroup::all_min(
+     void* output,
+     size_t n_bytes,
+     int dtype) {
++  failure_->check();
+   dispatch_all_types(dtype, [&](auto type_tag) {
+     using T = JACCL_GET_TYPE(type_tag);
+     all_reduce<T>(input, output, n_bytes, MinOp<T>{});
+   });
++  collective_completed();
+ }
+ 
+ void RingGroup::all_gather(const void* input, void* output, size_t n_bytes) {
++  failure_->check();
+   ring_.all_gather(
+       static_cast<const char*>(input),
+       static_cast<char*>(output),
+       n_bytes,
+       n_conns_);
++  collective_completed();
+ }
+ 
+ void RingGroup::sum_scatter(
+@@ -181,13 +198,16 @@ void RingGroup::sum_scatter(
+     void* output,
+     size_t n_bytes,
+     int dtype) {
++  failure_->check();
+   dispatch_all_types(dtype, [&](auto type_tag) {
+     using T = JACCL_GET_TYPE(type_tag);
+     reduce_scatter<T>(input, output, n_bytes, SumOp<T>{});
+   });
++  collective_completed();
+ }
+ 
+ void RingGroup::send(const void* input, size_t n_bytes, int dst) {
++  failure_->check();
+   int right = (rank_ + 1) % size_;
+   int left = (rank_ + size_ - 1) % size_;
+   if (dst != right && dst != left) {
+@@ -200,6 +220,7 @@ void RingGroup::send(const void* input, size_t n_bytes, int dst) {
+ }
+ 
+ void RingGroup::recv(void* output, size_t n_bytes, int src) {
++  failure_->check();
+   int right = (rank_ + 1) % size_;
+   int left = (rank_ + size_ - 1) % size_;
+   if (src != right && src != left) {
+diff --git a/mlx/distributed/jaccl/lib/jaccl/ring.h b/mlx/distributed/jaccl/lib/jaccl/ring.h
+index c901c15a8..585bb3bc5 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/ring.h
++++ b/mlx/distributed/jaccl/lib/jaccl/ring.h
+@@ -26,6 +26,8 @@ class RingGroup : public Group {
+       const std::vector<std::string>& right_devices,
+       SideChannel sc);
+ 
++  ~RingGroup() override;
++
+   int rank() override {
+     return rank_;
+   }
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+index 572e236bb..46ba022bf 100644
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -13,11 +13,7 @@ namespace mlx::core {
+ 
+ void synchronize(Stream s) {
+   if (s.device == mlx::core::Device::cpu) {
+-    auto p = std::make_shared<std::promise<void>>();
+-    std::future<void> f = p->get_future();
+-    scheduler::enqueue(s, [p = std::move(p)]() { p->set_value(); });
+-    f.wait();
+-    scheduler::check_error(s);
++    scheduler::scheduler().synchronize(s);
+   } else {
+     gpu::synchronize(s);
+   }
+@@ -75,8 +71,8 @@ struct StreamThread {
+     }
+   }
+ 
+-  void enqueue(std::function<void()> f) {
+-    if (is_main_thread()) {
++  void enqueue(std::function<void()> f, bool check_error = true) {
++    if (check_error && is_main_thread()) {
+       error.check();
+     }
+     {
+@@ -98,19 +94,45 @@ Scheduler::Scheduler() {
+ 
+ Scheduler::~Scheduler() = default;
+ 
++void Scheduler::synchronize(Stream s) {
++  auto& st = get_thread(s);
++  auto p = std::make_shared<std::promise<void>>();
++  auto f = p->get_future();
++  st.enqueue([p = std::move(p)] { p->set_value(); }, false);
++  f.wait();
++  st.error.check();
++}
++
+ void Scheduler::enqueue(Stream s, std::function<void()> task) {
++  enqueue(s, std::move(task), false);
++}
++
++void Scheduler::enqueue(Stream s, std::function<void()> task, bool count_task) {
+   auto& st = get_thread(s);
+-  st.enqueue([&st, task = std::move(task)]() mutable {
+-    try {
+-      task();
+-    } catch (const std::exception& error) {
+-      // Set error to stream only when no error happended before, to preserve
+-      // the earliest error.
+-      if (!st.error.valid()) {
+-        st.error.set_message(std::make_shared<std::string>(error.what()));
++  if (count_task) {
++    notify_new_task(s);
++  }
++  try {
++    st.enqueue([this, &st, s, task = std::move(task), count_task]() mutable {
++      try {
++        task();
++      } catch (const std::exception& error) {
++        // Set error to stream only when no error happended before, to preserve
++        // the earliest error.
++        if (!st.error.valid()) {
++          st.error.set_message(std::make_shared<std::string>(error.what()));
++        }
+       }
++      if (count_task) {
++        notify_task_completion(s);
++      }
++    });
++  } catch (...) {
++    if (count_task) {
++      notify_task_completion(s);
+     }
+-  });
++    throw;
++  }
+ }
+ 
+ void Scheduler::wait_event(
+@@ -132,13 +154,15 @@ void Scheduler::signal_event(
+     std::function<void(Event&)> task) {
+   assert(s.device == Device::cpu);
+   auto& st = get_thread(s);
+-  st.enqueue([&st, event = std::move(event), task = std::move(task)]() mutable {
+-    // Poison the signal event if current stream has error.
+-    if (st.error.valid()) {
+-      event.set_error(st.error);
+-    }
+-    task(event);
+-  });
++  st.enqueue(
++      [&st, event = std::move(event), task = std::move(task)]() mutable {
++        // Poison the signal event if current stream has error.
++        if (st.error.valid()) {
++          event.set_error(st.error);
++        }
++        task(event);
++      },
++      false);
+ }
+ 
+ void Scheduler::check_error(Stream s) {
+diff --git a/mlx/scheduler.h b/mlx/scheduler.h
+index 7bce5a9fe..d21968743 100644
+--- a/mlx/scheduler.h
++++ b/mlx/scheduler.h
+@@ -29,6 +29,8 @@ class MLX_API Scheduler {
+   Scheduler& operator=(Scheduler&&) = delete;
+ 
+   void enqueue(Stream s, std::function<void()> task);
++  void enqueue(Stream s, std::function<void()> task, bool count_task);
++  void synchronize(Stream s);
+   void wait_event(Stream s, Event event, std::function<void(Event&)> task);
+   void signal_event(Stream s, Event event, std::function<void(Event&)> task);
+   void check_error(Stream s);
+@@ -82,6 +84,11 @@ inline void enqueue(Stream s, F&& f) {
+   scheduler().enqueue(s, std::forward<F>(f));
+ }
+ 
++template <typename F>
++inline void enqueue(Stream s, F&& f, bool count_task) {
++  scheduler().enqueue(s, std::forward<F>(f), count_task);
++}
++
+ // Like enqueue but the task is used for processing the passed event.
+ template <typename F>
+ inline void wait_event(Stream s, Event event, F&& f) {
+diff --git a/tests/jaccl_tests.cpp b/tests/jaccl_tests.cpp
+index 54187155b..a7509a375 100644
+--- a/tests/jaccl_tests.cpp
++++ b/tests/jaccl_tests.cpp
+@@ -232,6 +232,9 @@ class FakeRDMAFabric {
+   std::atomic<int> mmio_faults{};
+   std::atomic<int> query_qp_calls{};
+   std::atomic<int> query_qp_rc{};
++  std::atomic<uint64_t> poll_calls{};
++  std::atomic<int> buffers_deregistered_with_live_qps{};
++  std::atomic<int> domains_freed_with_registered_buffers{};
+ 
+  private:
+   struct AllGatherSlot {
+@@ -279,6 +282,12 @@ class FakeRDMAFabric {
+   }
+ 
+   static int dealloc_pd(ibv_pd* pd) {
++    auto* self = instance_;
++    std::lock_guard lock(self->mutex_);
++    if (self->registered_buffers_[pd]) {
++      self->domains_freed_with_registered_buffers.fetch_add(1);
++    }
++    self->registered_buffers_.erase(pd);
+     delete pd;
+     return 0;
+   }
+@@ -370,10 +379,20 @@ class FakeRDMAFabric {
+     mr->length = length;
+     mr->lkey = 1;
+     mr->rkey = 1;
++    std::lock_guard lock(instance_->mutex_);
++    instance_->registered_buffers_[pd]++;
+     return mr;
+   }
+ 
+   static int dereg_mr(ibv_mr* mr) {
++    auto* self = instance_;
++    std::lock_guard lock(self->mutex_);
++    if (std::ranges::any_of(
++            self->qps_ | std::views::values,
++            [mr](const auto& qp) { return qp->qp.pd == mr->pd; })) {
++      self->buffers_deregistered_with_live_qps.fetch_add(1);
++    }
++    self->registered_buffers_[mr->pd]--;
+     delete mr;
+     return 0;
+   }
+@@ -499,6 +518,7 @@ class FakeRDMAFabric {
+ 
+   static int poll_cq(ibv_cq* cq, int num_entries, ibv_wc* wc) {
+     auto* self = instance_;
++    self->poll_calls.fetch_add(1);
+     auto* fcq = fake_cq(cq);
+     if (auto mode = self->unplug_mode_.load(); mode != UnplugMode::None) {
+       std::lock_guard lock(self->mutex_);
+@@ -525,6 +545,7 @@ class FakeRDMAFabric {
+   std::mutex mutex_;
+   uint32_t next_qpn_{1};
+   std::unordered_map<uint32_t, std::unique_ptr<FakeQP>> qps_;
++  std::unordered_map<ibv_pd*, size_t> registered_buffers_;
+   std::atomic<UnplugMode> unplug_mode_{UnplugMode::None};
+ 
+   std::mutex ag_mutex_;
+@@ -808,6 +829,16 @@ TEST_CASE("test jaccl a failed connection fails the whole group") {
+   CHECK_EQ(fabric.mmio_faults.load(), 0);
+ }
+ 
++TEST_CASE("test jaccl idle poll observes the shared failure immediately") {
++  FakeRDMAFabric fabric;
++  auto c = make_connection("fake_rdma_0");
++  auto failure = std::make_shared<jaccl::FailureState>();
++  c.share_failure(failure);
++  failure->set("watchdog expired");
++
++  CHECK_EQ(poll_error(c, 1), "[jaccl] watchdog expired");
++}
++
+ TEST_CASE("test jaccl a failed post fails the whole group") {
+   FakeRDMAFabric fabric;
+   auto a = make_connection("fake_rdma_0");
+@@ -856,3 +887,125 @@ TEST_CASE("test jaccl treats a send queue error as dead") {
+ 
+   CHECK(contains(poll_error_for(c, std::chrono::seconds(5)), "error state"));
+ }
++
++TEST_CASE("test jaccl abort releases blocked sends receives and collectives") {
++  for (bool ring : {false, true}) {
++    for (int operation = 0; operation < 4; operation++) {
++      FakeRDMAFabric fabric;
++      auto [g0, g1] = make_groups(
++          fabric,
++          {{{}, {"fake_rdma_0", "fake_rdma_1"}},
++           {{"fake_rdma_2", "fake_rdma_3"}, {}}},
++          ring);
++      std::vector<float> input(32768, 1.0f), output(65536);
++      auto before = fabric.poll_calls.load();
++      auto result = std::async(std::launch::async, [&] {
++        try {
++          switch (operation) {
++            case 0:
++              g0->send(input.data(), input.size() * sizeof(float), 1);
++              break;
++            case 1:
++              g0->recv(output.data(), input.size() * sizeof(float), 1);
++              break;
++            case 2:
++              g0->all_sum(
++                  input.data(),
++                  output.data(),
++                  input.size() * sizeof(float),
++                  jaccl::Float32);
++              break;
++            case 3:
++              g0->all_gather(
++                  input.data(), output.data(), input.size() * sizeof(float));
++              break;
++          }
++        } catch (const std::runtime_error& e) {
++          return std::string(e.what());
++        }
++        return std::string{};
++      });
++      auto deadline =
++          std::chrono::steady_clock::now() + std::chrono::seconds(5);
++      while (fabric.poll_calls.load() < before + 100 &&
++             std::chrono::steady_clock::now() < deadline) {
++        std::this_thread::yield();
++      }
++      CHECK_GE(fabric.poll_calls.load(), before + 100);
++      CHECK_EQ(g0->progress(), 0);
++      g0->abort("watchdog expired");
++      g0->abort("later error");
++      auto ready = result.wait_for(std::chrono::seconds(1));
++      if (ready != std::future_status::ready) {
++        fabric.unplug_on_poll(UnplugMode::SilentKernelError);
++      }
++      CHECK(ready == std::future_status::ready);
++      CHECK_EQ(result.get(), "[jaccl] watchdog expired");
++      CHECK_EQ(g0->progress(), 0);
++      CHECK_THROWS_WITH_AS(
++          g0->recv(output.data(), sizeof(float), 1),
++          "[jaccl] watchdog expired",
++          std::runtime_error);
++      CHECK_EQ(fabric.mmio_faults.load(), 0);
++      g0.reset();
++      g1.reset();
++      CHECK_EQ(fabric.buffers_deregistered_with_live_qps.load(), 0);
++      CHECK_EQ(fabric.domains_freed_with_registered_buffers.load(), 0);
++    }
++  }
++}
++
++TEST_CASE("test jaccl progress counts completed collectives only") {
++  for (bool ring : {false, true}) {
++    FakeRDMAFabric fabric;
++    auto [g0, g1] = make_groups(
++        fabric, {{{}, {"fake_rdma_0"}}, {{"fake_rdma_1"}, {}}}, ring);
++    std::array<float, 2> input{1.0f, 2.0f}, out0{}, out1{};
++    auto run = [&](jaccl::Group& group, float* output, int operation) {
++      switch (operation) {
++        case 0:
++          group.all_sum(input.data(), output, sizeof(float), jaccl::Float32);
++          break;
++        case 1:
++          group.all_max(input.data(), output, sizeof(float), jaccl::Float32);
++          break;
++        case 2:
++          group.all_min(input.data(), output, sizeof(float), jaccl::Float32);
++          break;
++        case 3:
++          group.all_gather(input.data(), output, sizeof(float));
++          break;
++        case 4:
++          group.sum_scatter(
++              input.data(), output, sizeof(float), jaccl::Float32);
++          break;
++        case 5:
++          group.barrier();
++          break;
++      }
++    };
++    CHECK_EQ(g0->progress(), 0);
++    CHECK_EQ(g1->progress(), 0);
++    for (int operation = 0; operation < 6; operation++) {
++      auto [t0, t1] = both_throw(
++          [&] { run(*g0, out0.data(), operation); },
++          [&] { run(*g1, out1.data(), operation); });
++      CHECK_FALSE(t0);
++      CHECK_FALSE(t1);
++      CHECK_EQ(g0->progress(), operation + 1);
++      CHECK_EQ(g1->progress(), operation + 1);
++    }
++    auto [t0, t1] = both_throw(
++        [&] { g0->send(input.data(), sizeof(float), 1); },
++        [&] { g1->recv(out1.data(), sizeof(float), 0); });
++    CHECK_FALSE(t0);
++    CHECK_FALSE(t1);
++    CHECK_EQ(out1[0], 1.0f);
++    CHECK_EQ(g0->progress(), 6);
++    CHECK_EQ(g1->progress(), 6);
++    g0->abort("stopped");
++    CHECK_THROWS_WITH_AS(
++        run(*g0, out0.data(), 0), "[jaccl] stopped", std::runtime_error);
++    CHECK_EQ(g0->progress(), 6);
++  }
++}
+diff --git a/tests/scheduler_tests.cpp b/tests/scheduler_tests.cpp
+index 2cc9325a0..7b73b0461 100644
+--- a/tests/scheduler_tests.cpp
++++ b/tests/scheduler_tests.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include "doctest/doctest.h"
+ 
++#include "mlx/backend/cpu/encoder.h"
++#include "mlx/event.h"
+ #include "mlx/mlx.h"
+ #include "mlx/scheduler.h"
+ 
+@@ -351,3 +353,119 @@ TEST_CASE("test cross stream fence ordering") {
+     }
+   }
+ }
++
++TEST_CASE("test failed CPU task still signals its completion event") {
++  auto stream = new_stream(Device::cpu);
++  auto release = std::make_shared<std::promise<void>>();
++  auto gate = release->get_future().share();
++  auto finished = std::make_shared<std::promise<void>>();
++  auto done = finished->get_future();
++  scheduler::enqueue(stream, [gate] {
++    gate.wait();
++    throw std::runtime_error("collective aborted");
++  });
++  scheduler::enqueue(stream, [finished] { finished->set_value(); });
++  release->set_value();
++  REQUIRE(done.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
++
++  Event event(stream);
++  event.set_value(1);
++  CHECK_NOTHROW(event.signal(stream));
++  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++  while (!event.is_signaled() && std::chrono::steady_clock::now() < deadline) {
++    std::this_thread::yield();
++  }
++  CHECK(event.is_signaled());
++  if (gpu::is_available()) {
++    auto consumer = new_stream(Device::gpu);
++    event.wait(consumer);
++    CHECK_THROWS_WITH_AS(
++        synchronize(consumer), "collective aborted", std::runtime_error);
++    CHECK_NOTHROW(synchronize(consumer));
++  }
++  CHECK_THROWS_WITH_AS(
++      event.check_error(), "collective aborted", std::runtime_error);
++  CHECK_NOTHROW(scheduler::check_error(stream));
++  CHECK_EQ(sum(arange(4, stream)).item<int>(), 6);
++  CHECK_EQ(sum(arange(4, new_stream(Device::cpu))).item<int>(), 6);
++}
++
++TEST_CASE("test CPU synchronize drains work before reporting a pending error") {
++  auto stream = new_stream(Device::cpu);
++  auto release_error = std::make_shared<std::promise<void>>();
++  auto error_gate = release_error->get_future().share();
++  auto tail_started = std::make_shared<std::promise<void>>();
++  auto started = tail_started->get_future();
++  auto release_tail = std::make_shared<std::promise<void>>();
++  auto tail_gate = release_tail->get_future().share();
++  std::atomic<bool> tail_done{false};
++  scheduler::enqueue(stream, [error_gate] {
++    error_gate.wait();
++    throw std::runtime_error("collective aborted");
++  });
++  scheduler::enqueue(stream, [tail_started, tail_gate, &tail_done] {
++    tail_started->set_value();
++    tail_gate.wait();
++    tail_done.store(true);
++  });
++  release_error->set_value();
++  REQUIRE(
++      started.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
++
++  std::promise<void> returned;
++  auto returned_future = returned.get_future();
++  bool returned_before_tail = false;
++  std::thread release([&] {
++    returned_before_tail =
++        returned_future.wait_for(std::chrono::milliseconds(100)) ==
++        std::future_status::ready;
++    release_tail->set_value();
++  });
++  CHECK_THROWS_WITH_AS(
++      synchronize(stream), "collective aborted", std::runtime_error);
++  returned.set_value();
++  release.join();
++  CHECK_FALSE(returned_before_tail);
++  CHECK(tail_done.load());
++  CHECK_NOTHROW(synchronize(stream));
++}
++
++TEST_CASE("test failed CPU dispatch does not leak active tasks") {
++  auto stream = new_stream(Device::cpu);
++  auto& encoder = cpu::get_command_encoder(stream);
++  for (int i = 1; i < cpu::DISPATCHES_PER_TASK; i++) {
++    encoder.dispatch([] {});
++  }
++  synchronize(stream);
++  auto baseline = scheduler::n_active_tasks();
++  auto release = std::make_shared<std::promise<void>>();
++  auto gate = release->get_future().share();
++  auto finished = std::make_shared<std::promise<void>>();
++  auto done = finished->get_future();
++  scheduler::enqueue(stream, [gate] {
++    gate.wait();
++    throw std::runtime_error("collective aborted");
++  });
++  scheduler::enqueue(stream, [finished] { finished->set_value(); });
++  release->set_value();
++  REQUIRE(done.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
++  CHECK_THROWS_WITH_AS(
++      encoder.dispatch([] {}), "collective aborted", std::runtime_error);
++  CHECK_EQ(scheduler::n_active_tasks(), baseline);
++  CHECK_NOTHROW(synchronize(stream));
++
++  for (int i = 1; i < cpu::DISPATCHES_PER_TASK; i++) {
++    encoder.dispatch([] {});
++  }
++  release = std::make_shared<std::promise<void>>();
++  gate = release->get_future().share();
++  encoder.dispatch([gate] {
++    gate.wait();
++    throw std::runtime_error("collective aborted again");
++  });
++  CHECK_EQ(scheduler::n_active_tasks(), baseline + 1);
++  release->set_value();
++  CHECK_THROWS_WITH_AS(
++      synchronize(stream), "collective aborted again", std::runtime_error);
++  CHECK_EQ(scheduler::n_active_tasks(), baseline);
++}
