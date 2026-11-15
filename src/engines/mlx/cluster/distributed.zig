@@ -335,14 +335,15 @@ const Bell = struct {
     }
 
     fn writeAll(b: Bell, bytes: []const u8) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
         const mu = &cluster().bell_mu;
-        mu.lock();
-        defer mu.unlock();
+        mu.lockUncancelable(io);
+        defer mu.unlock(io);
         var off: usize = 0;
         while (off < bytes.len) {
             const n = std.c.write(b.fd, bytes.ptr + off, bytes.len - off);
             if (n <= 0) {
-                if (b.follower) followerExit(.eof);
+                if (b.follower and cluster().follower_ready.load(.acquire)) followerExit(.eof);
                 return error.DistPeerGone;
             }
             off += @intCast(n);
@@ -355,7 +356,7 @@ const Bell = struct {
             const n = std.c.read(b.fd, out.ptr + off, out.len - off);
             const failure = dist_watchdog.classifyBellFailure(n, std.c._errno().*, @backingInt(std.c.E.INTR), @backingInt(std.c.E.AGAIN));
             if (failure) |f| {
-                if (b.follower) followerExit(f);
+                if (b.follower and cluster().follower_ready.load(.acquire)) followerExit(f);
                 return error.DistPeerGone;
             }
             if (n < 0) continue;
@@ -418,7 +419,7 @@ const Bell = struct {
             if (n == 1) return x[0];
             const failure = dist_watchdog.classifyBellFailure(n, std.c._errno().*, @backingInt(std.c.E.INTR), @backingInt(std.c.E.AGAIN));
             if (failure) |f| {
-                if (b.follower) followerExit(f);
+                if (b.follower and cluster().follower_ready.load(.acquire)) followerExit(f);
                 return error.DistPeerGone;
             }
             if (n < 0) continue;
@@ -945,7 +946,9 @@ const ClusterState = struct {
     watchdog_started: std.atomic.Value(bool) = .init(false),
     watchdog_stop: std.atomic.Value(bool) = .init(false),
     heartbeat_active: std.atomic.Value(bool) = .init(false),
-    bell_mu: std.Thread.Mutex = .{},
+    /// Set once this worker has sent READY: from then on a silent or closed bell ends the process.
+    follower_ready: std.atomic.Value(bool) = .init(false),
+    bell_mu: std.Io.Mutex = .init,
 };
 pub const cluster_shared = @import("../../../sdk/util/shared.zig").Shared(ClusterState, "cluster_state", .{});
 inline fn cluster() *ClusterState {
@@ -1819,6 +1822,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
     log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
     dist_watchdog.setBellTimeout(link.bells[0].fd, idleTimeoutMs());
+    cluster().follower_ready.store(true, .release);
     const d: c_int = @intCast(config.hidden_size);
     var steps: u64 = 0;
     while (true) {
@@ -2303,6 +2307,7 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
     try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
     log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
     dist_watchdog.setBellTimeout(link.bells[0].fd, idleTimeoutMs());
+    cluster().follower_ready.store(true, .release);
 
     const t = &xfm.t;
     var ctx: ForwardCtx = .{ .cache = &xfm.cache, .moe_seq_offset = &xfm.off, .ssm_entries = xfm.entries, .capture_hidden = null, .vision_embeddings = null };
