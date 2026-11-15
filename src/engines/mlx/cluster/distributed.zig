@@ -328,9 +328,12 @@ const Bell = struct {
         return .{ .fd = noDelay(fd), .follower = true };
     }
 
+    /// Also close-on-exec: a child that inherited the bell would hold it open after this process exits, and the peer
+    /// would never see the EOF that tells it to leave.
     fn noDelay(fd: std.c.fd_t) std.c.fd_t {
         const one: c_int = 1;
         _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &one, @sizeOf(c_int));
+        _ = std.c.fcntl(fd, std.posix.F.SETFD, @as(c_int, std.posix.FD_CLOEXEC));
         return fd;
     }
 
@@ -2228,7 +2231,7 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     }
     log.info("[dist] worker: joined, waiting for the host to load a model\n", .{});
     // Past a pair a worker can wait in a sum on a rank that died, where no bell reaches it: it leaves with rank 0.
-    if (link.size > 2) if (std.Thread.spawn(.{ .stack_size = 1 << 16 }, watchHost, .{link.bells[0]})) |t| t.detach() else |_| {};
+    if (link.size > 2) if (std.Thread.spawn(.{ .stack_size = 1 << 16 }, watchHost, .{link.bells[0]})) |t| t.detach() else |err| log.err("[dist] worker: cannot watch rank 0's bell ({s}); a lost rank 0 is caught only by the stall deadline\n", .{@errorName(err)});
     // The host rings when it reads the hello, which it does when it first loads the model.
     _ = try link.bells[0].wait();
     try sendMsg(&link, Hello.here(short.len).msg(), 0);
