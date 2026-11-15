@@ -316,13 +316,16 @@ const Bell = struct {
     /// A worker's bell: connected, then its rank.
     fn connect(coord: Coordinator, rank: u32) Bell {
         const fd = lan.connectTimeout(coord.ip4, coord.port +% 1, 3000) catch return .{};
-        const b: Bell = .{ .fd = noDelay(fd), .follower = true };
-        setBellTimeout(fd, idleTimeoutMs());
+        const b = makeFollower(fd);
         b.writeAll(&[_]u8{@intCast(rank)}) catch {
             _ = std.c.close(fd);
             return .{};
         };
         return b;
+    }
+
+    fn makeFollower(fd: std.c.fd_t) Bell {
+        return .{ .fd = noDelay(fd), .follower = true };
     }
 
     fn noDelay(fd: std.c.fd_t) std.c.fd_t {
@@ -333,7 +336,7 @@ const Bell = struct {
 
     fn writeAll(b: Bell, bytes: []const u8) !void {
         const mu = &cluster().bell_mu;
-        while (!mu.tryLock()) std.atomic.spinLoopHint();
+        mu.lock();
         defer mu.unlock();
         var off: usize = 0;
         while (off < bytes.len) {
@@ -425,11 +428,6 @@ const Bell = struct {
 
 fn idleTimeoutMs() u32 {
     return @max(1, env.intValue(u32, env.get(.MLX_SERVE_DIST_IDLE_MS), 3_000));
-}
-
-fn setBellTimeout(fd: std.c.fd_t, ms: u32) void {
-    const timeout = std.c.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
-    _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout, @sizeOf(@TypeOf(timeout)));
 }
 
 fn followerExit(reason: dist_watchdog.BellFailure) noreturn {
@@ -946,19 +944,27 @@ const ClusterState = struct {
     watchdog: dist_watchdog.State = .{},
     watchdog_started: std.atomic.Value(bool) = .init(false),
     watchdog_stop: std.atomic.Value(bool) = .init(false),
-    watchdog_op: std.atomic.Value(u8) = .init(0),
     heartbeat_active: std.atomic.Value(bool) = .init(false),
-    bell_mu: std.atomic.Mutex = .unlocked,
+    bell_mu: std.Thread.Mutex = .{},
 };
 pub const cluster_shared = @import("../../../sdk/util/shared.zig").Shared(ClusterState, "cluster_state", .{});
 inline fn cluster() *ClusterState {
     return cluster_shared.get();
 }
 
-fn beginDistStep(op: u8) void {
+fn beginDistStep() void {
     const c = cluster();
-    c.watchdog_op.store(op, .monotonic);
     c.watchdog.begin(@intCast(crt.monotonicMs()));
+}
+
+pub fn beginEngineStep() bool {
+    if (cluster().tp_link == null) return false;
+    beginDistStep();
+    return true;
+}
+
+pub fn endEngineStep() void {
+    cluster().watchdog.done();
 }
 
 const Heartbeat = struct { state: *ClusterState, bells: [max_ranks]Bell, size: u32, interval_ms: u32 };
@@ -979,8 +985,7 @@ fn watchdogLoop(c: *ClusterState, deadline_ms: u64) void {
         crt.sleepMs(250);
         if (c.watchdog_stop.load(.acquire)) return;
         const waited = c.watchdog.stalledMs(@intCast(crt.monotonicMs()), deadline_ms) orelse continue;
-        const op = if (c.watchdog_op.load(.monotonic) == 2) "tpLoad" else "all_sum";
-        log.err("[dist-watchdog] stall: step={d} op={s} waited_ms={d}; this rank exits\n", .{ c.watchdog.step.load(.monotonic), op, waited });
+        log.err("[dist-watchdog] stall: step={d} waited_ms={d}; this rank exits\n", .{ c.watchdog.step.load(.monotonic), waited });
         log.syncFile();
         std.c._exit(1);
     }
@@ -1365,7 +1370,6 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
             self.planned = true;
             cluster().tp_link = &self.link;
             dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
-            dsv41_mod.clusterHooks().tp_eval_done = &dsv41TpEvalDone;
             dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
             dsv41_mod.clusterHooks().tp_step = &dsv41TpStep;
             dsv41_mod.clusterHooks().tp_pipe = if (tpPipeWanted(&self.link)) &dsv41TpPipe else null;
@@ -1401,14 +1405,9 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
 /// DeepSeek-V4.1 tensor, every rank: `x` summed over the group, lazily on this thread's CPU stream.
 fn dsv41TpSum(x: mlx.mlx_array) anyerror!mlx.mlx_array {
     const link = cluster().tp_link orelse return error.DistWorkerNotJoined;
-    beginDistStep(1);
     cluster().tp_sums += 1;
     cluster().tp_values += mlx.mlx_array_size(x);
     return link.allSum(x);
-}
-
-fn dsv41TpEvalDone() void {
-    cluster().watchdog.done();
 }
 
 /// DeepSeek-V4.1 tensor, every rank: every rank's `x` stacked on axis 0 in rank order, lazily on this thread's CPU
@@ -1613,8 +1612,6 @@ fn sendAll(link: *const Link, m: Msg) void {
 fn dsv41TpLoad(id: u64, ids: []const u32, tensors: []const mlx.mlx_array) anyerror!void {
     const self = peer() orelse return error.DistWorkerNotJoined;
     if (!self.ready) try self.awaitReady();
-    beginDistStep(2);
-    defer cluster().watchdog.done();
     const a = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
     const t0 = io_util.nowUsMonotonic(cluster().group.?.io);
@@ -1805,11 +1802,9 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     }
     cluster().tp_link = link;
     dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
-    dsv41_mod.clusterHooks().tp_eval_done = &dsv41TpEvalDone;
     dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
     defer {
         dsv41_mod.clusterHooks().tp_sum = null;
-        dsv41_mod.clusterHooks().tp_eval_done = null;
         dsv41_mod.clusterHooks().tp_gather = null;
         cluster().tp_link = null;
     }
@@ -1822,10 +1817,14 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     _ = mlx.mlx_get_active_memory(&active);
     try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
     log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
+    dist_watchdog.setBellTimeout(link.bells[0].fd, idleTimeoutMs());
     const d: c_int = @intCast(config.hidden_size);
     var steps: u64 = 0;
     while (true) {
         const msg = try recvMsg(link, 0);
+        const tracked = msg[0] != OP_DSV41_TP_LOAD;
+        if (tracked) beginDistStep();
+        defer if (tracked) cluster().watchdog.done();
         switch (msg[0]) {
             OP_STOP => break,
             OP_RELEASE => return true,
@@ -1931,8 +1930,6 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                 try dsv41_mod.tpWorkerSnap(m, allocator, &parked, &snaps, op, joined(msg[2], msg[3]), joined(msg[4], msg[5]));
             },
             OP_DSV41_TP_LOAD => {
-                beginDistStep(2);
-                defer cluster().watchdog.done();
                 const n: usize = @intCast(joined(msg[3], msg[4]));
                 const sent = try queuedRecv(link, &.{@intCast(n)}, .int32, 0);
                 defer _ = mlx.mlx_array_free(sent);
@@ -2304,6 +2301,7 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
     _ = mlx.mlx_get_active_memory(&active);
     try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
     log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
+    dist_watchdog.setBellTimeout(link.bells[0].fd, idleTimeoutMs());
 
     const t = &xfm.t;
     var ctx: ForwardCtx = .{ .cache = &xfm.cache, .moe_seq_offset = &xfm.off, .ssm_entries = xfm.entries, .capture_hidden = null, .vision_embeddings = null };

@@ -28,6 +28,11 @@ pub const State = struct {
 
 pub const BellFailure = enum { timeout, eof };
 
+pub fn setBellTimeout(fd: std.c.fd_t, ms: u32) void {
+    const timeout = std.c.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
+    _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout, @sizeOf(@TypeOf(timeout)));
+}
+
 /// A bell read's result: null to keep reading (data, or an interrupted read), else why the leader is gone.
 pub fn classifyBellFailure(n: isize, errno: i32, interrupted: i32, would_block: i32) ?BellFailure {
     if (n == 0) return .eof;
@@ -55,4 +60,33 @@ test "a bell read: timeout and EOF end the follower, data and EINTR do not" {
     try std.testing.expectEqual(BellFailure.eof, classifyBellFailure(-1, 54, 4, 11).?);
     try std.testing.expectEqual(@as(?BellFailure, null), classifyBellFailure(-1, 4, 4, 11));
     try std.testing.expectEqual(@as(?BellFailure, null), classifyBellFailure(3, 0, 4, 11));
+}
+
+test "a follower bell waits through the idle timeout before ready" {
+    var pair: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair));
+    defer for (pair) |fd| {
+        _ = std.c.close(fd);
+    };
+    var probe = struct {
+        fd: std.c.fd_t,
+        result: isize = -1,
+        returned: std.atomic.Value(bool) = .init(false),
+        fn read(self: *@This()) void {
+            var byte: u8 = undefined;
+            self.result = std.c.read(self.fd, @ptrCast(&byte), 1);
+            self.returned.store(true, .release);
+        }
+    }{ .fd = pair[0] };
+    const thread = try std.Thread.spawn(.{}, @TypeOf(probe).read, .{&probe});
+    var fds = [_]std.posix.pollfd{.{ .fd = pair[0], .events = std.posix.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&fds, 50));
+    try std.testing.expect(!probe.returned.load(.acquire));
+    try std.testing.expectEqual(@as(isize, 1), std.c.write(pair[1], &[_]u8{1}, 1));
+    thread.join();
+    try std.testing.expectEqual(@as(isize, 1), probe.result);
+    setBellTimeout(pair[0], 20);
+    var byte: u8 = undefined;
+    const n = std.c.read(pair[0], @ptrCast(&byte), 1);
+    try std.testing.expectEqual(BellFailure.timeout, classifyBellFailure(n, std.c._errno().*, @backingInt(std.c.E.INTR), @backingInt(std.c.E.AGAIN)).?);
 }

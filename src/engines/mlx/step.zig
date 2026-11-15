@@ -35,6 +35,7 @@ const publishFirstToken = @import("spec/wiring.zig").publishFirstToken;
 const hasWorkPendingLocked = @import("runtime/loop.zig").hasWorkPendingLocked;
 const warm_requests = @import("warm_requests.zig");
 const drainSideQueues = @import("runtime/loop.zig").drainSideQueues;
+const distributed = @import("cluster/distributed.zig");
 
 /// Caller holds queue_mu. Recheck arrivals under the lock before the short, wakeable retry wait.
 fn waitForDiskRetryLocked(sch: *Scheduler, ms: u32) void {
@@ -129,6 +130,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     var ran = mode == .yield and drainSideQueues(sch);
     var to_prefill: [16]*Slot = undefined;
     var n_prefill: usize = 0;
+    var has_decode = false;
     {
         sch.queue_mu.lockUncancelable(sch.io);
         defer sch.queue_mu.unlock(sch.io);
@@ -161,6 +163,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
 
         // If only vision/embed/cleanup/load work is pending, loop back to drain it.
         if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) return if (ran) .ran else .idle;
+        has_decode = sch.decoding.items.len > 0;
 
         // Single-flight admission (the dsv4 class): a model with
         // MODULE-OWNED decode state admits at most one live slot.
@@ -217,6 +220,9 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         if (sw.read() > BUDGET_REVISE_WINDOW_NS) sch.budget_revise_sw = null;
         if (n_prefill > 0) reviseHotCacheBudgets(sch, true);
     }
+
+    const tp_step = (n_prefill > 0 or has_decode) and distributed.beginEngineStep();
+    defer if (tp_step) distributed.endEngineStep();
 
     // A batch admitted together prefills in order. A long cold prompt first would hold every short
     // request in the batch until it ends, and the chunk-boundary hook never sees them because
