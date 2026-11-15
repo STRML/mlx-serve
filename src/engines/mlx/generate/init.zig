@@ -11,6 +11,9 @@ const io_util = @import("../../../sdk/util/io_util.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
 const mtp_acceptance = @import("../../../sdk/spec/mtp_acceptance.zig");
 const round_cost = @import("../spec/round_cost.zig");
+const context = @import("../admission/context.zig");
+const mtp_group_planner = @import("../spec/mtp_group_planner.zig");
+const dflash_policy = @import("../spec/dflash/policy.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = transformer_mod.ForwardCtx;
@@ -61,6 +64,9 @@ const CheckpointSink = @import("../kv/cache_ops.zig").CheckpointSink;
 const intree = @import("../plugin/intree.zig");
 const plugin_driver = @import("../plugin/driver.zig");
 
+/// The most rows a spec round's verify writes past its last accepted token: an MTP chain at its deepest, or a DFlash
+/// block.
+pub const verify_rows_max: usize = @max(mtp_group_planner.MAX_DEPTH + 1, dflash_policy.MAX_ROWS);
 
 pub fn initWithOptions(
     io: std.Io,
@@ -79,7 +85,10 @@ pub fn initWithOptions(
     // stochastic-verify filters, batched decode via `gen.sampling`)
     // inherits the model's mask without per-site wiring.
     var sampling = sampling_in;
-    sampling.suppress_mask = xfm.suppress_mask;
+    sampling.suppress_mask = if (sampling_in.suppress_cjk)
+        xfm.suppress_mask_cjk orelse return error.SuppressCjkUnavailable
+    else
+        xfm.suppress_mask;
     // MLX_SERVE_KEYED_SAMPLING: every clean sampled request keyed, not only a row-exact trunk's; DSpark's stochastic
     // arm then takes the serial verdict (spec/dspark.zig `serialVerdict`).
     sampling.keyed = (xfm.config.rowExactDecode() or (env.on(.MLX_SERVE_KEYED_SAMPLING) and !sampling.shapesLogits())) and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
@@ -152,6 +161,8 @@ pub fn initWithOptions(
     var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
     // Only an echo of prompt logprobs reads a prompt forward's logits before its last row.
     ctx.last_row_logits = options.prompt_logprobs == null;
+    // A grow allocates no slack past the context and the rows a verify writes past its last token.
+    ctx.cache.limitGrowth(@as(usize, context.getEffectiveContextLength(&xfm.config)) + verify_rows_max);
 
     const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
     defer allocator.free(ids_i32);
@@ -193,7 +204,7 @@ pub fn initWithOptions(
     // start at ssm_checkpoint_pos_offset, so the final KV length is that
     // offset plus everything we're about to forward.
     const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-    const PREFILL_CHUNK: usize = archCapped(decodeShareCapped(effectivePrefillChunk(
+    const PREFILL_CHUNK: usize = archCapped(decodeShareCapped(xfm.config.cappedPrefillChunk(effectivePrefillChunk(
         xfm.config.prefillScoreHeadDim(),
         xfm.config.num_attention_heads,
         total_ctx_for_chunk,
@@ -201,7 +212,7 @@ pub fn initWithOptions(
         xfm.config.isMoe(),
         xfm.config.longCtxGated(),
         options.pinned_prefill_chunk,
-    ), options.decode_share_width_cap), &xfm.config);
+    )), options.decode_share_width_cap), &xfm.config);
     // Phase-level prefill instrumentation. Enabled at debug level OR via
     // diag prefill-trace (which forces the trace line at info).
     // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
@@ -1149,4 +1160,36 @@ pub fn initWithOptions(
 
     attachCp(&gen, &ssm_checkpoints, allocator);
     return gen;
+}
+
+// ── tests ──
+
+const testing = std.testing;
+const model_mod = @import("../../../sdk/config/model.zig");
+
+test "initWithOptions: suppress_cjk wires the CJK mask and fails without one" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp.dir, path, s);
+    var cfg = try model_mod.parseConfig(io, a, path);
+    defer cfg.deinit(a);
+    var xfm = try plugin_driver.load(io, a, &cfg, path, s);
+    defer xfm.deinit();
+    var tok: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1 };
+    const cjk: SamplingParams = .{ .temperature = 0, .suppress_cjk = true };
+    try testing.expectError(error.SuppressCjkUnavailable, initWithOptions(io, a, &xfm, &tok, &prompt, 4, cjk, &.{}, .{}));
+    const mask_buf = try a.alloc(bool, cfg.vocab_size);
+    defer a.free(mask_buf);
+    @memset(mask_buf, false);
+    xfm.suppress_mask_cjk = mlx.mlx_array_new_data(mask_buf.ptr, &[_]c_int{@intCast(cfg.vocab_size)}, 1, .bool_);
+    var gen = try initWithOptions(io, a, &xfm, &tok, &prompt, 4, cjk, &.{}, .{ .skip_lazy_preforward = true });
+    defer gen.deinit(a);
+    try testing.expectEqual(xfm.suppress_mask_cjk.?.ctx, gen.sampling.suppress_mask.?.ctx);
 }

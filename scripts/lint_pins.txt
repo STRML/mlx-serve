@@ -204,3 +204,4 @@ src/plugins/deepseek_v41/kernels/dec_seg_ffn_in.metal	!*parts	the level-1 kernel
 src/plugins/deepseek_v41/kernels/dec_seg_ffn_in.metal	!logits + 	the level-1 kernel writes and reads what its last arrivers read through seg_write_peer_* and seg_read_peer_*, never a plain store or load
 src/plugins/deepseek_v41/kernels/dec_seg_ffn_in.metal	!)logits	the level-1 kernel writes and reads what its last arrivers read through seg_write_peer_* and seg_read_peer_*, never a plain store or load
 src/plugins/deepseek_v41/kernels/dec_seg_ffn_in.metal	!*logits	the level-1 kernel writes and reads what its last arrivers read through seg_write_peer_* and seg_read_peer_*, never a plain store or load
+tests/*.sh	!-f "mlx-serve	a test script frees its port with srv_preclean, never a pkill pattern (it takes a server the script did not start)

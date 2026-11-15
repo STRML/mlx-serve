@@ -6,6 +6,7 @@ const io_util = @import("../../sdk/util/io_util.zig");
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const testing = std.testing;
 const http_server = @import("server.zig");
+const mlx_engine = @import("../engines/mlx.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const memory_ceiling = @import("../registry/memory_ceiling.zig");
 
@@ -265,7 +266,7 @@ fn cacheImportPeakFits(peak: u64) bool {
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const headroom = memory_ceiling.currentGpuMemoryCeiling(config, active_mem) -| active_mem -| http_server.cacheTransferReservedBytes();
-    const reclaimable = if (model.prefix_cache) |cache| cache.residentBytes() else 0;
+    const reclaimable = mlx_engine.api().hot_cache_bytes(model);
     return peak <= headroom +| reclaimable;
 }
 

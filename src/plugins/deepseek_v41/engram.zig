@@ -260,8 +260,38 @@ pub const Table = struct {
     s_stride: u64,
     slen: usize,
     b_off: u64 = 0,
+    /// The table sits in a shard the preflight bills (`preflight.modelDiskBytes`), so `shardBytes` takes it back out.
+    in_shards: bool = false,
     /// A prompt grid's rows read whole and past the page cache (`readDirect`); else span by span through it.
     direct: bool = false,
+    /// The codes' own descriptor, which reads past the page cache (`openCodes`); -1: none.
+    cfd: c_int = -1,
+    /// Set while the page cache has no room for the codes (`pastCache`): they are read through `cfd`.
+    past_cache: std.atomic.Value(bool) = .init(false),
+
+    /// A second descriptor for the codes of a resident pack's table, read past the page cache while `pastCache` says
+    /// so; the scales stay on `fd`. A row's codes sit in a table far larger than memory and are seldom read twice,
+    /// its scales a page of a few thousand that every chunk reads again: with no memory to spare the cache evicted
+    /// the scales to hold the codes, and every row cost two reads.
+    pub fn openCodes(self: *Table) void {
+        if (comptime !builtin.os.tag.isDarwin()) return;
+        if (self.records() or self.mode == .gguf or self.cfd >= 0) return;
+        var path: [std.c.PATH_MAX]u8 = undefined;
+        if (std.c.fcntl(self.fd, std.c.F.GETPATH, &path) == -1) return;
+        const fd = crt.openRead(@ptrCast(&path));
+        if (fd < 0) return;
+        _ = std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0));
+        edir.register(fd);
+        self.cfd = fd;
+    }
+
+    pub fn pastCache(self: *Table, on: bool) void {
+        self.past_cache.store(on and self.cfd >= 0, .release);
+    }
+
+    fn wfd(self: *const Table) c_int {
+        return if (self.past_cache.load(.acquire)) self.cfd else self.fd;
+    }
 
     /// The table read past the page cache: a streamed bank's slot rows hold the memory the cache would (on a resident
     /// pack the cache serves a warm prompt's rows faster).
@@ -276,6 +306,10 @@ pub const Table = struct {
         // The direct Engram reads: the descriptor's block registration dropped with it.
         edir.unregister(self.fd);
         crt.close(self.fd);
+        if (self.cfd >= 0) {
+            edir.unregister(self.cfd);
+            crt.close(self.cfd);
+        }
     }
 
     /// A repacked table (`engram/engram-manifest.json`): a row's codes then its scales, one record a row, read with
@@ -284,10 +318,11 @@ pub const Table = struct {
         return self.mode != .affine and self.w_stride == self.s_stride and self.s_off == self.w_off + self.wlen and
             self.wlen + self.slen <= edir.max_record;
     }
-    /// Bytes this table occupies inside the pack's safetensors shards (read by
+    /// Bytes this table occupies inside the pack's billed safetensors shards (read by
     /// pread, never resident); a repack table lives outside them.
     pub fn shardBytes(self: *const Table) u64 {
-        return if (self.mode == .affine) self.rows * (self.w_stride + 2 * self.s_stride) else 0;
+        if (!self.in_shards) return 0;
+        return self.rows * (self.w_stride + self.s_stride * @as(u64, if (self.mode == .affine) 2 else 1));
     }
 
     /// Layer `layer`'s table in `dir`; `index` is its position among the
@@ -369,6 +404,7 @@ pub const Table = struct {
             .s_stride = scols * 2,
             .slen = @intCast(scols * 2),
             .b_off = base + regions[2].start,
+            .in_shards = true,
         };
     }
 
@@ -457,7 +493,19 @@ pub const Table = struct {
         const s = qwen4_ple.headerRegion(hdr.object, scale_key, "F8_E8M0", 1, size, @intCast(base), .matrix) catch return error.EngramTableHeader;
         if (w.rows != rows or s.rows != rows) return error.EngramTableSize;
         if (w.cols != head_dim or s.cols * 32 != head_dim) return error.EngramTableGeometry;
-        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = base + w.start, .w_stride = head_dim, .wlen = head_dim, .s_off = base + s.start, .s_stride = s.cols, .slen = s.cols };
+        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = base + w.start, .w_stride = head_dim, .wlen = head_dim, .s_off = base + s.start, .s_stride = s.cols, .slen = s.cols, .in_shards = billedShard(a, io, dir, spec.weight_file) };
+    }
+
+    /// Whether the preflight bills `file` (`preflight.modelDiskBytes`): a shard the index names, or with no index a
+    /// top-level one.
+    fn billedShard(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, file: []const u8) bool {
+        const top = std.mem.indexOfScalar(u8, file, '/') == null;
+        const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 << 20)) catch return top;
+        const idx = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return top;
+        const wm = (if (idx == .object) idx.object.get("weight_map") else null) orelse return top;
+        if (wm != .object) return top;
+        for (wm.object.values()) |v| if (v == .string and std.mem.eql(u8, v.string, file)) return true;
+        return false;
     }
 
     /// Rows `ids` as they sit on disk (host only, any thread).
@@ -722,7 +770,7 @@ pub const Table = struct {
             fn readPart(t: *const Table, j: *const Job, k: usize, r: u64, part: usize) bool {
                 if (t.records()) return edir.readRecord(t.fd, j.w[k * t.wlen ..][0..t.wlen], j.s[k * t.slen ..][0..t.slen], t.w_off + r * t.w_stride);
                 return switch (part) {
-                    0 => edir.readRow(t.fd, j.w[k * t.wlen ..][0..t.wlen], t.w_off + r * t.w_stride),
+                    0 => edir.readRow(t.wfd(), j.w[k * t.wlen ..][0..t.wlen], t.w_off + r * t.w_stride),
                     1 => edir.readRow(t.fd, j.s[k * t.slen ..][0..t.slen], t.s_off + r * t.s_stride),
                     else => edir.readRow(t.fd, j.b[k * t.slen ..][0..t.slen], t.b_off + r * t.s_stride),
                 };
@@ -746,7 +794,7 @@ pub const Table = struct {
                     continue;
                 }
                 if (r >= t.rows or
-                    !edir.readRow(t.fd, self.w[i * t.wlen ..][0..t.wlen], t.w_off + r * t.w_stride) or
+                    !edir.readRow(t.wfd(), self.w[i * t.wlen ..][0..t.wlen], t.w_off + r * t.w_stride) or
                     !edir.readRow(t.fd, self.s[i * t.slen ..][0..t.slen], t.s_off + r * t.s_stride) or
                     (t.mode == .affine and !edir.readRow(t.fd, self.b[i * t.slen ..][0..t.slen], t.b_off + r * t.s_stride)))
                 {
@@ -758,6 +806,12 @@ pub const Table = struct {
         }
     };
 };
+
+/// Whether the page cache has no room for a prompt's Engram codes: under an eighth of RAM free or reclaimable, a
+/// chunk's code pages (16 KiB a row read) push the tables' scales out of it.
+pub fn cacheTight(available: u64, total: u64) bool {
+    return available < total / 8;
+}
 
 /// Engram rows read ahead on a thread of its own: per grid (a run of `len` tokens from position `at`),
 /// layer by layer and span by span, the order the forward asks for them, so the SSD reads hide behind
@@ -772,6 +826,9 @@ pub const Prefetch = struct {
     thread: ?std.Thread = null,
     /// A batch's grids (one a state, `startBatch`) read a layer at a time across all of them, as its forward asks.
     across: bool = false,
+    /// What `take` spent waiting for rows the drive had not handed over yet: the forward's time at an Engram layer
+    /// with nothing for the GPU to do.
+    waited_ms: i64 = 0,
 
     /// `ids` is `[len][tables.len][nc]` row ids (`Hash.rows`).
     pub const Spec = struct { at: usize, len: usize, ids: []const u32 };
@@ -965,7 +1022,11 @@ pub const Prefetch = struct {
     pub fn take(self: *Prefetch, at: usize, layer: usize, k: usize) !struct { raw: Table.Raw, us: u32 } {
         for (self.grids) |*g| if (g.at == at) {
             const item = &g.items[layer * (g.items.len / self.tables.len) + k];
-            while (item.state.load(.acquire) == pending) std.Thread.yield() catch {};
+            if (item.state.load(.acquire) == pending) {
+                const t0 = crt.monotonicMs();
+                while (item.state.load(.acquire) == pending) std.Thread.yield() catch {};
+                self.waited_ms += crt.monotonicMs() - t0;
+            }
             const raw = item.raw orelse return error.EngramRead;
             item.raw = null;
             return .{ .raw = raw, .us = item.us };
@@ -1142,6 +1203,11 @@ test "dsv41 engram: a table nested under language_model. (oMLX's packs) opens li
 
 /// oMLX's lossless layout: 4 rows of head_dim 64 as raw e4m3 codes (1.0) with row r's first scale 2^r, its second 0.5.
 fn writeRawFp8Fixture(io: std.Io, dir: std.Io.Dir) !void {
+    return writeRawFp8FixtureAt(io, dir, "engram/model-00002-of-00002.safetensors");
+}
+
+/// `writeRawFp8Fixture` with the table in `file`; a top-level `file` is a shard the index names.
+fn writeRawFp8FixtureAt(io: std.Io, dir: std.Io.Dir, comptime file: []const u8) !void {
     const hdr = "{\"layers.1.engram.embed.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[4,64],\"data_offsets\":[0,256]}," ++
         "\"layers.1.engram.embed.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[4,2],\"data_offsets\":[256,264]}}";
     var shard: [8 + hdr.len + 264]u8 = undefined;
@@ -1153,12 +1219,27 @@ fn writeRawFp8Fixture(io: std.Io, dir: std.Io.Dir) !void {
         data[256 + 2 * r] = @intCast(127 + r); // 2^r for the first 32 columns
         data[256 + 2 * r + 1] = 126; // 0.5 for the rest
     }
-    try dir.createDirPath(io, "engram");
-    try dir.writeFile(io, .{ .sub_path = "engram/model-00002-of-00002.safetensors", .data = &shard });
+    const top = comptime std.mem.indexOfScalar(u8, file, '/') == null;
+    if (!top) try dir.createDirPath(io, std.fs.path.dirname(file).?);
+    try dir.writeFile(io, .{ .sub_path = file, .data = &shard });
     try dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"omlx_deepseek_v41\":{\"version\":1,\"engram_tables\":{" ++
-        "\"language_model.layers.1.engram.embed\":{\"weight_key\":\"layers.1.engram.embed.weight\",\"weight_file\":\"engram/model-00002-of-00002.safetensors\"," ++
-        "\"scale_key\":\"layers.1.engram.embed.scale\",\"scale_file\":\"engram/model-00002-of-00002.safetensors\",\"bias_key\":null,\"bits\":null,\"group_size\":null}}}}" });
-    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{}}" });
+        "\"language_model.layers.1.engram.embed\":{\"weight_key\":\"layers.1.engram.embed.weight\",\"weight_file\":\"" ++ file ++ "\"," ++
+        "\"scale_key\":\"layers.1.engram.embed.scale\",\"scale_file\":\"" ++ file ++ "\",\"bias_key\":null,\"bits\":null,\"group_size\":null}}}}" });
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = if (top)
+        "{\"weight_map\":{\"layers.1.engram.embed.weight\":\"" ++ file ++ "\",\"layers.1.engram.embed.scale\":\"" ++ file ++ "\"}}"
+    else
+        "{\"weight_map\":{}}" });
+}
+
+test "dsv41 engram: oMLX's raw fp8 table inside a shard the index names bills its bytes there" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeRawFp8FixtureAt(io, td.dir, "model-00002-of-00002.safetensors");
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
+    defer t.close();
+    try testing.expectEqual(@as(u64, 4 * 64 + 4 * 2), t.shardBytes());
 }
 
 test "dsv41 engram: oMLX's lossless pack reads the release's raw fp8 table from the shard its config names" {
@@ -1381,6 +1462,39 @@ test "dsv41 engram: a prefetch hands each span's rows as a gather of the same id
     try mlx.check(mlx.mlx_array_eval(want));
     try mlx.check(mlx.mlx_array_eval(got));
     try testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(want).?[0 .. 4 * 64], mlx.mlx_array_data_float32(got).?[0 .. 4 * 64]);
+}
+
+test "dsv41 engram: codes read past the page cache are the rows read through it" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeRawFp8Fixture(io, td.dir);
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    var plain = try Table.open(testing.allocator, dir, 0, 1, 4, 64);
+    defer plain.close();
+    const ids = [_]u32{ 3, 0, 2, 2, 1 };
+    const through = try plain.read(testing.allocator, &ids);
+    defer through.deinit(testing.allocator);
+    // A table of its own: the rows the first one read sit in the LRU under that one's descriptor.
+    var t = try Table.open(testing.allocator, dir, 0, 1, 4, 64);
+    defer t.close();
+    // Without its own descriptor the table stays on the cache whatever it is told.
+    t.pastCache(true);
+    try testing.expectEqual(t.fd, t.wfd());
+    t.openCodes();
+    try testing.expect(t.cfd >= 0 and t.cfd != t.fd);
+    try testing.expectEqual(t.fd, t.wfd());
+    t.pastCache(true);
+    try testing.expectEqual(t.cfd, t.wfd());
+    const past = try t.read(testing.allocator, &ids);
+    defer past.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, through.w, past.w);
+    try testing.expectEqualSlices(u8, through.s, past.s);
+    t.pastCache(false);
+    try testing.expectEqual(t.fd, t.wfd());
+    try testing.expect(cacheTight(24 << 30, 256 << 30) and !cacheTight(130 << 30, 256 << 30));
 }
 
 test "dsv41 engram: a prompt grid read whole past the cache (a streamed bank's table) hands each span the span read's rows" {

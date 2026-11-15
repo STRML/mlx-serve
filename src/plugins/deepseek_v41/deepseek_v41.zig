@@ -25,6 +25,7 @@ const gather_nax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
 const log = @import("../../sdk/util/log.zig");
 const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 const engram = @import("engram.zig");
+const system = @import("../../sdk/util/system.zig");
 const cache_codec = @import("cache_codec.zig");
 const cache_pack = @import("cache_pack.zig");
 const cache_abi = @import("../../abi/plugin.zig");
@@ -496,6 +497,8 @@ pub const Dsv41Model = struct {
     /// The request's prompt, whose later chunks' Engram rows are read while an earlier one runs.
     prompt: []u32 = &.{},
     ahead: ?*engram.Prefetch = null,
+    /// The rows the next call brings when this module cut a chunk itself (`extendCold`): what the read-ahead reads.
+    next_rows: ?usize = null,
     rope_plain: Rope,
     rope_yarn: Rope,
     attn_dec_kernel: mlx.mlx_fast_metal_kernel,
@@ -1785,7 +1788,7 @@ pub fn pairRange(c: anytype, mine: u64, theirs: u64) ?[2]usize {
 /// from the shard the index names, the vision tower only on `vision` (its unread split copies never), the Engram
 /// projections kept beside its tables.
 pub fn loadPack(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, vision: bool) !Weights {
-    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .index_owners = true, .skip = &visionUnread });
+    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .skip = &visionUnread });
     errdefer w.deinit();
     const path = try std.fmt.allocPrintSentinel(gpa, "{s}/engram/engram-residents.safetensors", .{dir}, 0);
     defer gpa.free(path);
@@ -2241,7 +2244,7 @@ fn initEngram(m: *Dsv41Model, w: *Weights, dir: []const u8) !void {
             .qk = prod,
             .table = try engram.Table.open(m.gpa, dir, k, l, c.dsv41_engram_rows[k], c.dsv41_engram_head_dim),
         };
-        if (c.dsv41_streamed) m.engrams[k].table.readDirect();
+        if (c.dsv41_streamed) m.engrams[k].table.readDirect() else m.engrams[k].table.openCodes();
         opened += 1;
     }
 }
@@ -4792,7 +4795,11 @@ pub const ENGRAM_INS = [_][*:0]const u8{ "x", "kv", "qk", "cst" };
 
 // ── the forward ──────────────────────────────────────────────────────────
 
-pub const Want = enum { last, all };
+/// `replay`: no logits. The rows rebuild their layers' windows with the band stopped at the chunk's first row; no
+/// compressor runs, so the global rows and index keys stay as they are (`rewind`).
+/// `encode`: no logits. A prompt chunk the same call continues with one that replays (`extendCold`): the encoder's
+/// layers and the decoder's global rows, without the decoder's replay, whose windows the next chunk never reads.
+pub const Want = enum { last, all, replay, encode };
 
 /// One block over one span: the staggered hyper-connections around
 /// attention and the MoE. Returns the new stream; `pre` becomes the FFN's
@@ -5081,7 +5088,7 @@ fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []
     m.ahead = null;
 
     // The next chunk is expected as wide as this one; hist already holds this chunk.
-    const w = if (mine) @min(m.prompt.len - p1, L) else 0;
+    const w = if (mine) @min(m.prompt.len - p1, m.next_rows orelse L) else 0;
     const next = try gpa.alloc(u32, if (w > region_rows) w * hs.n_layers * hs.cols() else 0);
     defer gpa.free(next);
     if (next.len > 0) {
@@ -5093,6 +5100,7 @@ fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []
     const ahead_spec: engram.Prefetch.Spec = .{ .at = p1, .len = w, .ids = next };
     if (adopted) |a| {
         if (next.len > 0) m.ahead = try engram.Prefetch.start(gpa, tables, &.{ahead_spec}, hs.cols(), span);
+        a.waited_ms = 0;
         return a;
     }
     const cur_spec: engram.Prefetch.Spec = .{ .at = p0, .len = L, .ids = rows };
@@ -5272,6 +5280,9 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     defer if (prefetch) |pf| if (m.ahead != pf) pf.finish();
     const eng_early = given == .host and L > region_rows;
     if (eng_early) {
+        // A prompt chunk: its codes go past the page cache while the cache has no room for them.
+        const tight = eng_on and engram.cacheTight(system.getAvailableMemBytes(), system.getTotalMemBytes());
+        for (m.engrams) |*e| e.table.pastCache(tight);
         eng_ids = try engramIds(m, gpa, st, given.host, images);
         if (eng_on) prefetch = try engramPrefetch(m, gpa, st, eng_tables, given.host, eng_ids, span, images);
     }
@@ -5330,6 +5341,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     @memset(held, none);
     var sp = spansOf(held, n_spans, targets, span, L, p0);
     sp.whole = held[held.len - 4 ..][0..2];
+    if (want == .replay) sp.floor = p0;
     sp.eng_ids = eng_ids;
     sp.ncols = ncols;
     var img_mask: A = none;
@@ -5397,9 +5409,19 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         try exchange(m, gpa, &sp, p0, st.snap_at != null and st.snap_at.? == p0 + L, if (st.verify) |v| v.n0 == p0 else false);
         from = p.hi;
     }
-    const enc_hi = if (tail != null) m.ced_split.? else m.n_layers;
+    if (want == .encode and (m.ced_split == null or m.pair != null or st.verify != null)) return error.Dsv41EncodeUnsupported;
+    const enc_hi = if (tail != null or want == .encode) m.ced_split.? else m.n_layers;
     try runLayers(m, gpa, st, &sp, held, from, enc_hi);
     Laps.lap(.build);
+    if (want == .encode) {
+        try cedCompress(m, gpa, st, &sp, enc_hi);
+        st.n = p0 + L;
+        var ev: std.ArrayList(A) = .empty;
+        defer ev.deinit(gpa);
+        for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
+        try asyncEvalAll(ev.items);
+        return none;
+    }
     if (tail) |tl| {
         var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
         tsp.whole = held[held.len - 2 ..][0..2];
@@ -5408,6 +5430,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         m.ced_stats.chunks += 1;
         m.ced_stats.skipped += L - tl;
         log.info("[dsv41] CED prefill: {d} rows encoder-only, replay {d} rows\n", .{ L - tl, tl });
+        if (prefetch) |pf| log.debug("[dsv41] the chunk waited {d} ms on its Engram rows{s}\n", .{ pf.waited_ms, if (m.engrams[0].table.past_cache.load(.acquire)) ", codes past the page cache" else "" });
         try runLayers(m, gpa, st, &tsp, held, enc_hi, m.n_layers);
         sp = tsp;
     }
@@ -5423,6 +5446,15 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         if (st.verify) |*v| {
             v.mh = sc.out(all);
         } else try commitMain(&sc, m, st, all, sp.p0);
+    }
+    if (want == .replay) {
+        var ev: std.ArrayList(A) = .empty;
+        defer ev.deinit(gpa);
+        for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
+        for (st.ds) |r| try ev.append(gpa, r.buf);
+        if (st.mh.ctx != null) try ev.append(gpa, st.mh);
+        try evalAll(ev.items);
+        return none;
     }
 
     // The final collapse uses the last layer's FFN mix.
@@ -6434,10 +6466,8 @@ fn spansOf(held: []A, n: usize, targets: usize, span: usize, L: usize, p0: usize
     return .{ .xs = held[0..n], .pres = held[n .. 2 * n], .topks = held[2 * n .. 3 * n], .cands = held[3 * n .. 4 * n], .mh = held[4 * n .. 4 * n + n * targets], .span = span, .L = L, .p0 = p0, .eng_ids = &.{}, .ncols = 0 };
 }
 
-/// CED: layer `li`'s compressor over every row of `sp` (the decoder's global KV and index keys exist at every
-/// position), then `sp`'s last rows become `tsp`'s spans, the decoder's input; `sp`'s streams are released. The rows
-/// before the tail get no decoder window KV, which no tail query reaches: the tail's band stops at its first row.
-fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, tsp: *const Spans, li: usize) !void {
+/// CED: layer `li`'s compressor over every row of `sp`: the decoder's global KV and index keys exist at every position.
+fn cedCompress(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, li: usize) !void {
     const ly = &m.layers[li];
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
@@ -6445,6 +6475,15 @@ fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
         const pa = try hcPreNormWide(&sc, m, x, pre, &ly.hc_attn, ly.attn_norm);
         try compress(&sc, m, st, li, &ly.comp.?, pa.h, sp.p0 + k * sp.span);
     }
+}
+
+/// CED: `cedCompress`, then `sp`'s last rows become `tsp`'s spans, the decoder's input; `sp`'s streams are released.
+/// The rows before the tail get no decoder window KV, which no tail query reaches: the tail's band stops at its first
+/// row.
+fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, tsp: *const Spans, li: usize) !void {
+    try cedCompress(m, gpa, st, sp, li);
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
     // The tail's rows come from the spans it overlaps.
     const skip = sp.L - tsp.L;
     const k0 = skip / sp.span;
@@ -6734,6 +6773,9 @@ pub const Snap = struct {
     ds: []A,
     mh: A,
     hist: []u32,
+    /// False: a slice (`sliceSnap`). Its global rows and index keys stop at `n`; its windows, open groups and DSpark
+    /// rows are the longer run's and `rewind` rebuilds them when it is restored.
+    whole: bool = true,
 
     const LSnap = struct { win: A, comp: ?Rows, idx_k: ?Rows, pend_kv: A, pend_gate: A };
 
@@ -6791,9 +6833,48 @@ pub const Snap = struct {
             .ds = ds,
             .mh = ref(self.mh),
             .hist = hist,
+            .whole = self.whole,
         };
     }
 };
+
+/// A snapshot of the longest prefix of at most `len` tokens that `sn` restores at: `sn`'s own when it ends there,
+/// else its global rows and index keys cut where every pooling group is closed, the windows left to `rewind`.
+/// Null: none (past its end, nothing left, image rows, a tensor split).
+pub fn sliceSnap(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap, len: usize) !?Snap {
+    if (len >= sn.n) return if (len == sn.n) try sn.clone(gpa) else null;
+    if (m.tp != null or m.pair != null or sn.vision_key != 0) return null;
+    var group: usize = 1;
+    for (m.layers[0..sn.layers.len], sn.layers) |*ly, l| if (l.comp != null) {
+        group = group / std.math.gcd(group, ly.ratio) * ly.ratio;
+    };
+    const n = len - len % group;
+    if (n == 0) return null;
+    var out = try sn.clone(gpa);
+    errdefer out.deinit(gpa);
+    out.ids = try gpa.realloc(out.ids, n);
+    out.hist = try gpa.realloc(out.hist, @min(out.hist.len, n));
+    out.n = n;
+    out.whole = false;
+    for (out.layers, m.layers[0..out.layers.len]) |*l, *ly| {
+        if (l.comp) |*r| r.used = n / ly.ratio;
+        if (l.idx_k) |*r| r.used = n / ly.ratio;
+        for ([_]*A{ &l.pend_kv, &l.pend_gate }) |a| hold(a, none);
+    }
+    return out;
+}
+
+/// The tech report's SWA bounded replay. `st` stands at `st.n` with a longer run's windows (a restored slice); the
+/// last window of `ids`, the state's own tokens, is run again from its first row, which rebuilds every layer's
+/// window and the DSpark stages' and leaves the global rows as they are. Approximate where the window was cut: the
+/// replay's first rows attend none of the rows before them.
+pub fn rewind(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32) !void {
+    if (ids.len != st.n) return error.Dsv41SnapshotGeometry;
+    const s = st.n -| m.cfg.sliding_window;
+    if (st.hist.items.len > s) st.hist.shrinkRetainingCapacity(s);
+    st.n = s;
+    _ = try extendIds(m, gpa, st, .{ .host = ids[s..] }, .replay, null);
+}
 
 fn cacheSetting(h: *std.hash.Wyhash, value: anytype) void {
     switch (@typeInfo(@TypeOf(value))) {
@@ -6895,6 +6976,8 @@ pub fn exportSnapshot(m: *const Dsv41Model, sn: *const Snap, out: *cache_abi.Aux
     out.tensor_len = 0;
     out.names_len = 0;
     out.header_len = 0;
+    // A slice is restored, never stored: its windows are not its own.
+    if (!sn.whole) return error.Dsv41SnapshotSliced;
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
     if (had_error) return error.Dsv41CacheMlxErrorPending;
@@ -7230,6 +7313,45 @@ pub fn snapshotStateIfDue(st: *State, gen: u64) !void {
     st.snap_at = null;
 }
 
+/// The capture an unfinished prompt leaves: the state where its last forwarded chunk ended, keyed by the armed ids up
+/// to there, so an abandoned prefill resumes instead of starting over. Nothing when no capture is armed, nothing
+/// was forwarded, or an image of the prompt lies past that point (the armed key hashes every image row).
+pub fn snapshotStateAtChunk(m: *const Dsv41Model, st: *State, gen: u64) !void {
+    const at = st.snap_at orelse return;
+    if (st.snap != null or st.n == 0 or st.n >= at) return;
+    if (m.imageRows(st.snap_ids[0..st.n]) != m.imageRows(st.snap_ids)) return;
+    const ids = try st.gpa.dupe(u32, st.snap_ids[0..st.n]);
+    st.gpa.free(st.snap_ids);
+    st.snap_ids = ids;
+    st.snap_at = st.n;
+    try snapshotStateIfDue(st, gen);
+}
+
+/// A prompt chunk of at least `LEAD_MIN` rows whose Engram rows nothing read ahead sends its first half ahead of the
+/// rest (0: the chunk runs whole): the drive reads the rest behind it, where the whole chunk holds the GPU at the first
+/// Engram layer until its last row is read. A narrower lead feeds the matrix units too few rows an expert.
+pub fn leadRows(L: usize, read_ahead: bool) usize {
+    return if (read_ahead or L < LEAD_MIN) 0 else L / 2 / SPAN * SPAN;
+}
+const LEAD_MIN: usize = 4096;
+
+/// `extendIds` of a prompt chunk for its last row's logits, its lead (`leadRows`) run first without the decoder's
+/// replay, which the rest of the chunk makes at its own end.
+fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, vision: ?VisionRows) !A {
+    const whole = m.engrams.len == 0 or m.pair != null or m.tp != null or m.streamed != null or m.trace != null or
+        m.ced_split == null or st.verify != null or !cedEnabled();
+    const lead = if (whole) 0 else leadRows(ids.len, if (m.ahead) |a| a.covers(st.n, ids.len) else false);
+    if (lead == 0) return extendIds(m, gpa, st, .{ .host = ids }, .last, vision);
+    defer m.next_rows = null;
+    m.next_rows = ids.len - lead;
+    _ = try extendIds(m, gpa, st, .{ .host = ids[0..lead] }, .encode, vision);
+    var rest = vision;
+    if (rest) |*v| v.offset += std.mem.count(u32, ids[0..lead], &.{m.cfg.image_token_id});
+    // The prompt's next chunk is expected as wide as this whole one, not as its rest.
+    m.next_rows = ids.len;
+    return extendIds(m, gpa, st, .{ .host = ids[lead..] }, .last, rest);
+}
+
 /// `extend` that takes the armed snapshot on the way: a chunk crossing its
 /// position runs as two.
 /// One decode token still on the GPU (`Ids.gpu`), where `extendResumable` takes host ids.
@@ -7245,7 +7367,7 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
     const st = &m.dec_state.?;
     if (st.snap_at) |at| if (at > st.n and at < st.n + ids.len) {
         const k = at - st.n;
-        const head = try extendIds(m, gpa, st, .{ .host = ids[0..k] }, .last, vision);
+        const head = try extendCold(m, gpa, st, ids[0..k], vision);
         _ = mlx.mlx_array_free(head);
         try snapshotIfDue(m);
         // The tail's rows follow the head's.
@@ -7253,7 +7375,7 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
         if (rest) |*v| v.offset += std.mem.count(u32, ids[0..k], &.{m.cfg.image_token_id});
         return extendIds(m, gpa, st, .{ .host = ids[k..] }, .last, rest);
     };
-    const out = try extendIds(m, gpa, st, .{ .host = ids }, .last, vision);
+    const out = try extendCold(m, gpa, st, ids, vision);
     try snapshotIfDue(m);
     return out;
 }
@@ -10552,6 +10674,15 @@ test "dsv41 image token: without image rows it is text, as in the reference's te
     }
 }
 
+test "dsv41 lead: a wide prompt chunk nothing read ahead sends its first rows ahead, and what is left still replays" {
+    try testing.expectEqual(@as(usize, 0), leadRows(LEAD_MIN - 1, false));
+    try testing.expectEqual(@as(usize, 2048), leadRows(LEAD_MIN, false));
+    try testing.expectEqual(@as(usize, 3840), leadRows(8064, false));
+    try testing.expectEqual(@as(usize, 0), leadRows(8064, true));
+    // The rest keeps a window to replay and the rows a replaying chunk skips.
+    try testing.expect(LEAD_MIN - leadRows(LEAD_MIN, false) >= 128 + CED_MIN_SKIP);
+}
+
 test "dsv41 CED split:the decoder starts at the last KV source when everything after it reads its ratio-1 rows" {
     var c: Config = .{ .model_type = "deepseek_v41", .num_hidden_layers = 40, .sliding_window = 128 };
     for (0..40) |l| c.dsv4_compress_ratios[l] = if (l < 2) 0 else if (l < 20) 2 else 1;
@@ -10646,7 +10777,7 @@ test "dsv41 CED: a wide chunk replays its last window through the decoder, the s
     // The full forward, and the chunk replayed as one piece; traced once each.
     var tr: [2]Trace = .{ .{ .gpa = gpa }, .{ .gpa = gpa } };
     defer for (&tr) |*x| x.deinit();
-    var plain: [2][]f32 = undefined;
+    var plain: [2][]f32 = .{ &.{}, &.{} };
     defer for (plain) |p| gpa.free(p);
     for (0..2) |ced| {
         _ = setenv("MLX_SERVE_DSV41_CED", if (ced == 1) "1" else "0", 1);

@@ -201,14 +201,17 @@ pub const Drafting = struct {
         return true;
     }
 
-    /// A drafted round: `gain` = the ms of plain rounds its tokens would have cost, `wall` = what it took, at most
-    /// doubling or halving the average so one cold-kernel round cannot stop drafting.
+    /// A round counts for at most this many times the rounds before it (the first: its own gain).
+    const STALL: f32 = 2;
+
+    /// A drafted round's wall time is bounded by the rounds before it, so a stall cannot stop drafting.
     pub fn record(self: *Drafting, gain: f32, wall_in: f32) void {
+        const prior_wall = if (self.wall > 0) self.wall else gain;
+        const wall = std.math.clamp(wall_in, prior_wall / STALL, prior_wall * STALL);
         if (self.wall <= 0) {
             self.gain = gain;
-            self.wall = wall_in;
+            self.wall = wall;
         } else {
-            const wall = std.math.clamp(wall_in, self.wall * 0.5, self.wall * 2);
             self.gain += ALPHA * (gain - self.gain);
             self.wall += ALPHA * (wall - self.wall);
         }
@@ -732,6 +735,44 @@ fn trained(b0: f32, b1: f32, slope: f32) GroupCost {
         cost.sample(st, rows, b0 + b1 * @as(f32, @floatFromInt(st)) + slope * @as(f32, @floatFromInt(rows - st)));
     };
     return cost;
+}
+
+test "Drafting: a stalled round is not what a round costs" {
+    // A round that emits four tokens in the time of two plain steps.
+    const gain: f32 = 4 * 17.7;
+    var d: Drafting = .{};
+    for (0..20) |_| {
+        try testing.expect(d.shouldDraft());
+        d.record(gain, 35);
+    }
+    // A kernel's first compile, a foreign GPU job: one round takes five seconds. Nothing is owed for it.
+    d.record(gain, 5000);
+    for (0..20) |_| {
+        try testing.expect(d.shouldDraft());
+        d.record(gain, 35);
+    }
+    // The first round of all stalls: a few plain rounds, then drafting again.
+    var cold: Drafting = .{};
+    cold.record(gain, 5000);
+    var rounds: usize = 0;
+    while (cold.skipped < 100 and rounds < 8) {
+        if (cold.shouldDraft()) {
+            cold.record(gain, 35);
+            rounds += 1;
+        }
+    }
+    try testing.expect(cold.skipped < 20);
+    try testing.expect(cold.shouldDraft());
+}
+
+test "GroupCost: rows and states cost more, and a slower machine's rounds scale the prior within bounds" {
+    var cost: GroupCost = .{};
+    try testing.expect(cost.ms(2, 4) > cost.ms(2, 2) and cost.ms(3, 3) > cost.ms(2, 2));
+    for (0..200) |_| cost.sample(2, 4, 2 * GroupCost.prior(2, 4));
+    try testing.expectApproxEqAbs(@as(f32, 2), cost.scale, 0.05);
+    cost.sample(2, 4, std.math.nan(f32));
+    cost.sample(2, 4, 1e9);
+    try testing.expect(cost.scale <= 2.5);
 }
 
 test "GroupCost: a machine's own base and row slope are learned apart, and its row choice follows them" {
