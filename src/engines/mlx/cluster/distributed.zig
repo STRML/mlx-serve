@@ -18,6 +18,7 @@ const ssmFreeSpecCapture = @import("../ssm/entry.zig").ssmFreeSpecCapture;
 const ssmFreeQsaState = @import("../../../plugins/qwen4_exp/qsa/history.zig").ssmFreeQsaState;
 const h3_split = @import("../../../plugins/minimax_h3/cluster.zig");
 const wire = @import("../../../sdk/util/wire.zig");
+const probe = @import("probe.zig");
 const lan = @import("../../../host/lan/lan.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
 
@@ -53,6 +54,10 @@ pub const Config = struct {
 
 /// `cfg.device` as one entry per rank: a single device (a pair) faces the one peer.
 fn deviceList(cfg: Config, out: *[max_ranks][]const u8) ![]const []const u8 {
+    if (cfg.size == 1 and cfg.rank == 0 and std.mem.eql(u8, cfg.device, "-")) {
+        out[0] = "-";
+        return out[0..1];
+    }
     if (cfg.size < 2 or cfg.size > max_ranks or cfg.rank >= cfg.size) return error.DistDeviceList;
     if (std.mem.indexOfScalar(u8, cfg.device, ',') == null) {
         // One port faces one peer only.
@@ -124,7 +129,7 @@ pub const Link = struct {
     /// Joins the group. Blocks until every rank has connected to the coordinator.
     pub fn open(io: std.Io, cfg: Config) !Link {
         if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable;
-        if (!mlx.mlx_distributed_is_available("jaccl")) {
+        if (cfg.size > 1 and !mlx.mlx_distributed_is_available("jaccl")) {
             log.err("[dist] JACCL is unavailable: RDMA over Thunderbolt needs macOS 26.2+ and `rdma_ctl enable` (Recovery)\n", .{});
             return error.RdmaUnavailable;
         }
@@ -152,7 +157,7 @@ pub const Link = struct {
         // Rank 0 files each worker's bell, by the rank it names, while the group forms. A worker dials its bell
         // before JACCL, so a rank with no bell has not started: the join names it.
         const coord = try bellAddress(cfg);
-        var rv: Rendezvous = .{ .listener = if (cfg.rank == 0) Bell.listen(coord, cfg.size - 1) else Bell.none, .size = cfg.size };
+        var rv: Rendezvous = .{ .listener = if (cfg.rank == 0 and cfg.size > 1) Bell.listen(coord, cfg.size - 1) else Bell.none, .size = cfg.size };
         defer rv.close();
         var acceptor: ?std.Thread = if (rv.listener != Bell.none) std.Thread.spawn(.{ .stack_size = 1 << 16 }, Rendezvous.run, .{&rv}) catch null else null;
         defer if (acceptor) |t| {
@@ -168,7 +173,7 @@ pub const Link = struct {
             return error.DistNoBell;
         }
         var g = mlx.mlx_distributed_group_new();
-        mlx.check(mlx.mlx_distributed_init(&g, true, "jaccl")) catch {
+        mlx.check(mlx.mlx_distributed_init(&g, cfg.size > 1, "jaccl")) catch {
             var eb: [512]u8 = undefined;
             log.err("[dist] JACCL init failed: {s}\n", .{mlx.takeError(&eb) orelse "unknown"});
             return error.RdmaInitFailed;
@@ -209,6 +214,16 @@ pub const Link = struct {
             b.* = .{};
         };
         _ = mlx.mlx_distributed_group_free(self.group);
+    }
+
+    pub fn abort(self: *const Link, reason: [:0]const u8) !void {
+        try mlx.check(mlx.mlx_distributed_group_abort(self.group, reason));
+    }
+
+    pub fn progress(self: *const Link) !u64 {
+        var completed: u64 = 0;
+        try mlx.check(mlx.mlx_distributed_group_progress(self.group, &completed));
+        return completed;
     }
 
     /// Bit `k` set for each worker `k` rank 0 has a bell to.
@@ -2383,6 +2398,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     var soak: u64 = 0;
     var relink: u64 = 0;
     var sums: u64 = 0;
+    var abort_after_ms: u32 = 0;
     var chain = false;
     var rest: [16][]const u8 = undefined;
     var n_rest: usize = 0;
@@ -2397,16 +2413,21 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, args[ai], "--sums") and ai + 1 < args.len) {
             sums = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
             ai += 1;
+        } else if (std.mem.eql(u8, args[ai], "--abort-after-ms") and ai + 1 < args.len) {
+            abort_after_ms = std.fmt.parseInt(u32, args[ai + 1], 10) catch return error.InvalidArgs;
+            if (abort_after_ms == 0) return error.InvalidArgs;
+            ai += 1;
         } else if (std.mem.eql(u8, args[ai], "--chain")) {
             chain = true;
         } else if (n_rest < rest.len) {
             rest[n_rest] = args[ai];
             n_rest += 1;
-        }
+        } else return error.InvalidArgs;
     }
     const cfg = try parseArgs(rest[0..n_rest]);
+    if ((abort_after_ms > 0 and sums == 0) or (sums > 0 and (soak > 0 or chain)) or (relink > 0 and (soak > 0 or chain))) return error.InvalidArgs;
+    if (sums > 0) return sumLoop(io, cfg, sums, abort_after_ms, relink);
     if (relink > 0) return relinkProbe(io, cfg, relink);
-    if (sums > 0) return sumLoop(io, cfg, sums);
     var link = try Link.open(io, cfg);
     defer link.deinit();
     const s = mlx.mlx_default_gpu_stream_new();
@@ -2501,57 +2522,201 @@ fn relinkProbe(io: std.Io, cfg: Config, n: u64) !void {
         };
         const open_us = sw_open.read() / std.time.ns_per_us;
         var sw_sum = io_util.Stopwatch.init(io);
-        const r = try link.allSum(x);
-        try evalOne(r);
-        var v: f32 = 0;
-        var total = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_sum(&total, r, false, s));
-        try mlx.check(mlx.mlx_array_item_float32(&v, total));
-        _ = mlx.mlx_array_free(total);
-        _ = mlx.mlx_array_free(r);
+        const v = probeCollective(&link, x, s) catch |err| {
+            link.deinit();
+            return err;
+        };
         const sum_us = sw_sum.read() / std.time.ns_per_us;
         var sw_free = io_util.Stopwatch.init(io);
+        drainProbeStreams();
         link.deinit();
+        try mlx.check(mlx.mlx_distributed_clear_backends());
         const free_us = sw_free.read() / std.time.ns_per_us;
         log.info("[dist-probe] relink {d}: open {d} us, first all_sum {d} us (check {d} == {d}), free {d} us\n", .{ k, open_us, sum_us, v, 10240 * cfg.size, free_us });
     }
     log.info("[dist-probe] relink: {d} cycles clean\n", .{n});
 }
 
-/// `--sums N`: N back-to-back all_sums of a decode-row-sized tensor, the shape of a TP decode step. Kill one rank
-/// mid-run to see what the survivors get (plan 61c, gate G5): each failure is logged with the time since the last
-/// good sum, and the loop keeps going so a later throw or a hang both show in the log.
-fn sumLoop(io: std.Io, cfg: Config, n: u64) !void {
+fn probeCollective(link: *const Link, x: mlx.mlx_array, stream: mlx.mlx_stream) !f32 {
+    const r = try link.allSum(x);
+    defer _ = mlx.mlx_array_free(r);
+    errdefer drainProbeStreams();
+    try evalOne(r);
+    return checkProbeSum(r, link.size, stream);
+}
+
+fn checkProbeSum(r: mlx.mlx_array, size: u32, stream: mlx.mlx_stream) !f32 {
+    var wide = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wide);
+    errdefer drainProbeStreams();
+    try mlx.check(mlx.mlx_astype(&wide, r, .float32, stream));
+    var total = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(total);
+    errdefer drainProbeStreams();
+    try mlx.check(mlx.mlx_sum(&total, wide, false, stream));
+    var value: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&value, total));
+    if (value != @as(f32, @floatFromInt(10240 * size))) return error.DistSumMismatch;
+    return value;
+}
+
+const ProbeWatchdog = struct {
+    io: std.Io,
+    link: *const Link,
+    timeout_ms: u32,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ProbeWatchdog) void {
+        var clock = io_util.Stopwatch.init(self.io);
+        var deadline: probe.ProgressDeadline = .{};
+        while (!self.stop.load(.acquire)) {
+            const completed = self.link.progress() catch return;
+            if (deadline.expired(completed, clock.read() / std.time.ns_per_ms, self.timeout_ms)) {
+                var buf: [256]u8 = undefined;
+                var peer_buf: [32]u8 = undefined;
+                const peers = probe.peerRanks(self.link.rank, self.link.size, &peer_buf) catch unreachable;
+                const reason = std.fmt.bufPrintSentinel(&buf, "no progress for {d} ms; last completed collective id={d}; rank={d}; peer ranks={s}", .{ self.timeout_ms, deadline.last, self.link.rank, peers }, 0) catch unreachable;
+                log.err("[dist-probe] abort: {s}\n", .{reason});
+                self.link.abort(reason) catch |err| log.err("[dist-probe] abort failed: {s}\n", .{@errorName(err)});
+                return;
+            }
+            crt.sleepMs(1);
+        }
+    }
+};
+
+fn probePeerGone(bell: Bell) bool {
+    if (!bell.open()) return true;
+    var fds = [_]std.posix.pollfd{.{ .fd = bell.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    if ((std.posix.poll(&fds, 0) catch return true) == 0) return false;
+    var byte: [1]u8 = undefined;
+    const n = std.c.recv(bell.fd, &byte, 1, std.c.MSG.PEEK);
+    if (n < 0 and (std.c._errno().* == @backingInt(std.c.E.INTR) or std.c._errno().* == @backingInt(std.c.E.AGAIN))) return false;
+    return n <= 0;
+}
+
+fn probeSurvivors(link: *const Link, timeout_ms: u32) !u32 {
+    if (link.rank != 0) {
+        const bell = link.bells[0];
+        if (!bell.open()) return error.DistCoordinatorGone;
+        var fds = [_]std.posix.pollfd{.{ .fd = bell.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        if ((try std.posix.poll(&fds, @intCast(@min(@as(u64, timeout_ms) * 2 + 1000, std.math.maxInt(i32))))) == 0) return error.DistRecoveryTimeout;
+        var mask: [1]u8 = undefined;
+        bell.readAll(&mask) catch return error.DistCoordinatorGone;
+        return mask[0];
+    }
+    var mask: u32 = 1;
+    for (1..link.size) |rank| {
+        if (!probePeerGone(link.bells[rank])) mask |= @as(u32, 1) << @intCast(rank);
+    }
+    for (1..link.size) |rank| {
+        if (mask & (@as(u32, 1) << @intCast(rank)) == 0) continue;
+        const one: c_int = 1;
+        if (comptime builtin.os.tag == .macos) _ = std.c.setsockopt(link.bells[rank].fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, &one, @sizeOf(c_int));
+        try link.bells[rank].say(&[_]u8{@intCast(mask)});
+    }
+    return mask;
+}
+
+fn freshProbeStreams() !void {
+    for ([_]mlx.mlx_device_type{ .cpu, .gpu }) |kind| {
+        const dev = mlx.mlx_device_new_type(kind, 0);
+        defer _ = mlx.mlx_device_free(dev);
+        const stream = mlx.mlx_stream_new_device(dev);
+        defer _ = mlx.mlx_stream_free(stream);
+        try mlx.check(mlx.mlx_set_default_stream(stream));
+    }
+}
+
+fn drainProbeStreams() void {
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    _ = mlx.mlx_synchronize(cpu);
+    const gpu = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(gpu);
+    _ = mlx.mlx_synchronize(gpu);
+}
+
+fn probeRelinkConfig(cfg: Config, survivors: u32, devices: []u8, coordinator: []u8) !Config {
+    const next = try probe.compact(cfg.rank, cfg.size, survivors);
+    var ports: [max_ranks][]const u8 = undefined;
+    return .{
+        .rank = next.rank,
+        .size = next.size,
+        .device = try probe.compactDevices(survivors, try deviceList(cfg, &ports), devices),
+        .coordinator = try jacclCoordinator(cfg, coordinator),
+    };
+}
+
+fn sumLoop(io: std.Io, initial: Config, n: u64, abort_after_ms: u32, relinks: u64) !void {
+    var cfg = initial;
+    var devices: [2][512]u8 = undefined;
+    var coordinator: [128]u8 = undefined;
+    var cycle: u64 = 0;
+    while (true) : (cycle += 1) {
+        var link = try Link.open(io, cfg);
+        if (abort_after_ms > 0 and relinks > 0 and link.size > 1) {
+            const all = ((@as(u32, 1) << @intCast(link.size)) - 1) & ~@as(u32, 1);
+            if ((link.rank == 0 and link.bellMask() != all) or (link.rank != 0 and !link.bells[0].open())) {
+                link.deinit();
+                return error.DistNoBell;
+            }
+        }
+        const failure = if (sumSession(io, &link, n, abort_after_ms)) |_| {
+            link.deinit();
+            return;
+        } else |err| err;
+        if (cycle >= relinks or abort_after_ms == 0) {
+            link.deinit();
+            return failure;
+        }
+        const survivors = probeSurvivors(&link, abort_after_ms) catch |err| {
+            link.deinit();
+            return err;
+        };
+        link.deinit();
+        try mlx.check(mlx.mlx_distributed_clear_backends());
+        const next = try probeRelinkConfig(cfg, survivors, &devices[cycle % 2], &coordinator);
+        log.info("[dist-probe] relink {d}: survivors=0x{x}, rank {d}/{d} -> {d}/{d}, device={s}\n", .{ cycle + 1, survivors, cfg.rank, cfg.size, next.rank, next.size, next.device });
+        cfg = next;
+        try freshProbeStreams();
+    }
+}
+
+fn sumSession(io: std.Io, link: *const Link, n: u64, abort_after_ms: u32) !void {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const shape = [_]c_int{10240};
     var x = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_ones(&x, &shape, 1, .bfloat16, s));
     defer _ = mlx.mlx_array_free(x);
+    errdefer drainProbeStreams();
     try evalOne(x);
-    var link = try Link.open(io, cfg);
-    defer link.deinit();
+    var watchdog: ProbeWatchdog = .{ .io = io, .link = link, .timeout_ms = abort_after_ms };
+    const thread: ?std.Thread = if (abort_after_ms > 0 and link.size > 1) try std.Thread.spawn(.{}, ProbeWatchdog.run, .{&watchdog}) else null;
+    defer if (thread) |t| {
+        watchdog.stop.store(true, .release);
+        t.join();
+    };
+    errdefer drainProbeStreams();
     var since_good = io_util.Stopwatch.init(io);
-    var failures: u32 = 0;
     var k: u64 = 0;
     while (k < n) : (k += 1) {
-        const r = link.allSum(x) catch |e| {
-            failures += 1;
-            log.err("[dist-probe] sums {d}: all_sum build failed after {d} ms since the last good sum: {s}\n", .{ k, since_good.read() / std.time.ns_per_ms, @errorName(e) });
-            if (failures >= 3) return e;
-            continue;
+        const r = link.allSum(x) catch |err| {
+            log.err("[dist-probe] sums {d}: build failed after {d} ms: {s}\n", .{ k, since_good.read() / std.time.ns_per_ms, @errorName(err) });
+            return err;
         };
         defer _ = mlx.mlx_array_free(r);
-        evalOne(r) catch |e| {
-            failures += 1;
-            log.err("[dist-probe] sums {d}: all_sum eval failed after {d} ms since the last good sum: {s}\n", .{ k, since_good.read() / std.time.ns_per_ms, @errorName(e) });
-            if (failures >= 3) return e;
-            continue;
+        errdefer drainProbeStreams();
+        evalOne(r) catch |err| {
+            log.err("[dist-probe] sums {d}: eval failed after {d} ms: {s}\n", .{ k, since_good.read() / std.time.ns_per_ms, @errorName(err) });
+            return err;
         };
+        if (k == 0) _ = try checkProbeSum(r, link.size, s);
         since_good = io_util.Stopwatch.init(io);
-        if (k % 20000 == 0) log.info("[dist-probe] sums {d} ok\n", .{k});
+        if (k % 20000 == 0) log.info("[dist-probe] sums {d} ok (rank {d}/{d})\n", .{ k, link.rank, link.size });
     }
-    log.info("[dist-probe] sums: {d} clean\n", .{n});
+    log.info("[dist-probe] sums: {d} clean (rank {d}/{d})\n", .{ n, link.rank, link.size });
 }
 
 fn soakLink(io: std.Io, link: *const Link, other: u32, n: u64, s: mlx.mlx_stream) !void {
@@ -2639,6 +2804,49 @@ fn workerArgs(args: []const []const u8, out: [][]const u8) []const []const u8 {
     out[args.len] = "--rank";
     out[args.len + 1] = "1";
     return out[0 .. args.len + 2];
+}
+
+test "dist-probe recovery keeps the coordinator reachable on the surviving cable" {
+    var devices: [128]u8 = undefined;
+    var coord: [128]u8 = undefined;
+    var addr: [128]u8 = undefined;
+    const host = try probeRelinkConfig(.{ .rank = 0, .size = 3, .device = "-,rdma_en2,rdma_en13", .coordinator = "10.254.12.1:55100" }, 0b101, &devices, &coord);
+    try std.testing.expectEqual(@as(u32, 2), host.size);
+    try std.testing.expectEqualStrings("-,rdma_en13", host.device);
+    try std.testing.expectEqualStrings("0.0.0.0:55100", try jacclCoordinator(host, &addr));
+    const worker = try probeRelinkConfig(.{ .rank = 2, .size = 3, .device = "rdma_en13,rdma_en2,-", .coordinator = "10.254.13.1:55100" }, 0b101, &devices, &coord);
+    try std.testing.expectEqual(@as(u32, 1), worker.rank);
+    try std.testing.expectEqualStrings("rdma_en13,-", worker.device);
+    try std.testing.expectEqualStrings("10.254.13.1:55100", try jacclCoordinator(worker, &addr));
+}
+
+test "dist-probe recovery broadcasts one survivor set after a follower dies" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair));
+    defer _ = std.c.close(pair[0]);
+    defer _ = std.c.close(pair[1]);
+    var lost: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &lost));
+    defer _ = std.c.close(lost[0]);
+    _ = std.c.close(lost[1]);
+    var host: Link = .{ .group = .{}, .rank = 0, .size = 3 };
+    host.bells[1] = .{ .fd = lost[0] };
+    host.bells[2] = .{ .fd = pair[0] };
+    var worker: Link = .{ .group = .{}, .rank = 2, .size = 3 };
+    worker.bells[0] = .{ .fd = pair[1] };
+    try std.testing.expectEqual(@as(u32, 0b101), try probeSurvivors(&host, 10));
+    try std.testing.expectEqual(@as(u32, 0b101), try probeSurvivors(&worker, 10));
+}
+
+test "dist-probe checks the recovered collective value" {
+    const stream = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_ones(&x, &.{10240}, 1, .float32, stream));
+    try std.testing.expectEqual(@as(f32, 10240), try checkProbeSum(x, 1, stream));
+    try std.testing.expectError(error.DistSumMismatch, checkProbeSum(x, 2, stream));
 }
 
 test "deviceMatrixJson: each row names the local device, the diagonal is null" {

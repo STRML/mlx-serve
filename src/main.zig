@@ -148,8 +148,11 @@ fn printUsage(io: std.Io) void {
         \\                      [--rank k --size n] (default 1 of 2; past a pair
         \\                      --device lists the port facing each rank, own `-`)
         \\                      [--model-dir <dir>]... (default ~/.mlx-serve/models)
-        \\  dist-probe          Measure the RDMA link: --rank 0|1 --coordinator
-        \\                      <ip:port> --device <rdma_enX> [--soak N]
+        \\  dist-probe          Probe the RDMA link: --rank N [--size N]
+        \\                      --coordinator <ip:port> --device <rdma_enX[,..]>
+        \\                      [--soak N | --chain | --relink N | --sums N]
+        \\                      --sums N [--abort-after-ms N] [--relink N]
+        \\                      Abort stalled sums; relink survivors via rank 0.
         \\  launch <agent>      Configure + launch a coding agent CLI against the
         \\                      local server (claude, pi, omp, opencode, codex,
         \\                      hermes, aider, zcode); starts the MLX-Serve app if the
@@ -647,7 +650,10 @@ pub fn main(init: std.process.Init) !void {
             if (mlx_engine.api().cluster_worker(io, allocator, args[2..]) != null) std.process.exit(1);
             return;
         } else if (std.mem.eql(u8, cmd, "dist-probe")) {
-            if (mlx_engine.api().cluster_probe(io, args[2..]) != null) std.process.exit(1);
+            if (mlx_engine.api().cluster_probe(io, args[2..])) |err| {
+                log.err("[dist-probe] failed: {s}\n", .{err});
+                std.process.exit(1);
+            }
             return;
         } else if (std.mem.eql(u8, cmd, "plugin")) {
             @import("host/plugins/cli.zig").cmdPlugin(allocator, io, args[2..]) catch std.process.exit(1);
@@ -1494,7 +1500,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
-        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @intFromEnum(mode), group_model, dist_split, dist_size, dist_join_timeout));
+        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @backingInt(mode), group_model, dist_split, dist_size, dist_join_timeout));
     }
 
     if (serve_mode) {

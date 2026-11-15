@@ -283,6 +283,18 @@ pub fn addUnitTests(g: *const Graph) Tests {
     const shards: u32 = if (test_filter != null) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
     const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
+    const distributed_c = b.addSystemCommand(&.{ "xcrun", "clang++", "-std=c++20" });
+    distributed_c.addPrefixedDirectoryArg("-I", b.path("lib/mlxc-src"));
+    distributed_c.addPrefixedDirectoryArg("-I", b.path("lib/mlx-src"));
+    distributed_c.addFileArg(b.path("tests/test_distributed_group_c.cpp"));
+    distributed_c.addFileArg(b.path("lib/mlx/lib/libmlxc.dylib"));
+    distributed_c.addFileArg(b.path("lib/mlx/lib/libmlx.dylib"));
+    distributed_c.addPrefixedDirectoryArg("-Wl,-rpath,", b.path("lib/mlx/lib"));
+    distributed_c.addArg("-o");
+    const distributed_c_exe = distributed_c.addOutputFileArg("distributed-group-c-test");
+    const distributed_c_run = std.Build.Step.Run.create(b, "run distributed C ABI test");
+    distributed_c_run.addFileArg(distributed_c_exe);
+    test_step.dependOn(&distributed_c_run.step);
     // A Run step given an env var copies the WHOLE configure-time environment into the cached configuration, so the
     // tests' own variables (MLX_SERVE_TAPE_RECORD, *_TEST_MODEL) would stay frozen at the last reconfigure.
     b.graph.poisonCache();
