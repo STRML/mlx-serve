@@ -2532,6 +2532,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     // `--soak N`: N header + one-row-stream round trips, the shape of a pipeline decode hop.
     var soak: u64 = 0;
     var relink: u64 = 0;
+    var sums: u64 = 0;
     var chain = false;
     var rest: [16][]const u8 = undefined;
     var n_rest: usize = 0;
@@ -2543,6 +2544,9 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, args[ai], "--relink") and ai + 1 < args.len) {
             relink = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
             ai += 1;
+        } else if (std.mem.eql(u8, args[ai], "--sums") and ai + 1 < args.len) {
+            sums = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
+            ai += 1;
         } else if (std.mem.eql(u8, args[ai], "--chain")) {
             chain = true;
         } else if (n_rest < rest.len) {
@@ -2552,6 +2556,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     }
     const cfg = try parseArgs(rest[0..n_rest]);
     if (relink > 0) return relinkProbe(io, cfg, relink);
+    if (sums > 0) return sumLoop(io, cfg, sums);
     var link = try Link.open(io, cfg);
     defer link.deinit();
     const s = mlx.mlx_default_gpu_stream_new();
@@ -2661,6 +2666,42 @@ fn relinkProbe(io: std.Io, cfg: Config, n: u64) !void {
         log.info("[dist-probe] relink {d}: open {d} us, first all_sum {d} us (check {d} == {d}), free {d} us\n", .{ k, open_us, sum_us, v, 10240 * cfg.size, free_us });
     }
     log.info("[dist-probe] relink: {d} cycles clean\n", .{n});
+}
+
+/// `--sums N`: N back-to-back all_sums of a decode-row-sized tensor, the shape of a TP decode step. Kill one rank
+/// mid-run to see what the survivors get (plan 61c, gate G5): each failure is logged with the time since the last
+/// good sum, and the loop keeps going so a later throw or a hang both show in the log.
+fn sumLoop(io: std.Io, cfg: Config, n: u64) !void {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const shape = [_]c_int{10240};
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_ones(&x, &shape, 1, .bfloat16, s));
+    defer _ = mlx.mlx_array_free(x);
+    try evalOne(x);
+    var link = try Link.open(io, cfg);
+    defer link.deinit();
+    var since_good = io_util.Stopwatch.init(io);
+    var failures: u32 = 0;
+    var k: u64 = 0;
+    while (k < n) : (k += 1) {
+        const r = link.allSum(x) catch |e| {
+            failures += 1;
+            log.err("[dist-probe] sums {d}: all_sum build failed after {d} ms since the last good sum: {s}\n", .{ k, since_good.read() / std.time.ns_per_ms, @errorName(e) });
+            if (failures >= 3) return e;
+            continue;
+        };
+        defer _ = mlx.mlx_array_free(r);
+        evalOne(r) catch |e| {
+            failures += 1;
+            log.err("[dist-probe] sums {d}: all_sum eval failed after {d} ms since the last good sum: {s}\n", .{ k, since_good.read() / std.time.ns_per_ms, @errorName(e) });
+            if (failures >= 3) return e;
+            continue;
+        };
+        since_good = io_util.Stopwatch.init(io);
+        if (k % 20000 == 0) log.info("[dist-probe] sums {d} ok\n", .{k});
+    }
+    log.info("[dist-probe] sums: {d} clean\n", .{n});
 }
 
 fn soakLink(io: std.Io, link: *const Link, other: u32, n: u64, s: mlx.mlx_stream) !void {
