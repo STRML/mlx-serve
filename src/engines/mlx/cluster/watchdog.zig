@@ -84,6 +84,18 @@ test "a step of many forwards survives while each forward is within the deadline
     try std.testing.expectEqual(@as(?u64, 10_000), s.stalledMs(now + 10_000, 10_000));
 }
 
+test "a loop iteration armed as one step: a 5 s unit with no forward stays alive; a hung iteration fires at 30 s" {
+    var s: State = .{};
+    s.begin(0);
+    try std.testing.expect(loopAlive(5_000, 0, s.in_flight.load(.acquire), 1_000));
+    try std.testing.expectEqual(@as(?u64, null), s.stalledMs(5_000, 30_000));
+    s.progress(5_000);
+    try std.testing.expectEqual(@as(?u64, null), s.stalledMs(34_000, 30_000));
+    try std.testing.expectEqual(@as(?u64, 30_000), s.stalledMs(35_000, 30_000));
+    s.done();
+    try std.testing.expect(!loopAlive(40_000, 35_000, s.in_flight.load(.acquire), 3_000));
+}
+
 test "a bell read: timeout and EOF end the follower, data and EINTR do not" {
     try std.testing.expectEqual(BellFailure.timeout, classifyBellFailure(-1, 11, 4, 11).?);
     try std.testing.expectEqual(BellFailure.eof, classifyBellFailure(0, 0, 4, 11).?);

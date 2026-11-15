@@ -962,19 +962,21 @@ fn beginDistStep() void {
     c.watchdog.begin(@intCast(crt.monotonicMs()));
 }
 
-pub fn beginEngineStep() bool {
-    if (cluster().tp_link == null) return false;
-    beginDistStep();
-    return true;
-}
-
-pub fn endEngineStep() void {
-    cluster().watchdog.done();
-}
-
+/// Top of every inference-loop iteration. On a tensor-parallel leader the whole iteration is a watched step: begun here,
+/// moved forward by each iteration and each forward inside it, ended by `parkInferenceLoop` before the idle wait.
 pub fn tickInferenceLoop() void {
     const c = cluster();
+    const now: u64 = @intCast(crt.monotonicMs());
     _ = c.loop_ticks.fetchAdd(1, .monotonic);
+    c.loop_tick_ms.store(now, .release);
+    if (c.tp_link == null) return;
+    if (c.watchdog.in_flight.load(.acquire)) c.watchdog.progress(now) else c.watchdog.begin(now);
+}
+
+/// The loop is about to wait for work: nothing is in flight, and the wait itself ticks every 500 ms.
+pub fn parkInferenceLoop() void {
+    const c = cluster();
+    c.watchdog.done();
     c.loop_tick_ms.store(@intCast(crt.monotonicMs()), .release);
 }
 
@@ -1634,6 +1636,7 @@ fn sendAll(link: *const Link, m: Msg) void {
 fn dsv41TpLoad(id: u64, ids: []const u32, tensors: []const mlx.mlx_array) anyerror!void {
     const self = peer() orelse return error.DistWorkerNotJoined;
     if (!self.ready) try self.awaitReady();
+    cluster().watchdog.progress(@intCast(crt.monotonicMs()));
     const a = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
     const t0 = io_util.nowUsMonotonic(cluster().group.?.io);

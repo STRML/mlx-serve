@@ -155,6 +155,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                 if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) continue;
                 // No later tick runs while parked, so release here.
                 sleep_inhibit.setActive(holdsSleepWhileParked(sch));
+                distributed.parkInferenceLoop();
                 sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .boot } }) catch {};
                 break;
             }
@@ -222,9 +223,6 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         if (sw.read() > BUDGET_REVISE_WINDOW_NS) sch.budget_revise_sw = null;
         if (n_prefill > 0) reviseHotCacheBudgets(sch, true);
     }
-
-    const tp_step = (n_prefill > 0 or has_decode) and distributed.beginEngineStep();
-    defer if (tp_step) distributed.endEngineStep();
 
     // A batch admitted together prefills in order. A long cold prompt first would hold every short
     // request in the batch until it ends, and the chunk-boundary hook never sees them because
