@@ -4491,7 +4491,24 @@ pub fn routeFrom(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, logits: A, 
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, m.route_kernel, iv, cfg, sc.s));
     var idx = mlx.mlx_array_new();
     var wts = mlx.mlx_array_new();
-    return .{ .idx = try sc.res(mlx.mlx_vector_array_get(&idx, ov, 0), &idx), .wts = try sc.res(mlx.mlx_vector_array_get(&wts, ov, 1), &wts) };
+    const out: Routes = .{ .idx = try sc.res(mlx.mlx_vector_array_get(&idx, ov, 0), &idx), .wts = try sc.res(mlx.mlx_vector_array_get(&wts, ov, 1), &wts) };
+    if (std.c.getenv("DSV41_ROUTE_DUMP")) |dir| try dumpRoutes(std.mem.span(dir), ly.layer, out.idx, L, K);
+    return out;
+}
+
+/// Experiment only (plan 61c gate G3b, issue 61): with `DSV41_ROUTE_DUMP=<dir>` set, append every routing call's
+/// `[L, K]` u32 expert ids to `<dir>/route-L<layer>.u32` as a record `{L, K, ids...}`, so the expert-parallel MoE
+/// bench can replay real routing. It evaluates `idx` on the host, so it serializes the forward; never set it in serving.
+fn dumpRoutes(dir: []const u8, layer: usize, idx: A, L: usize, K: usize) !void {
+    try mlx.check(mlx.mlx_array_eval(idx));
+    const data = mlx.mlx_array_data_uint32(idx) orelse return;
+    var path_buf: [1024]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/route-L{d}.u32", .{ dir, layer }) catch return;
+    const f = std.c.fopen(path.ptr, "ab") orelse return;
+    defer _ = std.c.fclose(f);
+    const head = [2]u32{ @intCast(L), @intCast(K) };
+    _ = std.c.fwrite(&head, @sizeOf(u32), 2, f);
+    _ = std.c.fwrite(data, @sizeOf(u32), L * K, f);
 }
 
 /// The routed sum `y` (f32) plus the shared expert.
