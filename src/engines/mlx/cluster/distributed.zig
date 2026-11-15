@@ -50,7 +50,23 @@ pub const Config = struct {
     /// each worker dials rank 0's address on its own cable, so rank 0 listens on every address (`jacclCoordinator`).
     coordinator: []const u8,
     device: []const u8,
+    /// CLOCK_MONOTONIC ms (`crt.monotonicMs`) by which this rank's part of the group must form, bells included;
+    /// 0 gives `default_formation_ms` from the start of `Link.open`.
+    formation_deadline_ms: u64 = 0,
 };
+
+/// A formation's budget when the caller sets no deadline: a worker started a little before rank 0 still joins.
+const default_formation_ms: u64 = 10_000;
+
+fn formationDeadline(cfg: Config) u64 {
+    if (cfg.formation_deadline_ms != 0) return cfg.formation_deadline_ms;
+    return @as(u64, @intCast(crt.monotonicMs())) + default_formation_ms;
+}
+
+fn msLeft(deadline_ms: u64) u32 {
+    const now: u64 = @intCast(crt.monotonicMs());
+    return @intCast(@min(deadline_ms -| now, std.math.maxInt(u32)));
+}
 
 /// `cfg.device` as one entry per rank: a single device (a pair) faces the one peer.
 fn deviceList(cfg: Config, out: *[max_ranks][]const u8) ![]const []const u8 {
@@ -160,12 +176,14 @@ pub const Link = struct {
             rv.stop.store(true, .release);
             t.join();
         };
-        var to_host: Bell = if (cfg.rank == 0) .{} else Bell.connect(coord, cfg.rank);
+        const deadline = formationDeadline(cfg);
+        // A worker never runs bell-less: without the bell it has no heartbeat and no EOF to leave on when rank 0 dies.
+        var to_host: Bell = if (cfg.rank == 0) .{} else dialBell(coord, cfg.rank, deadline);
         errdefer if (to_host.open()) {
             _ = std.c.close(to_host.fd);
         };
-        if (cfg.size > 2 and cfg.rank != 0 and !to_host.open()) {
-            log.err("[dist] rank {d}: no bell connection to rank 0 at {s} (port + 1)\n", .{ cfg.rank, cfg.coordinator });
+        if (cfg.rank != 0 and !to_host.open()) {
+            log.err("[dist] rank {d}: no bell connection to rank 0 at {s} (port + 1) by the formation deadline\n", .{ cfg.rank, cfg.coordinator });
             return error.DistNoBell;
         }
         var g = mlx.mlx_distributed_group_new();
@@ -177,14 +195,11 @@ pub const Link = struct {
         var link: Link = .{ .group = g, .rank = @intCast(mlx.mlx_distributed_group_rank(g)), .size = @intCast(mlx.mlx_distributed_group_size(g)) };
         if (link.rank != cfg.rank or link.size != cfg.size) return error.RdmaGroupMismatch;
         if (link.rank != 0) {
-            // A worker started while rank 0 was down failed its first dial, and JACCL's own retries then met rank 0:
-            // rank 0 still files bells for 10 s after the group forms.
-            if (!to_host.open()) to_host = Bell.connect(coord, cfg.rank);
             link.bells[0] = to_host;
-            if (!to_host.open()) log.warn("[dist] no bell connection: this worker waits on the RDMA link, one core busy\n", .{});
+            to_host = .{};
         } else if (acceptor) |t| {
-            // Every worker dialed its bell before the group formed; a late one gets 10 s.
-            _ = rv.waitAll(10_000);
+            // Every worker dialed its bell before it joined JACCL; one still missing gets what is left of the deadline.
+            _ = rv.waitAll(msLeft(deadline));
             rv.stop.store(true, .release);
             t.join();
             acceptor = null;
@@ -193,12 +208,11 @@ pub const Link = struct {
         if (link.rank == 0) {
             var mb: [64]u8 = undefined;
             const missing = missingRanks(link.bellMask(), link.size, &mb);
-            if (missing.len > 0 and link.size > 2) {
-                log.err("[dist] no bell connection from rank {s}: is that worker an older mlx-serve?\n", .{missing});
+            if (missing.len > 0) {
+                log.err("[dist] no bell connection from rank {s} by the formation deadline: is that worker an older mlx-serve?\n", .{missing});
                 link.deinit();
                 return error.DistNoBell;
             }
-            if (missing.len > 0) log.warn("[dist] no bell connection: the worker waits on the RDMA link, one core busy\n", .{});
         }
         startWatchdog(&link);
         log.info("[dist] joined: rank {d} of {d}\n", .{ link.rank, link.size });
@@ -2138,6 +2152,50 @@ fn watchBells(link: *const Link, last_us: *u32) u32 {
             @atomicStore(u32, last_us, std.mem.readInt(u32, &x, .little), .release);
         }
     }
+}
+
+/// Dials rank 0's bell until it answers or `deadline_ms` (CLOCK_MONOTONIC) passes, waiting 20 ms and doubling to 1 s
+/// between tries as JACCL's connect does; a closed bell when the deadline passes first. A worker that starts a few ms
+/// before rank 0 listens joins instead of going on without a bell.
+fn dialBell(coord: Coordinator, rank: u32, deadline_ms: u64) Bell {
+    var wait: u32 = 20;
+    while (msLeft(deadline_ms) > 0) {
+        const b = Bell.connect(coord, rank);
+        if (b.open()) return b;
+        const left = msLeft(deadline_ms);
+        if (left <= wait) return .{};
+        crt.sleepMs(wait);
+        wait = @min(wait * 2, 1000);
+    }
+    return .{};
+}
+
+test "a worker whose bell is refused past the formation deadline gets no bell, near the deadline" {
+    const coord: Coordinator = .{ .ip4 = .{ 127, 0, 0, 1 }, .port = 46181 };
+    const t0 = crt.monotonicMs();
+    const b = dialBell(coord, 1, @as(u64, @intCast(t0)) + 300);
+    const took = crt.monotonicMs() - t0;
+    try std.testing.expect(!b.open());
+    try std.testing.expect(took >= 150 and took < 1500);
+}
+
+test "a worker that dials before rank 0 listens joins once the listener opens" {
+    const coord: Coordinator = .{ .ip4 = .{ 127, 0, 0, 1 }, .port = 46183 };
+    const Late = struct {
+        fn listenAfter(c: Coordinator, fd: *std.c.fd_t) void {
+            crt.sleepMs(120);
+            fd.* = Bell.listen(c, 1);
+        }
+    };
+    var listener: std.c.fd_t = Bell.none;
+    const t = try std.Thread.spawn(.{}, Late.listenAfter, .{ coord, &listener });
+    const b = dialBell(coord, 1, @as(u64, @intCast(crt.monotonicMs())) + 3000);
+    t.join();
+    defer if (listener != Bell.none) {
+        _ = std.c.close(listener);
+    };
+    try std.testing.expect(b.open());
+    _ = std.c.close(b.fd);
 }
 
 /// Waits on the bells for a worker to leave: a read returns only at its end.
