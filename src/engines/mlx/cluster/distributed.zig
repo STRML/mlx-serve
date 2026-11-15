@@ -55,6 +55,8 @@ pub const Config = struct {
     formation_deadline_ms: u64 = 0,
 };
 
+var jaccl_deadline_warned: std.atomic.Value(bool) = .init(false);
+
 /// A formation's budget when the caller sets no deadline: a worker started a little before rank 0 still joins.
 const default_formation_ms: u64 = 10_000;
 
@@ -186,6 +188,8 @@ pub const Link = struct {
             log.err("[dist] rank {d}: no bell connection to rank 0 at {s} (port + 1) by the formation deadline\n", .{ cfg.rank, cfg.coordinator });
             return error.DistNoBell;
         }
+        if (!mlx.jacclFormationDeadlineAvailable() and !jaccl_deadline_warned.swap(true, .acq_rel))
+            log.err("[dist] JACCL formation deadline unavailable: this libjaccl lacks jaccl_set_formation_deadline_ms (a stock MLX), so a missing peer blocks formation until the process dies\n", .{});
         mlx.setJacclFormationDeadline(deadline);
         defer mlx.setJacclFormationDeadline(0);
         var g = mlx.mlx_distributed_group_new();
@@ -1157,9 +1161,9 @@ pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
     if (peer()) |p| return clusterJson(allocator, p);
     const g = cluster().group orelse return allocator.dupe(u8, "");
     var mb: [64]u8 = undefined;
-    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":false,\"worker_ready\":false,\"worker_model\":\"{s}\",\"worker_gone\":{},\"size\":{d},\"missing_ranks\":\"{s}\",\"lost_rank\":{d}}}", .{
-        @tagName(g.mode),                                               std.json.fmt(std.fs.path.basename(g.model), .{}), cluster().joined.load(.acquire), workerCopyName(), worker_gone.load(.acquire), g.size,
-        missingRanks(cluster().bells_seen.load(.acquire), g.size, &mb), cluster().lost_rank.load(.acquire),
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":false,\"worker_ready\":false,\"worker_model\":\"{s}\",\"worker_gone\":{},\"size\":{d},\"missing_ranks\":\"{s}\",\"lost_rank\":{d},\"jaccl_deadline\":{}}}", .{
+        @tagName(g.mode),                                               std.json.fmt(std.fs.path.basename(g.model), .{}), cluster().joined.load(.acquire),       workerCopyName(), worker_gone.load(.acquire), g.size,
+        missingRanks(cluster().bells_seen.load(.acquire), g.size, &mb), cluster().lost_rank.load(.acquire),               mlx.jacclFormationDeadlineAvailable(),
     });
 }
 
@@ -1190,11 +1194,11 @@ fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
         try workers.writer.print("{s}{{\"rank\":{d},\"name\":{f},\"free_mib\":{d},\"total_mib\":{d},\"resident_mib\":{d},\"model\":\"{s}\"}}", .{ if (k > 1) "," else "", k, std.json.fmt(r.name(), .{}), r.hello.avail_mib, r.hello.total_mib, r.resident_mib, copyName(copies[k]) });
     }
     const w = p.worker();
-    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}],\"worker_model\":\"{s}\",\"worker_gone\":{},\"size\":{d},\"lost_rank\":{d},\"workers\":[{s}]}}", .{
+    return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}],\"worker_model\":\"{s}\",\"worker_gone\":{},\"size\":{d},\"lost_rank\":{d},\"jaccl_deadline\":{},\"workers\":[{s}]}}", .{
         @tagName(p.mode),                       std.json.fmt(std.fs.path.basename(p.model), .{}),                     cluster().joined.load(.acquire),  p.planned,               p.ready,           sp.total,                   sp.start,                          sp.end,
         if (p.mode == .pipeline) sp.end else 0, sp.total,                                                             if (p.shard) |sh| sh.size else 0, w.hello.avail_mib,       w.hello.total_mib, p.exchanges,                std.json.fmt(p.workerName(), .{}), speed,
         p.link_bytes_per_us / 1000,             std.json.fmt(cluster().last_job_buf[0..cluster().last_job_len], .{}), cluster().last_split[0],          cluster().last_split[1], workerCopyName(),  worker_gone.load(.acquire), p.link.size,                       cluster().lost_rank.load(.acquire),
-        workers.written(),
+        mlx.jacclFormationDeadlineAvailable(),  workers.written(),
     });
 }
 
@@ -2631,6 +2635,7 @@ fn chainProbe(io: std.Io, link: *const Link, s: mlx.mlx_stream) !void {
 /// joins the group and measures round trips at the sizes inference moves
 /// (one decode row of a hyper-connection stream, a prefill chunk) and all_sum.
 pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
+    log.info("[dist-probe] jaccl formation deadline: {s}\n", .{if (mlx.jacclFormationDeadlineAvailable()) "available" else "missing"});
     // `--soak N`: N header + one-row-stream round trips, the shape of a pipeline decode hop.
     var soak: u64 = 0;
     var relink: u64 = 0;
