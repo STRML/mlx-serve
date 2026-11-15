@@ -2632,8 +2632,10 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     log.info("[dist-probe] done\n", .{});
 }
 
-/// `--relink N`: open the group, check one all_sum, free it, and open it again in the same process, N times.
-/// Answers whether a live layout switch can form a group at switch time (plan 61c, gate G2) and what it costs.
+/// `--relink N`: open the group, check one all_sum, free it, drop MLX's cached group, and open it again in the same
+/// process, N times. MLX caches each backend's group, so without the clear every open after the first got the same
+/// group back and formed nothing. Answers whether a live layout switch can form a group at switch time (plan 61c,
+/// gate G2b) and what it costs; each cycle's line carries the wall clock so a harness can line it up with its samples.
 fn relinkProbe(io: std.Io, cfg: Config, n: u64) !void {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -2661,11 +2663,23 @@ fn relinkProbe(io: std.Io, cfg: Config, n: u64) !void {
         _ = mlx.mlx_array_free(r);
         const sum_us = sw_sum.read() / std.time.ns_per_us;
         var sw_free = io_util.Stopwatch.init(io);
+        drainProbeStreams();
         link.deinit();
+        try mlx.check(mlx.mlx_distributed_clear_backends());
         const free_us = sw_free.read() / std.time.ns_per_us;
-        log.info("[dist-probe] relink {d}: open {d} us, first all_sum {d} us (check {d} == {d}), free {d} us\n", .{ k, open_us, sum_us, v, 10240 * cfg.size, free_us });
+        log.info("[dist-probe] relink {d}: epoch_ms {d} open {d} us, first all_sum {d} us (check {d} == {d}), free {d} us\n", .{ k, crt.wallMs(), open_us, sum_us, v, 10240 * cfg.size, free_us });
     }
     log.info("[dist-probe] relink: {d} cycles clean\n", .{n});
+}
+
+/// Waits out every stream, so no collective is still queued on a group about to be freed.
+fn drainProbeStreams() void {
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    _ = mlx.mlx_synchronize(cpu);
+    const gpu = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(gpu);
+    _ = mlx.mlx_synchronize(gpu);
 }
 
 /// `--sums N`: N back-to-back all_sums of a decode-row-sized tensor, the shape of a TP decode step. Kill one rank
