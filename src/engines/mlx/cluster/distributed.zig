@@ -2258,7 +2258,7 @@ fn watchHost(b: Bell) void {
             @backingInt(std.c.E.BADF), @backingInt(std.c.E.NOTSOCK) => return,
             else => break,
         };
-        if (n == 0) break;
+        if (n == 0 or dist_watchdog.tcpPeerGone(b.fd)) break;
         crt.sleepMs(20); // a ring the inference thread has yet to read
     }
     followerExit(.eof);

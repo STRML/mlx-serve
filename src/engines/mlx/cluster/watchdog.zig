@@ -37,6 +37,18 @@ pub fn loopAlive(now_ms: u64, last_tick_ms: u64, in_flight: bool, limit_ms: u64)
 
 pub const BellFailure = enum { timeout, eof };
 
+/// The peer of a TCP socket has closed or reset it, read from the kernel's connection state (macOS
+/// `TCP_CONNECTION_INFO`), so an EOF queued behind bytes nobody has read still counts. False when the state is unknown.
+pub fn tcpPeerGone(fd: std.c.fd_t) bool {
+    if (comptime @import("builtin").os.tag != .macos) return false;
+    const tcp_connection_info: c_int = 0x106;
+    const tcps_established: u8 = 4;
+    var info: [256]u8 align(8) = undefined;
+    var len: std.c.socklen_t = info.len;
+    if (std.c.getsockopt(fd, std.posix.IPPROTO.TCP, tcp_connection_info, &info, &len) != 0 or len == 0) return false;
+    return info[0] != tcps_established;
+}
+
 pub fn setBellTimeout(fd: std.c.fd_t, ms: u32) void {
     const timeout = std.c.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
     _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout, @sizeOf(@TypeOf(timeout)));
@@ -131,4 +143,29 @@ test "a follower bell waits through the idle timeout before ready" {
     var byte: u8 = undefined;
     const n = std.c.read(pair[0], @ptrCast(&byte), 1);
     try std.testing.expectEqual(BellFailure.timeout, classifyBellFailure(n, std.c._errno().*, @backingInt(std.c.E.INTR), @backingInt(std.c.E.AGAIN)).?);
+}
+
+test "a TCP peer that closed reads as gone even with its last bytes unread" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const posix = std.posix;
+    const lst = std.c.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer _ = std.c.close(lst);
+    var addr = std.c.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    try std.testing.expectEqual(@as(c_int, 0), std.c.bind(lst, @ptrCast(&addr), @sizeOf(@TypeOf(addr))));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.listen(lst, 1));
+    var alen: std.c.socklen_t = @sizeOf(@TypeOf(addr));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(lst, @ptrCast(&addr), &alen));
+    const cli = std.c.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    defer _ = std.c.close(cli);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.connect(cli, @ptrCast(&addr), @sizeOf(@TypeOf(addr))));
+    const srv = std.c.accept(lst, null, null);
+    try std.testing.expect(srv >= 0);
+    try std.testing.expect(!tcpPeerGone(cli));
+    try std.testing.expectEqual(@as(isize, 1), std.c.write(srv, &[_]u8{5}, 1));
+    _ = std.c.close(srv);
+    var none: [0]posix.pollfd = .{};
+    var tries: usize = 0;
+    while (!tcpPeerGone(cli) and tries < 100) : (tries += 1) _ = std.c.poll(&none, 0, 1);
+    try std.testing.expect(tcpPeerGone(cli));
 }
