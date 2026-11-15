@@ -4492,13 +4492,22 @@ pub fn routeFrom(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, logits: A, 
     var idx = mlx.mlx_array_new();
     var wts = mlx.mlx_array_new();
     const out: Routes = .{ .idx = try sc.res(mlx.mlx_vector_array_get(&idx, ov, 0), &idx), .wts = try sc.res(mlx.mlx_vector_array_get(&wts, ov, 1), &wts) };
-    if (std.c.getenv("DSV41_ROUTE_DUMP")) |dir| try dumpRoutes(std.mem.span(dir), ly.layer, out.idx, L, K);
+    if (std.c.getenv("DSV41_ROUTE_DUMP")) |dir| try dumpRoutes(std.mem.span(dir), layerIndex(m, ly), out.idx, L, K);
     return out;
 }
 
 /// Experiment only (plan 61c gate G3b, issue 61): with `DSV41_ROUTE_DUMP=<dir>` set, append every routing call's
 /// `[L, K]` u32 expert ids to `<dir>/route-L<layer>.u32` as a record `{L, K, ids...}`, so the expert-parallel MoE
 /// bench can replay real routing. It evaluates `idx` on the host, so it serializes the forward; never set it in serving.
+/// `ly`'s position in `m.layers`, or 1000 for a layer outside it (a DSpark stage).
+fn layerIndex(m: *const Dsv41Model, ly: *const Layer) usize {
+    const base = @intFromPtr(m.layers.ptr);
+    const at = @intFromPtr(ly);
+    if (at < base) return 1000;
+    const i = (at - base) / @sizeOf(Layer);
+    return if (i < m.layers.len) i else 1000;
+}
+
 fn dumpRoutes(dir: []const u8, layer: usize, idx: A, L: usize, K: usize) !void {
     try mlx.check(mlx.mlx_array_eval(idx));
     const data = mlx.mlx_array_data_uint32(idx) orelse return;
