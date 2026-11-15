@@ -41,6 +41,7 @@ const distributed = @import("cluster/distributed.zig");
 fn waitForDiskRetryLocked(sch: *Scheduler, ms: u32) void {
     if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) return;
     sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .boot } }) catch {};
+    distributed.tickInferenceLoop();
 }
 
 const ChatPassMode = enum { main, yield };
@@ -154,7 +155,8 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                 if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) continue;
                 // No later tick runs while parked, so release here.
                 sleep_inhibit.setActive(holdsSleepWhileParked(sch));
-                sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
+                sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .boot } }) catch {};
+                break;
             }
             // Hold until the loop parks again.
             if (!sch.shutdown.load(.acquire)) sleep_inhibit.setActive(true);

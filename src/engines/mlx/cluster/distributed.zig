@@ -942,6 +942,8 @@ const ClusterState = struct {
     worker_us: std.atomic.Value(u32) = .init(0),
     /// Receives from the worker in progress on the inference thread (`queuedRecv`).
     recvs: std.atomic.Value(u32) = .init(0),
+    loop_ticks: std.atomic.Value(u64) = .init(0),
+    loop_tick_ms: std.atomic.Value(u64) = .init(0),
     watchdog: dist_watchdog.State = .{},
     watchdog_started: std.atomic.Value(bool) = .init(false),
     watchdog_stop: std.atomic.Value(bool) = .init(false),
@@ -970,6 +972,12 @@ pub fn endEngineStep() void {
     cluster().watchdog.done();
 }
 
+pub fn tickInferenceLoop() void {
+    const c = cluster();
+    _ = c.loop_ticks.fetchAdd(1, .monotonic);
+    c.loop_tick_ms.store(@intCast(crt.monotonicMs()), .release);
+}
+
 const Heartbeat = struct { state: *ClusterState, bells: [max_ranks]Bell, size: u32, interval_ms: u32 };
 
 fn heartbeatLoop(h: Heartbeat) void {
@@ -977,17 +985,27 @@ fn heartbeatLoop(h: Heartbeat) void {
         crt.sleepMs(h.interval_ms);
         if (h.state.watchdog_stop.load(.acquire)) return;
         if (!h.state.heartbeat_active.load(.acquire)) continue;
+        const now_ms: u64 = @intCast(crt.monotonicMs());
+        if (!dist_watchdog.loopAlive(now_ms, h.state.loop_tick_ms.load(.acquire), h.state.watchdog.in_flight.load(.acquire), 1_000)) continue;
         for (1..h.size) |rank| if (h.bells[rank].open()) {
             h.bells[rank].writeAll(&.{Bell.heartbeat_byte}) catch {};
         };
     }
 }
 
-fn watchdogLoop(c: *ClusterState, deadline_ms: u64) void {
+fn watchdogLoop(c: *ClusterState, deadline_ms: u64, leader: bool) void {
     while (true) {
         crt.sleepMs(250);
         if (c.watchdog_stop.load(.acquire)) return;
-        const waited = c.watchdog.stalledMs(@intCast(crt.monotonicMs()), deadline_ms) orelse continue;
+        const now_ms: u64 = @intCast(crt.monotonicMs());
+        const last_tick_ms = c.loop_tick_ms.load(.acquire);
+        const in_flight = c.watchdog.in_flight.load(.acquire);
+        if (leader and !dist_watchdog.loopAlive(now_ms, last_tick_ms, in_flight, @as(u64, idleTimeoutMs()))) {
+            log.err("[dist-watchdog] leader loop stalled: waited_ms={d}; this rank exits\n", .{now_ms -| last_tick_ms});
+            log.syncFile();
+            std.c._exit(1);
+        }
+        const waited = c.watchdog.stalledMs(now_ms, deadline_ms) orelse continue;
         log.err("[dist-watchdog] stall: step={d} waited_ms={d}; this rank exits\n", .{ c.watchdog.step.load(.monotonic), waited });
         log.syncFile();
         std.c._exit(1);
@@ -998,7 +1016,7 @@ fn startWatchdog(link: *const Link) void {
     const c = cluster();
     if (c.watchdog_started.swap(true, .acq_rel)) return;
     const deadline: u64 = env.intValue(u32, env.get(.MLX_SERVE_DIST_STALL_MS), 30_000);
-    const watcher = std.Thread.spawn(.{ .stack_size = 1 << 16 }, watchdogLoop, .{ c, deadline }) catch {
+    const watcher = std.Thread.spawn(.{ .stack_size = 1 << 16 }, watchdogLoop, .{ c, deadline, link.rank == 0 and link.size > 1 }) catch {
         log.err("[dist-watchdog] cannot start watchdog thread\n", .{});
         log.syncFile();
         std.c._exit(1);

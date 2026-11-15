@@ -31,6 +31,10 @@ pub const State = struct {
     }
 };
 
+pub fn loopAlive(now_ms: u64, last_tick_ms: u64, in_flight: bool, limit_ms: u64) bool {
+    return in_flight or now_ms -| last_tick_ms <= limit_ms;
+}
+
 pub const BellFailure = enum { timeout, eof };
 
 pub fn setBellTimeout(fd: std.c.fd_t, ms: u32) void {
@@ -57,6 +61,15 @@ test "a step in flight past the deadline is a stall; idle and finished steps are
     try std.testing.expectEqual(@as(?u64, null), s.stalledMs(10_000, 10));
     s.begin(10_000);
     try std.testing.expectEqual(@as(u64, 2), s.step.load(.monotonic));
+}
+
+test "idle loop ticks keep the heartbeat alive, stale idle trips, and a step keeps it alive" {
+    for (1..9) |tick| {
+        const now_ms: u64 = tick * 500;
+        try std.testing.expect(loopAlive(now_ms + 1_000, now_ms, false, 1_000));
+    }
+    try std.testing.expect(!loopAlive(7_001, 4_000, false, 3_000));
+    try std.testing.expect(loopAlive(20_000, 4_000, true, 1_000));
 }
 
 test "a step of many forwards survives while each forward is within the deadline; a hung forward fires" {

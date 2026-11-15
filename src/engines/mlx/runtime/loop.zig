@@ -36,6 +36,7 @@ const ThreadCtx = @import("thread.zig").ThreadCtx;
 const signalStarted = @import("thread.zig").signalStarted;
 const recordLoadError = @import("thread.zig").recordLoadError;
 const runGenRequests = @import("media_runner.zig").runGenRequests;
+const distributed = @import("../cluster/distributed.zig");
 
 pub fn hasWorkPendingLocked(sch: *const Scheduler) bool {
     return sch.pending.items.len > 0 or
@@ -93,6 +94,7 @@ pub fn inferenceLoop(ctx: ThreadCtx) void {
     }
 
     while (!sch.shutdown.load(.acquire)) {
+        distributed.tickInferenceLoop();
         // Phase D: cold-load drain. Process ONE load per tick — loading a
         // model is heavy (~seconds; weight read + JIT compile + warmup)
         // and we want the rest of the inference loop to stay responsive.
