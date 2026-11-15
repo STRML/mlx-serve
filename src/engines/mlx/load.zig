@@ -57,6 +57,7 @@ const preflightVerdict = @import("runtime/preflight.zig").preflightVerdict;
 const mlxActiveBytes = @import("runtime/preflight.zig").mlxActiveBytes;
 const loadRequirementBytes = @import("runtime/preflight.zig").loadRequirementBytes;
 const scheduler_mod = @import("scheduler.zig");
+const load_lock = @import("load_lock.zig");
 
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
 /// mlx ops here bind to this thread's GPU stream from t0; subsequent
@@ -97,6 +98,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const scanned = try residentModelDiskBytes(sch.allocator, sch.io, params.model_dir, params.config);
         break :blk residentGateBytes(scanned, params.entry.bytes_on_disk, true).?;
     };
+    var load_guard = try load_lock.Lock.acquire(load_lock.pathFromOverride(env.span(.MLX_SERVE_LOAD_LOCK)));
+    defer load_guard.release();
 
     // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup
     // is thrown by MLX as a C++ exception that can't be caught across the C ABI,
