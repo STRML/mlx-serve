@@ -2636,6 +2636,8 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     var relink: u64 = 0;
     var sums: u64 = 0;
     var chain = false;
+    // `--formation-ms M`: each open must form within M ms (Config.formation_deadline_ms), bells and JACCL alike.
+    var formation_ms: u64 = 0;
     var rest: [16][]const u8 = undefined;
     var n_rest: usize = 0;
     var ai: usize = 0;
@@ -2649,6 +2651,9 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, args[ai], "--sums") and ai + 1 < args.len) {
             sums = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
             ai += 1;
+        } else if (std.mem.eql(u8, args[ai], "--formation-ms") and ai + 1 < args.len) {
+            formation_ms = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
+            ai += 1;
         } else if (std.mem.eql(u8, args[ai], "--chain")) {
             chain = true;
         } else if (n_rest < rest.len) {
@@ -2657,7 +2662,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         }
     }
     const cfg = try parseArgs(rest[0..n_rest]);
-    if (relink > 0) return relinkProbe(io, cfg, relink);
+    if (relink > 0) return relinkProbe(io, cfg, relink, formation_ms);
     if (sums > 0) return sumLoop(io, cfg, sums);
     var link = try Link.open(io, cfg);
     defer link.deinit();
@@ -2738,7 +2743,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
 /// process, N times. MLX caches each backend's group, so without the clear every open after the first got the same
 /// group back and formed nothing. Answers whether a live layout switch can form a group at switch time (plan 61c,
 /// gate G2b) and what it costs; each cycle's line carries the wall clock so a harness can line it up with its samples.
-fn relinkProbe(io: std.Io, cfg: Config, n: u64) !void {
+fn relinkProbe(io: std.Io, cfg: Config, n: u64, formation_ms: u64) !void {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const shape = [_]c_int{10240};
@@ -2749,7 +2754,9 @@ fn relinkProbe(io: std.Io, cfg: Config, n: u64) !void {
     var k: u64 = 0;
     while (k < n) : (k += 1) {
         var sw_open = io_util.Stopwatch.init(io);
-        var link = Link.open(io, cfg) catch |e| {
+        var c = cfg;
+        if (formation_ms > 0) c.formation_deadline_ms = @as(u64, @intCast(crt.monotonicMs())) + formation_ms;
+        var link = Link.open(io, c) catch |e| {
             log.err("[dist-probe] relink {d}: open failed: {s}\n", .{ k, @errorName(e) });
             return e;
         };
