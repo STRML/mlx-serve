@@ -4517,8 +4517,8 @@ fn dumpRoutes(dir: []const u8, layer: usize, idx: A, L: usize, K: usize) !void {
     const f = std.c.fopen(path_buf[0..len :0], "ab") orelse return;
     defer _ = std.c.fclose(f);
     const head = [2]u32{ @intCast(L), @intCast(K) };
-    _ = std.c.fwrite(&head, @sizeOf(u32), 2, f);
-    _ = std.c.fwrite(data, @sizeOf(u32), L * K, f);
+    _ = std.c.fwrite(std.mem.asBytes(&head).ptr, 1, @sizeOf(@TypeOf(head)), f);
+    _ = std.c.fwrite(@as([*]const u8, @ptrCast(data)), 1, L * K * @sizeOf(u32), f);
 }
 
 /// The routed sum `y` (f32) plus the shared expert.
