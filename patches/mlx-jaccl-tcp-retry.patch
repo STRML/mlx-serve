@@ -146,7 +146,7 @@
      sockets_.push_back(
          TCPSocket::connect(
 -            IBV_TAG, address, 4, 1000, [](int attempt, int wait) {
-+            IBV_TAG, address, 4, 20, [](int attempt, int wait) {
++            IBV_TAG, address, 20, 20, [](int attempt, int wait) {
                std::cerr << IBV_TAG << " Connection attempt " << attempt
                          << " waiting " << wait << " ms" << std::endl;
              }));
