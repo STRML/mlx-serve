@@ -2381,6 +2381,7 @@ fn chainProbe(io: std.Io, link: *const Link, s: mlx.mlx_stream) !void {
 pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     // `--soak N`: N header + one-row-stream round trips, the shape of a pipeline decode hop.
     var soak: u64 = 0;
+    var relink: u64 = 0;
     var chain = false;
     var rest: [16][]const u8 = undefined;
     var n_rest: usize = 0;
@@ -2388,6 +2389,9 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     while (ai < args.len) : (ai += 1) {
         if (std.mem.eql(u8, args[ai], "--soak") and ai + 1 < args.len) {
             soak = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
+            ai += 1;
+        } else if (std.mem.eql(u8, args[ai], "--relink") and ai + 1 < args.len) {
+            relink = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
             ai += 1;
         } else if (std.mem.eql(u8, args[ai], "--chain")) {
             chain = true;
@@ -2397,6 +2401,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         }
     }
     const cfg = try parseArgs(rest[0..n_rest]);
+    if (relink > 0) return relinkProbe(io, cfg, relink);
     var link = try Link.open(io, cfg);
     defer link.deinit();
     const s = mlx.mlx_default_gpu_stream_new();
@@ -2470,6 +2475,42 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         log.info("[dist-probe] all_sum bf16 {d:>9} B: mean {d:>9.1} us (sum check {d} == {d})\n", .{ n * 2, @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(iters)) / 1000.0, v, n * @as(c_int, @intCast(link.size)) });
     }
     log.info("[dist-probe] done\n", .{});
+}
+
+/// `--relink N`: open the group, check one all_sum, free it, and open it again in the same process, N times.
+/// Answers whether a live layout switch can form a group at switch time (plan 61c, gate G2) and what it costs.
+fn relinkProbe(io: std.Io, cfg: Config, n: u64) !void {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const shape = [_]c_int{10240};
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_ones(&x, &shape, 1, .float32, s));
+    defer _ = mlx.mlx_array_free(x);
+    try evalOne(x);
+    var k: u64 = 0;
+    while (k < n) : (k += 1) {
+        var sw_open = io_util.Stopwatch.init(io);
+        var link = Link.open(io, cfg) catch |e| {
+            log.err("[dist-probe] relink {d}: open failed: {s}\n", .{ k, @errorName(e) });
+            return e;
+        };
+        const open_us = sw_open.read() / std.time.ns_per_us;
+        var sw_sum = io_util.Stopwatch.init(io);
+        const r = try link.allSum(x);
+        try evalOne(r);
+        var v: f32 = 0;
+        var total = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_sum(&total, r, false, s));
+        try mlx.check(mlx.mlx_array_item_float32(&v, total));
+        _ = mlx.mlx_array_free(total);
+        _ = mlx.mlx_array_free(r);
+        const sum_us = sw_sum.read() / std.time.ns_per_us;
+        var sw_free = io_util.Stopwatch.init(io);
+        link.deinit();
+        const free_us = sw_free.read() / std.time.ns_per_us;
+        log.info("[dist-probe] relink {d}: open {d} us, first all_sum {d} us (check {d} == {d}), free {d} us\n", .{ k, open_us, sum_us, v, 10240 * cfg.size, free_us });
+    }
+    log.info("[dist-probe] relink: {d} cycles clean\n", .{n});
 }
 
 fn soakLink(io: std.Io, link: *const Link, other: u32, n: u64, s: mlx.mlx_stream) !void {
