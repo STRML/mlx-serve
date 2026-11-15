@@ -157,6 +157,8 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                 sleep_inhibit.setActive(holdsSleepWhileParked(sch));
                 distributed.parkInferenceLoop();
                 sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .boot } }) catch {};
+                // A request that woke the wait is served in this same iteration: reopen the watched step for it.
+                distributed.tickInferenceLoop();
                 break;
             }
             // Hold until the loop parks again.
