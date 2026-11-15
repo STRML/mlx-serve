@@ -875,6 +875,9 @@ pub const Peer = struct {
                 },
             }
         }
+        // The leader self-check and the heartbeat gate start at the first loop tick after this: the model load that got
+        // here ran inside a loop iteration that had already ticked, with no watched step.
+        cluster().loop_tick_ms.store(0, .release);
         cluster().heartbeat_active.store(true, .release);
         self.ready = true;
     }
@@ -1005,7 +1008,8 @@ fn watchdogLoop(c: *ClusterState, deadline_ms: u64, leader: bool) void {
         const now_ms: u64 = @intCast(crt.monotonicMs());
         const last_tick_ms = c.loop_tick_ms.load(.acquire);
         const in_flight = c.watchdog.in_flight.load(.acquire);
-        if (leader and !dist_watchdog.loopAlive(now_ms, last_tick_ms, in_flight, @as(u64, idleTimeoutMs()))) {
+        const ready = c.heartbeat_active.load(.acquire);
+        if (leader and ready and !dist_watchdog.loopAlive(now_ms, last_tick_ms, in_flight, @as(u64, idleTimeoutMs()))) {
             log.err("[dist-watchdog] leader loop stalled: waited_ms={d}; this rank exits\n", .{now_ms -| last_tick_ms});
             log.syncFile();
             std.c._exit(1);

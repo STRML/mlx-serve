@@ -116,6 +116,16 @@ test "a leader still loading (no tick yet) is alive however long the load takes;
     try std.testing.expect(loopAlive(602_000, 600_000, false, 3_000));
 }
 
+test "the real order: tick, a long load that ends with the group ready (clock reset), a quiet gap, then a tick" {
+    var last_tick: u64 = 1_000;
+    try std.testing.expect(loopAlive(1_500, last_tick, false, 3_000));
+    last_tick = 0;
+    try std.testing.expect(loopAlive(400_000, last_tick, false, 3_000));
+    last_tick = 405_000;
+    try std.testing.expect(loopAlive(407_000, last_tick, false, 3_000));
+    try std.testing.expect(!loopAlive(409_000, last_tick, false, 3_000));
+}
+
 test "a bell read: timeout and EOF end the follower, data and EINTR do not" {
     try std.testing.expectEqual(BellFailure.timeout, classifyBellFailure(-1, 11, 4, 11).?);
     try std.testing.expectEqual(BellFailure.eof, classifyBellFailure(0, 0, 4, 11).?);
