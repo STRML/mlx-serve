@@ -10,11 +10,6 @@ const v1_spec_bytes = 56;
 const v2_spec_bytes = 64;
 const magic_v1 = "DV41A001";
 const magic_v2 = "DV41A002";
-// SSD restores measured 2026-11-14 (M5 Ultra): footprint high-water = loaded + destination + a transient of
-// 0.53-0.59 x destination (tokens: loaded / destination / measured bytes):
-// 32,791: 111,444,060 / 137,672,540 / 321,896,520; 131,095: 426,410,076 / 531,281,756 / 1,267,482,912;
-// 262,167: 846,364,764 / 1,056,094,044 / 2,524,856,896. Peak = 1.10 x (loaded + 1.6 x destination): the transient is
-// charged to destination, which a packed (smaller) loaded size does not shrink. 1M is unmeasured.
 const import_peak_loaded_pct: u64 = 110;
 const import_peak_destination_pct: u64 = 176;
 
