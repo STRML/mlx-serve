@@ -4512,8 +4512,9 @@ fn dumpRoutes(dir: []const u8, layer: usize, idx: A, L: usize, K: usize) !void {
     try mlx.check(mlx.mlx_array_eval(idx));
     const data = mlx.mlx_array_data_uint32(idx) orelse return;
     var path_buf: [1024]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/route-L{d}.u32", .{ dir, layer }) catch return;
-    const f = std.c.fopen(path.ptr, "ab") orelse return;
+    const len = (std.fmt.bufPrint(path_buf[0 .. path_buf.len - 1], "{s}/route-L{d}.u32", .{ dir, layer }) catch return).len;
+    path_buf[len] = 0;
+    const f = std.c.fopen(path_buf[0..len :0], "ab") orelse return;
     defer _ = std.c.fclose(f);
     const head = [2]u32{ @intCast(L), @intCast(K) };
     _ = std.c.fwrite(&head, @sizeOf(u32), 2, f);
