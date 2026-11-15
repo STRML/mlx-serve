@@ -443,14 +443,14 @@ fn followerExit(reason: dist_watchdog.BellFailure) noreturn {
 }
 
 /// Writes the `[dist-exit]` record (fsynced), without exiting: for a path that leaves through `main`.
-fn noteDistExit(cause: dist_watchdog.ExitCause, peer: ?u32, waited_ms: ?u64) void {
+fn noteDistExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64) void {
     var buf: [160]u8 = undefined;
-    log.err("{s}", .{dist_watchdog.exitRecord(&buf, crt.wallMs(), cause, peer, cluster().watchdog.step.load(.monotonic), waited_ms)});
+    log.err("{s}", .{dist_watchdog.exitRecord(&buf, crt.wallMs(), cause, peer_rank, cluster().watchdog.step.load(.monotonic), waited_ms)});
     log.syncFile();
 }
 
-fn distExit(cause: dist_watchdog.ExitCause, peer: ?u32, waited_ms: ?u64) noreturn {
-    noteDistExit(cause, peer, waited_ms);
+fn distExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64) noreturn {
+    noteDistExit(cause, peer_rank, waited_ms);
     std.c._exit(1);
 }
 
