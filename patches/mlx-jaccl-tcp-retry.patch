@@ -1,0 +1,152 @@
+--- a/mlx/distributed/jaccl/lib/jaccl/tcp.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/tcp.cpp
+@@ -1,6 +1,11 @@
+ // Copyright © 2025 Apple Inc.
+ 
+ #include <netdb.h>
++#include <algorithm>
++#include <poll.h>
++#include <ifaddrs.h>
++#include <netinet/in.h>
++#include <cerrno>
+ #include <unistd.h>
+ #include <cstring>
+ #include <sstream>
+@@ -10,6 +15,48 @@
+ 
+ namespace jaccl {
+ 
++// jaccl-tcp-patch v2: bind to the local IPv4 address that shares the destination's subnet, so the connect uses that
++// interface's scoped route. No match leaves the socket unbound.
++static void bind_to_subnet(int sock, const address_t& addr) {
++  if (addr.addr.ss_family != AF_INET) return;
++  auto dst = reinterpret_cast<const sockaddr_in*>(&addr.addr)->sin_addr.s_addr;
++  struct ifaddrs* list = nullptr;
++  if (getifaddrs(&list) != 0) return;
++  for (auto* ifa = list; ifa != nullptr; ifa = ifa->ifa_next) {
++    if (ifa->ifa_addr == nullptr || ifa->ifa_netmask == nullptr || ifa->ifa_addr->sa_family != AF_INET) continue;
++    auto local = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr)->sin_addr.s_addr;
++    auto mask = reinterpret_cast<sockaddr_in*>(ifa->ifa_netmask)->sin_addr.s_addr;
++    if (mask == 0 || (local & mask) != (dst & mask)) continue;
++    sockaddr_in src = {};
++    src.sin_family = AF_INET;
++    src.sin_addr.s_addr = local;
++    ::bind(sock, reinterpret_cast<sockaddr*>(&src), sizeof(src));
++    break;
++  }
++  freeifaddrs(list);
++}
++
++// jaccl-tcp-patch: a connect a signal interrupted is still in progress; wait for it rather than abandon it.
++static int finish_connect(int sock) {
++  struct pollfd p = {sock, POLLOUT, 0};
++  int r;
++  do {
++    r = poll(&p, 1, 10000);
++  } while (r < 0 && errno == EINTR);
++  if (r <= 0) {
++    if (r == 0) errno = ETIMEDOUT;
++    return -1;
++  }
++  int err = 0;
++  socklen_t len = sizeof(err);
++  if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0) return -1;
++  if (err != 0) {
++    errno = err;
++    return -1;
++  }
++  return 0;
++}
++
+ /**
+  * Parse a sockaddr from an ip and port provided as strings.
+  */
+@@ -115,7 +162,7 @@
+   }
+ 
+   // Prepare waiting for connections
+-  success = ::listen(sock_, 0);
++  success = ::listen(sock_, 16);
+   if (success < 0) {
+     std::ostringstream msg;
+     msg << tag << " Couldn't listen (error: " << errno << ")";
+@@ -124,7 +171,10 @@
+ }
+ 
+ TCPSocket TCPSocket::accept(const char* tag) {
+-  int peer = ::accept(sock_, nullptr, nullptr);
++  int peer;
++  do {
++    peer = ::accept(sock_, nullptr, nullptr);
++  } while (peer < 0 && errno == EINTR);
+   if (peer < 0) {
+     std::ostringstream msg;
+     msg << tag << " Accept failed (error: " << errno << ")";
+@@ -137,6 +187,7 @@
+ void TCPSocket::send(const char* tag, const void* data, size_t len) {
+   while (len > 0) {
+     auto n = ::send(sock_, data, len, 0);
++    if (n < 0 && errno == EINTR) continue;
+     if (n <= 0) {
+       std::ostringstream msg;
+       msg << tag << " Send failed with errno=" << errno;
+@@ -150,6 +201,7 @@
+ void TCPSocket::recv(const char* tag, void* data, size_t len) {
+   while (len > 0) {
+     auto n = ::recv(sock_, data, len, 0);
++    if (n < 0 && errno == EINTR) continue;
+     if (n <= 0) {
+       std::ostringstream msg;
+       msg << tag << " Recv failed with errno=" << errno;
+@@ -166,7 +218,7 @@
+     int num_retries,
+     int wait,
+     std::function<void(int, int)> cb) {
+-  int sock, success;
++  int sock, success, last_errno = 0;
+ 
+   // Attempt to connect `num_retries` times with exponential backoff.
+   for (int attempt = 0; attempt < num_retries; attempt++) {
+@@ -179,10 +231,16 @@
+       throw std::runtime_error(msg.str());
+     }
+ 
++    bind_to_subnet(sock, addr);
+     success = ::connect(sock, addr.get(), addr.len);
++    if (success < 0 && errno == EINTR) {
++      success = finish_connect(sock);
++    }
+     if (success == 0) {
+       break;
+     }
++    last_errno = errno;
++    close(sock);
+ 
+     if (cb != nullptr) {
+       cb(attempt, wait);
+@@ -191,12 +249,12 @@
+       std::this_thread::sleep_for(std::chrono::milliseconds(wait));
+     }
+ 
+-    wait <<= 1;
++    wait = std::min(wait * 2, 1000);
+   }
+ 
+   if (success < 0) {
+     std::ostringstream msg;
+-    msg << tag << " Couldn't connect (error: " << errno << ")";
++    msg << tag << " Couldn't connect (error: " << last_errno << ")";
+     throw std::runtime_error(msg.str());
+   }
+ 
+--- a/mlx/distributed/jaccl/lib/jaccl/rdma.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/rdma.cpp
+@@ -384,7 +384,7 @@
+   } else {
+     sockets_.push_back(
+         TCPSocket::connect(
+-            IBV_TAG, address, 4, 1000, [](int attempt, int wait) {
++            IBV_TAG, address, 4, 20, [](int attempt, int wait) {
+               std::cerr << IBV_TAG << " Connection attempt " << attempt
+                         << " waiting " << wait << " ms" << std::endl;
+             }));

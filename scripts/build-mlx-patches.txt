@@ -3,4 +3,5 @@
 lib/mlxc-src patches/mlxc-gather-qmm-global-scale.patch
 lib/mlx-src patches/mlx-jaccl-group-abort.patch
 lib/mlx-src patches/mlx-jaccl-ordered-rs.patch
+lib/mlx-src patches/mlx-jaccl-tcp-retry.patch
 lib/mlxc-src patches/mlxc-group-abort.patch

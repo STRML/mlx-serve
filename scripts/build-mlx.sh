@@ -76,11 +76,14 @@ echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT"
 
 NCPU="$(sysctl -n hw.ncpu)"
 
-# The files a patch touches are reset first, so an edited patch replaces the old one; local edits anywhere else in the
-# submodule are kept.
+# Reset patched files before applying the set so overlapping patches compose; edits elsewhere in each submodule are kept.
 for i in ${PATCH_FILES[@]+"${!PATCH_FILES[@]}"}; do
   src="${PATCH_DIRS[$i]}" patch="${PATCH_FILES[$i]}"
   git -C "$src" checkout -- $(git -C "$src" apply --numstat -p1 "$patch" | cut -f3)
+done
+
+for i in ${PATCH_FILES[@]+"${!PATCH_FILES[@]}"}; do
+  src="${PATCH_DIRS[$i]}" patch="${PATCH_FILES[$i]}"
   git -C "$src" apply -p1 "$patch"
 done
 
