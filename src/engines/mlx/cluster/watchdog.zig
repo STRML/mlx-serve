@@ -31,8 +31,10 @@ pub const State = struct {
     }
 };
 
+/// The leader's inference loop counts as alive while it has never ticked (the model still loading, before the loop
+/// exists), while a watched step is in flight, or while its last tick is within `limit_ms`.
 pub fn loopAlive(now_ms: u64, last_tick_ms: u64, in_flight: bool, limit_ms: u64) bool {
-    return in_flight or now_ms -| last_tick_ms <= limit_ms;
+    return last_tick_ms == 0 or in_flight or now_ms -| last_tick_ms <= limit_ms;
 }
 
 pub const BellFailure = enum { timeout, eof };
@@ -106,6 +108,12 @@ test "a loop iteration armed as one step: a 5 s unit with no forward stays alive
     try std.testing.expectEqual(@as(?u64, 30_000), s.stalledMs(35_000, 30_000));
     s.done();
     try std.testing.expect(!loopAlive(40_000, 35_000, s.in_flight.load(.acquire), 3_000));
+}
+
+test "a leader still loading (no tick yet) is alive however long the load takes; a loop that stopped ticking is not" {
+    try std.testing.expect(loopAlive(600_000, 0, false, 3_000));
+    try std.testing.expect(loopAlive(610_000, 600_000, false, 3_000) == false);
+    try std.testing.expect(loopAlive(602_000, 600_000, false, 3_000));
 }
 
 test "a bell read: timeout and EOF end the follower, data and EINTR do not" {
