@@ -295,14 +295,24 @@ var jaccl_deadline_looked = false;
 /// (local-llm bench/studio-cluster/jaccl-deadline-patch.py); with a stock libjaccl this does nothing and formation
 /// waits as before. One formation at a time.
 pub fn setJacclFormationDeadline(deadline_ms: u64) void {
+    const f = jacclDeadlineFn() orelse return;
+    f(@intCast(deadline_ms));
+}
+
+/// Whether this process's libjaccl bounds formation by a deadline; without it a missing peer blocks rank 0's group
+/// init until the process dies.
+pub fn jacclFormationDeadlineAvailable() bool {
+    return jacclDeadlineFn() != null;
+}
+
+fn jacclDeadlineFn() ?*const fn (i64) callconv(.c) void {
     if (!jaccl_deadline_looked) {
         jaccl_deadline_looked = true;
         if (std.c.dlopen(null, .{ .LAZY = true })) |self| {
             if (std.c.dlsym(self, "jaccl_set_formation_deadline_ms")) |f| jaccl_deadline_fn = @ptrCast(@alignCast(f));
         }
     }
-    const f = jaccl_deadline_fn orelse return;
-    f(@intCast(deadline_ms));
+    return jaccl_deadline_fn;
 }
 
 pub fn cudaAvailable() bool {
