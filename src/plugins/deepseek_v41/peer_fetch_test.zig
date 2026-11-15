@@ -221,6 +221,28 @@ fn buildPrompt(comptime len: usize) [len]u32 {
     return out;
 }
 
+fn expectPromptEntries(hc: *const prefix_cache.HotPrefixCache, prompts: []const []const u32) !void {
+    var count: usize = 0;
+    for (hc.entries.items) |e| {
+        const m = e.module orelse continue;
+        if (m.tail_from == 0) count += 1;
+    }
+    try testing.expectEqual(prompts.len, count);
+    for (prompts) |ids| {
+        var matches: usize = 0;
+        for (hc.entries.items) |e| {
+            const m = e.module orelse continue;
+            if (m.tail_from == 0 and std.mem.eql(u32, e.tokens, ids)) matches += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), matches);
+    }
+}
+
+fn expectResidentIds(hc: *const prefix_cache.HotPrefixCache, ids: []const u64) !void {
+    try testing.expectEqual(ids.len, hc.entries.items.len);
+    for (ids, hc.entries.items) |id, e| try testing.expectEqual(id, e.id);
+}
+
 test "dsv41 peer fetch: v41ServableFiles builds a servable pack with byte tokenizer and chat template" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -260,7 +282,7 @@ test "dsv41 peer fetch: export from model A and importWireModule into model B pr
     const turn1 = try model_a.runGreedy(full_prompt[0..25], 2, true);
     defer testing.allocator.free(turn1.tokens);
     try testing.expectEqual(@as(u32, 0), turn1.cached);
-    try testing.expectEqual(@as(usize, 1), model_a.entry.prefix_cache.?.entries.items.len);
+    try expectPromptEntries(model_a.entry.prefix_cache.?, &.{full_prompt[0..24]});
 
     var expired_export: @import("../../host/gpu_thread/requests.zig").CacheExportRequest = .{
         .model = model_a.entry,
@@ -661,11 +683,15 @@ test "dsv41 peer fetch: an import that cannot fit is refused before it evicts a 
     for (&other, 0..) |*id, i| id.* = @intCast(5 + (i * 11) % 70);
     const r1 = try model_b.runGreedy(other[0..17], 2, true);
     defer testing.allocator.free(r1.tokens);
-    other[0] = 90;
-    const r2 = try model_b.runGreedy(other[0..17], 2, true);
+    var other2 = other;
+    other2[0] = 90;
+    const r2 = try model_b.runGreedy(other2[0..17], 2, true);
     defer testing.allocator.free(r2.tokens);
     const hc = model_b.entry.prefix_cache.?;
-    try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
+    try expectPromptEntries(hc, &.{ other[0..16], other2[0..16] });
+    const resident_ids = try testing.allocator.alloc(u64, hc.entries.items.len);
+    defer testing.allocator.free(resident_ids);
+    for (hc.entries.items, resident_ids) |e, *id| id.* = e.id;
 
     {
         const limits = memory_ceiling.overrides();
@@ -674,7 +700,7 @@ test "dsv41 peer fetch: an import that cannot fit is refused before it evicts a 
         limits.* = .{ .static_ceiling = 1, .wired_limit_mb = 0 };
         const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .no_memory }), out);
-        try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
+        try expectResidentIds(hc, resident_ids);
     }
     {
         const prev = hc.max_kv_bytes;
@@ -682,14 +708,14 @@ test "dsv41 peer fetch: an import that cannot fit is refused before it evicts a 
         hc.max_kv_bytes = 1;
         const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .commit_declined }), out);
-        try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
+        try expectResidentIds(hc, resident_ids);
     }
     {
         hc.ram_enabled = false;
         defer hc.ram_enabled = true;
         const out = try peer_transfer.importWireModule(testing.allocator, model_b.sch.io, &model_b.sch, model_b.entry, wire);
         try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .commit_declined }), out);
-        try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
+        try expectResidentIds(hc, resident_ids);
     }
 }
 
