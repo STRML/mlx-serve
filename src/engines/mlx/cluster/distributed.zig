@@ -994,7 +994,7 @@ fn watchdogLoop(c: *ClusterState, deadline_ms: u64) void {
 fn startWatchdog(link: *const Link) void {
     const c = cluster();
     if (c.watchdog_started.swap(true, .acq_rel)) return;
-    const deadline: u64 = env.intValue(u32, env.get(.MLX_SERVE_DIST_STALL_MS), 10_000);
+    const deadline: u64 = env.intValue(u32, env.get(.MLX_SERVE_DIST_STALL_MS), 30_000);
     const watcher = std.Thread.spawn(.{ .stack_size = 1 << 16 }, watchdogLoop, .{ c, deadline }) catch {
         log.err("[dist-watchdog] cannot start watchdog thread\n", .{});
         log.syncFile();
