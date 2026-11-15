@@ -436,7 +436,21 @@ fn idleTimeoutMs() u32 {
 
 fn followerExit(reason: dist_watchdog.BellFailure) noreturn {
     log.err("[dist-watchdog] leader gone: bell {s} (idle timeout {d} ms); this worker exits\n", .{ @tagName(reason), idleTimeoutMs() });
+    switch (reason) {
+        .eof => distExit(.bell_eof, 0, null),
+        .timeout => distExit(.bell_timeout, 0, idleTimeoutMs()),
+    }
+}
+
+/// Writes the `[dist-exit]` record (fsynced), without exiting: for a path that leaves through `main`.
+fn noteDistExit(cause: dist_watchdog.ExitCause, peer: ?u32, waited_ms: ?u64) void {
+    var buf: [160]u8 = undefined;
+    log.err("{s}", .{dist_watchdog.exitRecord(&buf, crt.wallMs(), cause, peer, cluster().watchdog.step.load(.monotonic), waited_ms)});
     log.syncFile();
+}
+
+fn distExit(cause: dist_watchdog.ExitCause, peer: ?u32, waited_ms: ?u64) noreturn {
+    noteDistExit(cause, peer, waited_ms);
     std.c._exit(1);
 }
 
@@ -1011,13 +1025,11 @@ fn watchdogLoop(c: *ClusterState, deadline_ms: u64, leader: bool) void {
         const ready = c.heartbeat_active.load(.acquire);
         if (leader and ready and !dist_watchdog.loopAlive(now_ms, last_tick_ms, in_flight, @as(u64, idleTimeoutMs()))) {
             log.err("[dist-watchdog] leader loop stalled: waited_ms={d}; this rank exits\n", .{now_ms -| last_tick_ms});
-            log.syncFile();
-            std.c._exit(1);
+            distExit(.self_check, null, now_ms -| last_tick_ms);
         }
         const waited = c.watchdog.stalledMs(now_ms, deadline_ms) orelse continue;
         log.err("[dist-watchdog] stall: step={d} waited_ms={d}; this rank exits\n", .{ c.watchdog.step.load(.monotonic), waited });
-        log.syncFile();
-        std.c._exit(1);
+        distExit(.stall, null, waited);
     }
 }
 
@@ -1027,16 +1039,14 @@ fn startWatchdog(link: *const Link) void {
     const deadline: u64 = env.intValue(u32, env.get(.MLX_SERVE_DIST_STALL_MS), 30_000);
     const watcher = std.Thread.spawn(.{ .stack_size = 1 << 16 }, watchdogLoop, .{ c, deadline, link.rank == 0 and link.size > 1 }) catch {
         log.err("[dist-watchdog] cannot start watchdog thread\n", .{});
-        log.syncFile();
-        std.c._exit(1);
+        distExit(.watchdog_thread, null, null);
     };
     watcher.detach();
     if (link.rank == 0) {
         const interval = @max(1, idleTimeoutMs() / 3);
         const heartbeat = std.Thread.spawn(.{ .stack_size = 1 << 16 }, heartbeatLoop, .{Heartbeat{ .state = c, .bells = link.bells, .size = link.size, .interval_ms = interval }}) catch {
             log.err("[dist-watchdog] cannot start heartbeat thread\n", .{});
-            log.syncFile();
-            std.c._exit(1);
+            distExit(.heartbeat_thread, null, null);
         };
         heartbeat.detach();
     }
@@ -1451,6 +1461,7 @@ fn dsv41TpGather(x: mlx.mlx_array) anyerror!mlx.mlx_array {
 fn noteTpStep(p0: usize, rows: usize) void {
     const c = cluster();
     c.watchdog.progress(@intCast(crt.monotonicMs()));
+    if (env.on(.DIST_STEPS)) log.info("[dist-step] epoch_ms={d} rows={d} step={d}\n", .{ crt.wallMs(), rows, c.watchdog.step.load(.monotonic) });
     if (c.tp_last.rows > 0 and (c.tp_last.rows > 1 or c.tp_sums != 80)) log.info("[dist] tensor step at {d}: {d} rows, {d} sums of {d} values\n", .{ c.tp_last.p0, c.tp_last.rows, c.tp_sums, c.tp_values });
     c.tp_sums = 0;
     c.tp_values = 0;
@@ -2102,7 +2113,7 @@ fn watchWorker(link: *const Link) void {
     log.err("[dist] a step waits on worker rank {d}, which left; its requests end and this server exits\n", .{lost});
     if (@import("../../../host/http/server.zig").launch().global_scheduler) |sch| @import("../scheduler.zig").failInFlight(sch, "DistWorkerLeft");
     crt.sleepMs(2000);
-    std.c._exit(1);
+    distExit(.worker_left, lost, null);
 }
 
 /// Right after the worker joins, over the bell connection (no MLX off the inference thread):
@@ -2195,6 +2206,7 @@ fn sameModel(io: std.Io, allocator: std.mem.Allocator, parts: []const []const u8
 /// rank 0's group, loads the part of the model rank 0 names (found by folder name in its own
 /// model folders, `~/.mlx-serve/models` by default), then runs forwards until rank 0 stops it.
 pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    errdefer noteDistExit(.worker_error, 0, null);
     // JACCL (RDMA over Thunderbolt) exists only on macOS.
     if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable;
     preferFastSynch();

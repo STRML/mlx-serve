@@ -115,6 +115,14 @@ pub fn sleepMs(ms: u32) void {
     _ = std.c.nanosleep(&ts, null);
 }
 
+/// Wall-clock ms since the epoch (CLOCK_REALTIME): comparable across NTP-synced hosts, unlike `monotonicMs`.
+pub fn wallMs() i64 {
+    if (is_windows) return 0;
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
 pub fn monotonicMs() i64 {
     if (is_windows) return @intCast(GetTickCount64());
     var ts: std.c.timespec = undefined;

@@ -39,6 +39,25 @@ pub fn loopAlive(now_ms: u64, last_tick_ms: u64, in_flight: bool, limit_ms: u64)
 
 pub const BellFailure = enum { timeout, eof };
 
+/// Why a rank leaves the group by `_exit`; the `[dist-exit]` record names it.
+pub const ExitCause = enum { stall, self_check, bell_eof, bell_timeout, worker_left, worker_error, watchdog_thread, heartbeat_thread };
+
+/// The one line every exit path writes before `_exit`: `[dist-exit] epoch_ms=<wall ms> cause=<c> peer=<rank|-> step=<n>
+/// waited_ms=<n|->`. A harness on another host compares `epoch_ms` with its own wall clock.
+pub fn exitRecord(buf: []u8, epoch_ms: i64, cause: ExitCause, peer: ?u32, step: u64, waited_ms: ?u64) []const u8 {
+    var pb: [12]u8 = undefined;
+    var wb: [24]u8 = undefined;
+    const p = if (peer) |v| std.fmt.bufPrint(&pb, "{d}", .{v}) catch "-" else "-";
+    const w = if (waited_ms) |v| std.fmt.bufPrint(&wb, "{d}", .{v}) catch "-" else "-";
+    return std.fmt.bufPrint(buf, "[dist-exit] epoch_ms={d} cause={s} peer={s} step={d} waited_ms={s}\n", .{ epoch_ms, @tagName(cause), p, step, w }) catch buf[0..0];
+}
+
+test "exitRecord: every field, with - for an unknown peer or wait" {
+    var buf: [160]u8 = undefined;
+    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=1794778000123 cause=worker_left peer=2 step=41 waited_ms=-\n", exitRecord(&buf, 1794778000123, .worker_left, 2, 41, null));
+    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=5 cause=stall peer=- step=0 waited_ms=30001\n", exitRecord(&buf, 5, .stall, null, 0, 30001));
+}
+
 /// The peer of a TCP socket has closed or reset it, read from the kernel's connection state (macOS
 /// `TCP_CONNECTION_INFO`), so an EOF queued behind bytes nobody has read still counts. False when the state is unknown.
 pub fn tcpPeerGone(fd: std.c.fd_t) bool {
