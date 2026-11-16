@@ -340,6 +340,8 @@ const Entry = struct {
     /// Workload the request belonged to (`server.requestCacheKey`, 0 = anonymous).
     /// Eviction is fair across keys: the key holding the most entries pays first.
     cache_key: u64 = 0,
+    /// The router's session (`X-Session-Key`, 0 = untagged): `findSessionTip` names this session's entry to export.
+    session: u64 = 0,
     /// Stable identity for observers; `last_used` moves on every touch.
     id: u64 = 0,
     /// Snapshot of the live KVCache at end of generation. Owns refcount-shared
@@ -1443,7 +1445,35 @@ pub const HotPrefixCache = struct {
         tokens: []const u32,
         quant_config: kv_quant.KVQuantConfig,
         cache_key: u64,
+        has_tools: bool,
+        media: []const MediaSpan,
+        session: u64,
     };
+
+    fn ramHit(e: *const Entry) ?RamModuleHit {
+        return .{
+            .payload = e.module orelse return null,
+            .tokens = e.tokens,
+            .quant_config = e.quant_config,
+            .cache_key = e.cache_key,
+            .has_tools = e.has_tools,
+            .media = e.media,
+            .session = e.session,
+        };
+    }
+
+    /// The newest committed tip a session tagged: never a rung (a longer entry of its conversation exists), never an
+    /// entry a slot has checked out. Untagged entries (0) belong to no session.
+    pub fn findSessionTip(self: *const HotPrefixCache, session: u64) ?RamModuleHit {
+        if (session == 0) return null;
+        var best: ?usize = null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.session != session or e.module == null or e.checked_out_by != null) continue;
+            if (self.isModuleRung(i)) continue;
+            if (best == null or e.id > self.entries.items[best.?].id) best = i;
+        }
+        return ramHit(&self.entries.items[best orelse return null]);
+    }
 
     pub fn findRamModule(
         self: *const HotPrefixCache,
@@ -1455,18 +1485,14 @@ pub const HotPrefixCache = struct {
         const m = self.findBestRestorableMatchWithModule(prompt_ids, has_tools, &.{}, quant_config, false, null, .{ .binding = binding, .media_rows = null }) orelse return null;
         const e = &self.entries.items[m.idx];
         if (e.media.len != 0) return null;
-        return .{
-            .payload = e.module orelse return null,
-            .tokens = e.tokens,
-            .quant_config = e.quant_config,
-            .cache_key = e.cache_key,
-        };
+        return ramHit(e);
     }
 
     pub fn hasModuleCovering(
         self: *const HotPrefixCache,
         binding: ModuleBinding,
         ids: []const u32,
+        media: []const MediaSpan,
         has_tools: bool,
         quant_config: kv_quant.KVQuantConfig,
     ) bool {
@@ -1475,7 +1501,7 @@ pub const HotPrefixCache = struct {
             const m = e.module orelse continue;
             if (!ModuleBinding.same(m.binding, binding) or e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant_config, quant_config) or e.tokens.len < ids.len) continue;
-            if (mediaSharedBound(e.media, &.{}) < ids.len) continue;
+            if (mediaSharedBound(e.media, media) < ids.len) continue;
             if (ids.len > 0 and e.tokens[ids.len - 1] != ids[ids.len - 1]) continue;
             if (std.mem.eql(u32, e.tokens[0..ids.len], ids)) return true;
         }
@@ -2073,8 +2099,9 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         quant_config: kv_quant.KVQuantConfig,
         cache_key: u64,
+        session: u64,
     ) !CommitStatus {
-        return self.commitModuleTail(binding, snapshot, ids, prefix_key, media, has_tools, quant_config, cache_key, 0);
+        return self.commitModuleTail(binding, snapshot, ids, prefix_key, media, has_tools, quant_config, cache_key, session, 0);
     }
 
     /// `commitModule` of the state where a request's decode stopped, `tail_from` prompt tokens then what it
@@ -2089,6 +2116,7 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         quant_config: kv_quant.KVQuantConfig,
         cache_key: u64,
+        session: u64,
         tail_from: usize,
     ) !CommitStatus {
         var retained = false;
@@ -2134,6 +2162,7 @@ pub const HotPrefixCache = struct {
             .has_tools = has_tools,
             .quant_config = quant_config,
             .cache_key = cache_key,
+            .session = session,
             .id = self.bumpCounter(),
             .last_used = self.bumpCounter(),
             .touched_ms = crt.monotonicMs(),
@@ -11445,7 +11474,11 @@ const ModuleFake = struct {
         frees: usize = 0,
 
         fn put(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan) !CommitStatus {
-            return cache.commitModule(binding, self, self.ids, self.key, media, false, kv_quant.KVQuantConfig.dense, 0);
+            return self.putSession(cache, binding, media, 0);
+        }
+
+        fn putSession(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan, session: u64) !CommitStatus {
+            return cache.commitModule(binding, self, self.ids, self.key, media, false, kv_quant.KVQuantConfig.dense, 0, session);
         }
     };
     const Rows = struct { start: usize, key: u64 };
@@ -11681,7 +11714,7 @@ test "HotPrefixCache module: a decode-end entry lasts until its conversation com
     var boundary: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3 }, .key = 6 };
     var tail: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 6 }, .key = 21 };
     _ = try boundary.put(&cache, binding, &.{});
-    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 4);
+    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 0, 4);
     try testing.expectEqual(@as(usize, 2), cache.entries.items.len);
     try testing.expectEqual(@as(usize, 6), cache.findModuleMatch(binding, &.{ 1, 2, 3, 4, 5, 6, 7 }, false, &.{}, null, dense).?.n);
     // The same prompt again (a regenerate): its boundary leaves the old tail alone, its own tail replaces it.
@@ -11689,7 +11722,7 @@ test "HotPrefixCache module: a decode-end entry lasts until its conversation com
     _ = try again.put(&cache, binding, &.{});
     try testing.expectEqual(@as(usize, 0), tail.frees);
     var other: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 9 }, .key = 19 };
-    _ = try cache.commitModuleTail(binding, &other, other.ids, other.key, &.{}, false, dense, 0, 4);
+    _ = try cache.commitModuleTail(binding, &other, other.ids, other.key, &.{}, false, dense, 0, 0, 4);
     try testing.expectEqual(@as(usize, 1), tail.frees);
     // The next turn's boundary reaches past the prompt: the tail it rendered differently is dropped.
     var next: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 8, 8 }, .key = 26 };
@@ -11700,14 +11733,14 @@ test "HotPrefixCache module: a decode-end entry lasts until its conversation com
     // Room: a tail is the first to go for any commit, and takes no prompt boundary's place itself.
     cache.max_kv_bytes = 120;
     var tail2: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 8, 8, 8, 5 }, .key = 39 };
-    _ = try cache.commitModuleTail(binding, &tail2, tail2.ids, tail2.key, &.{}, false, dense, 0, 7);
+    _ = try cache.commitModuleTail(binding, &tail2, tail2.ids, tail2.key, &.{}, false, dense, 0, 0, 7);
     try testing.expectEqual(@as(u64, 120), cache.current_kv_bytes);
     var far: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 70, 71 }, .key = 141 };
     _ = try far.put(&cache, binding, &.{});
     try testing.expectEqual(@as(usize, 1), tail2.frees);
     try testing.expectEqual(@as(usize, 0), next.frees + again.frees);
     var tail3: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 70, 71, 72, 73 }, .key = 286 };
-    try testing.expectEqual(CommitStatus.declined, try cache.commitModuleTail(binding, &tail3, tail3.ids, tail3.key, &.{}, false, dense, 0, 3));
+    try testing.expectEqual(CommitStatus.declined, try cache.commitModuleTail(binding, &tail3, tail3.ids, tail3.key, &.{}, false, dense, 0, 0, 3));
     try testing.expectEqual(@as(usize, 1), tail3.frees);
     try testing.expectEqual(@as(usize, 0), far.frees + next.frees);
 }
@@ -11751,7 +11784,7 @@ test "HotPrefixCache module: an ineligible longer checkpoint cannot hide a short
             .key = if (case == .prefix_key) 99 else if (case == .ids) 24 else 18,
         };
         var short: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
-        _ = try cache.commitModule(binding, &long, long.ids, long.key, &media, case == .tools, if (case == .quant) kv_quant.KVQuantConfig.affine(4) else kv_quant.KVQuantConfig.dense, 0);
+        _ = try cache.commitModule(binding, &long, long.ids, long.key, &media, case == .tools, if (case == .quant) kv_quant.KVQuantConfig.affine(4) else kv_quant.KVQuantConfig.dense, 0, 0);
         _ = try short.put(&cache, binding, &media);
         const prompt: []const u32 = switch (case) {
             .equal_length => &.{ 1, 2, 3, 4 },
@@ -11989,7 +12022,7 @@ test "HotPrefixCache module: oversized disabled and malformed commits free the w
     try testing.expectEqual(@as(usize, 0), kept.frees);
     try testing.expectEqual(@as(u64, 40), cache.current_kv_bytes);
     var bad: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17 };
-    try testing.expectEqual(@as(CommitStatus, .declined), try cache.commitModule(binding, &bad, &.{ 8, 10 }, 17, &.{}, false, kv_quant.KVQuantConfig.dense, 0));
+    try testing.expectEqual(@as(CommitStatus, .declined), try cache.commitModule(binding, &bad, &.{ 8, 10 }, 17, &.{}, false, kv_quant.KVQuantConfig.dense, 0, 0));
     try testing.expectEqual(@as(usize, 1), bad.frees);
     var disabled = HotPrefixCache.init(testing.allocator, 0);
     defer disabled.deinit();
@@ -12128,7 +12161,7 @@ test "HotPrefixCache module: incoming workload pays for eviction before an older
         .{ .owner = &fake, .ids = &.{ 5, 6 }, .key = 11 },
     };
     for (&snaps, 0..) |*snap, i| {
-        _ = try cache.commitModule(binding, snap, snap.ids, snap.key, &.{}, false, kv_quant.KVQuantConfig.dense, if (i == 0) 202 else 101);
+        _ = try cache.commitModule(binding, snap, snap.ids, snap.key, &.{}, false, kv_quant.KVQuantConfig.dense, if (i == 0) 202 else 101, 0);
     }
     try testing.expectEqual(@as(usize, 0), snaps[0].frees);
     try testing.expectEqual(@as(usize, 1), snaps[1].frees);
@@ -12375,7 +12408,7 @@ test "under-floor module commits remain RAM-only" {
     const binding = fake.bind(&bound, &xfm);
     var hc = try ModuleDiskTest.init(&tmp, 2);
     defer hc.deinit();
-    try testing.expectEqual(@as(CommitStatus, .declined), try hc.commitModule(binding, null, &.{ 1, 2 }, 3, &.{}, false, kv_quant.KVQuantConfig.dense, 0));
+    try testing.expectEqual(@as(CommitStatus, .declined), try hc.commitModule(binding, null, &.{ 1, 2 }, 3, &.{}, false, kv_quant.KVQuantConfig.dense, 0, 0));
     var snap = ModuleDiskTest.snap(&fake, &.{ 1, 2 });
     try testing.expectEqual(@as(CommitStatus, .{ .ok = 2 }), try snap.put(&hc, binding, &.{}));
     try testing.expectEqual(@as(usize, 0), fake.exports);
@@ -12957,4 +12990,60 @@ test "HotPrefixCache: a whole-prompt plugin's checkpoint, stored through CacheOp
         try testing.expectEqual(@as(usize, 6), hit.matched);
     }
     try testing.expectEqualStrings("", try pcSsmDiffField(s, &restored[0], &restored[1]));
+}
+
+test "HotPrefixCache module: a session's tip is its newest committed entry, never a rung or another session's" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    var a_short: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+    var a_long: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var b_fork: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 5 }, .key = 11 };
+    _ = try a_short.putSession(&cache, binding, &.{}, 7);
+    _ = try a_long.putSession(&cache, binding, &.{}, 7);
+    _ = try b_fork.putSession(&cache, binding, &.{}, 8);
+
+    const tip_a = cache.findSessionTip(7).?;
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, tip_a.tokens);
+    try testing.expectEqual(@as(u64, 7), tip_a.session);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5 }, cache.findSessionTip(8).?.tokens);
+    try testing.expectEqual(@as(?HotPrefixCache.RamModuleHit, null), cache.findSessionTip(9));
+    try testing.expectEqual(@as(?HotPrefixCache.RamModuleHit, null), cache.findSessionTip(0));
+}
+
+test "HotPrefixCache module: a session tip keeps its image spans and an untagged commit is no tip" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 4);
+    defer cache.deinit();
+    const media = [_]MediaSpan{.{ .start = 1, .key = 0xA11CE }};
+    var image: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var plain: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 7, 8 }, .key = 15 };
+    _ = try image.putSession(&cache, binding, &media, 5);
+    _ = try plain.put(&cache, binding, &.{});
+    try testing.expectEqualSlices(MediaSpan, &media, cache.findSessionTip(5).?.media);
+    try testing.expectEqual(@as(?HotPrefixCache.RamModuleHit, null), cache.findSessionTip(6));
+}
+
+test "HotPrefixCache module: the same tokens under a changed image are not covered by the entry" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 4);
+    defer cache.deinit();
+    const media = [_]MediaSpan{.{ .start = 1, .key = 8 }};
+    const changed = [_]MediaSpan{.{ .start = 1, .key = 9 }};
+    var snap: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    _ = try snap.put(&cache, binding, &media);
+    const dense = kv_quant.KVQuantConfig.dense;
+    try testing.expect(cache.hasModuleCovering(binding, &.{ 1, 2, 3, 4 }, &media, false, dense));
+    try testing.expect(cache.hasModuleCovering(binding, &.{ 1, 2 }, &media, false, dense));
+    try testing.expect(!cache.hasModuleCovering(binding, &.{ 1, 2, 3, 4 }, &changed, false, dense));
+    try testing.expect(!cache.hasModuleCovering(binding, &.{ 1, 2, 3, 4 }, &.{}, false, dense));
 }

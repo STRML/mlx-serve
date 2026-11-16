@@ -100,7 +100,7 @@ fn commitModuleDecodeEnd(sch: *Scheduler, slot: *Slot, gen: *Generator, binding:
             plugin_driver.auxFree(binding.xfm, snap);
             return;
         }
-        const st = hc.commitModuleTail(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, slot.full_prompt.len) catch |err| {
+        const st = hc.commitModuleTail(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, slot.session, slot.full_prompt.len) catch |err| {
             log.warn("[hot-cache] module decode-end commit failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -129,7 +129,7 @@ fn commitCancelledModule(sch: *Scheduler, slot: *Slot, xfm: *transformer_mod.Tra
         return;
     }
     const n: usize = @intCast(info.n);
-    const st = hc.commitModule(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key) catch |err| {
+    const st = hc.commitModule(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, slot.session) catch |err| {
         log.warn("[hot-cache] cancelled module commit failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -163,7 +163,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             return;
         }
         // The snapshot describes its own forwarded prompt boundary, excluding the generated tail.
-        _ = hc.commitModule(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key) catch |err| {
+        _ = hc.commitModule(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, slot.session) catch |err| {
             log.warn("[hot-cache] module commit failed: {s}\n", .{@errorName(err)});
             return;
         };

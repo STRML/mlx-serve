@@ -1,4 +1,5 @@
-//! HTTP handlers for `X-Cache-Export: 1` on `/v1/chat/completions` and `POST /v1/cache/import`.
+//! HTTP handlers for `X-Cache-Export: 1` on `/v1/chat/completions` (by prompt body, or by `X-Session-Key` alone)
+//! and `POST /v1/cache/import`.
 
 const std = @import("std");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
@@ -11,6 +12,7 @@ const sendErrorResponse = @import("../http/errors.zig").sendErrorResponse;
 const sendErrorResponseWithReason = @import("../http/errors.zig").sendErrorResponseWithReason;
 const requests = @import("../gpu_thread/requests.zig");
 const LoadedModel = @import("../registry/registry.zig").LoadedModel;
+const Scheduler = @import("../gpu_thread/scheduler.zig").Scheduler;
 
 pub var max_export_bytes_override: ?usize = null;
 
@@ -58,7 +60,32 @@ pub fn handleCacheExport(
         .admit_transfer_budget = true,
         .allocator = allocator,
     };
-    const outcome = scheduler.exportCache(&req) catch |err| {
+    try runExport(allocator, stream, scheduler, &req, .{ .message = "No matching RAM prefix-cache entry" });
+}
+
+/// Exports the session's newest committed entry, named by the request's `X-Session-Key` and no body.
+pub fn handleSessionExport(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
+    const scheduler = http_server.launch().global_scheduler orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
+        return;
+    };
+    var req: requests.CacheExportRequest = .{
+        .model = lm,
+        .prompt_ids = &.{},
+        .has_tools = false,
+        .session = stream.session_key,
+        .deadline_ms = stream.cache_deadline_ms,
+        .max_bytes = effectiveMaxExportBytes(),
+        .admit_transfer_budget = true,
+        .allocator = allocator,
+    };
+    try runExport(allocator, stream, scheduler, &req, .{ .message = "No committed RAM entry for this session", .reason = "session_not_found" });
+}
+
+const NotFound = struct { message: []const u8, reason: ?[]const u8 = null };
+
+fn runExport(allocator: std.mem.Allocator, stream: *Conn, scheduler: *Scheduler, req: *requests.CacheExportRequest, not_found: NotFound) !void {
+    const outcome = scheduler.exportCache(req) catch |err| {
         log.warn("POST /v1/chat/completions (cache export) -> 500 ({s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "500 Internal Server Error", "internal_error", "Cache export failed", 500);
         return;
@@ -67,9 +94,7 @@ pub fn handleCacheExport(
         .deadline_passed => {
             try sendErrorResponse(allocator, stream, "408 Request Timeout", "timeout_error", "cache export refused: deadline passed before it started", 408);
         },
-        .not_found => {
-            try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "No matching RAM prefix-cache entry", 404);
-        },
+        .not_found => try sendErrorResponseWithReason(allocator, stream, "404 Not Found", "not_found", not_found.message, 404, not_found.reason),
         .transfer_unsupported => {
             try sendErrorResponseWithReason(allocator, stream, "409 Conflict", "conflict", transfer_unsupported_message, 409, "transfer_unsupported");
         },

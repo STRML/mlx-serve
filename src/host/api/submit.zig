@@ -93,6 +93,7 @@ pub fn nonStreamingViaScheduler(
         .vision_embeddings = vision_embeddings,
         .media = media,
         .cache_key = cache_key,
+        .session = if (conn) |c| c.session_key else 0,
         .client = if (conn) |c| c.client else .other,
         .ablation = if (conn) |c| c.ablation else null,
         .mrope_pos = mrope.pos,

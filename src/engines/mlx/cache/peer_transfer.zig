@@ -144,7 +144,7 @@ pub fn exportWireModule(
     cache_key: u64,
     max_bytes: usize,
 ) !requests.CacheExportOutcome {
-    return exportWireModuleWithBudget(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, max_bytes, false);
+    return exportWireModuleWithBudget(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, 0, max_bytes, false);
 }
 
 fn exportWireModuleWithBudget(
@@ -157,6 +157,7 @@ fn exportWireModuleWithBudget(
     kv_quant_override: ?kv_quant.KVQuantConfig,
     variant: u64,
     cache_key: u64,
+    session: u64,
     max_bytes: usize,
     admit_transfer_budget: bool,
 ) !requests.CacheExportOutcome {
@@ -167,7 +168,6 @@ fn exportWireModuleWithBudget(
     const xfm = lm.transformer orelse return .not_found;
     const cfg = lm.config orelse return .not_found;
     const hc = lm.prefix_cache orelse return .not_found;
-    const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, variant) orelse return .not_found;
     const pack_identity = switch (pack_identity_mod.status(lm.pack_identity)) {
         .ready => |id| id,
         .pending => return .identity_pending,
@@ -175,7 +175,13 @@ fn exportWireModuleWithBudget(
     };
     const quant_config = kv_quant_override orelse cfg.kv_quant_override orelse sch.kv_quant_config;
 
-    const hit = hc.findRamModule(binding, prompt_ids, has_tools, quant_config) orelse return .not_found;
+    const hit = if (session != 0)
+        hc.findSessionTip(session) orelse return .not_found
+    else blk: {
+        const by_prompt = prefix_cache_mod.ModuleBinding.forVariant(xfm, variant) orelse return .not_found;
+        break :blk hc.findRamModule(by_prompt, prompt_ids, has_tools, quant_config) orelse return .not_found;
+    };
+    const binding = hit.payload.binding;
 
     var info: plugin_abi.AuxSnapshotInfo = .{};
     if (!plugin_driver.auxDescribe(binding.xfm, hit.payload.snapshot, &info).isOk() or
@@ -195,7 +201,7 @@ fn exportWireModuleWithBudget(
     defer inv_arena.deinit();
     const inv = try exp.inventory(inv_arena.allocator());
 
-    const total_len = try peer_wire.encodedSize(hit.tokens.len, exp.out.header_len, inv);
+    const total_len = try peer_wire.encodedSize(hit.tokens.len, hit.media.len, exp.out.header_len, inv);
     if (total_len > max_bytes) {
         return .{ .too_large = @intCast(total_len) };
     }
@@ -231,11 +237,13 @@ fn exportWireModuleWithBudget(
         .prefix_key = info.prefix_key,
         .cache_key = eff_cache_key,
         .variant = binding.variant,
-        .has_tools = has_tools,
+        .has_tools = hit.has_tools,
         .quant_config = hit.quant_config,
         .ids = hit.tokens,
         .plugin_header = exp.header[0..exp.out.header_len],
         .tensors = inv,
+        .media = hit.media,
+        .session = hit.session,
     });
 
     var cursor = payload_off;
@@ -257,7 +265,7 @@ fn mapDecodeError(err: peer_wire.DecodeError) error{OutOfMemory}!requests.CacheI
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.TruncatedEnvelope => .truncated_body,
-        error.BadEnvelope, error.BadTensorName => .bad_envelope,
+        error.BadEnvelope, error.BadTensorName, error.BadMediaSpans => .bad_envelope,
         error.UnsupportedEnvelopeVersion => .unknown_version,
         error.BadQuantConfig => .bad_quant_config,
         error.BadTensorDtype => .bad_dtype,
@@ -350,7 +358,7 @@ pub fn importWireModule(
         return .{ .refused = .quant_config };
     }
 
-    if (hc.hasModuleCovering(binding, env.ids, env.has_tools, env.quant_config)) {
+    if (hc.hasModuleCovering(binding, env.ids, env.media, env.has_tools, env.quant_config)) {
         logRefusal(.stale, env.ids.len);
         return .{ .refused = .stale };
     }
@@ -440,10 +448,11 @@ pub fn importWireModule(
         snapshot,
         env.ids,
         env.prefix_key,
-        &.{},
+        env.media,
         env.has_tools,
         env.quant_config,
         env.cache_key,
+        env.session,
     ) catch |err| {
         publishHotCacheResidency(sch);
         return err;
@@ -492,6 +501,7 @@ pub fn runCacheExportRequest(sch: *Scheduler, req: *requests.CacheExportRequest)
         req.kv_quant_override,
         req.variant,
         req.cache_key,
+        req.session,
         req.max_bytes,
         req.admit_transfer_budget,
     ) catch |err| {
