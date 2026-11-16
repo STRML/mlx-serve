@@ -67,6 +67,20 @@ fn formationDeadline(cfg: Config) u64 {
     return @as(u64, @intCast(crt.monotonicMs())) + default_formation_ms;
 }
 
+/// A follower whose formation fails returns 80-100 ms after JACCL throws, most of it freeing the RDMA objects it had
+/// made (G2b run 200: rank 0, which fails before it makes any, returns within 33 ms). JACCL's deadline comes that much
+/// earlier, so a failed open still returns by the formation deadline.
+const jaccl_teardown_ms: u64 = 150;
+
+fn jacclDeadline(deadline_ms: u64) u64 {
+    return @max(deadline_ms -| jaccl_teardown_ms, 1);
+}
+
+test "JACCL's deadline leaves the teardown margin before the formation deadline" {
+    try std.testing.expectEqual(@as(u64, 9_850), jacclDeadline(10_000));
+    try std.testing.expectEqual(@as(u64, 1), jacclDeadline(100));
+}
+
 fn msLeft(deadline_ms: u64) u32 {
     const now: u64 = @intCast(crt.monotonicMs());
     return @intCast(@min(deadline_ms -| now, std.math.maxInt(u32)));
@@ -194,12 +208,13 @@ pub const Link = struct {
         }
         if (!mlx.jacclFormationDeadlineAvailable() and !jaccl_deadline_warned.swap(true, .acq_rel))
             log.err("[dist] JACCL formation deadline unavailable: this libjaccl lacks jaccl_set_formation_deadline_ms (a stock MLX), so a missing peer blocks formation until the process dies\n", .{});
-        mlx.setJacclFormationDeadline(deadline);
+        mlx.setJacclFormationDeadline(jacclDeadline(deadline));
         defer mlx.setJacclFormationDeadline(0);
         var g = mlx.mlx_distributed_group_new();
         mlx.check(mlx.mlx_distributed_init(&g, true, "jaccl")) catch {
             var eb: [512]u8 = undefined;
-            log.err("[dist] JACCL init failed: {s}\n", .{mlx.takeError(&eb) orelse "unknown"});
+            const past: i64 = crt.monotonicMs() - @as(i64, @intCast(jacclDeadline(deadline)));
+            log.err("[dist] JACCL init failed ({d} ms past its deadline): {s}\n", .{ past, mlx.takeError(&eb) orelse "unknown" });
             return error.RdmaInitFailed;
         };
         var link: Link = .{ .group = g, .rank = @intCast(mlx.mlx_distributed_group_rank(g)), .size = @intCast(mlx.mlx_distributed_group_size(g)) };
