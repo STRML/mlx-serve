@@ -998,6 +998,12 @@ test "dsv41 row cut: a leader's prompt chunk ships the DSpark stage windows and 
     const follow = try fixture.Fixture.initWhole(gpa, .{ .dspark_stages = 1 });
     defer follow.deinit();
     try testing.expect(lead.m.n_mtp > 0);
+    // The fixture keeps the release's KV source layers past its own two; a parsed config names only layers it has.
+    for ([_]*dsv41.Dsv41Model{ lead.m, follow.m }) |m| {
+        const have = (@as(u64, 1) << @intCast(m.n_layers)) - 1;
+        m.cfg.dsv41_kv_sources &= have;
+        m.cfg.dsv41_index_sources &= have;
+    }
     try expectLeaderShips(gpa, lead.m, follow.m);
 }
 
