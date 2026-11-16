@@ -166,6 +166,11 @@ fn ramOnly(ram: ?RamModuleHit) SessionLookup {
     return if (ram) |h| .{ .hit = h } else .none;
 }
 
+/// A refused SSD record leaves a shorter RAM boundary to export; with none, the refusal is the answer.
+fn refusedUnless(ram: ?RamModuleHit, outcome: requests.CacheExportOutcome) SessionLookup {
+    return if (ram) |h| .{ .hit = h } else .{ .refused = outcome };
+}
+
 /// A session's newest prompt boundary: the RAM tip, or the SSD's when RAM holds none or a shorter one. An SSD record
 /// is read back into a snapshot (`holder` frees it) so it exports the way a RAM entry does. A record that cannot be
 /// read leaves the RAM tip, else nothing: the caller sees `session_not_found`.
@@ -190,15 +195,15 @@ fn sessionHit(
     const inventory = d.moduleInventory(tip.id) orelse return ramOnly(ram);
     var stored: u64 = 0;
     for (inventory) |t| stored += t.bytes;
-    if (stored > max_bytes) return .{ .refused = .{ .too_large = @intCast(stored) } };
+    if (stored > max_bytes) return refusedUnless(ram, .{ .too_large = @intCast(stored) });
     var plan_peak: u64 = 0;
     if (!plugin_driver.auxImportPlan(binding.xfm, header, &plan_peak).isOk()) return ramOnly(ram);
-    const peak = prefill_mod.moduleImportPeak(plan_peak, inventory) catch return .{ .refused = .no_memory };
-    if (peak > prefillHeadroomNow(cfg, stagedHostBytes(@constCast(sch)))) return .{ .refused = .no_memory };
+    const peak = prefill_mod.moduleImportPeak(plan_peak, inventory) catch return refusedUnless(ram, .no_memory);
+    if (peak > prefillHeadroomNow(cfg, stagedHostBytes(@constCast(sch)))) return refusedUnless(ram, .no_memory);
 
     var arrays = d.loadModuleParts(tip.id) catch return ramOnly(ram);
     defer d.freeNamed(&arrays);
-    const tensors = allocator.alloc(plugin_abi.AuxTensor, arrays.items.len) catch return .{ .refused = .no_memory };
+    const tensors = allocator.alloc(plugin_abi.AuxTensor, arrays.items.len) catch return refusedUnless(ram, .no_memory);
     defer allocator.free(tensors);
     for (arrays.items, tensors) |array, *t| t.* = .{ .name = .of(array.key), .array = .{ .ctx = array.arr.ctx } };
     var snapshot: plugin_abi.Handle = null;
