@@ -315,6 +315,8 @@ fn jacclDeadlineFn() ?*const fn (i64) callconv(.c) void {
     return jaccl_deadline_fn;
 }
 
+pub extern "c" fn mlx_distributed_clear_backends() c_int;
+
 pub fn cudaAvailable() bool {
     if (cuda_cache == null) {
         var cuda = false;
@@ -395,9 +397,6 @@ pub extern "c" fn mlx_distributed_group_new() mlx_distributed_group;
 pub extern "c" fn mlx_distributed_is_available(bk: ?[*:0]const u8) bool;
 pub extern "c" fn mlx_distributed_init(res: *mlx_distributed_group, strict: bool, bk: ?[*:0]const u8) c_int;
 pub extern "c" fn mlx_distributed_group_free(group: mlx_distributed_group) c_int;
-/// Side-MLX patch (local-llm bench/studio-cluster/mlxc-clear-backends.patch): drops MLX's cached groups, so the next
-/// init forms a new one. Absent from a stock mlx-c, so only a build linked against the side MLX resolves it.
-pub extern "c" fn mlx_distributed_clear_backends() c_int;
 pub extern "c" fn mlx_distributed_group_rank(group: mlx_distributed_group) c_int;
 pub extern "c" fn mlx_distributed_group_size(group: mlx_distributed_group) c_int;
 pub extern "c" fn mlx_distributed_all_sum(res: *mlx_array, x: mlx_array, group: mlx_distributed_group, s: mlx_stream) c_int;

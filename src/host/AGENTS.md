@@ -70,6 +70,8 @@ Sampling + logprobs + streams:
 - **`Conn.close` sends FIN, then waits for the PEER to hang up (≤ 5 min) when the body is close-delimited** (SSE, NDJSON: no `Content-Length`): closed under a lagging reader, the kernel's `fin_timeout` RSTs it and the client gets ECONNRESET after every byte. A response written with a `Content-Length` sets `Conn.length_framed` and closes at once; an unmarked head keeps the wait. Guard: `tests/test_responses_streaming.sh` [G].
 - **Grammar**: every state has a legal byte; the mask never walks the vocabulary (#380, `token_mask.buildMask`, `nextConstrained` lazy); NO whitespace OUTSIDE the root, the model's own layout inside (`MAX_FREE_WS` 16); token→bytes tables are per-MODEL (`grammarTokenBytes`). Guard: `tests/test_json_mode_multi_model.sh`.
 
-LAN + console:
+Layout switch (`host/internal/`):
+- **`/v1/internal/*` takes its own key and nothing else** (`--internal-key-file`, 0600, never `--api-key`; the serving key is 401 and loopback is NOT exempt); no flag, no such paths. Dispatched BEFORE the serving-key and LAN gates.
+- **One attempt id per box, one table** (`attempt.zig`: 8 states x 5 commands, pure; `switch.zig`: its mutex, admission count, `Formation` seam). Every observation ticks the clock, so no timer thread exists; public inference counts in `enter`/`leave` and a drain waits on that count.
 - **LAN**: per-INTERFACE dns_sd callbacks, loopback-first fetches, eviction via `attemptKnown`; proxying bounded by the TUNNEL MARKER (`isTunneledRequest` at gate AND dispatch, ONE hop, `error.SelfFetch`).
 - **Console** (`app-web/`, Svelte): `src/html/index.html` is BUILT, never hand-edited: change the source, `npm run build`, commit both. Rules + guards: `app-web/CLAUDE.md`; `tests/test_index_page.sh` serves it headless. Metrics are on when `GET /metrics.json` is not 503.

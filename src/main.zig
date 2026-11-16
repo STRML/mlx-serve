@@ -28,7 +28,8 @@ const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
 const chat_mod = @import("host/chat/chat.zig");
 const server_mod = @import("host/http/server.zig");
 const ablation_api = @import("host/api/ablation.zig");
-const effectiveSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").effectiveSsmCheckpointStride;
+const internal_install = @import("host/internal/install.zig");
+const launchSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").launchSsmCheckpointStride;
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const ane_lm = @import("engines/ane/lm.zig");
 const status = @import("host/status.zig");
@@ -368,6 +369,11 @@ fn printUsage(io: std.Io) void {
         \\  --ablation-profiles <dir> --ablation-key-file <path>
         \\                      Per-request directional ablation (docs/api.md);
         \\                        the key file is 0600, at least 32 bytes.
+        \\  --internal-key-file <path>
+        \\                      Enable /v1/internal/* (the layout switch's drain,
+        \\                        tp4, join, tp1, abort and mode poll) behind the
+        \\                        key in this file (0600, at least 32 bytes, never
+        \\                        the --api-key). Without it those paths 404.
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
@@ -737,6 +743,7 @@ pub fn main(init: std.process.Init) !void {
     var kv_attn_mode: server_mod.KvAttnMode = .auto;
     var ablation_profiles: ?[]const u8 = null;
     var ablation_key_file: ?[]const u8 = null;
+    var internal_key_file: ?[]const u8 = null;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
@@ -1216,6 +1223,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ablation-key-file") and i + 1 < args.len) {
             i += 1;
             ablation_key_file = args[i];
+        } else if (std.mem.eql(u8, args[i], "--internal-key-file") and i + 1 < args.len) {
+            i += 1;
+            internal_key_file = args[i];
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
@@ -1240,6 +1250,17 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+    const switch_config: ?@import("host/internal/formation.zig").Config = if (internal_key_file != null and dist_mode != null) blk: {
+        const cfg: @import("host/internal/formation.zig").Config = .{
+            .coordinator = dist_coordinator orelse return error.InvalidArgs,
+            .device = dist_device orelse return error.InvalidArgs,
+            .model_dir = dist_model orelse run_model_dir orelse model_dir,
+            .size = dist_size,
+        };
+        if (cfg.size < 2 or cfg.size > @import("engines/mlx/cluster/distributed.zig").max_ranks or cfg.rank >= cfg.size or cfg.model_dir.len == 0) return error.InvalidArgs;
+        try @import("engines/mlx/cluster/distributed.zig").primeEnv(.{ .rank = cfg.rank, .size = cfg.size, .coordinator = cfg.coordinator, .device = cfg.device });
+        break :blk cfg;
+    } else null;
     if (!server_mod.mtpAllowedByDefault(mtp_forced, mlx.metalKernelsAvailable(), mlx.cudaAvailable())) enable_mtp = false;
 
     // One value for the three media seams (they run under gen.zig with no
@@ -1404,6 +1425,8 @@ pub fn main(init: std.process.Init) !void {
         server_mod.g_metrics = m;
     }
     defer server_mod.g_metrics = null;
+    server_mod.g_internal = internal_install.launch(allocator, io, internal_key_file, server_mod.g_api_key, server_mod.g_metrics, switch_config) catch std.process.exit(1);
+    defer server_mod.g_internal = null;
 
     // ── GGUF early-branch: route to an embedded engine ──
     //
@@ -1501,7 +1524,7 @@ pub fn main(init: std.process.Init) !void {
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
 
-    if (dist_mode) |mode| {
+    if (switch_config == null) if (dist_mode) |mode| {
         const coordinator = dist_coordinator orelse {
             log.err("--dist needs --dist-coordinator IP:PORT (this Mac's address the worker connects to)\n", .{});
             std.process.exit(1);
@@ -1515,8 +1538,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
-        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @intFromEnum(mode), group_model, dist_split, dist_size, dist_join_timeout));
-    }
+        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @backingInt(mode), group_model, dist_split, dist_size, dist_join_timeout));
+    };
 
     if (serve_mode) {
         // Headless boot: `--model-dir` given, no `--model`. Start with no
@@ -1876,7 +1899,7 @@ fn withLaunchFlags(base: LoadParams, spec: SpecLoadFlags, kv: KVQuantConfig) Loa
     p.prefix_cache_mem_bytes = l.prefix_cache_mem_bytes;
     p.prefix_cache_clamp = true;
     p.prefix_cache_disk_bytes = l.prefix_cache_disk_bytes;
-    p.ssm_checkpoint_stride = effectiveSsmCheckpointStride(l.ssm_checkpoint_stride, l.prefix_cache_capacity, l.prefix_cache_ram_enabled, l.prefix_cache_disk_bytes);
+    p.ssm_checkpoint_stride = launchSsmCheckpointStride();
     p.ssm_checkpoint_max = l.ssm_checkpoint_max;
     p.tokenize_cache_entries = server_mod.tokenize_cache_entries;
     p.launch_warmup_eager = warmup_eager;

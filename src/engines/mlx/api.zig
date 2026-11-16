@@ -61,6 +61,7 @@ pub const table: host.Api = .{
     .cluster_worker = clusterWorker,
     .cluster_probe = clusterProbe,
     .cluster_connect = clusterConnect,
+    .switch_adapter = @import("cluster/switch_adapter.zig").install,
     .configure = configure_mod.apply,
     .install_admission_hooks = @import("admission/admit.zig").installSchedulerHooks,
     .set_gen_yield = setGenYield,

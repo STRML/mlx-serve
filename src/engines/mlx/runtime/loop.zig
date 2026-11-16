@@ -37,9 +37,11 @@ const signalStarted = @import("thread.zig").signalStarted;
 const recordLoadError = @import("thread.zig").recordLoadError;
 const runGenRequests = @import("media_runner.zig").runGenRequests;
 const distributed = @import("../cluster/distributed.zig");
+const switch_adapter = @import("../cluster/switch_adapter.zig");
 
 pub fn hasWorkPendingLocked(sch: *const Scheduler) bool {
-    return sch.pending.items.len > 0 or
+    return switch_adapter.hasPending() or
+        sch.pending.items.len > 0 or
         sch.decoding.items.len > 0 or
         sch.vision_queue.items.len > 0 or
         sch.embed_queue.items.len > 0 or
@@ -56,6 +58,8 @@ pub const idleEvictTickMs = @import("../../../host/http/server.zig").idleEvictTi
 
 pub fn inferenceLoop(ctx: ThreadCtx) void {
     const sch = ctx.scheduler;
+    switch_adapter.bindInferenceThread(sch);
+    defer switch_adapter.unbindInferenceThread();
     const params = ctx.params;
     defer sch.inference_done.store(true, .release);
     // Covers shutdown and startup-load failure.
@@ -155,6 +159,7 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
     //     so freeing per-slot KVCache + vision_embeddings + ssm_entries
     //     is safe here even though those slots' arrays might trigger
     //     real GPU memory release on refcount-zero.
+    const switched = switch_adapter.drain();
     var cleanup_batch: [16]*Slot = undefined;
     var cleanup_n: usize = 0;
     // 0b. Drain any pending vision/embed work. These run synchronously on
@@ -224,7 +229,7 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
     for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
     for (export_batch[0..export_n]) |req| peer_transfer.runCacheExportRequest(sch, req);
     for (import_batch[0..import_n]) |req| peer_transfer.runCacheImportRequest(sch, req);
-    return cleanup_n + vision_n + embed_n + export_n + import_n > 0;
+    return switched or cleanup_n + vision_n + embed_n + export_n + import_n > 0;
 }
 
 // ── tests ──

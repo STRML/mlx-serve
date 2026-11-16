@@ -67,7 +67,8 @@ pub fn freeMlx(self: *LoadedModel) void {
 /// Used by eviction so the registry keeps the entry around as
 /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
 /// mlx frees happen on the inference thread.
-pub fn unloadResident(self: *LoadedModel) void {
+pub fn unloadResident(self: *LoadedModel) bool {
+    if (distributed.switchHolds(self.path)) return false;
     // A Thunderbolt pair's model unloads on both Macs; its next load plans again.
     if (distributed.serves(self.path)) distributed.release();
     self.closeEngine();
@@ -94,4 +95,5 @@ pub fn unloadResident(self: *LoadedModel) void {
     // budget against it for the whole session.
     if (self.config) |c| c.pinned_prefill_chunk = 0;
     self.state = .unloaded;
+    return true;
 }
