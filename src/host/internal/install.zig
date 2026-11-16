@@ -83,6 +83,8 @@ test "with a distributed configuration the installed switch has a formation back
     for ([_]@import("attempt.zig").Cmd{ .tp4, .join, .tp1 }) |cmd| {
         try std.testing.expect(inst.sw.command(cmd, 1, 0).status != 501);
     }
+}
+
 const testing = std.testing;
 
 test "without --metrics the switch still has a progress source, and it holds the prefill limit" {
