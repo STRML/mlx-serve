@@ -1990,6 +1990,8 @@ test "deepseek_v41 leader prefill: Engram read-ahead stays with the active TP st
     for (&prompt, 0..) |*id, i| id.* = @intCast((i * 13 + 3) % 1024);
     try dsv41.reset(tp, gpa);
     try dsv41.armPrompt(tp, &prompt, null, true);
+    const ra = tp.read_ahead orelse return error.LeaderPromptReadAheadMissing;
+    ra.wait();
     for ([_]usize{ 0, 32 }) |p0| {
         _ = mlx.mlx_array_free(try dsv41.extendResumable(tp, gpa, prompt[p0..][0..32], null));
         const ahead = tp.ahead orelse return error.LeaderPrefillDroppedEngramReadAhead;
@@ -1997,5 +1999,65 @@ test "deepseek_v41 leader prefill: Engram read-ahead stays with the active TP st
         try testing.expect(fx.m.ahead == null);
         try testing.expectEqualSlices(u32, prompt[0 .. p0 + 32], tp.dec_state.?.hist.items);
     }
+    try testing.expect(ra.hits.load(.acquire) > 0);
+    try testing.expectEqual(@as(usize, 0), ra.misses.load(.acquire));
     try testing.expectEqual(@as(usize, 0), fx.m.prompt.len);
+    tp.dropReadAhead();
+    for (fx.m.engrams) |e| try testing.expect(e.table.read_ahead == null);
+}
+
+test "deepseek_v41 switch: Engram prompt stores follow TP1, TP4 and abort lifetimes" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fxmod = @import("decode/fixture.zig");
+    const rcmod = @import("rowcut.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try fxmod.writeEngramPack(gpa, td.dir, 1024, .{ 0, 1 });
+    var path: [512]u8 = undefined;
+    const dir = path[0..try td.dir.realPath(io, &path)];
+    const fx = try fxmod.Fixture.initWhole(gpa, .{ .layers = 2, .engram_dir = dir, .engram_layers = .{ 0, 1 } });
+    defer fx.deinit();
+    const rows = try rcmod.RowCut.create(gpa, fx.m.s, fx.m, 0, fx.m.n_layers, 0, 4);
+    defer rows.destroy();
+    const tp = try dsv41.init(gpa, &fx.m.cfg, &fx.w, fx.m.s, .{ .tp = .{ .rank = 0, .size = 4 }, .resident = .{ .model = fx.m, .rows = rows }, .pack_dir = dir });
+    defer tp.deinit();
+    tp.prefill_whole = fx.m;
+    var pm: v41.Model = undefined;
+    pm.mdl = fx.m;
+    pm.modes = .{ .tp1 = fx.m, .tp = tp };
+    pm.parked = .empty;
+    pm.idle = null;
+    pm.owner = 0;
+    pm.bank_streams = false;
+    var prompt: [96]u32 = undefined;
+    for (&prompt, 0..) |*id, i| id.* = @intCast((i * 13 + 3) % 1024);
+    try dsv41.reset(pm.mdl, gpa);
+    try dsv41.armPrompt(pm.mdl, &prompt, null, false);
+    try testing.expect(pm.mdl.read_ahead != null);
+    try v41.swapMode(&pm, .tp);
+    try testing.expect(fx.m.read_ahead == null);
+    for (fx.m.engrams) |e| try testing.expect(e.table.read_ahead == null);
+    try dsv41.reset(tp, gpa);
+    tp.tp.?.rank = 1;
+    try dsv41.armPrompt(tp, &prompt, null, false);
+    try testing.expect(tp.read_ahead == null);
+    for (fx.m.engrams) |e| try testing.expect(e.table.read_ahead == null);
+    tp.tp.?.rank = 0;
+    tp.prefill_whole = null;
+    try dsv41.armPrompt(tp, &prompt, null, false);
+    try testing.expect(tp.read_ahead == null);
+    tp.prefill_whole = fx.m;
+    try dsv41.armPrompt(tp, &prompt, null, false);
+    try testing.expect(tp.read_ahead != null);
+    v41.table.release_slot.?(&pm, 0);
+    try testing.expect(tp.read_ahead == null);
+    for (fx.m.engrams) |e| try testing.expect(e.table.read_ahead == null);
+    try dsv41.reset(tp, gpa);
+    try dsv41.armPrompt(tp, &prompt, null, false);
+    try testing.expect(tp.read_ahead != null);
+    try v41.swapMode(&pm, .tp1);
+    try testing.expect(tp.read_ahead == null and fx.m.read_ahead == null);
+    for (fx.m.engrams) |e| try testing.expect(e.table.read_ahead == null);
 }

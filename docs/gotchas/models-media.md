@@ -866,3 +866,11 @@ latent width even when query heads are sharded. Snapshot captures keep their pos
 ship marks the live state unsynchronized and prevents capture publication. Engram read-ahead follows the active state
 between model objects. The fixed-point TP4 fixture proves decode parity, mixed chunks and a corrupt-bank negative
 control; the shared follower loop and abort/restore tests guard ordering and cache ownership.
+
+### Engram prompt stores on switch-capable servers
+
+The prompt-wide store rejected every tensor model, including rank zero whose wide chunks execute on its resident
+TP1 model. Allowing rank zero alone still left that executor's tables unbound, so its reads fell back to SSD.
+The active model now owns one store sourced from and bound to the leader executor's tables as well as its own;
+cleanup unbinds both. The real Engram fixture checks store hits during wide leader chunks, active TP1 setup beside
+a TP rank, follower exclusion, and cleanup on mode switches and slot release.

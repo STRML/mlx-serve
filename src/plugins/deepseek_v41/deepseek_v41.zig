@@ -598,6 +598,9 @@ pub const Dsv41Model = struct {
         self.dropAhead();
         if (self.read_ahead) |ra| {
             for (self.engrams) |*e| e.table.read_ahead = null;
+            if (self.tp != null) if (self.prefill_whole) |whole| {
+                for (whole.engrams) |*e| e.table.read_ahead = null;
+            };
             ra.wait();
             log.info("[dsv41] Engram read-ahead rows: ready {d}, served {d}, SSD fallback {d}\n", .{ ra.ready.load(.acquire), ra.hits.load(.acquire), ra.misses.load(.acquire) });
             ra.deinit();
@@ -7373,7 +7376,11 @@ pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize
 }
 
 fn startPromptReadAhead(m: *Dsv41Model, prompt: []const u32, images: bool, budget: usize, available: u64) !void {
-    if (m.engrams.len == 0 or m.tp != null or m.pair != null or m.streamed != null) return;
+    if (m.engrams.len == 0 or m.pair != null or m.streamed != null) return;
+    const reader = if (m.tp) |tp| blk: {
+        if (tp.rank != 0) return;
+        break :blk m.prefill_whole orelse return;
+    } else m;
     if (budget == 0) {
         log.info("[dsv41] Engram read-ahead off: budget 0\n", .{});
         return;
@@ -7381,7 +7388,7 @@ fn startPromptReadAhead(m: *Dsv41Model, prompt: []const u32, images: bool, budge
     const hs = &(m.hash orelse return);
     var sources: [engram.MAX_LAYERS]engram.readahead.Source = undefined;
     var max_rows: usize = 0;
-    for (m.engrams, 0..) |*e, layer| {
+    for (reader.engrams, 0..) |*e, layer| {
         sources[layer] = e.table.source();
         max_rows = @max(max_rows, @min(e.table.rows, prompt.len * hs.cols()));
     }
@@ -7408,6 +7415,11 @@ fn startPromptReadAhead(m: *Dsv41Model, prompt: []const u32, images: bool, budge
     try ra.start();
     m.read_ahead = ra;
     for (m.engrams, 0..) |*e, layer| {
+        e.table.read_ahead = ra;
+        e.table.read_ahead_layer = layer;
+    }
+    // Wide TP chunks read the whole model's tables; the active model owns the store's lifetime and bill.
+    for (reader.engrams, 0..) |*e, layer| {
         e.table.read_ahead = ra;
         e.table.read_ahead_layer = layer;
     }
