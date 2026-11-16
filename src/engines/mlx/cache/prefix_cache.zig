@@ -11708,7 +11708,11 @@ const ModuleFake = struct {
         }
 
         fn putSession(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan, session: u64) !CommitStatus {
-            return cache.commitModule(binding, self, self.ids, self.key, media, false, kv_quant.KVQuantConfig.dense, 0, session);
+            return self.putAs(cache, binding, media, session, false, kv_quant.KVQuantConfig.dense);
+        }
+
+        fn putAs(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan, session: u64, has_tools: bool, quant: kv_quant.KVQuantConfig) !CommitStatus {
+            return cache.commitModule(binding, self, self.ids, self.key, media, has_tools, quant, 0, session);
         }
     };
     const Rows = struct { start: usize, key: u64 };
@@ -13801,6 +13805,93 @@ test "HotPrefixCache module: when the idle flush reports done, every tip whose r
     try testing.expect(calls < 64);
     const index = hc.tipIndex() orelse return error.TestExpectedIndex;
     for ([_]u64{ 7, 8, 9 }) |session| try testing.expect(index.find(session) != null);
+}
+
+test "HotPrefixCache module: sessions that commit one prompt under different cache configurations each export their own entry" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const dense = kv_quant.KVQuantConfig.dense;
+    const kv8 = kv_quant.KVQuantConfig.affine(8);
+    var plain: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var quantized: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var tooled: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    _ = try plain.putAs(&cache, binding, &.{}, 7, false, dense);
+    _ = try quantized.putAs(&cache, binding, &.{}, 8, false, kv8);
+    _ = try tooled.putAs(&cache, binding, &.{}, 9, true, dense);
+
+    const first = cache.findSessionTip(7) orelse return error.TestExpectedTip;
+    const second = cache.findSessionTip(8) orelse return error.TestExpectedTip;
+    const third = cache.findSessionTip(9) orelse return error.TestExpectedTip;
+    try testing.expect(std.meta.eql(first.quant_config, dense) and !first.has_tools);
+    try testing.expect(std.meta.eql(second.quant_config, kv8) and !second.has_tools);
+    try testing.expect(std.meta.eql(third.quant_config, dense) and third.has_tools);
+}
+
+test "HotPrefixCache module: a session's SSD record is its own cache configuration's, and another configuration's is no proof its tip is durable" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const dense = kv_quant.KVQuantConfig.dense;
+    const kv8 = kv_quant.KVQuantConfig.affine(8);
+    const ids = ModuleDiskTest.ids(7);
+    var hc = try ModuleDiskTest.init(&tmp, 8);
+    defer hc.deinit();
+    var plain = ModuleDiskTest.snap(&fake, ids[0..512]);
+    var quantized = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try plain.putAs(&hc, binding, &.{}, 7, false, dense);
+    try ModuleDiskTest.finish(&hc, cpu);
+    _ = hc.flushOwedSlice(cpu);
+    _ = try quantized.putAs(&hc, binding, &.{}, 8, false, kv8);
+
+    const tip_8 = hc.sessionTip(8) orelse return error.TestExpectedTip;
+    try testing.expect(hc.disk.?.moduleByBoundary(tip_8.id, tip_8.n) == null);
+    const index = hc.tipIndex() orelse return error.TestExpectedIndex;
+    try testing.expect(index.find(8) == null);
+    try ModuleDiskTest.finish(&hc, cpu);
+    _ = hc.flushOwedSlice(cpu);
+
+    const tip_7 = hc.sessionTip(7) orelse return error.TestExpectedTip;
+    const own_7 = hc.disk.?.moduleByBoundary(tip_7.id, tip_7.n) orelse return error.TestExpectedRecord;
+    const own_8 = hc.disk.?.moduleByBoundary(tip_8.id, tip_8.n) orelse return error.TestExpectedRecord;
+    try testing.expect(std.meta.eql(own_7.quant, dense));
+    try testing.expect(std.meta.eql(own_8.quant, kv8));
+    try testing.expect(index.find(8) != null);
+}
+
+test "HotPrefixCache module: a tip whose index append failed stays unpersisted and persists on the next flush after the failure clears" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const ids = ModuleDiskTest.ids(7);
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    const index = hc.tipIndex() orelse return error.TestExpectedIndex;
+    try std.Io.Dir.cwd().createDirPath(testing.io, index.path);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.putSession(&hc, binding, &.{}, 7);
+    try ModuleDiskTest.finish(&hc, cpu);
+    _ = hc.flushOwedSlice(cpu);
+    try testing.expect(!hc.session_tips.get(7).?.persisted);
+    try testing.expect(hc.tips_unpersisted);
+
+    try std.Io.Dir.cwd().deleteTree(testing.io, index.path);
+    _ = hc.flushOwedSlice(cpu);
+    try testing.expect(hc.session_tips.get(7).?.persisted);
+    try testing.expect(index.find(7) != null);
 }
 
 test "HotPrefixCache module: sessions that claim one resident checkpoint below the persistence floor all keep their export" {
