@@ -2881,13 +2881,35 @@ fn dialBellControlled(coord: Coordinator, rank: u32, deadline_ms: u64, control: 
     return .{};
 }
 
+/// A loopback coordinator whose bell port (port + 1) nothing listens on: an ephemeral port the kernel just handed out and
+/// released, so no other test or process holds it.
+fn closedBellCoordinator() !Coordinator {
+    const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(fd);
+    var addr: std.posix.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+    if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) != 0) return error.SkipZigTest;
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.c.getsockname(fd, @ptrCast(&addr), &len) != 0) return error.SkipZigTest;
+    return .{ .ip4 = .{ 127, 0, 0, 1 }, .port = std.mem.bigToNative(u16, addr.port) -% 1 };
+}
+
 test "a worker whose bell is refused past the formation deadline gets no bell, near the deadline" {
-    const coord: Coordinator = .{ .ip4 = .{ 127, 0, 0, 1 }, .port = 46181 };
+    const coord = try closedBellCoordinator();
     const t0 = crt.monotonicMs();
     const b = dialBellControlled(coord, 1, @as(u64, @intCast(t0)) + 300, null);
     const took = crt.monotonicMs() - t0;
     try std.testing.expect(!b.open());
     try std.testing.expect(took >= 150 and took < 1500);
+}
+
+test "a worker dialing an address that drops its SYN still returns by the formation deadline" {
+    const coord: Coordinator = .{ .ip4 = .{ 192, 0, 2, 1 }, .port = 46185 };
+    const t0 = crt.monotonicMs();
+    const b = dialBellControlled(coord, 1, @as(u64, @intCast(t0)) + 400, null);
+    const took = crt.monotonicMs() - t0;
+    try std.testing.expect(!b.open());
+    try std.testing.expect(took < 400 + 100);
 }
 
 test "a worker that dials before rank 0 listens joins once the listener opens" {
