@@ -316,11 +316,11 @@ pub fn handleConnection(
     }
 
     // ── Layout switch (plan 61c): public inference is admitted in TP1 and by the TP4 leader, counted so a drain can wait for zero.
-    const admission = internal_ep.Admission.enter(if (internal_ep.isInference(method, path)) http_server.internalSwitch() else null) catch {
+    const admitted = internal_ep.Admission.enter(if (internal_ep.isInference(method, path)) http_server.internalSwitch() else null) catch {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", internal_ep.refusal_message, 503);
         return;
     };
-    defer admission.leave();
+    defer admitted.leave();
 
     // ── Plan 05: routes that don't depend on a loaded model (connectivity
     //    probes + CORS preflight + listing endpoints). Handle these BEFORE
