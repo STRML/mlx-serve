@@ -73,7 +73,7 @@ const Owned = struct {
     }
 };
 
-/// A cut of one axis: part `rank` of `size` of the rows from `base`.
+/// A cut of one axis: part `rank` of `size` of the `len` rows from `base`, `ceil(len / size)` a part, the last what remains.
 const Cut = struct {
     base: usize = 0,
     len: usize,
@@ -81,10 +81,10 @@ const Cut = struct {
     size: u32,
 
     fn lo(c: Cut) usize {
-        return c.base + c.len / c.size * c.rank;
+        return c.base + dsv41.vocabRange(c.len, c.rank, c.size).lo;
     }
     fn hi(c: Cut) usize {
-        return c.lo() + c.len / c.size;
+        return c.base + dsv41.vocabRange(c.len, c.rank, c.size).hi;
     }
 };
 
@@ -92,8 +92,11 @@ const Cutter = struct {
     gpa: std.mem.Allocator,
     s: S,
     owned: *Owned,
+    /// Every part the same width: an all_gather joins them.
+    even: bool = false,
 
     fn arr(k: Cutter, a: A, axis: usize, c: Cut) !A {
+        if (k.even and c.len % c.size != 0) return error.Dsv41RowCutUneven;
         return k.owned.put(k.gpa, try view(k.s, a, axis, c.lo(), c.hi()));
     }
     fn bank(k: Cutter, b: Bank, c: Cut) !Bank {
@@ -161,7 +164,7 @@ pub const RowLayer = struct {
             rl.fused = .{ .gu = gu, .sgu = sgu, .down = e.down, .sdn = ly.shared[2] };
         };
         errdefer rl.owned.deinit(gpa);
-        const k: Cutter = .{ .gpa = gpa, .s = s, .owned = &rl.owned };
+        const k: Cutter = .{ .gpa = gpa, .s = s, .owned = &rl.owned, .even = true };
         // Gate and up: views into the fused bank's halves where the load fused them.
         const gate, const up = if (e.gu) |gu| blk: {
             const inter: usize = @intCast(@divExact(dim(gu.w, 1), 2));
@@ -328,7 +331,8 @@ pub const RouteCrc = struct {
 
 /// What a TP4 prompt chunk needs from the mode it runs in. Rank 0 runs the chunk on its TP1 model alone (`run`, which
 /// hands back the slot's snapshot after it), then `ship` sends that snapshot's cache tensors to every other rank under
-/// its id: `dsv41.tpLoad`'s path through the cluster's `tp_load` hook in serving, a recorder in a test.
+/// its id: `dsv41.tpLoad`'s path through the cluster's `tp_load` hook in serving, a recorder in a test. Every rank
+/// holds the DSpark stages and runs them row-cut, so their windows ride too.
 pub const LeaderPrefill = struct {
     ctx: ?*anyopaque = null,
     whole: *const dsv41.Dsv41Model,
@@ -342,7 +346,7 @@ pub fn prefillOnLeader(gpa: std.mem.Allocator, g: Group, lp: LeaderPrefill, ids:
     if (g.rank != 0) return error.Dsv41RowCutNotLeader;
     const sn = try lp.run(lp.ctx, ids, p0);
     if (g.size == 1) return sn;
-    const xs = try dsv41.tpLoadTensors(lp.whole, gpa, sn);
+    const xs = try dsv41.planTensors(lp.whole, gpa, sn, try dsv41.shipPlan(lp.whole, sn.n, true));
     defer dsv41.freeArrays(gpa, xs);
     try lp.ship(lp.ctx, sn.tp_id, sn.ids, xs);
     return sn;
@@ -352,7 +356,7 @@ pub fn prefillOnLeader(gpa: std.mem.Allocator, g: Group, lp: LeaderPrefill, ids:
 /// TP4 turn restores it). The KV is whole on every rank, so the follower's TP1 model takes it as is.
 pub fn importOnFollower(gpa: std.mem.Allocator, g: Group, whole: *const dsv41.Dsv41Model, snaps: *dsv41.Snaps, id: u64, ids: []const u32, tensors: []const A) !void {
     if (g.rank == 0) return error.Dsv41RowCutLeaderImport;
-    try dsv41.tpWorkerLoad(whole, gpa, snaps, id, ids, tensors);
+    try dsv41.importPlan(whole, gpa, snaps, id, ids, tensors, try dsv41.shipPlan(whole, ids.len, true));
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -409,13 +413,16 @@ fn expectTpClose(label: []const u8, rows: usize, want: []const f32, got: []const
     var peak: f32 = 0;
     var err: f32 = 0;
     for (want, got) |u, v| {
+        if (!std.math.isFinite(u) or !std.math.isFinite(v)) return error.NonFinite;
         peak = @max(peak, @abs(u));
         err = @max(err, @abs(u - v));
     }
     try testing.expect(peak > 0);
     const tol: f32 = if (device.naxAvailable()) 1e-2 else 1e-3;
-    std.debug.print("[rowcut] {s} R={d}: max-abs {e:.2} ({e:.2} of peak, bar {e:.0}), rel rms {e:.2}\n", .{ label, rows, err, err / peak, tol, decode.relRms(got, want) });
+    const rms = decode.relRms(got, want);
+    std.debug.print("[rowcut] {s} R={d}: max-abs {e:.2} ({e:.2} of peak, bar {e:.0}), rel rms {e:.2}\n", .{ label, rows, err, err / peak, tol, rms });
     try testing.expect(err <= tol * peak);
+    try testing.expect(rms <= tol);
 }
 
 fn routes(sc: *Scope, fx: *fixture.Fixture, ly: *const dsv41.Layer, rows: usize, dt: mlx.mlx_dtype) !struct { x: A, r: dsv41.Routes } {
@@ -923,7 +930,7 @@ const PrefillRig = struct {
 
     fn run(ctx: ?*anyopaque, ids: []const u32, _: usize) anyerror!*const dsv41.Snap {
         const self: *PrefillRig = @ptrCast(@alignCast(ctx.?));
-        try dsv41.tpWorkerLoad(self.leader, self.gpa, &self.lead, 7, ids, self.disk);
+        try dsv41.importPlan(self.leader, self.gpa, &self.lead, 7, ids, self.disk, try dsv41.shipPlan(self.leader, ids.len, true));
         const sn = self.lead.getPtr(7).?;
         sn.tp_id = 7;
         return sn;
@@ -936,16 +943,11 @@ const PrefillRig = struct {
     }
 };
 
-test "dsv41 row cut: a prompt chunk on the leader reaches a follower as the same snapshot, under the leader's id" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    const gpa = testing.allocator;
-    const lead = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
-    defer lead.deinit();
-    const follow = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
-    defer follow.deinit();
+/// A prompt chunk on `lead` reaches `follow` as the same snapshot of every tensor a rank holds, under the leader's id.
+fn expectLeaderShips(gpa: std.mem.Allocator, lead: *dsv41.Dsv41Model, follow: *dsv41.Dsv41Model) !void {
     const n = 301;
-    const plan = try dsv41.tpLoadPlan(lead.m, n);
-    var sc = Scope.init(gpa, lead.m.s);
+    const plan = try dsv41.shipPlan(lead, n, true);
+    var sc = Scope.init(gpa, lead.s);
     defer sc.deinit();
     const disk = try gpa.alloc(A, plan.len);
     defer gpa.free(disk);
@@ -956,23 +958,76 @@ test "dsv41 row cut: a prompt chunk on the leader reaches a follower as the same
     const ids = try gpa.alloc(u32, n);
     defer gpa.free(ids);
     @memset(ids, 5);
-    var rig: PrefillRig = .{ .gpa = gpa, .leader = lead.m, .follower = follow.m, .lead = .init(gpa), .follow = .init(gpa), .disk = disk };
+    var rig: PrefillRig = .{ .gpa = gpa, .leader = lead, .follower = follow, .lead = .init(gpa), .follow = .init(gpa), .disk = disk };
     defer dsv41.dropSnaps(&rig.lead, gpa);
     defer dsv41.dropSnaps(&rig.follow, gpa);
-    const lp: LeaderPrefill = .{ .ctx = &rig, .whole = lead.m, .run = PrefillRig.run, .ship = PrefillRig.ship };
+    const lp: LeaderPrefill = .{ .ctx = &rig, .whole = lead, .run = PrefillRig.run, .ship = PrefillRig.ship };
     const four: Group = .{ .rank = 0, .size = 4, .gather = Group.solo.gather };
     _ = try prefillOnLeader(gpa, four, lp, ids, 0);
     try testing.expectEqual(@as(usize, 1), rig.shipped);
     const got = rig.follow.getPtr(7) orelse return error.NotShipped;
     try testing.expectEqual(@as(usize, n), got.n);
-    const want = try dsv41.tpLoadTensors(lead.m, gpa, rig.lead.getPtr(7).?);
+    const want = try dsv41.planTensors(lead, gpa, rig.lead.getPtr(7).?, plan);
     defer dsv41.freeArrays(gpa, want);
-    const back = try dsv41.tpLoadTensors(follow.m, gpa, got);
+    const back = try dsv41.planTensors(follow, gpa, got, try dsv41.shipPlan(follow, n, true));
     defer dsv41.freeArrays(gpa, back);
+    try testing.expectEqual(want.len, back.len);
     for (want, back) |a, b| try testing.expect(try same(a, b));
     // Only the leader prefills; only a follower imports; one rank ships nothing.
     try testing.expectError(error.Dsv41RowCutNotLeader, prefillOnLeader(gpa, .{ .rank = 2, .size = 4, .gather = Group.solo.gather }, lp, ids, 0));
-    try testing.expectError(error.Dsv41RowCutLeaderImport, importOnFollower(gpa, four, follow.m, &rig.follow, 8, ids, want));
+    try testing.expectError(error.Dsv41RowCutLeaderImport, importOnFollower(gpa, four, follow, &rig.follow, 8, ids, want));
     _ = try prefillOnLeader(gpa, Group.solo, lp, ids, 0);
     try testing.expectEqual(@as(usize, 1), rig.shipped);
+}
+
+test "dsv41 row cut: a prompt chunk on the leader reaches a follower as the same snapshot, under the leader's id" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const lead = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer lead.deinit();
+    const follow = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer follow.deinit();
+    try expectLeaderShips(gpa, lead.m, follow.m);
+}
+
+test "dsv41 row cut: a leader's prompt chunk ships the DSpark stage windows and main rows too" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const lead = try fixture.Fixture.initWhole(gpa, .{ .dspark_stages = 1 });
+    defer lead.deinit();
+    const follow = try fixture.Fixture.initWhole(gpa, .{ .dspark_stages = 1 });
+    defer follow.deinit();
+    try testing.expect(lead.m.n_mtp > 0);
+    try expectLeaderShips(gpa, lead.m, follow.m);
+}
+
+test "dsv41 row cut: the parity bar fails a result that is not finite" {
+    const want = [_]f32{ 1, -2, 3, 0.5 };
+    const nan = std.math.nan(f32);
+    try testing.expectError(error.NonFinite, expectTpClose("nan", 1, &want, &[_]f32{ nan, nan, nan, nan }));
+    try testing.expectError(error.NonFinite, expectTpClose("inf", 1, &want, &[_]f32{ 1, -2, std.math.inf(f32), 0.5 }));
+    try expectTpClose("same", 1, &want, &want);
+}
+
+test "dsv41 row cut: a head's vocabulary rows that do not divide by the ranks all land on one, and a gathered cut refuses them" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vals: [17 * 2]f32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @floatFromInt(i);
+    const w = mlx.mlx_array_new_data(&vals, &[_]c_int{ 17, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    var seen: std.ArrayList(f32) = .empty;
+    defer seen.deinit(gpa);
+    for (0..4) |r| {
+        var rh = try RowHead.init(gpa, mlx.gpuStream(), .{ .w = w }, w, @intCast(r), 4);
+        defer rh.deinit();
+        const got = try host(gpa, rh.head.w);
+        defer gpa.free(got);
+        try seen.appendSlice(gpa, got);
+    }
+    try testing.expectEqualSlices(f32, &vals, seen.items);
+    var owned: Owned = .{};
+    defer owned.deinit(gpa);
+    const even: Cutter = .{ .gpa = gpa, .s = mlx.gpuStream(), .owned = &owned, .even = true };
+    try testing.expectError(error.Dsv41RowCutUneven, even.arr(w, 0, .{ .len = 17, .rank = 0, .size = 4 }));
 }

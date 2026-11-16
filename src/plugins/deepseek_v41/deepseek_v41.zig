@@ -6007,14 +6007,24 @@ pub fn tpFree(m: *const Dsv41Model, gen: u64) void {
 /// off the same summed stream through whole KV weights, so rank 0's are theirs; the DSpark windows too when every rank
 /// drafts, else they are rank 0's alone.
 pub fn tpLoadPlan(m: *const Dsv41Model, n: usize) !cache_codec.Plan {
+    return shipPlan(m, n, m.draft_shard);
+}
+
+/// A snapshot of `n` positions as one rank ships it to another: every layer's caches and Engram history, the DSpark
+/// windows and main rows when `stages`.
+pub fn shipPlan(m: *const Dsv41Model, n: usize, stages: bool) !cache_codec.Plan {
     var l = try cacheLayout(m);
-    if (!m.draft_shard) l.stages = 0;
+    if (!stages) l.stages = 0;
     return cache_codec.Plan.init(l, n, 0);
 }
 
 /// `sn`'s tensors of `tpLoadPlan`, evaluated (caller frees with `freeArrays`).
 pub fn tpLoadTensors(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap) ![]A {
-    const p = try tpLoadPlan(m, sn.n);
+    return planTensors(m, gpa, sn, try tpLoadPlan(m, sn.n));
+}
+
+/// `sn`'s tensors of `p`, evaluated (caller frees with `freeArrays`).
+pub fn planTensors(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap, p: cache_codec.Plan) ![]A {
     const out = try gpa.alloc(A, p.len);
     var made: usize = 0;
     errdefer freeArrays(gpa, out[0..made]);
@@ -6043,7 +6053,11 @@ pub fn tpLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap) !vo
 
 /// Tensor-parallel rank past 0: rank 0's snapshot `id` read from disk, as `tpLoadPlan`'s tensors in order.
 pub fn tpWorkerLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, id: u64, ids: []const u32, tensors: []const A) !void {
-    const p = try tpLoadPlan(m, ids.len);
+    return importPlan(m, gpa, snaps, id, ids, tensors, try tpLoadPlan(m, ids.len));
+}
+
+/// Snapshot `id` rebuilt from `p`'s tensors in order, into `snaps` under that id.
+pub fn importPlan(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, id: u64, ids: []const u32, tensors: []const A, p: cache_codec.Plan) !void {
     if (tensors.len != p.len) return error.DistPeerDiverged;
     const header = try gpa.alloc(u8, cache_codec.max_header);
     defer gpa.free(header);
