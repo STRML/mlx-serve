@@ -186,7 +186,7 @@ pub const Index = struct {
         const f = try std.Io.Dir.createFileAbsolute(self.io, self.path, .{ .truncate = false });
         defer f.close(self.io);
         var len = try f.length(self.io);
-        if (len == 0) {
+        if (len < HEADER_BYTES) {
             try f.writePositionalAll(self.io, &headerBytes(), 0);
             len = HEADER_BYTES;
         }
