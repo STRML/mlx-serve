@@ -1071,6 +1071,22 @@ test "deepseek_v41 modes: a swap drops every slot's state, live and parked, so a
 test "deepseek_v41 modes: on the wide prompt path the whole model gives today's logits with a TP4 model's wide prompts between its steps" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try wideBeside();
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "deepseek_v41 modes: the wide arm again with the flash kernel on, a setting both modes read from one load" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    _ = setenv("MLX_SERVE_DSV41_FLASH_ATTN", "", 1);
+    defer _ = unsetenv("MLX_SERVE_DSV41_FLASH_ATTN");
+    try wideBeside();
+}
+
+/// The whole model's wide steps beside a TP4 model's wide prompts, against today's load on the wide path.
+fn wideBeside() !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const files = try fixture.v41TpFiles(arena.allocator(), 7);
