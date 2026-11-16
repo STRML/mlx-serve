@@ -1,0 +1,130 @@
+diff --git a/mlx/distributed/jaccl/lib/jaccl/tcp.cpp b/mlx/distributed/jaccl/lib/jaccl/tcp.cpp
+index e8c1f2d0b..9f93763b6 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/tcp.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/tcp.cpp
+@@ -2,6 +2,9 @@
+ 
+ #include <netdb.h>
+ #include <algorithm>
++#include <atomic>
++#include <cstdint>
++#include <time.h>
+ #include <poll.h>
+ #include <ifaddrs.h>
+ #include <netinet/in.h>
+@@ -36,6 +39,41 @@ static void bind_to_subnet(int sock, const address_t& addr) {
+   freeifaddrs(list);
+ }
+ 
++// jaccl-deadline-patch v1: one absolute CLOCK_MONOTONIC ms deadline for group formation, 0 = none.
++static std::atomic<int64_t> formation_deadline_ms{0};
++
++static int64_t monotonic_ms() {
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
++}
++
++// Milliseconds left before the deadline: -1 with no deadline, 0 once it has passed.
++static int deadline_left_ms() {
++  int64_t d = formation_deadline_ms.load(std::memory_order_acquire);
++  if (d == 0) return -1;
++  int64_t left = d - monotonic_ms();
++  if (left <= 0) return 0;
++  return left > 0x7fffffff ? 0x7fffffff : static_cast<int>(left);
++}
++
++// Waits for `events` on `fd` until the formation deadline; throws when it passes first. No deadline: returns at once
++// and the caller's blocking call waits as before.
++static void wait_until_deadline(int fd, short events, const char* tag, const char* what) {
++  for (;;) {
++    int left = deadline_left_ms();
++    if (left < 0) return;
++    struct pollfd p = {fd, events, 0};
++    int r = left == 0 ? 0 : poll(&p, 1, left);
++    if (r > 0) return;
++    if (r < 0 && errno == EINTR) continue;
++    if (r < 0) return;
++    std::ostringstream msg;
++    msg << tag << " formation deadline passed in " << what;
++    throw std::runtime_error(msg.str());
++  }
++}
++
+ // jaccl-tcp-patch: a connect a signal interrupted is still in progress; wait for it rather than abandon it.
+ static int finish_connect(int sock) {
+   struct pollfd p = {sock, POLLOUT, 0};
+@@ -172,6 +210,7 @@ void TCPSocket::listen(const char* tag, const address_t& addr) {
+ 
+ TCPSocket TCPSocket::accept(const char* tag) {
+   int peer;
++  wait_until_deadline(sock_, POLLIN, tag, "accept");
+   do {
+     peer = ::accept(sock_, nullptr, nullptr);
+   } while (peer < 0 && errno == EINTR);
+@@ -186,6 +225,7 @@ TCPSocket TCPSocket::accept(const char* tag) {
+ 
+ void TCPSocket::send(const char* tag, const void* data, size_t len) {
+   while (len > 0) {
++    wait_until_deadline(sock_, POLLOUT, tag, "send");
+     auto n = ::send(sock_, data, len, 0);
+     if (n < 0 && errno == EINTR) continue;
+     if (n <= 0) {
+@@ -200,6 +240,7 @@ void TCPSocket::send(const char* tag, const void* data, size_t len) {
+ 
+ void TCPSocket::recv(const char* tag, void* data, size_t len) {
+   while (len > 0) {
++    wait_until_deadline(sock_, POLLIN, tag, "recv");
+     auto n = ::recv(sock_, data, len, 0);
+     if (n < 0 && errno == EINTR) continue;
+     if (n <= 0) {
+@@ -222,6 +263,11 @@ TCPSocket TCPSocket::connect(
+ 
+   // Attempt to connect `num_retries` times with exponential backoff.
+   for (int attempt = 0; attempt < num_retries; attempt++) {
++    if (deadline_left_ms() == 0) {
++      std::ostringstream msg;
++      msg << tag << " formation deadline passed in connect after " << attempt << " attempts";
++      throw std::runtime_error(msg.str());
++    }
+     // Create the socket
+     sock = socket(AF_INET, SOCK_STREAM, 0);
+     if (sock < 0) {
+@@ -246,7 +292,8 @@ TCPSocket TCPSocket::connect(
+       cb(attempt, wait);
+     }
+     if (wait > 0) {
+-      std::this_thread::sleep_for(std::chrono::milliseconds(wait));
++      int left = deadline_left_ms();
++      std::this_thread::sleep_for(std::chrono::milliseconds(left >= 0 && left < wait ? left : wait));
+     }
+ 
+     wait = std::min(wait * 2, 1000);
+@@ -262,3 +309,7 @@ TCPSocket TCPSocket::connect(
+ }
+ 
+ } // namespace jaccl
++
++extern "C" __attribute__((visibility("default"))) void jaccl_set_formation_deadline_ms(int64_t deadline_ms) {
++  jaccl::formation_deadline_ms.store(deadline_ms, std::memory_order_release);
++}
+diff --git a/mlx/distributed/jaccl/lib/jaccl/tcp.h b/mlx/distributed/jaccl/lib/jaccl/tcp.h
+index 8c8791353..bbaf012f1 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/tcp.h
++++ b/mlx/distributed/jaccl/lib/jaccl/tcp.h
+@@ -3,6 +3,7 @@
+ #pragma once
+ 
+ #include <sys/socket.h>
++#include <cstdint>
+ #include <functional>
+ #include <string>
+ 
+@@ -65,3 +66,7 @@ class TCPSocket {
+ };
+ 
+ } // namespace jaccl
++
++// Absolute CLOCK_MONOTONIC milliseconds; zero disables the formation deadline.
++extern "C" __attribute__((visibility("default"))) void
++jaccl_set_formation_deadline_ms(int64_t deadline_ms);
