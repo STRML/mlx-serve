@@ -1375,6 +1375,28 @@ test "deepseek_v41 modes: freeing the TP4 model leaves the whole model's launch 
     }
 }
 
+test "deepseek_v41 modes: a DSpark pack's TP4 rank holds its stages as a --dist tensor rank does, sharded or on rank 0 whole" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41TpDsparkFiles(arena.allocator(), 7);
+    LoneGroup.arm(4);
+    defer LoneGroup.disarm();
+    defer _ = unsetenv("DSV41_DRAFT_SHARD");
+    for ([_]bool{ true, false }) |shard| {
+        _ = setenv("DSV41_DRAFT_SHARD", if (shard) "1" else "0", 1);
+        const t = try Twin.openWith(files, "", tp4_setting);
+        defer t.close();
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        const tp = m.modes.tp orelse return error.NoTpMode;
+        try testing.expectEqual(@as(usize, 2), m.modes.tp1.n_mtp);
+        try testing.expectEqual(@as(usize, 2), tp.n_mtp);
+        try testing.expectEqual(shard, tp.draft_shard);
+        _ = mlx.mlx_array_free(try dsv41.prefill(tp, testing.allocator, &.{ 3, 1, 4, 1, 5, 9, 2, 6 }, null));
+    }
+}
+
 test "deepseek_v41 modes: tp_mode is refused by name at a size below 2 or a rank past it" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;

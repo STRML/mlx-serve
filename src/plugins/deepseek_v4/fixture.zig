@@ -355,6 +355,17 @@ pub fn v41TpFiles(a: std.mem.Allocator, seed: u64) ![]const File {
     });
 }
 
+/// `v41TpFiles` with two DSpark stages: the pack a tensor group's rank drafts from.
+pub fn v41TpDsparkFiles(a: std.mem.Allocator, seed: u64) ![]const File {
+    const files = try v41TpFiles(a, seed);
+    const cfg = try std.mem.replaceOwned(u8, a, files[0].bytes, "\"compress_ratios\": [0, 0, 2, 2, 2, 1, 1, 1]", v41_dspark_keys);
+    if (std.mem.eql(u8, cfg, files[0].bytes)) return error.FixtureConfigDrift;
+    return a.dupe(File, &.{
+        .{ .name = "config.json", .bytes = cfg },
+        .{ .name = "model.safetensors", .bytes = try v41Pack(a, seed, v41_vocab, 2, false, v41_tp_dims) },
+    });
+}
+
 /// The Markov rank of a pack whose drafter heads are quantized: a whole group.
 const quant_rank = 64;
 

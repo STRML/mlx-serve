@@ -42,11 +42,13 @@ pub fn build(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: mlx.m
     var out: Modes = .{ .tp1 = undefined };
     if (group) |g| {
         if (opts.tp != null or opts.pair != null) return error.Dsv41ModeBesideSplit;
-        out.tp_weights = try shardViews(gpa, w, g, s);
-        errdefer out.tp_weights.?.deinit();
+        if (!dsv41.tpGeometryFits(whole, g.size)) return error.Dsv41ShardUneven;
         var o = opts;
-        o.tp = g;
         o.draft_shard = dsv41.draftShardWanted(g.size);
+        // As a `--dist tensor` rank loads: with a sharded draft every rank holds its slice of the DSpark stages.
+        o.tp = .{ .rank = g.rank, .size = g.size, .stages = o.draft_shard };
+        out.tp_weights = try shardViews(gpa, w, o.tp.?, s);
+        errdefer out.tp_weights.?.deinit();
         out.tp = try dsv41.init(gpa, whole, &out.tp_weights.?, s, o);
     }
     errdefer if (out.tp) |t| {
@@ -57,14 +59,14 @@ pub fn build(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: mlx.m
     return out;
 }
 
-/// A map of `w`'s tensors as rank `sh` of a tensor group reads them: each one `Shard.axis` cuts as a slice of the
+/// A map of `w`'s tensors as rank `sh` of a tensor group reads them: each one `sh.axisOf` cuts as a slice of the
 /// resident array, every other one the same array. Nothing is copied here; the arrays stay `w`'s.
 pub fn shardViews(gpa: std.mem.Allocator, w: *const Weights, sh: Shard, s: mlx.mlx_stream) !Weights {
     var out = Weights.init(gpa);
     errdefer out.deinit();
     var it = w.map.iterator();
     while (it.next()) |kv| {
-        const v = try viewOf(kv.value_ptr.*, Shard.axis(kv.key_ptr.*), sh, s);
+        const v = try viewOf(kv.value_ptr.*, sh.axisOf(kv.key_ptr.*), sh, s);
         out.put(kv.key_ptr.*, v) catch |e| {
             _ = mlx.mlx_array_free(v);
             return e;
@@ -98,6 +100,15 @@ test "mode.build: a tensor group's mode beside a --dist split is refused before 
     defer w.deinit();
     const cfg: Config = undefined;
     try std.testing.expectError(error.Dsv41ModeBesideSplit, build(std.testing.allocator, &cfg, &w, .{ .ctx = null }, .{ .tp = .{ .rank = 0, .size = 2 } }, .{ .rank = 0, .size = 4 }));
+}
+
+test "mode.build: a group size the release geometry's heads or output groups cannot split is refused by name before it reads a weight" {
+    var w = Weights.init(std.testing.allocator);
+    defer w.deinit();
+    const cfg: Config = .{ .model_type = "deepseek_v41", .num_attention_heads = 64, .dsv4_o_groups = 8, .moe_intermediate_size = 2048, .shared_expert_intermediate_size = 2048 };
+    try std.testing.expect(dsv41.tpGeometryFits(&cfg, 4));
+    for ([_]u32{ 16, 3, 128 }) |size|
+        try std.testing.expectError(error.Dsv41ShardUneven, build(std.testing.allocator, &cfg, &w, .{ .ctx = null }, .{}, .{ .rank = 0, .size = size }));
 }
 
 /// A tensor group of `size` ranks in one process, for a rank-0 model's tests: every rank's part is rank 0's, so a sum

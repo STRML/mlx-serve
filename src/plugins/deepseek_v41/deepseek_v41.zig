@@ -1837,7 +1837,16 @@ pub const InitOpts = struct {
     quant: ?*const outside.Format = null,
 };
 
+/// Whether a `size`-rank tensor split leaves every rank a whole, non-empty share of each width the split divides:
+/// the attention heads, the output groups (whole groups a rank) and the expert widths.
+pub fn tpGeometryFits(cfg: *const Config, size: u32) bool {
+    if (size == 0) return false;
+    for ([_]u32{ cfg.num_attention_heads, cfg.dsv4_o_groups, cfg.moe_intermediate_size }) |n| if (n == 0 or n % size != 0) return false;
+    return cfg.shared_expert_intermediate_size % size == 0;
+}
+
 pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opts: InitOpts) !*Dsv41Model {
+    if (opts.tp) |t| if (!tpGeometryFits(whole, t.size)) return error.Dsv41ShardUneven;
     var sliced = whole.*;
     // A streamed bank reads whole experts and only rank 0 opens one; a split's ranks hold half of each.
     if (opts.tp != null and opts.streamed_experts) return error.Dsv41TpStreamedExperts;
