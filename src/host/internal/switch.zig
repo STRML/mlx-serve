@@ -20,9 +20,10 @@ pub const ReleaseError = error{PeerUnreachable};
 /// and `released`, from whatever thread finished the work.
 pub const Formation = struct {
     ctx: *anyopaque,
-    /// Begin forming the group as `role`, absolute CLOCK_MONOTONIC `deadline_ms`. A leader returns once the JACCL
-    /// listener is open; a follower returns as soon as its switch thread is running.
-    start: *const fn (ctx: *anyopaque, role: attempt.Role, n: u64, deadline_ms: i64) StartError!void,
+    /// Begin forming the group as `role`, with `budget_ms` left before the router's deadline (a duration: this box's
+    /// clock epochs never meet the caller's). A leader returns once the JACCL listener is open; a follower returns as
+    /// soon as its switch thread is running.
+    start: *const fn (ctx: *anyopaque, role: attempt.Role, n: u64, budget_ms: i64) StartError!void,
     /// Cancel an in-progress formation; the switch thread unwinds and calls `formationFailed`.
     cancel: *const fn (ctx: *anyopaque, n: u64) void,
     /// Leader only: send OP_RELEASE and begin the down-switch; `released` reports its end.
@@ -178,7 +179,7 @@ pub const Switch = struct {
         }
     }
 
-    /// Apply one router command. `deadline_ms` is an absolute CLOCK_MONOTONIC time for `tp4` and `join`; 0 means two seconds from now.
+    /// Apply one router command. `deadline_ms` is an absolute time on this controller's clock for `tp4` and `join`; 0 means two seconds from now.
     pub fn command(self: *Switch, cmd: attempt.Cmd, n: u64, deadline_ms: i64) Reply {
         const now_ms = self.now();
         const needs_formation = cmd == .tp4 or cmd == .join or cmd == .tp1;
@@ -204,7 +205,7 @@ pub const Switch = struct {
         const f = self.formation orelse return .{ .status = 200, .snap = snap };
         switch (effect) {
             .none, .close_admission, .reopen_admission => {},
-            .start_formation => f.start(f.ctx, role, n, deadline_ms) catch |err| {
+            .start_formation => f.start(f.ctx, role, n, deadline_ms - self.now()) catch |err| {
                 const why: attempt.Failure = if (err == error.ListenerTimeout) .listener else .other;
                 _ = self.formationFailed(n, why);
                 return .{ .status = 502, .reason = @tagName(why), .snap = self.snapshot() };
@@ -300,7 +301,7 @@ const Fake = struct {
     start_err: ?anyerror = null,
     release_err: ?anyerror = null,
     started_role: attempt.Role = .none,
-    started_deadline: i64 = 0,
+    started_budget: i64 = 0,
     sync_form: ?*Switch = null,
 
     fn deinit(self: *Fake) void {
@@ -313,11 +314,11 @@ fn testNow(_: std.Io) i64 {
     return test_now;
 }
 
-fn fakeStart(ctx: *anyopaque, role: attempt.Role, n: u64, deadline_ms: i64) StartError!void {
+fn fakeStart(ctx: *anyopaque, role: attempt.Role, n: u64, budget_ms: i64) StartError!void {
     const f: *Fake = @ptrCast(@alignCast(ctx));
     f.calls.append(t.allocator, 's') catch unreachable;
     f.started_role = role;
-    f.started_deadline = deadline_ms;
+    f.started_budget = budget_ms;
     if (f.start_err) |_| return error.ListenerTimeout;
     if (f.sync_form) |sw| _ = sw.formed(n);
 }
@@ -386,7 +387,7 @@ test "tp4 and join need a formation backend and leave the machine untouched with
     try t.expectEqual(attempt.State.draining, sw.snapshot().state);
 }
 
-test "tp4 starts formation as leader with the router's deadline; the thread publishes through formed" {
+test "tp4 starts formation as leader with the time left to the router's deadline; the thread publishes through formed" {
     var f: Fake = .{};
     defer f.deinit();
     var sw = newSwitch(&f);
@@ -394,7 +395,7 @@ test "tp4 starts formation as leader with the router's deadline; the thread publ
     const r = sw.command(.tp4, 4, 11_900);
     try t.expectEqual(@as(u16, 200), r.status);
     try t.expectEqual(attempt.Role.leader, f.started_role);
-    try t.expectEqual(@as(i64, 11_900), f.started_deadline);
+    try t.expectEqual(@as(i64, 1_900), f.started_budget);
     try t.expectEqual(attempt.State.forming, sw.snapshot().state);
     try t.expect(sw.formed(4));
     try t.expectEqual(attempt.Mode.tp4, sw.snapshot().mode);
@@ -408,7 +409,7 @@ test "join with no deadline gets the default two seconds" {
     _ = sw.command(.drain, 4, 0);
     _ = sw.command(.join, 4, 0);
     try t.expectEqual(attempt.Role.follower, f.started_role);
-    try t.expectEqual(@as(i64, 12_000), f.started_deadline);
+    try t.expectEqual(@as(i64, 2_000), f.started_budget);
     try t.expect(!sw.snapshot().admitting);
 }
 

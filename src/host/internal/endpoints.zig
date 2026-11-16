@@ -178,11 +178,11 @@ const Rig = struct {
     sw: sw_mod.Switch,
     calls: [8]u8 = undefined,
     n_calls: usize = 0,
-    deadline: i64 = 0,
+    budget: i64 = 0,
 
-    fn start(ctx: *anyopaque, _: attempt.Role, _: u64, deadline_ms: i64) sw_mod.StartError!void {
+    fn start(ctx: *anyopaque, _: attempt.Role, _: u64, budget_ms: i64) sw_mod.StartError!void {
         const r: *Rig = @ptrCast(@alignCast(ctx));
-        r.deadline = deadline_ms;
+        r.budget = budget_ms;
         r.note('s');
     }
     fn cancel(ctx: *anyopaque, _: u64) void {
@@ -312,13 +312,13 @@ test "a refused command is 409 with the reason and the box's N" {
     try expectField(res.body, "n", "9");
 }
 
-test "tp4 converts the router's wall-clock deadline to this box's monotonic clock" {
+test "tp4 hands the formation the time left to the router's wall-clock deadline" {
     var r = rig();
     wire(&r);
     _ = call(&r, KEY, "POST", "/v1/internal/drain", BEARER, "{\"n\":1}");
     const res = call(&r, KEY, "POST", "/v1/internal/tp4", BEARER, "{\"n\":1,\"deadline_ms\":1700000001900}");
     try t.expectEqual(@as(u16, 200), res.status);
-    try t.expectEqual(@as(i64, 51_900), r.deadline);
+    try t.expectEqual(@as(i64, 1_900), r.budget);
 }
 
 test "a deadline in the past or more than ten seconds out is a 400" {
