@@ -505,6 +505,8 @@ pub const Dsv41Model = struct {
     /// The request's prompt, whose later chunks' Engram rows are read while an earlier one runs.
     prompt: []u32 = &.{},
     ahead: ?*engram.Prefetch = null,
+    read_ahead: ?*engram.readahead.ReadAhead = null,
+    read_ahead_limit: u64 = std.math.maxInt(u64),
     /// The rows the next call brings when this module cut a chunk itself (`extendCold`): what the read-ahead reads.
     next_rows: ?usize = null,
     rope_plain: Rope,
@@ -590,6 +592,18 @@ pub const Dsv41Model = struct {
         self.ahead = null;
     }
 
+    pub fn dropReadAhead(self: *Dsv41Model) void {
+        if (self.read_ahead) |ra| ra.cancel();
+        self.dropAhead();
+        if (self.read_ahead) |ra| {
+            for (self.engrams) |*e| e.table.read_ahead = null;
+            ra.wait();
+            log.info("[dsv41] Engram read-ahead rows: ready {d}, served {d}, SSD fallback {d}\n", .{ ra.ready.load(.acquire), ra.hits.load(.acquire), ra.misses.load(.acquire) });
+            ra.deinit();
+        }
+        self.read_ahead = null;
+    }
+
     pub fn deinit(self: *Dsv41Model) void {
         // scratch_x1.zig: the prompt's regions let go with the model.
         sx1.releaseAll();
@@ -599,7 +613,7 @@ pub const Dsv41Model = struct {
             s.deinit();
             self.gpa.destroy(s);
         }
-        self.dropAhead();
+        self.dropReadAhead();
         self.gpa.free(self.prompt);
         for (self.engrams) |*e| e.table.close();
         if (self.embed_tab) |*t| t.close();
@@ -2182,6 +2196,18 @@ pub fn dsparkWanted(cfg: *const Config, pair: ?Pair, mtp: ?bool) bool {
     }
     const ds = env.get(.MLX_SERVE_DSV4_DSPARK);
     return (mtp orelse true) or (ds != null and ds.?[0] != '0');
+}
+
+pub fn readAheadReserve(config: anytype) u64 {
+    if (config.dsv41_n_engram_layers == 0) return 0;
+    const T = @TypeOf(config.*);
+    if (@hasField(T, "dsv41_streamed")) {
+        if (config.dsv41_streamed) return 0;
+    } else {
+        if (config.dist_shard != null or config.dist_dsv41 != null or config.dist_span != null or config.stream_experts_override != null) return 0;
+        if (config.plugin) |b| if (b.parsed.caps.streamed_weights) return 0;
+    }
+    return engram.readAheadBudget(env.span(.MLX_SERVE_DSV41_ENGRAM_READAHEAD_MB));
 }
 
 /// What a load holds of the pack: its safetensors bytes less the Engram tables it preads and the tensors it
@@ -6792,6 +6818,7 @@ pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision:
 
 /// A fresh request's empty state.
 pub fn reset(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
+    m.dropReadAhead();
     var fresh = try initState(m, gpa);
     if (m.dec_state) |*st| {
         fresh.snap_at = st.snap_at;
@@ -7261,13 +7288,58 @@ pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize
     return n;
 }
 
+fn startPromptReadAhead(m: *Dsv41Model, prompt: []const u32, images: bool, budget: usize, available: u64) !void {
+    if (m.engrams.len == 0 or m.tp != null or m.pair != null or m.streamed != null) return;
+    if (budget == 0) {
+        log.info("[dsv41] Engram read-ahead off: budget 0\n", .{});
+        return;
+    }
+    const hs = &(m.hash orelse return);
+    var sources: [engram.MAX_LAYERS]engram.readahead.Source = undefined;
+    var max_rows: usize = 0;
+    for (m.engrams, 0..) |*e, layer| {
+        sources[layer] = e.table.source();
+        max_rows = @max(max_rows, @min(e.table.rows, prompt.len * hs.cols()));
+    }
+    const ra = (try engram.readahead.ReadAhead.create(m.gpa, sources[0..m.engrams.len], engram.readahead.allowed(budget, available), max_rows)) orelse return;
+    errdefer ra.deinit();
+    var hist: [engram.MAX_NGRAM - 1]u32 = undefined;
+    var nh: usize = 0;
+    var rows: [engram.MAX_LAYERS * engram.MAX_COLS]u32 = undefined;
+    for (prompt) |tok| {
+        const comp = m.compressedId(tok, images);
+        const ids = rows[0 .. hs.n_layers * hs.cols()];
+        hs.rows(hist[0..nh], &.{comp}, ids);
+        for (m.engrams, 0..) |_, layer| {
+            for (ids[layer * hs.cols() ..][0..hs.cols()]) |id| _ = ra.add(layer, id);
+        }
+        if (ra.full()) break;
+        if (nh == hist.len) {
+            std.mem.copyForwards(u32, hist[0 .. nh - 1], hist[1..nh]);
+            nh -= 1;
+        }
+        hist[nh] = comp;
+        nh += 1;
+    }
+    try ra.start();
+    m.read_ahead = ra;
+    for (m.engrams, 0..) |*e, layer| {
+        e.table.read_ahead = ra;
+        e.table.read_ahead_layer = layer;
+    }
+    log.info("[dsv41] Engram read-ahead on: {d} MiB reserved, cap {d} MiB\n", .{ ra.bytes >> 20, budget >> 20 });
+}
+
 /// Arms only this live State; candidate identity covers the boundary's ids and image rows.
 pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: bool) !void {
-    m.dropAhead();
+    m.dropReadAhead();
     m.gpa.free(m.prompt);
     m.prompt = &.{};
     m.prompt = try m.gpa.dupe(u32, prompt);
     const st = &m.dec_state.?;
+    if (st.n == 0 and prompt.len > region_rows) startPromptReadAhead(m, prompt, vision_rows != null, @intCast(@min(engram.readAheadBudget(env.span(.MLX_SERVE_DSV41_ENGRAM_READAHEAD_MB)), m.read_ahead_limit)), system.getAvailableMemBytes()) catch |err| {
+        log.warn("[dsv41] Engram read-ahead skipped: {s}\n", .{@errorName(err)});
+    };
     if (st.snap) |*sn| sn.deinit(st.gpa);
     st.snap = null;
     st.gpa.free(st.snap_ids);
@@ -7444,6 +7516,8 @@ fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u
 /// position runs as two.
 /// One decode token still on the GPU (`Ids.gpu`), where `extendResumable` takes host ids.
 pub fn extendResumableGpu(m: *Dsv41Model, gpa: std.mem.Allocator, tok: A) !A {
+    errdefer m.dropReadAhead();
+    defer if (m.read_ahead != null and m.dec_state.?.n >= m.prompt.len) m.dropReadAhead();
     try snapshotIfDue(m);
     const out = try extendIds(m, gpa, &m.dec_state.?, .{ .gpu = tok }, .last, null);
     try snapshotIfDue(m);
@@ -7451,6 +7525,8 @@ pub fn extendResumableGpu(m: *Dsv41Model, gpa: std.mem.Allocator, tok: A) !A {
 }
 
 pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision: ?VisionRows) !A {
+    errdefer m.dropReadAhead();
+    defer if (m.read_ahead != null and m.dec_state.?.n >= m.prompt.len) m.dropReadAhead();
     try snapshotIfDue(m);
     const st = &m.dec_state.?;
     if (st.snap_at) |at| if (at > st.n and at < st.n + ids.len) {
@@ -11657,4 +11733,47 @@ test "dsv41 pair: a layer split refuses an MLX pack's streamed experts by name b
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.Dsv41PairStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 4, .hi = 8, .worker = false }, .streamed_experts = true }));
+}
+
+test "dsv41 engram read-ahead: known prompt hashes later chunks before any forward" {
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try engram.writeAffineFixture(io, td.dir, "");
+    var path: [512]u8 = undefined;
+    var e: EngramLayer = undefined;
+    e.table = try engram.Table.open(gpa, path[0..try td.dir.realPath(io, &path)], 0, 1, 4, 64);
+    defer e.table.close();
+    var m: Dsv41Model = undefined;
+    m.gpa = gpa;
+    m.cfg = .{};
+    m.ahead = null;
+    m.read_ahead = null;
+    m.tp = null;
+    m.pair = null;
+    m.streamed = null;
+    m.engrams = @as(*[1]EngramLayer, &e);
+    var map = [_]u32{ 0, 1, 2, 3 };
+    m.token_map = &map;
+    var hs: engram.Hash = .{ .n_layers = 1, .max_ngram = 2, .heads = 1, .pad = 0 };
+    hs.mult[0][0] = 1;
+    hs.mult[0][1] = 3;
+    hs.primes[0][0] = 4;
+    m.hash = hs;
+    const prompt = [_]u32{ 0, 3, 1, 2, 0, 3, 1, 2 };
+    try startPromptReadAhead(&m, &prompt, false, 32 << 20, 64 << 30);
+    const ra = m.read_ahead orelse return error.ReadAheadMissing;
+    defer m.dropReadAhead();
+    ra.wait();
+    var rows: [prompt.len]u32 = undefined;
+    hs.rows(&.{}, &prompt, &rows);
+    const raw = try e.table.read(gpa, rows[prompt.len / 2 ..]);
+    defer raw.deinit(gpa);
+    try testing.expectEqual(@as(usize, prompt.len / 2), ra.hits.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), ra.misses.load(.acquire));
+    m.dropReadAhead();
+    try testing.expect(m.read_ahead == null and e.table.read_ahead == null);
+    try startPromptReadAhead(&m, &prompt, false, 32 << 20, 12 << 30);
+    try testing.expect(m.read_ahead == null);
 }

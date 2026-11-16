@@ -131,6 +131,7 @@ const Kept = struct {
 /// Parks a live slot; excluded configurations retain an unclaimed state for legacy resume.
 fn park(m: *Model) !void {
     const st = m.mdl.dec_state orelse return;
+    m.mdl.dropReadAhead();
     const k: Kept = .{ .st = st, .gen = m.mdl.state_gen };
     if (m.owner != 0) try m.parked.put(gpa, m.owner, k) else if (!auxEnabled(m)) keepIdle(m, k) else {
         var orphan = k;
@@ -184,10 +185,13 @@ pub fn swapMode(m: *Model, to: mode.Mode) !void {
     if (m.idle) |*k| k.deinit();
     m.idle = null;
     m.owner = 0;
-    for ([_]*dsv41.Dsv41Model{ m.mdl, next }) |x| if (x.dec_state) |*st| {
-        st.deinit();
-        x.dec_state = null;
-    };
+    for ([_]*dsv41.Dsv41Model{ m.mdl, next }) |x| {
+        x.dropReadAhead();
+        if (x.dec_state) |*st| {
+            st.deinit();
+            x.dec_state = null;
+        }
+    }
     m.modes.active = to;
     m.mdl = next;
 }
@@ -204,6 +208,7 @@ fn swapModeEntry(mp: *anyopaque, to: abi.ServingMode) callconv(.c) Verdict {
 
 fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
+    if (slot == m.owner) m.mdl.dropReadAhead();
     if (!auxEnabled(mp)) {
         if (slot == m.owner) {
             m.owner = 0;
@@ -694,7 +699,7 @@ pub fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows
     };
 }
 
-/// `CacheHooks.state_bytes`: the bytes the request's state holds on the GPU, for the engine's cache budget.
+/// `CacheHooks.state_bytes`: live device state, for the engine's cache budget.
 pub fn stateBytes(mp: *anyopaque) callconv(.c) u64 {
     const m: *Model = @ptrCast(@alignCast(mp));
     var bytes: u64 = if (m.mdl.dec_state) |*st| dsv41.stateBytes(st) else 0;

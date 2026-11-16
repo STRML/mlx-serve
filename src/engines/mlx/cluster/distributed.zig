@@ -6102,7 +6102,11 @@ const TestModeAdapter = struct {
         self.swaps = 0;
         self.fail = false;
         self.whole.dec_state = null;
+        self.whole.ahead = null;
+        self.whole.read_ahead = null;
         self.tensor.dec_state = null;
+        self.tensor.ahead = null;
+        self.tensor.read_ahead = null;
         self.tensor.cfg = .{ .hidden_size = 4 };
         self.model.mdl = &self.whole;
         self.model.modes = .{ .tp1 = &self.whole, .tp = &self.tensor };

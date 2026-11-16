@@ -1504,6 +1504,18 @@ pub fn auxPrefixKey(xfm: *const Transformer, ids: []const u32, media: ?Array, ou
 
 pub fn auxBeginPrompt(xfm: *const Transformer, slot: u32, prompt: []const u32, media: ?Array, restored_at: u64, capture: bool) abi.Verdict {
     const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
+    if (intree.dsv41(xfm)) |m| {
+        const min_rows = @import("../../../plugins/deepseek_v41/deepseek_v41.zig").region_rows;
+        if (restored_at == 0 and prompt.len > min_rows and m.engrams.len > 0) {
+            m.dropReadAhead();
+            const cfg = &xfm.config;
+            const chunk = cfg.cappedPrefillChunk(if (cfg.pinned_prefill_chunk > 0) cfg.pinned_prefill_chunk else 8192);
+            const pc = @import("../admission/prefill_chunk.zig");
+            const sch = @import("../../../host/http/server.zig").launch().global_scheduler;
+            const staged = if (sch) |s| @import("../cache/budget.zig").stagedHostBytes(s) else 0;
+            m.read_ahead_limit = pc.prefillHeadroomNow(cfg, staged) -| pc.dsv41PrefillMemoryNeeded(cfg, prompt.len, chunk);
+        }
+    }
     return b.hooks.begin_prompt(b.model, slot, .of(prompt), .{ .ctx = if (media) |m| m.ctx else null }, restored_at, capture);
 }
 
@@ -2359,8 +2371,12 @@ test "plugin swap mode: ABI reaches DSv4.1 and refuses unsupported or absent mod
     const p = @import("../../../plugins/deepseek_v41/plugin.zig");
     var whole: p.Module = undefined;
     whole.dec_state = null;
+    whole.ahead = null;
+    whole.read_ahead = null;
     var tensor: p.Module = undefined;
     tensor.dec_state = null;
+    tensor.ahead = null;
+    tensor.read_ahead = null;
     var m: p.Model = undefined;
     m.mdl = &whole;
     m.modes = .{ .tp1 = &whole, .tp = &tensor };

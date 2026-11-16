@@ -52,8 +52,9 @@ pub fn prefillTransientReserveAtKv(
     kv_len: u64,
 ) u64 {
     const seq: u64 = @max(kv_len, chunk);
-    // The arch that bills its own prompt pass is priced the same way here as at admission (`prefillNeededAtChunk`).
-    if (config.isDsv41()) return @import("prefill_chunk.zig").dsv41PrefillMemoryNeeded(config, seq, chunk);
+    // Optional host rows reserve cache headroom without increasing the request's admission bill.
+    if (config.isDsv41()) return @import("prefill_chunk.zig").dsv41PrefillMemoryNeeded(config, seq, chunk) +|
+        @import("../../../plugins/deepseek_v41/deepseek_v41.zig").readAheadReserve(config);
     return prefillMemoryNeeded(
         seq,
         config.num_attention_heads,

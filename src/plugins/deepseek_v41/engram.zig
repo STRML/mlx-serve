@@ -18,6 +18,8 @@ const gguf_claim = @import("../../sdk/quant/gguf/claim.zig");
 const gguf_root = @import("../../sdk/quant/gguf/root.zig");
 const ds41_gguf = @import("../../sdk/quant/gguf/arch/deepseek41.zig");
 
+pub const readahead = @import("engram_readahead.zig");
+
 pub const MAX_LAYERS = 4;
 pub const MAX_NGRAM = 8;
 pub const MAX_HEADS = 16;
@@ -248,6 +250,8 @@ fn unpackTokenMap(map: []u32, raw: []const u8) !void {
 /// table inside a safetensors shard (weight / scales / biases tensors).
 pub const Table = struct {
     fd: c_int,
+    read_ahead: ?*readahead.ReadAhead = null,
+    read_ahead_layer: usize = 0,
     rows: u64,
     head_dim: u32,
     mode: QuantMode,
@@ -521,6 +525,19 @@ pub const Table = struct {
         }
     };
 
+    pub fn source(self: *const Table) readahead.Source {
+        return .{ .ctx = self, .row_bytes = self.wlen + self.slen + (if (self.mode == .affine) self.slen else 0), .read = readSource };
+    }
+
+    fn readSource(ctx: *const anyopaque, id: u32, out: []u8) bool {
+        const self: *const Table = @ptrCast(@alignCast(ctx));
+        var job: Job = .{ .t = self, .ids = &.{id}, .w = out[0..self.wlen], .s = out[self.wlen..][0..self.slen], .b = out[self.wlen + self.slen ..] };
+        if (id >= self.rows) return false;
+        const parts: usize = if (self.records()) 1 else if (self.mode == .affine) 3 else 2;
+        for (0..parts) |part| if (!Job.Parts.readPart(self, &job, 0, id, part)) return false;
+        return true;
+    }
+
     pub fn read(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !Raw {
         // A prompt's spans repeat rows (common n-grams): each distinct row is read once.
         if (ids.len > GCD_ROWS) if (try self.readDistinct(gpa, ids)) |r| return r;
@@ -568,6 +585,7 @@ pub const Table = struct {
     /// block the run read last when it holds them, so neighbouring rows' scales cost one read. Rows in `ids`'s order.
     /// `cap`: the threads the read may run on (at most `GRID_THREADS`).
     fn readSorted(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, cap: usize) !Raw {
+        if (self.read_ahead != null) return self.readAll(gpa, ids);
         const n = ids.len;
         const w = try gpa.alignedAlloc(u8, .@"4", n * self.wlen);
         errdefer gpa.free(w);
@@ -628,7 +646,7 @@ pub const Table = struct {
         const bi = try gpa.alignedAlloc(u8, .@"4", if (self.mode == .affine) n * self.slen else 0);
         errdefer gpa.free(bi);
         var job: Job = .{ .t = self, .ids = ids, .w = w, .s = sc, .b = bi };
-        if (builtin.os.tag.isDarwin() and n <= GCD_ROWS) {
+        if (builtin.os.tag.isDarwin() and n <= GCD_ROWS and self.read_ahead == null) {
             // a decode token's or verify's rows wait at the first Engram layer while the GPU idles: the
             // rows the LRU holds copied out of it, the others read on its pool.
             try self.readHeld(&job);
@@ -676,7 +694,8 @@ pub const Table = struct {
     /// `ids`' rows into `w`, `s` and `b` (`Table.read`'s layout), a row a GCD work item; false on a failed read.
     fn readInto(ctx: *const anyopaque, ids: []const u32, w: []u8, s: []u8, b: []u8) bool {
         const self: *const Table = @ptrCast(@alignCast(ctx));
-        var job: Job = .{ .t = self, .ids = ids, .w = w, .s = s, .b = b };
+        // The LRU's reader can outlive a prompt cache.
+        var job: Job = .{ .t = self, .ids = ids, .w = w, .s = s, .b = b, .use_read_ahead = false };
         dispatch_apply_f(ids.len, dispatch_get_global_queue(qos_user_initiated, 0), &job, Job.applyOne);
         return !job.bad.load(.acquire);
     }
@@ -736,6 +755,7 @@ pub const Table = struct {
 
     const Job = struct {
         t: *const Table,
+        use_read_ahead: bool = true,
         ids: []const u32,
         w: []u8,
         s: []u8,
@@ -785,6 +805,12 @@ pub const Table = struct {
             var i = first;
             while (i < self.ids.len) : (i += stride) {
                 const r: u64 = self.ids[i];
+                if (self.use_read_ahead) if (t.read_ahead) |ra| if (ra.get(t.read_ahead_layer, self.ids[i])) |raw| {
+                    @memcpy(self.w[i * t.wlen ..][0..t.wlen], raw[0..t.wlen]);
+                    @memcpy(self.s[i * t.slen ..][0..t.slen], raw[t.wlen..][0..t.slen]);
+                    if (self.b.len > 0) @memcpy(self.b[i * t.slen ..][0..t.slen], raw[t.wlen + t.slen ..]);
+                    continue;
+                };
                 if (rec) {
                     // a repacked table: the row's record, its codes then its scales, in one read
                     if (r >= t.rows or !edir.readRecord(t.fd, self.w[i * t.wlen ..][0..t.wlen], self.s[i * t.slen ..][0..t.slen], t.w_off + r * t.w_stride)) {
@@ -806,6 +832,11 @@ pub const Table = struct {
         }
     };
 };
+
+pub fn readAheadBudget(setting: ?[]const u8) usize {
+    const mb = if (setting) |v| std.fmt.parseInt(u32, v, 10) catch 2048 else 2048;
+    return @as(usize, @min(mb, 16384)) << 20;
+}
 
 /// Whether the page cache has no room for a prompt's Engram codes: under an eighth of RAM free or reclaimable, a
 /// chunk's code pages (16 KiB a row read) push the tables' scales out of it.
@@ -1562,4 +1593,49 @@ test "dsv41 engram: an affine table bills the shard bytes it occupies, a repack 
     var r = try Table.open(testing.allocator, dir, 0, 1, 4, 64);
     defer r.close();
     try testing.expectEqual(@as(u64, 0), r.shardBytes());
+}
+
+test "dsv41 engram read-ahead: fixture bytes and dequant output match with partial residency" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = testing.allocator;
+    const stream = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    for ([_]bool{ false, true }) |affine| {
+        var td = testing.tmpDir(.{});
+        defer td.cleanup();
+        if (affine) try writeAffineFixture(io, td.dir, "") else try writeRawFp8Fixture(io, td.dir);
+        var path: [512]u8 = undefined;
+        var t = try Table.open(gpa, path[0..try td.dir.realPath(io, &path)], 0, 1, 4, 64);
+        defer t.close();
+        const ids = [_]u32{ 0, 3, 1, 0, 2, 1 };
+        const want = try t.read(gpa, &ids);
+        defer want.deinit(gpa);
+        const probe = (try readahead.ReadAhead.create(gpa, &.{t.source()}, 32 << 20, 1)).?;
+        const cap = probe.bytes;
+        probe.deinit();
+        const ra = (try readahead.ReadAhead.create(gpa, &.{t.source()}, cap, 4)).?;
+        try testing.expect(ra.bytes <= cap);
+        defer ra.deinit();
+        _ = ra.add(0, 0);
+        try testing.expect(!ra.add(0, 1));
+        try ra.start();
+        ra.wait();
+        t.read_ahead = ra;
+        defer t.read_ahead = null;
+        const got = try t.read(gpa, &ids);
+        defer got.deinit(gpa);
+        try testing.expectEqualSlices(u8, want.w, got.w);
+        try testing.expectEqualSlices(u8, want.s, got.s);
+        try testing.expectEqualSlices(u8, want.b, got.b);
+        const a = try t.dequant(want, ids.len, stream);
+        defer _ = mlx.mlx_array_free(a);
+        const b = try t.dequant(got, ids.len, stream);
+        defer _ = mlx.mlx_array_free(b);
+        try mlx.check(mlx.mlx_array_eval(a));
+        try mlx.check(mlx.mlx_array_eval(b));
+        try testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(a).?[0 .. ids.len * 64], mlx.mlx_array_data_float32(b).?[0 .. ids.len * 64]);
+        if (comptime builtin.os.tag.isDarwin()) try testing.expect(Table.readInto(&t, &.{0}, got.w[0..t.wlen], got.s[0..t.slen], got.b[0 .. if (affine) t.slen else 0]));
+        try testing.expectEqual(@as(usize, 2), ra.hits.load(.acquire));
+        try testing.expectEqual(@as(usize, 4), ra.misses.load(.acquire));
+    }
 }

@@ -53,6 +53,7 @@ pub const kill_levers = [_]struct { []const u8, KvEffect }{
     .{ "DSV41_ENGRAM_EARLY", .same },
     .{ "DSV41_ENGRAM_LEAD", .same },
     .{ "MLX_SERVE_DSV41_ENGRAM_LRU_MB", .same },
+    .{ "MLX_SERVE_DSV41_ENGRAM_READAHEAD_MB", .same },
     .{ "DSV41_TP_PIPE", .same },
     .{ "DSV41_DSPARK_PIPE", .same },
     .{ "DSV41_DRAFT_SHARD", .same },

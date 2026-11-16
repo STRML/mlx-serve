@@ -195,6 +195,9 @@ pub fn stagedHostBytes(sch: *Scheduler) u64 {
         const entry = entry_ptr.*;
         if (entry.state != .ready) continue;
         if (entry.prefix_cache) |hc| bytes +|= hc.stagedHostBytes();
+        if (entry.transformer) |t| if (@import("../plugin/intree.zig").dsv41(t)) |m| if (m.read_ahead) |ra| {
+            bytes +|= ra.bytes;
+        };
     }
     return bytes;
 }

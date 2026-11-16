@@ -632,3 +632,26 @@ test "the hot cache is sized against memory nobody holds, while requests may cou
         memory_ceiling.currentGpuMemoryCeiling(&cfg, 0),
     );
 }
+
+test "engram read-ahead: hot-cache plan reserves host rows under the GPU ceiling" {
+    const env = @import("../../../env.zig");
+    const name = .MLX_SERVE_DSV41_ENGRAM_READAHEAD_MB;
+    const prev = if (env.span(name)) |v| try testing.allocator.dupeSentinel(u8, v, 0) else null;
+    defer if (prev) |v| testing.allocator.free(v);
+    defer if (prev) |v| env.set(name, v) else env.unset(name);
+    var c: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .dsv41_n_engram_layers = 2 };
+    const GiB: u64 = 1 << 30;
+    env.set(name, "0");
+    const off = planHotCache(&c, 16, 64 * GiB, 16 * GiB, 32768, 0, 0, 4096);
+    const off_request = @import("prefill_chunk.zig").prefillNeededAtChunk(&c, 32, 1, 16, 32, .{});
+    env.set(name, "2048");
+    const on = planHotCache(&c, 16, 64 * GiB, 16 * GiB, 32768, 0, 0, 4096);
+    try testing.expectEqual(off_request, @import("prefill_chunk.zig").prefillNeededAtChunk(&c, 32, 1, 16, 32, .{}));
+    try testing.expectEqual(2 * GiB, on.reserve - off.reserve);
+    try testing.expectEqual(2 * GiB, off.budget - on.budget);
+    c.dist_shard = .{ .rank = 0, .size = 4 };
+    try testing.expectEqual(off.reserve, planHotCache(&c, 16, 64 * GiB, 16 * GiB, 32768, 0, 0, 4096).reserve);
+    c.dist_shard = null;
+    c.stream_experts_override = .on;
+    try testing.expectEqual(off.reserve, planHotCache(&c, 16, 64 * GiB, 16 * GiB, 32768, 0, 0, 4096).reserve);
+}
