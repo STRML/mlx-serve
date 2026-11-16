@@ -2086,8 +2086,10 @@ test "a table that ends before the optional import_plan_details plans through im
     var x: Transformer = undefined;
     x.plugin = &bound;
     const tail = @offsetOf(abi.AuxHooks, "import_plan_details");
-    const sizes = [_]u32{ tail, @sizeOf(abi.AuxHooks) - 1, @sizeOf(abi.AuxHooks) };
-    const peaks = [_]u64{ 6144, 6144, 7 };
+    // The field's own end, not the table's: later optional hooks (settings_key) follow it.
+    const details_end = tail + @sizeOf(@FieldType(abi.AuxHooks, "import_plan_details"));
+    const sizes = [_]u32{ tail, details_end - 1, details_end, @sizeOf(abi.AuxHooks) };
+    const peaks = [_]u64{ 6144, 6144, 7, 7 };
     for (sizes, peaks) |size, peak| {
         hooks.size = size;
         try t.expect(auxEnabled(&x));
