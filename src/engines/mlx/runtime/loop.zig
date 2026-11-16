@@ -55,6 +55,7 @@ pub fn hasWorkPendingLocked(sch: *const Scheduler) bool {
 pub const idleEvictTickMs = @import("../../../host/http/server.zig").idleEvictTickMs;
 
 pub fn inferenceLoop(ctx: ThreadCtx) void {
+    distributed.bindInferenceThread();
     const sch = ctx.scheduler;
     const params = ctx.params;
     defer sch.inference_done.store(true, .release);

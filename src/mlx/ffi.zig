@@ -315,23 +315,7 @@ fn jacclDeadlineFn() ?*const fn (i64) callconv(.c) void {
     return jaccl_deadline_fn;
 }
 
-var clear_backends_fn: ?*const fn () callconv(.c) c_int = null;
-var clear_backends_looked = false;
-var clear_backends_warned: std.atomic.Value(bool) = .init(false);
-
-/// Drops the cached distributed groups when the side MLX provides the entry point.
-pub fn clearDistributedBackends() c_int {
-    if (!clear_backends_looked) {
-        clear_backends_looked = true;
-        if (std.c.dlopen(null, .{ .LAZY = true })) |self| {
-            if (std.c.dlsym(self, "mlx_distributed_clear_backends")) |f| clear_backends_fn = @ptrCast(@alignCast(f));
-        }
-    }
-    if (clear_backends_fn) |f| return f();
-    if (!clear_backends_warned.swap(true, .acq_rel))
-        log.err("[dist] mlx_distributed_clear_backends unavailable; cached groups cannot be cleared\n", .{});
-    return 0;
-}
+pub extern "c" fn mlx_distributed_clear_backends() c_int;
 
 pub fn cudaAvailable() bool {
     if (cuda_cache == null) {

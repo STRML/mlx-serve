@@ -32,6 +32,7 @@
 //! plus a cv broadcast.
 
 const std = @import("std");
+const distributed = @import("cluster/distributed.zig");
 const env = @import("../../env.zig");
 const depth_bounds = @import("spec/mtp_depth_bounds.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -1148,6 +1149,10 @@ pub fn unloadModelIfIdle(self: *Scheduler, id_or_empty: []const u8, idle_window_
                 .ready => break :wait,
             }
         }
+        if (distributed.switchHolds(entry.path)) {
+            self.registry.mutex.unlock(self.io);
+            return error.DistSwitchActive;
+        }
         if (idle_window_ms) |window_ms| {
             const now_ms = io_util.nowMsMonotonic(self.io);
             if (!model_registry_mod.ModelRegistry.idleEvictable(entry, now_ms, window_ms)) {
@@ -1173,6 +1178,7 @@ pub fn unloadModelIfIdle(self: *Scheduler, id_or_empty: []const u8, idle_window_
     req.done_mu.lockUncancelable(self.io);
     while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
     req.done_mu.unlock(self.io);
+    if (req.error_name != null) return error.DistSwitchActive;
 }
 
 /// The least recently used resident model nobody is holding, other than `keep`; its id

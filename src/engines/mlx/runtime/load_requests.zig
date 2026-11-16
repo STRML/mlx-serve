@@ -191,7 +191,21 @@ fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) 
 /// accounting. The conn thread already marked the entry `.evicting` and
 /// drained its refcount in `unloadModel`.
 pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
+    defer {
+        req.done_mu.lockUncancelable(sch.io);
+        req.done = true;
+        req.done_cond.broadcast(sch.io);
+        req.done_mu.unlock(sch.io);
+    }
     const entry = req.entry;
+    if (@import("../cluster/distributed.zig").switchHolds(entry.path)) {
+        sch.registry.mutex.lockUncancelable(sch.io);
+        entry.state = .ready;
+        sch.registry.state_cond.broadcast(sch.io);
+        sch.registry.mutex.unlock(sch.io);
+        req.error_name = "DistSwitchActive";
+        return;
+    }
     const bytes = entry.bytes_resident; // unloadResident zeroes it
     log.info("[registry] unloading model id={s} ({d:.2} GB resident)\n", .{
         entry.id,
@@ -226,11 +240,6 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     // freed model's headroom in place is exactly the per-transient-commit
     // configuration the policy exists to avoid.
     logWiredPolicy(mlx.applyWiredPolicy());
-
-    req.done_mu.lockUncancelable(sch.io);
-    req.done = true;
-    req.done_cond.broadcast(sch.io);
-    req.done_mu.unlock(sch.io);
 }
 
 test "a load refused for memory or an absent worker Mac is retried by the next request; a broken pack stays failed" {

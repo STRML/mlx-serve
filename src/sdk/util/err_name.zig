@@ -15,6 +15,7 @@ pub const Known = error{
     GpuTimeout,
     InsufficientMemory,
     DistWorkerNotJoined,
+    DistSwitchActive,
     LoadFailed,
     NoDefaultModel,
     NotEnoughMemory,
