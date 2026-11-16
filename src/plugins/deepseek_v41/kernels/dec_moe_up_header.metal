@@ -35,13 +35,14 @@ inline void dec_up_table(threadgroup vec<float, BITS == 2 ? 4 : 2>* lut, uint ti
 
 // The gate (acc[rr][0]) and up (acc[rr][1]) sums of one expert's output row against RG x rows, over the simdgroup; the
 // weights are decoded once whatever RG is. `xrow[rr]` is the row of `x` rr reads; `lut` decodes EPL fields at a time.
-template <int BITS, int GS, int K, int N, int RG, typename T>
+// The up row is UO rows past the gate row (N in a fused bank, the whole intermediate width in a rank's row view).
+template <int BITS, int GS, int K, int N, int RG, typename T, int UO = N>
 inline void dec_up_routed(const device uint32_t* w, const device T* sc, const device T* bi, uint row, const device T* x, thread const uint* xrow, uint lane, thread float (*acc)[2], threadgroup const vec<float, BITS == 2 ? 4 : 2>* lut) {
   // A lane's 32 inputs lie in one quant group of GS (64 or 128): GS / 32 lanes share a scale.
   constexpr uint KW = K * BITS / 32, KG = K / GS, UPL = K / 1024, UPG = GS / 32;
   constexpr int EPL = BITS == 2 ? 4 : 2, NIDX = 8 / EPL;
-  const uint wo[2] = {row * KW + lane * BITS, (row + N) * KW + lane * BITS};
-  const uint so[2] = {row * KG + lane / UPG, (row + N) * KG + lane / UPG};
+  const uint wo[2] = {row * KW + lane * BITS, (row + UO) * KW + lane * BITS};
+  const uint so[2] = {row * KG + lane / UPG, (row + UO) * KG + lane / UPG};
 #pragma unroll
   for (int rr = 0; rr < RG; ++rr) acc[rr][0] = acc[rr][1] = 0.0f;
 #pragma unroll
@@ -100,11 +101,11 @@ inline void dec_up_routed(const device uint32_t* w, const device T* sc, const de
 
 // The shared expert's gate (acc[r][0]) and up (acc[r][1]) of output row n against each of R x rows; its weights are
 // decoded once whatever R is.
-template <int R, int K, int N, typename XP>
+template <int R, int K, int N, typename XP, int SU = N>
 inline void dec_up_shared_x(const device uint32_t* sw, const device uint8_t* ss, uint n, XP x, uint lane, thread float (*acc)[2]) {
   constexpr uint KWS = K / 4, KGS = K / 32, UPL = K / 1024;
-  const uint wo[2] = {n * KWS + lane * 8, (n + N) * KWS + lane * 8};
-  const uint so[2] = {n * KGS + lane, (n + N) * KGS + lane};
+  const uint wo[2] = {n * KWS + lane * 8, (n + SU) * KWS + lane * 8};
+  const uint so[2] = {n * KGS + lane, (n + SU) * KGS + lane};
 #pragma unroll
   for (int r = 0; r < R; ++r) acc[r][0] = acc[r][1] = 0.0f;
 #pragma unroll
@@ -158,9 +159,9 @@ inline void dec_up_shared_x(const device uint32_t* sw, const device uint8_t* ss,
   }
 }
 
-template <int R, int K, int N, typename T>
+template <int R, int K, int N, typename T, int SU = N>
 inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, uint n, const device T* x, uint lane, thread float (*acc)[2]) {
-  dec_up_shared_x<R, K, N>(sw, ss, n, (const device uint4*)x, lane, acc);
+  dec_up_shared_x<R, K, N, const device uint4*, SU>(sw, ss, n, (const device uint4*)x, lane, acc);
 }
 
 // clampedSwiglu(gate, up) * wt with the two sums rounded to T where gather_qmm writes them; a NaN stays NaN

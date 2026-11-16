@@ -6,6 +6,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const dsv41 = @import("deepseek_v41.zig");
+const moe_up = @import("decode/moe_up.zig");
 
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
@@ -144,12 +145,19 @@ pub const RowLayer = struct {
     wo_a: Lin,
     sink: A,
     wo_b: Lin,
+    rank: u32,
+    size: u32,
+    /// The resident fused gate+up banks the decode kernel reads this rank's rows of in place (`moe_up.moeUpRows`).
+    fused: ?struct { gu: Bank, sgu: Lin } = null,
 
     pub fn init(gpa: std.mem.Allocator, s: S, ly: *const dsv41.Layer, rank: u32, size: u32) !RowLayer {
         const e = &ly.experts;
         if (e.ext != null or ly.shared[2].ext != null or ly.wo_a.ext != null) return error.Dsv41RowCutOutsideQuant;
         if (e.down.qp.mode == .gguf) return error.Dsv41RowCutGguf;
-        var rl: RowLayer = .{ .gpa = gpa, .experts = undefined, .shared = undefined, .wq_b = undefined, .wo_a = undefined, .sink = none, .wo_b = undefined };
+        var rl: RowLayer = .{ .gpa = gpa, .experts = undefined, .shared = undefined, .wq_b = undefined, .wo_a = undefined, .sink = none, .wo_b = undefined, .rank = rank, .size = size };
+        if (e.gu) |gu| if (ly.shared_gu) |sgu| {
+            rl.fused = .{ .gu = gu, .sgu = sgu };
+        };
         errdefer rl.owned.deinit(gpa);
         const k: Cutter = .{ .gpa = gpa, .s = s, .owned = &rl.owned };
         // Gate and up: views into the fused bank's halves where the load fused them.
@@ -210,6 +218,7 @@ pub fn stageUp(sc: *Scope, m: *const dsv41.Dsv41Model, rl: *const RowLayer, x: A
     const d = dim(x, 1);
     const limit = m.cfg.dsv4_swiglu_limit;
     const uidx = try sc.astype(idx, .uint32);
+    if (m.dec.moe_up) |ku| if (rl.fused) |f| if (try moe_up.moeUpRows(sc, m, ku, f.gu, f.sgu, rl.rank, rl.size, x, uidx, try sc.astype(wts, .float32))) |act| return act;
     const xe = try sc.reshape(x, &.{ @intCast(L), 1, 1, d });
     const gt, const up = try dsv41.gateUp(sc, &rl.experts, xe, lhsOf(L, k, m.lhs_gu), uidx, false);
     const iq = dim(gt, -1);
@@ -799,4 +808,37 @@ test "dsv41 row cut: the route CRC names the first layer a rank routed different
     const off = [_]u32{ mine[0], mine[1], mine[2] +% 1 };
     var apart: Stub = .{ .rank = 0, .others = &.{ mine, &off, mine } };
     try testing.expectEqual(@as(?usize, 2), try crc.firstDivergence(apart.group()));
+}
+
+test "dsv41 row cut: the fused up launch over a rank's rows of the resident banks is that rank's chain up stage" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .fused = true });
+    defer fx.deinit();
+    // The affine decode kernels are built on NAX GPUs only.
+    const ku = fx.m.dec.moe_up orelse return error.SkipZigTest;
+    const ly = fx.layer(20);
+    const rls = try cutRanks(gpa, ly, 4);
+    defer {
+        for (rls) |*r| r.deinit();
+        gpa.free(rls);
+    }
+    for ([_]usize{ 1, decode.max_rows }) |rows| {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const in = try routes(&sc, fx, ly, rows, .bfloat16);
+        for (rls) |*rl| {
+            const f = rl.fused.?;
+            const got = (try moe_up.moeUpRows(&sc, fx.m, ku, f.gu, f.sgu, rl.rank, rl.size, in.x, try sc.astype(in.r.idx, .uint32), in.r.wts)) orelse return error.Declined;
+            var chain = rl.*;
+            chain.fused = null;
+            const want = try stageUp(&sc, fx.m, &chain, in.x, in.r.idx, in.r.wts);
+            try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+            const a = try host(gpa, want);
+            defer gpa.free(a);
+            const b = try host(gpa, got);
+            defer gpa.free(b);
+            try testing.expect(decode.relRms(b, a) < 5e-3);
+        }
+    }
 }
