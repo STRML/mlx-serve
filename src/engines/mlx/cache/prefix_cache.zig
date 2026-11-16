@@ -1541,6 +1541,21 @@ pub const HotPrefixCache = struct {
         return tipOf(index.findBefore(session, newer.id, newer.seq) orelse return null);
     }
 
+    pub const TipWalk = struct {
+        session: u64,
+        last: ?SessionTip = null,
+
+        pub fn next(self: *TipWalk, hc: *HotPrefixCache) ?SessionTip {
+            const tip = if (self.last) |l| hc.sessionTipBefore(self.session, l) else hc.sessionTip(self.session);
+            self.last = tip;
+            return tip;
+        }
+    };
+
+    pub fn tipWalk(_: *HotPrefixCache, session: u64) TipWalk {
+        return .{ .session = session };
+    }
+
     fn tipOf(record: session_index_mod.Tip) SessionTip {
         return .{ .id = record.id, .n = @intCast(record.n), .variant = record.variant, .seq = record.seq, .persisted = true };
     }
@@ -13698,6 +13713,65 @@ test "HotPrefixCache module: claiming one checkpoint again and again never costs
     const older = hc.sessionTipBefore(7, newest) orelse return error.TestExpectedTip;
     try testing.expectEqual(@as(usize, 512), older.n);
     try testing.expect(hc.disk.?.moduleByBoundary(older.id, older.n) != null);
+}
+
+fn expectWalkVisitsEachBoundaryOnce(compact: bool) !void {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    hc.session_tips_seeded = true;
+    const index = hc.tipIndex() orelse return error.TestExpectedIndex;
+    const written = [_]u64{ 100, 200, 300, 200 };
+    for (written, 1..) |id, seq| index.append(.{ .session = 7, .id = id, .n = 512, .variant = 0, .seq = seq });
+    if (compact) {
+        var kept = std.ArrayList(session_index_mod.Tip).empty;
+        defer kept.deinit(testing.allocator);
+        try index.load(&kept);
+    }
+    var visited: [8]u64 = undefined;
+    var count: usize = 0;
+    var walk = hc.tipWalk(7);
+    while (walk.next(&hc)) |tip| : (count += 1) {
+        if (count == visited.len) break;
+        visited[count] = tip.id;
+    }
+    try testing.expectEqualSlices(u64, &.{ 200, 300, 100 }, visited[0..count]);
+}
+
+test "HotPrefixCache module: a session's fallback walk visits each boundary once, so a boundary written twice never hides an older one" {
+    try expectWalkVisitsEachBoundaryOnce(false);
+}
+
+test "HotPrefixCache module: the same walk after the index compacted keeps the older boundary" {
+    try expectWalkVisitsEachBoundaryOnce(true);
+}
+
+test "HotPrefixCache module: a checkpoint parked for its SSD write keeps its session's tip while the cap makes room" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var hc = try ModuleDiskTest.init(&tmp, 2);
+    defer hc.deinit();
+    hc.session_tip_cap = 2;
+    const first_ids = ModuleDiskTest.ids(7);
+    const second_ids = ModuleDiskTest.ids(3000);
+    const third_ids = ModuleDiskTest.ids(6000);
+    var first = ModuleDiskTest.snap(&fake, first_ids[0..512]);
+    var second = ModuleDiskTest.snap(&fake, second_ids[0..512]);
+    var third = ModuleDiskTest.snap(&fake, third_ids[0..512]);
+    _ = try first.putSession(&hc, binding, &.{}, 7);
+    _ = try second.putSession(&hc, binding, &.{}, 8);
+    _ = try third.putSession(&hc, binding, &.{}, 9);
+    try ModuleDiskTest.finish(&hc, cpu);
+
+    const tip = hc.sessionTip(7) orelse return error.TestExpectedTip;
+    try testing.expect(hc.disk.?.moduleByBoundary(tip.id, tip.n) != null);
 }
 
 test "HotPrefixCache module: when the idle flush reports done, every tip whose record landed is in the file" {
