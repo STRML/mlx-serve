@@ -28,7 +28,7 @@ pub const HoldProbe = struct {
     gen_reserve: u64,
     live: usize,
 
-    /// `credit` stands in for memory an eviction could return: the feasibility check only, never the verdict.
+    /// `credit` stands in for memory an eviction could return: it only decides whether evicting is worth trying, never the verdict.
     fn fitsWithCredit(self: *const HoldProbe, credit: u64) bool {
         const bill = self.bill_fn(self.bill_ctx);
         var active_now: usize = 0;
@@ -50,7 +50,11 @@ pub const HoldProbe = struct {
 /// room, the requesting model's own cache gives back LRU entries (never one a live slot holds,
 /// never the entry this prompt restores from) until it fits or nothing is left to give.
 pub fn holdsAfterEviction(cache: ?*HotPrefixCache, prompt: []const u32, probe: *HoldProbe) bool {
-    return holdsForMemory(probe.fitsWithCredit(0), probe.hasCompany());
+    if (!holdsForMemory(probe.fitsWithCredit(0), probe.hasCompany())) return false;
+    const hc = cache orelse return true;
+    if (!probe.fitsWithCredit(hc.reclaimableBytesFor(prompt))) return true;
+    _ = hc.evictLruToAdmitProtecting(prompt.len, probe, HoldProbe.fitsNow, hc.restoreCandidateUsed(prompt));
+    return !probe.fitsWithCredit(0);
 }
 
 /// Cold bill against live memory; the gated arch runs its own warm pass inside `runPrefill`.
