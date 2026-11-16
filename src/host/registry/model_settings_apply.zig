@@ -22,6 +22,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     config.lm_head_mxfp8_override = o.lm_head_mxfp8;
     config.ane_override = o.aneChoice();
     config.stream_experts_override = o.stream_experts;
+    config.tp_mode_override = o.tp_mode;
     config.drafter_override = o.drafter;
     o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;
@@ -44,5 +45,15 @@ test "applyModelSettings: model MTP setting outranks the launch default" {
         var o = model_settings.Override{ .mtp = c.setting };
         applyModelSettings(&cfg, &cc, &o, c.flag);
         try testing.expectEqual(c.want, cfg.mtp_override);
+    }
+}
+
+test "applyModelSettings: the model's tp_mode, a malformed one included, reaches the config" {
+    var cc = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    for ([_]?model_mod.TpModeSetting{ null, .{ .group = .{ .rank = 1, .size = 4 } }, .malformed }) |t| {
+        var cfg = ModelConfig{};
+        var o = model_settings.Override{ .tp_mode = t };
+        applyModelSettings(&cfg, &cc, &o, true);
+        try testing.expectEqualDeep(t, cfg.tp_mode_override);
     }
 }

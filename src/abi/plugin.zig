@@ -1066,10 +1066,14 @@ test "auxiliary tensor structures start with their size" {
     }
 }
 
-test "abi plugin: auxiliary callbacks are required function pointers" {
+test "abi plugin: auxiliary callbacks are required function pointers, except the optional trailing import_plan_details" {
     const info = @typeInfo(AuxHooks).@"struct";
     inline for (info.field_names, info.field_types, info.field_attrs) |name, T, attrs| {
         if (comptime std.mem.eql(u8, name, "size")) continue;
+        if (comptime std.mem.eql(u8, name, "import_plan_details")) {
+            try testing.expect(@typeInfo(T) == .optional and attrs.defaultValue(T).? == null);
+            continue;
+        }
         try testing.expect(@typeInfo(T) == .pointer);
         try testing.expect(attrs.defaultValue(T) == null);
     }

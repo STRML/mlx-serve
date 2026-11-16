@@ -84,6 +84,7 @@ const array_util = @import("../../mlx/array.zig");
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
 const Config = @import("config.zig").Config;
+pub const TpIds = @import("tp_ids.zig").TpIds;
 const Weights = resident.Weights;
 pub const QuantParams = params.QuantParams;
 const none: A = .{ .ctx = null };
@@ -443,6 +444,8 @@ pub const DsparkW = struct {
     markov_embed: A, // [vocab, rank]
     markov_head: A, // [vocab, rank] in the activation dtype: a draft step reads all of it
     conf: A, // f32 [1, dim + rank]
+    /// `markov.exact(conf)`, asked at load.
+    conf_exact: bool = false,
 };
 
 /// Rope as MLX `fast_rope` periods (`1 / inv_freq`), and their negation
@@ -453,6 +456,8 @@ pub const Dsv41Model = struct {
     gpa: std.mem.Allocator,
     s: S,
     cfg: Config,
+    /// The pack's config before a tensor split slices heads and expert widths: the cache identity hashes this one.
+    whole_cfg: Config,
     act: mlx.mlx_dtype,
     embed: Lin,
     /// the embedding rows read from the pack at each lookup (`embed` unset).
@@ -478,6 +483,8 @@ pub const Dsv41Model = struct {
     hc_tg: usize = HC_TG,
     /// Threads per top-k threadgroup (`probeTopkThreads`); the picks are the same at any width.
     topk_tg: usize = 1024,
+    /// What this GPU granted `topk_tg` and `hc_tg` before a tensor group pinned them (`pinLaunchShapes`): the cache key's.
+    granted_tg: ?[2]usize = null,
     /// Bytes per indexer score block (tests narrow it to drive several).
     /// Test-only: named intermediates of a one-span forward.
     trace: ?*Trace = null,
@@ -626,7 +633,7 @@ pub const Dsv41Model = struct {
         self.cache_pack_kernels.deinit();
         _ = mlx.mlx_fast_metal_kernel_free(self.engram_kernel);
         self.dec.deinit();
-        gtwin.deinit();
+        gtwin.release();
         self.freeQuant();
         freeRegions(self);
         self.gpa.destroy(self);
@@ -1835,10 +1842,13 @@ pub const InitOpts = struct {
     quant: ?*const outside.Format = null,
 };
 
+pub const tpGeometryFits = @import("config.zig").tpGeometryFits;
+
 pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opts: InitOpts) !*Dsv41Model {
-    var sliced = whole.*;
     // A streamed bank reads whole experts and only rank 0 opens one; a split's ranks hold half of each.
     if (opts.tp != null and opts.streamed_experts) return error.Dsv41TpStreamedExperts;
+    if (opts.tp) |t| if (!tpGeometryFits(whole, t.size)) return error.Dsv41ShardUneven;
+    var sliced = whole.*;
     // An MLX pack's stream opens slot rows for every routed layer, where a layer split bills each Mac its share.
     if (opts.pair != null and opts.streamed_experts and opts.quant == null) return error.Dsv41PairStreamedExperts;
     // A split slices the weights as MLX arrays; an outside plugin's stay whole.
@@ -1861,6 +1871,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         .gpa = gpa,
         .s = s,
         .cfg = cfg.*,
+        .whole_cfg = whole.*,
         .act = opts.act,
         .embed = undefined,
         .head = undefined,
@@ -2006,6 +2017,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             .markov_head = if (getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) != null) try markovHead(m, w, rank, "mtp.{d}.markov_head.markov_w2", .{last}) else try markovHead(m, w, rank, "mtp.{d}.markov_head.head", .{last}),
             .conf = try ownDense(m, w, cfg.hidden_size + rank, "mtp.{d}.confidence_head.proj", .{last}, .float32),
         };
+        m.dspark.?.conf_exact = try markov.exact(m.dspark.?.conf);
+        log.info("deepseek_v41: Markov chain: the confidence head's weights are {s}\n", .{if (m.dspark.?.conf_exact) "16-bit floats' values: its logit is the last kernel's" else "not all 16-bit floats' values: its logit stays on MLX's ops"});
         m.n_mtp = n_stages;
         if (opts.tp) |t| log.info("deepseek_v41: tensor rank {d} of {d}: DSpark {s}\n", .{ t.rank, t.size, if (m.draft_shard) "stages and Markov head split, every rank drafts (DSV41_DRAFT_SHARD=0: rank 0 alone)" else "drafts on rank 0 alone" });
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
@@ -2029,6 +2042,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     // The ring twins compiled now, not in a prompt's first wide layer (FLASH_ATTN on: the flash kernel and its heads
     // twin in their place).
     if (m.attn_gather != null) try warmRing(m);
+    gtwin.retain();
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages{s}{s}\n", .{ n_layers, m.engrams.len, n_stages, if (opts.quant != null) ", weights on " else "", if (opts.quant) |q| q.name() else "" });
     if (m.dec.moe_fp4 != null) log.info("deepseek_v41: fused mxfp4 MoE decode kernels on\n", .{});
     return m;
@@ -6051,6 +6065,16 @@ pub fn tpLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap) !vo
     try load(sn.tp_id, sn.ids, xs);
 }
 
+/// Makes `sn` known to the other ranks of the current group: one taken before the group formed (TP1, or an earlier
+/// group) goes over under a new id and keeps it, so it loads once a group. A failed load leaves its id as it was.
+pub fn tpEnsure(m: *const Dsv41Model, gpa: std.mem.Allocator, ids: *TpIds, sn: *Snap) !void {
+    if (m.tp == null or !ids.stale(sn.tp_id)) return;
+    const old = sn.tp_id;
+    sn.tp_id = ids.next();
+    errdefer sn.tp_id = old;
+    try tpLoad(m, gpa, sn);
+}
+
 /// Tensor-parallel rank past 0: rank 0's snapshot `id` read from disk, as `tpLoadPlan`'s tensors in order.
 pub fn tpWorkerLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, id: u64, ids: []const u32, tensors: []const A) !void {
     return importPlan(m, gpa, snaps, id, ids, tensors, try tpLoadPlan(m, ids.len));
@@ -6903,12 +6927,28 @@ fn cacheSetting(h: *std.hash.Wyhash, value: anytype) void {
     }
 }
 
-fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
-    if (m.n_layers > 64) return error.Dsv41CacheGeometry;
+/// Hash values rather than struct padding or the model_type slice's process-local address.
+fn layoutSettings(cfg: *const Config, knobs: anytype) u64 {
     var h = std.hash.Wyhash.init(0x4141);
-    // Hash values rather than struct padding or the model_type slice's process-local address.
-    cacheSetting(&h, m.cfg);
-    std.hash.autoHash(&h, .{ m.n_mtp, m.ds_block, m.span, m.moe_rows, m.ced_split, m.ced_min_skip, m.hc_tg, m.topk_tg, m.qat_off, m.attn_f16, m.head.qp });
+    cacheSetting(&h, cfg.*);
+    std.hash.autoHash(&h, knobs);
+    return h.final();
+}
+
+/// Pins the hc and top-k launch shapes to the smallest any rank of a tensor group runs. The first pin keeps what the
+/// GPU granted, so a group formed again, or none, never moves the cache key.
+pub fn pinLaunchShapes(m: *Dsv41Model, topk_tg: usize, hc_tg: usize) void {
+    if (m.granted_tg == null) m.granted_tg = .{ m.topk_tg, m.hc_tg };
+    m.topk_tg = topk_tg;
+    m.hc_tg = hc_tg;
+}
+
+pub fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
+    if (m.n_layers > 64) return error.Dsv41CacheGeometry;
+    const topk_tg, const hc_tg = m.granted_tg orelse .{ m.topk_tg, m.hc_tg };
+    // Every rank holds the same cache whatever the split, so the whole config and the GPU's own launch shapes key it:
+    // an entry moves between widths and between modes.
+    const settings = layoutSettings(&m.whole_cfg, .{ m.n_mtp, m.ds_block, m.span, m.moe_rows, m.ced_split, m.ced_min_skip, hc_tg, topk_tg, m.qat_off, m.attn_f16, m.head.qp });
     var l: cache_codec.Layout = .{
         .layers = m.n_layers,
         .stages = m.n_mtp,
@@ -6920,7 +6960,7 @@ fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
         .kv_sources = m.cfg.dsv41_kv_sources,
         .index_sources = m.cfg.dsv41_index_sources,
         .engram = m.hash != null,
-        .settings = h.final(),
+        .settings = settings,
     };
     @memcpy(l.ratios[0..m.n_layers], m.cfg.dsv4_compress_ratios[0..m.n_layers]);
     return l;
@@ -7916,7 +7956,7 @@ pub fn draftTail(sc: *Scope, m: *const Dsv41Model, x: A, pre: A, firsts: A, want
 fn fusedTail(sc: *Scope, m: *const Dsv41Model, hout: A, logits: A, t1: A, want_conf: bool, keep_logits: bool) !?DraftGraph {
     const ds = &m.dspark.?;
     const B = m.ds_block;
-    const f = (try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = t1, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .want_conf = want_conf, .keep = keep_logits })) orelse return null;
+    const f = (try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = t1, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .cw_exact = ds.conf_exact, .want_conf = want_conf, .keep = keep_logits })) orelse return null;
     const toks = try sc.keep(f.toks);
     const rows = if (f.rows) |r| try sc.keep(r) else toks;
     if (!want_conf) return .{ .ids = toks, .conf = toks, .logits = rows };
@@ -11243,6 +11283,18 @@ test "dsv41 tensor parallel: two ranks sum a bf16 part as it is, a wider part at
         try testing.expectEqual(mlx.mlx_dtype.bfloat16, Seen.dt);
         try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
     }
+}
+
+test "dsv41 cache identity: the iQ pack's settings hash is the value SSD entries were written under" {
+    const abi = @import("../../abi/plugin.zig");
+    const iq = @embedFile("../../fixtures/model-configs/deepseek_v41-iq-mlx-3.0bpw.json");
+    const mem: @import("../../sdk/root.zig").fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = iq }} };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try testing.expect(@import("config.zig").parse(&dir, abi.Str.of(iq), .{}, null, true, &p).isOk());
+    defer @import("config.zig").freeParsed(&p);
+    const knobs = .{ @as(usize, 3), @as(usize, 16), SPAN, MOE_ROWS, @as(?usize, null), CED_MIN_SKIP, HC_TG, @as(usize, 1024), false, true, QuantParams{ .bits = 8, .group_size = 64 } };
+    try testing.expectEqual(@as(u64, 1683361957965207653), layoutSettings(@import("config.zig").of(&p), knobs));
 }
 
 test "dsv41 head: the 8-bit head is the default, MLX_SERVE_DSV41_HEAD8=0 keeps the head as the pack ships it" {

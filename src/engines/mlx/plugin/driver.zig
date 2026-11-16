@@ -120,28 +120,53 @@ fn headMxfp8Setting(config: *const ModelConfig) ?bool {
 }
 
 /// `LoadCtx.settings_json`: the load settings stated for this model (a plugin that serves them reads them): the lossy
-/// `lm_head_mxfp8`, the `mtp` head, the lossy `int8_prefill`, `stream_experts` and the model's `ctx_size`. `buf` holds 128 bytes.
-pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    w.writeByte('{') catch unreachable;
-    if (headMxfp8Setting(config)) |on| w.print("\"lm_head_mxfp8\":{s}", .{if (on) "true" else "false"}) catch unreachable;
-    if (config.mtp_override) |on| w.print("{s}\"mtp\":{s}", .{ if (w.end > 1) "," else "", if (on) "true" else "false" }) catch unreachable;
-    if (config.int8_prefill_override) |on| w.print("{s}\"int8_prefill\":{s}", .{ if (w.end > 1) "," else "", if (on) "true" else "false" }) catch unreachable;
+/// `lm_head_mxfp8`, the `mtp` head, the lossy `int8_prefill`, `stream_experts`, `tp_mode` and the model's `ctx_size`.
+/// Caller frees.
+pub fn loadSettings(a: std.mem.Allocator, config: *const ModelConfig) std.mem.Allocator.Error![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    errdefer aw.deinit();
+    writeSettings(&aw.writer, config) catch return error.OutOfMemory;
+    return aw.toOwnedSlice();
+}
+
+fn writeSettings(w: *std.Io.Writer, config: *const ModelConfig) std.Io.Writer.Error!void {
+    var first = true;
+    try w.writeByte('{');
+    if (headMxfp8Setting(config)) |on| try settingBool(w, &first, "lm_head_mxfp8", on);
+    if (config.mtp_override) |on| try settingBool(w, &first, "mtp", on);
+    if (config.int8_prefill_override) |on| try settingBool(w, &first, "int8_prefill", on);
     if (config.stream_experts_override) |st| {
-        if (w.end > 1) w.writeByte(',') catch unreachable;
+        try separate(w, &first);
         switch (st) {
-            .on => w.writeAll("\"stream_experts\":true") catch unreachable,
-            .rows => |n| w.print("\"stream_experts\":{d}", .{n}) catch unreachable,
+            .on => try w.writeAll("\"stream_experts\":true"),
+            .rows => |n| try w.print("\"stream_experts\":{d}", .{n}),
         }
     }
+    if (config.tp_mode_override) |t| {
+        try separate(w, &first);
+        try t.write(w);
+    }
     const ctx = @import("../../../host/http/server.zig").manualContext(config);
-    if (ctx > 0) w.print("{s}\"ctx_size\":{d}", .{ if (w.end > 1) "," else "", ctx }) catch unreachable;
+    if (ctx > 0) {
+        try separate(w, &first);
+        try w.print("\"ctx_size\":{d}", .{ctx});
+    }
     if (config.caps().owns_decode_state and config.caps().streamed_weights) {
         const kv = @import("../../../host/http/server.zig").configuredKvQuantFor(config);
-        w.print("{s}\"kv_quant\":\"{s}\"", .{ if (w.end > 1) "," else "", kv.wireName() }) catch unreachable;
+        try separate(w, &first);
+        try w.print("\"kv_quant\":\"{s}\"", .{kv.wireName()});
     }
-    w.writeByte('}') catch unreachable;
-    return w.buffered();
+    try w.writeByte('}');
+}
+
+fn separate(w: *std.Io.Writer, first: *bool) std.Io.Writer.Error!void {
+    if (!first.*) try w.writeByte(',');
+    first.* = false;
+}
+
+fn settingBool(w: *std.Io.Writer, first: *bool, name: []const u8, on: bool) std.Io.Writer.Error!void {
+    try separate(w, first);
+    try w.print("\"{s}\":{s}", .{ name, if (on) "true" else "false" });
 }
 
 /// The lossy `lm_head_mxfp8` setting: an untied bf16 head (`<prefix>.lm_head.weight`, else a root `lm_head.weight`)
@@ -841,8 +866,9 @@ test "driver: a module-owned streamed plugin receives the configured KV precisio
     cfg.legacy.caps.owns_decode_state = true;
     cfg.legacy.caps.streamed_weights = true;
     cfg.kv_quant_override = @import("../../../sdk/blocks/attention/kv_quant.zig").KVQuantConfig.affine(8);
-    var buf: [256]u8 = undefined;
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, loadSettings(&buf, &cfg), .{});
+    const json = try loadSettings(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
     const value = parsed.value.object.get("kv_quant") orelse return error.MissingKvPrecision;
     try std.testing.expectEqualStrings("8", value.string);
@@ -901,14 +927,15 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     var why: abi.Verdict = .{};
     // A placeholder only the tokenizer names (RADIO's `<image>`) comes from the engine config, which read it.
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
-    var settings_buf: [128]u8 = undefined;
+    const settings = try loadSettings(a, config);
+    defer a.free(settings);
     const ceiling = @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling();
     const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config), growthStart(&dir, ceiling));
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
         .parsed = &b.parsed,
-        .settings_json = abi.Str.of(loadSettings(&settings_buf, config)),
+        .settings_json = abi.Str.of(settings),
         .stream = .{ .ctx = s.ctx },
         .host = @import("../../../host/host_table.zig").get(),
         .weights = if (lend) &src else null,
@@ -1765,27 +1792,56 @@ fn perSlot(xfm: *Transformer, x: Array, n: usize) ![]Array {
     return rows;
 }
 
+fn expectSettings(want: []const u8, config: *const ModelConfig) !void {
+    const got = try loadSettings(std.testing.allocator, config);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings(want, got);
+}
+
 test "driver: the load settings JSON carries the head and stream_experts settings a model states" {
-    var buf: [96]u8 = undefined;
     var config: ModelConfig = .{ .lm_head_mxfp8_override = false };
-    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false}", loadSettings(&buf, &config));
+    try expectSettings("{\"lm_head_mxfp8\":false}", &config);
     config.stream_experts_override = .on;
-    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"stream_experts\":true}", loadSettings(&buf, &config));
+    try expectSettings("{\"lm_head_mxfp8\":false,\"stream_experts\":true}", &config);
     config.stream_experts_override = .{ .rows = 64 };
-    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"stream_experts\":64}", loadSettings(&buf, &config));
+    try expectSettings("{\"lm_head_mxfp8\":false,\"stream_experts\":64}", &config);
 }
 
 test "plugin driver: the load settings carry the model's lm_head_mxfp8 and mtp" {
-    var buf: [128]u8 = undefined;
     var c: ModelConfig = .{};
-    try std.testing.expectEqualStrings("{}", loadSettings(&buf, &c));
+    try expectSettings("{}", &c);
     c.mtp_override = false;
-    try std.testing.expectEqualStrings("{\"mtp\":false}", loadSettings(&buf, &c));
+    try expectSettings("{\"mtp\":false}", &c);
     c.lm_head_mxfp8_override = false;
-    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"mtp\":false}", loadSettings(&buf, &c));
+    try expectSettings("{\"lm_head_mxfp8\":false,\"mtp\":false}", &c);
     // A plugin that sizes memory for a request reads the context the model is set to.
     c.ctx_override = 262144;
-    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"mtp\":false,\"ctx_size\":262144}", loadSettings(&buf, &c));
+    try expectSettings("{\"lm_head_mxfp8\":false,\"mtp\":false,\"ctx_size\":262144}", &c);
+}
+
+test "plugin driver: the load settings carry the model's tp_mode, a malformed one included, beside every other setting" {
+    var c: ModelConfig = .{ .tp_mode_override = .{ .group = .{ .rank = 1, .size = 4 } } };
+    try expectSettings("{\"tp_mode\":{\"rank\":1,\"size\":4}}", &c);
+    c.tp_mode_override = .malformed;
+    try expectSettings("{\"tp_mode\":\"malformed\"}", &c);
+    c = .{ .lm_head_mxfp8_override = false, .mtp_override = false, .int8_prefill_override = false, .stream_experts_override = .{ .rows = 4294967295 }, .tp_mode_override = .{ .group = .{ .rank = 4294967294, .size = 4294967295 } }, .ctx_override = 4294967295 };
+    c.legacy.caps.owns_decode_state = true;
+    c.legacy.caps.streamed_weights = true;
+    const json = try loadSettings(std.testing.allocator, &c);
+    defer std.testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("tp_mode") != null);
+}
+
+test "plugin driver: a streamed pack with every setting stated writes all of it, 139 bytes" {
+    var c: ModelConfig = .{ .lm_head_mxfp8_override = false, .mtp_override = false, .int8_prefill_override = false, .stream_experts_override = .{ .rows = 64 }, .tp_mode_override = .{ .group = .{ .rank = 0, .size = 4 } }, .ctx_override = 262144 };
+    c.legacy.caps.owns_decode_state = true;
+    c.legacy.caps.streamed_weights = true;
+    c.kv_quant_override = @import("../../../sdk/blocks/attention/kv_quant.zig").KVQuantConfig.affine(8);
+    const json = "{\"lm_head_mxfp8\":false,\"mtp\":false,\"int8_prefill\":false,\"stream_experts\":64,\"tp_mode\":{\"rank\":0,\"size\":4},\"ctx_size\":262144,\"kv_quant\":\"8\"}";
+    try std.testing.expectEqual(@as(usize, 139), json.len);
+    try expectSettings(json, &c);
 }
 
 test "driver: a DeepSeek-V4.1 pack's vision, aligner and image rows move to the tower; its trunk stays" {

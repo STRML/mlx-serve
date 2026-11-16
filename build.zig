@@ -12,13 +12,14 @@ const plugins = @import("build/plugins.zig");
 const standalone = @import("build/standalone.zig");
 
 comptime {
-    // 0.16.0's bundled libc++ fails to compile against the macOS 27 SDK
-    // (`use of undeclared identifier 'INFINITY'` in its vendored <random>);
-    // fixed in 0.17.0, which is why the floor moved.
-    if (builtin.zig_version.major == 0 and builtin.zig_version.minor < 17) {
+    // 0.16.0's bundled libc++ fails to compile against the macOS 27 SDK (`use of undeclared identifier 'INFINITY'` in
+    // its vendored <random>). A 0.17.0 pre-release (0.17.0-dev.2248) builds a binary that segfaults at startup; 0.17.1
+    // serves. So the floor is the 0.17.1 release, never a pre-release.
+    const v = builtin.zig_version;
+    if (v.pre != null or v.order(.{ .major = 0, .minor = 17, .patch = 1 }) == .lt) {
         @compileError(std.fmt.comptimePrint(
-            "mlx-serve requires Zig 0.17 (have {d}.{d}.{d}). Run ./scripts/fetch-zig.sh or grab it from https://ziglang.org/download/.",
-            .{ builtin.zig_version.major, builtin.zig_version.minor, builtin.zig_version.patch },
+            "mlx-serve requires the Zig 0.17.1 release or newer (have {d}.{d}.{d}{s}). Run ./scripts/fetch-zig.sh or grab it from https://ziglang.org/download/.",
+            .{ v.major, v.minor, v.patch, if (v.pre != null) " pre-release" else "" },
         ));
     }
 }
