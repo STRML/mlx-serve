@@ -221,6 +221,57 @@ pub const RowHead = struct {
     }
 };
 
+/// A tensor mode's row cut of the whole model's layers (`mode.build` attaches it to the mode's model as `row_cut`): the
+/// mode's MoE at up to `max_rows` rows runs `forward` over these views, gathered through the cluster's `tp_gather`.
+pub const RowCut = struct {
+    gpa: std.mem.Allocator,
+    /// By layer index, DSpark stages after the trunk; null where the whole model holds no such layer.
+    layers: []?RowLayer,
+    /// Calls of `run`: the row cut engaged.
+    calls: usize = 0,
+
+    /// Layers `[lo, hi)` of `whole` cut for rank `rank` of `size`.
+    pub fn create(gpa: std.mem.Allocator, s: S, whole: *const dsv41.Dsv41Model, lo: usize, hi: usize, rank: u32, size: u32) !*RowCut {
+        const rc = try gpa.create(RowCut);
+        errdefer gpa.destroy(rc);
+        rc.* = .{ .gpa = gpa, .layers = try gpa.alloc(?RowLayer, whole.layers.len) };
+        @memset(rc.layers, null);
+        errdefer rc.deinitLayers();
+        for (lo..hi) |li| rc.layers[li] = try RowLayer.init(gpa, s, &whole.layers[li], rank, size);
+        return rc;
+    }
+
+    fn deinitLayers(self: *RowCut) void {
+        for (self.layers) |*l| if (l.*) |*rl| rl.deinit();
+        self.gpa.free(self.layers);
+    }
+
+    pub fn destroy(self: *RowCut) void {
+        self.deinitLayers();
+        self.gpa.destroy(self);
+    }
+
+    /// The cut `m` runs layer `li` through at `rows` rows, or null for today's sum. Every rank decides alike: the stages
+    /// only when every rank holds them (`draft_shard`).
+    pub fn layer(self: *const RowCut, m: *const dsv41.Dsv41Model, li: usize, rows: usize) ?*const RowLayer {
+        if (rows > max_rows or li >= self.layers.len) return null;
+        if (li >= m.n_layers and !m.draft_shard) return null;
+        return if (self.layers[li]) |*rl| rl else null;
+    }
+
+    /// `forward` across `m`'s tensor group.
+    pub fn run(self: *RowCut, sc: *Scope, m: *const dsv41.Dsv41Model, rl: *const RowLayer, x: A, idx: A, wts: A) !A {
+        const t = m.tp orelse return error.Dsv41RowCutNoGroup;
+        self.calls += 1;
+        return forward(sc, m, rl, .{ .rank = t.rank, .size = t.size, .gather = hookGather }, x, idx, wts);
+    }
+
+    fn hookGather(_: ?*anyopaque, x: A) anyerror!A {
+        const g = dsv41.clusterHooks().tp_gather orelse return error.DsvTpNotJoined;
+        return g(x);
+    }
+};
+
 /// The one-row lhs indices TP1's `routed` passes where they fit this call.
 fn lhsOf(L: usize, k: usize, lhs: A) A {
     return if (L == 1 and lhs.ctx != null and k == @as(usize, @intCast(dim(lhs, 1)))) lhs else none;
@@ -1089,6 +1140,150 @@ test "dsv41 row cut: the linear cutter refuses an outside quant weight instead o
     const c: Cut = .{ .len = 8, .rank = 0, .size = 4 };
     try testing.expectError(error.Dsv41RowCutOutsideQuant, k.lin(l, 0, c));
     try testing.expectError(error.Dsv41RowCutOutsideQuant, k.linCols(l, c));
+}
+
+/// A tensor group's sums and gathers in one process: each rank runs against the others' parts from the pass before
+/// (its own where they have none yet), so passes fix the collectives one by one; the last pass changes none.
+const PassGroup = struct {
+    const max = 4;
+    var rank: usize = 0;
+    var size: usize = 4;
+    var gathers: usize = 0;
+    var parts: [max]std.ArrayList(A) = @splat(.empty);
+    var prev: [max]std.ArrayList(A) = @splat(.empty);
+
+    /// This rank's next collective input kept, and every rank's in rank order.
+    fn meet(x: A) ![max]A {
+        try mlx.check(mlx.mlx_array_eval(x));
+        var kept = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&kept, x);
+        const k = parts[rank].items.len;
+        try parts[rank].append(testing.allocator, kept);
+        var all: [max]A = undefined;
+        for (0..size) |r| all[r] = if (r != rank and k < prev[r].items.len) prev[r].items[k] else x;
+        return all;
+    }
+
+    fn sum(x: A) anyerror!A {
+        const all = try meet(x);
+        var acc = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&acc, all[0]);
+        for (all[1..size]) |p| {
+            var next = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&next, acc, p, mlx.gpuStream()));
+            _ = mlx.mlx_array_free(acc);
+            acc = next;
+        }
+        return acc;
+    }
+
+    fn gather(x: A) anyerror!A {
+        gathers += 1;
+        const all = try meet(x);
+        const vec = mlx.mlx_vector_array_new_data(&all, size);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 0, mlx.gpuStream()));
+        return o;
+    }
+
+    fn clear(l: *std.ArrayList(A)) void {
+        for (l.items) |a| _ = mlx.mlx_array_free(a);
+        l.clearRetainingCapacity();
+    }
+
+    /// Whether this pass's parts are the last pass's, bit for bit.
+    fn settled() !bool {
+        for (parts[0..size], prev[0..size]) |now, before| {
+            if (now.items.len != before.items.len) return false;
+            for (now.items, before.items) |a, b| if (!try same(a, b)) return false;
+        }
+        return true;
+    }
+
+    fn arm(n: usize) void {
+        size = n;
+        gathers = 0;
+        dsv41.clusterHooks().tp_sum = &sum;
+        dsv41.clusterHooks().tp_gather = &gather;
+    }
+
+    fn disarm(gpa: std.mem.Allocator) void {
+        dsv41.clusterHooks().tp_sum = null;
+        dsv41.clusterHooks().tp_gather = null;
+        for (&parts, &prev) |*a, *b| {
+            clear(a);
+            clear(b);
+            a.deinit(gpa);
+            b.deinit(gpa);
+            a.* = .empty;
+            b.* = .empty;
+        }
+    }
+};
+
+test "dsv41 row cut: a tensor mode's decode step through the worker entry runs the row cut and gives the whole model's stream" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const base: fixture.Opts = .{ .lo = 20, .hi = 22, .experts = 8, .ctx = 0, .act = .float32 };
+    const whole = try fixture.Fixture.init(gpa, base);
+    defer whole.deinit();
+    var ranks: [4]*fixture.Fixture = undefined;
+    var cuts: [4]*RowCut = undefined;
+    var made: usize = 0;
+    defer for (ranks[0..made], cuts[0..made]) |r, c| {
+        c.destroy();
+        r.deinit();
+    };
+    for (&ranks, &cuts, 0..) |*r, *c, i| {
+        var o = base;
+        o.tp = .{ .rank = @intCast(i), .size = 4 };
+        r.* = try fixture.Fixture.init(gpa, o);
+        c.* = RowCut.create(gpa, mlx.gpuStream(), whole.m, base.lo, base.hi, @intCast(i), 4) catch |e| {
+            r.*.deinit();
+            return e;
+        };
+        r.*.m.row_cut = c.*;
+        made += 1;
+    }
+    PassGroup.arm(4);
+    defer PassGroup.disarm(gpa);
+    for ([_]usize{ 1, 6 }) |rows| {
+        const in = try fixture.Input.of(whole, rows);
+        defer in.deinit();
+        const want = try fixture.streamOf(gpa, whole, in);
+        defer gpa.free(want);
+        var got: [4][]f32 = @splat(&.{});
+        defer for (got) |g| gpa.free(g);
+        var settled = false;
+        for (0..12) |_| {
+            for (0..4) |r| {
+                PassGroup.clear(&PassGroup.prev[r]);
+                std.mem.swap(std.ArrayList(A), &PassGroup.prev[r], &PassGroup.parts[r]);
+            }
+            for (ranks, 0..) |rk, r| {
+                PassGroup.rank = r;
+                const out = try in.step(gpa, rk.m);
+                defer for (out) |a| {
+                    _ = mlx.mlx_array_free(a);
+                };
+                gpa.free(got[r]);
+                got[r] = &.{};
+                got[r] = try dsv41.hostF32(out[0]);
+            }
+            if (try PassGroup.settled()) {
+                settled = true;
+                break;
+            }
+        }
+        try testing.expect(settled);
+        for (got) |g| try expectTpClose("tensor mode step", rows, want, g);
+        for (PassGroup.parts[0..4]) |*l| PassGroup.clear(l);
+        for (PassGroup.prev[0..4]) |*l| PassGroup.clear(l);
+    }
+    // Two layers, two gathers each, on every rank in every pass.
+    for (cuts) |c| try testing.expect(c.calls > 0);
+    try testing.expect(PassGroup.gathers >= 2 * 2 * 4);
 }
 
 test "dsv41 row cut: the parity bar fails a result that is not finite" {

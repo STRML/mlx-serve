@@ -27,6 +27,7 @@ const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwi
 const engram = @import("engram.zig");
 const system = @import("../../sdk/util/system.zig");
 const cache_codec = @import("cache_codec.zig");
+const rowcut = @import("rowcut.zig");
 const cache_pack = @import("cache_pack.zig");
 const cache_abi = @import("../../abi/plugin.zig");
 const glm5 = @import("../glm5_next/glm5_next.zig");
@@ -558,6 +559,8 @@ pub const Dsv41Model = struct {
     pair: ?Pair = null,
     /// This process's slice of every expert (`cfg.moe_intermediate_size` is already its width).
     tp: ?Shard = null,
+    /// A tensor mode's row cut of the whole model (`mode.Modes` owns it): its MoE runs there at decode widths.
+    row_cut: ?*rowcut.RowCut = null,
     /// Tensor parallel with the vocabulary split (`vocabSplit`): this rank's rows of the LM head. Every rank projects
     /// its part of each step's logits and the parts are gathered (`headLogits`); rank 0 still holds the whole head.
     head_part: ?HeadPart = null,
@@ -4548,6 +4551,7 @@ pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
     const ly = &m.layers[li];
     const r = try route(sc, m, ly, x, img);
     try VerifyPicks.note(m, li, r.idx);
+    if (m.row_cut) |rc| if (rc.layer(m, li, @intCast(dim(x, 0)))) |rl| return rc.run(sc, m, rl, x, r.idx, r.wts);
     // The DSpark stages' experts stay resident.
     if (li < m.n_layers) if (m.streamed) |src| {
         // A wide call's routed sum and the shared expert in one combine (the same f32 words).
@@ -4934,6 +4938,13 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
 /// A tensor split's FFN at decode width, from the summed attention output `ao`: this rank's experts over the routes,
 /// summed with the other ranks', then the hc expand. `pre` becomes the FFN's mix.
 pub fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, pre: *A) !A {
+    if (m.row_cut) |rc| if (rc.layer(m, li, @intCast(dim(x, 0)))) |rl| {
+        var p: [7]A = undefined;
+        try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
+        try VerifyPicks.note(m, li, p[5]);
+        pre.* = p[1];
+        return hcExpand(sc, p[0], try rc.run(sc, m, rl, p[4], p[5], p[6]), &.{ .pre = p[1], .post = p[2], .comb = p[3] });
+    };
     if (try dkern.seg_bounds.tpFfn(sc, m, li, x, ao, sa, pre)) |y| return y;
     const ly = &m.layers[li];
     if (dkern.seg.on(m, li, .ffn, dim(x, 0), .ffn_entry)) {
