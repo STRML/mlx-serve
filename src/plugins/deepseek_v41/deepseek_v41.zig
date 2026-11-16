@@ -563,6 +563,7 @@ pub const Dsv41Model = struct {
     tp: ?Shard = null,
     /// A tensor mode's row cut of the whole model (`mode.Modes` owns it): its MoE runs there at decode widths.
     row_cut: ?*rowcut.RowCut = null,
+    prefill_whole: ?*Dsv41Model = null,
     /// Tensor parallel with the vocabulary split (`vocabSplit`): this rank's rows of the LM head. Every rank projects
     /// its part of each step's logits and the parts are gathered (`headLogits`); rank 0 still holds the whole head.
     head_part: ?HeadPart = null,
@@ -1743,6 +1744,8 @@ const ClusterHooksState = struct {
     tp_batch: ?*const fn (gens: []const u64, p0s: []const usize, chunks: []const []const u32, verify: bool) anyerror!void = null,
     /// Tensor parallel, rank 0: the state `gen` is gone.
     tp_free: ?*const fn (gen: u64) void = null,
+    /// Rank zero's wide TP1 chunk: incremental latent state before another tensor step.
+    tp_prefill: ?*const fn (gen: u64, p0: usize, n: usize, capture: bool, tensors: []const A, stages: usize) anyerror!void = null,
     /// Tensor parallel, rank 0: a snapshot read from disk, as the cache tensors of `tpLoadPlan` in order.
     tp_load: ?*const fn (id: u64, ids: []const u32, tensors: []const A) anyerror!void = null,
     /// Tensor parallel, rank 0: a snapshot moved, appeared or went (`SnapOp`).
@@ -2329,7 +2332,7 @@ pub const Rows = struct {
         if (self.buf.ctx != null) _ = mlx.mlx_array_free(self.buf);
     }
 
-    fn append(self: *Rows, x: A, s: S) !void {
+    pub fn append(self: *Rows, x: A, s: S) !void {
         const n = dim(x, 0);
         if (n == 0) return;
         const end = try std.math.add(usize, self.used, n);
@@ -2480,6 +2483,7 @@ pub const VerifyOpts = struct {
 pub const State = struct {
     gpa: std.mem.Allocator,
     n: usize = 0,
+    tp_synced: bool = true,
     layers: []LState,
     /// The request's compressed token ids (Engram look-back).
     hist: std.ArrayList(u32) = .empty,
@@ -5329,12 +5333,92 @@ fn leadLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spa
     if (first == 1) RoundLaps.mark(.handed);
 }
 
+pub const prefillPlan = rowcut.prefillPlan;
+
+const LeaderChunk = struct {
+    m: *Dsv41Model,
+    whole: *Dsv41Model,
+    gpa: std.mem.Allocator,
+    st: *State,
+    want: Want,
+    vision: ?VisionRows,
+    sn: ?Snap = null,
+    out: A = none,
+
+    fn run(ctx: ?*anyopaque, ids: []const u32, _: usize) anyerror!*const Snap {
+        const self: *LeaderChunk = @ptrCast(@alignCast(ctx.?));
+        self.out = try extendChunk(self.whole, self.gpa, self.st, .{ .host = ids }, self.want, self.vision);
+        var copy: State = .{ .gpa = self.gpa, .n = self.st.n, .layers = self.st.layers, .ds = self.st.ds, .mh = self.st.mh, .hist = self.st.hist, .snap_at = self.st.n };
+        try snapshotStateIfDue(&copy, self.m.state_gen);
+        self.sn = copy.snap;
+        self.sn.?.tp_id = self.m.state_gen;
+        return &self.sn.?;
+    }
+
+    fn ship(ctx: ?*anyopaque, gen: u64, p0: usize, n: usize, xs: []const A, stages: usize) anyerror!void {
+        const self: *LeaderChunk = @ptrCast(@alignCast(ctx.?));
+        const send = clusterHooks().tp_prefill orelse return error.DsvTpNotJoined;
+        try send(gen, p0, n, self.st.snap_at == n, xs, stages);
+    }
+};
+
+fn leaderPrefill(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, want: Want, vision: ?VisionRows) !A {
+    if (m.tp.?.rank != 0 or m.dec_state == null or st != &m.dec_state.? or st.verify != null) return error.Dsv41TpStateNotLive;
+    const whole = m.prefill_whole.?;
+    whole.dropAhead();
+    whole.ahead = m.ahead;
+    m.ahead = null;
+    dropChain(m);
+    m.tp_drafted = null;
+    const prompt = whole.prompt;
+    const next_rows = whole.next_rows;
+    whole.prompt = m.prompt;
+    whole.next_rows = m.next_rows;
+    defer {
+        m.ahead = whole.ahead;
+        whole.ahead = null;
+        whole.prompt = prompt;
+        whole.next_rows = next_rows;
+    }
+    var chunk: LeaderChunk = .{ .m = m, .whole = whole, .gpa = gpa, .st = st, .want = want, .vision = vision };
+    defer if (chunk.sn) |*sn| sn.deinit(gpa);
+    errdefer if (chunk.out.ctx != null) {
+        _ = mlx.mlx_array_free(chunk.out);
+    };
+    st.tp_synced = false;
+    _ = try rowcut.prefillOnLeader(gpa, .{ .rank = 0, .size = m.tp.?.size, .gather = rowcut.Group.solo.gather }, .{ .ctx = &chunk, .whole = whole, .run = &LeaderChunk.run, .ship = &LeaderChunk.ship }, ids, st.n);
+    st.tp_synced = true;
+    return chunk.out;
+}
+
+pub fn tpWorkerPrefill(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, gen: u64, p0: usize, n: usize, capture: bool, tensors: []const A, stages: usize) !void {
+    const t = m.tp orelse return error.DsvTpNotJoined;
+    if (t.rank == 0) return error.Dsv41RowCutLeaderImport;
+    try tpActivate(m, parked, gen);
+    if (p0 == 0) {
+        if (m.dec_state) |*old| old.deinit();
+        m.dec_state = null;
+        m.dec_state = try initState(m, gpa);
+    }
+    const st = if (m.dec_state) |*s| s else return error.DistPeerDiverged;
+    try followVerifyOf(m, st, p0);
+    dropChain(m);
+    m.tp_drafted = null;
+    try rowcut.importOnFollower(gpa, .{ .rank = t.rank, .size = t.size, .gather = rowcut.Group.solo.gather }, m, st, p0, n, tensors, stages);
+    if (capture) {
+        st.snap_at = st.n;
+        try snapshotStateIfDue(st, gen);
+    }
+}
+
 fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, want: Want, vision: ?VisionRows) !A {
     const c = &m.cfg;
     const L = switch (given) {
         .host => |h| h.len,
         .gpu => |t| mlx.mlx_array_size(t),
     };
+    if (m.prefill_whole != null and given == .host and L > rowcut.max_rows)
+        return leaderPrefill(m, gpa, st, given.host, want, vision);
     const p0 = st.n;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
@@ -7064,7 +7148,7 @@ fn retained(x: A) !A {
     return out;
 }
 
-fn snapshotTensor(m: *const Dsv41Model, sn: *const Snap, spec: cache_codec.Spec) !A {
+pub fn snapshotTensor(m: *const Dsv41Model, sn: *const Snap, spec: cache_codec.Spec) !A {
     return switch (spec.kind) {
         .win => retained(sn.layers[spec.layer].win),
         .comp => sn.layers[spec.layer].comp.?.view(spec.rows, m.s),
@@ -7450,6 +7534,7 @@ fn snapshotIfDue(m: *Dsv41Model) !void {
 }
 
 pub fn snapshotStateIfDue(st: *State, gen: u64) !void {
+    if (!st.tp_synced) return error.DistPeerDiverged;
     const at = st.snap_at orelse return;
     if (st.n != at) return;
     const layers = try st.gpa.alloc(Snap.LSnap, st.layers.len);

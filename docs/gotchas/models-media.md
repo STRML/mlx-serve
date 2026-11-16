@@ -854,3 +854,15 @@ whole model's casts and repacks. Both modes kept their own fused banks, exceedin
 Build TP1 first, then derive TP layers from its processed tensors and reuse one RowCut's wo_b quarters. Share
 DSpark and Engram projections too. The fixture plugin-load regression compares both modes' active memory against
 TP1 plus wo_b quarters and small constants; forward proofs retain TP1's exact logits.
+### DeepSeek-V4.1 tensor mode ran wide prompts on column-cut experts
+
+Switching to tensor mode selected the TP model for every prompt chunk. The row-cut MoE accepts at most 24 rows;
+wider chunks fell through to column-cut down projections and per-layer reductions. The resident whole model and
+leader-prefill helpers existed but had no serving caller.
+
+The mode's wide chunks now run the whole model on rank zero. A dedicated worker message imports only new global
+KV/index rows and Engram history, plus bounded windows, pending groups and DSpark state. MLA state retains its whole
+latent width even when query heads are sharded. Snapshot captures keep their positions and group-era ids. A failed
+ship marks the live state unsynchronized and prevents capture publication. Engram read-ahead follows the active state
+between model objects. The fixed-point TP4 fixture proves decode parity, mixed chunks and a corrupt-bank negative
+control; the shared follower loop and abort/restore tests guard ordering and cache ownership.

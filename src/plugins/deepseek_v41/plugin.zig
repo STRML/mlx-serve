@@ -286,7 +286,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
             error.Dsv41RowCutOutsideQuant => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode's row cut does not read a pack an outside quant plugin loads"),
             error.Dsv41RowCutGguf => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode's row cut does not read GGUF expert banks"),
             error.Dsv41RowCutUneven => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode's size does not divide the expert and shared-expert widths into equal row cuts"),
-            error.Dsv41TpOutsideQuant =>Verdict.refuse(.unsupported, "deepseek_v41: a pack read by an outside quant plugin does not run split across two Macs"),
+            error.Dsv41TpOutsideQuant => Verdict.refuse(.unsupported, "deepseek_v41: a pack read by an outside quant plugin does not run split across two Macs"),
             error.OutsideQuantRefused => Verdict.refuse(.unsupported, "deepseek_v41: the outside quant plugin refused the pack (the log names why)"),
             error.StreamedBankUnclaimed => Verdict.refuse(.unsupported, "deepseek_v41: no installed quant plugin streams this pack's experts.bin (OpensourceWTF's EXL3 repacks: install turboexl3_ds41)"),
             else => Verdict.refuse(.failed, "deepseek_v41: the pack does not load"),
@@ -799,7 +799,11 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
     const m: *Model = @ptrCast(@alignCast(mp));
     const live = stateOf(m, slot) orelse return .ok;
     // A prompt that never reached its boundary hands over where it stopped; a tensor pair's worker holds no twin of it.
-    if (live.st.snap == null and m.mdl.tp == null) dsv41.snapshotStateAtChunk(m.mdl, live.st, live.gen) catch |e| return Verdict.named(.failed, @errorName(e));
+    if (!live.st.tp_synced) return Verdict.refuse(.failed, "deepseek_v41: tensor state import did not complete");
+    if (live.st.snap == null and (m.mdl.tp == null or m.mdl.prefill_whole != null)) {
+        dsv41.snapshotStateAtChunk(m.mdl, live.st, live.gen) catch |e| return Verdict.named(.failed, @errorName(e));
+        if (live.st.snap != null) dsv41.tpSnap(m.mdl, .capture, live.gen, 0);
+    }
     const sn = live.st.snap orelse return .ok;
     if (sn.n != sn.ids.len) return Verdict.refuse(.failed, "deepseek_v41: snapshot boundary differs from its ids");
     const owned = gpa.create(dsv41.Snap) catch |e| return Verdict.named(.failed, @errorName(e));

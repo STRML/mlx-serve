@@ -131,6 +131,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   asserts it), so the SSD tier writes rank 0's and a disk import sends the worker its tensors (`tpLoad`).
 - `tp_mode` builds TP1 first and borrows its transformed tensors through one `RowCut`: fusing raw TP slices copies
   the expert banks. Only `wo_b` quarters own weight buffers. Free TP before the cut and TP1; swaps drop slot states.
+- A mode's chunks wider than `rowcut.max_rows` run TP1 on rank 0; followers import new whole-width MLA rows before
+  another TP step. Preserve Engram read-ahead and snapshot boundaries; a failed ship cannot publish a capture.
 - Under `tp` rank 0 alone holds the vision tower: a chunk's image rows ride with its step (`tp_step` `images`), the
   worker splices them at offset 0, so a rank's splice must depend only on the chunk's own rows (`chunkImageRows`).
 - Packed v2 snapshot entries are readable by this plugin; older binaries drop them during SSD scan.
