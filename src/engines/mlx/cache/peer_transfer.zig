@@ -162,70 +162,66 @@ const DiskSession = struct {
 
 const SessionLookup = union(enum) { none, hit: RamModuleHit, refused: requests.CacheExportOutcome };
 
-fn ramOnly(ram: ?RamModuleHit) SessionLookup {
-    return if (ram) |h| .{ .hit = h } else .none;
-}
-
-/// A refused SSD record leaves a shorter RAM boundary to export; with none, the refusal is the answer.
-fn refusedUnless(ram: ?RamModuleHit, outcome: requests.CacheExportOutcome) SessionLookup {
-    return if (ram) |h| .{ .hit = h } else .{ .refused = outcome };
-}
-
-/// A session's newest prompt boundary: the RAM tip, or the SSD's when RAM holds none or a shorter one. An SSD record
-/// is read back into a snapshot (`holder` frees it) so it exports the way a RAM entry does. A record that cannot be
-/// read leaves the RAM tip, else nothing: the caller sees `session_not_found`.
+/// The prompt boundary a session's tip names, found by identity: the RAM entry with that prefix key and length, else
+/// the SSD record with it. The record is read back into a snapshot (`holder` frees it) so it exports the way a RAM
+/// entry does, under the variant the tip was committed with. The envelope carries the asking session, so the
+/// importer records it as an owner even when another session wrote the entry. A tip whose entry is gone, or whose
+/// record cannot be read, is `none`: the caller sees `session_not_found`.
 fn sessionHit(
     allocator: std.mem.Allocator,
     sch: *const Scheduler,
     cfg: *const ModelConfig,
     hc: *prefix_cache_mod.HotPrefixCache,
     xfm: *Transformer,
-    variant: u64,
     session: u64,
     max_bytes: usize,
     holder: *DiskSession,
 ) SessionLookup {
-    const ram = hc.findSessionTip(session);
-    const d = if (hc.disk) |*dd| dd else return ramOnly(ram);
-    const tip = d.sessionTip(session) orelse return ramOnly(ram);
-    if (ram) |h| if (h.tokens.len >= tip.tokens.len) return .{ .hit = h };
-    const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, variant) orelse return ramOnly(ram);
-    const header = d.readModuleHeader(tip.id) catch return ramOnly(ram);
+    const tip = hc.sessionTip(session) orelse return .none;
+    if (hc.findSessionTip(session)) |h| {
+        var hit = h;
+        hit.session = session;
+        return .{ .hit = hit };
+    }
+    const d = if (hc.disk) |*dd| dd else return .none;
+    const ref = d.moduleByKey(tip.prefix_key, tip.n) orelse return .none;
+    const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, ref.variant) orelse return .none;
+    const header = d.readModuleHeader(ref.id) catch return .none;
     defer d.allocator.free(header);
-    const inventory = d.moduleInventory(tip.id) orelse return ramOnly(ram);
+    const inventory = d.moduleInventory(ref.id) orelse return .none;
     var stored: u64 = 0;
     for (inventory) |t| stored += t.bytes;
-    if (stored > max_bytes) return refusedUnless(ram, .{ .too_large = @intCast(stored) });
+    if (stored > max_bytes) return .{ .refused = .{ .too_large = @intCast(stored) } };
     var plan_peak: u64 = 0;
-    if (!plugin_driver.auxImportPlan(binding.xfm, header, &plan_peak).isOk()) return ramOnly(ram);
-    const peak = prefill_mod.moduleImportPeak(plan_peak, inventory) catch return refusedUnless(ram, .no_memory);
-    if (peak > prefillHeadroomNow(cfg, stagedHostBytes(@constCast(sch)))) return refusedUnless(ram, .no_memory);
+    if (!plugin_driver.auxImportPlan(binding.xfm, header, &plan_peak).isOk()) return .none;
+    const peak = prefill_mod.moduleImportPeak(plan_peak, inventory) catch return .{ .refused = .no_memory };
+    if (peak > prefillHeadroomNow(cfg, stagedHostBytes(@constCast(sch)))) return .{ .refused = .no_memory };
 
-    var arrays = d.loadModuleParts(tip.id) catch return ramOnly(ram);
+    var arrays = d.loadModuleParts(ref.id) catch return .none;
     defer d.freeNamed(&arrays);
-    const tensors = allocator.alloc(plugin_abi.AuxTensor, arrays.items.len) catch return refusedUnless(ram, .no_memory);
+    const tensors = allocator.alloc(plugin_abi.AuxTensor, arrays.items.len) catch return .{ .refused = .no_memory };
     defer allocator.free(tensors);
     for (arrays.items, tensors) |array, *t| t.* = .{ .name = .of(array.key), .array = .{ .ctx = array.arr.ctx } };
     var snapshot: plugin_abi.Handle = null;
-    if (!plugin_driver.auxImportArrays(binding.xfm, tip.tokens, header, tensors, &snapshot).isOk() or snapshot == null or mlx.errorPending()) {
+    if (!plugin_driver.auxImportArrays(binding.xfm, ref.tokens, header, tensors, &snapshot).isOk() or snapshot == null or mlx.errorPending()) {
         if (snapshot != null) plugin_driver.auxFree(binding.xfm, snapshot);
-        return ramOnly(ram);
+        return .none;
     }
     holder.* = .{ .xfm = binding.xfm, .snapshot = snapshot };
     return .{ .hit = .{
         .payload = .{
             .binding = binding,
             .snapshot = snapshot,
-            .n = tip.tokens.len,
-            .prefix_key = tip.prefix_key,
+            .n = ref.tokens.len,
+            .prefix_key = ref.prefix_key,
             .aux_bytes = plugin_driver.auxBytes(binding.xfm, snapshot),
-            .disk_id = tip.id,
+            .disk_id = ref.id,
         },
-        .tokens = tip.tokens,
-        .quant_config = tip.quant,
+        .tokens = ref.tokens,
+        .quant_config = ref.quant,
         .cache_key = 0,
-        .has_tools = tip.has_tools,
-        .media = tip.media,
+        .has_tools = ref.has_tools,
+        .media = ref.media,
         .session = session,
     } };
 }
@@ -260,7 +256,7 @@ fn exportWireModuleWithBudget(
 
     var from_disk: DiskSession = .{};
     defer from_disk.release();
-    const hit = if (session != 0) switch (sessionHit(allocator, sch, cfg, hc, xfm, variant, session, max_bytes, &from_disk)) {
+    const hit = if (session != 0) switch (sessionHit(allocator, sch, cfg, hc, xfm, session, max_bytes, &from_disk)) {
         .hit => |h| h,
         .none => return .not_found,
         .refused => |outcome| return outcome,
@@ -445,7 +441,7 @@ pub fn importWireModule(
         return .{ .refused = .quant_config };
     }
 
-    if (hc.hasModuleCovering(binding, env.ids, env.media, env.has_tools, env.quant_config)) {
+    if (hc.claimCovering(binding, env.ids, env.media, env.has_tools, env.quant_config, env.session)) {
         logRefusal(.stale, env.ids.len);
         return .{ .refused = .stale };
     }

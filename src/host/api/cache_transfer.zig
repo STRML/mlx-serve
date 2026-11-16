@@ -85,8 +85,12 @@ pub fn handleSessionExport(allocator: std.mem.Allocator, stream: *Conn, lm: *Loa
 /// A session export names no prompt: the router sends `{}`. A body that carries `messages` is a prompt export,
 /// which an `X-Session-Key` beside it must not override.
 pub fn isBodylessExport(allocator: std.mem.Allocator, body: []const u8) bool {
-    _ = .{ allocator, body };
-    return false;
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) return true;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return !parsed.value.object.contains("messages");
 }
 
 const NotFound = struct { message: []const u8, reason: ?[]const u8 = null };

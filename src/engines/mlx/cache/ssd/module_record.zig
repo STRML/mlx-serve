@@ -34,8 +34,12 @@ pub const Envelope = struct {
     token_bytes: u64,
     tensors: []const Tensor,
     media: []const Media = &.{},
-    /// The router's `X-Session-Key` (0 = untagged): a restarted server still names the session's newest record.
+    /// The router's `X-Session-Key` of the commit that wrote this record (0 = untagged), the commit's order among all
+    /// tagged commits (`seq`), and the request variant its prefix key is folded with: a restarted server rebuilds
+    /// each session's tip from them.
     session: u64 = 0,
+    seq: u64 = 0,
+    variant: u64 = 0,
     part_bytes: []const u64 = &.{},
     bytes: u64 = 0,
 };

@@ -488,25 +488,46 @@ pub const DiskTier = struct {
     };
     pub const SessionRecord = struct { session: u64, seq: u64, variant: u64, prefix_key: u64, n: usize };
 
+    /// The newest committed record of the prompt boundary `n` tokens long whose (variant-folded) prefix key is
+    /// `prefix_key`: the RAM entry's twin on the SSD, found by identity and never by length or recency.
     pub fn moduleByKey(self: *DiskTier, prefix_key: u64, n: usize) ?ModuleRef {
-        _ = .{ self, prefix_key, n };
-        return null;
+        self.pollModuleWrites();
+        var best: ?*const IndexEntry = null;
+        for (self.entries.items) |*e| {
+            if (e.kind != .module or e.poisoned or e.module.?.state != .committed) continue;
+            if (e.kv_len != n or @as(u64, @bitCast(e.module.?.manifest.prefix_key)) != prefix_key) continue;
+            if (best == null or e.id > best.?.id) best = e;
+        }
+        const e = best orelse return null;
+        return .{
+            .id = e.id,
+            .tokens = e.tokens,
+            .media = e.media,
+            .has_tools = e.has_tools,
+            .quant = e.quant,
+            .prefix_key = prefix_key,
+            .variant = e.module.?.manifest.variant,
+        };
     }
 
+    /// Every committed record a session tagged: the tier's side of the session tip index, read once after a restart.
     pub fn sessionRecords(self: *DiskTier, out: *std.ArrayList(SessionRecord)) !void {
-        _ = .{ self, out };
+        self.pollModuleWrites();
+        for (self.entries.items) |*e| {
+            if (e.kind != .module or e.poisoned or e.module.?.state != .committed) continue;
+            const m = &e.module.?.manifest;
+            if (m.session == 0) continue;
+            try out.append(self.allocator, .{
+                .session = m.session,
+                .seq = m.seq,
+                .variant = m.variant,
+                .prefix_key = @bitCast(m.prefix_key),
+                .n = e.kv_len,
+            });
+        }
     }
 
     pub const ModuleSlice = enum { progress, busy, done };
-    /// A committed module record as a session's newest prompt boundary; slices belong to the tier.
-    pub const SessionTip = struct {
-        id: u64,
-        tokens: []const u32,
-        media: []const MediaSpan,
-        has_tools: bool,
-        quant: kv_quant.KVQuantConfig,
-        prefix_key: u64,
-    };
     pub const ModuleCandidate = struct { id: u64, n: u32, prefix_key: u64 };
     pub const ModuleCancellation = enum { memory_pressure, unload, invalidation, shutdown_expiry, holder_exhaustion, superseded };
     const PendingModuleFile = struct { id: u64, path: []u8, bytes: []u8, meta: bool };
@@ -576,7 +597,8 @@ pub const DiskTier = struct {
             .n = n, .prefix_key = @bitCast(input.prefix_key), .has_tools = input.has_tools,
             .scheme = @tagName(input.quant.scheme), .bits = input.quant.bits, .group_size = input.quant.group_size,
             .identity = context.identity, .header_bytes = input.header.len, .token_bytes = @as(u64, n) * 4,
-            .tensors = input.tensors, .media = media, .session = input.session,
+            .tensors = input.tensors, .media = media,
+            .session = input.session, .seq = input.seq, .variant = input.variant,
         }, input.header);
         var owns_record = true;
         defer if (owns_record) record.deinit();
@@ -911,27 +933,6 @@ pub const DiskTier = struct {
                 return a.n > b.n;
             }
         }.less);
-    }
-
-    /// The newest committed record tagged `session`; the tier's ids only grow, so the highest is the newest turn.
-    pub fn sessionTip(self: *DiskTier, session: u64) ?SessionTip {
-        if (session == 0) return null;
-        self.pollModuleWrites();
-        var best: ?*const IndexEntry = null;
-        for (self.entries.items) |*e| {
-            if (e.kind != .module or e.poisoned or e.module.?.state != .committed) continue;
-            if (e.module.?.manifest.session != session) continue;
-            if (best == null or e.id > best.?.id) best = e;
-        }
-        const e = best orelse return null;
-        return .{
-            .id = e.id,
-            .tokens = e.tokens,
-            .media = e.media,
-            .has_tools = e.has_tools,
-            .quant = e.quant,
-            .prefix_key = @bitCast(e.module.?.manifest.prefix_key),
-        };
     }
 
     pub fn readModuleHeader(self: *DiskTier, id: u64) ![]u8 {

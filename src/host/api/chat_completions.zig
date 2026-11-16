@@ -125,7 +125,7 @@ pub fn handleChatCompletions(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    if (stream.cache_export and stream.session_key != 0) return cache_transfer.handleSessionExport(allocator, stream, lm);
+    if (stream.cache_export and stream.session_key != 0 and cache_transfer.isBodylessExport(allocator, body)) return cache_transfer.handleSessionExport(allocator, stream, lm);
     // NOTE: no `lm.transformer.?` here — this handler also serves engine-backed
     // models (GGUF/llama, ds4) whose `transformer` is null. The only MLX-specific
     // gate below reads `config.has_hybrid_layers` (valid for every model incl. the

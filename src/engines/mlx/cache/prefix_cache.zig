@@ -340,8 +340,10 @@ const Entry = struct {
     /// Workload the request belonged to (`server.requestCacheKey`, 0 = anonymous).
     /// Eviction is fair across keys: the key holding the most entries pays first.
     cache_key: u64 = 0,
-    /// The router's session (`X-Session-Key`, 0 = untagged): `findSessionTip` names this session's entry to export.
+    /// The router's session (`X-Session-Key`, 0 = untagged) that committed this entry, and that commit's order
+    /// (`session_seq`): both go to its SSD record. Which entry a session exports is the index's (`session_tips`).
     session: u64 = 0,
+    seq: u64 = 0,
     /// Stable identity for observers; `last_used` moves on every touch.
     id: u64 = 0,
     /// Snapshot of the live KVCache at end of generation. Owns refcount-shared
@@ -730,6 +732,12 @@ pub const HotPrefixCache = struct {
     module_export_losses_total: u64 = 0,
     /// Byte floor for `restoreWouldPinEntry`; a field so a test can reproduce the live shape.
     restore_pin_min_bytes: u64 = RESTORE_PIN_MIN_BYTES,
+    /// Each tagged session's newest prompt boundary. Prefix entries are shared between sessions, so a session's
+    /// ownership lives here and never on the entry; `session_seq` is the last commit order handed out, seeded above
+    /// every record the SSD tier holds (`seedSessionTips`).
+    session_tips: std.AutoHashMapUnmanaged(u64, SessionTip) = .empty,
+    session_seq: u64 = 0,
+    session_tips_seeded: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -765,6 +773,7 @@ pub const HotPrefixCache = struct {
             freeEntryOwnedState(self.allocator, e);
         }
         self.entries.deinit(self.allocator);
+        self.session_tips.deinit(self.allocator);
         self.dropPendingSnapshots();
         if (self.disk) |*d| d.deinit();
         self.disk = null;
@@ -1462,31 +1471,17 @@ pub const HotPrefixCache = struct {
         };
     }
 
-    /// The newest committed prompt boundary a session tagged: never a rung (a longer boundary of its conversation
-    /// exists), never a decode-end tail, never an entry a slot has checked out. Untagged entries (0) belong to no session.
-    pub fn findSessionTip(self: *const HotPrefixCache, session: u64) ?RamModuleHit {
-        if (session == 0) return null;
-        var best: ?usize = null;
-        for (self.entries.items, 0..) |*e, i| {
+    /// The RAM entry a session's tip names: its prompt boundary as the index recorded it, never a decode-end tail and
+    /// never an entry a slot has checked out. Null when the entry has left RAM (the SSD may still hold it).
+    pub fn findSessionTip(self: *HotPrefixCache, session: u64) ?RamModuleHit {
+        const tip = self.sessionTip(session) orelse return null;
+        for (self.entries.items) |*e| {
             const m = e.module orelse continue;
-            if (e.session != session or e.checked_out_by != null or m.tail_from != 0) continue;
-            if (self.isSessionRung(i)) continue;
-            if (best == null or e.id > self.entries.items[best.?].id) best = i;
+            if (m.tail_from != 0 or e.checked_out_by != null) continue;
+            if (e.tokens.len != tip.n or m.prefix_key != tip.prefix_key or m.binding.variant != tip.variant) continue;
+            return ramHit(e);
         }
-        return ramHit(&self.entries.items[best orelse return null]);
-    }
-
-    /// `isModuleRung` among prompt boundaries: a decode-end tail is RAM-only and exports as no boundary, so it
-    /// does not make the boundary it extends a rung.
-    fn isSessionRung(self: *const HotPrefixCache, i: usize) bool {
-        const e = &self.entries.items[i];
-        for (self.entries.items, 0..) |*o, j| {
-            if (j == i or o.tokens.len <= e.tokens.len) continue;
-            const m = o.module orelse continue;
-            if (m.tail_from != 0) continue;
-            if (moduleRungOf(e, m.binding, o.tokens, o.media, o.has_tools, o.quant_config)) return true;
-        }
-        return false;
+        return null;
     }
 
     pub fn findRamModule(
@@ -1506,12 +1501,81 @@ pub const HotPrefixCache = struct {
     /// RAM or on the SSD, `seq` orders a session's commits across restarts.
     pub const SessionTip = struct { prefix_key: u64, n: usize, variant: u64, seq: u64 };
 
+    pub const MAX_SESSION_TIPS: usize = 4096;
+
     pub fn sessionTip(self: *HotPrefixCache, session: u64) ?SessionTip {
-        _ = .{ self, session };
-        return null;
+        if (session == 0) return null;
+        self.seedSessionTips();
+        return self.session_tips.get(session);
     }
 
-    /// `hasModuleCovering` that also records `session` as an owner of the shortest prompt boundary covering `ids`.
+    /// The SSD tier's tagged records are the tips a restart lost: read them once, and start new commit orders above
+    /// the highest of them. Waits for a tier to exist, so nothing is handed out before it has been read.
+    fn seedSessionTips(self: *HotPrefixCache) void {
+        if (self.session_tips_seeded) return;
+        const d = if (self.disk) |*dd| dd else return;
+        self.session_tips_seeded = true;
+        var records = std.ArrayList(kv_disk_cache.DiskTier.SessionRecord).empty;
+        defer records.deinit(self.allocator);
+        d.sessionRecords(&records) catch return;
+        for (records.items) |r| {
+            self.session_seq = @max(self.session_seq, r.seq);
+            self.noteSessionTip(r.session, .{ .prefix_key = r.prefix_key, .n = r.n, .variant = r.variant, .seq = r.seq });
+        }
+    }
+
+    fn nextSessionSeq(self: *HotPrefixCache) u64 {
+        self.seedSessionTips();
+        self.session_seq += 1;
+        return self.session_seq;
+    }
+
+    /// A newer commit of a session replaces its tip; an older one (a seeded record) never does.
+    fn noteSessionTip(self: *HotPrefixCache, session: u64, tip: SessionTip) void {
+        if (session == 0) return;
+        if (self.session_tips.get(session)) |old| if (old.seq > tip.seq) return;
+        if (self.session_tips.count() >= MAX_SESSION_TIPS and !self.session_tips.contains(session)) self.dropOldestSessionTip();
+        self.session_tips.put(self.allocator, session, tip) catch {};
+    }
+
+    fn dropOldestSessionTip(self: *HotPrefixCache) void {
+        var oldest: ?u64 = null;
+        var oldest_seq: u64 = std.math.maxInt(u64);
+        var it = self.session_tips.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.seq < oldest_seq) {
+                oldest_seq = kv.value_ptr.seq;
+                oldest = kv.key_ptr.*;
+            }
+        }
+        if (oldest) |k| _ = self.session_tips.remove(k);
+    }
+
+    /// Whether a session other than `session` has the prompt boundary of `e` as its tip: a commit that supersedes `e`
+    /// leaves it, and its owed SSD write, for that session's export.
+    fn heldByOtherSession(self: *const HotPrefixCache, e: *const Entry, session: u64) bool {
+        const m = e.module orelse return false;
+        var it = self.session_tips.iterator();
+        while (it.next()) |kv| {
+            if (kv.key_ptr.* == session) continue;
+            const t = kv.value_ptr.*;
+            if (t.prefix_key == m.prefix_key and t.n == e.tokens.len and t.variant == m.binding.variant) return true;
+        }
+        return false;
+    }
+
+    fn covers(e: *const Entry, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig) bool {
+        if (e.checked_out_by != null) return false;
+        const m = e.module orelse return false;
+        if (!ModuleBinding.same(m.binding, binding) or e.has_tools != has_tools) return false;
+        if (!std.meta.eql(e.quant_config, quant_config) or e.tokens.len < ids.len) return false;
+        if (mediaSharedBound(e.media, media) < ids.len) return false;
+        if (ids.len > 0 and e.tokens[ids.len - 1] != ids[ids.len - 1]) return false;
+        return std.mem.eql(u32, e.tokens[0..ids.len], ids);
+    }
+
+    /// `hasModuleCovering` that also records `session` as an owner of the shortest prompt boundary covering `ids`:
+    /// a deduplicated import is about bytes, and who may export them is the index's.
     pub fn claimCovering(
         self: *HotPrefixCache,
         binding: ModuleBinding,
@@ -1521,8 +1585,19 @@ pub const HotPrefixCache = struct {
         quant_config: kv_quant.KVQuantConfig,
         session: u64,
     ) bool {
-        _ = session;
-        return self.hasModuleCovering(binding, ids, media, has_tools, quant_config);
+        var shortest: ?*const Entry = null;
+        var covered = false;
+        for (self.entries.items) |*e| {
+            if (!covers(e, binding, ids, media, has_tools, quant_config)) continue;
+            covered = true;
+            if (e.module.?.tail_from != 0) continue;
+            if (shortest == null or e.tokens.len < shortest.?.tokens.len) shortest = e;
+        }
+        if (!covered or session == 0) return covered;
+        const e = shortest orelse return true;
+        const m = e.module.?;
+        self.noteSessionTip(session, .{ .prefix_key = m.prefix_key, .n = e.tokens.len, .variant = m.binding.variant, .seq = self.nextSessionSeq() });
+        return true;
     }
 
     pub fn hasModuleCovering(
@@ -1534,13 +1609,7 @@ pub const HotPrefixCache = struct {
         quant_config: kv_quant.KVQuantConfig,
     ) bool {
         for (self.entries.items) |*e| {
-            if (e.checked_out_by != null) continue;
-            const m = e.module orelse continue;
-            if (!ModuleBinding.same(m.binding, binding) or e.has_tools != has_tools) continue;
-            if (!std.meta.eql(e.quant_config, quant_config) or e.tokens.len < ids.len) continue;
-            if (mediaSharedBound(e.media, media) < ids.len) continue;
-            if (ids.len > 0 and e.tokens[ids.len - 1] != ids[ids.len - 1]) continue;
-            if (std.mem.eql(u32, e.tokens[0..ids.len], ids)) return true;
+            if (covers(e, binding, ids, media, has_tools, quant_config)) return true;
         }
         return false;
     }
@@ -2180,7 +2249,7 @@ pub const HotPrefixCache = struct {
         };
         // Allocate before removing any donor; OOM leaves the resident history intact.
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
-        self.supersedeModuleRungs(binding, ids, eff_media, has_tools, quant_config, tail_from == 0);
+        self.supersedeModuleRungs(binding, ids, eff_media, has_tools, quant_config, tail_from == 0, session);
         self.dropSupersededTails(binding, ids, has_tools, quant_config);
         const room = blk: {
             self.incoming_tip = .{ .binding = binding, .ids = ids, .media = eff_media, .has_tools = has_tools, .quant_config = quant_config };
@@ -2192,6 +2261,8 @@ pub const HotPrefixCache = struct {
             self.logModuleDecline(ids.len, aux_bytes, if (tail_from > 0) "a decode-end checkpoint takes no prompt boundary's room" else "no entry could be evicted for it");
             return .declined;
         }
+        // Only a prompt boundary a session tagged moves that session's tip.
+        const seq: u64 = if (tail_from == 0 and session != 0) self.nextSessionSeq() else 0;
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
             .tokens = keys[0],
@@ -2200,6 +2271,7 @@ pub const HotPrefixCache = struct {
             .quant_config = quant_config,
             .cache_key = cache_key,
             .session = session,
+            .seq = seq,
             .id = self.bumpCounter(),
             .last_used = self.bumpCounter(),
             .touched_ms = crt.monotonicMs(),
@@ -2224,6 +2296,7 @@ pub const HotPrefixCache = struct {
                 @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
             });
         }
+        if (seq != 0) self.noteSessionTip(session, .{ .prefix_key = variantKey(prefix_key, binding.variant), .n = ids.len, .variant = binding.variant, .seq = seq });
         self.logResident();
         return .{ .ok = ids.len };
     }
@@ -2308,12 +2381,14 @@ pub const HotPrefixCache = struct {
 
     /// The commit of `ids` makes every shorter entry of its conversation a rung. An entry of the
     /// same length is the same checkpoint and is replaced. Past `MODULE_RUNGS_KEPT` rungs the
-    /// ladder is thinned by `ladderVictim`.
-    fn supersedeModuleRungs(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, owed: bool) void {
+    /// ladder is thinned by `ladderVictim`. A rung another session's tip names is no rung of this commit's: it is
+    /// neither cancelled nor thinned, since that session may still export it.
+    fn supersedeModuleRungs(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, owed: bool, session: u64) void {
         // Only a conversation's latest state is owed to the SSD: what this commit extends or replaces is not written.
         if (owed) for (self.entries.items) |*e| {
             const m = e.module orelse continue;
             if (!moduleRungOf(e, binding, ids, media, has_tools, quant_config) or !self.moduleExportOwed(m)) continue;
+            if (e.tokens.len < ids.len and self.heldByOtherSession(e, session)) continue;
             self.cancelModule(m, .superseded);
             e.disk_dirty = false;
         };
@@ -2331,7 +2406,7 @@ pub const HotPrefixCache = struct {
             var idxs: [MODULE_RUNGS_KEPT + 2]usize = undefined;
             var n: usize = 0;
             for (self.entries.items, 0..) |*e, j| {
-                if (e.checked_out_by != null) continue;
+                if (e.checked_out_by != null or self.heldByOtherSession(e, session)) continue;
                 if (!moduleRungOf(e, binding, ids, media, has_tools, quant_config)) continue;
                 if (n == lens.len) break;
                 lens[n] = e.tokens.len;
@@ -2424,6 +2499,8 @@ pub const HotPrefixCache = struct {
             .quant = e.quant_config,
             .media = e.media,
             .session = e.session,
+            .seq = e.seq,
+            .variant = e.module.?.binding.variant,
             .header = exported.header[0..exported.out.header_len],
             .tensors = inventory_,
         }) catch |err| {
