@@ -2527,7 +2527,7 @@ test "dist bell cold READY waits beyond idle until the first leader byte" {
     var worker_link: Link = .{ .group = .{}, .rank = 1, .size = 2 };
     worker_link.bells[0] = pair.worker;
     var ready: WorkerReady = .{ .link = &worker_link, .started_ms = testDeadline(0) };
-    try WorkerReady.rows(&ready, 123, 456);
+    try ready.send(0, 123, 456);
     var decoder: BellDecoder = .{};
     const frame = (try testReadBellWord(&decoder, pair.leader.bells[1])).ready;
     try std.testing.expectEqual(@as(u32, 456), frame.calib_us);
@@ -2829,6 +2829,22 @@ test "dist bell READY matrix 16: rows calibration reaches peer through frame" {
     pair.worker = .{};
 }
 
+test "dist bell a rows worker's READY leaves its idle exit unarmed" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair = try TestBells.open(46133);
+    defer pair.close();
+    defer cluster().follower_pending.store(false, .release);
+    cluster().follower_pending.store(false, .release);
+    var worker_link: Link = .{ .group = .{}, .rank = 1, .size = 2 };
+    worker_link.bells[0] = pair.worker;
+    var ready: WorkerReady = .{ .link = &worker_link, .started_ms = testDeadline(0) };
+    try WorkerReady.rows(&ready, 1, 2);
+    var decoder: BellDecoder = .{};
+    try std.testing.expectEqual(@as(u32, 2), (try testReadBellWord(&decoder, pair.leader.bells[1])).ready.calib_us);
+    try std.testing.expect(ready.sent);
+    try std.testing.expect(!cluster().follower_pending.load(.acquire));
+}
+
 /// Waits on the bells for a worker to leave: a read returns only at its end.
 fn watchWorker(link: *const Link) void {
     const lost = watchBells(link, cluster());
@@ -3023,9 +3039,12 @@ const WorkerReady = struct {
         cluster().follower_pending.store(true, .release);
     }
 
+    /// A rows worker reports READY but never arms the idle exit: rank 0 runs a video job on its inference thread, which
+    /// stops the loop ticks that gate its heartbeats, so a long job would end an armed worker.
     fn rows(ctx: *anyopaque, resident_mib: u32, calib_us: u32) anyerror!void {
         const self: *WorkerReady = @ptrCast(@alignCast(ctx));
-        try self.send(0, resident_mib, calib_us);
+        try sendReadyFrame(self.link.bells[0], .{ .code = 0, .resident_mib = resident_mib, .calib_us = calib_us, .load_ms = loadElapsedMs(self.started_ms) });
+        self.sent = true;
     }
 };
 
