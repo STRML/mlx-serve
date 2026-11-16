@@ -68,7 +68,6 @@ pub fn moeDown(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, rb: usize, dow
     const R = dims(act, 0);
     const K = dims(act, 2);
     const N = dims(x1, 2);
-    const nt = rb * (K / 128);
     if (R < 1 or R > decode.max_rows or dims(act, 1) != TOPK + 1 or dims(x1, 0) != R or dims(x1, 1) != HC or dims(idx, 0) != R or dims(idx, 1) != TOPK) return null;
     if (K == 0 or K % 128 != 0 or K > max_k or N % rb != 0 or sp.post.ctx == null or sp.comb.ctx == null) return null;
     const bits = down.qp.bits;
@@ -80,22 +79,61 @@ pub fn moeDown(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, rb: usize, dow
     if (mlx.mlx_array_dtype(down.w) != .uint32 or mlx.mlx_array_dtype(shared.w) != .uint32 or mlx.mlx_array_dtype(shared.s) != .uint8) return null;
     if (mlx.mlx_array_dtype(sp.post) != .float32 or mlx.mlx_array_dtype(sp.comb) != .float32 or mlx.mlx_array_size(sp.post) != R * HC or mlx.mlx_array_size(sp.comb) != R * HC * HC) return null;
     if (dims(down.w, 1) != N or dims(down.w, 2) != K * bits / 32 or dims(down.s, 2) != K / gs or dims(shared.w, 0) != N or dims(shared.w, 1) != K / 4 or dims(shared.s, 1) != K / 32) return null;
+    const ins = [_]A{ act, down.w, down.s, down.b, shared.w, shared.s, idx, x1, sp.post, sp.comb };
+    return try launch(sc, kern, rb, .{ .R = R, .K = K, .N = N, .bits = bits, .gs = gs, .es = N, .xp = true }, &ins);
+}
+
+const Launch = struct { R: usize, K: usize, N: usize, bits: usize, gs: usize, es: usize, xp: bool };
+
+fn launch(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, rb: usize, l: Launch, ins: []const A) !A {
+    const bfd: mlx.mlx_dtype = .bfloat16;
+    const nt = rb * (l.K / 128);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    const shape = [_]c_int{ ci(R), HC, ci(N) };
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, bfd));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / rb * nt), 1, 1));
+    const stream = [_]c_int{ ci(l.R), HC, ci(l.N) };
+    const rows = [_]c_int{ ci(l.R), ci(l.N) };
+    const shape: []const c_int = if (l.xp) &stream else &rows;
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, shape.ptr, shape.len, bfd));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(l.N / rb * nt), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(nt), 1, 1));
-    inline for (.{ .{ "K", K }, .{ "N", N }, .{ "ROWS", R }, .{ "RB", rb }, .{ "HC", HC }, .{ "TOPK", TOPK }, .{ "BITS", bits }, .{ "GS", gs } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    inline for (.{ .{ "K", l.K }, .{ "N", l.N }, .{ "ROWS", l.R }, .{ "RB", rb }, .{ "HC", HC }, .{ "TOPK", TOPK }, .{ "BITS", l.bits }, .{ "GS", l.gs }, .{ "ES", l.es }, .{ "XP", @intFromBool(l.xp) } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", bfd));
-    const ins = [_]A{ act, down.w, down.s, down.b, shared.w, shared.s, idx, x1, sp.post, sp.comb };
-    const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    const iv = mlx.mlx_vector_array_new_data(ins.ptr, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
     var o = mlx.mlx_array_new();
     return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+
+/// The routed and shared down of rank `rank` of `size`'s quarter of the hidden rows from the whole `act` `[R, 7, K]`:
+/// `[R, hidden / size]` bf16, the sum rounded once (no hc expand). `down` and `shared` are the resident whole banks; each
+/// is bound from this rank's first row (a row-contiguous block, no copy). Null where `moeDown` would decline.
+pub fn moeDownRows(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, rb: usize, down: *const dsv41.Bank, shared: *const dsv41.Lin, rank: usize, size: usize, act: A, idx: A) !?A {
+    if (!mlx.streamIsGpu(sc.s) or rb == 0) return null;
+    if (mlx.getShape(act).len != 3 or mlx.getShape(idx).len != 2 or mlx.getShape(down.w).len != 3) return null;
+    const R = dims(act, 0);
+    const K = dims(act, 2);
+    const D = dims(down.w, 1);
+    if (D % size != 0) return null;
+    const N = D / size;
+    if (R < 1 or R > decode.max_rows or dims(act, 1) != TOPK + 1 or dims(idx, 0) != R or dims(idx, 1) != TOPK) return null;
+    if (K == 0 or K % 128 != 0 or K > max_k or N % rb != 0) return null;
+    const bits = down.qp.bits;
+    const gs = down.qp.group_size;
+    if (down.qp.mode != .affine or (bits != 2 and bits != 3) or (gs != 64 and gs != 128) or down.b.ctx == null) return null;
+    if (shared.qp.mode != .mxfp8 or shared.qp.bits != 8 or shared.qp.group_size != 32) return null;
+    const bfd: mlx.mlx_dtype = .bfloat16;
+    if (mlx.mlx_array_dtype(act) != bfd or mlx.mlx_array_dtype(down.s) != bfd or mlx.mlx_array_dtype(down.b) != bfd) return null;
+    if (mlx.mlx_array_dtype(down.w) != .uint32 or mlx.mlx_array_dtype(shared.w) != .uint32 or mlx.mlx_array_dtype(shared.s) != .uint8) return null;
+    if (dims(down.w, 2) != K * bits / 32 or dims(down.s, 2) != K / gs or dims(shared.w, 0) != D or dims(shared.w, 1) != K / 4 or dims(shared.s, 1) != K / 32) return null;
+    const lo = rank * N;
+    var b: [3]A = undefined;
+    for ([_]A{ down.w, down.s, down.b }, &b) |a, *o| o.* = try sc.slice(try sc.slice(a, 0, 0, 1), 1, lo, D);
+    // The stream inputs go unread at XP 0: any small arrays fill their slots.
+    const ins = [_]A{ act, b[0], b[1], b[2], try sc.slice(shared.w, 0, lo, D), try sc.slice(shared.s, 0, lo, D), idx, act, act, act };
+    return try launch(sc, kern, rb, .{ .R = R, .K = K, .N = N, .bits = bits, .gs = gs, .es = D, .xp = false }, &ins);
 }
 
 /// The rows a threadgroup owns on this GPU: `rows_per_tg`, halved until the GPU grants the threads of the six-row
@@ -511,6 +549,8 @@ const DownK = struct {
         g.int("TOPK", TOPK);
         g.int("BITS", p.bits);
         g.int("GS", p.gs);
+        g.int("ES", s.n);
+        g.int("XP", 1);
         g.dtype("T", adt);
         return g;
     }

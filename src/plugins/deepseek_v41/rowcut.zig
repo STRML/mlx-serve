@@ -7,6 +7,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const dsv41 = @import("deepseek_v41.zig");
 const moe_up = @import("decode/moe_up.zig");
+const moe_down = @import("decode/moe_down.zig");
 
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
@@ -147,8 +148,9 @@ pub const RowLayer = struct {
     wo_b: Lin,
     rank: u32,
     size: u32,
-    /// The resident fused gate+up banks the decode kernel reads this rank's rows of in place (`moe_up.moeUpRows`).
-    fused: ?struct { gu: Bank, sgu: Lin } = null,
+    /// The resident banks the decode kernels read this rank's rows of in place (`moe_up.moeUpRows`,
+    /// `moe_down.moeDownRows`): the fused gate+up banks and the downs.
+    fused: ?struct { gu: Bank, sgu: Lin, down: Bank, sdn: Lin } = null,
 
     pub fn init(gpa: std.mem.Allocator, s: S, ly: *const dsv41.Layer, rank: u32, size: u32) !RowLayer {
         const e = &ly.experts;
@@ -156,7 +158,7 @@ pub const RowLayer = struct {
         if (e.down.qp.mode == .gguf) return error.Dsv41RowCutGguf;
         var rl: RowLayer = .{ .gpa = gpa, .experts = undefined, .shared = undefined, .wq_b = undefined, .wo_a = undefined, .sink = none, .wo_b = undefined, .rank = rank, .size = size };
         if (e.gu) |gu| if (ly.shared_gu) |sgu| {
-            rl.fused = .{ .gu = gu, .sgu = sgu };
+            rl.fused = .{ .gu = gu, .sgu = sgu, .down = e.down, .sdn = ly.shared[2] };
         };
         errdefer rl.owned.deinit(gpa);
         const k: Cutter = .{ .gpa = gpa, .s = s, .owned = &rl.owned };
@@ -233,6 +235,7 @@ pub fn stageDown(sc: *Scope, m: *const dsv41.Dsv41Model, rl: *const RowLayer, h:
     const k: usize = @intCast(dim(idx, 1));
     const inter = dim(h, -1);
     const uidx = try sc.astype(idx, .uint32);
+    if (m.dec.moe_down) |kd| if (rl.fused) |f| if (try moe_down.moeDownRows(sc, kd, m.dec.moe_down_rb, &f.down, &f.sdn, rl.rank, rl.size, h, uidx)) |y| return sc.astype(y, .float32);
     const hr = try sc.reshape(try sc.slice(h, 1, 0, k), &.{ @intCast(L), @intCast(k), 1, inter });
     const dn = try dsv41.gatherMm(sc, hr, &rl.experts.down, lhsOf(L, k, m.lhs_dn), uidx, false);
     const dq = dim(dn, -1);
@@ -833,6 +836,42 @@ test "dsv41 row cut: the fused up launch over a rank's rows of the resident bank
             var chain = rl.*;
             chain.fused = null;
             const want = try stageUp(&sc, fx.m, &chain, in.x, in.r.idx, in.r.wts);
+            try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+            const a = try host(gpa, want);
+            defer gpa.free(a);
+            const b = try host(gpa, got);
+            defer gpa.free(b);
+            try testing.expect(decode.relRms(b, a) < 5e-3);
+        }
+    }
+}
+
+test "dsv41 row cut: the fused down launch over a rank's rows of the resident banks is that rank's chain down stage" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .fused = true });
+    defer fx.deinit();
+    // The affine decode kernels are built on NAX GPUs only.
+    const kd = fx.m.dec.moe_down orelse return error.SkipZigTest;
+    const ly = fx.layer(20);
+    const rls = try cutRanks(gpa, ly, 4);
+    defer {
+        for (rls) |*r| r.deinit();
+        gpa.free(rls);
+    }
+    for ([_]usize{ 1, decode.max_rows }) |rows| {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const in = try routes(&sc, fx, ly, rows, .bfloat16);
+        var parts: [4]A = undefined;
+        for (rls, &parts) |*rl, *p| p.* = try stageUp(&sc, fx.m, rl, in.x, in.r.idx, in.r.wts);
+        const h = try joinRanks(&sc, try sc.concat(&parts, 0), 4);
+        for (rls) |*rl| {
+            const f = rl.fused.?;
+            const got = (try moe_down.moeDownRows(&sc, kd, fx.m.dec.moe_down_rb, &f.down, &f.sdn, rl.rank, rl.size, h, try sc.astype(in.r.idx, .uint32))) orelse return error.Declined;
+            var chain = rl.*;
+            chain.fused = null;
+            const want = try stageDown(&sc, fx.m, &chain, h, in.r.idx);
             try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
             const a = try host(gpa, want);
             defer gpa.free(a);
