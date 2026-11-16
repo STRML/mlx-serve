@@ -2,7 +2,8 @@
 # test_internal_switch.sh — /v1/internal/* and the layout-switch admission gate (plan 61c step 5), over a real HTTP
 # server. [1] without --internal-key-file the paths 404; [2] startup refuses a loose-mode key file and a key equal to
 # --api-key; [3] the serving key, no key and a wrong key are 401 even from loopback, the internal key reads the mode;
-# [4] drain closes public inference with a 503 while /health, /v1/models and the mode poll stay up, abort reopens it;
+# [4] drain closes public inference and model operations (tokenize, load) with a 503 while /health, /v1/models and the
+# mode poll stay up, abort reopens it and chat reaches the model path (the missing model's 503, asserted by body);
 # [5] repeats, a stale N (409 carrying the box's N), an abort that fences a later drain, and tp4 with no formation
 # backend (501, state untouched); [6] a drain nobody follows expires on its own and reopens admission.
 #
@@ -88,6 +89,7 @@ check "no key is 401" "$(eq "$(status "$(get /v1/internal/mode)")" 401)"
 check "serving key is 401 on abort" "$(eq "$(status "$(post /v1/internal/abort '{"n":1}' "$SERVING")")" 401)"
 M="$(get /v1/internal/mode "$KEY")"
 check "internal key reads the mode: tp1, idle, admitting" "$([ "$(status "$M")" = 200 ] && [ "$(field "$M" mode)" = tp1 ] && [ "$(field "$M" state)" = idle ] && [ "$(field "$M" admitting)" = True ] && echo 1 || echo 0)"
+check "no --metrics: the mode poll still carries a progress count (stall detection runs)" "$([ "$(field "$M" progress)" != None ] && echo 1 || echo 0)"
 check "/health carries the mode fields" "$(has "$(curl -s "$BASE/health")" '"mode":"tp1"')"
 
 echo "[4/6] drain closes public inference; abort reopens it"
@@ -95,12 +97,16 @@ D="$(post /v1/internal/drain '{"n":7}' "$KEY")"
 check "drain 7 is 200, drained, state draining" "$([ "$(status "$D")" = 200 ] && [ "$(field "$D" drained)" = True ] && [ "$(field "$D" state)" = draining ] && echo 1 || echo 0)"
 C="$(post /v1/chat/completions '{"messages":[{"role":"user","content":"hi"}]}')"
 check "chat is 503 naming the switch" "$([ "$(status "$C")" = 503 ] && [ "$(has "$C" 'Layout switch')" = 1 ] && echo 1 || echo 0)"
+for op in /tokenize /detokenize /v1/load-model /v1/unload-model; do
+    O="$(post "$op" '{}')"
+    check "$op is refused while draining (model operations count as inference)" "$([ "$(status "$O")" = 503 ] && [ "$(has "$O" 'Layout switch')" = 1 ] && echo 1 || echo 0)"
+done
 check "/v1/models still answers" "$(eq "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/models")" 200)"
 check "/health still 200 while draining" "$(eq "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/health")" 200)"
 A="$(post /v1/internal/abort '{"n":7}' "$KEY")"
 check "abort 7 is 200, state aborted" "$([ "$(status "$A")" = 200 ] && [ "$(field "$A" state)" = aborted ] && echo 1 || echo 0)"
 C="$(post /v1/chat/completions '{"messages":[{"role":"user","content":"hi"}]}')"
-check "chat reaches the model path again (no Layout switch refusal)" "$([ "$(has "$C" 'Layout switch')" = 0 ] && echo 1 || echo 0)"
+check "chat reaches the model path again: 503 from the missing model, not the switch" "$([ "$(status "$C")" = 503 ] && [ "$(has "$C" 'No default model configured')" = 1 ] && [ "$(has "$C" 'Layout switch')" = 0 ] && echo 1 || echo 0)"
 
 echo "[5/6] repeats, stale N, fences, no formation backend"
 check "abort 7 again is 200 (idempotent)" "$(eq "$(status "$(post /v1/internal/abort '{"n":7}' "$KEY")")" 200)"
@@ -110,7 +116,7 @@ check "abort 12 fences an attempt the box never saw" "$([ "$(field "$(post /v1/i
 check "a late drain 12 is refused" "$(eq "$(status "$(post /v1/internal/drain '{"n":12}' "$KEY")")" 409)"
 post /v1/internal/drain '{"n":13}' "$KEY" > /dev/null
 T="$(post /v1/internal/tp4 '{"n":13}' "$KEY")"
-check "tp4 with no formation backend is 501" "$(eq "$(status "$T")" 501)"
+check "tp4 with no formation backend is 501 naming the missing adapter" "$([ "$(status "$T")" = 501 ] && [ "$(has "$T" 'the switch adapter is not installed')" = 1 ] && echo 1 || echo 0)"
 check "…and the box stays draining" "$(eq "$(field "$(get /v1/internal/mode "$KEY")" state)" draining)"
 check "a body naming a coordinator is ignored, not obeyed" "$(eq "$(status "$(post /v1/internal/join '{"n":13,"coordinator":"10.9.9.9:1"}' "$KEY")")" 501)"
 
