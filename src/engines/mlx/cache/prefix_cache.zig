@@ -4309,13 +4309,32 @@ pub const HotPrefixCache = struct {
                 checked_out += e.kv_bytes;
                 continue;
             }
-            const max_shared = @min(e.tokens.len, prompt_tokens.len);
-            var shared: usize = 0;
-            while (shared < max_shared and e.tokens[shared] == prompt_tokens[shared]) shared += 1;
-            if (shared < MIN_CANCELLED_COMMIT_TOKENS) continue;
+            if (sharedPrefixLen(e.tokens, prompt_tokens) < MIN_CANCELLED_COMMIT_TOKENS) continue;
             pinned = @max(pinned, e.kv_bytes);
         }
         return self.residentBytes() -| checked_out -| pinned;
+    }
+
+    fn sharedPrefixLen(a: []const u32, b: []const u32) usize {
+        const max_shared = @min(a.len, b.len);
+        var shared: usize = 0;
+        while (shared < max_shared and a[shared] == b[shared]) shared += 1;
+        return shared;
+    }
+
+    /// `last_used` of the resident entry this prompt would restore from (the longest shared
+    /// prefix past the restore floor), for an eviction that runs before the restore.
+    pub fn restoreCandidateUsed(self: *const HotPrefixCache, prompt_tokens: []const u32) ?u64 {
+        var best_len: usize = MIN_CANCELLED_COMMIT_TOKENS - 1;
+        var used: ?u64 = null;
+        for (self.entries.items) |*e| {
+            if (e.checked_out_by != null) continue;
+            const shared = sharedPrefixLen(e.tokens, prompt_tokens);
+            if (shared <= best_len) continue;
+            best_len = shared;
+            used = e.last_used;
+        }
+        return used;
     }
 
     /// Evict least-recently-used entries until `fits()` says the request fits (#353): a cached
@@ -4350,13 +4369,24 @@ pub const HotPrefixCache = struct {
         fits: *const fn (?*anyopaque) bool,
         protect_restored: bool,
     ) EvictionReport {
+        return self.evictLruToAdmitProtecting(seq_tokens, ctx, fits, if (protect_restored) self.last_restored_used else null);
+    }
+
+    /// `evictLruToAdmit` sparing the entry whose `last_used` is `protect` (null = spare none).
+    pub fn evictLruToAdmitProtecting(
+        self: *HotPrefixCache,
+        seq_tokens: u64,
+        ctx: ?*anyopaque,
+        fits: *const fn (?*anyopaque) bool,
+        protect: ?u64,
+    ) EvictionReport {
         var report = EvictionReport{};
         while (!fits(ctx)) {
             // Accounting bytes are what the entry was billed; live bytes are what the allocator got back.
             var live_before: usize = 0;
             _ = mlx.mlx_get_active_memory(&live_before);
             const acct_before = self.residentBytes();
-            if (!self.evictForAdmission(if (protect_restored) self.last_restored_used else null)) break;
+            if (!self.evictForAdmission(protect)) break;
             var live_after: usize = 0;
             _ = mlx.mlx_get_active_memory(&live_after);
             const freed_live: u64 = @as(u64, live_before) -| @as(u64, live_after);
