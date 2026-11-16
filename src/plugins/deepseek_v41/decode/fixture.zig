@@ -657,6 +657,99 @@ test "dsv41 tensor parallel: a snapshot read from disk reaches the worker as its
     try std.testing.expectError(error.DistPeerDiverged, dsv41.tpWorkerLoad(m, gpa, &snaps, 3, ids, sent[1..]));
 }
 
+/// A snapshot as the SSD import builds it, held in `snaps` under `id`; `sc` owns the arrays it was built from.
+fn importedSnap(sc: *dsv41.Scope, m: *dsv41.Dsv41Model, snaps: *dsv41.Snaps, id: u64, n: usize) !*dsv41.Snap {
+    const gpa = std.testing.allocator;
+    const p = try dsv41.tpLoadPlan(m, n);
+    const disk = try gpa.alloc(A, p.len);
+    defer gpa.free(disk);
+    for (p.specs(), disk, 0..) |spec, *x, k| {
+        const shape = [_]c_int{ @intCast(spec.rows), @intCast(spec.width) };
+        const vals = try sc.astype(try sc.arange(k, k + spec.rows * spec.width), spec.dtype);
+        x.* = try sc.reshape(vals, shape[0..spec.rank()]);
+    }
+    const ids = try gpa.alloc(u32, n);
+    defer gpa.free(ids);
+    @memset(ids, 3);
+    try dsv41.tpWorkerLoad(m, gpa, snaps, id, ids, disk);
+    return snaps.getPtr(id).?;
+}
+
+const TpHook = struct {
+    var loads: usize = 0;
+    var last: u64 = 0;
+    var fail = false;
+    fn load(id: u64, _: []const u32, _: []const A) anyerror!void {
+        if (fail) return error.DistPeerDiverged;
+        loads += 1;
+        last = id;
+    }
+};
+
+test "dsv41 tensor parallel: a snapshot the current group lacks reaches the other ranks once, under a new id" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .tp = .{ .rank = 0, .size = 2 } });
+    defer fx.deinit();
+    const m = fx.m;
+    var sc = dsv41.Scope.init(gpa, m.s);
+    defer sc.deinit();
+    var snaps: dsv41.Snaps = .init(gpa);
+    defer dsv41.dropSnaps(&snaps, gpa);
+    const sn = try importedSnap(&sc, m, &snaps, 1, 301);
+    TpHook.loads = 0;
+    TpHook.fail = false;
+    dsv41.clusterHooks().tp_load = &TpHook.load;
+    defer dsv41.clusterHooks().tp_load = null;
+    var ids: dsv41.TpIds = .{};
+
+    // Taken under TP1 (id 0), the group forms afterwards: one load, then the snapshot is the group's own.
+    sn.tp_id = 0;
+    ids.formed();
+    try dsv41.tpEnsure(m, gpa, &ids, sn);
+    try std.testing.expectEqual(@as(usize, 1), TpHook.loads);
+    try std.testing.expect(sn.tp_id != 0 and TpHook.last == sn.tp_id and !ids.stale(sn.tp_id));
+    try dsv41.tpEnsure(m, gpa, &ids, sn);
+    try std.testing.expectEqual(@as(usize, 1), TpHook.loads);
+
+    // A group later its followers are new: the id is stale again and goes over once more, under a newer id.
+    const earlier = sn.tp_id;
+    ids.formed();
+    try dsv41.tpEnsure(m, gpa, &ids, sn);
+    try std.testing.expectEqual(@as(usize, 2), TpHook.loads);
+    try std.testing.expect(sn.tp_id > earlier);
+
+    // A failed load leaves the snapshot's id as it was, so the next turn tries again.
+    ids.formed();
+    const before = sn.tp_id;
+    TpHook.fail = true;
+    try std.testing.expectError(error.DistPeerDiverged, dsv41.tpEnsure(m, gpa, &ids, sn));
+    try std.testing.expectEqual(before, sn.tp_id);
+    try std.testing.expectEqual(@as(usize, 2), TpHook.loads);
+
+    // Without a tensor split there are no other ranks to tell.
+    TpHook.fail = false;
+    const split = m.tp;
+    m.tp = null;
+    defer m.tp = split;
+    try dsv41.tpEnsure(m, gpa, &ids, sn);
+    try std.testing.expectEqual(@as(usize, 2), TpHook.loads);
+    try std.testing.expectEqual(before, sn.tp_id);
+}
+
+test "dsv41 cache identity: a model and its tensor rank 0 hash the same layout" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const whole = try Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer whole.deinit();
+    const split = try Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .tp = .{ .rank = 0, .size = 2 } });
+    defer split.deinit();
+    try std.testing.expect(split.m.cfg.num_attention_heads != whole.m.cfg.num_attention_heads);
+    const a = try dsv41.cacheLayout(whole.m);
+    const b = try dsv41.cacheLayout(split.m);
+    try std.testing.expectEqual(a.settings, b.settings);
+}
+
 /// One step's input rows: a stream and its mix.
 const Input = struct {
     x: A,

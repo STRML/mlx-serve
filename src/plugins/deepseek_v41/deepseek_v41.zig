@@ -81,6 +81,7 @@ const Shard = @import("../../sdk/weights/shard.zig").Shard;
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
 const Config = @import("config.zig").Config;
+pub const TpIds = @import("tp_ids.zig").TpIds;
 const Weights = resident.Weights;
 pub const QuantParams = params.QuantParams;
 const none: A = .{ .ctx = null };
@@ -418,6 +419,8 @@ pub const Dsv41Model = struct {
     gpa: std.mem.Allocator,
     s: S,
     cfg: Config,
+    /// The pack's config before a tensor split slices heads and expert widths: the cache identity hashes this one.
+    whole_cfg: Config,
     act: mlx.mlx_dtype,
     embed: Lin,
     /// the embedding rows read from the pack at each lookup (`embed` unset).
@@ -1697,6 +1700,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         .gpa = gpa,
         .s = s,
         .cfg = cfg.*,
+        .whole_cfg = whole.*,
         .act = opts.act,
         .embed = undefined,
         .head = undefined,
@@ -5238,6 +5242,16 @@ pub fn tpLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap) !vo
     try load(sn.tp_id, sn.ids, xs);
 }
 
+/// Makes `sn` known to the other ranks of the current group: one taken before the group formed (TP1, or an earlier
+/// group) goes over under a new id and keeps it, so it loads once a group. A failed load leaves its id as it was.
+pub fn tpEnsure(m: *const Dsv41Model, gpa: std.mem.Allocator, ids: *TpIds, sn: *Snap) !void {
+    if (m.tp == null or !ids.stale(sn.tp_id)) return;
+    const old = sn.tp_id;
+    sn.tp_id = ids.next();
+    errdefer sn.tp_id = old;
+    try tpLoad(m, gpa, sn);
+}
+
 /// Tensor-parallel rank past 0: rank 0's snapshot `id` read from disk, as `tpLoadPlan`'s tensors in order.
 pub fn tpWorkerLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, id: u64, ids: []const u32, tensors: []const A) !void {
     const p = try tpLoadPlan(m, ids.len);
@@ -6074,11 +6088,12 @@ fn cacheSetting(h: *std.hash.Wyhash, value: anytype) void {
     }
 }
 
-fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
+pub fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
     if (m.n_layers > 64) return error.Dsv41CacheGeometry;
     var h = std.hash.Wyhash.init(0x4141);
-    // Hash values rather than struct padding or the model_type slice's process-local address.
-    cacheSetting(&h, m.cfg);
+    // Hash values rather than struct padding or the model_type slice's process-local address. Every rank holds the
+    // same cache whatever the split, so the whole config keys it: an entry moves between widths.
+    cacheSetting(&h, m.whole_cfg);
     std.hash.autoHash(&h, .{ m.n_mtp, m.ds_block, m.span, m.moe_rows, m.ced_split, m.ced_min_skip, m.hc_tg, m.topk_tg, m.qat_off, m.attn_f16, m.head.qp });
     var l: cache_codec.Layout = .{
         .layers = m.n_layers,
@@ -10024,6 +10039,12 @@ test "dsv41 tensor parallel: two ranks sum a bf16 part as it is, a wider part at
         try testing.expectEqual(dt, Seen.dt);
         try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
     }
+}
+
+test "dsv41 cache identity: the config's part of the key is the value SSD entries were written under" {
+    var h = std.hash.Wyhash.init(0x4141);
+    cacheSetting(&h, @as(Config, .{}));
+    try testing.expectEqual(@as(u64, 5617875741235430630), h.final());
 }
 
 test "dsv41 head: the 8-bit head is the default, MLX_SERVE_DSV41_HEAD8=0 keeps the head as the pack ships it" {
