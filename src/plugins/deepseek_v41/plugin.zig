@@ -24,6 +24,7 @@ const outside_model = @import("../../sdk/quant/outside_model.zig");
 const env = @import("../../env.zig");
 const engram_decode = @import("decode/engram_decode.zig");
 const flash_attn = @import("prompt/flash_attn.zig");
+const numerics = @import("numerics.zig");
 const scratch_attn = @import("prompt/scratch_attn.zig");
 pub const config = @import("config.zig");
 
@@ -607,7 +608,12 @@ const aux_hooks = abi.AuxHooks{
     .handoff = &auxHandoff,
     .free = &auxFree,
     .bytes = &auxBytes,
+    .settings_key = &auxSettingsKey,
 };
+
+fn auxSettingsKey(_: *anyopaque) callconv(.c) u64 {
+    return numerics.key();
+}
 
 fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
     const m: *Model = @ptrCast(@alignCast(mp));

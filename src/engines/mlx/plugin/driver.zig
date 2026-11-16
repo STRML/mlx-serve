@@ -1266,6 +1266,15 @@ pub fn auxImportPlanDetails(xfm: *const Transformer, header: []const u8, out: *a
     return b.hooks.import_plan(b.model, .of(header), &out.peak);
 }
 
+/// The plugin's contribution to the peer settings key (`AuxHooks.settings_key`); null when it makes none.
+pub fn auxSettingsKey(xfm: *const Transformer) ?u64 {
+    const b = auxBinding(xfm) orelse return null;
+    const end = @offsetOf(abi.AuxHooks, "settings_key") + @sizeOf(@FieldType(abi.AuxHooks, "settings_key"));
+    if (b.hooks.size < end) return null;
+    const f = b.hooks.settings_key orelse return null;
+    return f(b.model);
+}
+
 pub fn auxExportArrays(xfm: *const Transformer, snap: abi.Handle, out: *abi.AuxExport) abi.Verdict {
     const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
     if (out.size < @sizeOf(abi.AuxExport)) return abi.Verdict.refuse(.unsupported, "auxiliary export storage is too short");
