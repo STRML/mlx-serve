@@ -508,7 +508,7 @@ test "peer transfer session: a session whose RAM entry is gone exports from the 
         if (r == .done) break;
     }
     try testing.expect(hc.disk.?.entryWholeOnDisk(disk_id));
-    const tip_tokens = hc.disk.?.sessionTip(9).?.tokens.len;
+    const tip_tokens = hc.sessionTip(9).?.n;
     hc.setBudget(1);
     hc.setBudget(0);
     try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
@@ -534,6 +534,70 @@ test "peer transfer session: a session whose RAM entry is gone exports from the 
     try testing.expectEqual(@as(u32, @intCast(tip_tokens)), warm_b.cached);
     try testing.expectEqual(warm_a.cached, warm_b.cached);
     try testing.expectEqualSlices(u32, warm_a.tokens, warm_b.tokens);
+}
+
+test "peer transfer session: two sessions on one conversation each export their own boundary" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const model_a = try PeerHarness.open(files);
+    defer model_a.close();
+
+    const full_prompt = buildPrompt(33);
+    const short = try model_a.runGreedyTagged(full_prompt[0..25], 2, true, 1);
+    defer testing.allocator.free(short.tokens);
+    const long = try model_a.runGreedyTagged(&full_prompt, 2, true, 2);
+    defer testing.allocator.free(long.tokens);
+
+    const first = exportBySession(model_a, 1);
+    try testing.expect(first == .ok);
+    defer testing.allocator.free(first.ok.bytes);
+    try testing.expectEqual(@as(usize, 24), first.ok.n);
+    const second = exportBySession(model_a, 2);
+    try testing.expect(second == .ok);
+    defer testing.allocator.free(second.ok.bytes);
+    try testing.expectEqual(@as(usize, 32), second.ok.n);
+}
+
+test "peer transfer session: an import another session's entry already covers still names its session" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const model_a = try PeerHarness.open(files);
+    defer model_a.close();
+    const model_b = try PeerHarness.open(files);
+    defer model_b.close();
+
+    const full_prompt = buildPrompt(33);
+    const turn_77 = try model_a.runGreedyTagged(full_prompt[0..25], 2, true, 77);
+    defer testing.allocator.free(turn_77.tokens);
+    const wire_77 = exportBySession(model_a, 77);
+    try testing.expect(wire_77 == .ok);
+    defer testing.allocator.free(wire_77.ok.bytes);
+    const turn_78 = try model_a.runGreedyTagged(full_prompt[0..25], 2, true, 78);
+    defer testing.allocator.free(turn_78.tokens);
+    const wire_78 = exportBySession(model_a, 78);
+    try testing.expect(wire_78 == .ok);
+    defer testing.allocator.free(wire_78.ok.bytes);
+
+    try testing.expect(importWire(model_b, wire_77.ok.bytes) == .ok);
+    const covered = importWire(model_b, wire_78.ok.bytes);
+    try testing.expect(covered == .refused and covered.refused == .stale);
+
+    const owned = exportBySession(model_b, 78);
+    try testing.expect(owned == .ok);
+    defer testing.allocator.free(owned.ok.bytes);
+    try testing.expectEqual(@as(usize, 24), owned.ok.n);
 }
 
 test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, settings, quant config, stale entry and low memory headroom" {

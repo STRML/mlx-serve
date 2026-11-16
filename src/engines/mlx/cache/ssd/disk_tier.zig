@@ -470,9 +470,32 @@ pub const DiskTier = struct {
         quant: kv_quant.KVQuantConfig,
         media: []const MediaSpan = &.{},
         session: u64 = 0,
+        seq: u64 = 0,
+        variant: u64 = 0,
         header: []const u8,
         tensors: []const module_record.Tensor,
     };
+
+    /// A committed module record named by its (variant-folded) prefix key and token count; slices belong to the tier.
+    pub const ModuleRef = struct {
+        id: u64,
+        tokens: []const u32,
+        media: []const MediaSpan,
+        has_tools: bool,
+        quant: kv_quant.KVQuantConfig,
+        prefix_key: u64,
+        variant: u64,
+    };
+    pub const SessionRecord = struct { session: u64, seq: u64, variant: u64, prefix_key: u64, n: usize };
+
+    pub fn moduleByKey(self: *DiskTier, prefix_key: u64, n: usize) ?ModuleRef {
+        _ = .{ self, prefix_key, n };
+        return null;
+    }
+
+    pub fn sessionRecords(self: *DiskTier, out: *std.ArrayList(SessionRecord)) !void {
+        _ = .{ self, out };
+    }
 
     pub const ModuleSlice = enum { progress, busy, done };
     /// A committed module record as a session's newest prompt boundary; slices belong to the tier.
@@ -9479,17 +9502,23 @@ const ModuleSource = struct {
         return tier;
     }
 
+    const Tag = struct { session: u64 = 0, seq: u64 = 0, variant: u64 = 0, key: u64 = 17 };
+
     fn register(tier: *DiskTier, n: u32) !u64 {
-        return registerSession(tier, n, 0);
+        return registerTagged(tier, n, .{});
     }
 
     fn registerSession(tier: *DiskTier, n: u32, session: u64) !u64 {
+        return registerTagged(tier, n, .{ .session = session });
+    }
+
+    fn registerTagged(tier: *DiskTier, n: u32, tag: Tag) !u64 {
         const ids = try testing.allocator.alloc(u32, n);
         defer testing.allocator.free(ids);
         for (ids, 0..) |*id, i| id.* = @intCast(i + 7);
         return (try tier.registerModule(.{
-            .tokens = ids, .prefix_key = 17, .has_tools = false, .quant = kv_quant.KVQuantConfig.dense,
-            .header = header, .tensors = tensors, .session = session,
+            .tokens = ids, .prefix_key = tag.key, .has_tools = false, .quant = kv_quant.KVQuantConfig.dense,
+            .header = header, .tensors = tensors, .session = tag.session, .seq = tag.seq, .variant = tag.variant,
         })) orelse error.ModuleRegistrationDeclined;
     }
 
@@ -9690,33 +9719,54 @@ test "a v10 module reopens and loads its complete CPU tensor inventory" {
     try testing.expectEqual(reopened.total_bytes, reopened.physicalDiskBytes());
 }
 
-test "a module record keeps its session tag across a reopen, and a session's tip is its newest committed record" {
+fn expectSessionRecords(tier: *DiskTier, a: u64, b: u64, c: u64, d: u64) !void {
+    var records = std.ArrayList(DiskTier.SessionRecord).empty;
+    defer records.deinit(testing.allocator);
+    try tier.sessionRecords(&records);
+    var tagged: usize = 0;
+    var newest_5: u64 = 0;
+    var newest_5_variant: u64 = 0;
+    for (records.items) |r| {
+        tagged += 1;
+        if (r.session == 5 and r.seq > newest_5) {
+            newest_5 = r.seq;
+            newest_5_variant = r.variant;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), tagged);
+    try testing.expectEqual(@as(u64, 9), newest_5);
+    try testing.expectEqual(@as(u64, 4), newest_5_variant);
+
+    const by_key = tier.moduleByKey(101, 513).?;
+    try testing.expectEqual(b, by_key.id);
+    try testing.expectEqual(@as(u64, 4), by_key.variant);
+    try testing.expectEqual(@as(usize, 513), by_key.tokens.len);
+    try testing.expectEqual(a, tier.moduleByKey(100, 512).?.id);
+    try testing.expectEqual(c, tier.moduleByKey(102, 514).?.id);
+    try testing.expectEqual(d, tier.moduleByKey(103, 515).?.id);
+    try testing.expect(tier.moduleByKey(101, 512) == null);
+    try testing.expect(tier.moduleByKey(104, 516) == null);
+}
+
+test "a module record keeps its session, seq and variant across a reopen, and a key names its record" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, testing.io, &buf);
     var tier = try ModuleSource.init(base, "r18s");
     defer tier.deinit();
-    const older = try ModuleSource.registerSession(&tier, 512, 5);
-    const newer = try ModuleSource.registerSession(&tier, 513, 5);
-    const other = try ModuleSource.registerSession(&tier, 514, 6);
-    const untagged = try ModuleSource.register(&tier, 515);
-    const unfinished = try ModuleSource.registerSession(&tier, 516, 5);
-    for ([_]u64{ older, newer, other, untagged }) |id| try ModuleSource.publish(&tier, id);
+    const a = try ModuleSource.registerTagged(&tier, 512, .{ .session = 5, .seq = 3, .key = 100 });
+    const b = try ModuleSource.registerTagged(&tier, 513, .{ .session = 5, .seq = 9, .variant = 4, .key = 101 });
+    const c = try ModuleSource.registerTagged(&tier, 514, .{ .session = 6, .seq = 4, .key = 102 });
+    const d = try ModuleSource.registerTagged(&tier, 515, .{ .key = 103 });
+    _ = try ModuleSource.registerTagged(&tier, 516, .{ .session = 5, .seq = 50, .key = 104 });
+    for ([_]u64{ a, b, c, d }) |id| try ModuleSource.publish(&tier, id);
     tier.drainWriter();
-    try testing.expectEqual(newer, tier.sessionTip(5).?.id);
-    try testing.expectEqual(@as(usize, 513), tier.sessionTip(5).?.tokens.len);
-    try testing.expectEqual(other, tier.sessionTip(6).?.id);
-    try testing.expectEqual(@as(?u64, null), if (tier.sessionTip(7)) |t| t.id else null);
-    try testing.expectEqual(@as(?u64, null), if (tier.sessionTip(0)) |t| t.id else null);
-    _ = unfinished;
+    try expectSessionRecords(&tier, a, b, c, d);
 
     var reopened = try ModuleSource.init(base, "r18s");
     defer reopened.deinit();
-    try testing.expectEqual(newer, reopened.sessionTip(5).?.id);
-    try testing.expectEqual(@as(u64, 17), reopened.sessionTip(5).?.prefix_key);
-    try testing.expectEqual(other, reopened.sessionTip(6).?.id);
-    try testing.expectEqual(@as(?u64, null), if (reopened.sessionTip(0)) |t| t.id else null);
+    try expectSessionRecords(&reopened, a, b, c, d);
 }
 
 test "stable module IDs miss after retirement without touching a replacement" {

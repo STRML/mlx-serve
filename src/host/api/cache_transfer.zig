@@ -82,6 +82,13 @@ pub fn handleSessionExport(allocator: std.mem.Allocator, stream: *Conn, lm: *Loa
     try runExport(allocator, stream, scheduler, &req, .{ .message = "No committed entry for this session", .reason = "session_not_found" });
 }
 
+/// A session export names no prompt: the router sends `{}`. A body that carries `messages` is a prompt export,
+/// which an `X-Session-Key` beside it must not override.
+pub fn isBodylessExport(allocator: std.mem.Allocator, body: []const u8) bool {
+    _ = .{ allocator, body };
+    return false;
+}
+
 const NotFound = struct { message: []const u8, reason: ?[]const u8 = null };
 
 fn runExport(allocator: std.mem.Allocator, stream: *Conn, scheduler: *Scheduler, req: *requests.CacheExportRequest, not_found: NotFound) !void {
@@ -197,4 +204,16 @@ pub fn handleCacheImport(
             try sendErrorResponseWithReason(allocator, stream, e.status, e.kind, e.message, e.code, e.reason);
         },
     }
+}
+
+test "isBodylessExport: only a body with no prompt is a session export" {
+    const a = std.testing.allocator;
+    try std.testing.expect(isBodylessExport(a, "{}"));
+    try std.testing.expect(isBodylessExport(a, ""));
+    try std.testing.expect(isBodylessExport(a, " \n{ }\n"));
+    try std.testing.expect(isBodylessExport(a, "{\"model\":\"m\"}"));
+    try std.testing.expect(!isBodylessExport(a, "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"));
+    try std.testing.expect(!isBodylessExport(a, "{\"model\":\"m\",\"messages\":[]}"));
+    try std.testing.expect(!isBodylessExport(a, "[]"));
+    try std.testing.expect(!isBodylessExport(a, "{not json"));
 }
