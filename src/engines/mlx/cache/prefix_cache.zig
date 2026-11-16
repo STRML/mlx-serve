@@ -738,6 +738,9 @@ pub const HotPrefixCache = struct {
     session_tips: std.AutoHashMapUnmanaged(u64, SessionTip) = .empty,
     session_seq: u64 = 0,
     session_tips_seeded: bool = false,
+    /// Tips held in memory, and sessions the persisted index keeps: fields so a test reaches either cheaply.
+    session_tip_cap: usize = MAX_SESSION_TIPS,
+    session_file_cap: usize = 65536,
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -1478,7 +1481,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items) |*e| {
             const m = e.module orelse continue;
             if (m.tail_from != 0 or e.checked_out_by != null) continue;
-            if (e.tokens.len != tip.n or m.prefix_key != tip.prefix_key or m.binding.variant != tip.variant) continue;
+            if (e.tokens.len != tip.n or m.prefix_key != tip.id or m.binding.variant != tip.variant) continue;
             return ramHit(e);
         }
         return null;
@@ -1499,7 +1502,7 @@ pub const HotPrefixCache = struct {
 
     /// Where a session's newest prompt boundary is: its (variant-folded) prefix key and token count name the entry in
     /// RAM or on the SSD, `seq` orders a session's commits across restarts.
-    pub const SessionTip = struct { prefix_key: u64, n: usize, variant: u64, seq: u64 };
+    pub const SessionTip = struct { id: u64, n: usize, variant: u64, seq: u64 };
 
     pub const MAX_SESSION_TIPS: usize = 4096;
 
@@ -1520,7 +1523,7 @@ pub const HotPrefixCache = struct {
         d.sessionRecords(&records) catch return;
         for (records.items) |r| {
             self.session_seq = @max(self.session_seq, r.seq);
-            self.noteSessionTip(r.session, .{ .prefix_key = r.prefix_key, .n = r.n, .variant = r.variant, .seq = r.seq });
+            self.noteSessionTip(r.session, .{ .id = r.prefix_key, .n = r.n, .variant = r.variant, .seq = r.seq });
         }
     }
 
@@ -1559,7 +1562,7 @@ pub const HotPrefixCache = struct {
         while (it.next()) |kv| {
             if (kv.key_ptr.* == session) continue;
             const t = kv.value_ptr.*;
-            if (t.prefix_key == m.prefix_key and t.n == e.tokens.len and t.variant == m.binding.variant) return true;
+            if (t.id == m.prefix_key and t.n == e.tokens.len and t.variant == m.binding.variant) return true;
         }
         return false;
     }
@@ -1596,7 +1599,7 @@ pub const HotPrefixCache = struct {
         if (!covered or session == 0) return covered;
         const e = shortest orelse return true;
         const m = e.module.?;
-        self.noteSessionTip(session, .{ .prefix_key = m.prefix_key, .n = e.tokens.len, .variant = m.binding.variant, .seq = self.nextSessionSeq() });
+        self.noteSessionTip(session, .{ .id = m.prefix_key, .n = e.tokens.len, .variant = m.binding.variant, .seq = self.nextSessionSeq() });
         return true;
     }
 
@@ -2296,7 +2299,7 @@ pub const HotPrefixCache = struct {
                 @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
             });
         }
-        if (seq != 0) self.noteSessionTip(session, .{ .prefix_key = variantKey(prefix_key, binding.variant), .n = ids.len, .variant = binding.variant, .seq = seq });
+        if (seq != 0) self.noteSessionTip(session, .{ .id = variantKey(prefix_key, binding.variant), .n = ids.len, .variant = binding.variant, .seq = seq });
         self.logResident();
         return .{ .ok = ids.len };
     }
@@ -13264,7 +13267,7 @@ test "HotPrefixCache module: a thinned ladder never drops the rung another sessi
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, cache.findSessionTip(8).?.tokens);
 }
 
-test "HotPrefixCache module: a covered import claims the covering entry for its session" {
+test "HotPrefixCache module: an import of a boundary an entry holds exactly claims that entry for its session" {
     var fake: ModuleFake = .{};
     var bound: plugin_driver.Bound = undefined;
     var xfm: transformer_mod.Transformer = undefined;
@@ -13277,8 +13280,8 @@ test "HotPrefixCache module: a covered import claims the covering entry for its 
 
     try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3, 4 }, &.{}, false, dense, 8));
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, cache.findSessionTip(8).?.tokens);
-    try testing.expect(cache.claimCovering(binding, &.{ 1, 2 }, &.{}, false, dense, 9));
-    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, cache.findSessionTip(9).?.tokens);
+    try testing.expect(!cache.claimCovering(binding, &.{ 1, 2 }, &.{}, false, dense, 9));
+    try testing.expect(cache.findSessionTip(9) == null);
     try testing.expect(!cache.claimCovering(binding, &.{ 9, 9 }, &.{}, false, dense, 10));
     try testing.expect(cache.findSessionTip(10) == null);
     try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3, 4 }, &.{}, false, dense, 0));
@@ -13334,10 +13337,149 @@ test "HotPrefixCache module: a session's tip survives a restart, and a commit af
     try testing.expectEqual(@as(usize, 513), restored.n);
     try testing.expectEqual(persisted_seq, restored.seq);
     try testing.expect(hc.findSessionTip(7) == null);
-    try testing.expect(hc.disk.?.moduleByKey(restored.prefix_key, restored.n) != null);
+    try testing.expect(hc.disk.?.moduleByBoundary(restored.id, restored.n) != null);
 
     var fresh = ModuleDiskTest.snap(&fake, other[0..512]);
     _ = try fresh.putSession(&hc, binding, &.{}, 7);
     try testing.expect(hc.sessionTip(7).?.seq > persisted_seq);
     try testing.expectEqual(@as(usize, 512), hc.findSessionTip(7).?.tokens.len);
+}
+
+test "HotPrefixCache module: sessions on equal-length prompts under one prefix key each keep their own tokens" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    var a: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 0 };
+    var b: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 5, 6, 7, 8 }, .key = 0 };
+    _ = try a.putSession(&cache, binding, &.{}, 7);
+    _ = try b.putSession(&cache, binding, &.{}, 8);
+    const first = cache.findSessionTip(7) orelse return error.TestExpectedTip;
+    const second = cache.findSessionTip(8) orelse return error.TestExpectedTip;
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, first.tokens);
+    try testing.expectEqualSlices(u32, &.{ 5, 6, 7, 8 }, second.tokens);
+}
+
+test "HotPrefixCache module: a tagged import a longer boundary covers is no import of its own boundary, and commits as one" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const dense = kv_quant.KVQuantConfig.dense;
+    var long: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    _ = try long.putSession(&cache, binding, &.{}, 7);
+
+    try testing.expect(!cache.claimCovering(binding, &.{ 1, 2 }, &.{}, false, dense, 8));
+    var own: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+    _ = try own.putSession(&cache, binding, &.{}, 8);
+    const exported = cache.findSessionTip(8) orelse return error.TestExpectedTip;
+    try testing.expectEqualSlices(u32, &.{ 1, 2 }, exported.tokens);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, (cache.findSessionTip(7) orelse return error.TestExpectedTip).tokens);
+    try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3 }, &.{}, false, dense, 0));
+}
+
+test "HotPrefixCache module: a tagged import only a decode-end tail covers still commits its own boundary" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const dense = kv_quant.KVQuantConfig.dense;
+    var boundary: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+    var tail: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    _ = try boundary.putSession(&cache, binding, &.{}, 7);
+    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 7, 2);
+
+    try testing.expect(!cache.claimCovering(binding, &.{ 1, 2, 3 }, &.{}, false, dense, 8));
+    var own: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3 }, .key = 6 };
+    _ = try own.putSession(&cache, binding, &.{}, 8);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, (cache.findSessionTip(8) orelse return error.TestExpectedTip).tokens);
+}
+
+test "HotPrefixCache module: two sessions that share one checkpoint both keep their tip across a restart" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const ids = ModuleDiskTest.ids(7);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    {
+        var hc = try ModuleDiskTest.init(&tmp, 4);
+        defer hc.deinit();
+        var first = ModuleDiskTest.snap(&fake, ids[0..512]);
+        var second = ModuleDiskTest.snap(&fake, ids[0..512]);
+        _ = try first.putSession(&hc, binding, &.{}, 7);
+        _ = try second.putSession(&hc, binding, &.{}, 8);
+        try ModuleDiskTest.finish(&hc, cpu);
+    }
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    const a = hc.sessionTip(7) orelse return error.TestExpectedTip;
+    const b = hc.sessionTip(8) orelse return error.TestExpectedTip;
+    try testing.expectEqual(a.id, b.id);
+    const record = hc.disk.?.moduleByBoundary(a.id, a.n) orelse return error.TestExpectedRecord;
+    try testing.expectEqual(@as(usize, 512), record.tokens.len);
+}
+
+test "HotPrefixCache module: a session past the in-memory index still resolves from the persisted one" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var hc = try ModuleDiskTest.init(&tmp, 8);
+    defer hc.deinit();
+    hc.session_tip_cap = 2;
+    const first_ids = ModuleDiskTest.ids(7);
+    const second_ids = ModuleDiskTest.ids(3000);
+    const third_ids = ModuleDiskTest.ids(6000);
+    var first = ModuleDiskTest.snap(&fake, first_ids[0..512]);
+    var second = ModuleDiskTest.snap(&fake, second_ids[0..512]);
+    var third = ModuleDiskTest.snap(&fake, third_ids[0..512]);
+    _ = try first.putSession(&hc, binding, &.{}, 7);
+    _ = try second.putSession(&hc, binding, &.{}, 8);
+    _ = try third.putSession(&hc, binding, &.{}, 9);
+    try ModuleDiskTest.finish(&hc, cpu);
+
+    try testing.expectEqual(@as(u32, 2), hc.session_tips.count());
+    const oldest = hc.sessionTip(7) orelse return error.TestExpectedTip;
+    try testing.expectEqual(@as(usize, 512), oldest.n);
+    try testing.expect(hc.disk.?.moduleByBoundary(oldest.id, oldest.n) != null);
+    try testing.expect(hc.sessionTip(10) == null);
+}
+
+test "HotPrefixCache module: a tip whose record is gone resolves to nothing" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const ids = ModuleDiskTest.ids(7);
+    {
+        var hc = try ModuleDiskTest.init(&tmp, 4);
+        defer hc.deinit();
+        var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+        _ = try snap.putSession(&hc, binding, &.{}, 7);
+        try ModuleDiskTest.finish(&hc, cpu);
+    }
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    const tip = hc.sessionTip(7) orelse return error.TestExpectedTip;
+    try testing.expect(hc.findSessionTip(7) == null);
+    try testing.expect(hc.disk.?.moduleByBoundary(tip.id +% 1, tip.n) == null);
+    try testing.expect(hc.disk.?.moduleByBoundary(tip.id, tip.n + 1) == null);
 }

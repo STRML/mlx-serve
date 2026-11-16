@@ -600,6 +600,79 @@ test "peer transfer session: an import another session's entry already covers st
     try testing.expectEqual(@as(usize, 24), owned.ok.n);
 }
 
+fn expectWireIds(wire: []const u8, want: []const u32) !void {
+    var decoded = try peer_wire.decode(testing.allocator, wire);
+    defer decoded.deinit();
+    try testing.expectEqualSlices(u32, want, decoded.ids);
+}
+
+test "peer transfer session: two sessions on different prompts of one length each export their own tokens" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const model_a = try PeerHarness.open(files);
+    defer model_a.close();
+
+    const first = buildPrompt(25);
+    var second: [25]u32 = undefined;
+    for (&second, 0..) |*id, i| id.* = @intCast(3 + (i * 11) % 79);
+    const turn_1 = try model_a.runGreedyTagged(&first, 2, true, 1);
+    defer testing.allocator.free(turn_1.tokens);
+    const turn_2 = try model_a.runGreedyTagged(&second, 2, true, 2);
+    defer testing.allocator.free(turn_2.tokens);
+
+    const wire_1 = exportBySession(model_a, 1);
+    try testing.expect(wire_1 == .ok);
+    defer testing.allocator.free(wire_1.ok.bytes);
+    const wire_2 = exportBySession(model_a, 2);
+    try testing.expect(wire_2 == .ok);
+    defer testing.allocator.free(wire_2.ok.bytes);
+    try expectWireIds(wire_1.ok.bytes, first[0..24]);
+    try expectWireIds(wire_2.ok.bytes, second[0..24]);
+}
+
+test "peer transfer session: an import a longer boundary covers exports exactly the tokens it carried" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const holder = try PeerHarness.open(files);
+    defer holder.close();
+    const sender = try PeerHarness.open(files);
+    defer sender.close();
+
+    const full_prompt = buildPrompt(33);
+    const long_turn = try holder.runGreedyTagged(&full_prompt, 2, true, 5);
+    defer testing.allocator.free(long_turn.tokens);
+    const short_turn = try sender.runGreedyTagged(full_prompt[0..25], 2, true, 6);
+    defer testing.allocator.free(short_turn.tokens);
+    const short_wire = exportBySession(sender, 6);
+    try testing.expect(short_wire == .ok);
+    defer testing.allocator.free(short_wire.ok.bytes);
+
+    const imported = importWire(holder, short_wire.ok.bytes);
+    try testing.expect(imported == .ok);
+
+    const own = exportBySession(holder, 6);
+    try testing.expect(own == .ok);
+    defer testing.allocator.free(own.ok.bytes);
+    try testing.expectEqual(@as(usize, 24), own.ok.n);
+    try expectWireIds(own.ok.bytes, full_prompt[0..24]);
+    const other = exportBySession(holder, 5);
+    try testing.expect(other == .ok);
+    defer testing.allocator.free(other.ok.bytes);
+    try testing.expectEqual(@as(usize, 32), other.ok.n);
+}
+
 test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, settings, quant config, stale entry and low memory headroom" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const old_fits = scheduler.prefill_admission_fits;

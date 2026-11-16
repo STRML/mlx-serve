@@ -510,6 +510,11 @@ pub const DiskTier = struct {
         };
     }
 
+    pub fn moduleByBoundary(self: *DiskTier, id: u64, n: usize) ?ModuleRef {
+        _ = .{ self, id, n };
+        return null;
+    }
+
     /// Every committed record a session tagged: the tier's side of the session tip index, read once after a restart.
     pub fn sessionRecords(self: *DiskTier, out: *std.ArrayList(SessionRecord)) !void {
         self.pollModuleWrites();

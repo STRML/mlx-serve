@@ -277,6 +277,8 @@ test {
     _ = @import("engines/mlx/runtime/sleep_inhibit.zig");
     _ = @import("engines/mlx/cache/ssd/disk_tier.zig");
     _ = @import("engines/mlx/cache/ssd/writer.zig");
+    _ = @import("engines/mlx/cache/ssd/session_index.zig");
+    _ = @import("engines/mlx/cache/boundary.zig");
     _ = @import("host/registry/discovery.zig");
     _ = @import("host/registry/stub_cache.zig");
     _ = @import("host/registry/pack_dir.zig");
