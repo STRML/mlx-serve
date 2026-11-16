@@ -1571,8 +1571,10 @@ list knew CUDA's faults only. Fix: `SubmissionsIgnored` marks the GPU context lo
 ### Switch-time group ownership
 
 A TP1-born process has no startup group, so model planning missed a formed switch group. Reusing the cold group's
-unload path could also release the attempt's link. Switch attempts now publish their own group record; planning and
-billing read it, and unload refuses until release/fall retires it. Planned down disarms watchers without closing the
-leader's bells, sends OP_RELEASE, and waits for follower EOFs under one two-second cap. A follower abort waits for that
-release; its fallback timer wakes the serve loop with FallRequested. The slice3 group, unload, release and abort
-loopback tests guard the ownership and teardown order.
+unload path could also release the attempt's link. Attempts own a separate group record, published with their outcome
+and pending abort under the attempt lock; a late outcome stays quarantined without publishing a group. Refused unloads
+and evictions preserve residency and accounting, restore queued victims to ready, and report retryable DistSwitchActive.
+Follower idle exits arm on the first leader byte. Aborting bell failures request fall, with the exit decision rechecked
+under its mutex. Release/fall refuse unsafe threads or active work and drain before OP_RELEASE. Planned down waits for
+follower EOFs under one two-second cap; an independent teardown deadline covers drain and backend destruction. A failed
+RELEASE leaves the caller its rank for exitReleaseFailed. The slice3 and dist fix2 loopback tests guard these paths.

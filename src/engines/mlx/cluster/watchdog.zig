@@ -40,7 +40,7 @@ pub fn loopAlive(now_ms: u64, last_tick_ms: u64, in_flight: bool, limit_ms: u64)
 pub const BellFailure = enum { timeout, eof };
 
 /// Why a rank leaves the group by `_exit`; the `[dist-exit]` record names it.
-pub const ExitCause = enum { stall, self_check, bell_eof, bell_timeout, worker_left, worker_error, watchdog_thread, heartbeat_thread, partial_go, cancelled_after_go };
+pub const ExitCause = enum { stall, self_check, bell_eof, bell_timeout, worker_left, worker_error, watchdog_thread, heartbeat_thread, partial_go, cancelled_after_go, teardown_timeout, release_failed };
 
 /// The one line every exit path writes before `_exit`: `[dist-exit] epoch_ms=<wall ms> cause=<c> peer=<rank|-> step=<n>
 /// waited_ms=<n|->`. A harness on another host compares `epoch_ms` with its own wall clock.

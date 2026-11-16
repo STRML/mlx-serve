@@ -119,7 +119,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     else
         null;
     defer if (in_dir_drafter) |p| sch.allocator.free(p);
-    makeRoomInRam(sch, params.entry.id, model_bytes);
+    try makeRoomInRam(sch, params.entry.id, model_bytes);
     const live_before = mlxActiveBytes();
     if (!scheduler_mod.skip_mem_preflight) {
         const gb = 1024.0 * 1024.0 * 1024.0;

@@ -38,6 +38,8 @@ pub const Mode = enum {
 
 /// The most ranks a group holds (JACCL's mesh: a cable from every Mac to every other).
 pub const max_ranks = 8;
+pub const TeardownError = error{ DistTeardownWrongThread, DistTeardownBusy };
+pub const ReleaseError = TeardownError || error{ReleaseSendFailed};
 
 /// How this process joins the group. Each rank names only its OWN RDMA devices: in a pair the
 /// one `rdma_enX` whose port faces the peer, past a pair a comma list with the port facing each
@@ -158,6 +160,9 @@ const LinkState = struct {
     releasing: std.atomic.Value(bool) = .init(false),
     aborting: std.atomic.Value(bool) = .init(false),
     abort_timer: ?std.Thread = null,
+    teardown_timer: ?std.Thread = null,
+    teardown_done: std.atomic.Value(bool) = .init(false),
+    test_teardown_pause: if (builtin.is_test) ?*TestTeardownPause else void = if (builtin.is_test) null else {},
     exit_mu: std.atomic.Mutex = .unlocked,
     watcher: ?std.Thread = null,
     control: ?*OpenControl = null,
@@ -185,7 +190,7 @@ const LinkState = struct {
     watchdog_threads: [2]?std.Thread = .{ null, null },
     heartbeat_active: std.atomic.Value(bool) = .init(false),
     follower_pending: std.atomic.Value(bool) = .init(false),
-    /// Armed by the first leader byte after cold READY, or GO during switch-time open.
+    /// Armed by the first leader byte after READY/GO.
     follower_ready: std.atomic.Value(bool) = .init(false),
     bell_mu: std.atomic.Mutex = .unlocked,
     ready_to_go_ms: u32 = 0,
@@ -193,7 +198,9 @@ const LinkState = struct {
     fn exit(self: *LinkState, detected: dist_watchdog.ExitCause, rank: ?u32, waited: ?u64) void {
         lock(&self.exit_mu);
         defer self.exit_mu.unlock();
-        if (self.closing.load(.acquire) or self.releasing.load(.acquire)) return;
+        if (detected == .teardown_timeout and self.teardown_done.load(.acquire)) return;
+        if (detected != .teardown_timeout and (self.closing.load(.acquire) or self.releasing.load(.acquire))) return;
+        if ((detected == .bell_eof or detected == .bell_timeout) and self.aborting.load(.acquire)) return;
         const cancelled = if (self.control) |control| control.cancelled.load(.acquire) else false;
         const cause: dist_watchdog.ExitCause = if (cancelled and self.go_committed)
             (if (self.rank == 0) .partial_go else .cancelled_after_go)
@@ -433,8 +440,7 @@ pub const Link = struct {
                 var active: usize = 0;
                 _ = mlx.mlx_get_active_memory(&active);
                 try workerReadyAwaitGo(self.bells[0], deadline, .{ .resident_mib = @intCast(active >> 20), .load_ms = loadElapsedMs(started_ms) });
-                dist_watchdog.setBellTimeout(self.bells[0].fd, idleTimeoutMs());
-                self.state.?.follower_ready.store(true, .release);
+                self.state.?.follower_pending.store(true, .release);
             }
         }
         self.state.?.go_committed = cfg.ready_in_open;
@@ -474,8 +480,8 @@ pub const Link = struct {
         }
     }
 
-    pub fn activate(self: *Link) void {
-        std.debug.assert(cluster().inference_thread == std.Thread.getCurrentId());
+    pub fn activate(self: *Link) error{DistTeardownWrongThread}!void {
+        if (cluster().inference_thread != std.Thread.getCurrentId()) return error.DistTeardownWrongThread;
         const c = cluster();
         lock(&c.state_mu);
         defer c.state_mu.unlock();
@@ -491,14 +497,15 @@ pub const Link = struct {
         state.exit(if (self.rank == 0) .partial_go else .cancelled_after_go, null, null);
     }
 
-    pub fn assertTeardownThread(self: *const Link) void {
-        std.debug.assert(cluster().inference_thread == std.Thread.getCurrentId());
-        std.debug.assert(self.state.?.recvs.load(.acquire) == 0);
-        std.debug.assert(!self.state.?.watchdog.in_flight.load(.acquire));
+    pub fn checkTeardownThread(self: *const Link) TeardownError!void {
+        if (cluster().inference_thread != std.Thread.getCurrentId()) return error.DistTeardownWrongThread;
+        const state = self.state orelse return error.DistTeardownBusy;
+        if (state.recvs.load(.acquire) != 0 or state.watchdog.in_flight.load(.acquire)) return error.DistTeardownBusy;
     }
 
-    pub fn drain(self: *const Link) void {
-        self.assertTeardownThread();
+    pub fn drain(self: *const Link) TeardownError!void {
+        try self.checkTeardownThread();
+        if (comptime builtin.is_test) if (self.state.?.test_teardown_pause) |pause| pause.visit(.drain);
         const cpu = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(cpu);
         _ = mlx.mlx_synchronize(cpu);
@@ -511,6 +518,11 @@ pub const Link = struct {
 
     pub fn disarm(self: *Link) void {
         const state = self.state.?;
+        const deadline = @as(u64, @intCast(crt.monotonicMs())) + env.intValue(u32, env.get(.MLX_SERVE_DIST_STALL_MS), 30_000);
+        state.teardown_timer = std.Thread.spawn(.{ .stack_size = 1 << 20 }, teardownDeadline, .{ state, deadline }) catch {
+            state.exit(.watchdog_thread, null, null);
+            return;
+        };
         lock(&state.exit_mu);
         state.releasing.store(true, .release);
         state.exit_mu.unlock();
@@ -519,8 +531,8 @@ pub const Link = struct {
         stopWatchdog(state);
     }
 
-    pub fn release(self: *Link, rank: *u32) error{ReleaseSendFailed}!void {
-        self.assertTeardownThread();
+    pub fn release(self: *Link, rank: *u32) ReleaseError!void {
+        try self.checkTeardownThread();
         if (self.rank != 0) return;
         const deadline = @as(u64, @intCast(crt.monotonicMs())) + 2000;
         for (1..self.size) |k| {
@@ -577,6 +589,7 @@ pub const Link = struct {
             closeBell(state.control, bell.fd);
             bell.* = .{};
         };
+        if (comptime builtin.is_test) if (state.test_teardown_pause) |pause| pause.visit(.free);
         _ = mlx.mlx_distributed_group_free(self.group);
         self.group = .{};
         const clear_result = if (builtin.is_test) test_clear_result orelse mlx.mlx_distributed_clear_backends() else mlx.mlx_distributed_clear_backends();
@@ -596,6 +609,8 @@ pub const Link = struct {
             c.active_state = null;
         }
         c.state_mu.unlock();
+        state.teardown_done.store(true, .release);
+        if (state.teardown_timer) |t| t.join();
         std.heap.page_allocator.destroy(state);
         self.state = null;
     }
@@ -793,8 +808,8 @@ const Bell = struct {
             const n = std.c.write(b.fd, bytes.ptr + off, bytes.len - off);
             if (n <= 0) {
                 if (b.follower) if (b.state) |state| {
-                    if (state.aborting.load(.acquire)) return error.FallRequested;
                     if (state.follower_ready.load(.acquire)) followerExit(state, .eof);
+                    if (state.aborting.load(.acquire)) return error.FallRequested;
                 };
                 return error.DistPeerGone;
             }
@@ -809,8 +824,8 @@ const Bell = struct {
             const failure = dist_watchdog.classifyBellFailure(n, std.c._errno().*, @backingInt(std.c.E.INTR), @backingInt(std.c.E.AGAIN));
             if (failure) |f| {
                 if (b.follower) if (b.state) |state| {
-                    if (f == .eof and state.aborting.load(.acquire)) return error.FallRequested;
                     if (state.follower_ready.load(.acquire)) followerExit(state, f);
+                    if (state.aborting.load(.acquire)) return error.FallRequested;
                 };
                 return error.DistPeerGone;
             }
@@ -882,8 +897,8 @@ const Bell = struct {
             const failure = dist_watchdog.classifyBellFailure(n, std.c._errno().*, @backingInt(std.c.E.INTR), @backingInt(std.c.E.AGAIN));
             if (failure) |f| {
                 if (b.follower) if (b.state) |state| {
-                    if (f == .eof and state.aborting.load(.acquire)) return error.FallRequested;
                     if (state.follower_ready.load(.acquire)) followerExit(state, f);
+                    if (state.aborting.load(.acquire)) return error.FallRequested;
                 };
                 return error.DistPeerGone;
             }
@@ -1101,7 +1116,7 @@ fn idleTimeoutMs() u32 {
 }
 
 fn followerExit(state: *LinkState, reason: dist_watchdog.BellFailure) void {
-    if (reason == .eof and state.aborting.load(.acquire)) return;
+    if (state.aborting.load(.acquire)) return;
     if (state.closing.load(.acquire) or state.releasing.load(.acquire)) return;
     log.err("[dist-watchdog] leader gone: bell {s} (idle timeout {d} ms); this worker exits\n", .{ @tagName(reason), idleTimeoutMs() });
     state.exit(if (reason == .eof) .bell_eof else .bell_timeout, 0, if (reason == .timeout) idleTimeoutMs() else null);
@@ -1112,6 +1127,10 @@ fn noteDistExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64
     var buf: [160]u8 = undefined;
     log.err("{s}", .{dist_watchdog.exitRecord(&buf, crt.wallMs(), cause, peer_rank, liveness().step, waited_ms)});
     log.syncFile();
+}
+
+pub fn exitReleaseFailed(rank: u32) noreturn {
+    distExit(.release_failed, rank, null);
 }
 
 fn distExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64) noreturn {
@@ -1713,6 +1732,13 @@ fn sleepUnlessStopped(c: *LinkState, ms: u32) bool {
         left -= step;
     }
     return c.closing.load(.acquire) or c.releasing.load(.acquire) or c.watchdog_stop.load(.acquire);
+}
+
+fn teardownDeadline(state: *LinkState, deadline: u64) void {
+    while (!state.teardown_done.load(.acquire)) {
+        if (msLeft(deadline) == 0) return state.exit(.teardown_timeout, null, null);
+        crt.sleepMs(@min(msLeft(deadline), 25));
+    }
 }
 
 fn abortFallback(link: Link) void {
@@ -4815,7 +4841,8 @@ test "dist switch matrix 11: a switch follower watches leader EOF" {
     req.cfg.rank = 1;
     try TestSwitchOpen.start(req);
     const link = (try TestSwitchOpen.outcome(11)).formed.link;
-    try std.testing.expect(link.state.?.follower_ready.load(.acquire));
+    try std.testing.expect(link.state.?.follower_pending.load(.acquire));
+    try std.testing.expect(!link.state.?.follower_ready.load(.acquire));
     _ = std.c.shutdown(TestSwitchOpen.peer_bell.fd, std.c.SHUT.RDWR);
     const end = testDeadline(1000);
     while (TestSwitchOpen.exits.count.load(.acquire) == 0 and msLeft(end) > 0) crt.sleepMs(1);
@@ -4966,7 +4993,7 @@ test "dist switch slice3 interface: context start publishes measured formation" 
     try std.testing.expect(formed.ready_to_go_ms != null);
     try std.testing.expect(formed.ready_to_go_ms.? < formed.open_ms);
     try std.testing.expectEqual(formed.link, switcher.poll(81).?.formed.link);
-    switcher.activate(81);
+    try switcher.activate(81);
     try std.testing.expect(formed.link.state.?.heartbeat_active.load(.acquire));
 }
 
@@ -5092,10 +5119,10 @@ test "dist switch slice3 fall: both roles close without RELEASE or EOF wait" {
         try TestSwitchOpen.start(req);
         const link = (try TestSwitchOpen.outcome(87)).formed.link;
         cluster().tp_link = link;
-        switcher.fall(86, link);
+        try switcher.fall(86, link);
         try std.testing.expect(switcher.poll(87) != null);
         const began = crt.monotonicMs();
-        switcher.fall(87, link);
+        try switcher.fall(87, link);
         try std.testing.expect(crt.monotonicMs() - began < 500);
         var byte: [1]u8 = undefined;
         try std.testing.expectEqual(@as(isize, 0), std.c.read(TestSwitchOpen.peer_bell.fd, &byte, 1));
@@ -5141,7 +5168,7 @@ test "dist switch slice3 abort: timer EOF returns FallRequested without an exit"
     var byte: [1]u8 = undefined;
     try std.testing.expectError(error.FallRequested, link.bells[0].readAll(&byte));
     try std.testing.expectError(error.FallRequested, sendStepTime(link.bells[0], 10));
-    switcher.fall(89, link);
+    try switcher.fall(89, link);
     try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
     try std.testing.expect(switcher.poll(89) == null);
 }
@@ -5191,7 +5218,7 @@ test "dist switch slice3 group: attempt shards are visible and retire independen
         if (startup) {
             var rank: u32 = 99;
             try switcher.release(101, link, &rank);
-        } else switcher.fall(101, link);
+        } else try switcher.fall(101, link);
         try std.testing.expect(!serves("/m/switch") and !holds("/m/switch"));
         try std.testing.expect(try planFor("/m/switch", &cfg) == null);
         try std.testing.expectEqual(startup, serves("/m/cold"));
@@ -5219,12 +5246,343 @@ test "dist switch slice3 unload: a formed attempt keeps its link and resident mo
     @import("../runtime/load_requests.zig").runUnloadRequest(&sch, &req);
     try std.testing.expect(req.done);
     try std.testing.expectEqualStrings("DistSwitchActive", req.error_name.?);
-    entry.unloadResident();
+    try std.testing.expect(!entry.unloadResident());
     try std.testing.expectEqual(.ready, entry.state);
     try std.testing.expectEqual(@as(u64, 1024), entry.bytes_resident);
     try std.testing.expectEqual(link, switcher.poll(102).?.formed.link);
     try std.testing.expect(!link.state.?.closing.load(.acquire));
-    switcher.fall(102, link);
-    entry.unloadResident();
+    try switcher.fall(102, link);
+    try std.testing.expect(entry.unloadResident());
     try std.testing.expectEqual(.unloaded, entry.state);
+}
+
+test "dist fix2 finding 1: formed follower survives 3500ms before leader activation" {
+    TestSwitchOpen.setup();
+    defer TestSwitchOpen.cleanup();
+    var req = TestSwitchOpen.request(201);
+    req.role = .follower;
+    req.cfg.rank = 1;
+    try TestSwitchOpen.start(req);
+    const link = (try TestSwitchOpen.outcome(201)).formed.link;
+    var probe = struct {
+        link: *Link,
+        returned: std.atomic.Value(bool) = .init(false),
+        result: ?anyerror = null,
+        op: i32 = 0,
+        fn run(self: *@This()) void {
+            const msg = recvMsg(self.link, 0) catch |err| {
+                self.result = err;
+                self.returned.store(true, .release);
+                return;
+            };
+            self.op = msg[0];
+            self.returned.store(true, .release);
+        }
+    }{ .link = link };
+    const t = try std.Thread.spawn(.{}, @TypeOf(probe).run, .{&probe});
+    crt.sleepMs(3500);
+    const early = probe.returned.load(.acquire);
+    try TestSwitchOpen.peer_bell.writeAll(&.{Bell.release_byte});
+    t.join();
+    try std.testing.expect(!early);
+    try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
+    try std.testing.expectEqual(@as(?anyerror, null), probe.result);
+    try std.testing.expectEqual(OP_RELEASE, probe.op);
+    try std.testing.expect(link.state.?.follower_ready.load(.acquire));
+    try switcher.fall(201, link);
+}
+
+test "dist fix2 finding 2: aborting bell timeouts request fall without exit" {
+    TestSwitchOpen.setup();
+    defer TestSwitchOpen.cleanup();
+    var req = TestSwitchOpen.request(202);
+    req.role = .follower;
+    req.cfg.rank = 1;
+    try TestSwitchOpen.start(req);
+    const link = (try TestSwitchOpen.outcome(202)).formed.link;
+    try TestSwitchOpen.peer_bell.writeAll(&.{Bell.pipe_byte});
+    try std.testing.expectEqual(Bell.pipe_byte, try link.bells[0].wait());
+    switcher.abortFormed(202);
+    dist_watchdog.setBellTimeout(link.bells[0].fd, 40);
+    try std.testing.expectError(error.FallRequested, recvMsg(link, 0));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectError(error.FallRequested, link.bells[0].readAll(&byte));
+    try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
+    try switcher.fall(202, link);
+}
+
+test "dist fix2 finding 2: watcher EOF admitted before abort rechecks under exit mutex" {
+    TestSwitchOpen.setup();
+    defer TestSwitchOpen.cleanup();
+    var req = TestSwitchOpen.request(203);
+    req.role = .follower;
+    req.cfg.rank = 1;
+    try TestSwitchOpen.start(req);
+    const link = (try TestSwitchOpen.outcome(203)).formed.link;
+    const state = link.state.?;
+    try TestSwitchOpen.peer_bell.writeAll(&.{Bell.pipe_byte});
+    try std.testing.expectEqual(Bell.pipe_byte, try link.bells[0].wait());
+    var probe = struct {
+        bell: Bell,
+        result: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var byte: [1]u8 = undefined;
+            self.bell.readAll(&byte) catch |err| {
+                self.result = err;
+            };
+        }
+    }{ .bell = link.bells[0] };
+    lock(&state.exit_mu);
+    _ = std.c.shutdown(TestSwitchOpen.peer_bell.fd, std.c.SHUT.RDWR);
+    const reader = try std.Thread.spawn(.{}, @TypeOf(probe).run, .{&probe});
+    crt.sleepMs(100);
+    state.aborting.store(true, .release);
+    state.exit_mu.unlock();
+    reader.join();
+    if (state.watcher) |t| t.join();
+    state.watcher = null;
+    try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
+    try std.testing.expectEqual(error.FallRequested, probe.result.?);
+    try switcher.fall(203, link);
+}
+
+test "dist fix2 finding 3: eviction refuses a switch victim without reclaiming its bytes" {
+    TestSwitchOpen.setup();
+    defer TestSwitchOpen.cleanup();
+    const Registry = @import("../../../host/registry/registry.zig").ModelRegistry;
+    var reg = try Registry.init(std.testing.allocator, std.testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const victim = try reg.registerStub("switch", "/m/switch", 1024);
+    reg.markReadyLocked(victim, 1024);
+    victim.state = .evicting;
+    const later = try reg.registerStub("later", "/m/later", 512);
+    reg.markReadyLocked(later, 512);
+    later.state = .evicting;
+    const target = try reg.registerStub("target", "/m/target", 2048);
+    target.state = .loading;
+    try TestSwitchOpen.start(TestSwitchOpen.request(204));
+    const link = (try TestSwitchOpen.outcome(204)).formed.link;
+    const scheduler = @import("../scheduler.zig");
+    var sch: scheduler.Scheduler = undefined;
+    sch.io = std.testing.io;
+    sch.registry = reg;
+    sch.hot_prefix_cache = null;
+    sch.allocator = std.testing.allocator;
+    sch.warm_queue = .empty;
+    var victims = [_]*@import("../../../host/registry/registry.zig").LoadedModel{ victim, later };
+    var cfg: model_mod.ModelConfig = .{};
+    var req: @import("../../../host/gpu_thread/requests.zig").LoadRequest = .{
+        .entry = target,
+        .config = &cfg,
+        .tok = undefined,
+        .chat_config = undefined,
+        .model_dir = "/m/target",
+        .allocator = std.testing.allocator,
+        .evict_entries = &victims,
+        .ane_declined = true,
+    };
+    defer if (req.error_name) |name| std.testing.allocator.free(name);
+    @import("../runtime/load_requests.zig").runLoadRequest(&sch, &req);
+    try std.testing.expect(req.done);
+    try std.testing.expectEqualStrings("DistSwitchActive", req.error_name.?);
+    try std.testing.expectEqual(error.DistSwitchActive, Registry.loadErrorFromName(req.error_name));
+    try std.testing.expectEqual(.unloaded, target.state);
+    try std.testing.expectEqual(.ready, victim.state);
+    try std.testing.expectEqual(.ready, later.state);
+    try std.testing.expectEqual(@as(u64, 1024), victim.bytes_resident);
+    try std.testing.expectEqual(@as(u64, 1536), reg.current_resident_bytes);
+    try std.testing.expectEqual(link, switcher.poll(204).?.formed.link);
+    try switcher.fall(204, link);
+}
+
+test "dist fix2 finding 4: teardown deadline survives disarm and closing" {
+    bindInferenceThread();
+    const saved = if (env.span(.MLX_SERVE_DIST_STALL_MS)) |v| try std.testing.allocator.dupeSentinel(u8, v, 0) else null;
+    defer if (saved) |v| {
+        env.set(.MLX_SERVE_DIST_STALL_MS, v);
+        std.testing.allocator.free(v);
+    } else env.unset(.MLX_SERVE_DIST_STALL_MS);
+    env.set(.MLX_SERVE_DIST_STALL_MS, "60");
+    var link = try newLink(.{ .rank = 0, .size = 2, .coordinator = "127.0.0.1:46231", .device = "loopback" });
+    defer link.deinit();
+    var exits: TestDistExit = .{};
+    link.state.?.test_exits = &exits;
+    startWatchdog(&link);
+    link.disarm();
+    link.state.?.closing.store(true, .release);
+    crt.sleepMs(200);
+    try std.testing.expectEqual(@as(u32, 1), exits.count.load(.acquire));
+    link.state.?.teardown_done.store(true, .release);
+    link.state.?.exit(.teardown_timeout, null, null);
+    try std.testing.expectEqual(@as(u32, 1), exits.count.load(.acquire));
+}
+
+test "dist fix2 finding 4: unsafe teardown and activation refuse without side effects" {
+    TestSwitchOpen.setup();
+    defer TestSwitchOpen.cleanup();
+    try TestSwitchOpen.start(TestSwitchOpen.request(205));
+    const link = (try TestSwitchOpen.outcome(205)).formed.link;
+    var rank: u32 = 99;
+    link.state.?.recvs.store(1, .release);
+    try std.testing.expectError(error.DistTeardownBusy, switcher.release(205, link, &rank));
+    try std.testing.expectError(error.DistTeardownBusy, switcher.fall(205, link));
+    link.state.?.recvs.store(0, .release);
+    link.state.?.watchdog.begin(testDeadline(0));
+    try std.testing.expectError(error.DistTeardownBusy, switcher.release(205, link, &rank));
+    try std.testing.expectError(error.DistTeardownBusy, switcher.fall(205, link));
+    link.state.?.watchdog.done();
+    var probe = struct {
+        link: *Link,
+        release_error: ?anyerror = null,
+        fall_error: ?anyerror = null,
+        activate_error: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var peer_rank: u32 = 99;
+            switcher.activate(205) catch |err| {
+                self.activate_error = err;
+            };
+            switcher.release(205, self.link, &peer_rank) catch |err| {
+                self.release_error = err;
+            };
+            switcher.fall(205, self.link) catch |err| {
+                self.fall_error = err;
+            };
+        }
+    }{ .link = link };
+    const t = try std.Thread.spawn(.{}, @TypeOf(probe).run, .{&probe});
+    t.join();
+    try std.testing.expectEqual(error.DistTeardownWrongThread, probe.activate_error.?);
+    try std.testing.expectEqual(error.DistTeardownWrongThread, probe.release_error.?);
+    try std.testing.expectEqual(error.DistTeardownWrongThread, probe.fall_error.?);
+    try std.testing.expectEqual(link, switcher.poll(205).?.formed.link);
+    try std.testing.expect(!link.state.?.releasing.load(.acquire));
+    try std.testing.expect(!link.state.?.closing.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 99), rank);
+    try switcher.fall(205, link);
+}
+
+const TestTeardownPause = struct {
+    stage: enum { drain, free },
+    early_release: bool = false,
+
+    fn visit(self: *@This(), stage: @TypeOf(self.stage)) void {
+        if (stage != self.stage) return;
+        if (stage == .drain) {
+            var byte: [1]u8 = undefined;
+            self.early_release = std.c.recv(TestSwitchOpen.peer_bell.fd, &byte, 1, std.c.MSG.PEEK | std.c.MSG.DONTWAIT) == 1;
+        }
+        crt.sleepMs(200);
+    }
+};
+
+test "dist fix2 finding 4: drain precedes RELEASE and deadline covers drain and group free" {
+    const saved = if (env.span(.MLX_SERVE_DIST_STALL_MS)) |v| try std.testing.allocator.dupeSentinel(u8, v, 0) else null;
+    defer if (saved) |v| {
+        env.set(.MLX_SERVE_DIST_STALL_MS, v);
+        std.testing.allocator.free(v);
+    } else env.unset(.MLX_SERVE_DIST_STALL_MS);
+    env.set(.MLX_SERVE_DIST_STALL_MS, "60");
+    for ([_]@FieldType(TestTeardownPause, "stage"){ .drain, .free }) |stage| {
+        TestSwitchOpen.setup();
+        defer TestSwitchOpen.cleanup();
+        try TestSwitchOpen.start(TestSwitchOpen.request(206));
+        const link = (try TestSwitchOpen.outcome(206)).formed.link;
+        var pause: TestTeardownPause = .{ .stage = stage };
+        link.state.?.test_teardown_pause = &pause;
+        var peer_wait: TestReleasePeer = .{ .bell = TestSwitchOpen.peer_bell, .delay_ms = 0 };
+        const t = if (stage == .free) try std.Thread.spawn(.{}, TestReleasePeer.run, .{&peer_wait}) else null;
+        var rank: u32 = 99;
+        const result = switcher.release(206, link, &rank);
+        if (t) |thread| thread.join();
+        try result;
+        try std.testing.expect(peer_wait.result == null);
+        try std.testing.expect(!pause.early_release);
+        try std.testing.expectEqual(@as(u32, 1), TestSwitchOpen.exits.count.load(.acquire));
+    }
+}
+
+test "dist fix2 finding 5: abort between formed CAS and return survives publication" {
+    TestSwitchOpen.setup();
+    defer TestSwitchOpen.cleanup();
+    const Gate = struct {
+        var entered: std.atomic.Value(bool) = .init(false);
+        var proceed: std.atomic.Value(bool) = .init(false);
+        fn pause() void {
+            entered.store(true, .release);
+            while (!proceed.load(.acquire)) crt.sleepMs(1);
+        }
+    };
+    Gate.entered.store(false, .release);
+    Gate.proceed.store(false, .release);
+    defer Gate.proceed.store(true, .release);
+    switcher.testing.after_formed = Gate.pause;
+    var req = TestSwitchOpen.request(207);
+    req.role = .follower;
+    req.cfg.rank = 1;
+    try TestSwitchOpen.start(req);
+    const end = testDeadline(2000);
+    while (!Gate.entered.load(.acquire) and msLeft(end) > 0) crt.sleepMs(1);
+    const entered = Gate.entered.load(.acquire);
+    const unpublished = switcher.poll(207) == null;
+    switcher.abortFormed(207);
+    Gate.proceed.store(true, .release);
+    const link = (try TestSwitchOpen.outcome(207)).formed.link;
+    try std.testing.expect(entered and unpublished);
+    try std.testing.expect(link.state.?.aborting.load(.acquire));
+    try TestSwitchOpen.peer_bell.writeAll(&.{Bell.release_byte});
+    try std.testing.expectEqual(OP_RELEASE, (try recvMsg(link, 0))[0]);
+    var rank: u32 = 99;
+    try switcher.release(207, link, &rank);
+    try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
+}
+
+test "dist fix2 finding 7: quarantined late formation never publishes a group" {
+    for ([_]bool{ false, true }) |poll_before_return| {
+        TestSwitchOpen.setup();
+        defer TestSwitchOpen.cleanup();
+        const old = cluster().group;
+        defer cluster().group = old;
+        cluster().group = null;
+        TestSwitchOpen.block = true;
+        TestSwitchOpen.ignore_cancel = true;
+        var req = TestSwitchOpen.request(208);
+        req.deadline_epoch_ms = crt.wallMs() + 80;
+        try TestSwitchOpen.start(req);
+        try TestSwitchOpen.awaitEntered();
+        crt.sleepMs(1200);
+        if (poll_before_return) try std.testing.expect(switcher.quarantined());
+        TestSwitchOpen.finish.store(true, .release);
+        const end = testDeadline(2000);
+        while (!TestSwitchOpen.returned.load(.acquire) and msLeft(end) > 0) crt.sleepMs(1);
+        crt.sleepMs(50);
+        try std.testing.expectEqual(.quarantined, switcher.poll(208).?);
+        try std.testing.expect(!switchHolds("/m/switch"));
+        try std.testing.expect(!holds("/m/switch") and !serves("/m/switch"));
+        var cfg: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .num_hidden_layers = 8, .num_attention_heads = 64, .dsv4_o_groups = 8, .moe_intermediate_size = 2304 };
+        try std.testing.expect(try planFor("/m/switch", &cfg) == null);
+        try std.testing.expectEqual(@as(u64, 1000), hostShare("/m/switch", &cfg, 1000));
+    }
+}
+
+test "dist fix2 public exit: release failure records rank and exits one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [512]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/release-exit.log", .{root});
+    const pid = std.c.fork();
+    if (pid < 0) return error.TestForkFailed;
+    if (pid == 0) {
+        log.openFile(path, 0) catch std.c._exit(99);
+        exitReleaseFailed(3);
+    }
+    var status_code: c_int = 0;
+    try std.testing.expectEqual(pid, std.c.waitpid(pid, &status_code, 0));
+    try std.testing.expectEqual(@as(c_int, 1 << 8), status_code);
+    const record = try tmp.dir.readFileAlloc(std.testing.io, "release-exit.log", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(record);
+    try std.testing.expect(std.mem.startsWith(u8, record, "[dist-exit] epoch_ms="));
+    try std.testing.expect(std.mem.indexOf(u8, record, " cause=release_failed peer=3 step=") != null);
+    try std.testing.expect(std.mem.endsWith(u8, record, " waited_ms=-\n"));
 }

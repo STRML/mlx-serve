@@ -26,6 +26,7 @@ const Attempt = struct {
     state: std.atomic.Value(State) = .init(.forming),
     returned: std.atomic.Value(bool) = .init(false),
     finished_ms: u64 = 0,
+    pending_abort: bool = false,
     thread: ?std.Thread = null,
     link: distributed.Link = undefined,
     failure: anyerror = error.InvalidArgs,
@@ -33,7 +34,14 @@ const Attempt = struct {
 
     fn run(self: *Attempt) void {
         defer {
+            lock();
+            defer mu.unlock();
             self.finished_ms = @intCast(crt.monotonicMs());
+            if (self.finished_ms > self.deadline_ms +| 1000) poisoned = true;
+            if (self.state.load(.acquire) == .formed and !poisoned) {
+                distributed.setSwitchGroup(&self.link, self.model_dir);
+                if (self.pending_abort) self.link.abortFormed();
+            }
             self.returned.store(true, .release);
         }
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -44,7 +52,7 @@ const Attempt = struct {
             return;
         };
         if (self.state.cmpxchgStrong(.forming, .formed, .acq_rel, .acquire) == null) {
-            distributed.setSwitchGroup(&self.link, self.model_dir);
+            if (comptime builtin.is_test) if (testing.after_formed) |hook| hook();
             return;
         }
         self.link.cancelledAfterGo();
@@ -128,12 +136,12 @@ pub fn cancel(n: u64) Cancel {
 }
 
 /// Called on the inference thread after the mode swap.
-pub fn activate(n: u64) void {
+pub fn activate(n: u64) error{DistTeardownWrongThread}!void {
     lock();
     defer mu.unlock();
     const a = current orelse return;
     if (a.req.n != n or !a.returned.load(.acquire) or a.state.load(.acquire) != .formed) return;
-    a.link.activate();
+    try a.link.activate();
 }
 
 pub fn poll(n: u64) ?FormOutcome {
@@ -157,15 +165,17 @@ pub fn poll(n: u64) ?FormOutcome {
 }
 
 /// Inference thread only, with no receive or collective in flight.
-pub fn release(n: u64, link: *distributed.Link, rank: *u32) error{ReleaseSendFailed}!void {
-    const a = beginRelease(n, link) orelse return;
+pub fn release(n: u64, link: *distributed.Link, rank: *u32) distributed.ReleaseError!void {
+    const a = try beginRelease(n, link) orelse return;
+    try link.drain();
     try link.release(rank);
     retire(a);
 }
 
 /// Inference thread only, with no receive or collective in flight.
-pub fn fall(n: u64, link: *distributed.Link) void {
-    const a = beginRelease(n, link) orelse return;
+pub fn fall(n: u64, link: *distributed.Link) distributed.TeardownError!void {
+    const a = try beginRelease(n, link) orelse return;
+    try link.drain();
     retire(a);
 }
 
@@ -174,23 +184,23 @@ pub fn abortFormed(n: u64) void {
     defer mu.unlock();
     fence = @max(fence, n);
     const a = current orelse return;
-    if (a.req.n != n or a.req.role != .follower or !a.returned.load(.acquire) or a.state.load(.acquire) != .formed or poisoned) return;
-    a.link.abortFormed();
+    if (a.req.n != n or a.req.role != .follower or a.state.load(.acquire) != .formed or poisoned) return;
+    a.pending_abort = true;
+    if (a.returned.load(.acquire)) a.link.abortFormed();
 }
 
-fn beginRelease(n: u64, link: *distributed.Link) ?*Attempt {
+fn beginRelease(n: u64, link: *distributed.Link) distributed.TeardownError!?*Attempt {
     lock();
     defer mu.unlock();
     const a = current orelse return null;
     if (a.req.n != n or &a.link != link or !a.returned.load(.acquire) or a.state.load(.acquire) != .formed or poisoned) return null;
-    link.assertTeardownThread();
+    try link.checkTeardownThread();
     a.state.store(.releasing, .release);
     link.disarm();
     return a;
 }
 
 fn retire(a: *Attempt) void {
-    a.link.drain();
     a.link.deinit();
     lock();
     defer mu.unlock();
@@ -224,14 +234,19 @@ pub fn quarantined() bool {
 
 pub const testing = if (builtin.is_test) struct {
     pub var open: Open = distributed.Link.open;
+    pub var after_formed: ?*const fn () void = null;
 
     pub fn reset() void {
         lock();
-        defer mu.unlock();
-        if (current) |a| a.destroy();
+        const a = current;
         current = null;
+        mu.unlock();
+        if (a) |attempt| attempt.destroy();
+        lock();
+        defer mu.unlock();
         poisoned = false;
         fence = 0;
         open = distributed.Link.open;
+        after_formed = null;
     }
 } else struct {};

@@ -41,7 +41,16 @@ pub fn logWiredPolicy(r: mlx.WiredPolicyResult) void {
 }
 
 /// Free `victims` (each marked `.evicting`, nobody holding it) on this thread.
-fn evictResident(sch: *Scheduler, victims: []const *LoadedModel) void {
+fn evictResident(sch: *Scheduler, victims: []const *LoadedModel) error{DistSwitchActive}!void {
+    errdefer {
+        sch.registry.mutex.lockUncancelable(sch.io);
+        for (victims) |v| if (v.state == .evicting) {
+            v.state = .ready;
+        };
+        sch.registry.state_cond.broadcast(sch.io);
+        sch.registry.mutex.unlock(sch.io);
+    }
+    for (victims) |v| if (@import("../cluster/distributed.zig").switchHolds(v.path)) return error.DistSwitchActive;
     for (victims) |victim| {
         const victim_bytes = victim.bytes_resident; // unloadResident zeroes it
         log.info("[registry] evicting model id={s} ({d:.2} GB resident)\n", .{
@@ -50,7 +59,7 @@ fn evictResident(sch: *Scheduler, victims: []const *LoadedModel) void {
         });
         moveHotCacheViewOff(sch, victim);
         warm_requests.forget(sch, victim);
-        victim.unloadResident();
+        if (!victim.unloadResident()) return error.DistSwitchActive;
         sch.registry.mutex.lockUncancelable(sch.io);
         sch.registry.accountEvictedLocked(victim_bytes);
         sch.registry.finalizeEvictionLocked(victim);
@@ -65,7 +74,7 @@ fn evictResident(sch: *Scheduler, victims: []const *LoadedModel) void {
 /// Unloads idle models, oldest first, when that lets a load of `weights` fit in RAM: as few as fit
 /// it, none when it already fits or when even all of them cannot (`planRamEvictionsLocked`). Runs
 /// past `--skip-mem-preflight` too: an idle model reloads, an overcommitted Mac kills the server.
-pub fn makeRoomInRam(sch: *Scheduler, keep_id: []const u8, weights: u64) void {
+pub fn makeRoomInRam(sch: *Scheduler, keep_id: []const u8, weights: u64) error{DistSwitchActive}!void {
     const room = loadRamRoom() orelse return;
     const need = loadRequirementBytes(weights);
     var victims: [16]*LoadedModel = undefined;
@@ -79,14 +88,17 @@ pub fn makeRoomInRam(sch: *Scheduler, keep_id: []const u8, weights: u64) void {
         @as(f64, @floatFromInt(room)) / 1_073_741_824.0,
         n,
     });
-    evictResident(sch, victims[0..n]);
+    try evictResident(sch, victims[0..n]);
 }
 
 pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // Step 1: evict victims (if any) BEFORE the load, so peak GPU residency
     // never holds the old + new model at once. unloadResident() drops
     // mlx_arrays — same thread-stream invariant as cleanup_queue drain.
-    evictResident(sch, req.evict_entries);
+    evictResident(sch, req.evict_entries) catch |err| {
+        req.evict_entries = &.{};
+        return failLoadRequest(sch, req, err);
+    };
     req.evict_entries = &.{};
 
     // A Neural Engine build runs on its own thread while the GPU keeps serving; an engine plugin's model is its own.
@@ -170,7 +182,7 @@ fn loadFailureCause(err: anyerror, had_error: bool) anyerror {
 /// the entry `.unloaded`: in `.error_state` every retry would fail fast until a server restart.
 fn failureRetries(name: []const u8) bool {
     return switch (model_registry_mod.ModelRegistry.loadErrorFromName(name)) {
-        error.InsufficientMemory, error.DistWorkerNotJoined, error.GpuTimeout => true,
+        error.InsufficientMemory, error.DistWorkerNotJoined, error.DistSwitchActive, error.GpuTimeout => true,
         error.LoadFailed => false,
     };
 }
@@ -213,7 +225,14 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     });
     moveHotCacheViewOff(sch, entry);
     warm_requests.forget(sch, entry);
-    entry.unloadResident();
+    if (!entry.unloadResident()) {
+        sch.registry.mutex.lockUncancelable(sch.io);
+        entry.state = .ready;
+        sch.registry.state_cond.broadcast(sch.io);
+        sch.registry.mutex.unlock(sch.io);
+        req.error_name = "DistSwitchActive";
+        return;
+    }
     // unloadResident freed the arrays into MLX's allocator cache — clear it
     // so the unload actually returns the memory to the OS (the whole point
     // of the load→generate→unload flow).

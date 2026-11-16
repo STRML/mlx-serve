@@ -479,7 +479,7 @@ pub fn deinit(self: *Scheduler) void {
         while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
             if (entry.state == .ready or entry.state == .evicting) {
-                entry.unloadResident();
+                _ = entry.unloadResident();
             }
         }
     }

@@ -227,4 +227,6 @@ Kernels + numerics:
 - **Upgrades**: mlx-c → diff `lib/mlxc-src/mlx/c/*.h` vs `src/mlx/ffi.zig`; ds4 → re-sync `engines/ds4/ffi.zig` EngineOptions + CORE_OBJS; NAX presence asserted, never assumed.
 - **ANE prefill (opt-in, M4-and-below, LOSSY)**: rules in `docs/reference.md` "ANE prefill rules"; parity = per-program cos/rms + perceived-content equivalence; `ready: N/M` under-count = silent partial coverage. Guard: `tests/test_ane_prefill.sh`.
 
-- **Switch groups own their link** (`cluster/switch.zig`): prime env at startup, activate after the mode swap, and release/fall on the inference thread with no collective in flight; model unload refuses while the attempt owns its group.
+- **Switch groups own their link** (`cluster/switch.zig`): prime env at startup and activate after the mode swap.
+  Release/fall check the inference thread and idle collectives, drain before RELEASE, and keep teardown bounded;
+  unload/eviction refuse while an attempt owns the model, and quarantined attempts never publish a group.

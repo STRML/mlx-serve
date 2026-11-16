@@ -39,7 +39,7 @@ pub const Api = struct {
     load_error_name: *const fn (*Scheduler, std.mem.Allocator, []const u8) ?[]u8,
     unload: *const fn (*Scheduler, []const u8, ?i64) Err,
     free_model_state: *const fn (*LoadedModel) void,
-    unload_resident: *const fn (*LoadedModel) void,
+    unload_resident: *const fn (*LoadedModel) bool,
     holds_pair: *const fn ([]const u8) bool,
     hot_cache_bytes: *const fn (*const LoadedModel) u64,
     // ── GPU-thread jobs

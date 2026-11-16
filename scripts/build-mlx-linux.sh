@@ -178,7 +178,7 @@ fi
 # ── 2. Build mlx-c against the fork's installed MLX ─────────────────────
 echo "== patch mlx-c for the fork's gather_qmm signature"
 # The files a patch touches are reset first, so an edited patch replaces the old one in a tree that built before.
-for patch in mlxc-gather-qmm-global-scale mlxc-x86-f16-data-alias; do
+for patch in mlxc-gather-qmm-global-scale mlxc-x86-f16-data-alias mlxc-clear-backends; do
   git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$ROOT/patches/$patch.patch" | cut -f3)
   git -C "$MLXC_SRC" apply -p1 "$ROOT/patches/$patch.patch"
 done

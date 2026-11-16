@@ -16,6 +16,8 @@ pub const Known = error{
     InsufficientMemory,
     DistWorkerNotJoined,
     DistSwitchActive,
+    DistTeardownWrongThread,
+    DistTeardownBusy,
     LoadFailed,
     NoDefaultModel,
     NotEnoughMemory,
