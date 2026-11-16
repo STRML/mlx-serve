@@ -25,7 +25,9 @@ pub fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     const bill = numbers_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, slot.enable_mtp);
     var active_now: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_now);
-    const fits = admissionFits(bill[0], bill[1], 0, sch.promise_ledger.outstanding(active_now), sch.gen_reserve_bytes, live);
+    const reclaimable = scheduler_mod.reclaimableHotCacheBytesFor(sch, slot.full_prompt);
+    const promised = sch.promise_ledger.outstanding(active_now);
+    const fits = admissionFits(bill[0], bill[1], reclaimable, promised, sch.gen_reserve_bytes, live);
     if (!holdsForMemory(fits, live > 0 or sch.gen_reserve_bytes > 0)) {
         if (slot.memory_promised == 0) {
             slot.memory_promised = bill[0];
@@ -35,7 +37,8 @@ pub fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     }
     if (!slot.memory_hold_logged) {
         slot.memory_hold_logged = true;
-        log.info("[admission] held: {d} tokens do not fit beside {d} live request(s) and {d} MB of media job; waiting for one to finish\n", .{ slot.full_prompt.len, live, sch.gen_reserve_bytes >> 20 });
+        const mib = 20;
+        log.info("[admission] held: {d} tokens do not fit beside {d} live request(s) and {d} MB of media job; waiting for one to finish (needs {d} MB, {d} MB available + {d} MB reclaimable, {d} MB promised)\n", .{ slot.full_prompt.len, live, sch.gen_reserve_bytes >> mib, bill[0] >> mib, bill[1] >> mib, reclaimable >> mib, promised >> mib });
     }
     return true;
 }

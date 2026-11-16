@@ -219,9 +219,8 @@ pub fn holdsForMemory(fits: bool, live_company: bool) bool {
 /// media job's reserve, and the sibling margin? Metal OOM is uncatchable, so a media step's
 /// transients are billed before chat may take them.
 pub fn admissionFits(need: u64, avail: u64, reclaimable: u64, promised: u64, gen_reserve: u64, live: usize) bool {
-    _ = reclaimable;
     const margin: u64 = if (live > 0) SIBLING_MARGIN_BYTES else 0;
-    return need +| promised +| gen_reserve +| margin <= avail;
+    return need +| promised +| gen_reserve +| margin <= avail +| reclaimable;
 }
 
 pub fn liveDecodingCount(sch: *Scheduler) usize {
