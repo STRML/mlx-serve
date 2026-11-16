@@ -207,7 +207,7 @@ pub const Drafting = struct {
     /// A drafted round's wall time is bounded by the rounds before it, so a stall cannot stop drafting.
     pub fn record(self: *Drafting, gain: f32, wall_in: f32) void {
         const prior_wall = if (self.wall > 0) self.wall else gain;
-        const wall = std.math.clamp(wall_in, prior_wall / STALL, prior_wall * STALL);
+        const wall = @min(wall_in, prior_wall * STALL);
         if (self.wall <= 0) {
             self.gain = gain;
             self.wall = wall;
