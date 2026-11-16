@@ -263,6 +263,7 @@ pub const Tests = struct {
 /// `test-build` and `test`: the unit tests, plus the plugins' own tests, the lint's and the import closure check.
 pub fn addUnitTests(g: *const Graph) Tests {
     const b = g.b;
+    g.test_mod.addCSourceFile(.{ .file = b.path("build/test_mlx_config.cpp"), .flags = &.{"-std=c++17"} });
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
     const qwen_preprocess_fixture = b.option(
         []const u8,
