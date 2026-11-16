@@ -661,6 +661,14 @@ fn nbytes(a: A) usize {
     return mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
 }
 
+/// Active bytes once the GPU is idle and the allocator's cache is dropped: what earlier tests left pending is released
+/// before the count, not inside a test's window.
+fn settledBytes() usize {
+    _ = mlx.mlx_synchronize(mlx.gpuStream());
+    _ = mlx.mlx_clear_cache();
+    return activeBytes();
+}
+
 fn activeBytes() usize {
     var n: usize = 0;
     _ = mlx.mlx_get_active_memory(&n);
@@ -736,7 +744,7 @@ test "dsv41 row cut: the views copy no weight bytes, and the row-cut forward rea
     const ly = fx.layer(20);
     // The window counts copies only: a lazy source weight would materialize whole when its first view is evaluated.
     try evalSources(ly);
-    const before = activeBytes();
+    const before = settledBytes();
     const rls = try cutRanks(gpa, ly, 4);
     defer {
         for (rls) |*r| r.deinit();
@@ -752,9 +760,11 @@ test "dsv41 row cut: the views copy no weight bytes, and the row-cut forward rea
         for ([_]A{ rl.experts.gate.w, rl.experts.up.w, rl.experts.down.w, rl.shared[0].w, rl.shared[1].w, rl.shared[2].w }) |a| smallest = @min(smallest, nbytes(a));
         for (rl.owned.items.items) |a| try mlx.check(mlx.mlx_array_eval(a));
     }
-    const grew = activeBytes() -| before;
+    const grew = settledBytes() -| before;
     std.debug.print("[rowcut] views: grew {d} B, wo_b copies {d} B, smallest view {d} B\n", .{ grew, wo_b, smallest });
-    try testing.expect(wo_b > 0 and grew >= wo_b and grew - wo_b < smallest);
+    // Within one view either way: a copy of any view adds at least `smallest`, and an earlier test's buffers freed
+    // inside the window take less.
+    try testing.expect(wo_b > 0 and grew + smallest > wo_b and grew < wo_b + smallest);
 
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
