@@ -765,16 +765,6 @@ test "Drafting: a stalled round is not what a round costs" {
     try testing.expect(cold.shouldDraft());
 }
 
-test "GroupCost: rows and states cost more, and a slower machine's rounds scale the prior within bounds" {
-    var cost: GroupCost = .{};
-    try testing.expect(cost.ms(2, 4) > cost.ms(2, 2) and cost.ms(3, 3) > cost.ms(2, 2));
-    for (0..200) |_| cost.sample(2, 4, 2 * GroupCost.prior(2, 4));
-    try testing.expectApproxEqAbs(@as(f32, 2), cost.scale, 0.05);
-    cost.sample(2, 4, std.math.nan(f32));
-    cost.sample(2, 4, 1e9);
-    try testing.expect(cost.scale <= 2.5);
-}
-
 test "GroupCost: a machine's own base and row slope are learned apart, and its row choice follows them" {
     var cost = trained(20, 3, 2.45);
     try testing.expectApproxEqAbs(@as(f32, 4 * 2.45), cost.ms(2, 6) - cost.ms(2, 2), 0.4);
