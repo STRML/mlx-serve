@@ -339,6 +339,42 @@ test "a session index counts a tip of one boundary once, so the fallback is anot
     try testing.expectEqual(@as(u64, 2 * RECORD_BYTES), try f.length(testing.io));
 }
 
+test "a session index written before the format header is set aside on open, and new tips persist and reload" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpPath(&tmp, &buf);
+    {
+        const f = try std.Io.Dir.createFileAbsolute(testing.io, path, .{});
+        defer f.close(testing.io);
+        var record: [RECORD_BYTES]u8 = undefined;
+        encode(tipOf(5, 1), &record);
+        try f.writePositionalAll(testing.io, &record, 0);
+        encode(tipOf(6, 2), &record);
+        try f.writePositionalAll(testing.io, &record, RECORD_BYTES);
+    }
+    {
+        var index = try Index.init(testing.allocator, testing.io, path, 16);
+        defer index.deinit();
+        try testing.expect(index.find(5) == null);
+        var out = try loaded(&index);
+        defer out.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 0), out.items.len);
+        try index.append(tipOf(7, 3));
+    }
+    var aside_buf: [520]u8 = undefined;
+    const aside = try std.fmt.bufPrint(&aside_buf, "{s}.old", .{path});
+    const kept = try std.Io.Dir.openFileAbsolute(testing.io, aside, .{});
+    defer kept.close(testing.io);
+    try testing.expectEqual(@as(u64, 2 * RECORD_BYTES), try kept.length(testing.io));
+    var index = try Index.init(testing.allocator, testing.io, path, 16);
+    defer index.deinit();
+    var out = try loaded(&index);
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(tipOf(7, 3), out.items[0]);
+}
+
 test "a session index keeps the newest sessions at its cap, and find reads the file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

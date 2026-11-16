@@ -13890,15 +13890,52 @@ test "HotPrefixCache module: a tip whose index append failed stays unpersisted a
     try std.Io.Dir.cwd().createDirPath(testing.io, index.path);
     var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
     _ = try snap.putSession(&hc, binding, &.{}, 7);
-    try ModuleDiskTest.finish(&hc, cpu);
-    _ = hc.flushOwedSlice(cpu);
+    const tip = hc.sessionTip(7) orelse return error.TestExpectedTip;
+    var calls: usize = 0;
+    while (hc.disk.?.moduleByBoundaryNow(tip.id, tip.n) == null and calls < 32) : (calls += 1) {
+        _ = hc.flushOwedSlice(cpu);
+        hc.disk.?.drainWriter();
+    }
+    try testing.expect(calls < 32);
     try testing.expect(!hc.session_tips.get(7).?.persisted);
     try testing.expect(hc.tips_unpersisted);
 
+    // The idle loop (`step.zig`) comes back to a cache while its flush does not say `.done`.
+    try testing.expect(hc.flushOwedSlice(cpu) != .done);
+    try testing.expect(hc.disk_dirty);
+
     try std.Io.Dir.cwd().deleteTree(testing.io, index.path);
-    _ = hc.flushOwedSlice(cpu);
+    var owed = true;
+    calls = 0;
+    while (owed and calls < 4) : (calls += 1) owed = hc.flushOwedSlice(cpu) != .done;
+    try testing.expect(!owed);
     try testing.expect(hc.session_tips.get(7).?.persisted);
     try testing.expect(index.find(7) != null);
+}
+
+test "HotPrefixCache module: a claim whose index append fails leaves the cache owing a retry" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const ids = ModuleDiskTest.ids(7);
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.putSession(&hc, binding, &.{}, 7);
+    try ModuleDiskTest.finish(&hc, cpu);
+    try testing.expect(!hc.disk_dirty);
+
+    const index = hc.tipIndex() orelse return error.TestExpectedIndex;
+    try std.Io.Dir.cwd().deleteFile(testing.io, index.path);
+    try std.Io.Dir.cwd().createDirPath(testing.io, index.path);
+    try testing.expect(hc.claimCovering(binding, ids[0..512], &.{}, false, kv_quant.KVQuantConfig.dense, 8));
+    try testing.expect(!hc.session_tips.get(8).?.persisted);
+    try testing.expect(hc.disk_dirty);
 }
 
 test "HotPrefixCache module: sessions that claim one resident checkpoint below the persistence floor all keep their export" {
