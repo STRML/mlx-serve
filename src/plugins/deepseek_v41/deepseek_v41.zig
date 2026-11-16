@@ -1840,10 +1840,10 @@ pub const InitOpts = struct {
 pub const tpGeometryFits = @import("config.zig").tpGeometryFits;
 
 pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opts: InitOpts) !*Dsv41Model {
-    if (opts.tp) |t| if (!tpGeometryFits(whole, t.size)) return error.Dsv41ShardUneven;
-    var sliced = whole.*;
     // A streamed bank reads whole experts and only rank 0 opens one; a split's ranks hold half of each.
     if (opts.tp != null and opts.streamed_experts) return error.Dsv41TpStreamedExperts;
+    if (opts.tp) |t| if (!tpGeometryFits(whole, t.size)) return error.Dsv41ShardUneven;
+    var sliced = whole.*;
     // An MLX pack's stream opens slot rows for every routed layer, where a layer split bills each Mac its share.
     if (opts.pair != null and opts.streamed_experts and opts.quant == null) return error.Dsv41PairStreamedExperts;
     // A split slices the weights as MLX arrays; an outside plugin's stay whole.
