@@ -1520,6 +1520,12 @@ pub const HotPrefixCache = struct {
         return tip;
     }
 
+    /// The session's tip before the one with `seq`: the fallback when that one's record is gone.
+    pub fn sessionTipBefore(self: *HotPrefixCache, session: u64, seq: u64) ?SessionTip {
+        _ = .{ self, session, seq };
+        return null;
+    }
+
     fn tipOf(record: session_index_mod.Tip) SessionTip {
         return .{ .id = record.id, .n = @intCast(record.n), .variant = record.variant, .seq = record.seq };
     }
@@ -13498,4 +13504,83 @@ test "HotPrefixCache module: a tip whose record is gone resolves to nothing" {
     try testing.expect(hc.findSessionTip(7) == null);
     try testing.expect(hc.disk.?.moduleByBoundary(tip.id +% 1, tip.n) == null);
     try testing.expect(hc.disk.?.moduleByBoundary(tip.id, tip.n + 1) == null);
+}
+
+test "HotPrefixCache module: a restart before a tip's record lands keeps the session's previous durable tip" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const ids = ModuleDiskTest.ids(7);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    {
+        var hc = try ModuleDiskTest.init(&tmp, 4);
+        defer hc.deinit();
+        var first = ModuleDiskTest.snap(&fake, ids[0..512]);
+        var second = ModuleDiskTest.snap(&fake, ids[0..513]);
+        _ = try first.putSession(&hc, binding, &.{}, 7);
+        try ModuleDiskTest.finish(&hc, cpu);
+        _ = hc.flushOwedSlice(cpu);
+        _ = try second.putSession(&hc, binding, &.{}, 7);
+    }
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    const tip = hc.sessionTip(7) orelse return error.TestExpectedTip;
+    try testing.expectEqual(@as(usize, 512), tip.n);
+    try testing.expect(hc.disk.?.moduleByBoundary(tip.id, tip.n) != null);
+}
+
+test "HotPrefixCache module: a tip reaches the persisted index only once its record is on the SSD" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const ids = ModuleDiskTest.ids(7);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.putSession(&hc, binding, &.{}, 7);
+    const index = hc.tipIndex() orelse return error.TestExpectedIndex;
+    try testing.expect(index.find(7) == null);
+    try ModuleDiskTest.finish(&hc, cpu);
+    _ = hc.flushOwedSlice(cpu);
+    try testing.expect(index.find(7) != null);
+}
+
+test "HotPrefixCache module: a tip whose record is gone falls back to the session's previous tip" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const ids = ModuleDiskTest.ids(7);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    var first = ModuleDiskTest.snap(&fake, ids[0..512]);
+    var second = ModuleDiskTest.snap(&fake, ids[0..513]);
+    _ = try first.putSession(&hc, binding, &.{}, 7);
+    try ModuleDiskTest.finish(&hc, cpu);
+    _ = hc.flushOwedSlice(cpu);
+    _ = try second.putSession(&hc, binding, &.{}, 7);
+    try ModuleDiskTest.finish(&hc, cpu);
+    _ = hc.flushOwedSlice(cpu);
+
+    const newest = hc.sessionTip(7) orelse return error.TestExpectedTip;
+    try testing.expectEqual(@as(usize, 513), newest.n);
+    const record = hc.disk.?.moduleByBoundary(newest.id, newest.n) orelse return error.TestExpectedRecord;
+    hc.disk.?.retireModule(record.id);
+    try testing.expect(hc.disk.?.moduleByBoundary(newest.id, newest.n) == null);
+    const older = hc.sessionTipBefore(7, newest.seq) orelse return error.TestExpectedTip;
+    try testing.expectEqual(@as(usize, 512), older.n);
+    try testing.expect(hc.disk.?.moduleByBoundary(older.id, older.n) != null);
 }
