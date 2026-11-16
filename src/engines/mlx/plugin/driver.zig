@@ -1807,6 +1807,17 @@ test "plugin driver: the load settings carry the model's tp_mode, a malformed on
     try std.testing.expect(parsed.value.object.get("tp_mode") != null);
 }
 
+test "plugin driver: a streamed pack with every setting stated writes all of it into the preflight's buffer" {
+    var buf: [128]u8 = undefined;
+    var c: ModelConfig = .{ .lm_head_mxfp8_override = false, .mtp_override = false, .int8_prefill_override = false, .stream_experts_override = .{ .rows = 64 }, .tp_mode_override = .{ .group = .{ .rank = 0, .size = 4 } }, .ctx_override = 262144 };
+    c.legacy.caps.owns_decode_state = true;
+    c.legacy.caps.streamed_weights = true;
+    c.kv_quant_override = @import("../../../sdk/blocks/attention/kv_quant.zig").KVQuantConfig.affine(8);
+    const json = "{\"lm_head_mxfp8\":false,\"mtp\":false,\"int8_prefill\":false,\"stream_experts\":64,\"tp_mode\":{\"rank\":0,\"size\":4},\"ctx_size\":262144,\"kv_quant\":\"8\"}";
+    try std.testing.expectEqual(@as(usize, 139), json.len);
+    try std.testing.expectEqualStrings(json, loadSettings(&buf, &c));
+}
+
 test "driver: a DeepSeek-V4.1 pack's vision, aligner and image rows move to the tower; its trunk stays" {
     var c: ModelConfig = .{ .model_type = "deepseek_v41" };
     for ([_][]const u8{ "vision.patch_embed.proj.weight", "aligner.w1.weight", "image_newline" }) |k| try std.testing.expect(towerKey(&c, k));

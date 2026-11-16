@@ -321,6 +321,8 @@ test "tpModeSetting: absent is unset; present and naming no rank of a group is r
     try std.testing.expectEqual(@as(?mode.Shard, null), try tpModeSetting(""));
     try std.testing.expectEqual(@as(?mode.Shard, null), try tpModeSetting("{\"mtp\":false}"));
     try std.testing.expectEqual(@as(?mode.Shard, .{ .rank = 1, .size = 4 }), try tpModeSetting("{\"mtp\":false,\"tp_mode\":{\"rank\":1,\"size\":4}}"));
+    try std.testing.expectEqual(@as(?mode.Shard, .{ .rank = 0, .size = 4 }), try tpModeSetting("{\"tp\\u005fmode\":{\"rank\":0,\"size\":4}}"));
+    try std.testing.expectError(error.Dsv41TpModeSetting, tpModeSetting("{\"tp\\u005fmode\":\"malformed\"}"));
     for ([_][]const u8{
         "{\"tp_mode\":{\"rank\":0}}",
         "{\"tp_mode\":\"malformed\"}",
