@@ -48,9 +48,10 @@ pub const Index = struct {
         self.allocator.free(self.path);
     }
 
-    /// The newest tip of each of the newest `cap` sessions, oldest first. The file keeps each of those sessions' two
-    /// newest tips, so a session whose newest record is gone has one to fall back to (`findBefore`); a file holding
-    /// anything else (older tips, sessions past the cap, a damaged record) is rewritten to just those.
+    /// The newest tip of each of the newest `cap` sessions, oldest first. The file keeps each of those sessions' newest
+    /// tip and the newest one of another boundary (a boundary claimed again is one tip with a newer `seq`), so a session
+    /// whose newest record is gone has one to fall back to (`findBefore`); a file holding anything else (older tips,
+    /// sessions past the cap, a damaged record) is rewritten to just those.
     pub fn load(self: *Index, out: *std.ArrayList(Tip)) !void {
         const bytes = self.readAll() orelse return;
         defer self.allocator.free(bytes);
@@ -67,13 +68,14 @@ pub const Index = struct {
             };
             records += 1;
             const held = try pairs.getOrPut(tip.session);
+            const pair = held.value_ptr;
             if (!held.found_existing) {
-                held.value_ptr.* = .{ .newest = tip };
-            } else if (tip.seq >= held.value_ptr.newest.seq) {
-                if (tip.seq > held.value_ptr.newest.seq) held.value_ptr.previous = held.value_ptr.newest;
-                held.value_ptr.newest = tip;
-            } else if (held.value_ptr.previous == null or tip.seq >= held.value_ptr.previous.?.seq) {
-                held.value_ptr.previous = tip;
+                pair.* = .{ .newest = tip };
+            } else if (tip.seq >= pair.newest.seq) {
+                if (tip.id != pair.newest.id) pair.previous = pair.newest;
+                pair.newest = tip;
+            } else if (tip.id != pair.newest.id and (pair.previous == null or tip.seq >= pair.previous.?.seq)) {
+                pair.previous = tip;
             }
         }
         var newest = std.ArrayList(Tip).empty;
@@ -100,8 +102,16 @@ pub const Index = struct {
     /// The newest tip the file holds for `session` older than `seq` and of another boundary than `id`: where a session
     /// falls back to when the record of its newest one is gone.
     pub fn findBefore(self: *Index, session: u64, id: u64, seq: u64) ?Tip {
-        _ = .{ self, session, id, seq };
-        return null;
+        const bytes = self.readAll() orelse return null;
+        defer self.allocator.free(bytes);
+        var best: ?Tip = null;
+        var at: usize = 0;
+        while (at + RECORD_BYTES <= bytes.len) : (at += RECORD_BYTES) {
+            const tip = decode(bytes[at..][0..RECORD_BYTES]) orelse continue;
+            if (tip.session != session or tip.seq >= seq or tip.id == id) continue;
+            if (best == null or best.?.seq <= tip.seq) best = tip;
+        }
+        return best;
     }
 
     /// The newest tip the file holds for `session`.

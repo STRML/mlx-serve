@@ -488,6 +488,11 @@ pub const DiskTier = struct {
     /// twin on the SSD, found by identity and never by length or recency.
     pub fn moduleByBoundary(self: *DiskTier, id: u64, n: usize) ?ModuleRef {
         self.pollModuleWrites();
+        return self.moduleByBoundaryNow(id, n);
+    }
+
+    /// `moduleByBoundary` against the records as the last poll left them.
+    pub fn moduleByBoundaryNow(self: *const DiskTier, id: u64, n: usize) ?ModuleRef {
         var best: ?*const IndexEntry = null;
         for (self.entries.items) |*e| {
             if (e.kind != .module or e.poisoned or e.module.?.state != .committed or e.kv_len != n) continue;

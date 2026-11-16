@@ -1523,6 +1523,7 @@ pub const HotPrefixCache = struct {
     };
 
     pub const MAX_SESSION_TIPS: usize = 4096;
+    const SESSION_TIP_CEILING: usize = 16;
 
     pub fn sessionTip(self: *HotPrefixCache, session: u64) ?SessionTip {
         if (session == 0) return null;
@@ -1536,8 +1537,8 @@ pub const HotPrefixCache = struct {
 
     /// The session's tip before `newer`, of another boundary: the fallback when `newer`'s record is gone.
     pub fn sessionTipBefore(self: *HotPrefixCache, session: u64, newer: SessionTip) ?SessionTip {
-        _ = .{ self, session, newer };
-        return null;
+        const index = self.tipIndex() orelse return null;
+        return tipOf(index.findBefore(session, newer.id, newer.seq) orelse return null);
     }
 
     fn tipOf(record: session_index_mod.Tip) SessionTip {
@@ -1588,11 +1589,33 @@ pub const HotPrefixCache = struct {
         self.persistDurableTips();
     }
 
-    /// Memory gives up a persisted tip, which the file still holds; an unpersisted one leaves only when they are all
-    /// that is left, twice over the cap.
+    /// Memory gives up a tip nothing needs: one the file holds, else one no entry resolves. A live tip that has no
+    /// record to persist (a checkpoint below the SSD floor, no tier) leaves only at the ceiling.
     fn makeRoomForSessionTip(self: *HotPrefixCache) void {
-        if (self.dropOldestSessionTip(true)) return;
-        if (self.session_tips.count() >= 2 * self.session_tip_cap) _ = self.dropOldestSessionTip(false);
+        if (self.dropOldestSessionTip(true) or self.dropGoneSessionTip()) return;
+        if (self.session_tips.count() < SESSION_TIP_CEILING * self.session_tip_cap) return;
+        log.warn("[hot-cache] {d} session tips are live: forgetting the oldest\n", .{self.session_tips.count()});
+        _ = self.dropOldestSessionTip(false);
+    }
+
+    /// Drops a tip whose boundary is in neither RAM nor a committed SSD record.
+    fn dropGoneSessionTip(self: *HotPrefixCache) bool {
+        const d = if (self.disk) |*dd| dd else null;
+        var it = self.session_tips.iterator();
+        while (it.next()) |kv| {
+            const tip = kv.value_ptr.*;
+            if (self.ramHoldsBoundary(tip)) continue;
+            if (d) |tier| if (tier.moduleByBoundaryNow(tip.id, tip.n) != null) continue;
+            return self.session_tips.remove(kv.key_ptr.*);
+        }
+        return false;
+    }
+
+    fn ramHoldsBoundary(self: *const HotPrefixCache, tip: SessionTip) bool {
+        for (self.entries.items) |*e| {
+            if (e.module != null and e.tokens.len == tip.n and e.boundary == tip.id) return true;
+        }
+        return false;
     }
 
     fn dropOldestSessionTip(self: *HotPrefixCache, persisted_only: bool) bool {
@@ -1615,12 +1638,13 @@ pub const HotPrefixCache = struct {
         if (!self.tips_unpersisted) return;
         const d = if (self.disk) |*dd| dd else return;
         const index = self.tipIndex() orelse return;
+        d.pollModuleWrites();
         var waiting = false;
         var it = self.session_tips.iterator();
         while (it.next()) |kv| {
             const tip = kv.value_ptr;
             if (tip.persisted) continue;
-            if (d.moduleByBoundary(tip.id, tip.n) == null) {
+            if (d.moduleByBoundaryNow(tip.id, tip.n) == null) {
                 waiting = true;
                 continue;
             }
@@ -3641,6 +3665,7 @@ pub const HotPrefixCache = struct {
         self.syncModuleLosses();
         self.dropWrittenOverBudget(d);
         if (!self.diskOwed()) {
+            self.persistDurableTips();
             self.disk_dirty = false;
             return null;
         }
