@@ -158,7 +158,12 @@ pub const Link = struct {
 
     /// Joins the group. Blocks until every rank has connected to the coordinator.
     pub fn open(io: std.Io, cfg: Config) !Link {
+        if (cfg.ready_in_open and cfg.formation_deadline_ms == 0) return error.InvalidArgs;
+        if (cluster().watchdog_started.load(.acquire)) return error.DistLinkAlreadyOpen;
         const started_ms: u64 = @intCast(crt.monotonicMs());
+        cluster().worker_gone.store(false, .release);
+        cluster().lost_rank.store(0, .release);
+        cluster().follower_pending.store(false, .release);
         cluster().follower_ready.store(false, .release);
         if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable;
         if (!mlx.mlx_distributed_is_available("jaccl")) {
@@ -245,7 +250,7 @@ pub const Link = struct {
                     if (err == error.DistPartialGo) distExit(.partial_go, null, null);
                     return err;
                 };
-                cluster().heartbeat_active.store(true, .release);
+                activateHeartbeat(cluster());
             } else {
                 var active: usize = 0;
                 _ = mlx.mlx_get_active_memory(&active);
@@ -475,8 +480,14 @@ const Bell = struct {
         var x: [1]u8 = undefined;
         while (true) {
             const n = std.c.read(b.fd, &x, 1);
-            if (n == 1 and x[0] == heartbeat_byte) continue;
-            if (n == 1) return x[0];
+            if (n == 1) {
+                if (b.follower and cluster().follower_pending.swap(false, .acq_rel)) {
+                    dist_watchdog.setBellTimeout(b.fd, idleTimeoutMs());
+                    cluster().follower_ready.store(true, .release);
+                }
+                if (x[0] == heartbeat_byte) continue;
+                return x[0];
+            }
             const failure = dist_watchdog.classifyBellFailure(n, std.c._errno().*, @backingInt(std.c.E.INTR), @backingInt(std.c.E.AGAIN));
             if (failure) |f| {
                 if (b.follower and cluster().follower_ready.load(.acquire)) followerExit(f);
@@ -1138,8 +1149,7 @@ pub const Peer = struct {
             self.remotes[k].resident_mib = resident;
             if (self.mode == .rows) self.worker_calib_us = state.ready_calib_us[k].load(.monotonic);
         }
-        state.loop_tick_ms.store(0, .release);
-        state.heartbeat_active.store(true, .release);
+        activateHeartbeat(state);
         self.ready = true;
     }
 };
@@ -1224,7 +1234,8 @@ const ClusterState = struct {
     /// The watchdog and (rank 0) heartbeat threads of the open link; `Link.deinit` joins them.
     watchdog_threads: [2]?std.Thread = .{ null, null },
     heartbeat_active: std.atomic.Value(bool) = .init(false),
-    /// Set once this worker is ready (after GO for switch-time open): from then on a silent or closed bell ends the process.
+    follower_pending: std.atomic.Value(bool) = .init(false),
+    /// Armed by the first leader byte after cold READY, or GO during switch-time open.
     follower_ready: std.atomic.Value(bool) = .init(false),
     bell_mu: std.Io.Mutex = .init,
 };
@@ -1254,6 +1265,11 @@ pub fn parkInferenceLoop() void {
     const c = cluster();
     c.watchdog.done();
     c.loop_tick_ms.store(@intCast(crt.monotonicMs()), .release);
+}
+
+fn activateHeartbeat(state: *ClusterState) void {
+    state.loop_tick_ms.store(0, .release);
+    state.heartbeat_active.store(true, .release);
 }
 
 const Heartbeat = struct { state: *ClusterState, bells: [max_ranks]Bell, size: u32, interval_ms: u32 };
@@ -1329,6 +1345,7 @@ fn stopWatchdog() void {
         t.join();
         slot.* = null;
     };
+    c.follower_pending.store(false, .release);
     c.follower_ready.store(false, .release);
     c.heartbeat_active.store(false, .release);
     c.loop_tick_ms.store(0, .release);
@@ -2489,6 +2506,106 @@ const TestReadyWorker = struct {
     }
 };
 
+test "dist bell cold READY waits beyond idle until the first leader byte" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    const old_idle = if (env.get(.MLX_SERVE_DIST_IDLE_MS)) |v| blk: {
+        const saved = try std.testing.allocator.allocSentinel(u8, std.mem.len(v), 0);
+        @memcpy(saved, std.mem.span(v));
+        break :blk saved;
+    } else null;
+    defer {
+        if (old_idle) |v| {
+            env.set(.MLX_SERVE_DIST_IDLE_MS, v);
+            std.testing.allocator.free(v);
+        } else env.unset(.MLX_SERVE_DIST_IDLE_MS);
+        cluster().follower_pending.store(false, .release);
+        cluster().follower_ready.store(false, .release);
+    }
+    env.set(.MLX_SERVE_DIST_IDLE_MS, "40");
+    var pair = try TestBells.open(46129);
+    defer pair.close();
+    var worker_link: Link = .{ .group = .{}, .rank = 1, .size = 2 };
+    worker_link.bells[0] = pair.worker;
+    var ready: WorkerReady = .{ .link = &worker_link, .started_ms = testDeadline(0) };
+    try WorkerReady.rows(&ready, 123, 456);
+    var decoder: BellDecoder = .{};
+    const frame = (try testReadBellWord(&decoder, pair.leader.bells[1])).ready;
+    try std.testing.expectEqual(@as(u32, 456), frame.calib_us);
+    var probe = struct {
+        bell: Bell,
+        result: ?anyerror = null,
+        returned: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            _ = self.bell.wait() catch |err| {
+                self.result = err;
+                self.returned.store(true, .release);
+                return;
+            };
+            self.returned.store(true, .release);
+        }
+    }{ .bell = .{ .fd = pair.worker.fd } };
+    const thread = try std.Thread.spawn(.{}, @TypeOf(probe).run, .{&probe});
+    crt.sleepMs(160);
+    const returned_early = probe.returned.load(.acquire);
+    const armed_early = cluster().follower_ready.load(.acquire);
+    pair.leader.bells[1].ring() catch {};
+    thread.join();
+    try std.testing.expect(!returned_early);
+    try std.testing.expect(!armed_early);
+    try std.testing.expectEqual(@as(?anyerror, null), probe.result);
+    try pair.leader.bells[1].writeAll(&.{ Bell.heartbeat_byte, Bell.pipe_byte });
+    try std.testing.expectEqual(Bell.pipe_byte, try pair.worker.wait());
+    try std.testing.expect(cluster().follower_ready.load(.acquire));
+    try std.testing.expectError(error.DistPeerGone, (Bell{ .fd = pair.worker.fd }).wait());
+}
+
+test "dist switch heartbeat activation clears a stale inference tick" {
+    var state: ClusterState = .{};
+    state.loop_tick_ms.store(1, .release);
+    activateHeartbeat(&state);
+    try std.testing.expect(state.heartbeat_active.load(.acquire));
+    try std.testing.expect(dist_watchdog.loopAlive(100_000, state.loop_tick_ms.load(.acquire), false, 1_000));
+}
+
+test "dist open clears peer loss before a new formation" {
+    const state = cluster();
+    state.worker_gone.store(true, .release);
+    state.lost_rank.store(2, .release);
+    defer {
+        state.worker_gone.store(false, .release);
+        state.lost_rank.store(0, .release);
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    _ = Link.open(io, .{ .rank = 0, .size = 0, .device = "", .coordinator = "127.0.0.1:46131" }) catch {};
+    try std.testing.expectEqual(@as(u32, 0), state.lost_rank.load(.acquire));
+    try std.testing.expect(!state.worker_gone.load(.acquire));
+    var peer_state = testColdPeer(.{ .group = .{}, .rank = 0, .size = 2 });
+    publishReady(state, 1, .{});
+    defer state.ready_code[1].store(0, .release);
+    defer state.heartbeat_active.store(false, .release);
+    try peer_state.awaitReadyUntil(state, testDeadline(100));
+}
+
+test "dist open refuses another live watchdog without changing its state" {
+    var link: Link = .{ .group = .{}, .rank = 1, .size = 2 };
+    startWatchdog(&link);
+    defer stopWatchdog();
+    cluster().follower_ready.store(true, .release);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.testing.expectError(error.DistLinkAlreadyOpen, Link.open(io, .{ .rank = 0, .size = 0, .device = "", .coordinator = "127.0.0.1:46131" }));
+    try std.testing.expect(cluster().watchdog_started.load(.acquire));
+    try std.testing.expect(!cluster().watchdog_stop.load(.acquire));
+    try std.testing.expect(cluster().watchdog_threads[0] != null);
+    try std.testing.expect(cluster().follower_ready.load(.acquire));
+}
+
+test "dist ready-in-open requires an explicit shared deadline before formation" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]u32{ 0, 1 }) |rank| {
+        try std.testing.expectError(error.InvalidArgs, Link.open(io, .{ .rank = rank, .size = 0, .device = "", .coordinator = "127.0.0.1:46131", .ready_in_open = true }));
+    }
+}
+
 test "dist bell READY matrix 1: every worker receives GO" {
     if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     var pair = try TestBells.open(46101);
@@ -2903,8 +3020,7 @@ const WorkerReady = struct {
         try sendReadyFrame(self.link.bells[0], .{ .code = code, .resident_mib = resident_mib, .calib_us = calib_us, .load_ms = loadElapsedMs(self.started_ms) });
         self.sent = true;
         if (code != 0) return;
-        dist_watchdog.setBellTimeout(self.link.bells[0].fd, idleTimeoutMs());
-        cluster().follower_ready.store(true, .release);
+        cluster().follower_pending.store(true, .release);
     }
 
     fn rows(ctx: *anyopaque, resident_mib: u32, calib_us: u32) anyerror!void {
