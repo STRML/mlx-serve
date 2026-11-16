@@ -1805,7 +1805,7 @@ test "plugin aux: a table that ends at import_plan_details binds and contributes
     var fake: AuxFake = .{ .on = true };
     var hooks = AuxFake.hooks;
     hooks.settings_key = &Key.settingsKey;
-    var cache: abi.CacheHooks = .{ .aux = &hooks };
+    const cache: abi.CacheHooks = .{ .aux = &hooks };
     const table = AuxFake.table(&cache);
     var bound: Bound = .{ .table = &table, .model = &fake };
     var x: Transformer = undefined;
