@@ -415,6 +415,31 @@ test "a session index written before the format header is set aside on open, and
     try testing.expectEqual(tipOf(7, 3), out.items[0]);
 }
 
+test "a session index whose first header write stopped short rewrites the header on the next append" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpPath(&tmp, &buf);
+    var index = try Index.init(testing.allocator, testing.io, path, 16);
+    defer index.deinit();
+    for ([_]usize{ 1, HEADER_BYTES / 2, HEADER_BYTES - 1 }) |partial| {
+        {
+            const f = try std.Io.Dir.createFileAbsolute(testing.io, path, .{});
+            defer f.close(testing.io);
+            try f.writePositionalAll(testing.io, headerBytes()[0..partial], 0);
+        }
+        try index.append(tipOf(7, partial));
+        try testing.expectEqual(tipOf(7, partial), index.find(7).?);
+        var out = try loaded(&index);
+        defer out.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 1), out.items.len);
+        try testing.expectEqual(tipOf(7, partial), out.items[0]);
+        const f = try std.Io.Dir.openFileAbsolute(testing.io, path, .{});
+        defer f.close(testing.io);
+        try testing.expectEqual(@as(u64, HEADER_BYTES + RECORD_BYTES), try f.length(testing.io));
+    }
+}
+
 test "a session index keeps the newest sessions at its cap, and find reads the file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
