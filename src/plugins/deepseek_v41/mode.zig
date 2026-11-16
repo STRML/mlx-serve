@@ -98,3 +98,73 @@ test "mode.build: a tensor group's mode beside a --dist split is refused before 
     const cfg: Config = undefined;
     try std.testing.expectError(error.Dsv41ModeBesideSplit, build(std.testing.allocator, &cfg, &w, .{ .ctx = null }, .{ .tp = .{ .rank = 0, .size = 2 } }, .{ .rank = 0, .size = 4 }));
 }
+
+/// A rank-0 model's tensor group with no peers: every rank's part is the sum.
+const LoneGroup = struct {
+    fn sum(x: mlx.mlx_array) anyerror!mlx.mlx_array {
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&o, x));
+        return o;
+    }
+    fn step(_: []const u32, _: usize, _: bool, _: bool, _: bool, _: u64, _: ?mlx.mlx_array) anyerror!void {}
+    fn batch(_: []const u64, _: []const usize, _: []const []const u32, _: bool) anyerror!void {}
+    fn free(_: u64) void {}
+    fn snap(_: dsv41.SnapOp, _: u64, _: u64) void {}
+};
+
+/// A prompt and three decode steps on the whole model: each step's logits (host f32, caller frees).
+fn wholeTurn(m: *dsv41.Dsv41Model, prompt: []const u32) ![4][]f32 {
+    const gpa = std.testing.allocator;
+    var out: [4][]f32 = undefined;
+    const p = try dsv41.prefill(m, gpa, prompt, null);
+    defer _ = mlx.mlx_array_free(p);
+    out[0] = try dsv41.hostF32(p);
+    for ([_]u32{ 5, 9, 13 }, out[1..]) |tok, *o| {
+        const l = try dsv41.extendResumable(m, gpa, &.{tok}, null);
+        defer _ = mlx.mlx_array_free(l);
+        o.* = try dsv41.hostF32(l);
+    }
+    return out;
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+test "mode: with Engram layers the whole model beside a tensor group's rank gives today's logits bit for bit (DSV41_TINY)" {
+    const root = @import("../../env.zig").span(.DSV41_TINY) orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    _ = setenv("MLX_ENABLE_TF32", "0", 1);
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try std.fmt.allocPrint(gpa, "{s}/pipe", .{root});
+    defer gpa.free(dir);
+    const cfg = try @import("../../sdk/testing/pack_config.zig").packConfig(@import("config.zig"), io, dir);
+    const opts: dsv41.InitOpts = .{ .act = .float32, .pack_dir = dir };
+    const prompt = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 8, 2, 6, 4 };
+
+    var want: [4][]f32 = undefined;
+    {
+        var w = try dsv41.loadPack(io, gpa, dir, false);
+        defer w.deinit();
+        const m = try dsv41.init(gpa, &cfg, &w, mlx.gpuStream(), opts);
+        defer m.deinit();
+        if (m.engrams.len == 0) return error.SkipZigTest;
+        want = try wholeTurn(m, &prompt);
+    }
+    defer for (want) |x| gpa.free(x);
+
+    const h = dsv41.clusterHooks();
+    h.* = .{ .tp_sum = &LoneGroup.sum, .tp_step = &LoneGroup.step, .tp_batch = &LoneGroup.batch, .tp_free = &LoneGroup.free, .tp_snap = &LoneGroup.snap };
+    defer h.* = .{};
+    var w = try dsv41.loadPack(io, gpa, dir, false);
+    defer w.deinit();
+    var modes = build(gpa, &cfg, &w, mlx.gpuStream(), opts, .{ .rank = 0, .size = 2 }) catch |e| switch (e) {
+        error.Dsv41ShardUneven => return error.SkipZigTest,
+        else => return e,
+    };
+    defer modes.deinit();
+    try std.testing.expect(modes.tp.?.engrams.len > 0);
+    _ = mlx.mlx_array_free(try dsv41.prefill(modes.tp.?, gpa, &prompt, null));
+    const got = try wholeTurn(modes.tp1, &prompt);
+    defer for (got) |x| gpa.free(x);
+    for (want, got) |a, b| try std.testing.expectEqualSlices(f32, a, b);
+}
