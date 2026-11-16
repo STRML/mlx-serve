@@ -1972,6 +1972,13 @@ const AuxFake = struct {
         out.* = m;
         return .ok;
     }
+    fn importPlanDetails(m: *anyopaque, header: abi.Str, out: *abi.AuxImportPlan) callconv(.c) abi.Verdict {
+        const f = get(m);
+        f.calls += 1;
+        if (!std.mem.eql(u8, header.slice(), "codec")) return abi.Verdict.refuse(.failed, "unexpected header");
+        out.* = .{ .peak = 7, .loaded = 11, .destination = 22 };
+        return .ok;
+    }
     const hooks: abi.AuxHooks = .{
         .reserve = undefined,
         .commit = undefined,
@@ -2028,7 +2035,7 @@ test "absent and short auxiliary tables refuse without calling hooks" {
             7 => hooks.size = @offsetOf(abi.AuxHooks, "import_plan"),
             8 => hooks.size = @offsetOf(abi.AuxHooks, "export_arrays"),
             9 => hooks.size = @offsetOf(abi.AuxHooks, "import_arrays"),
-            10 => hooks.size = @sizeOf(abi.AuxHooks) - 1,
+            10 => hooks.size = @offsetOf(abi.AuxHooks, "import_plan_details") - 1,
             11 => {
                 hooks.size = @sizeOf(abi.AuxHooks);
                 cache.size = @offsetOf(abi.CacheHooks, "aux");
@@ -2049,6 +2056,30 @@ test "absent and short auxiliary tables refuse without calling hooks" {
         try t.expectEqual(@as(u64, 0), auxBytes(&x, &fake));
         auxFree(&x, &fake);
         try t.expectEqual(@as(usize, 0), fake.calls);
+    }
+}
+
+test "a table that ends before the optional import_plan_details plans through import_plan" {
+    const t = std.testing;
+    var fake: AuxFake = .{ .disk = true };
+    var hooks = AuxFake.hooks;
+    hooks.import_plan_details = &AuxFake.importPlanDetails;
+    const cache: abi.CacheHooks = .{ .aux = &hooks };
+    const table = AuxFake.table(&cache);
+    var bound: Bound = .{ .table = &table, .model = &fake };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    const tail = @offsetOf(abi.AuxHooks, "import_plan_details");
+    const sizes = [_]u32{ tail, @sizeOf(abi.AuxHooks) - 1, @sizeOf(abi.AuxHooks) };
+    const peaks = [_]u64{ 6144, 6144, 7 };
+    for (sizes, peaks) |size, peak| {
+        hooks.size = size;
+        try t.expect(auxEnabled(&x));
+        var plan: abi.AuxImportPlan = .{};
+        try t.expect(auxImportPlanDetails(&x, "codec", &plan).isOk());
+        try t.expectEqual(peak, plan.peak);
+        try t.expectEqual(if (peak == 7) @as(u64, 11) else 0, plan.loaded);
+        try t.expectEqual(if (peak == 7) @as(u64, 22) else 0, plan.destination);
     }
 }
 
