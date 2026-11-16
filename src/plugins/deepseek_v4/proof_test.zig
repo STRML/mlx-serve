@@ -38,6 +38,11 @@ pub fn Twin(comptime P: type) type {
 
         /// `tape`: the recorded legacy values (empty: a test that compares none).
         pub fn open(files: []const sdk.fixture.File, tape: []const u8) !*@This() {
+            return openWith(files, tape, "");
+        }
+
+        /// `open` with the model's per-model settings JSON.
+        pub fn openWith(files: []const sdk.fixture.File, tape: []const u8, settings: []const u8) !*@This() {
             const a = testing.allocator;
             const io = std.Io.Threaded.global_single_threaded.io();
             const t = try a.create(@This());
@@ -53,7 +58,7 @@ pub fn Twin(comptime P: type) type {
             const pd = mem.packDir();
             try testing.expect(P.table.parse(&pd, .of(files[0].bytes), .{}, null, false, &t.parsed).isOk());
             var why: abi.Verdict = .{};
-            t.m = P.table.load(&.{ .model_dir = .of(dir), .dir = &pd, .parsed = &t.parsed, .stream = .{ .ctx = t.s.ctx } }, &why) orelse {
+            t.m = P.table.load(&.{ .model_dir = .of(dir), .dir = &pd, .parsed = &t.parsed, .stream = .{ .ctx = t.s.ctx }, .settings_json = .of(settings) }, &why) orelse {
                 std.debug.print("load: {s}\n", .{why.why.slice()});
                 return error.PluginLoad;
             };

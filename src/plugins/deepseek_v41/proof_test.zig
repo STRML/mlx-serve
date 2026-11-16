@@ -1185,3 +1185,225 @@ fn importForAllocationTest(gpa: std.mem.Allocator, m: *const dsv41.Dsv41Model, i
     defer gpa.destroy(sn);
     defer sn.deinit(gpa);
 }
+
+const gemv_twin = @import("decode/gemv_twin.zig");
+
+const LoneGroup = v41.mode.LoneGroup;
+
+/// One step's logits for `slot` (host f32, caller frees): all rows for a verify, else the last.
+fn stepLogits(t: *Twin, slot: u32, st: proof.Step, pos: u32) ![]f32 {
+    var out: abi.ForwardOut = .{};
+    const v = v41.table.forward(t.m, &.{ .mode = st.mode, .logits = if (st.mode == .verify) .all_rows else .last_row, .rows = @intCast(st.ids.len), .tokens = .of(st.ids), .slots = .of(&.{slot}), .positions = .of(&.{pos}) }, &out);
+    if (!v.isOk()) {
+        std.debug.print("forward: {s}\n", .{v.why.slice()});
+        return error.PluginForward;
+    }
+    const l: mlx.mlx_array = .{ .ctx = out.logits.ctx };
+    defer _ = mlx.mlx_array_free(l);
+    return hostRows(l);
+}
+
+/// Today's load (no `tp_mode`): every proof step's logits on slot 1.
+fn wholeSteps(files: []const sdk.fixture.File) ![proof.steps.len][]f32 {
+    const t = try Twin.open(files, "");
+    defer t.close();
+    var out: [proof.steps.len][]f32 = undefined;
+    var pos: u32 = 0;
+    for (proof.steps, &out) |st, *o| {
+        o.* = try stepLogits(t, 1, st, pos);
+        pos += @intCast(st.ids.len);
+    }
+    return out;
+}
+
+const tp4_setting = "{\"tp_mode\": {\"rank\": 0, \"size\": 4}}";
+
+test "deepseek_v41 modes: the whole model beside a TP4 rank's model gives today's logits bit for bit, through TP4 forwards, swaps and the TP4 model's state" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41TpFiles(arena.allocator(), 7);
+    const want = try wholeSteps(files);
+    defer for (want) |w| testing.allocator.free(w);
+
+    LoneGroup.arm(4);
+    defer LoneGroup.disarm();
+    const t = try Twin.openWith(files, "", tp4_setting);
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    const tp = m.modes.tp orelse return error.NoTpMode;
+    try testing.expectEqual(m.modes.tp1, m.mdl);
+    try testing.expectEqual(@as(usize, 4), m.modes.tp1.cfg.num_attention_heads / tp.cfg.num_attention_heads);
+    try testing.expectEqual(m.modes.tp1.cfg.moe_intermediate_size, 4 * tp.cfg.moe_intermediate_size);
+
+    // Each whole-model step follows a TP4 prompt on the TP4 model's own state.
+    var pos: u32 = 0;
+    for (proof.steps, want) |st, w| {
+        _ = mlx.mlx_array_free(try dsv41.prefill(tp, testing.allocator, &.{ 3, 1, 4, 1, 5, 9, 2, 6 }, null));
+        const got = try stepLogits(t, 1, st, pos);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(f32, w, got);
+        pos += @intCast(st.ids.len);
+    }
+    try testing.expect(LoneGroup.sums > 0);
+
+    // TP4 serves a turn, then TP1 serves the same steps from a fresh state, bit for bit.
+    try v41.swapMode(m, .tp);
+    try testing.expectEqual(tp, m.mdl);
+    testing.allocator.free(try stepLogits(t, 1, proof.steps[0], 0));
+    try v41.swapMode(m, .tp1);
+    pos = 0;
+    for (proof.steps, want) |st, w| {
+        const got = try stepLogits(t, 1, st, pos);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(f32, w, got);
+        pos += @intCast(st.ids.len);
+    }
+}
+
+test "deepseek_v41 modes: a swap drops every slot's state, live and parked, so a slot's next turn cannot continue it" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    LoneGroup.arm(4);
+    defer LoneGroup.disarm();
+    const t = try Twin.openWith(try fixture.v41TpFiles(arena.allocator(), 7), "", tp4_setting);
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    const a = [_]u32{ 3, 1, 4, 1, 5 };
+    const b = [_]u32{ 2, 7, 1, 8 };
+    for ([_]v41.mode.Mode{ .tp1, .tp, .tp1 }) |to| {
+        try v41.swapMode(m, to);
+        testing.allocator.free(try slotForward(t, .prefill, &.{1}, &a, &.{0}));
+        testing.allocator.free(try slotForward(t, .prefill, &.{2}, &b, &.{0}));
+        try testing.expectEqual(@as(u32, 1), m.parked.count());
+        const from = m.mdl;
+        try v41.swapMode(m, if (to == .tp1) .tp else .tp1);
+        try testing.expectEqual(@as(u32, 0), m.parked.count());
+        try testing.expectEqual(@as(u32, 0), m.owner);
+        try testing.expect(from.dec_state == null and m.mdl.dec_state == null);
+        // Slot 2's next token has no state to follow on either model.
+        try testing.expectError(error.PluginForward, slotForward(t, .decode, &.{2}, &.{6}, &.{@intCast(b.len)}));
+    }
+}
+
+test "deepseek_v41 modes: on the wide prompt path the whole model gives today's logits with a TP4 model's wide prompts between its steps" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try wideBeside();
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "deepseek_v41 modes: the wide arm again with the flash kernel on, a setting both modes read from one load" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    _ = setenv("MLX_SERVE_DSV41_FLASH_ATTN", "", 1);
+    defer _ = unsetenv("MLX_SERVE_DSV41_FLASH_ATTN");
+    try wideBeside();
+}
+
+/// The whole model's wide steps beside a TP4 model's wide prompts, against today's load on the wide path.
+fn wideBeside() !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41TpFiles(arena.allocator(), 7);
+    var want: [proof.steps.len][]f32 = undefined;
+    {
+        const wide = try WideTwin.open(files);
+        defer wide.close();
+        var pos: u32 = 0;
+        for (proof.steps, &want) |st, *w| {
+            w.* = try stepLogits(wide.t, 1, st, pos);
+            pos += @intCast(st.ids.len);
+        }
+    }
+    defer for (want) |w| testing.allocator.free(w);
+
+    LoneGroup.arm(4);
+    defer LoneGroup.disarm();
+    const t = try Twin.openWith(files, "", tp4_setting);
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    const tp = m.modes.tp orelse return error.NoTpMode;
+    // Both models off their compiled regions: every call runs the wide layer and its process-wide scratch rings.
+    const kept = .{ m.modes.tp1.regions, tp.regions };
+    m.modes.tp1.regions = kept[0][0..0];
+    tp.regions = kept[1][0..0];
+    defer {
+        m.modes.tp1.regions = kept[0];
+        tp.regions = kept[1];
+    }
+    var pos: u32 = 0;
+    for (proof.steps, want) |st, w| {
+        _ = mlx.mlx_array_free(try dsv41.prefill(tp, testing.allocator, &.{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5 }, null));
+        const got = try stepLogits(t, 1, st, pos);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(f32, w, got);
+        pos += @intCast(st.ids.len);
+    }
+}
+
+test "deepseek_v41 modes: freeing the TP4 model leaves the whole model's launch table and its logits as they were" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41TpFiles(arena.allocator(), 7);
+    const want = try wholeSteps(files);
+    defer for (want) |w| testing.allocator.free(w);
+    LoneGroup.arm(4);
+    defer LoneGroup.disarm();
+    const t = try Twin.openWith(files, "", tp4_setting);
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    _ = mlx.mlx_array_free(try dsv41.prefill(m.modes.tp.?, testing.allocator, &.{ 3, 1, 4, 1, 5, 9, 2, 6 }, null));
+    const held = gemv_twin.shapesHeld();
+    try testing.expect(held > 0);
+    m.modes.tp.?.deinit();
+    m.modes.tp = null;
+    try testing.expectEqual(held, gemv_twin.shapesHeld());
+    var pos: u32 = 0;
+    for (proof.steps, want) |st, w| {
+        const got = try stepLogits(t, 1, st, pos);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(f32, w, got);
+        pos += @intCast(st.ids.len);
+    }
+}
+
+test "deepseek_v41 modes: a DSpark pack's TP4 rank holds its stages as a --dist tensor rank does, sharded or on rank 0 whole" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41TpDsparkFiles(arena.allocator(), 7);
+    LoneGroup.arm(4);
+    defer LoneGroup.disarm();
+    defer _ = unsetenv("DSV41_DRAFT_SHARD");
+    for ([_]bool{ true, false }) |shard| {
+        _ = setenv("DSV41_DRAFT_SHARD", if (shard) "1" else "0", 1);
+        const t = try Twin.openWith(files, "", tp4_setting);
+        defer t.close();
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        const tp = m.modes.tp orelse return error.NoTpMode;
+        try testing.expectEqual(@as(usize, 2), m.modes.tp1.n_mtp);
+        try testing.expectEqual(@as(usize, 2), tp.n_mtp);
+        try testing.expectEqual(shard, tp.draft_shard);
+        _ = mlx.mlx_array_free(try dsv41.prefill(tp, testing.allocator, &.{ 3, 1, 4, 1, 5, 9, 2, 6 }, null));
+    }
+}
+
+test "deepseek_v41 modes: tp_mode is refused by name at a size below 2 or a rank past it" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41TpFiles(arena.allocator(), 7);
+    for ([_][]const u8{ "{\"tp_mode\": {\"rank\": 0, \"size\": 1}}", "{\"tp_mode\": {\"rank\": 4, \"size\": 4}}", "{\"tp_mode\": {\"rank\": 0, \"size\": 3}}" }) |bad| {
+        try testing.expectError(error.PluginLoad, Twin.openWith(files, "", bad));
+    }
+}

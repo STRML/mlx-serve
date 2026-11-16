@@ -142,6 +142,8 @@ pub const ForcedAlignerConfig = struct {
     languages: u32 = 0,
 };
 
+pub const TpModeSetting = @import("../weights/shard.zig").TpModeSetting;
+
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
@@ -541,6 +543,8 @@ pub const ModelConfig = struct {
     ane_override: ?bool = null,
     /// The model's `stream_experts` setting: its routed experts read from the pack into slot rows; null = resident.
     stream_experts_override: ?@import("../weights/streamed.zig").Setting = null,
+    /// The model's `tp_mode` setting, passed to its plugin's load; null = unset.
+    tp_mode_override: ?TpModeSetting = null,
     /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
     drafter_ctx_bytes_per_token: u64 = 0,
     /// `drafter` setting: null or "auto" = the in-dir probe, "off", or a path. Owned.
