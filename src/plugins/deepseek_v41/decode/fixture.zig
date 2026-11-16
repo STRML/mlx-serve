@@ -924,6 +924,33 @@ test "dsv41 cache identity: a model and its tensor rank 0 hash the same layout" 
     try std.testing.expectEqualDeep(a, b);
 }
 
+test "dsv41 cache identity: pinning the launch shapes to the smallest any rank runs leaves the layout alone" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer fx.deinit();
+    const m = fx.m;
+    m.topk_tg = 1024;
+    m.hc_tg = 1024;
+    const granted = try dsv41.cacheLayout(m);
+
+    dsv41.pinLaunchShapes(m, 512, 256);
+    try std.testing.expectEqual(@as(usize, 512), m.topk_tg);
+    try std.testing.expectEqual(@as(usize, 256), m.hc_tg);
+    try std.testing.expectEqualDeep(granted, try dsv41.cacheLayout(m));
+
+    // A group formed again pins from the pinned values: the key stays the GPU's own grant.
+    dsv41.pinLaunchShapes(m, 256, 128);
+    try std.testing.expectEqualDeep(granted, try dsv41.cacheLayout(m));
+
+    // Control: a GPU that grants fewer threads still keys apart from one that grants 1024.
+    const other = try Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer other.deinit();
+    other.m.topk_tg = 1024;
+    other.m.hc_tg = 512;
+    try std.testing.expect((try dsv41.cacheLayout(other.m)).settings != granted.settings);
+}
+
 /// One step's input rows: a stream and its mix.
 pub const Input = struct {
     x: A,
