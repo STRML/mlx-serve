@@ -57,3 +57,25 @@ pub fn launch(gpa: std.mem.Allocator, io: std.Io, key_file: ?[]const u8, serving
     log.info("[internal] layout switch enabled: /v1/internal/* takes the key in {s}\n", .{path});
     return .{ .sw = sw, .key = key };
 }
+
+test "with a distributed configuration the installed switch has a formation backend: tp4, join and tp1 are not 501" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/mlx-serve-internal-key-test-{d}", .{std.c.getpid()}, 0);
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return error.SkipZigTest;
+    const key = "0123456789abcdef0123456789abcdef-test-key";
+    _ = std.c.write(fd, key.ptr, key.len);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+    const inst = (try launch(std.testing.allocator, std.testing.io, path, null, null, .{
+        .coordinator = "127.0.0.1:46311",
+        .device = "-,rdma_en2",
+        .model_dir = "/tmp/no-model",
+    })).?;
+    defer std.testing.allocator.destroy(inst.sw);
+    try std.testing.expect(inst.sw.formation != null);
+    for ([_]@import("attempt.zig").Cmd{ .tp4, .join, .tp1 }) |cmd| {
+        try std.testing.expect(inst.sw.command(cmd, 1, 0).status != 501);
+    }
+}
