@@ -45,7 +45,12 @@ pub fn isInference(method: []const u8, path: []const u8) bool {
     return true;
 }
 
-pub const refusal_message = "Layout switch in progress or this box follows a TP4 leader";
+pub fn admitsRequest(method: []const u8, path: []const u8, ws_upgrade: bool) bool {
+    _ = ws_upgrade;
+    return isInference(method, path);
+}
+
+pub const refusal_message ="Layout switch in progress or this box follows a TP4 leader";
 
 /// One counted unit of public inference: a request, or one turn of a WebSocket.
 pub const Admission = struct {
@@ -440,6 +445,30 @@ test "a turn that was refused leaves no count, and an idle socket between turns 
     try t.expectEqual(@as(u32, 1), r.sw.snapshot().in_flight);
     second.leave();
     try t.expectEqual(@as(u32, 0), r.sw.snapshot().in_flight);
+}
+
+test "a Responses WebSocket upgrade is admitted for its model load: only an upgrade, only on that route" {
+    try t.expect(admitsRequest("GET", "/v1/responses", true));
+    try t.expect(!admitsRequest("GET", "/v1/responses", false));
+    try t.expect(!admitsRequest("GET", "/v1/models", true));
+    try t.expect(admitsRequest("POST", "/v1/chat/completions", false));
+}
+
+test "an upgrade admitted before a drain holds the count until its load ends; one arriving during it is refused" {
+    var r = rig();
+    var before = try Admission.enter(&r.sw);
+    var res = call(&r, KEY, "POST", "/v1/internal/drain", BEARER, "{\"n\":3,\"wait_ms\":0}");
+    try expectField(res.body, "drained", "false");
+    try t.expectEqual(@as(u32, 1), r.sw.snapshot().in_flight);
+    try t.expectError(error.Refused, Admission.enter(&r.sw));
+    before.leave();
+    try t.expectEqual(@as(u32, 0), r.sw.snapshot().in_flight);
+    try t.expect(r.sw.waitDrained(3, 0));
+    res = call(&r, KEY, "POST", "/v1/internal/abort", BEARER, "{\"n\":3}");
+    var other = try Admission.enter(&r.sw);
+    before.leave();
+    try t.expectEqual(@as(u32, 1), r.sw.snapshot().in_flight);
+    other.leave();
 }
 
 test "no switch installed: admission always passes and counts nothing" {

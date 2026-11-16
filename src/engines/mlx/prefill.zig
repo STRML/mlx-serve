@@ -163,6 +163,10 @@ fn importModuleSnapshot(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, ma
     if (!plugin_driver.auxRestoreAt(binding.xfm, id, snapshot, match.n).isOk()) return error.ModuleRestoreFailed;
 }
 
+fn prefillProgressSink(sch: *Scheduler) ?*std.atomic.Value(u64) {
+    return if (sch.metrics != null) &sch.inflight_prefill_tokens else null;
+}
+
 pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
@@ -614,7 +618,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // construction otherwise) so the cancelled-prefill commit can
             // restore hybrids too.
             .cancelled_checkpoint_sink = &slot.cancelled_prefill,
-            .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
+            .prefill_progress = prefillProgressSink(sch),
             .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
             .interleave_hook = .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb },
             .write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))
@@ -694,6 +698,15 @@ test "module import admission bounds envelope loads and rejects overflowing bill
     const too_large = [_]Tensor{.{ .name = "a", .dtype = "F32", .shape = &.{1}, .bytes = std.math.maxInt(u64) }};
     try testing.expectError(error.Overflow, moduleImportPeak(1, &too_large));
     try testing.expectEqual(std.math.maxInt(u64), try moduleImportPeak(std.math.maxInt(u64), &tensors));
+}
+
+test "without --metrics a prefill that advances still moves the counter the layout switch's stall check reads" {
+    var sch: Scheduler = undefined;
+    sch.metrics = null;
+    sch.inflight_prefill_tokens = std.atomic.Value(u64).init(0);
+    const sink: ?*std.atomic.Value(u64) = prefillProgressSink(&sch);
+    sink.?.store(4096, .monotonic);
+    try testing.expectEqual(@as(u64, 4096), sch.inflight_prefill_tokens.load(.monotonic));
 }
 
 test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/errored" {
