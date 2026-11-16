@@ -1567,3 +1567,14 @@ then ignored every later submission from the process ("Ignored (for causing prio
 request answered a bare 500 and `/health` stayed 200, so nothing restarted the server. Cause: the latch's sticky-error
 list knew CUDA's faults only. Fix: `SubmissionsIgnored` marks the GPU context lost like a CUDA fault (named 503,
 `/health` 503 `gpu context lost`). Guard: `a sticky CUDA error marks the GPU context lost; any other error does not`.
+
+### Switch-time group ownership
+
+A TP1-born process has no startup group, so model planning missed a formed switch group. Reusing the cold group's
+unload path could also release the attempt's link. Attempts own a separate group record, published with their outcome
+and pending abort under the attempt lock; a late outcome stays quarantined without publishing a group. Refused unloads
+and evictions preserve residency and accounting, restore queued victims to ready, and report retryable DistSwitchActive.
+Follower idle exits arm on the first leader byte. Aborting bell failures request fall, with the exit decision rechecked
+under its mutex. Release/fall refuse unsafe threads or active work and drain before OP_RELEASE. Planned down waits for
+follower EOFs under one two-second cap; an independent teardown deadline covers drain and backend destruction. A failed
+RELEASE leaves the caller its rank for exitReleaseFailed. The slice3 and dist fix2 loopback tests guard these paths.

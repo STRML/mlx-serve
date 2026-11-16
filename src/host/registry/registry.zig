@@ -456,8 +456,8 @@ pub const LoadedModel = struct {
     /// borrower has released.
     /// Free only the MLX-allocating state, leaving CPU-only fields (config/tokenizer/chat_config) and the
     /// discovery stub intact: eviction keeps the entry `.unloaded` for later listing and reload. Inference thread.
-    pub fn unloadResident(self: *LoadedModel) void {
-        mlx_engine.api().unload_resident(self);
+    pub fn unloadResident(self: *LoadedModel) bool {
+        return mlx_engine.api().unload_resident(self);
     }
 
     pub fn releaseRetainedCpuState(self: *LoadedModel) void {
@@ -492,7 +492,6 @@ pub const LoadedModel = struct {
             self.tokenize_cache = null;
         }
     }
-
 };
 
 /// Snapshot of a single entry, returned by `ModelRegistry.snapshot` for
@@ -1355,12 +1354,13 @@ pub const ModelRegistry = struct {
     /// Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, DistWorkerNotJoined, GpuTimeout } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, DistWorkerNotJoined, DistSwitchActive, GpuTimeout } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "GpuTimeout")) return error.GpuTimeout;
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "DistWorkerNotJoined")) return error.DistWorkerNotJoined;
+            if (std.mem.eql(u8, n, "DistSwitchActive")) return error.DistSwitchActive;
         }
         return error.LoadFailed;
     }
@@ -1723,7 +1723,7 @@ test "LoadedModel: a reload frees the CPU state the previous load left behind" {
     entry.config.?.ngram_table_path = try testing.allocator.dupe(u8, "/m/ngram_table.bin");
 
     // Unload retains it by contract.
-    entry.unloadResident();
+    try testing.expect(entry.unloadResident());
     try testing.expect(entry.tokenizer != null);
     try testing.expect(entry.config != null);
 
@@ -1932,7 +1932,7 @@ test "unloadResident resets the prefill-chunk pin but never the context pin" {
     cfg.pinned_context = 8192;
     lm.config = cfg;
 
-    lm.unloadResident();
+    try testing.expect(lm.unloadResident());
     try testing.expectEqual(@as(u32, 0), cfg.pinned_prefill_chunk);
     try testing.expectEqual(@as(u32, 8192), cfg.pinned_context);
 }

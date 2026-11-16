@@ -42,6 +42,7 @@ pub const table = abi.ModelTable{
     .forward = &forward,
     .release_slot = &releaseSlot,
     .activate_slot = &activateSlot,
+    .swap_mode = &swapModeEntry,
     .cache = &.{ .layout = &layout, .resume_prompt = &resumePrompt, .state_bytes = &stateBytes, .aux = &aux_hooks },
     .media = &.{ .tower = &media.tower, .prepare = &media.prepare, .placeholder_rows = &media.placeholderRows },
     .spec = &.{ .trunk_weight = &trunkWeight },
@@ -186,6 +187,16 @@ pub fn swapMode(m: *Model, to: mode.Mode) !void {
     };
     m.modes.active = to;
     m.mdl = next;
+}
+
+fn swapModeEntry(mp: *anyopaque, to: abi.ServingMode) callconv(.c) Verdict {
+    const m: *Model = @ptrCast(@alignCast(mp));
+    swapMode(m, switch (to) {
+        .tp1 => .tp1,
+        .tp => .tp,
+    }) catch |err| return Verdict.named(.failed, @errorName(err));
+    if (to == .tp) groupFormed(m);
+    return .ok;
 }
 
 fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {

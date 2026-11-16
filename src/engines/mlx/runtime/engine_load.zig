@@ -88,7 +88,7 @@ pub fn loadOutside(sch: *Scheduler, params: anytype, p: *const outside.Plugin) !
         log.err("[plugin] {s} cannot bill {s}: {s}\n", .{ p.name(), params.model_dir, bill.why.slice() });
         return error.EngineProbeRefused;
     }
-    makeRoomInRam(sch, params.entry.id, need);
+    try makeRoomInRam(sch, params.entry.id, need);
     if (!scheduler_mod.skip_mem_preflight and memInsufficientForLoad(need, availForLoad(sch.io, need))) return error.NotEnoughMemory;
     const s = try Served.openTable(gpa, .plugin, t, .{
         .model_dir = params.model_dir,
@@ -125,7 +125,7 @@ pub fn aneAdmit(sch: *Scheduler, params: anytype) bool {
     }
     // Its own preflight: the int8 copies outweigh a 4-bit pack's shards, and the GPU arm checks those.
     const need = aneBytes(sch.allocator, params.model_dir, params.ane_slots) orelse return false;
-    makeRoomInRam(sch, params.entry.id, need);
+    makeRoomInRam(sch, params.entry.id, need) catch return false;
     if (!scheduler_mod.skip_mem_preflight) {
         const avail = availForLoad(sch.io, need);
         if (memInsufficientForLoad(need, avail)) {

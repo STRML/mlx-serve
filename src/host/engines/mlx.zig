@@ -39,7 +39,7 @@ pub const Api = struct {
     load_error_name: *const fn (*Scheduler, std.mem.Allocator, []const u8) ?[]u8,
     unload: *const fn (*Scheduler, []const u8, ?i64) Err,
     free_model_state: *const fn (*LoadedModel) void,
-    unload_resident: *const fn (*LoadedModel) void,
+    unload_resident: *const fn (*LoadedModel) bool,
     holds_pair: *const fn ([]const u8) bool,
     hot_cache_bytes: *const fn (*const LoadedModel) u64,
     // ── GPU-thread jobs
@@ -74,6 +74,7 @@ pub const Api = struct {
     /// group model's load waits for the workers, null = the size's default).
     cluster_worker: *const fn (std.Io, std.mem.Allocator, []const []const u8) Err,
     cluster_probe: *const fn (std.Io, []const []const u8) Err,
+    switch_adapter: *const fn (*@import("../internal/switch.zig").Switch, @import("../internal/formation.zig").Config, *?*@import("../internal/formation.zig").Backend) Err,
     cluster_connect: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8, u8, []const u8, ?u32, u32, ?u32) Err,
     /// `--prompt` without `--serve`: one generation on the calling thread.
     run_offline: *const fn (*const Offline) Err,

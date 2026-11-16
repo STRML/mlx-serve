@@ -351,6 +351,7 @@ pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched:
         error.InsufficientMemory => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503),
         error.LoadFailed => try sendLoadFailedResponse(allocator, stream, sched, id),
         error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503),
+        error.DistSwitchActive => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "dist_switch_active", "DistSwitchActive: the layout switch owns this model; retry after the group is released", 503),
         error.DistWorkerNotJoined => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "worker_not_joined", "This model is served with a second Mac that has not joined: start `mlx-serve worker` there, then retry", 503),
         error.GpuContextLost => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_context_lost", gpu_context_lost_message, 503),
         error.GpuTimeout => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_timeout", gpu_timeout_load_message, 503),
@@ -711,4 +712,23 @@ test "generation out of memory does not carry a refusal reason" {
     const openai = try buildOpenAiStreamError(a, w);
     defer a.free(openai);
     try t.expect(std.mem.indexOf(u8, openai, "\"reason\"") == null);
+}
+
+test "internal switch load refusal names DistSwitchActive in the HTTP response" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var sockets: [2]std.c.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.socketpair(1, 1, 0, &sockets));
+    defer _ = std.c.close(sockets[0]);
+    defer _ = std.c.close(sockets[1]);
+    var conn: Conn = undefined;
+    conn.init(.{ .socket = .{ .handle = sockets[0], .address = undefined } }, testing.io);
+    var sch: Scheduler = undefined;
+    try sendEnsureLoadedError(testing.allocator, &conn, &sch, "switch-model", error.DistSwitchActive);
+    var buf: [4096]u8 = undefined;
+    const len = std.c.read(sockets[1], &buf, buf.len);
+    try testing.expect(len > 0);
+    const response = buf[0..@intCast(len)];
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 503"));
+    try testing.expect(std.mem.indexOf(u8, response, "dist_switch_active") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "DistSwitchActive") != null);
 }

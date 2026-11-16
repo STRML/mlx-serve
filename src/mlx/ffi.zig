@@ -315,6 +315,8 @@ fn jacclDeadlineFn() ?*const fn (i64) callconv(.c) void {
     return jaccl_deadline_fn;
 }
 
+pub extern "c" fn mlx_distributed_clear_backends() c_int;
+
 pub fn cudaAvailable() bool {
     if (cuda_cache == null) {
         var cuda = false;

@@ -195,6 +195,7 @@ pub fn takeMergeable(queue: *std.ArrayList(*GenRequest), batch: []*GenRequest, n
 /// eviction accounting, then the entry returns to `.unloaded` (the stub stays
 /// in the registry so it can reload later).
 pub const UnloadRequest = struct {
+    error_name: ?[]const u8 = null,
     entry: *model_registry_mod.LoadedModel,
     done: bool = false,
     done_mu: std.Io.Mutex = .init,

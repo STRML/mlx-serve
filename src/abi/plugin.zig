@@ -18,6 +18,8 @@ pub const PackDir = common.PackDir;
 
 pub const version: u32 = 1;
 
+pub const ServingMode = enum(u8) { tp1, tp };
+
 const nan = std.math.nan(f32);
 
 /// An object the engine owns and the plugin only passes back (a slot's KV cache): opaque until P3 types it.
@@ -1020,6 +1022,7 @@ pub const ModelTable = extern struct {
     /// the next call on `m`; the counters reset.
     meters: ?*const fn (m: *anyopaque, slot: u32, out: *Str) callconv(.c) void = null,
     speech: ?*const SpeechHooks = null,
+    swap_mode: ?*const fn (m: *anyopaque, to: ServingMode) callconv(.c) Verdict = null,
 };
 
 /// The modes a model serves: prefill, decode and verify always; the rest as its caps declare. An encoder (`embed`)
