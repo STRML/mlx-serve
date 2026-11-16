@@ -469,7 +469,7 @@ test "peer transfer session: an export by X-Session-Key imports on another box a
     const imported = importWire(model_b, exported.ok.bytes);
     try testing.expect(imported == .ok);
     try testing.expectEqual(@as(usize, 24), imported.ok.n);
-    try testing.expectEqual(@as(u64, 77), model_b.entry.prefix_cache.?.entries.items[0].session);
+    try testing.expectEqual(@as(usize, 24), model_b.entry.prefix_cache.?.sessionTip(77).?.n);
 
     const warm_a = try model_a.runGreedy(&full_prompt, 6, false);
     defer testing.allocator.free(warm_a.tokens);
@@ -525,7 +525,7 @@ test "peer transfer session: a session whose RAM entry is gone exports from the 
 
     const imported = importWire(model_b, exported.ok.bytes);
     try testing.expect(imported == .ok);
-    try testing.expectEqual(@as(u64, 9), model_b.entry.prefix_cache.?.entries.items[0].session);
+    try testing.expectEqual(tip_tokens, model_b.entry.prefix_cache.?.sessionTip(9).?.n);
 
     const warm_a = try model_a.runGreedy(&prompt, 6, false);
     defer testing.allocator.free(warm_a.tokens);

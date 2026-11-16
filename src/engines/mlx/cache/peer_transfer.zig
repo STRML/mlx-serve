@@ -184,8 +184,8 @@ fn sessionHit(
         return .{ .hit = hit };
     }
     const d = if (hc.disk) |*dd| dd else return .none;
-    const ref = d.moduleByKey(tip.id, tip.n) orelse return .none;
-    const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, ref.variant) orelse return .none;
+    const ref = d.moduleByBoundary(tip.id, tip.n) orelse return .none;
+    const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, tip.variant) orelse return .none;
     const header = d.readModuleHeader(ref.id) catch return .none;
     defer d.allocator.free(header);
     const inventory = d.moduleInventory(ref.id) orelse return .none;

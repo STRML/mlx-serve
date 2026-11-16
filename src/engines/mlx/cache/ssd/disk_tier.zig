@@ -57,6 +57,7 @@ const io_util = @import("../../../../sdk/util/io_util.zig");
 const disk_writer = @import("writer.zig");
 pub const module_record = @import("module_record.zig");
 const log = @import("../../../../sdk/util/log.zig");
+const boundary_mod = @import("../boundary.zig");
 
 const KVCache = transformer_mod.KVCache;
 
@@ -469,14 +470,11 @@ pub const DiskTier = struct {
         has_tools: bool,
         quant: kv_quant.KVQuantConfig,
         media: []const MediaSpan = &.{},
-        session: u64 = 0,
-        seq: u64 = 0,
-        variant: u64 = 0,
         header: []const u8,
         tensors: []const module_record.Tensor,
     };
 
-    /// A committed module record named by its (variant-folded) prefix key and token count; slices belong to the tier.
+    /// A committed module record found by its boundary; the slices belong to the tier.
     pub const ModuleRef = struct {
         id: u64,
         tokens: []const u32,
@@ -484,18 +482,16 @@ pub const DiskTier = struct {
         has_tools: bool,
         quant: kv_quant.KVQuantConfig,
         prefix_key: u64,
-        variant: u64,
     };
-    pub const SessionRecord = struct { session: u64, seq: u64, variant: u64, prefix_key: u64, n: usize };
 
-    /// The newest committed record of the prompt boundary `n` tokens long whose (variant-folded) prefix key is
-    /// `prefix_key`: the RAM entry's twin on the SSD, found by identity and never by length or recency.
-    pub fn moduleByKey(self: *DiskTier, prefix_key: u64, n: usize) ?ModuleRef {
+    /// The newest committed record of the prompt boundary `n` tokens long that `boundary.id` names: the RAM entry's
+    /// twin on the SSD, found by identity and never by length or recency.
+    pub fn moduleByBoundary(self: *DiskTier, id: u64, n: usize) ?ModuleRef {
         self.pollModuleWrites();
         var best: ?*const IndexEntry = null;
         for (self.entries.items) |*e| {
-            if (e.kind != .module or e.poisoned or e.module.?.state != .committed) continue;
-            if (e.kv_len != n or @as(u64, @bitCast(e.module.?.manifest.prefix_key)) != prefix_key) continue;
+            if (e.kind != .module or e.poisoned or e.module.?.state != .committed or e.kv_len != n) continue;
+            if (boundary_mod.id(@bitCast(e.module.?.manifest.prefix_key), e.tokens) != id) continue;
             if (best == null or e.id > best.?.id) best = e;
         }
         const e = best orelse return null;
@@ -505,31 +501,8 @@ pub const DiskTier = struct {
             .media = e.media,
             .has_tools = e.has_tools,
             .quant = e.quant,
-            .prefix_key = prefix_key,
-            .variant = e.module.?.manifest.variant,
+            .prefix_key = @bitCast(e.module.?.manifest.prefix_key),
         };
-    }
-
-    pub fn moduleByBoundary(self: *DiskTier, id: u64, n: usize) ?ModuleRef {
-        _ = .{ self, id, n };
-        return null;
-    }
-
-    /// Every committed record a session tagged: the tier's side of the session tip index, read once after a restart.
-    pub fn sessionRecords(self: *DiskTier, out: *std.ArrayList(SessionRecord)) !void {
-        self.pollModuleWrites();
-        for (self.entries.items) |*e| {
-            if (e.kind != .module or e.poisoned or e.module.?.state != .committed) continue;
-            const m = &e.module.?.manifest;
-            if (m.session == 0) continue;
-            try out.append(self.allocator, .{
-                .session = m.session,
-                .seq = m.seq,
-                .variant = m.variant,
-                .prefix_key = @bitCast(m.prefix_key),
-                .n = e.kv_len,
-            });
-        }
     }
 
     pub const ModuleSlice = enum { progress, busy, done };
@@ -603,7 +576,6 @@ pub const DiskTier = struct {
             .scheme = @tagName(input.quant.scheme), .bits = input.quant.bits, .group_size = input.quant.group_size,
             .identity = context.identity, .header_bytes = input.header.len, .token_bytes = @as(u64, n) * 4,
             .tensors = input.tensors, .media = media,
-            .session = input.session, .seq = input.seq, .variant = input.variant,
         }, input.header);
         var owns_record = true;
         defer if (owns_record) record.deinit();
@@ -9508,23 +9480,13 @@ const ModuleSource = struct {
         return tier;
     }
 
-    const Tag = struct { session: u64 = 0, seq: u64 = 0, variant: u64 = 0, key: u64 = 17 };
-
     fn register(tier: *DiskTier, n: u32) !u64 {
-        return registerTagged(tier, n, .{});
-    }
-
-    fn registerSession(tier: *DiskTier, n: u32, session: u64) !u64 {
-        return registerTagged(tier, n, .{ .session = session });
-    }
-
-    fn registerTagged(tier: *DiskTier, n: u32, tag: Tag) !u64 {
         const ids = try testing.allocator.alloc(u32, n);
         defer testing.allocator.free(ids);
         for (ids, 0..) |*id, i| id.* = @intCast(i + 7);
         return (try tier.registerModule(.{
-            .tokens = ids, .prefix_key = tag.key, .has_tools = false, .quant = kv_quant.KVQuantConfig.dense,
-            .header = header, .tensors = tensors, .session = tag.session, .seq = tag.seq, .variant = tag.variant,
+            .tokens = ids, .prefix_key = 17, .has_tools = false, .quant = kv_quant.KVQuantConfig.dense,
+            .header = header, .tensors = tensors,
         })) orelse error.ModuleRegistrationDeclined;
     }
 
@@ -9723,56 +9685,6 @@ test "a v10 module reopens and loads its complete CPU tensor inventory" {
     const data = mlx.mlx_array_data_float32(parts.items[0].arr) orelse return error.NoData;
     try testing.expectEqualSlices(f32, &.{ 1.25, -2.5, 3.75, 9 }, data[0..4]);
     try testing.expectEqual(reopened.total_bytes, reopened.physicalDiskBytes());
-}
-
-fn expectSessionRecords(tier: *DiskTier, a: u64, b: u64, c: u64, d: u64) !void {
-    var records = std.ArrayList(DiskTier.SessionRecord).empty;
-    defer records.deinit(testing.allocator);
-    try tier.sessionRecords(&records);
-    var tagged: usize = 0;
-    var newest_5: u64 = 0;
-    var newest_5_variant: u64 = 0;
-    for (records.items) |r| {
-        tagged += 1;
-        if (r.session == 5 and r.seq > newest_5) {
-            newest_5 = r.seq;
-            newest_5_variant = r.variant;
-        }
-    }
-    try testing.expectEqual(@as(usize, 3), tagged);
-    try testing.expectEqual(@as(u64, 9), newest_5);
-    try testing.expectEqual(@as(u64, 4), newest_5_variant);
-
-    const by_key = tier.moduleByKey(101, 513).?;
-    try testing.expectEqual(b, by_key.id);
-    try testing.expectEqual(@as(u64, 4), by_key.variant);
-    try testing.expectEqual(@as(usize, 513), by_key.tokens.len);
-    try testing.expectEqual(a, tier.moduleByKey(100, 512).?.id);
-    try testing.expectEqual(c, tier.moduleByKey(102, 514).?.id);
-    try testing.expectEqual(d, tier.moduleByKey(103, 515).?.id);
-    try testing.expect(tier.moduleByKey(101, 512) == null);
-    try testing.expect(tier.moduleByKey(104, 516) == null);
-}
-
-test "a module record keeps its session, seq and variant across a reopen, and a key names its record" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, testing.io, &buf);
-    var tier = try ModuleSource.init(base, "r18s");
-    defer tier.deinit();
-    const a = try ModuleSource.registerTagged(&tier, 512, .{ .session = 5, .seq = 3, .key = 100 });
-    const b = try ModuleSource.registerTagged(&tier, 513, .{ .session = 5, .seq = 9, .variant = 4, .key = 101 });
-    const c = try ModuleSource.registerTagged(&tier, 514, .{ .session = 6, .seq = 4, .key = 102 });
-    const d = try ModuleSource.registerTagged(&tier, 515, .{ .key = 103 });
-    _ = try ModuleSource.registerTagged(&tier, 516, .{ .session = 5, .seq = 50, .key = 104 });
-    for ([_]u64{ a, b, c, d }) |id| try ModuleSource.publish(&tier, id);
-    tier.drainWriter();
-    try expectSessionRecords(&tier, a, b, c, d);
-
-    var reopened = try ModuleSource.init(base, "r18s");
-    defer reopened.deinit();
-    try expectSessionRecords(&reopened, a, b, c, d);
 }
 
 test "stable module IDs miss after retirement without touching a replacement" {

@@ -4,8 +4,10 @@
 const std = @import("std");
 
 pub fn id(prefix_key: u64, tokens: []const u32) u64 {
-    _ = .{ prefix_key, tokens };
-    return 0;
+    var h = std.hash.Wyhash.init(prefix_key);
+    h.update(std.mem.sliceAsBytes(tokens));
+    h.update(std.mem.asBytes(&@as(u64, tokens.len)));
+    return h.final();
 }
 
 test "boundary id: equal-length prompts under one key differ, and a key or a length changes it" {

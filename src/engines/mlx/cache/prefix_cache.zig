@@ -23,6 +23,8 @@ const transformer_mod = @import("../transformer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const kv_quant = @import("kv_quant.zig");
 const kv_disk_cache = @import("ssd/disk_tier.zig");
+const session_index_mod = @import("ssd/session_index.zig");
+const boundary_mod = @import("boundary.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const log = @import("../../../sdk/util/log.zig");
 const crt = @import("../../../sdk/util/crt.zig");
@@ -340,10 +342,8 @@ const Entry = struct {
     /// Workload the request belonged to (`server.requestCacheKey`, 0 = anonymous).
     /// Eviction is fair across keys: the key holding the most entries pays first.
     cache_key: u64 = 0,
-    /// The router's session (`X-Session-Key`, 0 = untagged) that committed this entry, and that commit's order
-    /// (`session_seq`): both go to its SSD record. Which entry a session exports is the index's (`session_tips`).
-    session: u64 = 0,
-    seq: u64 = 0,
+    /// `boundary.id` of a module entry's prefix key and tokens: how a session's tip names it.
+    boundary: u64 = 0,
     /// Stable identity for observers; `last_used` moves on every touch.
     id: u64 = 0,
     /// Snapshot of the live KVCache at end of generation. Owns refcount-shared
@@ -738,6 +738,7 @@ pub const HotPrefixCache = struct {
     session_tips: std.AutoHashMapUnmanaged(u64, SessionTip) = .empty,
     session_seq: u64 = 0,
     session_tips_seeded: bool = false,
+    session_index: ?session_index_mod.Index = null,
     /// Tips held in memory, and sessions the persisted index keeps: fields so a test reaches either cheaply.
     session_tip_cap: usize = MAX_SESSION_TIPS,
     session_file_cap: usize = 65536,
@@ -777,6 +778,7 @@ pub const HotPrefixCache = struct {
         }
         self.entries.deinit(self.allocator);
         self.session_tips.deinit(self.allocator);
+        if (self.session_index) |*index| index.deinit();
         self.dropPendingSnapshots();
         if (self.disk) |*d| d.deinit();
         self.disk = null;
@@ -1470,7 +1472,7 @@ pub const HotPrefixCache = struct {
             .cache_key = e.cache_key,
             .has_tools = e.has_tools,
             .media = e.media,
-            .session = e.session,
+            .session = 0,
         };
     }
 
@@ -1481,7 +1483,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items) |*e| {
             const m = e.module orelse continue;
             if (m.tail_from != 0 or e.checked_out_by != null) continue;
-            if (e.tokens.len != tip.n or m.prefix_key != tip.id or m.binding.variant != tip.variant) continue;
+            if (e.tokens.len != tip.n or e.boundary != tip.id) continue;
             return ramHit(e);
         }
         return null;
@@ -1500,8 +1502,8 @@ pub const HotPrefixCache = struct {
         return ramHit(e);
     }
 
-    /// Where a session's newest prompt boundary is: its (variant-folded) prefix key and token count name the entry in
-    /// RAM or on the SSD, `seq` orders a session's commits across restarts.
+    /// Where a session's newest prompt boundary is: `boundary.id` and the token count name the entry in RAM or on the
+    /// SSD, `seq` orders a session's commits across restarts.
     pub const SessionTip = struct { id: u64, n: usize, variant: u64, seq: u64 };
 
     pub const MAX_SESSION_TIPS: usize = 4096;
@@ -1509,22 +1511,39 @@ pub const HotPrefixCache = struct {
     pub fn sessionTip(self: *HotPrefixCache, session: u64) ?SessionTip {
         if (session == 0) return null;
         self.seedSessionTips();
-        return self.session_tips.get(session);
+        if (self.session_tips.get(session)) |tip| return tip;
+        const record = (self.tipIndex() orelse return null).find(session) orelse return null;
+        const tip = tipOf(record);
+        self.noteSessionTip(session, tip, false);
+        return tip;
     }
 
-    /// The SSD tier's tagged records are the tips a restart lost: read them once, and start new commit orders above
-    /// the highest of them. Waits for a tier to exist, so nothing is handed out before it has been read.
+    fn tipOf(record: session_index_mod.Tip) SessionTip {
+        return .{ .id = record.id, .n = @intCast(record.n), .variant = record.variant, .seq = record.seq };
+    }
+
+    /// The persisted index, opened beside the SSD tier's records once there is a tier.
+    fn tipIndex(self: *HotPrefixCache) ?*session_index_mod.Index {
+        if (self.session_index) |*index| return index;
+        const d = if (self.disk) |*dd| dd else return null;
+        const path = std.fmt.allocPrint(self.allocator, "{s}/session-tips.bin", .{d.root}) catch return null;
+        defer self.allocator.free(path);
+        self.session_index = session_index_mod.Index.init(self.allocator, d.io, path, self.session_file_cap) catch return null;
+        return &self.session_index.?;
+    }
+
+    /// The persisted tips are what a restart lost: the newest few return to memory, and new commit orders start above
+    /// every one. Waits for a tier, so nothing is handed out before the file has been read.
     fn seedSessionTips(self: *HotPrefixCache) void {
         if (self.session_tips_seeded) return;
-        const d = if (self.disk) |*dd| dd else return;
+        const index = self.tipIndex() orelse return;
         self.session_tips_seeded = true;
-        var records = std.ArrayList(kv_disk_cache.DiskTier.SessionRecord).empty;
+        var records = std.ArrayList(session_index_mod.Tip).empty;
         defer records.deinit(self.allocator);
-        d.sessionRecords(&records) catch return;
-        for (records.items) |r| {
-            self.session_seq = @max(self.session_seq, r.seq);
-            self.noteSessionTip(r.session, .{ .id = r.prefix_key, .n = r.n, .variant = r.variant, .seq = r.seq });
-        }
+        index.load(&records) catch return;
+        if (records.items.len == 0) return;
+        self.session_seq = @max(self.session_seq, records.items[records.items.len - 1].seq);
+        for (records.items[records.items.len -| self.session_tip_cap..]) |record| self.noteSessionTip(record.session, tipOf(record), false);
     }
 
     fn nextSessionSeq(self: *HotPrefixCache) u64 {
@@ -1533,12 +1552,15 @@ pub const HotPrefixCache = struct {
         return self.session_seq;
     }
 
-    /// A newer commit of a session replaces its tip; an older one (a seeded record) never does.
-    fn noteSessionTip(self: *HotPrefixCache, session: u64, tip: SessionTip) void {
+    /// A newer commit of a session replaces its tip; an older one never does. A commit goes to the persisted index too.
+    fn noteSessionTip(self: *HotPrefixCache, session: u64, tip: SessionTip, persist: bool) void {
         if (session == 0) return;
         if (self.session_tips.get(session)) |old| if (old.seq > tip.seq) return;
-        if (self.session_tips.count() >= MAX_SESSION_TIPS and !self.session_tips.contains(session)) self.dropOldestSessionTip();
-        self.session_tips.put(self.allocator, session, tip) catch {};
+        if (self.session_tips.count() >= self.session_tip_cap and !self.session_tips.contains(session)) self.dropOldestSessionTip();
+        self.session_tips.put(self.allocator, session, tip) catch return;
+        if (!persist) return;
+        const index = self.tipIndex() orelse return;
+        index.append(.{ .session = session, .id = tip.id, .n = tip.n, .variant = tip.variant, .seq = tip.seq });
     }
 
     fn dropOldestSessionTip(self: *HotPrefixCache) void {
@@ -1557,12 +1579,12 @@ pub const HotPrefixCache = struct {
     /// Whether a session other than `session` has the prompt boundary of `e` as its tip: a commit that supersedes `e`
     /// leaves it, and its owed SSD write, for that session's export.
     fn heldByOtherSession(self: *const HotPrefixCache, e: *const Entry, session: u64) bool {
-        const m = e.module orelse return false;
+        if (e.module == null) return false;
         var it = self.session_tips.iterator();
         while (it.next()) |kv| {
             if (kv.key_ptr.* == session) continue;
             const t = kv.value_ptr.*;
-            if (t.id == m.prefix_key and t.n == e.tokens.len and t.variant == m.binding.variant) return true;
+            if (t.id == e.boundary and t.n == e.tokens.len) return true;
         }
         return false;
     }
@@ -1577,8 +1599,9 @@ pub const HotPrefixCache = struct {
         return std.mem.eql(u32, e.tokens[0..ids.len], ids);
     }
 
-    /// `hasModuleCovering` that also records `session` as an owner of the shortest prompt boundary covering `ids`:
-    /// a deduplicated import is about bytes, and who may export them is the index's.
+    /// The refusal of an import as stale. A tagged import is stale only when an entry holds exactly its boundary, which
+    /// then becomes the session's tip: a longer entry or a decode-end tail that merely covers it is another boundary,
+    /// and the session's own is committed beside it. Untagged, any covering entry makes it stale.
     pub fn claimCovering(
         self: *HotPrefixCache,
         binding: ModuleBinding,
@@ -1588,19 +1611,13 @@ pub const HotPrefixCache = struct {
         quant_config: kv_quant.KVQuantConfig,
         session: u64,
     ) bool {
-        var shortest: ?*const Entry = null;
-        var covered = false;
+        if (session == 0) return self.hasModuleCovering(binding, ids, media, has_tools, quant_config);
         for (self.entries.items) |*e| {
-            if (!covers(e, binding, ids, media, has_tools, quant_config)) continue;
-            covered = true;
-            if (e.module.?.tail_from != 0) continue;
-            if (shortest == null or e.tokens.len < shortest.?.tokens.len) shortest = e;
+            if (e.tokens.len != ids.len or !covers(e, binding, ids, media, has_tools, quant_config) or e.module.?.tail_from != 0) continue;
+            self.noteSessionTip(session, .{ .id = e.boundary, .n = e.tokens.len, .variant = e.module.?.binding.variant, .seq = self.nextSessionSeq() }, true);
+            return true;
         }
-        if (!covered or session == 0) return covered;
-        const e = shortest orelse return true;
-        const m = e.module.?;
-        self.noteSessionTip(session, .{ .id = m.prefix_key, .n = e.tokens.len, .variant = m.binding.variant, .seq = self.nextSessionSeq() });
-        return true;
+        return false;
     }
 
     pub fn hasModuleCovering(
@@ -2266,6 +2283,7 @@ pub const HotPrefixCache = struct {
         }
         // Only a prompt boundary a session tagged moves that session's tip.
         const seq: u64 = if (tail_from == 0 and session != 0) self.nextSessionSeq() else 0;
+        const boundary_key = boundary_mod.id(variantKey(prefix_key, binding.variant), ids);
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
             .tokens = keys[0],
@@ -2273,8 +2291,7 @@ pub const HotPrefixCache = struct {
             .has_tools = has_tools,
             .quant_config = quant_config,
             .cache_key = cache_key,
-            .session = session,
-            .seq = seq,
+            .boundary = boundary_key,
             .id = self.bumpCounter(),
             .last_used = self.bumpCounter(),
             .touched_ms = crt.monotonicMs(),
@@ -2299,7 +2316,7 @@ pub const HotPrefixCache = struct {
                 @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
             });
         }
-        if (seq != 0) self.noteSessionTip(session, .{ .id = variantKey(prefix_key, binding.variant), .n = ids.len, .variant = binding.variant, .seq = seq });
+        if (seq != 0) self.noteSessionTip(session, .{ .id = boundary_key, .n = ids.len, .variant = binding.variant, .seq = seq }, true);
         self.logResident();
         return .{ .ok = ids.len };
     }
@@ -2501,9 +2518,6 @@ pub const HotPrefixCache = struct {
             .has_tools = e.has_tools,
             .quant = e.quant_config,
             .media = e.media,
-            .session = e.session,
-            .seq = e.seq,
-            .variant = e.module.?.binding.variant,
             .header = exported.header[0..exported.out.header_len],
             .tensors = inventory_,
         }) catch |err| {
