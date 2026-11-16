@@ -28,6 +28,15 @@ The model plugin table (`ModelTable`) and every struct that crosses it. Extern l
 | `stream_room_cell` | `u64 = 16_384 + 1_024` | The request the stream rooms are billed at (16K prompt + 1K reply): a bank calibration's evidence cell. |
 | `max_round_tokens` | `32` | The most tokens a native drafter's round commits (`Round.tokens`). |
 
+### `AuxImportPlan` (extern struct)
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `size` | `u32` | `@sizeOf(AuxImportPlan)` |  |
+| `peak` | `u64` | `0` |  |
+| `loaded` | `u64` | `0` |  |
+| `destination` | `u64` | `0` |  |
+
 ### `LayerSpan` (extern struct)
 
 The layers this process serves when a model is split across machines; null = all of them.
@@ -759,7 +768,7 @@ A plugin's opaque per-slot state beside the KV cache, under the RAM prefix cache
 | `size` | `u32` | `@sizeOf(AuxHooks)` |  |
 | `reserve` | `*const fn (m: *anyopaque, slot: u32, tokens: u64) callconv(.c) Verdict` |  |  |
 | `commit` | `*const fn (m: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict` |  |  |
-| `snapshot` | `*const fn (m: *anyopaque, slot: u32, out: *Handle) callconv(.c) Verdict` |  | Transfers the slot's completed capture to the caller; null means no checkpoint was reached. |
+| `snapshot` | `*const fn (m: *anyopaque, slot: u32, out: *Handle) callconv(.c) Verdict` |  | Transfers the slot's completed capture to the caller; a plugin that can also hands over the state where an armed prompt it never finished stopped (`describe` says where). Null means neither. |
 | `restore_at` | `*const fn (m: *anyopaque, slot: u32, snap: Handle, pos: u64) callconv(.c) Verdict` |  | Accepts only `pos == snap.n`; builds the replacement before installing it. The caller keeps the snapshot. |
 | `slice` | `*const fn (m: *anyopaque, snap: Handle, len: u64, out: *Handle) callconv(.c) Verdict` |  | A snapshot of the longest prefix of at most `len` tokens the plugin restores at (`describe` says where): a clone at `len == snap.n`, shorter where the plugin can cut its state; named `.unsupported` when it holds none. |
 | `handoff` | `*const fn (m: *anyopaque, from_slot: u32, to_slot: u32) callconv(.c) Verdict` |  |  |
@@ -772,6 +781,8 @@ A plugin's opaque per-slot state beside the KV cache, under the RAM prefix cache
 | `import_plan` | `*const fn (m: *anyopaque, header: Str, out_peak_bytes: *u64) callconv(.c) Verdict` |  | Allocation-free validation of the complete header/inventory against the loaded instance. Reports the additional simultaneous load/construction/restore peak, including MLX copy scratch. Disk hooks may return named `.unsupported` while the instance retains its RAM snapshot capability. |
 | `export_arrays` | `*const fn (m: *anyopaque, snap: Handle, out: *AuxExport) callconv(.c) Verdict` |  | Exports used rows, not spare capacity, into caller-owned storage; insufficient capacity is named. |
 | `import_arrays` | `*const fn (m: *anyopaque, ids: Span(u32), header: Str, arrays: Span(AuxTensor), out: *Handle) callconv(.c) Verdict` |  | Borrows all inputs; validates every name/shape/dtype before allocating destination state. Success returns an evaluated, independent snapshot with growth headroom; failure frees partial state and leaves out null. |
+| `import_plan_details` | `?*const fn (m: *anyopaque, header: Str, out: *AuxImportPlan) callconv(.c) Verdict` | `null` |  |
+| `settings_key` | `?*const fn (m: *anyopaque) callconv(.c) u64` | `null` | A hash of this loaded instance's settings that change the bytes it caches, beyond the engine's own (a numerics lever, the arm the load chose). Hosts refuse a peer's entry when it differs; null contributes nothing. |
 
 ### `CacheHooks` (extern struct)
 

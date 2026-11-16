@@ -90,6 +90,8 @@ pub const Conn = struct {
     ablation_header: [192]u8 = undefined,
     ablation_header_len: usize = 0,
     cache_export: bool = false,
+    /// The current request's `X-Session-Key`, hashed by `sessionTag` (0 = none).
+    session_key: u64 = 0,
     cache_deadline_ms: ?u64 = null,
     cache_deadline_invalid: bool = false,
 
@@ -105,6 +107,7 @@ pub const Conn = struct {
         c.sse_headers_sent = false;
         c.length_framed = false;
         c.cache_export = false;
+        c.session_key = 0;
         c.cache_deadline_ms = null;
         c.cache_deadline_invalid = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
@@ -120,6 +123,7 @@ pub const Conn = struct {
         c.clearAblation();
         c.ablation_key = findHeaderValue(headers, "x-ablation-key");
         c.cache_export = if (findHeaderValue(headers, "x-cache-export")) |v| std.mem.eql(u8, v, "1") else false;
+        c.session_key = if (findHeaderValue(headers, "x-session-key")) |v| sessionTag(v) else 0;
         c.cache_deadline_ms = null;
         c.cache_deadline_invalid = false;
         if (findHeaderValue(headers, "x-cache-deadline-ms")) |v| {
@@ -130,6 +134,13 @@ pub const Conn = struct {
             const now: u64 = @intCast(@max(head_read_ms, 0));
             c.cache_deadline_ms = std.math.add(u64, now, duration) catch std.math.maxInt(u64);
         }
+    }
+
+    /// The tag a session's entries carry: a hash of the router's key, never 0 (0 means untagged).
+    pub fn sessionTag(key: []const u8) u64 {
+        if (key.len == 0) return 0;
+        const h = std.hash.Wyhash.hash(0x7365_7373_696f_6e31, key);
+        return if (h == 0) 1 else h;
     }
 
     fn parsePositiveDecimal(value: []const u8) ?u64 {
@@ -505,4 +516,23 @@ test "Conn: a request's X-Ablation line rides both response heads, and the next 
         conn.noteRequestHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n");
         try testing.expect(conn.ablation_key == null and conn.ablation == null and conn.ablationHeader().len == 0);
     }
+}
+
+test "Conn tags a request with its X-Session-Key and clears it when the next request has none" {
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 9 }, .port = 4242 } };
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = -1, .address = peer } }, std.Io.Threaded.global_single_threaded.io());
+    try testing.expectEqual(@as(u64, 0), conn.session_key);
+
+    conn.noteRequestHeaders("POST /v1/chat/completions HTTP/1.1\r\nX-Session-Key: abc123\r\n\r\n");
+    try testing.expectEqual(Conn.sessionTag("abc123"), conn.session_key);
+    try testing.expect(conn.session_key != 0);
+    try testing.expect(Conn.sessionTag("abc123") != Conn.sessionTag("abc124"));
+
+    conn.noteRequestHeaders("POST /v1/chat/completions HTTP/1.1\r\nX-Session-Key: abc123\r\nX-Cache-Deadline-Ms: nope\r\n\r\n");
+    try testing.expectEqual(Conn.sessionTag("abc123"), conn.session_key);
+
+    conn.noteRequestHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expectEqual(@as(u64, 0), conn.session_key);
+    try testing.expectEqual(@as(u64, 0), Conn.sessionTag(""));
 }
