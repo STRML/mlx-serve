@@ -91,3 +91,10 @@ fn viewOf(x: mlx.mlx_array, axis: ?Shard.Axis, sh: Shard, s: mlx.mlx_stream) !ml
     try mlx.check(mlx.mlx_slice(&o, x, &start, shape.len, &stop, shape.len, &strides, shape.len, s));
     return o;
 }
+
+test "mode.build: a tensor group's mode beside a --dist split is refused before it reads a weight" {
+    var w = Weights.init(std.testing.allocator);
+    defer w.deinit();
+    const cfg: Config = undefined;
+    try std.testing.expectError(error.Dsv41ModeBesideSplit, build(std.testing.allocator, &cfg, &w, .{ .ctx = null }, .{ .tp = .{ .rank = 0, .size = 2 } }, .{ .rank = 0, .size = 4 }));
+}

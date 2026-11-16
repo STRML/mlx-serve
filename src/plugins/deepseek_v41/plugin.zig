@@ -919,6 +919,7 @@ test "deepseek_v41 resident bill: neither the vision tower nor DSpark stages tha
 
 test {
     _ = config;
+    _ = mode;
     _ = bill_mod;
     _ = media;
     _ = @import("contract.zig");

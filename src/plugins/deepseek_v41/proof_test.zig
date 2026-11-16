@@ -1066,7 +1066,49 @@ test "deepseek_v41 modes: a swap drops every slot's state, live and parked, so a
     }
 }
 
-test "deepseek_v41 modes: tp_mode is refused by name at a size below 2 or a rank past it, and beside a --dist split" {
+test "deepseek_v41 modes: on the wide prompt path the whole model gives today's logits with a TP4 model's wide prompts between its steps" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41TpFiles(arena.allocator(), 7);
+    var want: [proof.steps.len][]f32 = undefined;
+    {
+        const wide = try WideTwin.open(files);
+        defer wide.close();
+        var pos: u32 = 0;
+        for (proof.steps, &want) |st, *w| {
+            w.* = try stepLogits(wide.t, 1, st, pos);
+            pos += @intCast(st.ids.len);
+        }
+    }
+    defer for (want) |w| testing.allocator.free(w);
+
+    LoneGroup.arm();
+    defer LoneGroup.disarm();
+    const t = try Twin.openWith(files, "", tp4_setting);
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    const tp = m.modes.tp orelse return error.NoTpMode;
+    // Both models off their compiled regions: every call runs the wide layer and its process-wide scratch rings.
+    const kept = .{ m.modes.tp1.regions, tp.regions };
+    m.modes.tp1.regions = kept[0][0..0];
+    tp.regions = kept[1][0..0];
+    defer {
+        m.modes.tp1.regions = kept[0];
+        tp.regions = kept[1];
+    }
+    var pos: u32 = 0;
+    for (proof.steps, want) |st, w| {
+        _ = mlx.mlx_array_free(try dsv41.prefill(tp, testing.allocator, &.{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5 }, null));
+        const got = try stepLogits(t, 1, st, pos);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(f32, w, got);
+        pos += @intCast(st.ids.len);
+    }
+}
+
+test "deepseek_v41 modes: tp_mode is refused by name at a size below 2 or a rank past it" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
