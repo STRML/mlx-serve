@@ -28,6 +28,7 @@ const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
 const chat_mod = @import("host/chat/chat.zig");
 const server_mod = @import("host/http/server.zig");
 const ablation_api = @import("host/api/ablation.zig");
+const internal_install = @import("host/internal/install.zig");
 const launchSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").launchSsmCheckpointStride;
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const ane_lm = @import("engines/ane/lm.zig");
@@ -368,6 +369,11 @@ fn printUsage(io: std.Io) void {
         \\  --ablation-profiles <dir> --ablation-key-file <path>
         \\                      Per-request directional ablation (docs/api.md);
         \\                        the key file is 0600, at least 32 bytes.
+        \\  --internal-key-file <path>
+        \\                      Enable /v1/internal/* (the layout switch's drain,
+        \\                        tp4, join, tp1, abort and mode poll) behind the
+        \\                        key in this file (0600, at least 32 bytes, never
+        \\                        the --api-key). Without it those paths 404.
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
@@ -552,8 +558,10 @@ fn printUsage(io: std.Io) void {
         \\  --dist-size <n>     Macs in the group, this one included (default 2).
         \\                        Past 2: DeepSeek-V4.1 with --dist tensor only;
         \\                        --dist-device lists the port facing each rank
-        \\                        in rank order, this Mac's own `-` (rank 0), and
+        \\                        in rank order, this Mac's own `-` at its rank, and
         \\                        each worker runs `worker --rank k --size n`
+        \\  --dist-rank <r>     This box's rank for --internal-key-file switches
+        \\                        (default 0; must be below --dist-size).
         \\  --dist-join-timeout <s>  How long after startup a missing worker reads as
         \\                        the group forming before the log names its rank
         \\                        (default 0 for a pair, 600 past it; the load
@@ -714,6 +722,7 @@ pub fn main(init: std.process.Init) !void {
     var dist_split: ?u32 = null;
     var dist_model: ?[]const u8 = null;
     var dist_size: u32 = 2;
+    var dist_rank: u32 = 0;
     var dist_join_timeout: ?u32 = null;
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
@@ -737,6 +746,7 @@ pub fn main(init: std.process.Init) !void {
     var kv_attn_mode: server_mod.KvAttnMode = .auto;
     var ablation_profiles: ?[]const u8 = null;
     var ablation_key_file: ?[]const u8 = null;
+    var internal_key_file: ?[]const u8 = null;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
@@ -833,6 +843,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--dist-size") and i + 1 < args.len) {
             i += 1;
             dist_size = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--dist-rank") and i + 1 < args.len) {
+            i += 1;
+            dist_rank = std.fmt.parseInt(u32, args[i], 10) catch {
+                log.err("[dist] --dist-rank takes an integer >= 0, got '{s}'\n", .{args[i]});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, args[i], "--dist-join-timeout") and i + 1 < args.len) {
             i += 1;
             dist_join_timeout = try std.fmt.parseInt(u32, args[i], 10);
@@ -1216,6 +1232,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ablation-key-file") and i + 1 < args.len) {
             i += 1;
             ablation_key_file = args[i];
+        } else if (std.mem.eql(u8, args[i], "--internal-key-file") and i + 1 < args.len) {
+            i += 1;
+            internal_key_file = args[i];
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
@@ -1240,6 +1259,26 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+    if (dist_rank >= dist_size) {
+        log.err("[dist] --dist-rank {d} must be below --dist-size {d}\n", .{ dist_rank, dist_size });
+        return error.InvalidArgs;
+    }
+    if (dist_rank != 0 and (internal_key_file == null or dist_mode == null)) {
+        log.err("[dist] --dist-rank above 0 requires --internal-key-file and --dist\n", .{});
+        return error.InvalidArgs;
+    }
+    const switch_config: ?@import("host/internal/formation.zig").Config = if (internal_key_file != null and dist_mode != null) blk: {
+        const cfg: @import("host/internal/formation.zig").Config = .{
+            .coordinator = dist_coordinator orelse return error.InvalidArgs,
+            .device = dist_device orelse return error.InvalidArgs,
+            .model_dir = dist_model orelse run_model_dir orelse model_dir,
+            .size = dist_size,
+            .rank = dist_rank,
+        };
+        if (cfg.size < 2 or cfg.size > @import("engines/mlx/cluster/distributed.zig").max_ranks or cfg.rank >= cfg.size or cfg.model_dir.len == 0) return error.InvalidArgs;
+        try @import("engines/mlx/cluster/distributed.zig").primeEnv(.{ .rank = cfg.rank, .size = cfg.size, .coordinator = cfg.coordinator, .device = cfg.device });
+        break :blk cfg;
+    } else null;
     if (!server_mod.mtpAllowedByDefault(mtp_forced, mlx.metalKernelsAvailable(), mlx.cudaAvailable())) enable_mtp = false;
 
     // One value for the three media seams (they run under gen.zig with no
@@ -1404,6 +1443,8 @@ pub fn main(init: std.process.Init) !void {
         server_mod.g_metrics = m;
     }
     defer server_mod.g_metrics = null;
+    server_mod.g_internal = internal_install.launch(allocator, io, internal_key_file, server_mod.g_api_key, switch_config) catch std.process.exit(1);
+    defer server_mod.g_internal = null;
 
     // ── GGUF early-branch: route to an embedded engine ──
     //
@@ -1501,7 +1542,7 @@ pub fn main(init: std.process.Init) !void {
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
 
-    if (dist_mode) |mode| {
+    if (switch_config == null) if (dist_mode) |mode| {
         const coordinator = dist_coordinator orelse {
             log.err("--dist needs --dist-coordinator IP:PORT (this Mac's address the worker connects to)\n", .{});
             std.process.exit(1);
@@ -1515,8 +1556,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
-        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @intFromEnum(mode), group_model, dist_split, dist_size, dist_join_timeout));
-    }
+        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @backingInt(mode), group_model, dist_split, dist_size, dist_join_timeout));
+    };
 
     if (serve_mode) {
         // Headless boot: `--model-dir` given, no `--model`. Start with no

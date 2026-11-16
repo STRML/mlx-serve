@@ -68,6 +68,14 @@ pub var g_api_key: ?[]const u8 = null;
 /// unless `--api-key` is set.
 pub var g_api_key_strict: bool = false;
 
+/// `--internal-key-file`: the layout switch (plan 61c) and the key its `/v1/internal/*` takes, set once before serving;
+/// null = no `/v1/internal/*`, no admission gate, and `/health` answers as it always did.
+pub var g_internal: ?@import("../internal/install.zig").Installed = null;
+
+pub fn internalSwitch() ?*@import("../internal/switch.zig").Switch {
+    return if (g_internal) |inst| inst.sw else null;
+}
+
 /// `--ablation-profiles` + `--ablation-key-file` (`api/ablation.zig`), set once before serving; null = off.
 pub var g_ablation: ?@import("../api/ablation.zig").Set = null;
 
