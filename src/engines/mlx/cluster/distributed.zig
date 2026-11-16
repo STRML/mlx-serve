@@ -2869,7 +2869,6 @@ pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode
     if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable; // a cluster exists only on macOS
     try checkHost(cfg, mode);
     try primeEnv(cfg);
-    preferFastSynch();
     cluster().group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split, .size = cfg.size, .join_timeout_s = join_timeout_s orelse defaultJoinTimeout(cfg.size), .started_us = io_util.nowUsMonotonic(io) };
     h3_split.hooks().* = .{ .serves = &serves, .plan_rows = &rowsPair, .note_job = &noteJob };
     const t = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, waitForWorker, .{ io, cfg });
