@@ -60,6 +60,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken
   outside a step (`armPrompt` at a restored boundary) goes as `.capture`. The ranks' caches are equal (`tpStream`
   asserts it), so the SSD tier writes rank 0's and a disk import sends the worker its tensors (`tpLoad`).
+- `tp_mode` loads a tensor group's rank (`mode.Modes.tp`) beside the whole model, over views of the same map and built
+  FIRST (`init` consumes its map). `swapMode` frees every slot's state with no `tpFree`; turns restore from the cache.
 - Under `tp` rank 0 alone holds the vision tower: a chunk's image rows ride with its step (`tp_step` `images`), the
   worker splices them at offset 0, so a rank's splice must depend only on the chunk's own rows (`chunkImageRows`).
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.

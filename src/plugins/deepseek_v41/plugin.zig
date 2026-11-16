@@ -9,6 +9,7 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const dsv41 = @import("deepseek_v41.zig");
+pub const mode = @import("mode.zig");
 const vision = @import("vision.zig");
 const media = @import("media.zig");
 const bill_mod = @import("bill.zig");
@@ -83,7 +84,9 @@ pub fn moduleOf(mp: *anyopaque) *Module {
 pub const Model = struct {
     cfg: config.Config,
     weights: Weights,
+    /// The active mode's model (`modes.current()`).
     mdl: *dsv41.Dsv41Model,
+    modes: mode.Modes,
     tower: ?vision.Dsv41Vision,
     /// the pack whose vision tower the media hook reads for each image (`tower`
     /// then null).
@@ -160,6 +163,25 @@ fn activate(m: *Model, slot: u32) !void {
     m.owner = slot;
 }
 
+/// Makes `to` the serving mode. Every slot's state goes: the live one, the parked ones and the idle one, each freed
+/// with no `tpFree` (a group's followers drop theirs with the group), and `owner` resets, so the next turn on any slot
+/// restores from the prefix cache. Callers snapshot what they keep first, while the group is whole.
+pub fn swapMode(m: *Model, to: mode.Mode) !void {
+    const next = m.modes.model(to) orelse return error.Dsv41ModeAbsent;
+    var it = m.parked.valueIterator();
+    while (it.next()) |k| k.deinit();
+    m.parked.clearRetainingCapacity();
+    if (m.idle) |*k| k.deinit();
+    m.idle = null;
+    m.owner = 0;
+    for ([_]*dsv41.Dsv41Model{ m.mdl, next }) |x| if (x.dec_state) |*st| {
+        st.deinit();
+        x.dec_state = null;
+    };
+    m.modes.active = to;
+    m.mdl = next;
+}
+
 fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (!auxEnabled(mp)) {
@@ -234,6 +256,9 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
             error.StreamedWeightsUnsupported => Verdict.refuse(.unsupported, "deepseek_v41: a streamed (experts.bin) pack needs the macOS build's expert streamer"),
             error.Dsv41TpStreamedExperts => Verdict.refuse(.unsupported, "deepseek_v41: streamed experts do not run split across two Macs; turn stream_experts off (each Mac holds half the experts)"),
             error.Dsv41PairStreamedExperts => Verdict.refuse(.unsupported, "deepseek_v41: stream_experts does not run on a layer split across two Macs; turn it off (each Mac would open slot rows for every layer)"),
+            error.Dsv41TpModeSetting => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode needs a size of 2 or more and a rank below it"),
+            error.Dsv41ModeBesideSplit => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode does not load beside a --dist split"),
+            error.Dsv41ShardUneven => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode's size does not divide the heads and experts"),
             error.Dsv41TpOutsideQuant => Verdict.refuse(.unsupported, "deepseek_v41: a pack read by an outside quant plugin does not run split across two Macs"),
             error.OutsideQuantRefused => Verdict.refuse(.unsupported, "deepseek_v41: the outside quant plugin refused the pack (the log names why)"),
             error.StreamedBankUnclaimed => Verdict.refuse(.unsupported, "deepseek_v41: no installed quant plugin streams this pack's experts.bin (OpensourceWTF's EXL3 repacks: install turboexl3_ds41)"),
@@ -271,6 +296,18 @@ fn mtpSetting(settings_json: []const u8) ?bool {
     return parsed.value.mtp;
 }
 
+/// The per-model `tp_mode` setting (`{"tp_mode": {"rank": 1, "size": 4}}`): this box's rank of the tensor group whose
+/// model loads beside the whole one (`mode.Modes.tp`).
+fn tpModeSetting(settings_json: []const u8) !?mode.Shard {
+    if (settings_json.len == 0) return null;
+    const S = struct { tp_mode: ?struct { rank: u32, size: u32 } = null };
+    const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const t = parsed.value.tp_mode orelse return null;
+    if (t.size < 2 or t.rank >= t.size) return error.Dsv41TpModeSetting;
+    return .{ .rank = t.rank, .size = t.size };
+}
+
 fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     const io = std.Io.Threaded.global_single_threaded.io();
     const c = config.of(ctx.parsed);
@@ -294,8 +331,9 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     defer if (quant) |q| q.close();
     // A pack an outside plugin reads has no tower reader here: its weights leave before the bank sizes its rows.
     if (quant != null) m.weights.dropPrefix("vision.");
-    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant });
-    errdefer m.mdl.deinit();
+    m.modes = try mode.build(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant }, try tpModeSetting(ctx.settings_json.slice()));
+    errdefer m.modes.deinit();
+    m.mdl = m.modes.tp1;
     // The fused Markov chain's kernels compiled now, not in the first draft.
     if (m.mdl.dspark) |*w| try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
     m.bank = null;
@@ -402,7 +440,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     while (it.next()) |k| k.deinit();
     m.parked.deinit(gpa);
     if (m.idle) |*k| k.deinit();
-    m.mdl.deinit();
+    m.modes.deinit();
     m.weights.deinit();
     gpa.destroy(m);
 }
