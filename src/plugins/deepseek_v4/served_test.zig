@@ -1259,6 +1259,8 @@ test "deepseek_v41 served: under the group backoff, priced-out drafts teach the 
     var g: Group = undefined;
     try g.open(try fixture.v41DsparkFiles(arena.allocator(), 7), &.{ &.{ 3, 17, 42, 9, 7, 25, 1, 60 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6 } });
     defer g.close();
+    // A backoff that has seen rounds: a fresh one clamps its first round's wall to its gain, so a zero-gain round cannot lose.
+    g.p.xfm.dspark_group_drafting = .{ .gain = 10, .wall = 10 };
     for (&g.gens) |*gen| {
         gen.dspark_pol.?.calib.seen = @splat(1e6);
         gen.dspark_pol.?.calib.hit = @splat(0);
@@ -1274,7 +1276,8 @@ test "deepseek_v41 served: under the group backoff, priced-out drafts teach the 
         try testing.expect(gen.dspark_pol.?.drafting.owed == 0 and gen.dspark_pol.?.drafting.wall == 0);
     }
     try testing.expect(staged > 0);
-    try testing.expect(g.p.xfm.dspark_group_drafting.wall > 0);
+    // The round's draft cost against no gain: the group's backoff owes rounds without a draft.
+    try testing.expect(g.p.xfm.dspark_group_drafting.owed >= 1);
 }
 
 test "deepseek_v41 served: a group slot whose drafts are priced out with rows to spare backs off, as a solo slot does (slot backoff)" {
@@ -1289,8 +1292,10 @@ test "deepseek_v41 served: a group slot whose drafts are priced out with rows to
     var g: Group = undefined;
     try g.open(try fixture.v41DsparkFiles(arena.allocator(), 7), &.{ &.{ 3, 17, 42, 9, 7, 25, 1, 60 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6 } });
     defer g.close();
+    // A backoff that has seen rounds: a fresh one clamps its first round's wall to its gain, so a zero-gain round cannot lose.
     // Calibrations that say no stage draft lands: the group buys no stage row.
     for (&g.gens) |*gen| {
+        gen.dspark_pol.?.drafting = .{ .gain = 10, .wall = 10 };
         gen.dspark_pol.?.calib.seen = @splat(1e6);
         gen.dspark_pol.?.calib.hit = @splat(0);
     }
