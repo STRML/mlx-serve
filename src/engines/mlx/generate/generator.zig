@@ -176,6 +176,8 @@ pub const Generator = struct {
     dspark_plain: u64 = 0,
     /// Rounds run as one slot of a DSpark group round (`spec/dspark_group.zig`), included in `dspark_attempted`.
     dspark_group_rounds: u64 = 0,
+    /// The group rounds in which this slot drafted nothing (`dspark_plain` also counts solo plain ticks).
+    dspark_group_plain: u64 = 0,
 
     // ── Gemma 4 assistant drafter state ──
     // External drafter model (cross-attends into target's KV). When

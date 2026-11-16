@@ -323,7 +323,10 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
                 gen.dspark_copy_accepted += accepted[k];
                 if (gen.dspark_pol) |*pol| pol.copy.observe(suffix[k], @intCast(d.len), accepted[k]);
             },
-            .plain => gen.dspark_plain += 1,
+            .plain => {
+                gen.dspark_plain += 1;
+                gen.dspark_group_plain += 1;
+            },
         }
         gen.dspark_group_rounds += 1;
     }
