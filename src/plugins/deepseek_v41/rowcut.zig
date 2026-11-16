@@ -413,48 +413,133 @@ pub const RouteCrc = struct {
     }
 };
 
-/// What a TP4 prompt chunk needs from the mode it runs in. Rank 0 runs the chunk on its TP1 model alone (`run`, which
-/// hands back the slot's snapshot after it), then `ship` sends that snapshot's cache tensors to every other rank under
-/// its id and the DSpark stages it holds: `dsv41.tpLoad`'s path through the cluster's `tp_load` hook in serving, a
-/// recorder in a test.
+/// A chunk's append-only rows since `p0`, with its bounded windows and open pooling groups.
+pub fn prefillPlan(m: *const dsv41.Dsv41Model, p0: usize, n: usize, stages: usize) !@import("cache_codec.zig").Plan {
+    if (p0 >= n) return error.DistPeerDiverged;
+    var p = try dsv41.shipPlan(m, n, stages);
+    const len = p.len;
+    p.len = 0;
+    p.loaded = 0;
+    for (0..len) |i| {
+        var spec = p.items[i];
+        spec.rows -= startRow(&p, spec, p0);
+        if (spec.rows == 0) continue;
+        p.items[p.len] = spec;
+        p.len += 1;
+        p.loaded += try spec.bytes();
+    }
+    return p;
+}
+
+fn startRow(p: *const @import("cache_codec.zig").Plan, spec: @import("cache_codec.zig").Spec, p0: usize) usize {
+    return switch (spec.kind) {
+        .comp, .index => p0 / p.layout.ratios[spec.layer],
+        .hist => p0,
+        else => 0,
+    };
+}
+
 pub const LeaderPrefill = struct {
     ctx: ?*anyopaque = null,
     whole: *const dsv41.Dsv41Model,
     run: *const fn (ctx: ?*anyopaque, ids: []const u32, p0: usize) anyerror!*const dsv41.Snap,
-    ship: *const fn (ctx: ?*anyopaque, id: u64, ids: []const u32, tensors: []const A, stages: usize) anyerror!void,
+    ship: *const fn (ctx: ?*anyopaque, id: u64, p0: usize, n: usize, tensors: []const A, stages: usize) anyerror!void,
 };
 
-/// Rank 0's half of a prompt chunk (`ids` from position `p0`): the chunk on the TP1 model, then its state to the other
-/// ranks. Returns the snapshot `run` made.
+/// Rank zero runs the whole model, then sends new global rows and bounded state to each follower.
 pub fn prefillOnLeader(gpa: std.mem.Allocator, g: Group, lp: LeaderPrefill, ids: []const u32, p0: usize) !*const dsv41.Snap {
     if (g.rank != 0) return error.Dsv41RowCutNotLeader;
     const sn = try lp.run(lp.ctx, ids, p0);
     if (g.size == 1) return sn;
-    const xs = try dsv41.planTensors(lp.whole, gpa, sn, try dsv41.shipPlan(lp.whole, sn.n, lp.whole.n_mtp));
-    defer dsv41.freeArrays(gpa, xs);
-    try lp.ship(lp.ctx, sn.tp_id, sn.ids, xs, lp.whole.n_mtp);
+    const p = try prefillPlan(lp.whole, p0, sn.n, lp.whole.n_mtp);
+    const xs = try gpa.alloc(A, p.len);
+    var made: usize = 0;
+    defer {
+        for (xs[0..made]) |x| _ = mlx.mlx_array_free(x);
+        gpa.free(xs);
+    }
+    for (p.specs(), xs) |spec, *o| {
+        const start = startRow(&p, spec, p0);
+        var full = spec;
+        full.rows += start;
+        if (spec.kind == .hist) {
+            o.* = mlx.mlx_array_new_data(sn.hist[start..].ptr, &[_]c_int{@intCast(spec.rows)}, 1, .uint32);
+            made += 1;
+            continue;
+        }
+        const x = try dsv41.snapshotTensor(lp.whole, sn, full);
+        defer _ = mlx.mlx_array_free(x);
+        o.* = try view(lp.whole.s, x, 0, start, start + spec.rows);
+        made += 1;
+    }
+    try dsv41.evalAll(xs);
+    try lp.ship(lp.ctx, sn.tp_id, p0, sn.n, xs, lp.whole.n_mtp);
     return sn;
 }
 
-/// A follower's half: rank 0's snapshot `id` rebuilt from the tensors it shipped with `stages` DSpark stages, into
-/// `snaps` under that id (the next TP4 turn restores it). The KV is whole on every rank, so the follower's TP1 model
-/// takes it as is; a follower without stages (rank 0 drafts alone) skips their tensors.
-pub fn importOnFollower(gpa: std.mem.Allocator, g: Group, whole: *const dsv41.Dsv41Model, snaps: *dsv41.Snaps, id: u64, ids: []const u32, tensors: []const A, stages: usize) !void {
+fn replace(dst: *A, src: A) !void {
+    var kept = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(kept);
+    try mlx.check(mlx.mlx_array_set(&kept, src));
+    if (dst.ctx != null) _ = mlx.mlx_array_free(dst.*);
+    dst.* = kept;
+}
+
+/// MLA caches retain their whole latent width; only query heads and weights are sharded.
+pub fn importOnFollower(gpa: std.mem.Allocator, g: Group, m: *const dsv41.Dsv41Model, st: *dsv41.State, p0: usize, n: usize, tensors: []const A, stages: usize) !void {
     if (g.rank == 0) return error.Dsv41RowCutLeaderImport;
-    const own = try dsv41.shipPlan(whole, ids.len, whole.n_mtp);
-    if (stages == whole.n_mtp) return dsv41.importPlan(whole, gpa, snaps, id, ids, tensors, own);
-    if (whole.n_mtp != 0) return error.Dsv41RowCutStagesMissing;
-    const sent = try dsv41.shipPlan(whole, ids.len, stages);
-    if (tensors.len != sent.len) return error.DistPeerDiverged;
-    const kept = try gpa.alloc(A, own.len);
-    defer gpa.free(kept);
-    var k: usize = 0;
-    for (sent.specs(), tensors) |spec, x| {
-        if (spec.kind == .ds or spec.kind == .mh) continue;
-        kept[k] = x;
-        k += 1;
+    if (m.n_mtp != stages and m.n_mtp != 0) return error.Dsv41RowCutStagesMissing;
+    if (st.n != p0 or st.verify != null) return error.DistPeerDiverged;
+    const p = try prefillPlan(m, p0, n, stages);
+    if (tensors.len != p.len) return error.DistPeerDiverged;
+    for (p.specs(), tensors) |spec, x| {
+        if (m.n_mtp == 0 and (spec.kind == .ds or spec.kind == .mh)) continue;
+        const shape = [_]c_int{ @intCast(spec.rows), @intCast(spec.width) };
+        if (!std.mem.eql(c_int, mlx.getShape(x), shape[0..spec.rank()]) or mlx.mlx_array_dtype(x) != spec.dtype) return error.DistPeerDiverged;
     }
-    try dsv41.importPlan(whole, gpa, snaps, id, ids, kept, own);
+    st.tp_synced = false;
+    for (st.layers) |*l| {
+        if (l.pend_kv.ctx != null) _ = mlx.mlx_array_free(l.pend_kv);
+        if (l.pend_gate.ctx != null) _ = mlx.mlx_array_free(l.pend_gate);
+        l.pend_kv = none;
+        l.pend_gate = none;
+    }
+    for (p.specs(), tensors) |spec, x| switch (spec.kind) {
+        .win => try replace(&st.layers[spec.layer].win.buf, x),
+        .comp => try st.layers[spec.layer].comp.?.append(x, m.s),
+        .index => try st.layers[spec.layer].idx_k.?.append(x, m.s),
+        .pend_kv => try replace(&st.layers[spec.layer].pend_kv, x),
+        .pend_gate => try replace(&st.layers[spec.layer].pend_gate, x),
+        .ds => if (m.n_mtp > 0) {
+            try replace(&st.ds[spec.layer].buf, x);
+        },
+        .mh => if (m.n_mtp > 0) {
+            try replace(&st.mh, x);
+        },
+        .hist => {
+            try mlx.check(mlx.mlx_array_eval(x));
+            const data = mlx.mlx_array_data_uint32(x) orelse return error.NoData;
+            try st.hist.appendSlice(gpa, data[0..spec.rows]);
+        },
+    };
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+    for (st.layers) |l| {
+        try ev.append(gpa, l.win.buf);
+        if (l.comp) |r| if (r.buf.ctx != null) {
+            try ev.append(gpa, r.buf);
+        };
+        if (l.idx_k) |r| if (r.buf.ctx != null) {
+            try ev.append(gpa, r.buf);
+        };
+        if (l.pend_kv.ctx != null) try ev.append(gpa, l.pend_kv);
+        if (l.pend_gate.ctx != null) try ev.append(gpa, l.pend_gate);
+    }
+    for (st.ds) |r| try ev.append(gpa, r.buf);
+    if (st.mh.ctx != null) try ev.append(gpa, st.mh);
+    try dsv41.evalAll(ev.items);
+    st.n = n;
+    st.tp_synced = true;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -1060,10 +1145,18 @@ const PrefillRig = struct {
         return sn;
     }
 
-    fn ship(ctx: ?*anyopaque, id: u64, ids: []const u32, tensors: []const A, stages: usize) anyerror!void {
+    fn ship(ctx: ?*anyopaque, id: u64, p0: usize, n: usize, tensors: []const A, stages: usize) anyerror!void {
         const self: *PrefillRig = @ptrCast(@alignCast(ctx.?));
         self.shipped += 1;
-        try importOnFollower(self.gpa, .{ .rank = 1, .size = 4, .gather = Group.solo.gather }, self.follower, &self.follow, id, ids, tensors, stages);
+        var st = try dsv41.initState(self.follower, self.gpa);
+        defer st.deinit();
+        try importOnFollower(self.gpa, .{ .rank = 1, .size = 4, .gather = Group.solo.gather }, self.follower, &st, p0, n, tensors, stages);
+        st.snap_at = n;
+        st.snap_ids = try self.gpa.alloc(u32, n);
+        @memset(st.snap_ids, 5);
+        try dsv41.snapshotStateIfDue(&st, id);
+        try self.follow.put(id, st.snap.?);
+        st.snap = null;
     }
 };
 
@@ -1100,7 +1193,9 @@ fn expectLeaderShips(gpa: std.mem.Allocator, lead: *dsv41.Dsv41Model, follow: *d
     for (want, back) |a, b| try testing.expect(try same(a, b));
     // Only the leader prefills; only a follower imports; one rank ships nothing.
     try testing.expectError(error.Dsv41RowCutNotLeader, prefillOnLeader(gpa, .{ .rank = 2, .size = 4, .gather = Group.solo.gather }, lp, ids, 0));
-    try testing.expectError(error.Dsv41RowCutLeaderImport, importOnFollower(gpa, four, follow, &rig.follow, 8, ids, want, follow.n_mtp));
+    var empty = try dsv41.initState(follow, gpa);
+    defer empty.deinit();
+    try testing.expectError(error.Dsv41RowCutLeaderImport, importOnFollower(gpa, four, follow, &empty, 0, n, want, follow.n_mtp));
     _ = try prefillOnLeader(gpa, Group.solo, lp, ids, 0);
     try testing.expectEqual(@as(usize, 1), rig.shipped);
 }
