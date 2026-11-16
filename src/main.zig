@@ -1414,7 +1414,7 @@ pub fn main(init: std.process.Init) !void {
         server_mod.g_metrics = m;
     }
     defer server_mod.g_metrics = null;
-    server_mod.g_internal = internal_install.launch(allocator, io, internal_key_file, server_mod.g_api_key, server_mod.g_metrics) catch std.process.exit(1);
+    server_mod.g_internal = internal_install.launch(allocator, io, internal_key_file, server_mod.g_api_key) catch std.process.exit(1);
     defer server_mod.g_internal = null;
 
     // ── GGUF early-branch: route to an embedded engine ──
