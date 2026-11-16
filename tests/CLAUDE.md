@@ -64,6 +64,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_models_capabilities.sh` /v1/models capabilities · `test_metrics.sh`, `test_metrics_outcomes.sh` --metrics
 - `test_index_page.sh` **H** console at GET / · `test_route_404_no_load.sh` unknown path loads nothing
 - `test_headless_spec_flags.sh` **H** headless honours spec flags, 404 before resolution
+- `test_internal_switch.sh` **H** `/v1/internal/*` (own key, drain closes inference, abort reopens, stale/fence/expiry) and `/health` mode fields
 - `test_providers.sh` **H** upstream providers via stubs · `test_launch_cmd.sh` `mlx-serve launch <agent>`
 - `test_launch_script.sh` **H** GET /launch · `test_website_agent_install.sh` **H** website/agent.sh · `test_opencode_probe.sh` **H**
 - `test_run_quiet.sh` **H** REPL greeting has no discovery noise · `test_partial_download.sh` **H** interrupted pull resumes

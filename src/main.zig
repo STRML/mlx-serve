@@ -28,6 +28,7 @@ const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
 const chat_mod = @import("host/chat/chat.zig");
 const server_mod = @import("host/http/server.zig");
 const ablation_api = @import("host/api/ablation.zig");
+const internal_install = @import("host/internal/install.zig");
 const launchSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").launchSsmCheckpointStride;
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const ane_lm = @import("engines/ane/lm.zig");
@@ -368,6 +369,11 @@ fn printUsage(io: std.Io) void {
         \\  --ablation-profiles <dir> --ablation-key-file <path>
         \\                      Per-request directional ablation (docs/api.md);
         \\                        the key file is 0600, at least 32 bytes.
+        \\  --internal-key-file <path>
+        \\                      Enable /v1/internal/* (the layout switch's drain,
+        \\                        tp4, join, tp1, abort and mode poll) behind the
+        \\                        key in this file (0600, at least 32 bytes, never
+        \\                        the --api-key). Without it those paths 404.
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
@@ -737,6 +743,7 @@ pub fn main(init: std.process.Init) !void {
     var kv_attn_mode: server_mod.KvAttnMode = .auto;
     var ablation_profiles: ?[]const u8 = null;
     var ablation_key_file: ?[]const u8 = null;
+    var internal_key_file: ?[]const u8 = null;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
@@ -1216,6 +1223,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ablation-key-file") and i + 1 < args.len) {
             i += 1;
             ablation_key_file = args[i];
+        } else if (std.mem.eql(u8, args[i], "--internal-key-file") and i + 1 < args.len) {
+            i += 1;
+            internal_key_file = args[i];
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
@@ -1404,6 +1414,8 @@ pub fn main(init: std.process.Init) !void {
         server_mod.g_metrics = m;
     }
     defer server_mod.g_metrics = null;
+    server_mod.g_internal = internal_install.launch(allocator, io, internal_key_file, server_mod.g_api_key, server_mod.g_metrics) catch std.process.exit(1);
+    defer server_mod.g_internal = null;
 
     // ── GGUF early-branch: route to an embedded engine ──
     //
