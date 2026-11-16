@@ -1250,6 +1250,17 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+    const switch_config: ?@import("host/internal/formation.zig").Config = if (internal_key_file != null and dist_mode != null) blk: {
+        const cfg: @import("host/internal/formation.zig").Config = .{
+            .coordinator = dist_coordinator orelse return error.InvalidArgs,
+            .device = dist_device orelse return error.InvalidArgs,
+            .model_dir = dist_model orelse run_model_dir orelse model_dir,
+            .size = dist_size,
+        };
+        if (cfg.size < 2 or cfg.size > @import("engines/mlx/cluster/distributed.zig").max_ranks or cfg.rank >= cfg.size or cfg.model_dir.len == 0) return error.InvalidArgs;
+        try @import("engines/mlx/cluster/distributed.zig").primeEnv(.{ .rank = cfg.rank, .size = cfg.size, .coordinator = cfg.coordinator, .device = cfg.device });
+        break :blk cfg;
+    } else null;
     if (!server_mod.mtpAllowedByDefault(mtp_forced, mlx.metalKernelsAvailable(), mlx.cudaAvailable())) enable_mtp = false;
 
     // One value for the three media seams (they run under gen.zig with no
@@ -1414,7 +1425,7 @@ pub fn main(init: std.process.Init) !void {
         server_mod.g_metrics = m;
     }
     defer server_mod.g_metrics = null;
-    server_mod.g_internal = internal_install.launch(allocator, io, internal_key_file, server_mod.g_api_key, server_mod.g_metrics) catch std.process.exit(1);
+    server_mod.g_internal = internal_install.launch(allocator, io, internal_key_file, server_mod.g_api_key, server_mod.g_metrics, switch_config) catch std.process.exit(1);
     defer server_mod.g_internal = null;
 
     // ── GGUF early-branch: route to an embedded engine ──
@@ -1513,7 +1524,7 @@ pub fn main(init: std.process.Init) !void {
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
 
-    if (dist_mode) |mode| {
+    if (switch_config == null) if (dist_mode) |mode| {
         const coordinator = dist_coordinator orelse {
             log.err("--dist needs --dist-coordinator IP:PORT (this Mac's address the worker connects to)\n", .{});
             std.process.exit(1);
@@ -1527,8 +1538,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
-        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @intFromEnum(mode), group_model, dist_split, dist_size, dist_join_timeout));
-    }
+        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @backingInt(mode), group_model, dist_split, dist_size, dist_join_timeout));
+    };
 
     if (serve_mode) {
         // Headless boot: `--model-dir` given, no `--model`. Start with no

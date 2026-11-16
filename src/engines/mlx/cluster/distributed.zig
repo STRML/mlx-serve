@@ -1133,6 +1133,22 @@ pub fn exitReleaseFailed(rank: u32) noreturn {
     distExit(.release_failed, rank, null);
 }
 
+pub fn exitSwitchAbort(n: u64) noreturn {
+    log.err("[dist-exit] epoch_ms={d} cause=switch_abort n={d} peer=- step={d} waited_ms=-\n", .{ crt.wallMs(), n, liveness().step });
+    log.syncFile();
+    std.c._exit(1);
+}
+
+pub fn switchStallNote(buf: []u8) []const u8 {
+    const c = cluster();
+    lock(&c.state_mu);
+    defer c.state_mu.unlock();
+    const state = c.active_state orelse return "";
+    if (!state.watchdog.in_flight.load(.acquire)) return "";
+    const started = state.watchdog.started_ms.load(.monotonic);
+    return std.fmt.bufPrint(buf, "step={d} waited_ms={d} peer={d}", .{ state.watchdog.step.load(.monotonic), @as(u64, @intCast(crt.monotonicMs())) -| started, state.lost_rank.load(.acquire) }) catch "";
+}
+
 fn distExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64) noreturn {
     noteDistExit(cause, peer_rank, waited_ms);
     std.c._exit(1);
@@ -5464,9 +5480,11 @@ test "dist fix2 finding 4: unsafe teardown and activation refuse without side ef
 const TestTeardownPause = struct {
     stage: enum { drain, free },
     early_release: bool = false,
+    thread_id: ?std.Thread.Id = null,
 
     fn visit(self: *@This(), stage: @TypeOf(self.stage)) void {
         if (stage != self.stage) return;
+        self.thread_id = std.Thread.getCurrentId();
         if (stage == .drain) {
             var byte: [1]u8 = undefined;
             self.early_release = std.c.recv(TestSwitchOpen.peer_bell.fd, &byte, 1, std.c.MSG.PEEK | std.c.MSG.DONTWAIT) == 1;
@@ -5585,4 +5603,369 @@ test "dist fix2 public exit: release failure records rank and exits one" {
     try std.testing.expect(std.mem.startsWith(u8, record, "[dist-exit] epoch_ms="));
     try std.testing.expect(std.mem.indexOf(u8, record, " cause=release_failed peer=3 step=") != null);
     try std.testing.expect(std.mem.endsWith(u8, record, " waited_ms=-\n"));
+}
+
+const switch_adapter = @import("switch_adapter.zig");
+const switch_controller = @import("../../../host/internal/switch.zig");
+
+const TestAdapter = struct {
+    sw: switch_controller.Switch,
+    adapter: switch_adapter.Adapter = undefined,
+    hook_thread: ?std.Thread.Id = null,
+    hook_error: bool = false,
+    hook_entered: std.atomic.Value(bool) = .init(false),
+    hook_finish: std.atomic.Value(bool) = .init(true),
+    var active: ?*@This() = null;
+
+    fn setup(self: *@This(), follower: bool, n: u64) !void {
+        TestSwitchOpen.setup();
+        self.* = .{ .sw = switch_controller.Switch.init(std.testing.io) };
+        self.sw.spawn_watcher = false;
+        var req = TestSwitchOpen.request(n);
+        req.cfg.rank = if (follower) 1 else 0;
+        try primeEnv(req.cfg);
+        self.adapter.init(&self.sw, .{ .cfg = req.cfg, .model_dir = "/m/switch" });
+        self.sw.formation = self.adapter.formation();
+        active = self;
+        switch_adapter.setSwapHook(swap);
+        switch_adapter.bindInferenceThread(null);
+    }
+
+    fn cleanup(self: *@This()) void {
+        _ = self;
+        switch_adapter.unbindInferenceThread();
+        switch_adapter.setSwapHook(null);
+        active = null;
+        TestSwitchOpen.cleanup();
+    }
+
+    fn swap(_: u64, link: *Link, role: switcher.Role) !void {
+        const self = active.?;
+        self.hook_thread = std.Thread.getCurrentId();
+        try std.testing.expectEqual(role == .leader, link.rank == 0);
+        try std.testing.expect(cluster().tp_link == null);
+        self.hook_entered.store(true, .release);
+        while (!self.hook_finish.load(.acquire)) crt.sleepMs(1);
+        if (self.hook_error) return error.TestSwapFailed;
+    }
+
+    fn form(self: *@This(), follower: bool, n: u64) !*Link {
+        try std.testing.expectEqual(@as(u16, 200), self.sw.command(.drain, n, 0).status);
+        try std.testing.expectEqual(@as(u16, 200), self.sw.command(if (follower) .join else .tp4, n, crt.wallMs() + 2000).status);
+        const formed = (try TestSwitchOpen.outcome(n)).formed;
+        const out = self.sw.formation.?.poll(self.sw.formation.?.ctx, n).?.formed;
+        try std.testing.expectEqual(@intFromPtr(formed.link), @intFromPtr(out.ptr));
+        try std.testing.expectEqual(formed.open_ms, out.open_ms);
+        try std.testing.expectEqual(formed.ready_to_go_ms orelse 0, out.ready_to_go_ms);
+        return formed.link;
+    }
+};
+
+test "dist switch adapter: controller forms activates and releases both roles inline" {
+    for ([_]bool{ false, true }) |follower| {
+        var t: TestAdapter = undefined;
+        try t.setup(follower, 301);
+        defer t.cleanup();
+        try std.testing.expectEqual(@as(u8, 1), t.sw.snapshot().peers);
+        const link = try t.form(follower, 301);
+        _ = t.sw.pump();
+        try std.testing.expectEqual(.formed, t.sw.snapshot().state);
+        try std.testing.expectEqual(std.Thread.getCurrentId(), t.hook_thread.?);
+        try std.testing.expectEqual(link, cluster().tp_link.?);
+        var peer_close: TestReleasePeer = .{ .bell = TestSwitchOpen.peer_bell, .delay_ms = 15 };
+        const peer_thread = if (!follower) try std.Thread.spawn(.{}, TestReleasePeer.run, .{&peer_close}) else null;
+        defer if (peer_thread) |th| th.join();
+        try std.testing.expectEqual(@as(u16, 200), t.sw.command(.tp1, 301, 0).status);
+        try std.testing.expectEqual(.released, t.sw.snapshot().state);
+        try std.testing.expect(switcher.poll(301) == null);
+        try std.testing.expect(cluster().tp_link == null);
+    }
+}
+
+test "dist switch adapter: abort fallback reports release_timeout after FallRequested" {
+    var t: TestAdapter = undefined;
+    try t.setup(true, 302);
+    defer t.cleanup();
+    const link = try t.form(true, 302);
+    _ = t.sw.pump();
+    _ = t.sw.command(.abort, 302, 0);
+    try std.testing.expectEqual(.aborting, t.sw.snapshot().state);
+    try std.testing.expectError(error.FallRequested, recvMsg(link, 0));
+    switch_adapter.followerFell(302, link);
+    try std.testing.expectEqual(.aborted, t.sw.snapshot().state);
+    try std.testing.expectEqual(.release_timeout, t.sw.snapshot().failure);
+    try std.testing.expect(t.sw.link == null);
+    try std.testing.expect(switcher.poll(302) == null);
+}
+
+test "dist switch adapter: failed or absent swap hook consumes each role once" {
+    for ([_]bool{ false, true }) |follower| for ([_]bool{ false, true }) |missing| {
+        var t: TestAdapter = undefined;
+        try t.setup(follower, 303);
+        defer t.cleanup();
+        t.hook_error = true;
+        if (missing) switch_adapter.setSwapHook(null);
+        _ = try t.form(follower, 303);
+        var peer_close: TestReleasePeer = .{ .bell = TestSwitchOpen.peer_bell, .delay_ms = 0 };
+        const th = if (!follower) try std.Thread.spawn(.{}, TestReleasePeer.run, .{&peer_close}) else null;
+        defer if (th) |thread| thread.join();
+        const f = t.sw.formation.?;
+        const link = f.poll(f.ctx, 303).?.formed.ptr;
+        try std.testing.expectError(error.SwapFailed, f.activate(f.ctx, 303, link));
+        try std.testing.expect(switcher.poll(303) == null);
+        try std.testing.expect(cluster().tp_link == null);
+        try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
+    };
+}
+
+test "dist switch adapter: controller records swap failure after adapter cleanup" {
+    var t: TestAdapter = undefined;
+    try t.setup(true, 304);
+    defer t.cleanup();
+    t.hook_error = true;
+    _ = try t.form(true, 304);
+    _ = t.sw.pump();
+    try std.testing.expectEqual(.aborted, t.sw.snapshot().state);
+    try std.testing.expectEqual(.other, t.sw.snapshot().failure);
+    try std.testing.expect(switcher.poll(304) == null);
+}
+
+test "dist switch adapter: unprimed start refuses before opener and maps cancellation" {
+    var t: TestAdapter = undefined;
+    try t.setup(false, 305);
+    defer t.cleanup();
+    setForeignIfDifferent("MLX_RANK", "99");
+    defer setForeignIfDifferent("MLX_RANK", "0");
+    const f = t.sw.formation.?;
+    try std.testing.expectError(error.DistEnvNotPrimed, f.start(f.ctx, .leader, 305, crt.wallMs() + 2000));
+    try std.testing.expect(!TestSwitchOpen.entered.load(.acquire));
+    try std.testing.expectEqual(.unknown, f.cancel(f.ctx, 305));
+    try primeEnv(t.adapter.context.cfg);
+    TestSwitchOpen.block = true;
+    try f.start(f.ctx, .leader, 305, crt.wallMs() + 2000);
+    try TestSwitchOpen.awaitEntered();
+    try std.testing.expectEqual(.cancelled, f.cancel(f.ctx, 305));
+    _ = try TestSwitchOpen.outcome(305);
+    try std.testing.expectEqual(.cancelled, f.poll(f.ctx, 305).?);
+}
+
+test "dist switch adapter: release failure names only the failed rank" {
+    var t: TestAdapter = undefined;
+    try t.setup(false, 306);
+    defer t.cleanup();
+    const link = try t.form(false, 306);
+    _ = std.c.shutdown(link.bells[1].fd, std.c.SHUT.WR);
+    const f = t.sw.formation.?;
+    var rank: ?u32 = 99;
+    try std.testing.expectError(error.ReleaseSendFailed, f.release(f.ctx, 306, link, &rank));
+    try std.testing.expectEqual(@as(?u32, 1), rank);
+}
+
+test "dist switch adapter: exit_process fsyncs switch_abort cause and attempt N" {
+    var t: TestAdapter = undefined;
+    try t.setup(false, 307);
+    defer t.cleanup();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [512]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/adapter-exit.log", .{root});
+    const pid = std.c.fork();
+    if (pid < 0) return error.TestForkFailed;
+    if (pid == 0) {
+        log.openFile(path, 0) catch std.c._exit(99);
+        const f = t.sw.formation.?;
+        f.exit_process(f.ctx, 307);
+        std.c._exit(98);
+    }
+    var status_code: c_int = 0;
+    try std.testing.expectEqual(pid, std.c.waitpid(pid, &status_code, 0));
+    try std.testing.expectEqual(@as(c_int, 1 << 8), status_code);
+    const record = try tmp.dir.readFileAlloc(std.testing.io, "adapter-exit.log", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(record);
+    try std.testing.expect(std.mem.indexOf(u8, record, "cause=switch_abort") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record, "n=307") != null);
+}
+
+const TestAdapterRunner = struct {
+    ready: std.atomic.Value(bool) = .init(false),
+    stop: std.atomic.Value(bool) = .init(false),
+    id: std.Thread.Id = undefined,
+    scheduler: ?*@import("../scheduler.zig").Scheduler = null,
+
+    fn run(self: *@This()) void {
+        switch_adapter.bindInferenceThread(self.scheduler);
+        self.id = std.Thread.getCurrentId();
+        self.ready.store(true, .release);
+        defer switch_adapter.unbindInferenceThread();
+        while (!self.stop.load(.acquire)) {
+            if (self.scheduler) |sch| {
+                sch.queue_mu.lockUncancelable(sch.io);
+                while (!@import("../runtime/loop.zig").hasWorkPendingLocked(sch) and !self.stop.load(.acquire))
+                    sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .boot } }) catch {
+                        sch.queue_mu.unlock(sch.io);
+                        return;
+                    };
+                sch.queue_mu.unlock(sch.io);
+            }
+            tickInferenceLoop();
+            _ = switch_adapter.drain();
+            crt.sleepMs(1);
+        }
+    }
+};
+
+test "dist switch adapter: off-thread activate release and fall wait for inference completion" {
+    for ([_]bool{ false, true }) |falling| {
+        var t: TestAdapter = undefined;
+        try t.setup(true, 308);
+        defer t.cleanup();
+        const link = try t.form(true, 308);
+        switch_adapter.unbindInferenceThread();
+        var sch: @import("../scheduler.zig").Scheduler = undefined;
+        sch.io = std.testing.io;
+        sch.queue_mu = .init;
+        sch.queue_cond = .init;
+        sch.pending = .empty;
+        sch.decoding = .empty;
+        sch.vision_queue = .empty;
+        sch.embed_queue = .empty;
+        sch.cleanup_queue = .empty;
+        sch.load_queue = .empty;
+        sch.gen_queue = .empty;
+        sch.unload_queue = .empty;
+        sch.cache_export_queue = .empty;
+        sch.cache_import_queue = .empty;
+        sch.warm_queue = .empty;
+        var runner: TestAdapterRunner = .{ .scheduler = &sch };
+        const worker = try std.Thread.spawn(.{}, TestAdapterRunner.run, .{&runner});
+        defer {
+            runner.stop.store(true, .release);
+            sch.queue_mu.lockUncancelable(sch.io);
+            sch.queue_cond.signal(sch.io);
+            sch.queue_mu.unlock(sch.io);
+            worker.join();
+        }
+        while (!runner.ready.load(.acquire)) crt.sleepMs(1);
+        t.hook_finish.store(false, .release);
+        var caller = struct {
+            f: switch_controller.Formation,
+            link: *Link,
+            done: std.atomic.Value(bool) = .init(false),
+            result: ?anyerror = null,
+            fn run(self: *@This()) void {
+                self.f.activate(self.f.ctx, 308, self.link) catch |err| {
+                    self.result = err;
+                };
+                self.done.store(true, .release);
+            }
+        }{ .f = t.sw.formation.?, .link = link };
+        const client = try std.Thread.spawn(.{}, @TypeOf(caller).run, .{&caller});
+        var client_joined = false;
+        defer {
+            t.hook_finish.store(true, .release);
+            if (!client_joined) client.join();
+        }
+        while (!t.hook_entered.load(.acquire)) crt.sleepMs(1);
+        try std.testing.expect(!caller.done.load(.acquire));
+        try std.testing.expectEqual(runner.id, t.hook_thread.?);
+        t.hook_finish.store(true, .release);
+        client.join();
+        client_joined = true;
+        try std.testing.expect(caller.result == null);
+        var pause: TestTeardownPause = .{ .stage = .drain };
+        link.state.?.test_teardown_pause = &pause;
+        const f = t.sw.formation.?;
+        const began = crt.monotonicMs();
+        var rank: ?u32 = 99;
+        if (falling) f.fall(f.ctx, 308, link) else try f.release(f.ctx, 308, link, &rank);
+        try std.testing.expect(crt.monotonicMs() - began >= 200);
+        try std.testing.expectEqual(runner.id, pause.thread_id.?);
+        if (!falling) try std.testing.expectEqual(@as(?u32, null), rank);
+        try std.testing.expect(switcher.poll(308) == null);
+    }
+}
+
+test "dist switch adapter: unavailable inference cannot orphan an activation" {
+    var t: TestAdapter = undefined;
+    try t.setup(false, 309);
+    defer t.cleanup();
+    switch_adapter.unbindInferenceThread();
+    const f = t.sw.formation.?;
+    try std.testing.expectError(error.Unavailable, f.start(f.ctx, .leader, 309, crt.wallMs() + 2000));
+    try std.testing.expect(!TestSwitchOpen.entered.load(.acquire));
+    const pid = std.c.fork();
+    if (pid < 0) return error.TestForkFailed;
+    if (pid == 0) {
+        var link: Link = undefined;
+        f.activate(f.ctx, 309, &link) catch std.c._exit(98);
+        std.c._exit(99);
+    }
+    var status_code: c_int = 0;
+    try std.testing.expectEqual(pid, std.c.waitpid(pid, &status_code, 0));
+    try std.testing.expectEqual(@as(c_int, 1 << 8), status_code);
+}
+
+test "dist switch adapter: follower RELEASE completes an abort before the fallback" {
+    var t: TestAdapter = undefined;
+    try t.setup(true, 310);
+    defer t.cleanup();
+    const link = try t.form(true, 310);
+    _ = t.sw.pump();
+    _ = t.sw.command(.abort, 310, 0);
+    try TestSwitchOpen.peer_bell.writeAll(&[_]u8{Bell.release_byte});
+    try std.testing.expectEqual(OP_RELEASE, (try recvMsg(link, 0))[0]);
+    const f = t.sw.formation.?;
+    var rank: ?u32 = 99;
+    try f.release(f.ctx, 310, link, &rank);
+    try std.testing.expectEqual(@as(?u32, null), rank);
+    try std.testing.expectEqual(.released, t.sw.snapshot().state);
+    try std.testing.expect(switcher.poll(310) == null);
+}
+
+test "dist switch adapter: failed formation preserves error name rank and timing" {
+    var t: TestAdapter = undefined;
+    try t.setup(false, 311);
+    defer t.cleanup();
+    TestSwitchOpen.failure = error.DistNoReady;
+    const f = t.sw.formation.?;
+    try f.start(f.ctx, .leader, 311, crt.wallMs() + 80);
+    const failed = (try TestSwitchOpen.outcome(311)).failed;
+    const out = f.poll(f.ctx, 311).?.failed;
+    try std.testing.expectEqualStrings("DistNoReady", out.err);
+    try std.testing.expectEqual(@as(?u32, 1), out.rank);
+    try std.testing.expectEqual(failed.elapsed_ms, out.elapsed_ms);
+    try std.testing.expect(out.elapsed_ms >= 60);
+    try std.testing.expectEqual(.already_finished, f.cancel(f.ctx, 311));
+}
+
+test "dist switch adapter: stall note follows the active watchdog" {
+    var t: TestAdapter = undefined;
+    try t.setup(false, 312);
+    defer t.cleanup();
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("", t.sw.stallNote(&buf));
+    _ = try t.form(false, 312);
+    _ = t.sw.pump();
+    const note = t.sw.stallNote(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, note, "step=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "waited_ms=") != null);
+    parkInferenceLoop();
+    try std.testing.expectEqualStrings("", t.sw.stallNote(&buf));
+}
+
+test "dist switch adapter: invalid configuration is refused before installation" {
+    var sw = switch_controller.Switch.init(std.testing.io);
+    for ([_]struct { size: u32, rank: u32 }{
+        .{ .size = 0, .rank = 0 },
+        .{ .size = 1, .rank = 0 },
+        .{ .size = 999, .rank = 0 },
+        .{ .size = 2, .rank = 2 },
+    }) |bad| {
+        var backend: ?*@import("../../../host/internal/formation.zig").Backend = null;
+        const name = switch_adapter.install(&sw, .{ .coordinator = "127.0.0.1:46201", .device = "loopback", .model_dir = "/m/switch", .size = bad.size, .rank = bad.rank }, &backend);
+        try std.testing.expectEqualStrings("InvalidArgs", name orelse "success");
+        try std.testing.expect(backend == null);
+    }
 }

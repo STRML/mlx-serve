@@ -8,7 +8,7 @@ const sw_mod = @import("switch.zig");
 
 pub const Installed = struct { sw: *sw_mod.Switch, key: [32]u8 };
 
-pub const LaunchError = error{ InternalKeyRefused, InternalKeyIsServingKey, OutOfMemory };
+pub const LaunchError = error{ InternalKeyRefused, InternalKeyIsServingKey, InternalDistRefused, OutOfMemory };
 
 var progress_metrics: ?*metrics.Metrics = null;
 
@@ -23,7 +23,7 @@ fn progress() sw_mod.Progress {
 
 /// Null without the flag. The key file follows the ablation key's rules (0600, owned, at least 32 bytes) and must not be
 /// the serving key. Stall detection for `/health` needs `--metrics`, the counters it reads.
-pub fn launch(gpa: std.mem.Allocator, io: std.Io, key_file: ?[]const u8, serving_key: ?[]const u8, m: ?*metrics.Metrics) LaunchError!?Installed {
+pub fn launch(gpa: std.mem.Allocator, io: std.Io, key_file: ?[]const u8, serving_key: ?[]const u8, m: ?*metrics.Metrics, dist: ?@import("formation.zig").Config) LaunchError!?Installed {
     const path = key_file orelse return null;
     const key = ablation.readKey(gpa, path) catch |e| {
         log.err("[internal] key file {s} refused: {s}\n", .{ path, switch (e) {
@@ -42,6 +42,14 @@ pub fn launch(gpa: std.mem.Allocator, io: std.Io, key_file: ?[]const u8, serving
     };
     const sw = try gpa.create(sw_mod.Switch);
     sw.* = sw_mod.Switch.init(io);
+    if (dist) |cfg| {
+        var backend: ?*@import("formation.zig").Backend = null;
+        if (@import("../engines/mlx.zig").api().switch_adapter(sw, cfg, &backend)) |name| {
+            log.err("[internal] distributed switch configuration refused: {s}\n", .{name});
+            return if (std.mem.eql(u8, name, "OutOfMemory")) error.OutOfMemory else error.InternalDistRefused;
+        }
+        sw.formation = backend.?.formation();
+    }
     if (m) |mm| {
         progress_metrics = mm;
         sw.progress = progress;
