@@ -242,15 +242,76 @@ pub fn joinRanks(sc: *Scope, parts: A, n: usize) !A {
 /// The routed and shared experts over `x` (`[L, hidden]`, L <= `max_rows`) routed by `idx` / `wts`, row-cut across
 /// `g`: the whole layer's MoE output on every rank, in `m.act`.
 pub fn forward(sc: *Scope, m: *const dsv41.Dsv41Model, rl: *const RowLayer, g: Group, x: A, idx: A, wts: A) !A {
-    _ = sc;
-    _ = m;
-    _ = rl;
-    _ = g;
-    _ = x;
-    _ = idx;
-    _ = wts;
-    return error.Dsv41RowCutUnbuilt;
+    const L = dim(x, 0);
+    if (L > max_rows) return error.Dsv41RowCutPrompt;
+    const h = try joinRanks(sc, try sc.keep(try g.gather(g.ctx, try stageUp(sc, m, rl, x, idx, wts))), g.size);
+    const y = try stageDown(sc, m, rl, h, idx);
+    const ys = try joinRanks(sc, try sc.keep(try g.gather(g.ctx, try sc.reshape(y, &.{ L, 1, dim(y, 1) }))), g.size);
+    return sc.astype(try sc.reshape(ys, &.{ L, dim(ys, 2) }), m.act);
 }
+
+/// Pins the kernel launch shapes a box probes for itself (`topk_tg`, `hc_tg`) to the smallest any rank runs, so every
+/// rank reduces in the same order and routes its rows alike.
+pub fn pinThreads(gpa: std.mem.Allocator, m: *dsv41.Dsv41Model, g: Group) !void {
+    const mine = [_]u32{ @intCast(m.topk_tg), @intCast(m.hc_tg) };
+    const all = try gatherHost(gpa, g, &mine);
+    defer gpa.free(all);
+    var lo = mine;
+    for (0..g.size) |r| for (&lo, all[r * 2 ..][0..2]) |*l, v| {
+        l.* = @min(l.*, v);
+    };
+    m.topk_tg = lo[0];
+    m.hc_tg = lo[1];
+}
+
+/// Every rank's `mine` (the same length on each), rank-major on the host (caller frees).
+fn gatherHost(gpa: std.mem.Allocator, g: Group, mine: []const u32) ![]u32 {
+    const a = mlx.mlx_array_new_data(mine.ptr, &[_]c_int{ 1, @intCast(mine.len) }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(a);
+    const all = try g.gather(g.ctx, a);
+    defer _ = mlx.mlx_array_free(all);
+    try mlx.check(mlx.mlx_array_eval(all));
+    const d = mlx.mlx_array_data_uint32(all) orelse return error.NoData;
+    return gpa.dupe(u32, d[0 .. mine.len * g.size]);
+}
+
+/// A diagnostic of the routes each layer took, one CRC32 of its ids and weights a layer, compared across the ranks:
+/// the row cut is right only while every rank routes alike. Reading it syncs the GPU; off in serving.
+pub const RouteCrc = struct {
+    gpa: std.mem.Allocator,
+    crcs: std.ArrayList(u32) = .empty,
+
+    pub fn deinit(self: *RouteCrc) void {
+        self.crcs.deinit(self.gpa);
+    }
+
+    pub fn add(self: *RouteCrc, r: dsv41.Routes) !void {
+        var h = std.hash.Crc32.init();
+        inline for (.{ .{ r.idx, .uint32 }, .{ r.wts, .float32 } }) |p| {
+            var c = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(c);
+            try mlx.check(mlx.mlx_astype(&c, p[0], p[1], mlx.gpuStream()));
+            var f = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f);
+            try mlx.check(mlx.mlx_contiguous(&f, c, false, mlx.gpuStream()));
+            try mlx.check(mlx.mlx_array_eval(f));
+            const n = mlx.mlx_array_size(f);
+            const bytes: [*]const u8 = if (p[1] == .uint32) @ptrCast(mlx.mlx_array_data_uint32(f) orelse return error.NoData) else @ptrCast(mlx.mlx_array_data_float32(f) orelse return error.NoData);
+            h.update(bytes[0 .. n * 4]);
+        }
+        try self.crcs.append(self.gpa, h.final());
+    }
+
+    /// The first layer some rank routed differently from rank 0, or null when all agree.
+    pub fn firstDivergence(self: *const RouteCrc, g: Group) !?usize {
+        const n = self.crcs.items.len;
+        if (n == 0) return null;
+        const all = try gatherHost(self.gpa, g, self.crcs.items);
+        defer self.gpa.free(all);
+        for (0..n) |li| for (1..g.size) |r| if (all[r * n + li] != all[li]) return li;
+        return null;
+    }
+};
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
@@ -364,4 +425,228 @@ test "dsv41 row cut: forward over a one-rank group is the TP1 MoE" {
         defer gpa.free(b);
         try testing.expect(try peakErr(a, b) <= 2e-4);
     }
+}
+
+fn same(a: A, b: A) !bool {
+    if (a.ctx == null or b.ctx == null) return a.ctx == b.ctx;
+    if (!std.mem.eql(c_int, mlx.getShape(a), mlx.getShape(b))) return false;
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_array_equal(&o, a, b, false, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_array_eval(o));
+    var eq = false;
+    try mlx.check(mlx.mlx_array_item_bool(&eq, o));
+    return eq;
+}
+
+fn sameLin(a: Lin, b: Lin) !bool {
+    return try same(a.w, b.w) and try same(a.s, b.s) and try same(a.b, b.b);
+}
+
+fn nbytes(a: A) usize {
+    return mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
+}
+
+fn activeBytes() usize {
+    var n: usize = 0;
+    _ = mlx.mlx_get_active_memory(&n);
+    return n;
+}
+
+test "dsv41 row cut: a rank's attention cut is today's tensor-parallel cut of the same tensors, gate and up its fused halves" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const whole = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer whole.deinit();
+    const rank = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .tp = .{ .rank = 2, .size = 4 } });
+    defer rank.deinit();
+    var rl = try RowLayer.init(gpa, mlx.gpuStream(), whole.layer(20), 2, 4);
+    defer rl.deinit();
+    const ly = rank.layer(20);
+    try testing.expect(try sameLin(rl.wq_b, ly.wq_b));
+    try testing.expect(try sameLin(rl.wo_a, ly.wo_a));
+    try testing.expect(try same(rl.sink, ly.sink));
+    try testing.expect(try sameLin(rl.wo_b, ly.wo_b));
+    const gu = ly.experts.gu.?;
+    const half: usize = @intCast(@divExact(dim(gu.w, 1), 2));
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    inline for (.{ "w", "s", "b" }) |f| if (@field(gu, f).ctx != null) {
+        try testing.expect(try same(@field(rl.experts.gate, f), try sc.slice(@field(gu, f), 1, 0, half)));
+        try testing.expect(try same(@field(rl.experts.up, f), try sc.slice(@field(gu, f), 1, half, 2 * half)));
+    };
+}
+
+test "dsv41 row cut: the views copy no weight bytes, and the row-cut forward reads them in place" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer fx.deinit();
+    const ly = fx.layer(20);
+    const before = activeBytes();
+    const rls = try cutRanks(gpa, ly, 4);
+    defer {
+        for (rls) |*r| r.deinit();
+        gpa.free(rls);
+    }
+    var wo_b: usize = 0;
+    for (rls) |*rl| {
+        inline for (.{ "w", "s", "b" }) |f| if (@field(rl.wo_b, f).ctx != null) {
+            wo_b += nbytes(@field(rl.wo_b, f));
+        };
+        // Every view evaluated: a copy would allocate here.
+        for (rl.owned.items.items) |a| try mlx.check(mlx.mlx_array_eval(a));
+    }
+    // The smallest bank view a gather reads: a copy of any view would allocate at least this much.
+    const view_bytes = nbytes(rls[0].experts.gate.w);
+    const grew = activeBytes() - before;
+    try testing.expect(wo_b > 0 and grew >= wo_b and grew - wo_b < view_bytes);
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const in = try routes(&sc, fx, ly, max_rows, .bfloat16);
+    for ([_]A{ in.x, in.r.idx, in.r.wts }) |a| try mlx.check(mlx.mlx_array_eval(a));
+    const base = activeBytes();
+    _ = mlx.mlx_reset_peak_memory();
+    const y = try simulate(&sc, fx.m, rls, in.x, in.r.idx, in.r.wts);
+    try mlx.check(mlx.mlx_array_eval(y));
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    try testing.expect(peak - base < view_bytes);
+}
+
+test "dsv41 row cut: a DSpark stage's MoE (its own experts, top-3) row-cut is the stage's TP1 MoE" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .act = .float32 });
+    defer fx.deinit();
+    var whole = try fixture.releaseConfig();
+    whole.dsv41_dspark_experts = 8;
+    fx.m.cfg.dsv41_dspark_experts = 8;
+    try fx.putLayer(&whole, "mtp.{d}.", 0, 8, false, null);
+    const m = fx.m;
+    const stage = try dsv41.loadLayer(m, &fx.w, "mtp", 0, null);
+    m.layers = try gpa.realloc(m.layers, m.n_layers + 1);
+    m.layers[m.n_layers] = stage;
+    const ly = &m.layers[m.n_layers];
+    try testing.expectEqual(@as(usize, whole.dsv41_dspark_top_k), ly.top_k);
+    const rls = try cutRanks(gpa, ly, 4);
+    defer {
+        for (rls) |*r| r.deinit();
+        gpa.free(rls);
+    }
+    for ([_]usize{ 1, 6, max_rows }) |rows| {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const in = try routes(&sc, fx, ly, rows, .float32);
+        const want = try dsv41.moeShare(m, gpa, m.n_layers, in.x, in.r.idx, in.r.wts);
+        defer _ = mlx.mlx_array_free(want);
+        const a = try host(gpa, want);
+        defer gpa.free(a);
+        const b = try host(gpa, try simulate(&sc, m, rls, in.x, in.r.idx, in.r.wts));
+        defer gpa.free(b);
+        try testing.expect(try peakErr(a, b) <= 2e-4);
+    }
+}
+
+test "dsv41 row cut: routes tied at the top-k cut-off pick the lower expert ids, the same on every call" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer fx.deinit();
+    var ly = fx.layer(20).*;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var zb = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&zb, &[_]c_int{ 1, 8 }, 2, .float32, mlx.gpuStream()));
+    ly.gate_bias = try sc.keep(zb);
+    // Rows of 8 logits: two clear winners, then six tied for the remaining picks.
+    const k = ly.top_k;
+    var vals: [3 * 8]f32 = undefined;
+    for (0..3) |r| for (0..8) |e| {
+        vals[r * 8 + e] = if (e == 3 or e == 6) 2.0 else 0.5;
+    };
+    const logits = try sc.keep(mlx.mlx_array_new_data(&vals, &[_]c_int{ 3, 8 }, 2, .float32));
+    var first: ?[]u32 = null;
+    defer if (first) |f| gpa.free(f);
+    for (0..4) |_| {
+        const r = try dsv41.routeFrom(&sc, fx.m, &ly, logits, none);
+        const ids = try sc.astype(r.idx, .uint32);
+        try mlx.check(mlx.mlx_array_eval(ids));
+        const got = (mlx.mlx_array_data_uint32(ids) orelse return error.NoData)[0 .. 3 * k];
+        const sorted = try gpa.dupe(u32, got[0..k]);
+        defer gpa.free(sorted);
+        std.mem.sort(u32, sorted, {}, std.sort.asc(u32));
+        // The two winners, then the lowest of the tied ids.
+        const tied = [_]u32{ 0, 1, 2, 4, 5, 7 };
+        var want: [8]u32 = undefined;
+        @memcpy(want[0 .. k - 2], tied[0 .. k - 2]);
+        want[k - 2] = 3;
+        want[k - 1] = 6;
+        std.mem.sort(u32, want[0..k], {}, std.sort.asc(u32));
+        try testing.expectEqualSlices(u32, want[0..k], sorted);
+        if (first) |f| try testing.expectEqualSlices(u32, f, got) else first = try gpa.dupe(u32, got);
+    }
+}
+
+/// A group of ranks whose other members' rows are fixed: `gather` stacks this rank's `x` with theirs, in rank order.
+const Stub = struct {
+    rank: u32,
+    others: []const []const u32,
+
+    fn group(self: *Stub) Group {
+        return .{ .rank = self.rank, .size = @intCast(self.others.len + 1), .ctx = self, .gather = gather };
+    }
+
+    fn gather(ctx: ?*anyopaque, x: A) anyerror!A {
+        const self: *Stub = @ptrCast(@alignCast(ctx.?));
+        try mlx.check(mlx.mlx_array_eval(x));
+        const n = mlx.mlx_array_size(x);
+        const mine = (mlx.mlx_array_data_uint32(x) orelse return error.NoData)[0..n];
+        var rows: [8 * 64]u32 = undefined;
+        var o: usize = 0;
+        for (0..self.others.len + 1) |r| {
+            const src = if (r == self.rank) mine else self.others[if (r < self.rank) r else r - 1];
+            @memcpy(rows[o..][0..n], src);
+            o += n;
+        }
+        return mlx.mlx_array_new_data(&rows, &[_]c_int{ @intCast(self.others.len + 1), @intCast(n) }, 2, .uint32);
+    }
+};
+
+test "dsv41 row cut: the ranks pin the probed launch shapes to the smallest any of them runs" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer fx.deinit();
+    fx.m.topk_tg = 1024;
+    fx.m.hc_tg = 512;
+    var stub: Stub = .{ .rank = 1, .others = &.{ &.{ 1024, 512 }, &.{ 512, 512 }, &.{ 1024, 256 } } };
+    try pinThreads(gpa, fx.m, stub.group());
+    try testing.expectEqual(@as(usize, 512), fx.m.topk_tg);
+    try testing.expectEqual(@as(usize, 256), fx.m.hc_tg);
+}
+
+test "dsv41 row cut: the route CRC names the first layer a rank routed differently" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer fx.deinit();
+    const ly = fx.layer(20);
+    var crc: RouteCrc = .{ .gpa = gpa };
+    defer crc.deinit();
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const in = try routes(&sc, fx, ly, 6, .bfloat16);
+    try crc.add(in.r);
+    try crc.add(try dsv41.route(&sc, fx.m, ly, in.x, none));
+    try testing.expectEqual(crc.crcs.items[0], crc.crcs.items[1]);
+    // A different input routes differently.
+    try crc.add((try routes(&sc, fx, ly, 6, .bfloat16)).r);
+    try testing.expect(crc.crcs.items[2] != crc.crcs.items[0]);
+    const mine = crc.crcs.items;
+    var agree: Stub = .{ .rank = 0, .others = &.{ mine, mine, mine } };
+    try testing.expectEqual(@as(?usize, null), try crc.firstDivergence(agree.group()));
+    const off = [_]u32{ mine[0], mine[1], mine[2] +% 1 };
+    var apart: Stub = .{ .rank = 0, .others = &.{ mine, &off, mine } };
+    try testing.expectEqual(@as(?usize, 2), try crc.firstDivergence(apart.group()));
 }
