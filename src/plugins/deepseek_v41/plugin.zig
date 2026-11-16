@@ -276,6 +276,28 @@ fn mtpSetting(settings_json: []const u8) ?bool {
     return parsed.value.mtp;
 }
 
+/// The fields `gpa.create(Model)` leaves undefined that no load step sets: the bank, the slot ownership, and the
+/// tensor snapshot ids (a struct default does not apply to a `create`d allocation).
+fn initSlotState(m: *Model) void {
+    m.bank = null;
+    m.bank_streams = false;
+    m.owner = 0;
+    m.parked = .empty;
+    m.idle = null;
+    m.tp_ids = .{};
+}
+
+test "dsv41 plugin: a created model starts with no bank, no slot owner and fresh tensor snapshot ids" {
+    var m: Model = undefined;
+    @memset(std.mem.asBytes(&m), 0xAA);
+    initSlotState(&m);
+    try std.testing.expectEqual(@as(u64, 0), m.tp_ids.last);
+    try std.testing.expectEqual(@as(u64, 0), m.tp_ids.formed_at);
+    try std.testing.expectEqual(@as(u32, 0), m.owner);
+    try std.testing.expect(m.idle == null and m.bank == null and !m.bank_streams);
+    try std.testing.expectEqual(@as(u32, 0), m.parked.count());
+}
+
 fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     const io = std.Io.Threaded.global_single_threaded.io();
     const c = config.of(ctx.parsed);
@@ -303,11 +325,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     errdefer m.mdl.deinit();
     // The fused Markov chain's kernels compiled now, not in the first draft.
     if (m.mdl.dspark) |*w| if (!m.mdl.draft_shard) try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
-    m.bank = null;
-    m.bank_streams = false;
-    m.owner = 0;
-    m.parked = .empty;
-    m.idle = null;
+    initSlotState(m);
     if (c.dsv41_streamed) {
         const dir = ctx.model_dir.slice();
         if (c.dsv41_exl3_bank) try openBank(m, quant, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes, start) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
