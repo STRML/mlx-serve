@@ -304,7 +304,7 @@ fn mtpSetting(settings_json: []const u8) ?bool {
 /// The per-model `tp_mode` setting (`{"tp_mode": {"rank": 1, "size": 4}}`): this box's rank of the tensor group whose
 /// model loads beside the whole one (`mode.Modes.tp`). A `tp_mode` that names no rank is refused, never read as unset.
 fn tpModeSetting(settings_json: []const u8) !?mode.Shard {
-    if (std.mem.indexOf(u8, settings_json, "\"tp_mode\"") == null) return null;
+    if (settings_json.len == 0) return null;
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, settings_json, .{}) catch return error.Dsv41TpModeSetting;
     defer parsed.deinit();
     if (parsed.value != .object) return error.Dsv41TpModeSetting;
