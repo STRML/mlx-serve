@@ -705,6 +705,17 @@ fn strided(gpa: std.mem.Allocator, owned: *Owned, b: Bank, rows: usize) !Bank {
 }
 
 /// The memory peak above what is live of one rank's up stage over `in` (1 row).
+fn evalSources(ly: *const dsv41.Layer) !void {
+    var xs: std.ArrayList(A) = .empty;
+    defer xs.deinit(testing.allocator);
+    const e = &ly.experts;
+    for ([_]?dsv41.Bank{ e.gu, e.gate, e.up, e.down }) |ob| if (ob) |bk| try xs.appendSlice(testing.allocator, &.{ bk.w, bk.s, bk.b });
+    var lins: [8]?Lin = .{ ly.shared_gu, ly.shared[0], ly.shared[1], ly.shared[2], ly.wq_b, ly.wo_a, ly.wo_b, null };
+    for (&lins) |ol| if (ol) |l| try xs.appendSlice(testing.allocator, &.{ l.w, l.s, l.b });
+    try xs.append(testing.allocator, ly.sink);
+    for (xs.items) |x| if (x.ctx != null) try mlx.check(mlx.mlx_array_eval(x));
+}
+
 fn stagePeak(gpa: std.mem.Allocator, fx: *fixture.Fixture, rl: *const RowLayer, x: A, idx: A, wts: A) !usize {
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
@@ -723,6 +734,8 @@ test "dsv41 row cut: the views copy no weight bytes, and the row-cut forward rea
     const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
     defer fx.deinit();
     const ly = fx.layer(20);
+    // The window counts copies only: a lazy source weight would materialize whole when its first view is evaluated.
+    try evalSources(ly);
     const before = activeBytes();
     const rls = try cutRanks(gpa, ly, 4);
     defer {
