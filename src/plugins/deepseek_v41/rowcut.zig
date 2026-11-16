@@ -17,7 +17,7 @@ const none: A = .{ .ctx = null };
 /// The widest call the row-cut forward takes: a batched DSpark verify.
 pub const max_rows = 24;
 
-/// The ranks a forward spans. `gather` is MLX's all_gather: every rank's `x` stacked along axis 0 in rank order
+/// The ranks a forward spans. `gather` is MLX's all_gather: every rank's `x` concatenated along axis 0 in rank order
 /// (caller frees the result).
 pub const Group = struct {
     rank: u32,
@@ -182,13 +182,14 @@ pub const RowHead = struct {
     head: Lin,
     markov_head: A = none,
 
-    pub fn init(gpa: std.mem.Allocator, s: S, m: *const dsv41.Dsv41Model, rank: u32, size: u32) !RowHead {
-        if (m.head.ext != null) return error.Dsv41RowCutOutsideQuant;
-        var rh: RowHead = .{ .gpa = gpa, .head = undefined };
+    /// From the model's `head` and DSpark's `markov_head` (none without DSpark).
+    pub fn init(gpa: std.mem.Allocator, s: S, head: Lin, markov_head: A, rank: u32, size: u32) !RowHead {
+        if (head.ext != null) return error.Dsv41RowCutOutsideQuant;
+        var rh: RowHead = .{ .gpa = gpa, .head = .{ .w = none, .qp = head.qp } };
         errdefer rh.owned.deinit(gpa);
         const k: Cutter = .{ .gpa = gpa, .s = s, .owned = &rh.owned };
-        rh.head = try k.lin(m.head, 0, .{ .len = @intCast(dim(m.head.w, 0)), .rank = rank, .size = size });
-        if (m.dspark) |ds| rh.markov_head = try k.arr(ds.markov_head, 0, .{ .len = @intCast(dim(ds.markov_head, 0)), .rank = rank, .size = size });
+        if (head.w.ctx != null) rh.head = try k.lin(head, 0, .{ .len = @intCast(dim(head.w, 0)), .rank = rank, .size = size });
+        if (markov_head.ctx != null) rh.markov_head = try k.arr(markov_head, 0, .{ .len = @intCast(dim(markov_head, 0)), .rank = rank, .size = size });
         return rh;
     }
 
@@ -379,40 +380,15 @@ fn routes(sc: *Scope, fx: *fixture.Fixture, ly: *const dsv41.Layer, rows: usize,
 test "dsv41 row cut: four ranks' row-cut MoE with its two gathers is the TP1 MoE at 1, 6 and 24 rows" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
-    // f32: the bar of today's tensor-parallel MoE sum; bf16: within a rounding of the activation.
-    for ([_]struct { act: mlx.mlx_dtype, tol: f32 }{ .{ .act = .float32, .tol = 2e-4 }, .{ .act = .bfloat16, .tol = 1e-2 } }) |arm| {
-        const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .act = arm.act });
-        defer fx.deinit();
-        const ly = fx.layer(20);
-        const rls = try cutRanks(gpa, ly, 4);
-        defer {
-            for (rls) |*r| r.deinit();
-            gpa.free(rls);
-        }
-        for ([_]usize{ 1, 6, max_rows }) |rows| {
-            var sc = Scope.init(gpa, mlx.gpuStream());
-            defer sc.deinit();
-            const in = try routes(&sc, fx, ly, rows, arm.act);
-            const want = try dsv41.moeShare(fx.m, gpa, 20, in.x, in.r.idx, in.r.wts);
-            defer _ = mlx.mlx_array_free(want);
-            const a = try host(gpa, want);
-            defer gpa.free(a);
-            const b = try host(gpa, try simulate(&sc, fx.m, rls, in.x, in.r.idx, in.r.wts));
-            defer gpa.free(b);
-            try testing.expectEqual(a.len, b.len);
-            try testing.expect(try peakErr(a, b) <= arm.tol);
-        }
-    }
-}
-
-test "dsv41 row cut: forward over a one-rank group is the TP1 MoE" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    const gpa = testing.allocator;
+    // The bar of today's tensor-parallel MoE sum (`decode/fixture.zig`), in f32.
     const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .act = .float32 });
     defer fx.deinit();
     const ly = fx.layer(20);
-    var rl = try RowLayer.init(gpa, mlx.gpuStream(), ly, 0, 1);
-    defer rl.deinit();
+    const rls = try cutRanks(gpa, ly, 4);
+    defer {
+        for (rls) |*r| r.deinit();
+        gpa.free(rls);
+    }
     for ([_]usize{ 1, 6, max_rows }) |rows| {
         var sc = Scope.init(gpa, mlx.gpuStream());
         defer sc.deinit();
@@ -421,7 +397,119 @@ test "dsv41 row cut: forward over a one-rank group is the TP1 MoE" {
         defer _ = mlx.mlx_array_free(want);
         const a = try host(gpa, want);
         defer gpa.free(a);
-        const b = try host(gpa, try forward(&sc, fx.m, &rl, Group.solo, in.x, in.r.idx, in.r.wts));
+        const b = try host(gpa, try simulate(&sc, fx.m, rls, in.x, in.r.idx, in.r.wts));
+        defer gpa.free(b);
+        try testing.expectEqual(a.len, b.len);
+        try testing.expect(try peakErr(a, b) <= 2e-4);
+    }
+}
+
+test "dsv41 row cut: in bf16 the four ranks land no further from an f32 model than the TP1 MoE does" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // Today's tensor-parallel bf16 bar (`decode/fixture.zig`): the median over seeds, 1.25x the chain's error.
+    for ([_]usize{ 1, 6, max_rows }) |rows| {
+        var cut: [5]f64 = undefined;
+        var chain: [5]f64 = undefined;
+        for (&cut, &chain, 1..) |*e_cut, *e_chain, seed| {
+            const truth = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .act = .float32, .seed = seed });
+            defer truth.deinit();
+            const plain = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .seed = seed });
+            defer plain.deinit();
+            const ly = plain.layer(20);
+            const rls = try cutRanks(gpa, ly, 4);
+            defer {
+                for (rls) |*r| r.deinit();
+                gpa.free(rls);
+            }
+            var sc = Scope.init(gpa, mlx.gpuStream());
+            defer sc.deinit();
+            // One set of routes for all three, so a near-tie flip cannot pick different experts.
+            const in = try routes(&sc, plain, ly, rows, .bfloat16);
+            const t32 = try dsv41.moeShare(truth.m, gpa, 20, try sc.astype(in.x, .float32), in.r.idx, in.r.wts);
+            defer _ = mlx.mlx_array_free(t32);
+            const c16 = try dsv41.moeShare(plain.m, gpa, 20, in.x, in.r.idx, in.r.wts);
+            defer _ = mlx.mlx_array_free(c16);
+            const t = try host(gpa, t32);
+            defer gpa.free(t);
+            const c = try host(gpa, c16);
+            defer gpa.free(c);
+            const g = try host(gpa, try simulate(&sc, plain.m, rls, in.x, in.r.idx, in.r.wts));
+            defer gpa.free(g);
+            e_cut.* = decode.relRms(g, t);
+            e_chain.* = decode.relRms(c, t);
+        }
+        std.mem.sort(f64, &cut, {}, std.sort.asc(f64));
+        std.mem.sort(f64, &chain, {}, std.sort.asc(f64));
+        std.debug.print("[rowcut] R={d}: median cut-truth {e:.2}, chain-truth {e:.2} (rel rms)\n", .{ rows, cut[2], chain[2] });
+        try testing.expect(cut[2] <= 1.25 * chain[2] + 1e-4);
+    }
+}
+
+/// Every rank of a row-cut group in one process: `gather` computes the other ranks' parts from the same input, so each
+/// rank's own `forward` runs whole, its two gathers included.
+const Lockstep = struct {
+    sc: *Scope,
+    m: *const dsv41.Dsv41Model,
+    rls: []const RowLayer,
+    rank: u32,
+    x: A,
+    idx: A,
+    wts: A,
+    h: A = none,
+
+    fn group(self: *Lockstep) Group {
+        return .{ .rank = self.rank, .size = @intCast(self.rls.len), .ctx = self, .gather = gather };
+    }
+
+    fn gather(ctx: ?*anyopaque, mine: A) anyerror!A {
+        const self: *Lockstep = @ptrCast(@alignCast(ctx.?));
+        var parts: [8]A = undefined;
+        const up = self.h.ctx == null;
+        for (self.rls, 0..) |*rl, r| {
+            if (r == self.rank) {
+                parts[r] = mine;
+            } else if (up) {
+                parts[r] = try stageUp(self.sc, self.m, rl, self.x, self.idx, self.wts);
+            } else {
+                const y = try stageDown(self.sc, self.m, rl, self.h, self.idx);
+                parts[r] = try self.sc.reshape(y, &.{ dim(y, 0), 1, dim(y, 1) });
+            }
+        }
+        const all = try self.sc.concat(parts[0..self.rls.len], 0);
+        if (up) self.h = try joinRanks(self.sc, all, self.rls.len);
+        return self.sc.out(all);
+    }
+};
+
+test "dsv41 row cut: every rank's forward over a four-rank group is the TP1 MoE" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .act = .float32 });
+    defer fx.deinit();
+    const ly = fx.layer(20);
+    const rls = try cutRanks(gpa, ly, 4);
+    defer {
+        for (rls) |*r| r.deinit();
+        gpa.free(rls);
+    }
+    var solo = try RowLayer.init(gpa, mlx.gpuStream(), ly, 0, 1);
+    defer solo.deinit();
+    for ([_]usize{ 1, 6, max_rows }) |rows| {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const in = try routes(&sc, fx, ly, rows, .float32);
+        const want = try dsv41.moeShare(fx.m, gpa, 20, in.x, in.r.idx, in.r.wts);
+        defer _ = mlx.mlx_array_free(want);
+        const a = try host(gpa, want);
+        defer gpa.free(a);
+        for (0..4) |r| {
+            var ls: Lockstep = .{ .sc = &sc, .m = fx.m, .rls = rls, .rank = @intCast(r), .x = in.x, .idx = in.r.idx, .wts = in.r.wts };
+            const b = try host(gpa, try forward(&sc, fx.m, &rls[r], ls.group(), in.x, in.r.idx, in.r.wts));
+            defer gpa.free(b);
+            try testing.expect(try peakErr(a, b) <= 2e-4);
+        }
+        const b = try host(gpa, try forward(&sc, fx.m, &solo, Group.solo, in.x, in.r.idx, in.r.wts));
         defer gpa.free(b);
         try testing.expect(try peakErr(a, b) <= 2e-4);
     }
@@ -477,6 +565,32 @@ test "dsv41 row cut: a rank's attention cut is today's tensor-parallel cut of th
     };
 }
 
+/// Rows `[0, 2 * rows)` of a bank's axis 1, every other one: the same shape as a row view, but no row-contiguous matrix.
+fn strided(gpa: std.mem.Allocator, owned: *Owned, b: Bank, rows: usize) !Bank {
+    var out = b;
+    inline for (.{ "w", "s", "b" }) |f| if (@field(b, f).ctx != null) {
+        const a = @field(b, f);
+        const sh = mlx.getShape(a);
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&o, a, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ sh[0], @intCast(2 * rows), sh[2] }, 3, &[_]c_int{ 1, 2, 1 }, 3, mlx.gpuStream()));
+        @field(out, f) = try owned.put(gpa, o);
+    };
+    return out;
+}
+
+/// The memory peak above what is live of one rank's up stage over `in` (1 row).
+fn stagePeak(gpa: std.mem.Allocator, fx: *fixture.Fixture, rl: *const RowLayer, x: A, idx: A, wts: A) !usize {
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const base = activeBytes();
+    _ = mlx.mlx_reset_peak_memory();
+    const h = try stageUp(&sc, fx.m, rl, x, idx, wts);
+    try mlx.check(mlx.mlx_array_eval(h));
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    return peak -| base;
+}
+
 test "dsv41 row cut: the views copy no weight bytes, and the row-cut forward reads them in place" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -490,28 +604,64 @@ test "dsv41 row cut: the views copy no weight bytes, and the row-cut forward rea
         gpa.free(rls);
     }
     var wo_b: usize = 0;
+    // The smallest weight view a matmul reads: a copy of any would allocate at least this much.
+    var smallest: usize = std.math.maxInt(usize);
     for (rls) |*rl| {
         inline for (.{ "w", "s", "b" }) |f| if (@field(rl.wo_b, f).ctx != null) {
             wo_b += nbytes(@field(rl.wo_b, f));
         };
-        // Every view evaluated: a copy would allocate here.
+        for ([_]A{ rl.experts.gate.w, rl.experts.up.w, rl.experts.down.w, rl.shared[0].w, rl.shared[1].w, rl.shared[2].w }) |a| smallest = @min(smallest, nbytes(a));
         for (rl.owned.items.items) |a| try mlx.check(mlx.mlx_array_eval(a));
     }
-    // The smallest bank view a gather reads: a copy of any view would allocate at least this much.
-    const view_bytes = nbytes(rls[0].experts.gate.w);
     const grew = activeBytes() - before;
-    try testing.expect(wo_b > 0 and grew >= wo_b and grew - wo_b < view_bytes);
+    try testing.expect(wo_b > 0 and grew >= wo_b and grew - wo_b < smallest);
+
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
-    const in = try routes(&sc, fx, ly, max_rows, .bfloat16);
+    const in = try routes(&sc, fx, ly, 1, .bfloat16);
     for ([_]A{ in.x, in.r.idx, in.r.wts }) |a| try mlx.check(mlx.mlx_array_eval(a));
-    const base = activeBytes();
-    _ = mlx.mlx_reset_peak_memory();
-    const y = try simulate(&sc, fx.m, rls, in.x, in.r.idx, in.r.wts);
-    try mlx.check(mlx.mlx_array_eval(y));
-    var peak: usize = 0;
-    _ = mlx.mlx_get_peak_memory(&peak);
-    try testing.expect(peak - base < view_bytes);
+    // The whole forward at one row: transients of a few KiB, far below any view.
+    {
+        var fsc = Scope.init(gpa, mlx.gpuStream());
+        defer fsc.deinit();
+        const base = activeBytes();
+        _ = mlx.mlx_reset_peak_memory();
+        try mlx.check(mlx.mlx_array_eval(try simulate(&fsc, fx.m, rls, in.x, in.r.idx, in.r.wts)));
+        var peak: usize = 0;
+        _ = mlx.mlx_get_peak_memory(&peak);
+        try testing.expect(peak -| base < smallest / 2);
+    }
+    // The planted control: a gate view with a row stride makes the gather copy it, and the counter sees the copy.
+    const in_place = try stagePeak(gpa, fx, &rls[0], in.x, in.r.idx, in.r.wts);
+    var planted = rls[0];
+    var extra: Owned = .{};
+    defer extra.deinit(gpa);
+    const iq: usize = @intCast(dim(rls[0].experts.gate.w, 1));
+    planted.experts.gate = try strided(gpa, &extra, ly.experts.gu.?, iq);
+    const copied = try stagePeak(gpa, fx, &planted, in.x, in.r.idx, in.r.wts);
+    try testing.expect(in_place < smallest / 2);
+    try testing.expect(copied >= nbytes(planted.experts.gate.w));
+}
+
+test "dsv41 row cut: a rank's head and Markov head are its vocabulary rows, as views" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vals: [16 * 4]f32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @floatFromInt(i);
+    const w = mlx.mlx_array_new_data(&vals, &[_]c_int{ 16, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    const mk = mlx.mlx_array_new_data(&vals, &[_]c_int{ 16, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(mk);
+    var rh = try RowHead.init(gpa, mlx.gpuStream(), .{ .w = w }, mk, 3, 4);
+    defer rh.deinit();
+    for ([_]A{ rh.head.w, rh.markov_head }) |a| {
+        const got = try host(gpa, a);
+        defer gpa.free(got);
+        try testing.expectEqualSlices(f32, vals[12 * 4 ..], got);
+    }
+    var bare = try RowHead.init(gpa, mlx.gpuStream(), .{ .w = w }, none, 0, 4);
+    defer bare.deinit();
+    try testing.expect(bare.markov_head.ctx == null);
 }
 
 test "dsv41 row cut: a DSpark stage's MoE (its own experts, top-3) row-cut is the stage's TP1 MoE" {
