@@ -206,6 +206,11 @@ pub const Drafting = struct {
 
     /// A drafted round's wall time is bounded by the rounds before it, so a stall cannot stop drafting.
     pub fn record(self: *Drafting, gain: f32, wall_in: f32) void {
+        if (self.wall <= 0 and gain <= 0) {
+            self.owed = self.period;
+            self.period = @min(self.period * 2, MAX_PERIOD);
+            return;
+        }
         const prior_wall = if (self.wall > 0) self.wall else gain;
         const wall = if (prior_wall > 0) @min(wall_in, prior_wall * STALL) else wall_in;
         if (self.wall <= 0) {
@@ -768,7 +773,7 @@ test "Drafting: a stalled round is not what a round costs" {
 test "Drafting: a first round that gained nothing still owes plain rounds" {
     var d: Drafting = .{};
     d.record(0, 35);
-    try testing.expect(d.wall > 0);
+    try testing.expectEqual(@as(f32, 0), d.wall);
     try testing.expect(d.owed >= 1);
 }
 
