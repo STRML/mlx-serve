@@ -134,9 +134,9 @@ fn plain(buf: []u8, status: u16, msg: []const u8) Response {
     return .{ .status = status, .body = std.fmt.bufPrint(buf, "{{\"ok\":false,\"error\":\"{s}\"}}", .{msg}) catch "{}" };
 }
 
-fn render(buf: []u8, status: u16, reason: []const u8, drained: ?bool, snap: sw_mod.Snapshot) Response {
+fn render(io: std.Io, buf: []u8, status: u16, reason: []const u8, drained: ?bool, snap: sw_mod.Snapshot) Response {
     var tmp: [512]u8 = undefined;
-    const body = sw_mod.renderSnapshot(&tmp, snap);
+    const body = sw_mod.renderSnapshot(io, &tmp, snap);
     var dr: [24]u8 = undefined;
     const drained_field = if (drained) |d| std.fmt.bufPrint(&dr, ",\"drained\":{}", .{d}) catch "" else "";
     const error_field = if (status == 501) ",\"error\":\"no formation backend: the switch adapter is not installed\"" else "";
@@ -156,7 +156,7 @@ pub fn handle(sw: *sw_mod.Switch, internal_key: ?[32]u8, req: Request, wall_now_
     const is_get = std.mem.eql(u8, req.method, "GET");
     if (std.mem.eql(u8, route, "mode")) {
         if (!is_get) return plain(buf, 405, "method not allowed");
-        return render(buf, 200, "", null, sw.snapshot());
+        return render(sw.io, buf, 200, "", null, sw.snapshot());
     }
     const cmd = commandOf(route) orelse return plain(buf, 404, "not found");
     if (!std.mem.eql(u8, req.method, "POST")) return plain(buf, 405, "method not allowed");
@@ -173,7 +173,7 @@ pub fn handle(sw: *sw_mod.Switch, internal_key: ?[32]u8, req: Request, wall_now_
         drained = sw.waitDrained(p.n, p.wait_ms);
         snap = sw.snapshot();
     }
-    return render(buf, reply.status, reply.reason, drained, snap);
+    return render(sw.io, buf, reply.status, reply.reason, drained, snap);
 }
 
 /// `/health`: 200 `ok` with the mode fields, 503 naming quarantine, an abort in progress, or a stall.
@@ -330,6 +330,25 @@ test "routes: wrong method is 405, unknown path is 404" {
     try t.expectEqual(@as(u16, 404), call(&r, KEY, "GET", "/v1/internal/", BEARER, "").status);
 }
 
+test "internal mode reply carries the box wall clock in epoch milliseconds" {
+    var r = rig();
+    const res = call(&r, KEY, "GET", "/v1/internal/mode", BEARER, "");
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, res.body, .{});
+    defer parsed.deinit();
+    const clock = parsed.value.object.get("clock_ms") orelse return error.MissingClock;
+    const now = @import("../../sdk/util/io_util.zig").nowMs(t.io);
+    try t.expect(@abs(clock.integer - now) <= 5000);
+}
+
+test "internal mode reply carries positive free and inactive memory in MiB" {
+    var r = rig();
+    const res = call(&r, KEY, "GET", "/v1/internal/mode", BEARER, "");
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, res.body, .{});
+    defer parsed.deinit();
+    const room = parsed.value.object.get("room_mib") orelse return error.MissingRoom;
+    try t.expect(room.integer > 0);
+}
+
 test "a command needs a positive integer n" {
     var r = rig();
     for ([_][]const u8{ "", "{}", "{\"n\":0}", "{\"n\":-1}", "{\"n\":\"7\"}", "not json", "{\"n\":1.5}" }) |b| {
@@ -410,6 +429,11 @@ test "every command and the mode poll are served on any repeat" {
         const p = try std.fmt.bufPrint(&path, "/v1/internal/{s}", .{c});
         const res = call(&r, KEY, "POST", p, BEARER, "{\"n\":2}");
         try t.expect(res.status == 200 or res.status == 409 or res.status == 501);
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, res.body, .{});
+        defer parsed.deinit();
+        const o = parsed.value.object;
+        try t.expect((o.get("clock_ms") orelse return error.MissingClock).integer > 0);
+        try t.expect((o.get("room_mib") orelse return error.MissingRoom).integer > 0);
     }
 }
 

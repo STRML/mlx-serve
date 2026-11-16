@@ -90,6 +90,8 @@ check "serving key is 401 on abort" "$(eq "$(status "$(post /v1/internal/abort '
 M="$(get /v1/internal/mode "$KEY")"
 check "internal key reads the mode: tp1, idle, admitting" "$([ "$(status "$M")" = 200 ] && [ "$(field "$M" mode)" = tp1 ] && [ "$(field "$M" state)" = idle ] && [ "$(field "$M" admitting)" = True ] && echo 1 || echo 0)"
 check "no --metrics: the mode poll still carries a progress count (stall detection runs)" "$([ "$(field "$M" progress)" != None ] && echo 1 || echo 0)"
+check "mode clock_ms is within 5 s of this box's wall clock" "$(python3 -c 'import json,sys,time; v=json.loads(sys.argv[1].split(" ",1)[1]).get("clock_ms"); print(int(type(v) is int and abs(v-time.time_ns()//1_000_000) <= 5000))' "$M")"
+check "mode room_mib is a positive integer" "$(python3 -c 'import json,sys; v=json.loads(sys.argv[1].split(" ",1)[1]).get("room_mib"); print(int(type(v) is int and v > 0))' "$M")"
 check "/health carries the mode fields" "$(has "$(curl -s "$BASE/health")" '"mode":"tp1"')"
 
 echo "[4/6] drain closes public inference; abort reopens it"

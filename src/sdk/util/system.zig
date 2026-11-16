@@ -202,6 +202,15 @@ pub fn getAvailableMemBytes() u64 {
     return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), host +| returnedNotShown(host));
 }
 
+/// `vm_stat` free + inactive bytes on Darwin; OS available RAM elsewhere. No MLX calls. Null when the Darwin query
+/// fails, so a caller never reads a failure as no room. Mach's free_count includes speculative pages; vm_stat's
+/// "Pages free" excludes them.
+pub fn getFreeInactiveMemBytes() ?u64 {
+    if (comptime !builtin.os.tag.isDarwin()) return hostAvailableMemBytes();
+    const v = darwinVm() orelse return null;
+    return ((@as(u64, v.vm.free_count) -| v.vm.speculative_count) + v.vm.inactive_count) * v.page;
+}
+
 /// macOS shows memory MLX handed back about a second late, while a new allocation can take it at once: a reading
 /// taken right after an eviction or an unload refused work that fit. This carries what MLX returned between two
 /// close readings until the OS figure shows it, or MLX takes it again.
@@ -740,4 +749,25 @@ test "memoryPressureLevel reads the kernel's level on macOS" {
     if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
     const level = memoryPressureLevel();
     try std.testing.expect(level == 1 or level == 2 or level == 4);
+}
+
+test "internal switch room counts only free and inactive pages at the host page size" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const saved = reading_override;
+    defer reading_override = saved;
+    var vm = std.mem.zeroes(VmStats64);
+    vm.free_count = 100;
+    vm.inactive_count = 300;
+    vm.speculative_count = 20;
+    vm.external_page_count = 500;
+    vm.purgeable_count = 40;
+    for ([_]u64{ 4096, 16384 }) |page| {
+        reading_override = .{ .vm = .{ .total = 16 << 30, .page = page, .vm = vm }, .footprint = 0, .now_ms = 1000 };
+        try std.testing.expectEqual(@as(?u64, 380 * page), getFreeInactiveMemBytes());
+    }
+    vm.free_count = std.math.maxInt(u32);
+    vm.inactive_count = 1;
+    vm.speculative_count = 0;
+    reading_override = .{ .vm = .{ .total = 1 << 48, .page = 16384, .vm = vm }, .footprint = 0, .now_ms = 1000 };
+    try std.testing.expectEqual(@as(?u64, @as(u64, 1) << 46), getFreeInactiveMemBytes());
 }
