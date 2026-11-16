@@ -532,15 +532,17 @@ fn sharedAt(words: []const f64, exps: []const f64, d: usize, i: usize, k: usize)
 }
 
 /// The block's down half: `rows` decode rows over `Params.experts` routed experts of a `bits`-bit group-`gs` bank plus
-/// the shared mxfp8 expert, y rounded to bf16 once, then the hc expand.
+/// the shared mxfp8 expert, y rounded to bf16 once, then the hc expand. With `xp` off, a tensor rank's row cut: the
+/// banks hold `cut` times the launch's N rows an expert, the launch reads the first N of each (expert stride `cut * N`)
+/// and writes y alone.
 const DownK = struct {
-    pub const Params = struct { experts: usize = 8, bits: u32 = 3, gs: u32 = 64 };
+    pub const Params = struct { experts: usize = 8, bits: u32 = 3, gs: u32 = 64, xp: bool = true, cut: usize = 1 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         const nt = rows_per_tg * (s.k / 128);
         if (s.rows < 1 or s.rows > decode.max_rows or s.n == 0 or s.n % rows_per_tg != 0 or s.k == 0 or s.k % 128 != 0 or s.k > max_k or p.experts < TOPK or p.experts > 64) return null;
         var g = metal.Geometry{ .grid = .{ ci(s.n / rows_per_tg * nt), 1, 1 }, .tg = .{ ci(nt), 1, 1 } };
-        g.out(&.{ ci(s.rows), HC, ci(s.n) }, adt);
+        if (p.xp) g.out(&.{ ci(s.rows), HC, ci(s.n) }, adt) else g.out(&.{ ci(s.rows), ci(s.n) }, adt);
         g.int("K", s.k);
         g.int("N", s.n);
         g.int("ROWS", s.rows);
@@ -549,8 +551,8 @@ const DownK = struct {
         g.int("TOPK", TOPK);
         g.int("BITS", p.bits);
         g.int("GS", p.gs);
-        g.int("ES", s.n);
-        g.int("XP", 1);
+        g.int("ES", s.n * p.cut);
+        g.int("XP", @intFromBool(p.xp));
         g.dtype("T", adt);
         return g;
     }
@@ -561,9 +563,10 @@ const DownK = struct {
         const N = k.shape.n;
         const K = k.shape.k;
         const x = try k.add(adt, &.{ R, TOPK + 1, K });
-        const routed = try contract.Bank.add(k, &.{ p.experts, N }, p.bits, p.gs, K);
-        const words = try k.add(.uint32, &.{ N, K / 4 });
-        const exps = try k.add(.uint8, &.{ N, K / 32 });
+        const D = N * p.cut;
+        const routed = try contract.Bank.add(k, &.{ p.experts, D }, p.bits, p.gs, K);
+        const words = try k.add(.uint32, &.{ D, K / 4 });
+        const exps = try k.add(.uint8, &.{ D, K / 32 });
         const inds = try k.add(.uint32, &.{ R, TOPK });
         const res = try k.add(adt, &.{ R, HC, N });
         const post = try k.add(.float32, &.{ R, HC });
@@ -582,7 +585,7 @@ const DownK = struct {
                 v.* = @floatFromInt(e);
             }
         }
-        const bytes = try k.scratch().alloc(u8, N * K);
+        const bytes = try k.scratch().alloc(u8, D * K);
         defer k.scratch().free(bytes);
         switch (f) {
             .random, .nonfinite => {
@@ -597,7 +600,7 @@ const DownK = struct {
                     // pair's first group is positive, so a row sharing the expert meets the same infinity.
                     const put = [_]f64{ kit.nan, kit.inf, -kit.inf, kit.inf };
                     for (0..R * (TOPK + 1)) |i| kit.uniform(rng, x[i * K ..][0..p.gs], 0.1, 2);
-                    for (put, 0..) |v, s| try routed.plant(@as(usize, @intFromFloat(inds[s])) * N + s, v, k.scratch());
+                    for (put, 0..) |v, s| try routed.plant(@as(usize, @intFromFloat(inds[s])) * D + s, v, k.scratch());
                 }
             },
             .stress => {
@@ -608,7 +611,7 @@ const DownK = struct {
                 for (1..R * (TOPK + 1)) |i| @memcpy(x[i * K ..][0..K], x[0..K]);
                 try routed.mirrored(rng, perm, k.scratch());
                 // fp8 integers 1..15 (exact) on the first half, their negatives on the shuffled second, unit scales.
-                for (0..N) |d| for (0..K / 2) |i| {
+                for (0..D) |d| for (0..K / 2) |i| {
                     const c: u8 = if (i < 8) 1 else rng.intRangeAtMost(u8, 1, 15);
                     var code: u8 = 0;
                     while (kc.host.e4m3(code) != @as(f64, @floatFromInt(c))) code += 1;
@@ -623,8 +626,8 @@ const DownK = struct {
         for (words, 0..) |*wd, i| wd.* = @floatFromInt(std.mem.readInt(u32, bytes[4 * i ..][0..4], .little));
     }
 
-    pub fn count(_: Params, s: Shape) usize {
-        return s.rows * HC * s.n;
+    pub fn count(p: Params, s: Shape) usize {
+        return s.rows * @as(usize, if (p.xp) HC else 1) * s.n;
     }
 
     pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
@@ -641,7 +644,7 @@ const DownK = struct {
             var m: f64 = 0;
             for (0..TOPK) |s| {
                 const e: usize = @intFromFloat(k.in(6)[r * TOPK + s]);
-                const q = routed.dot(e * N + d, k.in(0)[(r * (TOPK + 1) + s) * K ..][0..K], sum, t);
+                const q = routed.dot(e * N * k.p.cut + d, k.in(0)[(r * (TOPK + 1) + s) * K ..][0..K], sum, t);
                 parts[s] = q[0];
                 m += q[1];
             }
@@ -655,6 +658,11 @@ const DownK = struct {
             parts[TOPK] = sum.of(t[0..K]);
             m += sm;
             const tot = sum.of(&parts);
+            if (!k.p.xp) {
+                out[r * N + d] = tot;
+                mag[r * N + d] = m;
+                continue;
+            }
             const y = bf(tot);
             m += (@abs(tot) + @abs(y)) * flip;
             for (0..HC) |i| {
@@ -676,16 +684,41 @@ const DownK = struct {
 /// Served shapes cut the output rows to a few where the float64 reference would run for seconds; the reduction axis stays
 /// the release's.
 pub fn register(set: *kc.Set) !void {
-    inline for (.{ .{ 3, 64 }, .{ 2, 64 }, .{ 2, 128 }, .{ 3, 128 } }) |w| try kit.add(set, DownK, &down_l, .{ .bits = w[0], .gs = w[1] }, .{
-        .name = std.fmt.comptimePrint("dsv41 dec moe_down ({d}-bit g{d} routed + mxfp8 shared, hc expand)", .{ w[0], w[1] }),
+    inline for (.{ .{ 3, 64 }, .{ 2, 64 }, .{ 2, 128 }, .{ 3, 128 } }) |w| inline for (.{ .{ true, 1, "hc expand" }, .{ false, 4, "a quarter of the rows, y only" } }) |arm| try kit.add(set, DownK, &down_l, .{ .bits = w[0], .gs = w[1], .xp = arm[0], .cut = arm[1] }, .{
+        .name = std.fmt.comptimePrint("dsv41 dec moe_down ({d}-bit g{d} routed + mxfp8 shared, {s})", .{ w[0], w[1], arm[2] }),
         .accum = .f32,
         .depth = depthK,
         .ops = 4,
-        .mids = 1,
+        .mids = if (arm[0]) 1 else 0,
         .out = .bf16,
         .tiles = .{ .{}, .{ .size = rows_per_tg, .step = rows_per_tg, .min = rows_per_tg }, .{ .size = 128, .step = 128, .min = 128 } },
         .served = &.{ .{ .rows = 1, .n = 64, .k = 2304 }, .{ .rows = 6, .n = 64, .k = 2304 }, .{ .rows = 2, .n = 32, .k = 128 } },
     });
+}
+
+test "dsv41 dec moe_down: a rank's row launch is the declared row-cut launch, byte for byte" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    inline for (.{ .{ 3, 64 }, .{ 2, 128 } }) |wd| for ([_]usize{ 1, 6 }) |rows| {
+        const c = try a.create(kit.Case(DownK));
+        defer {
+            c.deinit();
+            a.destroy(c);
+        }
+        c.* = .init(a, &down_l, .{ .bits = wd[0], .gs = wd[1], .xp = false, .cut = 4 });
+        try std.testing.expect(try c.prepare(.{ .rows = rows, .n = 64, .k = 256 }, .random, 7));
+        try c.run();
+        const mine = try a.dupe(u8, c.rig.outputBytes());
+        defer a.free(mine);
+        var sc = dsv41.Scope.init(a, c.rig.stream());
+        defer sc.deinit();
+        const down: dsv41.Bank = .{ .w = c.args[1], .s = c.args[2], .b = c.args[3], .qp = .{ .bits = wd[0], .group_size = wd[1] } };
+        const shared: dsv41.Lin = .{ .w = c.args[4], .s = c.args[5], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
+        const got = (try moeDownRows(&sc, kern, rows_per_tg, &down, &shared, 0, 4, c.args[0], c.args[6])) orelse return error.Declined;
+        try std.testing.expectEqualSlices(u8, try c.rig.bytesOf(&.{got}), mine);
+    };
 }
 
 test "dsv41 dec moe_down: the declared launch is the shipped wrapper's, byte for byte" {

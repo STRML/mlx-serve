@@ -93,7 +93,7 @@ pub const Rows = struct {
 
 /// `moeUp` over rank `rank` of `size`'s quarter rows of the resident fused banks `gu` and `sgu` (a tensor rank's row cut,
 /// `rowcut.zig`): `[R, k + 1, inter / size]`, the bank bound from its first row this rank reads, so nothing is copied.
-pub fn moeUpRows(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernel, gu: dsv41.Bank, sgu: dsv41.Lin, rank: usize, size: usize, h2: A, idx: A, wts: A) !?A {
+pub fn moeUpRows(sc: *dsv41.Scope, kern: Kernel, gu: dsv41.Bank, sgu: dsv41.Lin, rank: usize, size: usize, h2: A, idx: A, wts: A) !?A {
     if (!mlx.streamIsGpu(sc.s) or gu.s.ctx == null or gu.b.ctx == null or sgu.s.ctx == null) return null;
     const hs = mlx.getShape(h2);
     const is = mlx.getShape(idx);
@@ -110,7 +110,7 @@ pub fn moeUpRows(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernel, gu:
     const inter: usize = @intCast(@divExact(gw[1], 2));
     const n = inter / size;
     const dt = mlx.mlx_array_dtype(h2);
-    if (dt != m.act or mlx.mlx_array_dtype(gu.s) != dt or mlx.mlx_array_dtype(gu.b) != dt) return null;
+    if (mlx.mlx_array_dtype(gu.s) != dt or mlx.mlx_array_dtype(gu.b) != dt) return null;
     if (mlx.mlx_array_dtype(idx) != .uint32 or mlx.mlx_array_dtype(wts) != .float32) return null;
     const sw = mlx.getShape(sgu.w);
     const ss = mlx.getShape(sgu.s);
@@ -184,8 +184,10 @@ fn sharedWeight(sw: []const f64, ss: []const f64, r: usize, i: usize, k: usize) 
     return e4m3(byte) * std.math.pow(f64, 2, ss[r * (k / 32) + i / 32] - 127);
 }
 
+/// With `cut` above 1, a tensor rank's row cut: the banks hold `cut` times the launch's N gate rows (and up rows) an
+/// expert, and the launch reads the first N of each (`moeUpRows` at rank 0).
 const MoeUp = struct {
-    pub const Params = struct { bits: u32, gs: u32 = 64, experts: usize = 8, lim: f64 = 10 };
+    pub const Params = struct { bits: u32, gs: u32 = 64, experts: usize = 8, lim: f64 = 10, cut: usize = 1 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.rows > decode.max_rows or s.n == 0 or s.k == 0 or s.k % 1024 != 0) return null;
@@ -197,9 +199,9 @@ const MoeUp = struct {
         g.int("TOPK", TOPK);
         g.int("BITS", p.bits);
         g.int("GS", p.gs);
-        g.int("ES", 2 * s.n);
-        g.int("UO", s.n);
-        g.int("SUO", s.n);
+        g.int("ES", 2 * s.n * p.cut);
+        g.int("UO", s.n * p.cut);
+        g.int("SUO", s.n * p.cut);
         g.dtype("T", act);
         return g;
     }
@@ -210,9 +212,10 @@ const MoeUp = struct {
         const N = k.shape.n;
         const K = k.shape.k;
         const x = try k.add(act, &.{ R, K });
-        const routed = try cv.Bank.add(k, &.{ p.experts, 2 * N }, p.bits, p.gs, K);
-        const sw = try k.add(.uint32, &.{ 2 * N, K / 4 });
-        const ss = try k.add(.uint8, &.{ 2 * N, K / 32 });
+        const I = N * p.cut;
+        const routed = try cv.Bank.add(k, &.{ p.experts, 2 * I }, p.bits, p.gs, K);
+        const sw = try k.add(.uint32, &.{ 2 * I, K / 4 });
+        const ss = try k.add(.uint8, &.{ 2 * I, K / 32 });
         const inds = try k.add(.uint32, &.{ R, TOPK });
         const wts = try k.add(.float32, &.{ R, TOPK });
         const lim = try k.add(.float32, &.{1});
@@ -225,7 +228,7 @@ const MoeUp = struct {
             rng.shuffle(usize, pool[0..p.experts]);
             for (0..TOPK) |j| inds[row * TOPK + j] = @floatFromInt(pool[j]);
         }
-        const bytes = try k.scratch().alloc(u8, 2 * N * K);
+        const bytes = try k.scratch().alloc(u8, 2 * I * K);
         defer k.scratch().free(bytes);
         switch (f) {
             .random, .nonfinite => {
@@ -241,7 +244,7 @@ const MoeUp = struct {
                 cv.mirroredX(rng, x[0..K], perm);
                 for (1..R) |row| mirrorRow(rng, x[row * K ..][0..K], perm);
                 try routed.mirrored(rng, perm, k.scratch());
-                for (0..2 * N) |r| {
+                for (0..2 * I) |r| {
                     const h = K / 2;
                     for (0..h) |i| {
                         const c: u8 = if (i < 8) 1 else @intCast(rng.intRangeAtMost(u32, 1, 8));
@@ -259,9 +262,9 @@ const MoeUp = struct {
             const put = [_][3]f64{ .{ 0, kit.nan, 0 }, .{ 1, kit.inf, 0 }, .{ 2, 0, -kit.inf }, .{ 3, kit.inf, -kit.inf } };
             for (put) |q| {
                 const e: usize = @intFromFloat(q[0]);
-                const base = @as(usize, @intFromFloat(inds[e])) * 2 * N + e % N;
+                const base = @as(usize, @intFromFloat(inds[e])) * 2 * I + e % N;
                 if (q[1] != 0) try routed.plant(base, q[1], k.scratch());
-                if (q[2] != 0) try routed.plant(base + N, q[2], k.scratch());
+                if (q[2] != 0) try routed.plant(base + I, q[2], k.scratch());
             }
         }
     }
@@ -282,6 +285,7 @@ const MoeUp = struct {
     pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
         const R = k.shape.rows;
         const N = k.shape.n;
+        const I = N * k.p.cut;
         const K = k.shape.k;
         const routed: cv.Bank = .{ .w = k.in(1), .s = k.in(2), .b = k.in(3), .bits = k.p.bits, .gs = k.p.gs, .k = K };
         const t = try k.scratch().alloc(f64, K);
@@ -294,12 +298,12 @@ const MoeUp = struct {
             var wt: f64 = 1;
             if (j < TOPK) {
                 const e: usize = @intFromFloat(k.in(6)[row * TOPK + j]);
-                g = routed.dot(e * 2 * N + c, x, sum, t);
-                up = routed.dot(e * 2 * N + N + c, x, sum, t);
+                g = routed.dot(e * 2 * I + c, x, sum, t);
+                up = routed.dot(e * 2 * I + I + c, x, sum, t);
                 wt = k.in(7)[row * TOPK + j];
             } else {
                 g = sharedDot(k, c, x, sum, t);
-                up = sharedDot(k, N + c, x, sum, t);
+                up = sharedDot(k, I + c, x, sum, t);
             }
             const gt = kit.spec.roundTo(.bf16, g[0]);
             const ut = kit.spec.roundTo(.bf16, up[0]);
@@ -333,9 +337,9 @@ const moe_up_l = cv.launch("dsv41_dec_moe_up", &INS, &.{"out"}, SOURCE, HEADER, 
 /// Served shapes cut the output width to 64: each column runs the same code at its own index; the reduction length and
 /// the rows (R = 1..6, over 8 experts so the rows share most of them) are the release's.
 pub fn register(set: *kc.Set) !void {
-    inline for (.{ 2, 3 }) |bits| inline for (.{ 64, 128 }) |gs| {
-        try kit.add(set, MoeUp, &moe_up_l, .{ .bits = bits, .gs = gs }, .{
-            .name = std.fmt.comptimePrint("dsv41 dec moe_up {d}-bit g{d} + mxfp8 shared", .{ bits, gs }),
+    inline for (.{ 2, 3 }) |bits| inline for (.{ 64, 128 }) |gs| inline for (.{ .{ 1, "" }, .{ 4, ", a quarter of the rows" } }) |arm| {
+        try kit.add(set, MoeUp, &moe_up_l, .{ .bits = bits, .gs = gs, .cut = arm[0] }, .{
+            .name = std.fmt.comptimePrint("dsv41 dec moe_up {d}-bit g{d} + mxfp8 shared{s}", .{ bits, gs, arm[1] }),
             .accum = .f32,
             .depth = depth,
             .ops = 8,
@@ -567,6 +571,28 @@ test "dsv41 dec moe_up: the declared launch is the wrapper's, byte for byte" {
         defer _ = mlx.mlx_fast_metal_kernel_free(kern.k);
         defer _ = mlx.mlx_array_free(kern.lim);
         const theirs = try run(&sc, .{ .k = kern.k, .lim = c.args[8] }, bits, gs, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5], c.args[6], c.args[7], Rows.fused(@intCast(@divExact(mlx.getShape(c.args[4])[0], 2))));
+        try testing.expectEqualSlices(u8, try c.rig.bytesOf(&.{theirs}), mine);
+    };
+}
+
+test "dsv41 dec moe_up: a rank's row launch is the declared row-cut launch, byte for byte" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    inline for (.{ 2, 3 }) |bits| inline for (.{ 64, 128 }) |gs| for ([_]Shape{ .{ .rows = 1, .n = 24, .k = 2048 }, .{ .rows = 4, .n = 9, .k = 1024 } }) |shape| {
+        var c = kit.Case(MoeUp).init(a, &moe_up_l, .{ .bits = bits, .gs = gs, .cut = 4 });
+        defer c.deinit();
+        try testing.expect(try c.prepare(shape, .random, 7));
+        try c.run();
+        const mine = try a.dupe(u8, c.rig.outputBytes());
+        defer a.free(mine);
+        var sc = dsv41.Scope.init(a, mlx.gpuStream());
+        defer sc.deinit();
+        const kern = try build(10);
+        defer _ = mlx.mlx_fast_metal_kernel_free(kern.k);
+        defer _ = mlx.mlx_array_free(kern.lim);
+        const gu: dsv41.Bank = .{ .w = c.args[1], .s = c.args[2], .b = c.args[3], .qp = .{ .bits = bits, .group_size = gs } };
+        const sgu: dsv41.Lin = .{ .w = c.args[4], .s = c.args[5], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
+        const theirs = (try moeUpRows(&sc, .{ .k = kern.k, .lim = c.args[8] }, gu, sgu, 0, 4, c.args[0], c.args[6], c.args[7])) orelse return error.Declined;
         try testing.expectEqualSlices(u8, try c.rig.bytesOf(&.{theirs}), mine);
     };
 }

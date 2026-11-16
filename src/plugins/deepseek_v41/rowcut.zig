@@ -220,7 +220,7 @@ pub fn stageUp(sc: *Scope, m: *const dsv41.Dsv41Model, rl: *const RowLayer, x: A
     const d = dim(x, 1);
     const limit = m.cfg.dsv4_swiglu_limit;
     const uidx = try sc.astype(idx, .uint32);
-    if (m.dec.moe_up) |ku| if (rl.fused) |f| if (try moe_up.moeUpRows(sc, m, ku, f.gu, f.sgu, rl.rank, rl.size, x, uidx, try sc.astype(wts, .float32))) |act| return act;
+    if (m.dec.moe_up) |ku| if (rl.fused) |f| if (try moe_up.moeUpRows(sc, ku, f.gu, f.sgu, rl.rank, rl.size, x, uidx, try sc.astype(wts, .float32))) |act| return act;
     const xe = try sc.reshape(x, &.{ @intCast(L), 1, 1, d });
     const gt, const up = try dsv41.gateUp(sc, &rl.experts, xe, lhsOf(L, k, m.lhs_gu), uidx, false);
     const iq = dim(gt, -1);
@@ -832,7 +832,7 @@ test "dsv41 row cut: the fused up launch over a rank's rows of the resident bank
         const in = try routes(&sc, fx, ly, rows, .bfloat16);
         for (rls) |*rl| {
             const f = rl.fused.?;
-            const got = (try moe_up.moeUpRows(&sc, fx.m, ku, f.gu, f.sgu, rl.rank, rl.size, in.x, try sc.astype(in.r.idx, .uint32), in.r.wts)) orelse return error.Declined;
+            const got = (try moe_up.moeUpRows(&sc, ku, f.gu, f.sgu, rl.rank, rl.size, in.x, try sc.astype(in.r.idx, .uint32), in.r.wts)) orelse return error.Declined;
             var chain = rl.*;
             chain.fused = null;
             const want = try stageUp(&sc, fx.m, &chain, in.x, in.r.idx, in.r.wts);
