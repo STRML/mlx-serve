@@ -740,6 +740,7 @@ pub const HotPrefixCache = struct {
     session_seq: u64 = 0,
     session_tips_seeded: bool = false,
     tips_unpersisted: bool = false,
+    index_append_failing: bool = false,
     session_index: ?session_index_mod.Index = null,
     /// Tips held in memory, and sessions the persisted index keeps: fields so a test reaches either cheaply.
     session_tip_cap: usize = MAX_SESSION_TIPS,
@@ -1665,7 +1666,14 @@ pub const HotPrefixCache = struct {
                 waiting = true;
                 continue;
             }
-            index.append(.{ .session = kv.key_ptr.*, .id = tip.id, .n = tip.n, .variant = tip.variant, .seq = tip.seq });
+            index.append(.{ .session = kv.key_ptr.*, .id = tip.id, .n = tip.n, .variant = tip.variant, .seq = tip.seq }) catch |err| {
+                if (!self.index_append_failing) log.warn("[session-index] append failed, the tip stays unpersisted and retries on the next flush: {s}\n", .{@errorName(err)});
+                self.index_append_failing = true;
+                self.disk_dirty = true;
+                waiting = true;
+                break;
+            };
+            self.index_append_failing = false;
             tip.persisted = true;
         }
         self.tips_unpersisted = waiting;
@@ -2379,7 +2387,7 @@ pub const HotPrefixCache = struct {
         }
         // Only a prompt boundary a session tagged moves that session's tip.
         const seq: u64 = if (tail_from == 0 and session != 0) self.nextSessionSeq() else 0;
-        const boundary_key = boundary_mod.id(variantKey(prefix_key, binding.variant), ids, eff_media);
+        const boundary_key = boundary_mod.id(variantKey(prefix_key, binding.variant), ids, eff_media, has_tools, quant_config);
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
             .tokens = keys[0],
@@ -2685,7 +2693,7 @@ pub const HotPrefixCache = struct {
     fn cancelPendingModules(self: *HotPrefixCache, reason: kv_disk_cache.DiskTier.ModuleCancellation) void {
         self.cancelPendingModule(&self.finishing_disk, reason);
         self.cancelPendingModule(&self.pending_disk, reason);
-        self.disk_dirty = self.diskOwed();
+        self.disk_dirty = self.flushOwed();
     }
 
     fn cancelModuleExports(self: *HotPrefixCache, reason: kv_disk_cache.DiskTier.ModuleCancellation) void {
@@ -2701,7 +2709,7 @@ pub const HotPrefixCache = struct {
             e.disk_dirty = false;
         };
         self.syncModuleLosses();
-        self.disk_dirty = self.diskOwed();
+        self.disk_dirty = self.flushOwed();
     }
 
     /// Commit the current `source_cache` state under the given key. Updates
@@ -3661,6 +3669,15 @@ pub const HotPrefixCache = struct {
         return self.modulePublicationPending();
     }
 
+    /// A tip whose index append failed is owed another try; `diskOwed` leaves it out so a shutdown does not wait on it.
+    fn indexRetryOwed(self: *const HotPrefixCache) bool {
+        return self.tips_unpersisted and self.index_append_failing;
+    }
+
+    fn flushOwed(self: *const HotPrefixCache) bool {
+        return self.diskOwed() or self.indexRetryOwed();
+    }
+
     fn modulePublicationPending(self: *const HotPrefixCache) bool {
         const d = if (self.disk) |*dd| dd else return false;
         for (d.entries.items) |e| {
@@ -3683,10 +3700,10 @@ pub const HotPrefixCache = struct {
         self.dropWrittenOverBudget(d);
         if (!self.diskOwed()) {
             self.persistDurableTips();
-            self.disk_dirty = false;
+            self.disk_dirty = self.indexRetryOwed();
             return null;
         }
-        defer self.disk_dirty = self.diskOwed();
+        defer self.disk_dirty = self.flushOwed();
         if (self.sliceStagedModule(d, s)) |r| return r;
         if (self.finishing_disk != null) return self.slicePending(d, &self.finishing_disk, s);
         // The live state captured at commit, not what the RAM entry kept after its trim.
@@ -11708,7 +11725,11 @@ const ModuleFake = struct {
         }
 
         fn putSession(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan, session: u64) !CommitStatus {
-            return cache.commitModule(binding, self, self.ids, self.key, media, false, kv_quant.KVQuantConfig.dense, 0, session);
+            return self.putAs(cache, binding, media, session, false, kv_quant.KVQuantConfig.dense);
+        }
+
+        fn putAs(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan, session: u64, has_tools: bool, quant: kv_quant.KVQuantConfig) !CommitStatus {
+            return cache.commitModule(binding, self, self.ids, self.key, media, has_tools, quant, 0, session);
         }
     };
     const Rows = struct { start: usize, key: u64 };
@@ -13725,7 +13746,7 @@ fn expectWalkVisitsEachBoundaryOnce(compact: bool) !void {
     hc.session_tips_seeded = true;
     const index = hc.tipIndex() orelse return error.TestExpectedIndex;
     const written = [_]u64{ 100, 200, 300, 200 };
-    for (written, 1..) |id, seq| index.append(.{ .session = 7, .id = id, .n = 512, .variant = 0, .seq = seq });
+    for (written, 1..) |id, seq| try index.append(.{ .session = 7, .id = id, .n = 512, .variant = 0, .seq = seq });
     if (compact) {
         var kept = std.ArrayList(session_index_mod.Tip).empty;
         defer kept.deinit(testing.allocator);
@@ -13801,6 +13822,130 @@ test "HotPrefixCache module: when the idle flush reports done, every tip whose r
     try testing.expect(calls < 64);
     const index = hc.tipIndex() orelse return error.TestExpectedIndex;
     for ([_]u64{ 7, 8, 9 }) |session| try testing.expect(index.find(session) != null);
+}
+
+test "HotPrefixCache module: sessions that commit one prompt under different cache configurations each export their own entry" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const dense = kv_quant.KVQuantConfig.dense;
+    const kv8 = kv_quant.KVQuantConfig.affine(8);
+    var plain: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var quantized: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var tooled: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    _ = try plain.putAs(&cache, binding, &.{}, 7, false, dense);
+    _ = try quantized.putAs(&cache, binding, &.{}, 8, false, kv8);
+    _ = try tooled.putAs(&cache, binding, &.{}, 9, true, dense);
+
+    const first = cache.findSessionTip(7) orelse return error.TestExpectedTip;
+    const second = cache.findSessionTip(8) orelse return error.TestExpectedTip;
+    const third = cache.findSessionTip(9) orelse return error.TestExpectedTip;
+    try testing.expect(std.meta.eql(first.quant_config, dense) and !first.has_tools);
+    try testing.expect(std.meta.eql(second.quant_config, kv8) and !second.has_tools);
+    try testing.expect(std.meta.eql(third.quant_config, dense) and third.has_tools);
+}
+
+test "HotPrefixCache module: a session's SSD record is its own cache configuration's, and another configuration's is no proof its tip is durable" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const dense = kv_quant.KVQuantConfig.dense;
+    const kv8 = kv_quant.KVQuantConfig.affine(8);
+    const ids = ModuleDiskTest.ids(7);
+    var hc = try ModuleDiskTest.init(&tmp, 8);
+    defer hc.deinit();
+    var plain = ModuleDiskTest.snap(&fake, ids[0..512]);
+    var quantized = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try plain.putAs(&hc, binding, &.{}, 7, false, dense);
+    try ModuleDiskTest.finish(&hc, cpu);
+    _ = hc.flushOwedSlice(cpu);
+    _ = try quantized.putAs(&hc, binding, &.{}, 8, false, kv8);
+
+    const tip_8 = hc.sessionTip(8) orelse return error.TestExpectedTip;
+    try testing.expect(hc.disk.?.moduleByBoundary(tip_8.id, tip_8.n) == null);
+    const index = hc.tipIndex() orelse return error.TestExpectedIndex;
+    try testing.expect(index.find(8) == null);
+    try ModuleDiskTest.finish(&hc, cpu);
+    _ = hc.flushOwedSlice(cpu);
+
+    const tip_7 = hc.sessionTip(7) orelse return error.TestExpectedTip;
+    const own_7 = hc.disk.?.moduleByBoundary(tip_7.id, tip_7.n) orelse return error.TestExpectedRecord;
+    const own_8 = hc.disk.?.moduleByBoundary(tip_8.id, tip_8.n) orelse return error.TestExpectedRecord;
+    try testing.expect(std.meta.eql(own_7.quant, dense));
+    try testing.expect(std.meta.eql(own_8.quant, kv8));
+    try testing.expect(index.find(8) != null);
+}
+
+test "HotPrefixCache module: a tip whose index append failed stays unpersisted and persists on the next flush after the failure clears" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const ids = ModuleDiskTest.ids(7);
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    const index = hc.tipIndex() orelse return error.TestExpectedIndex;
+    try std.Io.Dir.cwd().createDirPath(testing.io, index.path);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.putSession(&hc, binding, &.{}, 7);
+    const tip = hc.sessionTip(7) orelse return error.TestExpectedTip;
+    var calls: usize = 0;
+    while (hc.disk.?.moduleByBoundaryNow(tip.id, tip.n) == null and calls < 32) : (calls += 1) {
+        _ = hc.flushOwedSlice(cpu);
+        hc.disk.?.drainWriter();
+    }
+    try testing.expect(calls < 32);
+    try testing.expect(!hc.session_tips.get(7).?.persisted);
+    try testing.expect(hc.tips_unpersisted);
+
+    // The idle loop (`step.zig`) comes back to a cache while its flush does not say `.done`.
+    try testing.expect(hc.flushOwedSlice(cpu) != .done);
+    try testing.expect(hc.disk_dirty);
+
+    try std.Io.Dir.cwd().deleteTree(testing.io, index.path);
+    var owed = true;
+    calls = 0;
+    while (owed and calls < 4) : (calls += 1) owed = hc.flushOwedSlice(cpu) != .done;
+    try testing.expect(!owed);
+    try testing.expect(hc.session_tips.get(7).?.persisted);
+    try testing.expect(index.find(7) != null);
+}
+
+test "HotPrefixCache module: a claim whose index append fails leaves the cache owing a retry" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const ids = ModuleDiskTest.ids(7);
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.putSession(&hc, binding, &.{}, 7);
+    try ModuleDiskTest.finish(&hc, cpu);
+    try testing.expect(!hc.disk_dirty);
+
+    const index = hc.tipIndex() orelse return error.TestExpectedIndex;
+    try std.Io.Dir.cwd().deleteFile(testing.io, index.path);
+    try std.Io.Dir.cwd().createDirPath(testing.io, index.path);
+    try testing.expect(hc.claimCovering(binding, ids[0..512], &.{}, false, kv_quant.KVQuantConfig.dense, 8));
+    try testing.expect(!hc.session_tips.get(8).?.persisted);
+    try testing.expect(hc.disk_dirty);
 }
 
 test "HotPrefixCache module: sessions that claim one resident checkpoint below the persistence floor all keep their export" {

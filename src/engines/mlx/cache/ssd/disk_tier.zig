@@ -521,7 +521,7 @@ pub const DiskTier = struct {
     }
 
     fn moduleIsBoundary(e: *const IndexEntry, id: u64, n: usize) bool {
-        return e.kv_len == n and boundary_mod.id(@bitCast(e.module.?.manifest.prefix_key), e.tokens, e.media) == id;
+        return e.kv_len == n and boundary_mod.id(@bitCast(e.module.?.manifest.prefix_key), e.tokens, e.media, e.has_tools, e.quant) == id;
     }
 
     pub const ModuleSlice = enum { progress, busy, done };

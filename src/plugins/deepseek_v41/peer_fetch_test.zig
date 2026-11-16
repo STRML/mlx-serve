@@ -537,6 +537,61 @@ test "peer transfer session: a session whose RAM entry is gone exports from the 
     try testing.expectEqualSlices(u32, warm_a.tokens, warm_b.tokens);
 }
 
+fn landOwedWrites(h: *PeerHarness) void {
+    const hc = h.entry.prefix_cache.?;
+    for (0..32) |_| {
+        const r = hc.flushOwedSlice(h.xfm.s);
+        hc.disk.?.drainWriter();
+        hc.disk.?.pollModuleWrites();
+        if (r == .done) break;
+    }
+}
+
+var imports_seen: usize = 0;
+
+fn failFirstImport() void {
+    imports_seen += 1;
+    if (imports_seen == 1) mlx.latchErrorForTest("injected session import failure");
+}
+
+test "peer transfer session: a newest SSD import that fails with an MLX error leaves the older tip exportable" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+    const old_probe = peer_transfer.after_aux_import_for_test;
+    defer peer_transfer.after_aux_import_for_test = old_probe;
+    imports_seen = 0;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const model_a = try PeerHarness.open(files);
+    defer model_a.close();
+    try model_a.attachDisk();
+
+    var prompt: [514]u32 = undefined;
+    for (&prompt, 0..) |*id, i| id.* = @intCast(3 + i % 80);
+    const first = try model_a.runGreedyTagged(prompt[0..513], 2, true, 9);
+    defer testing.allocator.free(first.tokens);
+    landOwedWrites(model_a);
+    const second = try model_a.runGreedyTagged(&prompt, 2, true, 9);
+    defer testing.allocator.free(second.tokens);
+    landOwedWrites(model_a);
+    const hc = model_a.entry.prefix_cache.?;
+    try testing.expectEqual(@as(usize, 513), hc.sessionTip(9).?.n);
+    hc.setBudget(1);
+    hc.setBudget(0);
+    try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
+
+    peer_transfer.after_aux_import_for_test = failFirstImport;
+    const exported = exportBySession(model_a, 9);
+    try testing.expect(exported == .ok);
+    defer testing.allocator.free(exported.ok.bytes);
+    try testing.expectEqual(@as(usize, 512), exported.ok.n);
+    try testing.expect(imports_seen >= 2);
+}
+
 test "peer transfer session: two sessions on one conversation each export their own boundary" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const old_fits = scheduler.prefill_admission_fits;

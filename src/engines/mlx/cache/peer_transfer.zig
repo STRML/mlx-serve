@@ -161,6 +161,8 @@ const DiskSession = struct {
 
 const SessionLookup = union(enum) { none, hit: RamModuleHit, refused: requests.CacheExportOutcome };
 
+pub var after_aux_import_for_test: ?*const fn () void = null;
+
 /// The prompt boundary a session's newest tip names, else the next boundary of the session that has a record, in RAM or
 /// on the SSD (`tipHit`). A session whose every tip is gone is `none`: the caller sees `session_not_found`.
 fn sessionHit(
@@ -175,8 +177,10 @@ fn sessionHit(
 ) SessionLookup {
     var walk: prefix_cache_mod.HotPrefixCache.TipWalk = .{ .session = session };
     while (walk.next(hc)) |tip| {
+        const had_error = mlx.errorPending();
         const found = tipHit(allocator, sch, cfg, hc, xfm, session, tip, max_bytes, holder);
         if (found != .none) return found;
+        mlx.dropLatchedErrorUnless(had_error);
     }
     return .none;
 }
@@ -217,7 +221,9 @@ fn tipHit(
     defer allocator.free(tensors);
     for (arrays.items, tensors) |array, *t| t.* = .{ .name = .of(array.key), .array = .{ .ctx = array.arr.ctx } };
     var snapshot: plugin_abi.Handle = null;
-    if (!plugin_driver.auxImportArrays(binding.xfm, ref.tokens, header, tensors, &snapshot).isOk() or snapshot == null or mlx.errorPending()) {
+    const imported = plugin_driver.auxImportArrays(binding.xfm, ref.tokens, header, tensors, &snapshot).isOk();
+    if (after_aux_import_for_test) |probe| probe();
+    if (!imported or snapshot == null or mlx.errorPending()) {
         if (snapshot != null) plugin_driver.auxFree(binding.xfm, snapshot);
         return .none;
     }
