@@ -120,7 +120,8 @@ fn headMxfp8Setting(config: *const ModelConfig) ?bool {
 }
 
 /// `LoadCtx.settings_json`: the load settings stated for this model (a plugin that serves them reads them): the lossy
-/// `lm_head_mxfp8`, the `mtp` head, the lossy `int8_prefill`, `stream_experts` and the model's `ctx_size`. `buf` holds 128 bytes.
+/// `lm_head_mxfp8`, the `mtp` head, the lossy `int8_prefill`, `stream_experts`, `tp_mode` and the model's `ctx_size`.
+/// `buf` holds 256 bytes.
 pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeByte('{') catch unreachable;
@@ -133,6 +134,10 @@ pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
             .on => w.writeAll("\"stream_experts\":true") catch unreachable,
             .rows => |n| w.print("\"stream_experts\":{d}", .{n}) catch unreachable,
         }
+    }
+    if (config.tp_mode_override) |t| {
+        if (w.end > 1) w.writeByte(',') catch unreachable;
+        t.write(&w) catch unreachable;
     }
     const ctx = @import("../../../host/http/server.zig").manualContext(config);
     if (ctx > 0) w.print("{s}\"ctx_size\":{d}", .{ if (w.end > 1) "," else "", ctx }) catch unreachable;
@@ -901,7 +906,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     var why: abi.Verdict = .{};
     // A placeholder only the tokenizer names (RADIO's `<image>`) comes from the engine config, which read it.
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
-    var settings_buf: [128]u8 = undefined;
+    var settings_buf: [256]u8 = undefined;
     const ceiling = @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling();
     const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config), growthStart(&dir, ceiling));
     const m = b.table.load(&.{
@@ -1786,6 +1791,20 @@ test "plugin driver: the load settings carry the model's lm_head_mxfp8 and mtp" 
     // A plugin that sizes memory for a request reads the context the model is set to.
     c.ctx_override = 262144;
     try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"mtp\":false,\"ctx_size\":262144}", loadSettings(&buf, &c));
+}
+
+test "plugin driver: the load settings carry the model's tp_mode, a malformed one included, beside every other setting" {
+    var buf: [256]u8 = undefined;
+    var c: ModelConfig = .{ .tp_mode_override = .{ .group = .{ .rank = 1, .size = 4 } } };
+    try std.testing.expectEqualStrings("{\"tp_mode\":{\"rank\":1,\"size\":4}}", loadSettings(&buf, &c));
+    c.tp_mode_override = .malformed;
+    try std.testing.expectEqualStrings("{\"tp_mode\":\"malformed\"}", loadSettings(&buf, &c));
+    c = .{ .lm_head_mxfp8_override = false, .mtp_override = false, .int8_prefill_override = false, .stream_experts_override = .{ .rows = 4294967295 }, .tp_mode_override = .{ .group = .{ .rank = 4294967294, .size = 4294967295 } }, .ctx_override = 4294967295 };
+    c.legacy.caps.owns_decode_state = true;
+    c.legacy.caps.streamed_weights = true;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, loadSettings(&buf, &c), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("tp_mode") != null);
 }
 
 test "driver: a DeepSeek-V4.1 pack's vision, aligner and image rows move to the tower; its trunk stays" {

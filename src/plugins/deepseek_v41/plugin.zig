@@ -19,6 +19,7 @@ const quant_abi = @import("../../abi/quant.zig");
 const Resident = @import("../../sdk/weights/resident.zig").Resident;
 const Weights = @import("../../sdk/weights/resident.zig").Weights;
 const Layout = @import("../../sdk/quant/native.zig").Layout;
+const TpModeSetting = @import("../../sdk/weights/shard.zig").TpModeSetting;
 const streamed = @import("../../sdk/weights/streamed.zig");
 const outside = @import("../../sdk/quant/outside.zig");
 const outside_model = @import("../../sdk/quant/outside_model.zig");
@@ -260,9 +261,9 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
             error.StreamedWeightsUnsupported => Verdict.refuse(.unsupported, "deepseek_v41: a streamed (experts.bin) pack needs the macOS build's expert streamer"),
             error.Dsv41TpStreamedExperts => Verdict.refuse(.unsupported, "deepseek_v41: streamed experts do not run split across two Macs; turn stream_experts off (each Mac holds half the experts)"),
             error.Dsv41PairStreamedExperts => Verdict.refuse(.unsupported, "deepseek_v41: stream_experts does not run on a layer split across two Macs; turn it off (each Mac would open slot rows for every layer)"),
-            error.Dsv41TpModeSetting => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode needs a size of 2 or more and a rank below it"),
+            error.Dsv41TpModeSetting => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode must be {\"rank\": r, \"size\": n} with n of 2 or more and r below n"),
             error.Dsv41ModeBesideSplit => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode does not load beside a --dist split"),
-            error.Dsv41ShardUneven => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode's size does not divide the heads and experts"),
+            error.Dsv41ShardUneven => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode's size does not divide the attention heads, output groups and expert widths"),
             error.Dsv41TpOutsideQuant => Verdict.refuse(.unsupported, "deepseek_v41: a pack read by an outside quant plugin does not run split across two Macs"),
             error.OutsideQuantRefused => Verdict.refuse(.unsupported, "deepseek_v41: the outside quant plugin refused the pack (the log names why)"),
             error.StreamedBankUnclaimed => Verdict.refuse(.unsupported, "deepseek_v41: no installed quant plugin streams this pack's experts.bin (OpensourceWTF's EXL3 repacks: install turboexl3_ds41)"),
@@ -301,15 +302,34 @@ fn mtpSetting(settings_json: []const u8) ?bool {
 }
 
 /// The per-model `tp_mode` setting (`{"tp_mode": {"rank": 1, "size": 4}}`): this box's rank of the tensor group whose
-/// model loads beside the whole one (`mode.Modes.tp`).
+/// model loads beside the whole one (`mode.Modes.tp`). A `tp_mode` that names no rank is refused, never read as unset.
 fn tpModeSetting(settings_json: []const u8) !?mode.Shard {
-    if (settings_json.len == 0) return null;
-    const S = struct { tp_mode: ?struct { rank: u32, size: u32 } = null };
-    const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
+    if (std.mem.indexOf(u8, settings_json, "\"tp_mode\"") == null) return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, settings_json, .{}) catch return error.Dsv41TpModeSetting;
     defer parsed.deinit();
-    const t = parsed.value.tp_mode orelse return null;
+    if (parsed.value != .object) return error.Dsv41TpModeSetting;
+    const v = parsed.value.object.get("tp_mode") orelse return null;
+    const t = switch (TpModeSetting.of(v)) {
+        .group => |g| g,
+        .malformed => return error.Dsv41TpModeSetting,
+    };
     if (t.size < 2 or t.rank >= t.size) return error.Dsv41TpModeSetting;
     return .{ .rank = t.rank, .size = t.size };
+}
+
+test "tpModeSetting: absent is unset; present and naming no rank of a group is refused by name" {
+    try std.testing.expectEqual(@as(?mode.Shard, null), try tpModeSetting(""));
+    try std.testing.expectEqual(@as(?mode.Shard, null), try tpModeSetting("{\"mtp\":false}"));
+    try std.testing.expectEqual(@as(?mode.Shard, .{ .rank = 1, .size = 4 }), try tpModeSetting("{\"mtp\":false,\"tp_mode\":{\"rank\":1,\"size\":4}}"));
+    for ([_][]const u8{
+        "{\"tp_mode\":{\"rank\":0}}",
+        "{\"tp_mode\":\"malformed\"}",
+        "{\"tp_mode\":null}",
+        "{\"tp_mode\":{\"rank\":-1,\"size\":4}}",
+        "{\"tp_mode\":{\"rank\":0,\"size\":1}}",
+        "{\"tp_mode\":{\"rank\":4,\"size\":4}}",
+        "{\"tp_mode\":{\"rank\":0,\"size\":4}",
+    }) |bad| try std.testing.expectError(error.Dsv41TpModeSetting, tpModeSetting(bad));
 }
 
 fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
