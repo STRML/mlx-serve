@@ -100,17 +100,41 @@ test "mode.build: a tensor group's mode beside a --dist split is refused before 
     try std.testing.expectError(error.Dsv41ModeBesideSplit, build(std.testing.allocator, &cfg, &w, .{ .ctx = null }, .{ .tp = .{ .rank = 0, .size = 2 } }, .{ .rank = 0, .size = 4 }));
 }
 
-/// A rank-0 model's tensor group with no peers: every rank's part is the sum.
-const LoneGroup = struct {
+/// A tensor group of `size` ranks in one process, for a rank-0 model's tests: every rank's part is rank 0's, so a sum
+/// is the part and a gather is `size` copies of it on axis 0 (distributed.zig's order).
+pub const LoneGroup = struct {
+    pub var sums: usize = 0;
+    var size: usize = 4;
+
     fn sum(x: mlx.mlx_array) anyerror!mlx.mlx_array {
+        sums += 1;
         var o = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_array_set(&o, x));
         return o;
     }
+    fn gather(x: mlx.mlx_array) anyerror!mlx.mlx_array {
+        var xs: [8]mlx.mlx_array = @splat(x);
+        const vec = mlx.mlx_vector_array_new_data(&xs, size);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 0, mlx.gpuStream()));
+        return o;
+    }
     fn step(_: []const u32, _: usize, _: bool, _: bool, _: dsv41.VerifyOpts, _: u64, _: ?mlx.mlx_array) anyerror!void {}
     fn batch(_: []const u64, _: []const usize, _: []const []const u32, _: bool) anyerror!void {}
+    fn draft(_: []const u64, _: []const usize, _: []const u32) anyerror!void {}
+    fn load(_: u64, _: []const u32, _: []const mlx.mlx_array) anyerror!void {}
     fn free(_: u64) void {}
     fn snap(_: dsv41.SnapOp, _: u64, _: u64) void {}
+
+    pub fn arm(n: usize) void {
+        size = n;
+        sums = 0;
+        dsv41.clusterHooks().* = .{ .tp_sum = &sum, .tp_gather = &gather, .tp_step = &step, .tp_batch = &batch, .tp_draft = &draft, .tp_load = &load, .tp_free = &free, .tp_snap = &snap };
+    }
+    pub fn disarm() void {
+        dsv41.clusterHooks().* = .{};
+    }
 };
 
 /// A prompt and three decode steps on the whole model: each step's logits (host f32, caller frees).
@@ -153,9 +177,8 @@ test "mode: with Engram layers the whole model beside a tensor group's rank give
     }
     defer for (want) |x| gpa.free(x);
 
-    const h = dsv41.clusterHooks();
-    h.* = .{ .tp_sum = &LoneGroup.sum, .tp_step = &LoneGroup.step, .tp_batch = &LoneGroup.batch, .tp_free = &LoneGroup.free, .tp_snap = &LoneGroup.snap };
-    defer h.* = .{};
+    LoneGroup.arm(2);
+    defer LoneGroup.disarm();
     var w = try dsv41.loadPack(io, gpa, dir, false);
     defer w.deinit();
     var modes = build(gpa, &cfg, &w, mlx.gpuStream(), opts, .{ .rank = 0, .size = 2 }) catch |e| switch (e) {

@@ -1188,29 +1188,7 @@ fn importForAllocationTest(gpa: std.mem.Allocator, m: *const dsv41.Dsv41Model, i
 
 const gemv_twin = @import("decode/gemv_twin.zig");
 
-/// A tensor group in one process, for a rank-0 model whose peers are absent: every rank's part is the sum.
-const LoneGroup = struct {
-    var sums: usize = 0;
-    fn sum(x: mlx.mlx_array) anyerror!mlx.mlx_array {
-        sums += 1;
-        var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(&o, x));
-        return o;
-    }
-    fn step(_: []const u32, _: usize, _: bool, _: bool, _: dsv41.VerifyOpts, _: u64, _: ?mlx.mlx_array) anyerror!void {}
-    fn batch(_: []const u64, _: []const usize, _: []const []const u32, _: bool) anyerror!void {}
-    fn free(_: u64) void {}
-    fn snap(_: dsv41.SnapOp, _: u64, _: u64) void {}
-
-    fn arm() void {
-        const h = dsv41.clusterHooks();
-        h.* = .{ .tp_sum = &sum, .tp_step = &step, .tp_batch = &batch, .tp_free = &free, .tp_snap = &snap };
-        sums = 0;
-    }
-    fn disarm() void {
-        dsv41.clusterHooks().* = .{};
-    }
-};
+const LoneGroup = v41.mode.LoneGroup;
 
 /// One step's logits for `slot` (host f32, caller frees): all rows for a verify, else the last.
 fn stepLogits(t: *Twin, slot: u32, st: proof.Step, pos: u32) ![]f32 {
@@ -1249,7 +1227,7 @@ test "deepseek_v41 modes: the whole model beside a TP4 rank's model gives today'
     const want = try wholeSteps(files);
     defer for (want) |w| testing.allocator.free(w);
 
-    LoneGroup.arm();
+    LoneGroup.arm(4);
     defer LoneGroup.disarm();
     const t = try Twin.openWith(files, "", tp4_setting);
     defer t.close();
@@ -1289,7 +1267,7 @@ test "deepseek_v41 modes: a swap drops every slot's state, live and parked, so a
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    LoneGroup.arm();
+    LoneGroup.arm(4);
     defer LoneGroup.disarm();
     const t = try Twin.openWith(try fixture.v41TpFiles(arena.allocator(), 7), "", tp4_setting);
     defer t.close();
@@ -1345,7 +1323,7 @@ fn wideBeside() !void {
     }
     defer for (want) |w| testing.allocator.free(w);
 
-    LoneGroup.arm();
+    LoneGroup.arm(4);
     defer LoneGroup.disarm();
     const t = try Twin.openWith(files, "", tp4_setting);
     defer t.close();
@@ -1377,7 +1355,7 @@ test "deepseek_v41 modes: freeing the TP4 model leaves the whole model's launch 
     const files = try fixture.v41TpFiles(arena.allocator(), 7);
     const want = try wholeSteps(files);
     defer for (want) |w| testing.allocator.free(w);
-    LoneGroup.arm();
+    LoneGroup.arm(4);
     defer LoneGroup.disarm();
     const t = try Twin.openWith(files, "", tp4_setting);
     defer t.close();
