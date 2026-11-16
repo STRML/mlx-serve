@@ -255,6 +255,7 @@ test {
     _ = @import("plugins/bailing_hybrid/bill_test.zig");
     _ = @import("engines/mlx/plugin/deepseek_test.zig");
     _ = @import("plugins/deepseek_v41/engram.zig");
+    _ = @import("plugins/deepseek_v41/numerics.zig");
     _ = @import("sdk/weights/nocache_reader.zig");
     _ = @import("plugins/deepseek_v41/deepseek_v41.zig");
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig");
@@ -277,6 +278,8 @@ test {
     _ = @import("engines/mlx/runtime/sleep_inhibit.zig");
     _ = @import("engines/mlx/cache/ssd/disk_tier.zig");
     _ = @import("engines/mlx/cache/ssd/writer.zig");
+    _ = @import("engines/mlx/cache/ssd/session_index.zig");
+    _ = @import("engines/mlx/cache/boundary.zig");
     _ = @import("host/registry/discovery.zig");
     _ = @import("host/registry/stub_cache.zig");
     _ = @import("host/registry/pack_dir.zig");

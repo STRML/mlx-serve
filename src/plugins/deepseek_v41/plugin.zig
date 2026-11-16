@@ -26,6 +26,7 @@ const outside_model = @import("../../sdk/quant/outside_model.zig");
 const env = @import("../../env.zig");
 const engram_decode = @import("decode/engram_decode.zig");
 const flash_attn = @import("prompt/flash_attn.zig");
+const numerics = @import("numerics.zig");
 const scratch_attn = @import("prompt/scratch_attn.zig");
 pub const config = @import("config.zig");
 
@@ -101,6 +102,8 @@ pub const Model = struct {
     /// The bank holds fewer slot rows than experts, so it reads from the SSD and plans its rows into the headroom the
     /// prefix cache would also spend.
     bank_streams: bool = false,
+    /// The flash mode this load configured: the peer settings key describes it, whatever a later load sets.
+    flash_mode: flash_attn.Mode = .off,
     /// The slot whose state is `mdl.dec_state` (0: none claimed it yet, a resumed state or the module's own); every
     /// other live slot's waits in `parked`. Excluded configurations keep the last finished state in `idle`.
     owner: u32 = 0,
@@ -392,6 +395,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     const m = try gpa.create(Model);
     errdefer gpa.destroy(m);
     m.cfg = c.*;
+    m.flash_mode = flash_attn.ps().mode;
     // The driver's map never holds the vision tower (the engine's encoder reads it and hands its rows to `forward`).
     const taken = if (ctx.weights) |w| Resident.take(w) else null;
     // the tower left on disk, read for each image (`media.tower`).
@@ -717,7 +721,13 @@ const aux_hooks = abi.AuxHooks{
     .handoff = &auxHandoff,
     .free = &auxFree,
     .bytes = &auxBytes,
+    .settings_key = &auxSettingsKey,
 };
+
+fn auxSettingsKey(mp: *anyopaque) callconv(.c) u64 {
+    const m: *Model = @ptrCast(@alignCast(mp));
+    return numerics.key(m.flash_mode);
+}
 
 fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
     const m: *Model = @ptrCast(@alignCast(mp));

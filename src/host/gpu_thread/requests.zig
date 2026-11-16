@@ -382,6 +382,8 @@ pub const CacheExportRequest = struct {
     kv_quant_override: ?kv_quant.KVQuantConfig = null,
     variant: u64 = 0,
     cache_key: u64 = 0,
+    /// Nonzero: export the prompt boundary the session's tip names (`sessionTip`); `prompt_ids` is ignored.
+    session: u64 = 0,
     deadline_ms: ?u64 = null,
     max_bytes: usize,
     admit_transfer_budget: bool = false,

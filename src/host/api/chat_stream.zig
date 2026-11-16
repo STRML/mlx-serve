@@ -254,6 +254,7 @@ pub fn handleStreamingGeneration(
         .vision_embeddings = slot_ve_s,
         .media = media,
         .cache_key = cache_key,
+        .session = stream.session_key,
         .client = stream.client,
         .ablation = stream.ablation,
         .mrope_pos = mrope.pos,

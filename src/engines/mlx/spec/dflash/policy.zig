@@ -206,6 +206,11 @@ pub const Drafting = struct {
 
     /// A drafted round's wall time is bounded by the rounds before it, so a stall cannot stop drafting.
     pub fn record(self: *Drafting, gain: f32, wall_in: f32) void {
+        if (self.wall <= 0 and gain <= 0) {
+            self.owed = self.period;
+            self.period = @min(self.period * 2, MAX_PERIOD);
+            return;
+        }
         const prior_wall = if (self.wall > 0) self.wall else gain;
         const wall = if (prior_wall > 0) @min(wall_in, prior_wall * STALL) else wall_in;
         if (self.wall <= 0) {
@@ -768,8 +773,29 @@ test "Drafting: a stalled round is not what a round costs" {
 test "Drafting: a first round that gained nothing still owes plain rounds" {
     var d: Drafting = .{};
     d.record(0, 35);
-    try testing.expect(d.wall > 0);
+    try testing.expectEqual(@as(f32, 0), d.wall);
     try testing.expect(d.owed >= 1);
+}
+
+test "Drafting: a first round that stalled with nothing gained leaves five profitable probes at most a few plain rounds" {
+    var d: Drafting = .{};
+    d.record(0, 5000);
+    for (0..5) |_| {
+        while (!d.shouldDraft()) {}
+        d.record(35.4, 35);
+    }
+    try testing.expect(d.skipped <= 3);
+}
+
+test "Drafting: rounds that gain nothing with no prior wall back off instead of drafting every round" {
+    var d: Drafting = .{};
+    var drafted: u32 = 0;
+    for (0..50) |_| {
+        if (!d.shouldDraft()) continue;
+        drafted += 1;
+        d.record(0, 35);
+    }
+    try testing.expect(drafted <= 10);
 }
 
 test "GroupCost: a machine's own base and row slope are learned apart, and its row choice follows them" {

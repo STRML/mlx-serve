@@ -1296,7 +1296,6 @@ test "deepseek_v41 served: a group slot whose drafts are priced out with rows to
         staged += 1;
         // The round's draft cost, against no gain: the backoff owes rounds without a draft.
         try testing.expect(gen.dspark_pol.?.drafting.owed >= 1);
-        try testing.expect(gen.dspark_pol.?.drafting.wall > 0);
     }
     try testing.expect(staged > 0);
 }

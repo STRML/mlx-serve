@@ -175,15 +175,19 @@ fn hashPack(job: *Job, bytes_read: *u64) !u64 {
     if (model) |m| if (gguf_files.findMtpSidecar(io, job.allocator, m)) |stage| {
         defer job.allocator.free(stage);
         const above = std.fs.path.dirname(dir_path) orelse dir_path;
-        try hasher.file(cwd, stage, relativeTo(above, stage));
+        try hasher.file(cwd, stage, under(dir_path, stage) orelse relativeTo(above, stage));
     };
     bytes_read.* = hasher.bytes_read;
     return hasher.h.final();
 }
 
-fn relativeTo(base: []const u8, path: []const u8) []const u8 {
+fn under(base: []const u8, path: []const u8) ?[]const u8 {
     if (path.len > base.len and std.mem.startsWith(u8, path, base) and path[base.len] == '/') return path[base.len + 1 ..];
-    return std.fs.path.basename(path);
+    return null;
+}
+
+fn relativeTo(base: []const u8, path: []const u8) []const u8 {
+    return under(base, path) orelse std.fs.path.basename(path);
 }
 
 fn packPaths(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, recursive: bool) ![][]u8 {
@@ -397,6 +401,26 @@ test "pack identity: GGUF with a stage file beside it: the MTP folder above it c
         id.* = try identityOf(model);
     }
     try testing.expect(ids[0] != ids[1]);
+}
+
+test "pack identity: identical GGUF packs with a stage file in differently named folders are one pack" {
+    var dirs: [2]TestDir = .{ try TestDir.init(), try TestDir.init() };
+    defer for (&dirs) |*d| d.tmp.cleanup();
+    const names = [_][]const u8{ "quant-a", "quant-b" };
+    var ids: [2]u64 = undefined;
+    for (&dirs, &ids, names) |*d, *id, folder| {
+        try d.tmp.dir.createDirPath(testing.io, folder);
+        const model_rel = try std.fmt.allocPrint(testing.allocator, "{s}/model.gguf", .{folder});
+        defer testing.allocator.free(model_rel);
+        const stage_rel = try std.fmt.allocPrint(testing.allocator, "{s}/DSpark-support.gguf", .{folder});
+        defer testing.allocator.free(stage_rel);
+        try d.write(model_rel, 4096, null);
+        try d.write(stage_rel, 4096, null);
+        const model = try d.sub(model_rel);
+        defer testing.allocator.free(model);
+        id.* = try identityOf(model);
+    }
+    try testing.expectEqual(ids[0], ids[1]);
 }
 
 test "pack identity: folder of safetensors: the engram token map counts" {
