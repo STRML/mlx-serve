@@ -772,6 +772,27 @@ test "Drafting: a first round that gained nothing still owes plain rounds" {
     try testing.expect(d.owed >= 1);
 }
 
+test "Drafting: a first round that stalled with nothing gained leaves five profitable probes at most a few plain rounds" {
+    var d: Drafting = .{};
+    d.record(0, 5000);
+    for (0..5) |_| {
+        while (!d.shouldDraft()) {}
+        d.record(35.4, 35);
+    }
+    try testing.expect(d.skipped <= 3);
+}
+
+test "Drafting: rounds that gain nothing with no prior wall back off instead of drafting every round" {
+    var d: Drafting = .{};
+    var drafted: u32 = 0;
+    for (0..50) |_| {
+        if (!d.shouldDraft()) continue;
+        drafted += 1;
+        d.record(0, 35);
+    }
+    try testing.expect(drafted <= 10);
+}
+
 test "GroupCost: a machine's own base and row slope are learned apart, and its row choice follows them" {
     var cost = trained(20, 3, 2.45);
     try testing.expectApproxEqAbs(@as(f32, 4 * 2.45), cost.ms(2, 6) - cost.ms(2, 2), 0.4);
