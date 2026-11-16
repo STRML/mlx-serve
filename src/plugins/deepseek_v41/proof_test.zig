@@ -1224,6 +1224,42 @@ fn wholeSteps(files: []const sdk.fixture.File) ![proof.steps.len][]f32 {
 
 const tp4_setting = "{\"tp_mode\": {\"rank\": 0, \"size\": 4}}";
 
+fn settledLoadBytes() !usize {
+    try mlx.check(mlx.mlx_synchronize(mlx.gpuStream()));
+    try mlx.check(mlx.mlx_clear_cache());
+    var bytes: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&bytes));
+    return bytes;
+}
+
+test "deepseek_v41 modes: TP4 beside whole allocates only wo_b quarters and small mode constants" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41TpDsparkFiles(arena.allocator(), 7);
+    var whole_bytes: usize = 0;
+    var wo_b_bytes: usize = 0;
+    {
+        const before = try settledLoadBytes();
+        const t = try Twin.open(files, "");
+        defer t.close();
+        whole_bytes = (try settledLoadBytes()) - before;
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        for (m.mdl.layers) |ly| inline for (.{ "w", "s", "b" }) |f| {
+            const a = @field(ly.wo_b, f);
+            if (a.ctx != null) wo_b_bytes += mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a) / 4;
+        };
+    }
+    const before = try settledLoadBytes();
+    const t = try Twin.openWith(files, "", tp4_setting);
+    defer t.close();
+    const both_bytes = (try settledLoadBytes()) - before;
+    const extra = both_bytes -| whole_bytes;
+    const allowance = wo_b_bytes + 64 * 1024;
+    std.debug.print("[mode-memory] whole {d} B, both {d} B, extra {d} B, wo_b {d} B, allowance {d} B\n", .{ whole_bytes, both_bytes, extra, wo_b_bytes, allowance });
+    try testing.expect(extra <= allowance);
+}
+
 test "deepseek_v41 modes: the whole model beside a TP4 rank's model gives today's logits bit for bit, through TP4 forwards, swaps and the TP4 model's state" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
