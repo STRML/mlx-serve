@@ -28,26 +28,39 @@ pub fn isInternalPath(path: []const u8) bool {
 }
 
 const not_inference = [_][]const u8{
-    "/tokenize",
-    "/detokenize",
     "/v1/models/rescan",
     "/v1/providers/reload",
-    "/v1/load-model",
-    "/v1/unload-model",
     "/v1/responses/compact",
     "/api/pull",
     "/api/show",
 };
 
-/// Public inference, which a switch drains and a TP4 follower refuses: every POST that is not a model-free utility,
-/// plus the Responses WebSocket upgrade.
+/// Public inference, which a switch drains and a TP4 follower refuses: every POST that is not a model-free utility
+/// (tokenize, detokenize, load and unload can load, unload or run a model, so they count). The Responses WebSocket
+/// is admitted per turn by `Admission`, never for the life of its connection.
 pub fn isInference(method: []const u8, path: []const u8) bool {
     if (isInternalPath(path)) return false;
-    if (std.mem.eql(u8, method, "GET")) return std.mem.eql(u8, path, "/v1/responses");
     if (!std.mem.eql(u8, method, "POST")) return false;
     for (not_inference) |p| if (std.mem.eql(u8, path, p)) return false;
     return true;
 }
+
+pub const refusal_message = "Layout switch in progress or this box follows a TP4 leader";
+
+/// One counted unit of public inference: a request, or one turn of a WebSocket.
+pub const Admission = struct {
+    sw: ?*sw_mod.Switch = null,
+
+    pub fn enter(sw: ?*sw_mod.Switch) error{Refused}!Admission {
+        const s = sw orelse return .{};
+        if (!s.enter()) return error.Refused;
+        return .{ .sw = s };
+    }
+
+    pub fn leave(self: Admission) void {
+        if (self.sw) |s| s.leave();
+    }
+};
 
 pub fn statusLine(status: u16) []const u8 {
     return switch (status) {
@@ -116,7 +129,8 @@ fn render(buf: []u8, status: u16, reason: []const u8, drained: ?bool, snap: sw_m
     const body = sw_mod.renderSnapshot(&tmp, snap);
     var dr: [24]u8 = undefined;
     const drained_field = if (drained) |d| std.fmt.bufPrint(&dr, ",\"drained\":{}", .{d}) catch "" else "";
-    return .{ .status = status, .body = std.fmt.bufPrint(buf, "{{\"ok\":{},\"reason\":\"{s}\"{s},{s}", .{ status == 200, reason, drained_field, body[1..] }) catch "{}" };
+    const error_field = if (status == 501) ",\"error\":\"no formation backend: the switch adapter is not installed\"" else "";
+    return .{ .status = status, .body = std.fmt.bufPrint(buf, "{{\"ok\":{},\"reason\":\"{s}\"{s}{s},{s}", .{ status == 200, reason, error_field, drained_field, body[1..] }) catch "{}" };
 }
 
 /// The router's deadline is wall-clock and shared by every rank; it is refused when past or absurdly far.
@@ -146,7 +160,7 @@ pub fn handle(sw: *sw_mod.Switch, internal_key: ?[32]u8, req: Request, wall_now_
     var drained: ?bool = null;
     var snap = reply.snap;
     if (cmd == .drain and reply.status == 200) {
-        drained = sw.waitDrained(p.wait_ms);
+        drained = sw.waitDrained(p.n, p.wait_ms);
         snap = sw.snapshot();
     }
     return render(buf, reply.status, reply.reason, drained, snap);
@@ -394,15 +408,68 @@ test "which requests count as public inference" {
     try t.expect(isInference("POST", "/v1/messages"));
     try t.expect(isInference("POST", "/api/generate"));
     try t.expect(isInference("POST", "/v1/embeddings"));
-    try t.expect(isInference("GET", "/v1/responses"));
     try t.expect(!isInference("GET", "/v1/models"));
     try t.expect(!isInference("GET", "/health"));
     try t.expect(!isInference("GET", "/metrics"));
-    try t.expect(!isInference("POST", "/tokenize"));
     try t.expect(!isInference("POST", "/v1/internal/drain"));
     try t.expect(!isInference("POST", "/v1/models/rescan"));
     try t.expect(!isInference("POST", "/v1/providers/reload"));
     try t.expect(!isInference("OPTIONS", "/v1/chat/completions"));
+}
+
+test "model operations count as inference: they can load, unload or run a model" {
+    for ([_][]const u8{ "/tokenize", "/detokenize", "/v1/load-model", "/v1/unload-model" }) |p| {
+        try t.expect(isInference("POST", p));
+    }
+}
+
+test "a Responses WebSocket upgrade is not inference: each turn is admitted by the socket" {
+    try t.expect(!isInference("GET", "/v1/responses"));
+}
+
+test "a turn that was refused leaves no count, and an idle socket between turns never holds a drain" {
+    var r = rig();
+    const first = try Admission.enter(&r.sw);
+    first.leave();
+    var res = call(&r, KEY, "POST", "/v1/internal/drain", BEARER, "{\"n\":3}");
+    try expectField(res.body, "drained", "true");
+    try t.expectError(error.Refused, Admission.enter(&r.sw));
+    try t.expectEqual(@as(u32, 0), r.sw.snapshot().in_flight);
+    res = call(&r, KEY, "POST", "/v1/internal/abort", BEARER, "{\"n\":3}");
+    const second = try Admission.enter(&r.sw);
+    try t.expectEqual(@as(u32, 1), r.sw.snapshot().in_flight);
+    second.leave();
+    try t.expectEqual(@as(u32, 0), r.sw.snapshot().in_flight);
+}
+
+test "no switch installed: admission always passes and counts nothing" {
+    const a = try Admission.enter(null);
+    a.leave();
+}
+
+test "a drain aborted while it waits is 200 with drained false" {
+    var r = rig();
+    try t.expect(r.sw.enter());
+    const Aborter = struct {
+        fn run(rg: *Rig) void {
+            std.Io.sleep(t.io, .fromMilliseconds(30), .real) catch {};
+            _ = rg.sw.command(.abort, 3, 0);
+            rg.sw.leave();
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Aborter.run, .{&r});
+    defer th.join();
+    const res = call(&r, KEY, "POST", "/v1/internal/drain", BEARER, "{\"n\":3,\"wait_ms\":1000}");
+    try t.expectEqual(@as(u16, 200), res.status);
+    try expectField(res.body, "drained", "false");
+    try expectField(res.body, "state", "aborted");
+}
+
+test "a 501 names the reason: the switch adapter is not installed" {
+    var r = rig();
+    const res = call(&r, KEY, "POST", "/v1/internal/tp1", BEARER, "{\"n\":1}");
+    try t.expectEqual(@as(u16, 501), res.status);
+    try expectField(res.body, "error", "no formation backend: the switch adapter is not installed");
 }
 
 test "the health body carries mode, n, role and peers; 503 names the cause" {

@@ -316,15 +316,11 @@ pub fn handleConnection(
     }
 
     // ── Layout switch (plan 61c): public inference is admitted in TP1 and by the TP4 leader, counted so a drain can wait for zero.
-    var admitted: ?*@import("../internal/switch.zig").Switch = null;
-    defer if (admitted) |sw| sw.leave();
-    if (http_server.g_internal) |inst| if (internal_ep.isInference(method, path)) {
-        if (!inst.sw.enter()) {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Layout switch in progress or this box follows a TP4 leader", 503);
-            return;
-        }
-        admitted = inst.sw;
+    const admission = internal_ep.Admission.enter(if (internal_ep.isInference(method, path)) http_server.internalSwitch() else null) catch {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", internal_ep.refusal_message, 503);
+        return;
     };
+    defer admission.leave();
 
     // ── Plan 05: routes that don't depend on a loaded model (connectivity
     //    probes + CORS preflight + listing endpoints). Handle these BEFORE

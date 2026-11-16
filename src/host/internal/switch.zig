@@ -214,13 +214,17 @@ pub const Switch = struct {
         self.in_flight -|= 1;
     }
 
-    /// True once no admitted request remains, waiting at most `wait_ms`.
-    pub fn waitDrained(self: *Switch, wait_ms: i64) bool {
+    /// True once no admitted request remains while attempt `n` is still draining, waiting at most `wait_ms`. An attempt
+    /// that was aborted, fenced or expired meanwhile is not drained, however empty the count.
+    pub fn waitDrained(self: *Switch, n: u64, wait_ms: i64) bool {
         const deadline = io_util.nowMsMonotonic(self.io) + wait_ms;
         while (true) {
             self.lock();
+            self.m.tick(self.now());
+            const draining = self.m.n == n and self.m.state == .draining;
             const idle = self.in_flight == 0;
             self.unlock();
+            if (!draining) return false;
             if (idle) return true;
             if (io_util.nowMsMonotonic(self.io) >= deadline) return false;
             std.Io.sleep(self.io, .fromMilliseconds(5), .real) catch {};
@@ -612,9 +616,43 @@ test "drain waits for the local in-flight count to reach zero" {
     var sw = newSwitch(null);
     try t.expect(sw.enter());
     _ = sw.command(.drain, 1, 0);
-    try t.expect(!sw.waitDrained(20));
+    try t.expect(!sw.waitDrained(1, 20));
     sw.leave();
-    try t.expect(sw.waitDrained(20));
+    try t.expect(sw.waitDrained(1, 20));
+}
+
+test "a drain whose attempt was aborted is not drained once the count reaches zero" {
+    var sw = newSwitch(null);
+    try t.expect(sw.enter());
+    _ = sw.command(.drain, 1, 0);
+    _ = sw.command(.abort, 1, 0);
+    sw.leave();
+    try t.expect(!sw.waitDrained(1, 20));
+}
+
+test "a drain is drained only for the attempt that is draining" {
+    var sw = newSwitch(null);
+    _ = sw.command(.drain, 1, 0);
+    _ = sw.command(.abort, 1, 0);
+    _ = sw.command(.drain, 2, 0);
+    try t.expect(!sw.waitDrained(1, 20));
+    try t.expect(sw.waitDrained(2, 20));
+}
+
+test "a drain aborted while it waits answers false without running out the wait" {
+    var sw = newSwitch(null);
+    try t.expect(sw.enter());
+    _ = sw.command(.drain, 1, 0);
+    const Aborter = struct {
+        fn run(s: *Switch) void {
+            std.Io.sleep(s.io, .fromMilliseconds(30), .real) catch {};
+            _ = s.command(.abort, 1, 0);
+            s.leave();
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Aborter.run, .{&sw});
+    defer th.join();
+    try t.expect(!sw.waitDrained(1, 2000));
 }
 
 test "tp4 and join need a formation backend and leave the machine untouched without one" {

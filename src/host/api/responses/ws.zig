@@ -17,6 +17,8 @@ const mapGenerationError = @import("../../http/errors.zig").mapGenerationError;
 const jsonEscape = @import("../format.zig").jsonEscape;
 const handleResponses = @import("handler.zig").handleResponses;
 const ablation = @import("../ablation.zig");
+const http_server = @import("../../http/server.zig");
+const internal_ep = @import("../../internal/endpoints.zig");
 
 /// Bridge that lets a Conn route OpenAI-Responses output through a WebSocket
 /// transport instead of HTTP/SSE. When `Conn.ws_mode` is set, `sendResponse`
@@ -245,6 +247,13 @@ pub fn handleResponsesWebSocket(
             try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "stream/stream_options/background are not allowed over WebSocket");
             continue;
         }
+
+        // A turn is admitted and counted alone: an idle socket between turns never holds a drain.
+        const admission = internal_ep.Admission.enter(http_server.internalSwitch()) catch {
+            try wsSendErrorTurn(allocator, &ws_conn, 503, "service_unavailable", internal_ep.refusal_message);
+            continue;
+        };
+        defer admission.leave();
 
         // ── Resolve previous_response_id against per-conn cache first.
         //    For store:false continuations on this connection, the chain
