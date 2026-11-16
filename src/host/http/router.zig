@@ -4,12 +4,14 @@ const request_options = @import("../api/request_options.zig");
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
+const io_util = @import("../../sdk/util/io_util.zig");
 const media_mod = @import("../media_jobs/gen.zig");
 const instr = @import("../metrics/metrics.zig");
 const lan_mod = @import("../lan/lan.zig");
 const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
 const http_server = @import("server.zig");
+const internal_ep = @import("../internal/endpoints.zig");
 const request_model = @import("../api/request_model.zig");
 
 const Conn = @import("conn.zig").Conn;
@@ -83,6 +85,20 @@ const handleResponsesDelete = @import("../api/responses/handler.zig").handleResp
 const handleResponsesCompact = @import("../api/responses/handler.zig").handleResponsesCompact;
 const handleResponses = @import("../api/responses/handler.zig").handleResponses;
 const handleResponsesWebSocket = @import("../api/responses/ws.zig").handleResponsesWebSocket;
+
+/// `/v1/internal/*`: the internal key decides (never the serving key, loopback included); no key configured means no such path.
+fn serveInternal(allocator: std.mem.Allocator, stream: *Conn, method: []const u8, path: []const u8, raw_headers: []const u8, body: []const u8) !void {
+    const inst = http_server.g_internal orelse
+        return sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Not found", 404);
+    var buf: [1024]u8 = undefined;
+    const res = internal_ep.handle(inst.sw, inst.key, .{
+        .method = method,
+        .path = path,
+        .authorization = @import("auth.zig").findHeaderValueCI(raw_headers, "authorization"),
+        .body = body,
+    }, .{ .mono_ms = io_util.nowMsMonotonic(stream.io), .wall_ms = io_util.nowMs(stream.io) }, &buf);
+    try sendResponse(stream, internal_ep.statusLine(res.status), "application/json", res.body);
+}
 
 /// Every path `handleConnection` dispatches. Kept beside the chain rather than
 /// derived from it because one question has to be answerable BEFORE a model is
@@ -249,6 +265,9 @@ pub fn handleConnection(
         }
     }
 
+    // ── `/v1/internal/*` has its own key and never meets the serving key or the LAN gate.
+    if (internal_ep.isInternalPath(path)) return serveInternal(allocator, stream, method, path, request[0..header_end_pos], request_body);
+
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
     //    requires the key (the OpenAI/Anthropic/Ollama APIs AND the index page
     //    + metrics panel/feed) — EXCEPT `/health` and CORS preflight, which
@@ -296,6 +315,17 @@ pub fn handleConnection(
         }
     }
 
+    // ── Layout switch (plan 61c): public inference is admitted in TP1 and by the TP4 leader, counted so a drain can wait for zero.
+    var admitted: ?*@import("../internal/switch.zig").Switch = null;
+    defer if (admitted) |sw| sw.leave();
+    if (http_server.g_internal) |inst| if (internal_ep.isInference(method, path)) {
+        if (!inst.sw.enter()) {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Layout switch in progress or this box follows a TP4 leader", 503);
+            return;
+        }
+        admitted = inst.sw;
+    };
+
     // ── Plan 05: routes that don't depend on a loaded model (connectivity
     //    probes + CORS preflight + listing endpoints). Handle these BEFORE
     //    `scheduler.ensureLoaded` so they don't trigger a cold load of the
@@ -309,6 +339,11 @@ pub fn handleConnection(
     }
     if (std.mem.eql(u8, method, "GET") and isRoute(path, "/health")) {
         if (mlx.gpuContextLost()) return sendResponse(stream, "503 Service Unavailable", "application/json", "{\"status\":\"gpu context lost\"}");
+        if (http_server.g_internal) |inst| {
+            var hbuf: [256]u8 = undefined;
+            const h = internal_ep.healthResponse(inst.sw, &hbuf);
+            return sendResponse(stream, internal_ep.statusLine(h.status), "application/json", h.body);
+        }
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
         return;
