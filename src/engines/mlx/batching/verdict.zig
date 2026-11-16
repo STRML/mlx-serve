@@ -216,7 +216,8 @@ pub fn holdsForMemory(fits: bool, live_company: bool) bool {
 
 /// Does a prefill needing `need` fit `avail` beside siblings' unallocated promises, a running
 /// media job's reserve, and the sibling margin? Metal OOM is uncatchable, so a media step's
-/// transients are billed before chat may take them.
+/// transients are billed before chat may take them. `avail` is what is free NOW: memory a
+/// cache eviction would return counts only once the eviction has run.
 pub fn admissionFits(need: u64, avail: u64, promised: u64, gen_reserve: u64, live: usize) bool {
     const margin: u64 = if (live > 0) SIBLING_MARGIN_BYTES else 0;
     return need +| promised +| gen_reserve +| margin <= avail;

@@ -14,7 +14,6 @@ const prefix_cache_mod = @import("prefix_cache.zig");
 const peer_wire = @import("peer_wire.zig");
 const prefill_mod = @import("../prefill.zig");
 const pack_identity_mod = @import("pack_identity.zig");
-const dsv41_numerics = @import("../../../plugins/deepseek_v41/numerics.zig");
 const env_vars = @import("../../../env.zig");
 const forceGpuFamilyFallback = @import("../../../mlx/device.zig").forceGpuFamilyFallback;
 const publishHotCacheResidency = @import("budget.zig").publishHotCacheResidency;
@@ -93,7 +92,7 @@ pub fn modelSettingsKey(lm: *const LoadedModel, cfg: *const ModelConfig, xfm: *c
     } else {
         std.hash.autoHash(&h, @as(u8, 0));
     }
-    std.hash.autoHash(&h, dsv41_numerics.resolved());
+    std.hash.autoHash(&h, plugin_driver.auxSettingsKey(xfm));
     std.hash.autoHash(&h, .{ env_vars.int(.LAYER_CAP, usize, 0), env_vars.on(.DSV4_SKIP_MOE), forceGpuFamilyFallback() });
     if (model_mod.getConfigOverrides()) |raw| {
         h.update("\x00");
@@ -144,7 +143,107 @@ pub fn exportWireModule(
     cache_key: u64,
     max_bytes: usize,
 ) !requests.CacheExportOutcome {
-    return exportWireModuleWithBudget(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, max_bytes, false);
+    return exportWireModuleWithBudget(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, 0, max_bytes, false);
+}
+
+const RamModuleHit = prefix_cache_mod.HotPrefixCache.RamModuleHit;
+
+/// The snapshot an SSD record was read back into, freed when the export is done with it.
+const DiskSession = struct {
+    xfm: ?*const Transformer = null,
+    snapshot: plugin_abi.Handle = null,
+
+    fn release(self: *DiskSession) void {
+        if (self.snapshot != null) plugin_driver.auxFree(self.xfm.?, self.snapshot);
+        self.snapshot = null;
+    }
+};
+
+const SessionLookup = union(enum) { none, hit: RamModuleHit, refused: requests.CacheExportOutcome };
+
+pub var after_aux_import_for_test: ?*const fn () void = null;
+
+/// The prompt boundary a session's newest tip names, else the next boundary of the session that has a record, in RAM or
+/// on the SSD (`tipHit`). A session whose every tip is gone is `none`: the caller sees `session_not_found`.
+fn sessionHit(
+    allocator: std.mem.Allocator,
+    sch: *const Scheduler,
+    cfg: *const ModelConfig,
+    hc: *prefix_cache_mod.HotPrefixCache,
+    xfm: *Transformer,
+    session: u64,
+    max_bytes: usize,
+    holder: *DiskSession,
+) SessionLookup {
+    var walk: prefix_cache_mod.HotPrefixCache.TipWalk = .{ .session = session };
+    while (walk.next(hc)) |tip| {
+        const had_error = mlx.errorPending();
+        const found = tipHit(allocator, sch, cfg, hc, xfm, session, tip, max_bytes, holder);
+        if (found != .none) return found;
+        mlx.dropLatchedErrorUnless(had_error);
+    }
+    return .none;
+}
+
+/// The prompt boundary a tip names, found by identity: the RAM entry with that id and length, else the SSD record with
+/// it. The record is read back into a snapshot (`holder` frees it) so it exports the way a RAM entry does, under the
+/// variant the tip was committed with. The envelope carries the asking session, so the importer records it as an owner
+/// even when another session wrote the entry. A tip whose entry is gone, or whose record cannot be read, is `none`.
+fn tipHit(
+    allocator: std.mem.Allocator,
+    sch: *const Scheduler,
+    cfg: *const ModelConfig,
+    hc: *prefix_cache_mod.HotPrefixCache,
+    xfm: *Transformer,
+    session: u64,
+    tip: prefix_cache_mod.HotPrefixCache.SessionTip,
+    max_bytes: usize,
+    holder: *DiskSession,
+) SessionLookup {
+    if (hc.ramHitOfTip(tip, session)) |hit| return .{ .hit = hit };
+    const d = if (hc.disk) |*dd| dd else return .none;
+    const ref = d.moduleByBoundary(tip.id, tip.n) orelse return .none;
+    const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, tip.variant) orelse return .none;
+    const header = d.readModuleHeader(ref.id) catch return .none;
+    defer d.allocator.free(header);
+    const inventory = d.moduleInventory(ref.id) orelse return .none;
+    var stored: u64 = 0;
+    for (inventory) |t| stored += t.bytes;
+    if (stored > max_bytes) return .{ .refused = .{ .too_large = @intCast(stored) } };
+    var plan_peak: u64 = 0;
+    if (!plugin_driver.auxImportPlan(binding.xfm, header, &plan_peak).isOk()) return .none;
+    const peak = prefill_mod.moduleImportPeak(plan_peak, inventory) catch return .{ .refused = .no_memory };
+    if (peak > prefillHeadroomNow(cfg, stagedHostBytes(@constCast(sch)))) return .{ .refused = .no_memory };
+
+    var arrays = d.loadModuleParts(ref.id) catch return .none;
+    defer d.freeNamed(&arrays);
+    const tensors = allocator.alloc(plugin_abi.AuxTensor, arrays.items.len) catch return .{ .refused = .no_memory };
+    defer allocator.free(tensors);
+    for (arrays.items, tensors) |array, *t| t.* = .{ .name = .of(array.key), .array = .{ .ctx = array.arr.ctx } };
+    var snapshot: plugin_abi.Handle = null;
+    const imported = plugin_driver.auxImportArrays(binding.xfm, ref.tokens, header, tensors, &snapshot).isOk();
+    if (after_aux_import_for_test) |probe| probe();
+    if (!imported or snapshot == null or mlx.errorPending()) {
+        if (snapshot != null) plugin_driver.auxFree(binding.xfm, snapshot);
+        return .none;
+    }
+    holder.* = .{ .xfm = binding.xfm, .snapshot = snapshot };
+    return .{ .hit = .{
+        .payload = .{
+            .binding = binding,
+            .snapshot = snapshot,
+            .n = ref.tokens.len,
+            .prefix_key = ref.prefix_key,
+            .aux_bytes = plugin_driver.auxBytes(binding.xfm, snapshot),
+            .disk_id = ref.id,
+        },
+        .tokens = ref.tokens,
+        .quant_config = ref.quant,
+        .cache_key = 0,
+        .has_tools = ref.has_tools,
+        .media = ref.media,
+        .session = session,
+    } };
 }
 
 fn exportWireModuleWithBudget(
@@ -157,6 +256,7 @@ fn exportWireModuleWithBudget(
     kv_quant_override: ?kv_quant.KVQuantConfig,
     variant: u64,
     cache_key: u64,
+    session: u64,
     max_bytes: usize,
     admit_transfer_budget: bool,
 ) !requests.CacheExportOutcome {
@@ -167,7 +267,6 @@ fn exportWireModuleWithBudget(
     const xfm = lm.transformer orelse return .not_found;
     const cfg = lm.config orelse return .not_found;
     const hc = lm.prefix_cache orelse return .not_found;
-    const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, variant) orelse return .not_found;
     const pack_identity = switch (pack_identity_mod.status(lm.pack_identity)) {
         .ready => |id| id,
         .pending => return .identity_pending,
@@ -175,7 +274,17 @@ fn exportWireModuleWithBudget(
     };
     const quant_config = kv_quant_override orelse cfg.kv_quant_override orelse sch.kv_quant_config;
 
-    const hit = hc.findRamModule(binding, prompt_ids, has_tools, quant_config) orelse return .not_found;
+    var from_disk: DiskSession = .{};
+    defer from_disk.release();
+    const hit = if (session != 0) switch (sessionHit(allocator, sch, cfg, hc, xfm, session, max_bytes, &from_disk)) {
+        .hit => |h| h,
+        .none => return .not_found,
+        .refused => |outcome| return outcome,
+    } else blk: {
+        const by_prompt = prefix_cache_mod.ModuleBinding.forVariant(xfm, variant) orelse return .not_found;
+        break :blk hc.findRamModule(by_prompt, prompt_ids, has_tools, quant_config) orelse return .not_found;
+    };
+    const binding = hit.payload.binding;
 
     var info: plugin_abi.AuxSnapshotInfo = .{};
     if (!plugin_driver.auxDescribe(binding.xfm, hit.payload.snapshot, &info).isOk() or
@@ -195,7 +304,7 @@ fn exportWireModuleWithBudget(
     defer inv_arena.deinit();
     const inv = try exp.inventory(inv_arena.allocator());
 
-    const total_len = try peer_wire.encodedSize(hit.tokens.len, exp.out.header_len, inv);
+    const total_len = try peer_wire.encodedSize(hit.tokens.len, hit.media.len, hit.session, exp.out.header_len, inv);
     if (total_len > max_bytes) {
         return .{ .too_large = @intCast(total_len) };
     }
@@ -231,11 +340,13 @@ fn exportWireModuleWithBudget(
         .prefix_key = info.prefix_key,
         .cache_key = eff_cache_key,
         .variant = binding.variant,
-        .has_tools = has_tools,
+        .has_tools = hit.has_tools,
         .quant_config = hit.quant_config,
         .ids = hit.tokens,
         .plugin_header = exp.header[0..exp.out.header_len],
         .tensors = inv,
+        .media = hit.media,
+        .session = hit.session,
     });
 
     var cursor = payload_off;
@@ -257,7 +368,7 @@ fn mapDecodeError(err: peer_wire.DecodeError) error{OutOfMemory}!requests.CacheI
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.TruncatedEnvelope => .truncated_body,
-        error.BadEnvelope, error.BadTensorName => .bad_envelope,
+        error.BadEnvelope, error.BadTensorName, error.BadMediaSpans => .bad_envelope,
         error.UnsupportedEnvelopeVersion => .unknown_version,
         error.BadQuantConfig => .bad_quant_config,
         error.BadTensorDtype => .bad_dtype,
@@ -350,7 +461,7 @@ pub fn importWireModule(
         return .{ .refused = .quant_config };
     }
 
-    if (hc.hasModuleCovering(binding, env.ids, env.has_tools, env.quant_config)) {
+    if (hc.claimCovering(binding, env.ids, env.media, env.has_tools, env.quant_config, env.session)) {
         logRefusal(.stale, env.ids.len);
         return .{ .refused = .stale };
     }
@@ -440,10 +551,11 @@ pub fn importWireModule(
         snapshot,
         env.ids,
         env.prefix_key,
-        &.{},
+        env.media,
         env.has_tools,
         env.quant_config,
         env.cache_key,
+        env.session,
     ) catch |err| {
         publishHotCacheResidency(sch);
         return err;
@@ -492,6 +604,7 @@ pub fn runCacheExportRequest(sch: *Scheduler, req: *requests.CacheExportRequest)
         req.kv_quant_override,
         req.variant,
         req.cache_key,
+        req.session,
         req.max_bytes,
         req.admit_transfer_budget,
     ) catch |err| {

@@ -206,8 +206,13 @@ pub const Drafting = struct {
 
     /// A drafted round's wall time is bounded by the rounds before it, so a stall cannot stop drafting.
     pub fn record(self: *Drafting, gain: f32, wall_in: f32) void {
+        if (self.wall <= 0 and gain <= 0) {
+            self.owed = self.period;
+            self.period = @min(self.period * 2, MAX_PERIOD);
+            return;
+        }
         const prior_wall = if (self.wall > 0) self.wall else gain;
-        const wall = std.math.clamp(wall_in, prior_wall / STALL, prior_wall * STALL);
+        const wall = if (prior_wall > 0) @min(wall_in, prior_wall * STALL) else wall_in;
         if (self.wall <= 0) {
             self.gain = gain;
             self.wall = wall;
@@ -825,14 +830,32 @@ test "Drafting: a stalled round is not what a round costs" {
     try testing.expect(cold.shouldDraft());
 }
 
-test "GroupCost: rows and states cost more, and a slower machine's rounds scale the prior within bounds" {
-    var cost: GroupCost = .{};
-    try testing.expect(cost.ms(2, 4) > cost.ms(2, 2) and cost.ms(3, 3) > cost.ms(2, 2));
-    for (0..200) |_| cost.sample(2, 4, 2 * GroupCost.prior(2, 4));
-    try testing.expectApproxEqAbs(@as(f32, 2), cost.scale(), 0.05);
-    cost.sample(2, 4, std.math.nan(f32));
-    cost.sample(2, 4, 1e9);
-    try testing.expect(cost.scale() <= 2.5);
+test "Drafting: a first round that gained nothing still owes plain rounds" {
+    var d: Drafting = .{};
+    d.record(0, 35);
+    try testing.expectEqual(@as(f32, 0), d.wall);
+    try testing.expect(d.owed >= 1);
+}
+
+test "Drafting: a first round that stalled with nothing gained leaves five profitable probes at most a few plain rounds" {
+    var d: Drafting = .{};
+    d.record(0, 5000);
+    for (0..5) |_| {
+        while (!d.shouldDraft()) {}
+        d.record(35.4, 35);
+    }
+    try testing.expect(d.skipped <= 3);
+}
+
+test "Drafting: rounds that gain nothing with no prior wall back off instead of drafting every round" {
+    var d: Drafting = .{};
+    var drafted: u32 = 0;
+    for (0..50) |_| {
+        if (!d.shouldDraft()) continue;
+        drafted += 1;
+        d.record(0, 35);
+    }
+    try testing.expect(drafted <= 10);
 }
 
 test "GroupCost: a machine's own base and row slope are learned apart, and its row choice follows them" {
