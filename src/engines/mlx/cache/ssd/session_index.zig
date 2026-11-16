@@ -117,10 +117,6 @@ pub const Index = struct {
         if (!clean or records != survivors.items.len) self.rewrite(survivors.items);
     }
 
-    pub fn append(self: *Index, tip: Tip) void {
-        self.appendRecord(tip) catch |err| log.warn("[session-index] append failed: {s}\n", .{@errorName(err)});
-    }
-
     /// The newest tip the file holds for `session` whose boundary is not in `tried`: where a lookup falls back to when
     /// the records of the tips it has tried are gone.
     pub fn findExcluding(self: *Index, session: u64, tried: []const u64) ?Tip {
@@ -150,7 +146,7 @@ pub const Index = struct {
         return best;
     }
 
-    fn appendRecord(self: *Index, tip: Tip) !void {
+    pub fn append(self: *Index, tip: Tip) !void {
         if (self.recordCount() >= COMPACT_FACTOR * self.cap) self.compact();
         const f = try std.Io.Dir.createFileAbsolute(self.io, self.path, .{ .truncate = false });
         defer f.close(self.io);
@@ -230,9 +226,9 @@ test "a session index returns each session's newest tip, oldest first, after a r
     {
         var index = try Index.init(testing.allocator, testing.io, path, 16);
         defer index.deinit();
-        try index.appendRecord(tipOf(5, 1));
-        try index.appendRecord(tipOf(6, 2));
-        try index.appendRecord(tipOf(5, 3));
+        try index.append(tipOf(5, 1));
+        try index.append(tipOf(6, 2));
+        try index.append(tipOf(5, 3));
     }
     var index = try Index.init(testing.allocator, testing.io, path, 16);
     defer index.deinit();
@@ -254,7 +250,7 @@ test "a session index keeps a session's newest tips of distinct boundaries throu
     const path = try tmpPath(&tmp, &buf);
     var index = try Index.init(testing.allocator, testing.io, path, 4);
     defer index.deinit();
-    for (1..7) |seq| try index.appendRecord(tipOf(5, seq));
+    for (1..7) |seq| try index.append(tipOf(5, seq));
     var out = try loaded(&index);
     defer out.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), out.items.len);
@@ -279,7 +275,7 @@ test "a session index that holds C, A, B, A keeps C once compacted, and findExcl
     var index = try Index.init(testing.allocator, testing.io, path, 4);
     defer index.deinit();
     const written = [_]u64{ 100, 200, 300, 200 };
-    for (written, 1..) |id, seq| try index.appendRecord(.{ .session = 5, .id = id, .n = 512, .variant = 0, .seq = seq });
+    for (written, 1..) |id, seq| try index.append(.{ .session = 5, .id = id, .n = 512, .variant = 0, .seq = seq });
     var out = try loaded(&index);
     defer out.deinit(testing.allocator);
     try testing.expectEqual(@as(u64, 200), index.findExcluding(5, &.{}).?.id);
@@ -296,9 +292,9 @@ test "a session index skips a half-written tail and a damaged record, and append
     {
         var index = try Index.init(testing.allocator, testing.io, path, 16);
         defer index.deinit();
-        try index.appendRecord(tipOf(1, 1));
-        try index.appendRecord(tipOf(2, 2));
-        try index.appendRecord(tipOf(3, 3));
+        try index.append(tipOf(1, 1));
+        try index.append(tipOf(2, 2));
+        try index.append(tipOf(3, 3));
     }
     {
         const f = try std.Io.Dir.openFileAbsolute(testing.io, path, .{ .mode = .read_write });
@@ -314,7 +310,7 @@ test "a session index skips a half-written tail and a damaged record, and append
         try testing.expectEqual(@as(usize, 1), out.items.len);
         try testing.expectEqual(tipOf(1, 1), out.items[0]);
     }
-    try index.appendRecord(tipOf(4, 4));
+    try index.append(tipOf(4, 4));
     var again = try Index.init(testing.allocator, testing.io, path, 16);
     defer again.deinit();
     var out = try loaded(&again);
@@ -331,8 +327,8 @@ test "a session index counts a tip of one boundary once, so the fallback is anot
     var index = try Index.init(testing.allocator, testing.io, path, 8);
     defer index.deinit();
     const first: Tip = .{ .session = 5, .id = 100, .n = 512, .variant = 0, .seq = 1 };
-    for ([_]u64{ 2, 3, 4 }) |seq| try index.appendRecord(.{ .session = 5, .id = 200, .n = 513, .variant = 0, .seq = seq });
-    try index.appendRecord(first);
+    for ([_]u64{ 2, 3, 4 }) |seq| try index.append(.{ .session = 5, .id = 200, .n = 513, .variant = 0, .seq = seq });
+    try index.append(first);
     var out = try loaded(&index);
     defer out.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), out.items.len);
@@ -350,7 +346,7 @@ test "a session index keeps the newest sessions at its cap, and find reads the f
     const path = try tmpPath(&tmp, &buf);
     var index = try Index.init(testing.allocator, testing.io, path, 3);
     defer index.deinit();
-    for (1..15) |s| try index.appendRecord(tipOf(s, s));
+    for (1..15) |s| try index.append(tipOf(s, s));
     try testing.expectEqual(tipOf(14, 14), index.find(14).?);
     var out = try loaded(&index);
     defer out.deinit(testing.allocator);

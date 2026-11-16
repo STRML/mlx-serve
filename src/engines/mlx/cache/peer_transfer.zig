@@ -177,8 +177,10 @@ fn sessionHit(
 ) SessionLookup {
     var walk: prefix_cache_mod.HotPrefixCache.TipWalk = .{ .session = session };
     while (walk.next(hc)) |tip| {
+        const had_error = mlx.errorPending();
         const found = tipHit(allocator, sch, cfg, hc, xfm, session, tip, max_bytes, holder);
         if (found != .none) return found;
+        mlx.dropLatchedErrorUnless(had_error);
     }
     return .none;
 }

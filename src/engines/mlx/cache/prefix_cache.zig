@@ -740,6 +740,7 @@ pub const HotPrefixCache = struct {
     session_seq: u64 = 0,
     session_tips_seeded: bool = false,
     tips_unpersisted: bool = false,
+    index_append_failing: bool = false,
     session_index: ?session_index_mod.Index = null,
     /// Tips held in memory, and sessions the persisted index keeps: fields so a test reaches either cheaply.
     session_tip_cap: usize = MAX_SESSION_TIPS,
@@ -1665,7 +1666,13 @@ pub const HotPrefixCache = struct {
                 waiting = true;
                 continue;
             }
-            index.append(.{ .session = kv.key_ptr.*, .id = tip.id, .n = tip.n, .variant = tip.variant, .seq = tip.seq });
+            index.append(.{ .session = kv.key_ptr.*, .id = tip.id, .n = tip.n, .variant = tip.variant, .seq = tip.seq }) catch |err| {
+                if (!self.index_append_failing) log.warn("[session-index] append failed, the tip stays unpersisted and retries on the next flush: {s}\n", .{@errorName(err)});
+                self.index_append_failing = true;
+                waiting = true;
+                break;
+            };
+            self.index_append_failing = false;
             tip.persisted = true;
         }
         self.tips_unpersisted = waiting;
@@ -2379,7 +2386,7 @@ pub const HotPrefixCache = struct {
         }
         // Only a prompt boundary a session tagged moves that session's tip.
         const seq: u64 = if (tail_from == 0 and session != 0) self.nextSessionSeq() else 0;
-        const boundary_key = boundary_mod.id(variantKey(prefix_key, binding.variant), ids, eff_media);
+        const boundary_key = boundary_mod.id(variantKey(prefix_key, binding.variant), ids, eff_media, has_tools, quant_config);
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
             .tokens = keys[0],
@@ -13729,7 +13736,7 @@ fn expectWalkVisitsEachBoundaryOnce(compact: bool) !void {
     hc.session_tips_seeded = true;
     const index = hc.tipIndex() orelse return error.TestExpectedIndex;
     const written = [_]u64{ 100, 200, 300, 200 };
-    for (written, 1..) |id, seq| index.append(.{ .session = 7, .id = id, .n = 512, .variant = 0, .seq = seq });
+    for (written, 1..) |id, seq| try index.append(.{ .session = 7, .id = id, .n = 512, .variant = 0, .seq = seq });
     if (compact) {
         var kept = std.ArrayList(session_index_mod.Tip).empty;
         defer kept.deinit(testing.allocator);
