@@ -178,11 +178,7 @@ fn sessionHit(
     holder: *DiskSession,
 ) SessionLookup {
     const tip = hc.sessionTip(session) orelse return .none;
-    if (hc.findSessionTip(session)) |h| {
-        var hit = h;
-        hit.session = session;
-        return .{ .hit = hit };
-    }
+    if (hc.findSessionTip(session)) |hit| return .{ .hit = hit };
     const d = if (hc.disk) |*dd| dd else return .none;
     const ref = d.moduleByBoundary(tip.id, tip.n) orelse return .none;
     const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, tip.variant) orelse return .none;

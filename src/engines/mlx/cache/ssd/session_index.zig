@@ -153,7 +153,8 @@ const testing = std.testing;
 
 fn tmpPath(tmp: *testing.TmpDir, buf: []u8) ![]const u8 {
     const n = try tmp.dir.realPath(testing.io, buf);
-    return std.fmt.bufPrint(buf[n..], "/session-tips.bin", .{}) catch error.NoSpaceLeft;
+    const tail = try std.fmt.bufPrint(buf[n..], "/session-tips.bin", .{});
+    return buf[0 .. n + tail.len];
 }
 
 fn tipOf(session: u64, seq: u64) Tip {
@@ -175,9 +176,9 @@ test "a session index returns each session's newest tip, oldest first, after a r
     {
         var index = try Index.init(testing.allocator, testing.io, path, 16);
         defer index.deinit();
-        index.append(tipOf(5, 1));
-        index.append(tipOf(6, 2));
-        index.append(tipOf(5, 3));
+        try index.appendRecord(tipOf(5, 1));
+        try index.appendRecord(tipOf(6, 2));
+        try index.appendRecord(tipOf(5, 3));
     }
     var index = try Index.init(testing.allocator, testing.io, path, 16);
     defer index.deinit();
@@ -198,9 +199,9 @@ test "a session index skips a half-written tail and a damaged record, and append
     {
         var index = try Index.init(testing.allocator, testing.io, path, 16);
         defer index.deinit();
-        index.append(tipOf(1, 1));
-        index.append(tipOf(2, 2));
-        index.append(tipOf(3, 3));
+        try index.appendRecord(tipOf(1, 1));
+        try index.appendRecord(tipOf(2, 2));
+        try index.appendRecord(tipOf(3, 3));
     }
     {
         const f = try std.Io.Dir.openFileAbsolute(testing.io, path, .{ .mode = .read_write });
@@ -216,7 +217,7 @@ test "a session index skips a half-written tail and a damaged record, and append
         try testing.expectEqual(@as(usize, 1), out.items.len);
         try testing.expectEqual(tipOf(1, 1), out.items[0]);
     }
-    index.append(tipOf(4, 4));
+    try index.appendRecord(tipOf(4, 4));
     var again = try Index.init(testing.allocator, testing.io, path, 16);
     defer again.deinit();
     var out = try loaded(&again);
@@ -232,7 +233,7 @@ test "a session index keeps the newest sessions at its cap, and find reads the f
     const path = try tmpPath(&tmp, &buf);
     var index = try Index.init(testing.allocator, testing.io, path, 3);
     defer index.deinit();
-    for (1..15) |s| index.append(tipOf(s, s));
+    for (1..15) |s| try index.appendRecord(tipOf(s, s));
     try testing.expectEqual(tipOf(14, 14), index.find(14).?);
     var out = try loaded(&index);
     defer out.deinit(testing.allocator);

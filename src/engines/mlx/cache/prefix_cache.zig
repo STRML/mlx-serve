@@ -1484,7 +1484,9 @@ pub const HotPrefixCache = struct {
             const m = e.module orelse continue;
             if (m.tail_from != 0 or e.checked_out_by != null) continue;
             if (e.tokens.len != tip.n or e.boundary != tip.id) continue;
-            return ramHit(e);
+            var hit = ramHit(e) orelse continue;
+            hit.session = session;
+            return hit;
         }
         return null;
     }
