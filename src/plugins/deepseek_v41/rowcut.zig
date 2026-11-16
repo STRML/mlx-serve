@@ -103,11 +103,13 @@ const Cutter = struct {
         return .{ .w = try k.arr(b.w, 1, c), .s = try k.arr(b.s, 1, c), .b = try k.arr(b.b, 1, c), .qp = b.qp };
     }
     fn lin(k: Cutter, l: Lin, axis: usize, c: Cut) !Lin {
+        if (l.ext != null) return error.Dsv41RowCutOutsideQuant;
         return .{ .w = try k.arr(l.w, axis, c), .s = try k.arr(l.s, axis, c), .b = try k.arr(l.b, axis, c), .qp = l.qp };
     }
     /// Columns `c` of a linear in a buffer of its own: a column cut of a row-major weight is no view. A quantized
     /// weight's columns cut whole groups.
     fn linCols(k: Cutter, l: Lin, c: Cut) !Lin {
+        if (l.ext != null) return error.Dsv41RowCutOutsideQuant;
         var out: Lin = .{ .w = none, .qp = l.qp };
         inline for (.{ "w", "s", "b" }) |f| {
             const a = @field(l, f);
@@ -339,13 +341,13 @@ pub const RouteCrc = struct {
 
 /// What a TP4 prompt chunk needs from the mode it runs in. Rank 0 runs the chunk on its TP1 model alone (`run`, which
 /// hands back the slot's snapshot after it), then `ship` sends that snapshot's cache tensors to every other rank under
-/// its id: `dsv41.tpLoad`'s path through the cluster's `tp_load` hook in serving, a recorder in a test. Every rank
-/// holds the DSpark stages and runs them row-cut, so their windows ride too.
+/// its id and the DSpark stages it holds: `dsv41.tpLoad`'s path through the cluster's `tp_load` hook in serving, a
+/// recorder in a test.
 pub const LeaderPrefill = struct {
     ctx: ?*anyopaque = null,
     whole: *const dsv41.Dsv41Model,
     run: *const fn (ctx: ?*anyopaque, ids: []const u32, p0: usize) anyerror!*const dsv41.Snap,
-    ship: *const fn (ctx: ?*anyopaque, id: u64, ids: []const u32, tensors: []const A) anyerror!void,
+    ship: *const fn (ctx: ?*anyopaque, id: u64, ids: []const u32, tensors: []const A, stages: usize) anyerror!void,
 };
 
 /// Rank 0's half of a prompt chunk (`ids` from position `p0`): the chunk on the TP1 model, then its state to the other
@@ -354,17 +356,31 @@ pub fn prefillOnLeader(gpa: std.mem.Allocator, g: Group, lp: LeaderPrefill, ids:
     if (g.rank != 0) return error.Dsv41RowCutNotLeader;
     const sn = try lp.run(lp.ctx, ids, p0);
     if (g.size == 1) return sn;
-    const xs = try dsv41.planTensors(lp.whole, gpa, sn, try dsv41.shipPlan(lp.whole, sn.n, true));
+    const xs = try dsv41.planTensors(lp.whole, gpa, sn, try dsv41.shipPlan(lp.whole, sn.n, lp.whole.n_mtp));
     defer dsv41.freeArrays(gpa, xs);
-    try lp.ship(lp.ctx, sn.tp_id, sn.ids, xs);
+    try lp.ship(lp.ctx, sn.tp_id, sn.ids, xs, lp.whole.n_mtp);
     return sn;
 }
 
-/// A follower's half: rank 0's snapshot `id` rebuilt from the tensors it shipped, into `snaps` under that id (the next
-/// TP4 turn restores it). The KV is whole on every rank, so the follower's TP1 model takes it as is.
-pub fn importOnFollower(gpa: std.mem.Allocator, g: Group, whole: *const dsv41.Dsv41Model, snaps: *dsv41.Snaps, id: u64, ids: []const u32, tensors: []const A) !void {
+/// A follower's half: rank 0's snapshot `id` rebuilt from the tensors it shipped with `stages` DSpark stages, into
+/// `snaps` under that id (the next TP4 turn restores it). The KV is whole on every rank, so the follower's TP1 model
+/// takes it as is; a follower without stages (rank 0 drafts alone) skips their tensors.
+pub fn importOnFollower(gpa: std.mem.Allocator, g: Group, whole: *const dsv41.Dsv41Model, snaps: *dsv41.Snaps, id: u64, ids: []const u32, tensors: []const A, stages: usize) !void {
     if (g.rank == 0) return error.Dsv41RowCutLeaderImport;
-    try dsv41.importPlan(whole, gpa, snaps, id, ids, tensors, try dsv41.shipPlan(whole, ids.len, true));
+    const own = try dsv41.shipPlan(whole, ids.len, whole.n_mtp);
+    if (stages == whole.n_mtp) return dsv41.importPlan(whole, gpa, snaps, id, ids, tensors, own);
+    if (whole.n_mtp != 0) return error.Dsv41RowCutStagesMissing;
+    const sent = try dsv41.shipPlan(whole, ids.len, stages);
+    if (tensors.len != sent.len) return error.DistPeerDiverged;
+    const kept = try gpa.alloc(A, own.len);
+    defer gpa.free(kept);
+    var k: usize = 0;
+    for (sent.specs(), tensors) |spec, x| {
+        if (spec.kind == .ds or spec.kind == .mh) continue;
+        kept[k] = x;
+        k += 1;
+    }
+    try dsv41.importPlan(whole, gpa, snaps, id, ids, kept, own);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -938,23 +954,24 @@ const PrefillRig = struct {
 
     fn run(ctx: ?*anyopaque, ids: []const u32, _: usize) anyerror!*const dsv41.Snap {
         const self: *PrefillRig = @ptrCast(@alignCast(ctx.?));
-        try dsv41.importPlan(self.leader, self.gpa, &self.lead, 7, ids, self.disk, try dsv41.shipPlan(self.leader, ids.len, true));
+        try dsv41.importPlan(self.leader, self.gpa, &self.lead, 7, ids, self.disk, try dsv41.shipPlan(self.leader, ids.len, self.leader.n_mtp));
         const sn = self.lead.getPtr(7).?;
         sn.tp_id = 7;
         return sn;
     }
 
-    fn ship(ctx: ?*anyopaque, id: u64, ids: []const u32, tensors: []const A) anyerror!void {
+    fn ship(ctx: ?*anyopaque, id: u64, ids: []const u32, tensors: []const A, stages: usize) anyerror!void {
         const self: *PrefillRig = @ptrCast(@alignCast(ctx.?));
         self.shipped += 1;
-        try importOnFollower(self.gpa, .{ .rank = 1, .size = 4, .gather = Group.solo.gather }, self.follower, &self.follow, id, ids, tensors);
+        try importOnFollower(self.gpa, .{ .rank = 1, .size = 4, .gather = Group.solo.gather }, self.follower, &self.follow, id, ids, tensors, stages);
     }
 };
 
-/// A prompt chunk on `lead` reaches `follow` as the same snapshot of every tensor a rank holds, under the leader's id.
+/// A prompt chunk on `lead` reaches `follow` as the same snapshot of every tensor the follower holds, under the
+/// leader's id.
 fn expectLeaderShips(gpa: std.mem.Allocator, lead: *dsv41.Dsv41Model, follow: *dsv41.Dsv41Model) !void {
     const n = 301;
-    const plan = try dsv41.shipPlan(lead, n, true);
+    const plan = try dsv41.shipPlan(lead, n, lead.n_mtp);
     var sc = Scope.init(gpa, lead.s);
     defer sc.deinit();
     const disk = try gpa.alloc(A, plan.len);
@@ -975,15 +992,15 @@ fn expectLeaderShips(gpa: std.mem.Allocator, lead: *dsv41.Dsv41Model, follow: *d
     try testing.expectEqual(@as(usize, 1), rig.shipped);
     const got = rig.follow.getPtr(7) orelse return error.NotShipped;
     try testing.expectEqual(@as(usize, n), got.n);
-    const want = try dsv41.planTensors(lead, gpa, rig.lead.getPtr(7).?, plan);
+    const want = try dsv41.planTensors(lead, gpa, rig.lead.getPtr(7).?, try dsv41.shipPlan(lead, n, follow.n_mtp));
     defer dsv41.freeArrays(gpa, want);
-    const back = try dsv41.planTensors(follow, gpa, got, try dsv41.shipPlan(follow, n, true));
+    const back = try dsv41.planTensors(follow, gpa, got, try dsv41.shipPlan(follow, n, follow.n_mtp));
     defer dsv41.freeArrays(gpa, back);
     try testing.expectEqual(want.len, back.len);
     for (want, back) |a, b| try testing.expect(try same(a, b));
     // Only the leader prefills; only a follower imports; one rank ships nothing.
     try testing.expectError(error.Dsv41RowCutNotLeader, prefillOnLeader(gpa, .{ .rank = 2, .size = 4, .gather = Group.solo.gather }, lp, ids, 0));
-    try testing.expectError(error.Dsv41RowCutLeaderImport, importOnFollower(gpa, four, follow, &rig.follow, 8, ids, want));
+    try testing.expectError(error.Dsv41RowCutLeaderImport, importOnFollower(gpa, four, follow, &rig.follow, 8, ids, want, follow.n_mtp));
     _ = try prefillOnLeader(gpa, Group.solo, lp, ids, 0);
     try testing.expectEqual(@as(usize, 1), rig.shipped);
 }
@@ -998,21 +1015,38 @@ test "dsv41 row cut: a prompt chunk on the leader reaches a follower as the same
     try expectLeaderShips(gpa, lead.m, follow.m);
 }
 
+/// A two-layer whole model with `stages` DSpark stages. The fixture keeps the release's KV source layers past its own
+/// two; a parsed config names only layers it has.
+fn wholeWithStages(gpa: std.mem.Allocator, stages: u32) !*fixture.Fixture {
+    const fx = try fixture.Fixture.initWhole(gpa, .{ .dspark_stages = stages });
+    const have = (@as(u64, 1) << @intCast(fx.m.n_layers)) - 1;
+    fx.m.cfg.dsv41_kv_sources &= have;
+    fx.m.cfg.dsv41_index_sources &= have;
+    return fx;
+}
+
 test "dsv41 row cut: a leader's prompt chunk ships the DSpark stage windows and main rows too" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
-    const lead = try fixture.Fixture.initWhole(gpa, .{ .dspark_stages = 1 });
+    const lead = try wholeWithStages(gpa, 1);
     defer lead.deinit();
-    const follow = try fixture.Fixture.initWhole(gpa, .{ .dspark_stages = 1 });
+    const follow = try wholeWithStages(gpa, 1);
     defer follow.deinit();
     try testing.expect(lead.m.n_mtp > 0);
-    // The fixture keeps the release's KV source layers past its own two; a parsed config names only layers it has.
-    for ([_]*dsv41.Dsv41Model{ lead.m, follow.m }) |m| {
-        const have = (@as(u64, 1) << @intCast(m.n_layers)) - 1;
-        m.cfg.dsv41_kv_sources &= have;
-        m.cfg.dsv41_index_sources &= have;
-    }
     try expectLeaderShips(gpa, lead.m, follow.m);
+}
+
+test "dsv41 row cut: a follower without DSpark stages (rank 0 drafts alone) takes the leader's chunk without them" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const lead = try wholeWithStages(gpa, 1);
+    defer lead.deinit();
+    const follow = try wholeWithStages(gpa, 0);
+    defer follow.deinit();
+    try testing.expect(lead.m.n_mtp > 0 and follow.m.n_mtp == 0);
+    try expectLeaderShips(gpa, lead.m, follow.m);
+    // A follower holding stages the leader did not send is refused by name.
+    try testing.expectError(error.Dsv41RowCutStagesMissing, expectLeaderShips(gpa, follow.m, lead.m));
 }
 
 test "dsv41 row cut: a layer with any linear in an outside quant plugin is refused by name" {
@@ -1044,6 +1078,17 @@ test "dsv41 row cut: a layer with any linear in an outside quant plugin is refus
         try testing.expectEqual(@as(usize, if (ly.shared_gu != null) 8 else 7), marked);
         if (fused) try testing.expect(ly.shared_gu != null);
     }
+}
+
+test "dsv41 row cut: the linear cutter refuses an outside quant weight instead of dropping it" {
+    const gpa = testing.allocator;
+    var owned: Owned = .{};
+    defer owned.deinit(gpa);
+    const k: Cutter = .{ .gpa = gpa, .s = undefined, .owned = &owned };
+    const l: Lin = .{ .w = none, .ext = .{ .t = undefined, .w = undefined } };
+    const c: Cut = .{ .len = 8, .rank = 0, .size = 4 };
+    try testing.expectError(error.Dsv41RowCutOutsideQuant, k.lin(l, 0, c));
+    try testing.expectError(error.Dsv41RowCutOutsideQuant, k.linCols(l, c));
 }
 
 test "dsv41 row cut: the parity bar fails a result that is not finite" {

@@ -6007,14 +6007,14 @@ pub fn tpFree(m: *const Dsv41Model, gen: u64) void {
 /// off the same summed stream through whole KV weights, so rank 0's are theirs; the DSpark windows too when every rank
 /// drafts, else they are rank 0's alone.
 pub fn tpLoadPlan(m: *const Dsv41Model, n: usize) !cache_codec.Plan {
-    return shipPlan(m, n, m.draft_shard);
+    return shipPlan(m, n, if (m.draft_shard) m.n_mtp else 0);
 }
 
-/// A snapshot of `n` positions as one rank ships it to another: every layer's caches and Engram history, the DSpark
-/// windows and main rows when `stages`.
-pub fn shipPlan(m: *const Dsv41Model, n: usize, stages: bool) !cache_codec.Plan {
+/// A snapshot of `n` positions as one rank ships it to another: every layer's caches and Engram history, and the
+/// windows and main rows of `stages` DSpark stages.
+pub fn shipPlan(m: *const Dsv41Model, n: usize, stages: usize) !cache_codec.Plan {
     var l = try cacheLayout(m);
-    if (!stages) l.stages = 0;
+    l.stages = stages;
     return cache_codec.Plan.init(l, n, 0);
 }
 
