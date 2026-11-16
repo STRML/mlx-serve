@@ -1,0 +1,35 @@
+diff --git a/mlx/c/distributed_group.cpp b/mlx/c/distributed_group.cpp
+--- a/mlx/c/distributed_group.cpp
++++ b/mlx/c/distributed_group.cpp
+@@ -59,6 +59,16 @@ extern "C" int mlx_distributed_group_size(mlx_distributed_group group) {
+   }
+ }
+ 
++extern "C" int mlx_distributed_clear_backends(void) {
++  try {
++    mlx::core::distributed::clear_backends();
++    return 0;
++  } catch (std::exception& e) {
++    mlx_error("%s", e.what());
++    return 1;
++  }
++}
++
+ extern "C" int mlx_distributed_group_split(
+     mlx_distributed_group* res,
+     mlx_distributed_group group,
+diff --git a/mlx/c/distributed_group.h b/mlx/c/distributed_group.h
+--- a/mlx/c/distributed_group.h
++++ b/mlx/c/distributed_group.h
+@@ -51,6 +51,11 @@ int mlx_distributed_group_rank(mlx_distributed_group group);
+  */
+ int mlx_distributed_group_size(mlx_distributed_group group);
+ 
++/**
++ * Drop MLX's cached groups, so the next init forms a new one (after every group operation has drained).
++ */
++int mlx_distributed_clear_backends(void);
++
+ /**
+  * Split the group.
+  */
