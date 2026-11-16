@@ -79,7 +79,7 @@ pub fn handleSessionExport(allocator: std.mem.Allocator, stream: *Conn, lm: *Loa
         .admit_transfer_budget = true,
         .allocator = allocator,
     };
-    try runExport(allocator, stream, scheduler, &req, .{ .message = "No committed RAM entry for this session", .reason = "session_not_found" });
+    try runExport(allocator, stream, scheduler, &req, .{ .message = "No committed entry for this session", .reason = "session_not_found" });
 }
 
 const NotFound = struct { message: []const u8, reason: ?[]const u8 = null };

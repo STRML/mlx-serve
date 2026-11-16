@@ -34,6 +34,8 @@ pub const Envelope = struct {
     token_bytes: u64,
     tensors: []const Tensor,
     media: []const Media = &.{},
+    /// The router's `X-Session-Key` (0 = untagged): a restarted server still names the session's newest record.
+    session: u64 = 0,
     part_bytes: []const u64 = &.{},
     bytes: u64 = 0,
 };

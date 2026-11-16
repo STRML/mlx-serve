@@ -2400,6 +2400,7 @@ pub const HotPrefixCache = struct {
             .has_tools = e.has_tools,
             .quant = e.quant_config,
             .media = e.media,
+            .session = e.session,
             .header = exported.header[0..exported.out.header_len],
             .tensors = inventory_,
         }) catch |err| {

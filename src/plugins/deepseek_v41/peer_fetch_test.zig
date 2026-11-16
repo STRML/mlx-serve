@@ -32,6 +32,8 @@ const mlx_engine = @import("../../host/engines/mlx.zig");
 
 const testing = std.testing;
 
+const Greedy = struct { cached: u32, tokens: []u32 };
+
 const PeerHarness = struct {
     tmp: testing.TmpDir,
     path_buf: [512]u8 = undefined,
@@ -191,13 +193,18 @@ const PeerHarness = struct {
         hc.module_quiet_ms = 0;
     }
 
-    fn runGreedy(h: *PeerHarness, prompt: []const u32, max_tokens: u32, commit: bool) !struct { cached: u32, tokens: []u32 } {
+    fn runGreedy(h: *PeerHarness, prompt: []const u32, max_tokens: u32, commit: bool) !Greedy {
+        return h.runGreedyTagged(prompt, max_tokens, commit, 0);
+    }
+
+    fn runGreedyTagged(h: *PeerHarness, prompt: []const u32, max_tokens: u32, commit: bool, session: u64) !Greedy {
         const s = try RequestSlot.init(testing.allocator, h.sch.io, h.entry.config.?, .{
             .model = h.entry,
             .prompt_ids = prompt,
             .sampling = .{ .temperature = 0 },
             .eos_token_ids = &.{},
             .max_tokens = max_tokens,
+            .session = session,
         }, h.sch.kv_quant_config);
         defer s.deinit();
         try prefill_request.runPrefill(&h.sch, s);
@@ -406,6 +413,120 @@ test "dsv41 peer fetch: export from model A and importWireModule into model B pr
         );
         try testing.expectEqual(@as(@TypeOf(disk_exp), .not_found), disk_exp);
     }
+}
+
+fn exportBySession(h: *PeerHarness, session: u64) @import("../../host/gpu_thread/requests.zig").CacheExportOutcome {
+    var req: @import("../../host/gpu_thread/requests.zig").CacheExportRequest = .{
+        .model = h.entry,
+        .prompt_ids = &.{},
+        .has_tools = false,
+        .session = session,
+        .max_bytes = router.max_cache_export_bytes,
+        .allocator = testing.allocator,
+    };
+    peer_transfer.runCacheExportRequest(&h.sch, &req);
+    return req.outcome;
+}
+
+fn importWire(h: *PeerHarness, wire: []const u8) @import("../../host/gpu_thread/requests.zig").CacheImportOutcome {
+    var req: @import("../../host/gpu_thread/requests.zig").CacheImportRequest = .{
+        .model = h.entry,
+        .body = wire,
+        .allocator = testing.allocator,
+    };
+    peer_transfer.runCacheImportRequest(&h.sch, &req);
+    return req.outcome;
+}
+
+test "peer transfer session: an export by X-Session-Key imports on another box and resumes there" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const model_a = try PeerHarness.open(files);
+    defer model_a.close();
+    const model_b = try PeerHarness.open(files);
+    defer model_b.close();
+
+    const full_prompt = buildPrompt(33);
+    const turn1 = try model_a.runGreedyTagged(full_prompt[0..25], 2, true, 77);
+    defer testing.allocator.free(turn1.tokens);
+
+    try testing.expectEqual(@as(@TypeOf(exportBySession(model_a, 78)), .not_found), exportBySession(model_a, 78));
+    const exported = exportBySession(model_a, 77);
+    try testing.expect(exported == .ok);
+    defer testing.allocator.free(exported.ok.bytes);
+    try testing.expectEqual(@as(usize, 24), exported.ok.n);
+
+    const imported = importWire(model_b, exported.ok.bytes);
+    try testing.expect(imported == .ok);
+    try testing.expectEqual(@as(usize, 24), imported.ok.n);
+    try testing.expectEqual(@as(u64, 77), model_b.entry.prefix_cache.?.entries.items[0].session);
+
+    const warm_a = try model_a.runGreedy(&full_prompt, 6, false);
+    defer testing.allocator.free(warm_a.tokens);
+    const warm_b = try model_b.runGreedy(&full_prompt, 6, false);
+    defer testing.allocator.free(warm_b.tokens);
+    try testing.expectEqual(@as(u32, 24), warm_b.cached);
+    try testing.expectEqual(warm_a.cached, warm_b.cached);
+    try testing.expectEqualSlices(u32, warm_a.tokens, warm_b.tokens);
+}
+
+test "peer transfer session: a session whose RAM entry is gone exports from the SSD and resumes on another box" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const model_a = try PeerHarness.open(files);
+    defer model_a.close();
+    const model_b = try PeerHarness.open(files);
+    defer model_b.close();
+    try model_a.attachDisk();
+
+    var prompt: [513]u32 = undefined;
+    for (&prompt, 0..) |*id, i| id.* = @intCast(3 + i % 80);
+    const seeded = try model_a.runGreedyTagged(&prompt, 2, true, 9);
+    defer testing.allocator.free(seeded.tokens);
+    const hc = model_a.entry.prefix_cache.?;
+    const disk_id = hc.entries.items[0].module.?.disk_id.?;
+    for (0..32) |_| {
+        const r = hc.flushOwedSlice(model_a.xfm.s);
+        hc.disk.?.drainWriter();
+        hc.disk.?.pollModuleWrites();
+        if (r == .done) break;
+    }
+    try testing.expect(hc.disk.?.entryWholeOnDisk(disk_id));
+    const tip_tokens = hc.disk.?.sessionTip(9).?.tokens.len;
+    hc.setBudget(1);
+    hc.setBudget(0);
+    try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
+
+    try testing.expectEqual(@as(@TypeOf(exportBySession(model_a, 10)), .not_found), exportBySession(model_a, 10));
+    const exported = exportBySession(model_a, 9);
+    try testing.expect(exported == .ok);
+    defer testing.allocator.free(exported.ok.bytes);
+    try testing.expectEqual(tip_tokens, exported.ok.n);
+    try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
+
+    const imported = importWire(model_b, exported.ok.bytes);
+    try testing.expect(imported == .ok);
+    try testing.expectEqual(@as(u64, 9), model_b.entry.prefix_cache.?.entries.items[0].session);
+
+    const warm_a = try model_a.runGreedy(&prompt, 6, false);
+    defer testing.allocator.free(warm_a.tokens);
+    const warm_b = try model_b.runGreedy(&prompt, 6, false);
+    defer testing.allocator.free(warm_b.tokens);
+    try testing.expectEqual(@as(u32, @intCast(tip_tokens)), warm_b.cached);
+    try testing.expectEqual(warm_a.cached, warm_b.cached);
+    try testing.expectEqualSlices(u32, warm_a.tokens, warm_b.tokens);
 }
 
 test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, settings, quant config, stale entry and low memory headroom" {

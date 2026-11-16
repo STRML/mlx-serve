@@ -147,6 +147,84 @@ pub fn exportWireModule(
     return exportWireModuleWithBudget(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, 0, max_bytes, false);
 }
 
+const RamModuleHit = prefix_cache_mod.HotPrefixCache.RamModuleHit;
+
+/// The snapshot an SSD record was read back into, freed when the export is done with it.
+const DiskSession = struct {
+    xfm: ?*const Transformer = null,
+    snapshot: plugin_abi.Handle = null,
+
+    fn release(self: *DiskSession) void {
+        if (self.snapshot != null) plugin_driver.auxFree(self.xfm.?, self.snapshot);
+        self.snapshot = null;
+    }
+};
+
+const SessionLookup = union(enum) { none, hit: RamModuleHit, refused: requests.CacheExportOutcome };
+
+fn ramOnly(ram: ?RamModuleHit) SessionLookup {
+    return if (ram) |h| .{ .hit = h } else .none;
+}
+
+/// A session's newest prompt boundary: the RAM tip, or the SSD's when RAM holds none or a shorter one. An SSD record
+/// is read back into a snapshot (`holder` frees it) so it exports the way a RAM entry does. A record that cannot be
+/// read leaves the RAM tip, else nothing: the caller sees `session_not_found`.
+fn sessionHit(
+    allocator: std.mem.Allocator,
+    sch: *const Scheduler,
+    cfg: *const ModelConfig,
+    hc: *prefix_cache_mod.HotPrefixCache,
+    xfm: *Transformer,
+    variant: u64,
+    session: u64,
+    max_bytes: usize,
+    holder: *DiskSession,
+) SessionLookup {
+    const ram = hc.findSessionTip(session);
+    const d = if (hc.disk) |*dd| dd else return ramOnly(ram);
+    const tip = d.sessionTip(session) orelse return ramOnly(ram);
+    if (ram) |h| if (h.tokens.len >= tip.tokens.len) return .{ .hit = h };
+    const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, variant) orelse return ramOnly(ram);
+    const header = d.readModuleHeader(tip.id) catch return ramOnly(ram);
+    defer d.allocator.free(header);
+    const inventory = d.moduleInventory(tip.id) orelse return ramOnly(ram);
+    var stored: u64 = 0;
+    for (inventory) |t| stored += t.bytes;
+    if (stored > max_bytes) return .{ .refused = .{ .too_large = @intCast(stored) } };
+    var plan_peak: u64 = 0;
+    if (!plugin_driver.auxImportPlan(binding.xfm, header, &plan_peak).isOk()) return ramOnly(ram);
+    const peak = prefill_mod.moduleImportPeak(plan_peak, inventory) catch return .{ .refused = .no_memory };
+    if (peak > prefillHeadroomNow(cfg, stagedHostBytes(@constCast(sch)))) return .{ .refused = .no_memory };
+
+    var arrays = d.loadModuleParts(tip.id) catch return ramOnly(ram);
+    defer d.freeNamed(&arrays);
+    const tensors = allocator.alloc(plugin_abi.AuxTensor, arrays.items.len) catch return .{ .refused = .no_memory };
+    defer allocator.free(tensors);
+    for (arrays.items, tensors) |array, *t| t.* = .{ .name = .of(array.key), .array = .{ .ctx = array.arr.ctx } };
+    var snapshot: plugin_abi.Handle = null;
+    if (!plugin_driver.auxImportArrays(binding.xfm, tip.tokens, header, tensors, &snapshot).isOk() or snapshot == null or mlx.errorPending()) {
+        if (snapshot != null) plugin_driver.auxFree(binding.xfm, snapshot);
+        return ramOnly(ram);
+    }
+    holder.* = .{ .xfm = binding.xfm, .snapshot = snapshot };
+    return .{ .hit = .{
+        .payload = .{
+            .binding = binding,
+            .snapshot = snapshot,
+            .n = tip.tokens.len,
+            .prefix_key = tip.prefix_key,
+            .aux_bytes = plugin_driver.auxBytes(binding.xfm, snapshot),
+            .disk_id = tip.id,
+        },
+        .tokens = tip.tokens,
+        .quant_config = tip.quant,
+        .cache_key = 0,
+        .has_tools = tip.has_tools,
+        .media = tip.media,
+        .session = session,
+    } };
+}
+
 fn exportWireModuleWithBudget(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -175,9 +253,13 @@ fn exportWireModuleWithBudget(
     };
     const quant_config = kv_quant_override orelse cfg.kv_quant_override orelse sch.kv_quant_config;
 
-    const hit = if (session != 0)
-        hc.findSessionTip(session) orelse return .not_found
-    else blk: {
+    var from_disk: DiskSession = .{};
+    defer from_disk.release();
+    const hit = if (session != 0) switch (sessionHit(allocator, sch, cfg, hc, xfm, variant, session, max_bytes, &from_disk)) {
+        .hit => |h| h,
+        .none => return .not_found,
+        .refused => |outcome| return outcome,
+    } else blk: {
         const by_prompt = prefix_cache_mod.ModuleBinding.forVariant(xfm, variant) orelse return .not_found;
         break :blk hc.findRamModule(by_prompt, prompt_ids, has_tools, quant_config) orelse return .not_found;
     };
