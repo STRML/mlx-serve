@@ -1064,23 +1064,29 @@ test "codec refuses changed loaded settings and invalid IDs before allocating" {
     try e.capture(t, &p);
     defer e.deinit();
     const ids = p[0 .. p.len - 1];
+    // A sender loaded with another config differs in both: the model's own cfg and the whole config the cache key hashes.
     const cfg = m.mdl.cfg;
-    defer m.mdl.cfg = cfg;
+    const whole = m.mdl.whole_cfg;
+    defer {
+        m.mdl.cfg = cfg;
+        m.mdl.whole_cfg = whole;
+    }
     for (0..5) |change| {
-        switch (change) {
-            0 => m.mdl.cfg.sliding_window += 1,
-            1 => m.mdl.cfg.dsv4_dspark_target_layers[0] += 1,
-            2 => m.mdl.cfg.quant_bits += 1,
-            3 => m.mdl.cfg.dsv41_engram_compressed_vocab += 1,
-            4 => m.mdl.cfg.dsv4_compress_ratios[2] += 1,
+        inline for (.{ &m.mdl.cfg, &m.mdl.whole_cfg }) |c| switch (change) {
+            0 => c.sliding_window += 1,
+            1 => c.dsv4_dspark_target_layers[0] += 1,
+            2 => c.quant_bits += 1,
+            3 => c.dsv41_engram_compressed_vocab += 1,
+            4 => c.dsv4_compress_ratios[2] += 1,
             else => unreachable,
-        }
+        };
         var peak: u64 = 123;
         const verdict = v41.table.cache.aux.?.import_plan(t.m, e.bytes(), &peak);
         try testing.expectEqual(abi.Verdict.Code.failed, verdict.code);
         try testing.expectEqual(@as(u64, 0), peak);
         try expectInvalidImport(t, &e, ids, e.arrays());
         m.mdl.cfg = cfg;
+        m.mdl.whole_cfg = whole;
     }
     const stages = m.mdl.n_mtp;
     m.mdl.n_mtp = 0;
