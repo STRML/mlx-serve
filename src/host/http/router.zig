@@ -96,7 +96,7 @@ fn serveInternal(allocator: std.mem.Allocator, stream: *Conn, method: []const u8
         .path = path,
         .authorization = @import("auth.zig").findHeaderValueCI(raw_headers, "authorization"),
         .body = body,
-    }, .{ .mono_ms = io_util.nowMsMonotonic(stream.io), .wall_ms = io_util.nowMs(stream.io) }, &buf);
+    }, io_util.nowMs(stream.io), &buf);
     try sendResponse(stream, internal_ep.statusLine(res.status), "application/json", res.body);
 }
 

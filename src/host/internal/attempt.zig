@@ -9,17 +9,19 @@ pub const Mode = enum { tp1, tp4 };
 pub const Cmd = enum { drain, tp4, join, tp1, abort };
 
 /// Why a formation ended without a group; the router's switch log names it.
-pub const Failure = enum { none, listener, join, ready, go, deadline, cancelled, drain_expired, other };
+pub const Failure = enum { none, listener, join, ready, go, deadline, cancelled, drain_expired, release_timeout, other };
 
 pub const Config = struct {
     /// A box that took "drain N" but saw no "tp4 N" or "join N" this long aborts N itself (1 s drain + 2 s formation + slack).
     drain_expiry_ms: i64 = 3500,
     /// A formation or an abort that has not unwound by now leaves the thread's resources untouched and quarantines the box.
     unwind_limit_ms: i64 = 2500,
+    /// A follower told to abort a formed group serves it this long for the leader's OP_RELEASE, then falls by itself.
+    release_wait_ms: i64 = 2000,
 };
 
 /// What the caller does after an accepted command.
-pub const Effect = enum { none, close_admission, reopen_admission, start_formation, cancel_formation, begin_release, exit_process };
+pub const Effect = enum { none, close_admission, reopen_admission, start_formation, cancel_formation, begin_release, await_release, exit_process };
 
 pub const Refusal = enum {
     /// Attempt 0, which no router issues.
@@ -47,6 +49,11 @@ pub const Machine = struct {
     entered_ms: i64 = 0,
     quarantined: bool = false,
     failure: Failure = .none,
+    /// A follower aborting a formed group, still serving it until OP_RELEASE or `release_wait_ms`.
+    awaiting_release: bool = false,
+    fall_due: bool = false,
+    /// Set from `formed` until the link is gone: a follower waiting out its abort still serves TP4.
+    grouped: bool = false,
 
     pub fn command(self: *Machine, cmd: Cmd, n: u64, now_ms: i64) Outcome {
         self.tick(now_ms);
@@ -114,7 +121,15 @@ pub const Machine = struct {
                 self.enter(.aborting, now_ms);
                 break :blk .{ .ok = .cancel_formation };
             },
-            .formed, .releasing => blk: {
+            .formed => if (self.role == .leader) blk: {
+                self.enter(.releasing, now_ms);
+                break :blk .{ .ok = .begin_release };
+            } else blk: {
+                self.awaiting_release = true;
+                self.enter(.aborting, now_ms);
+                break :blk .{ .ok = .await_release };
+            },
+            .releasing => blk: {
                 self.enter(.aborting, now_ms);
                 break :blk .{ .ok = .exit_process };
             },
@@ -136,7 +151,16 @@ pub const Machine = struct {
                 self.failure = .drain_expired;
                 self.enter(.aborted, now_ms);
             },
-            .forming, .aborting => if (waited >= self.cfg.unwind_limit_ms) {
+            .aborting => if (self.awaiting_release) {
+                if (waited >= self.cfg.release_wait_ms) {
+                    self.awaiting_release = false;
+                    self.fall_due = true;
+                    self.enter(.aborting, now_ms);
+                }
+            } else if (waited >= self.cfg.unwind_limit_ms) {
+                self.quarantined = true;
+            },
+            .forming => if (waited >= self.cfg.unwind_limit_ms) {
                 self.quarantined = true;
             },
             else => {},
@@ -146,6 +170,7 @@ pub const Machine = struct {
     /// The switch thread finished forming the group. False: this attempt is no longer live, publish nothing.
     pub fn formed(self: *Machine, n: u64, now_ms: i64) bool {
         if (self.quarantined or n != self.n or self.state != .forming) return false;
+        self.grouped = true;
         self.enter(.formed, now_ms);
         return true;
     }
@@ -155,21 +180,32 @@ pub const Machine = struct {
         if (self.quarantined or n != self.n) return false;
         if (self.state != .forming and self.state != .aborting) return false;
         self.failure = why;
+        self.grouped = false;
         self.enter(.aborted, now_ms);
         return true;
     }
 
-    /// A follower read OP_RELEASE.
+    /// A follower read OP_RELEASE, whether it was serving the group or waiting out an abort.
     pub fn releasing(self: *Machine, n: u64, now_ms: i64) bool {
-        if (self.quarantined or n != self.n or self.state != .formed) return false;
+        if (self.quarantined or n != self.n) return false;
+        if (self.state != .formed and !(self.state == .aborting and self.awaiting_release)) return false;
+        self.awaiting_release = false;
         self.enter(.releasing, now_ms);
         return true;
+    }
+
+    /// True once after a follower's wait for OP_RELEASE ran out: the caller falls, then reports `formationFailed(.release_timeout)`.
+    pub fn takeFallDue(self: *Machine) bool {
+        const due = self.fall_due;
+        self.fall_due = false;
+        return due;
     }
 
     /// The box freed its link, cleared MLX's cached group and swapped back to the TP1 model.
     pub fn released(self: *Machine, n: u64, now_ms: i64) bool {
         if (self.quarantined or n != self.n) return false;
         if (self.state != .formed and self.state != .releasing) return false;
+        self.grouped = false;
         self.enter(.released, now_ms);
         return true;
     }
@@ -190,6 +226,7 @@ pub const Machine = struct {
     pub fn mode(self: *const Machine) Mode {
         return switch (self.state) {
             .formed, .releasing => .tp4,
+            .aborting => if (self.grouped) .tp4 else .tp1,
             else => .tp1,
         };
     }
@@ -265,7 +302,8 @@ const table = [_]Row{
     .{ .from = .draining, .cmd = .abort, .arg = 5, .want = ok.e(.reopen_admission), .to = .aborted },
     .{ .from = .forming, .cmd = .abort, .arg = 5, .want = ok.e(.cancel_formation), .to = .aborting },
     .{ .from = .aborting, .cmd = .abort, .arg = 5, .want = .noop, .to = .aborting },
-    .{ .from = .formed, .cmd = .abort, .arg = 5, .want = ok.e(.exit_process), .to = .aborting },
+    .{ .from = .formed, .role = .leader, .cmd = .abort, .arg = 5, .want = ok.e(.begin_release), .to = .releasing },
+    .{ .from = .formed, .role = .follower, .cmd = .abort, .arg = 5, .want = ok.e(.await_release), .to = .aborting },
     .{ .from = .releasing, .cmd = .abort, .arg = 5, .want = ok.e(.exit_process), .to = .aborting },
     .{ .from = .released, .cmd = .abort, .arg = 5, .want = .noop, .to = .released },
     .{ .from = .aborted, .cmd = .abort, .arg = 5, .want = .noop, .to = .aborted },
@@ -277,7 +315,8 @@ const table = [_]Row{
     .{ .from = .aborted, .cmd = .abort, .arg = 7, .want = ok.e(.none), .to = .aborted, .to_n = 7 },
     .{ .from = .draining, .cmd = .abort, .arg = 7, .want = ok.e(.reopen_admission), .to = .aborted, .to_n = 7 },
     .{ .from = .forming, .cmd = .abort, .arg = 7, .want = ok.e(.cancel_formation), .to = .aborting, .to_n = 7 },
-    .{ .from = .formed, .cmd = .abort, .arg = 7, .want = ok.e(.exit_process), .to = .aborting, .to_n = 7 },
+    .{ .from = .formed, .role = .leader, .cmd = .abort, .arg = 7, .want = ok.e(.begin_release), .to = .releasing, .to_n = 7 },
+    .{ .from = .formed, .role = .follower, .cmd = .abort, .arg = 7, .want = ok.e(.await_release), .to = .aborting, .to_n = 7 },
 };
 
 fn machineIn(from: State, n: u64, role: Role) Machine {
@@ -445,4 +484,65 @@ test "an idle box admits TP1; a draining or forming box does not" {
     try t.expectEqual(Mode.tp1, m.mode());
     _ = m.command(.drain, 1, 0);
     try t.expect(!m.admits());
+}
+
+fn formedFollower(n: u64) Machine {
+    var m: Machine = .{};
+    _ = m.command(.drain, n, 0);
+    _ = m.command(.join, n, 0);
+    _ = m.formed(n, 5);
+    return m;
+}
+
+test "a follower's abort of a formed group waits for the leader's OP_RELEASE, then releases as for tp1" {
+    var m = formedFollower(3);
+    try t.expectEqual(Outcome{ .ok = .await_release }, m.command(.abort, 3, 100));
+    try t.expect(!m.admits());
+    try t.expectEqual(Mode.tp4, m.mode());
+    try t.expect(m.releasing(3, 500));
+    try t.expectEqual(State.releasing, m.state);
+    try t.expect(m.released(3, 900));
+    m.tick(100 + 2000);
+    try t.expect(!m.takeFallDue());
+    try t.expectEqual(State.released, m.state);
+}
+
+test "a follower with no OP_RELEASE for 2 s falls by itself, and the fall is due once" {
+    var m = formedFollower(3);
+    _ = m.command(.abort, 3, 100);
+    m.tick(100 + 1999);
+    try t.expect(!m.takeFallDue());
+    m.tick(100 + 2000);
+    try t.expect(m.takeFallDue());
+    try t.expect(!m.takeFallDue());
+    try t.expect(!m.releasing(3, 2200));
+    try t.expect(m.formationFailed(3, 2300, .release_timeout));
+    try t.expectEqual(State.aborted, m.state);
+    try t.expectEqual(Failure.release_timeout, m.failure);
+    try t.expectEqual(Mode.tp1, m.mode());
+    try t.expect(m.admits());
+}
+
+test "a follower's wait does not count toward the unwind limit; its fall does" {
+    var m = formedFollower(3);
+    _ = m.command(.abort, 3, 0);
+    m.tick(2000 + 2499);
+    try t.expect(m.takeFallDue());
+    try t.expect(!m.quarantined);
+    m.tick(2000 + 2499 + 2499);
+    try t.expect(!m.quarantined);
+    m.tick(2000 + 2499 + 2500);
+    try t.expect(m.quarantined);
+}
+
+test "the leader's abort of a formed group is the planned down: releasing, then released" {
+    var l: Machine = .{};
+    _ = l.command(.drain, 3, 0);
+    _ = l.command(.tp4, 3, 0);
+    _ = l.formed(3, 5);
+    try t.expectEqual(Outcome{ .ok = .begin_release }, l.command(.abort, 3, 10));
+    try t.expectEqual(State.releasing, l.state);
+    try t.expect(l.released(3, 50));
+    try t.expectEqual(Outcome.noop, l.command(.abort, 3, 60));
+    try t.expectEqual(State.released, l.state);
 }

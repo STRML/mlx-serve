@@ -16,9 +16,6 @@ pub const Request = struct {
     body: []const u8,
 };
 
-/// This box's two clocks at the moment of the request: the router's deadline is a wall-clock value.
-pub const Clocks = struct { mono_ms: i64, wall_ms: i64 };
-
 pub const Response = struct { status: u16, body: []const u8 };
 
 const max_body = 1024;
@@ -122,14 +119,13 @@ fn render(buf: []u8, status: u16, reason: []const u8, drained: ?bool, snap: sw_m
     return .{ .status = status, .body = std.fmt.bufPrint(buf, "{{\"ok\":{},\"reason\":\"{s}\"{s},{s}", .{ status == 200, reason, drained_field, body[1..] }) catch "{}" };
 }
 
-/// The wall-clock deadline of the router as this box's CLOCK_MONOTONIC time; null when it is past or absurdly far.
-fn monotonicDeadline(wall_deadline_ms: i64, clk: Clocks) ?i64 {
-    const ahead = wall_deadline_ms - clk.wall_ms;
-    if (ahead <= 0 or ahead > max_deadline_ahead_ms) return null;
-    return clk.mono_ms + ahead;
+/// The router's deadline is wall-clock and shared by every rank; it is refused when past or absurdly far.
+fn validDeadline(wall_deadline_ms: i64, wall_now_ms: i64) bool {
+    const ahead = wall_deadline_ms - wall_now_ms;
+    return ahead > 0 and ahead <= max_deadline_ahead_ms;
 }
 
-pub fn handle(sw: *sw_mod.Switch, internal_key: ?[32]u8, req: Request, clk: Clocks, buf: []u8) Response {
+pub fn handle(sw: *sw_mod.Switch, internal_key: ?[32]u8, req: Request, wall_now_ms: i64, buf: []u8) Response {
     const key = internal_key orelse return plain(buf, 404, "not found");
     if (!authorized(key, req.authorization)) return plain(buf, 401, "unauthorized");
     const route = req.path[@min(prefix.len, req.path.len)..];
@@ -142,7 +138,10 @@ pub fn handle(sw: *sw_mod.Switch, internal_key: ?[32]u8, req: Request, clk: Cloc
     if (!std.mem.eql(u8, req.method, "POST")) return plain(buf, 405, "method not allowed");
     const p = parseParams(req.body) orelse return plain(buf, 400, "body needs a positive integer n");
     var deadline: i64 = 0;
-    if (p.deadline_ms) |d| deadline = monotonicDeadline(d, clk) orelse return plain(buf, 400, "deadline is past or too far ahead");
+    if (p.deadline_ms) |d| {
+        if (!validDeadline(d, wall_now_ms)) return plain(buf, 400, "deadline is past or too far ahead");
+        deadline = d;
+    }
     const reply = sw.command(cmd, p.n, deadline);
     var drained: ?bool = null;
     var snap = reply.snap;
@@ -178,24 +177,33 @@ const Rig = struct {
     sw: sw_mod.Switch,
     calls: [8]u8 = undefined,
     n_calls: usize = 0,
-    budget: i64 = 0,
+    deadline: i64 = 0,
 
-    fn start(ctx: *anyopaque, _: attempt.Role, _: u64, budget_ms: i64) sw_mod.StartError!void {
-        const r: *Rig = @ptrCast(@alignCast(ctx));
-        r.budget = budget_ms;
-        r.note('s');
+    fn me(ctx: *anyopaque) *Rig {
+        return @ptrCast(@alignCast(ctx));
     }
-    fn cancel(ctx: *anyopaque, _: u64) void {
-        const r: *Rig = @ptrCast(@alignCast(ctx));
-        r.note('c');
+    fn start(ctx: *anyopaque, _: attempt.Role, _: u64, deadline_epoch_ms: i64) sw_mod.StartError!void {
+        me(ctx).deadline = deadline_epoch_ms;
+        me(ctx).note('s');
     }
-    fn release(ctx: *anyopaque, _: u64) sw_mod.ReleaseError!void {
-        const r: *Rig = @ptrCast(@alignCast(ctx));
-        r.note('r');
+    fn cancel(ctx: *anyopaque, _: u64) sw_mod.CancelResult {
+        me(ctx).note('c');
+        return .cancelled;
+    }
+    fn poll(_: *anyopaque, _: u64) ?sw_mod.FormOutcome {
+        return null;
+    }
+    fn release(ctx: *anyopaque, _: u64, _: *anyopaque, _: *?u32) sw_mod.ReleaseError!void {
+        me(ctx).note('r');
+    }
+    fn fall(ctx: *anyopaque, _: u64, _: *anyopaque) void {
+        me(ctx).note('f');
+    }
+    fn quarantined(_: *anyopaque) bool {
+        return false;
     }
     fn exitProcess(ctx: *anyopaque, _: u64) void {
-        const r: *Rig = @ptrCast(@alignCast(ctx));
-        r.note('x');
+        me(ctx).note('x');
     }
     fn peers(_: *anyopaque) u8 {
         return 0;
@@ -207,23 +215,37 @@ const Rig = struct {
         r.calls[r.n_calls] = c;
         r.n_calls += 1;
     }
-    fn calledSlice(r: *const Rig) []const u8 {
-        return r.calls[0..r.n_calls];
-    }
 };
+
+fn wallNow(_: std.Io) i64 {
+    return WALL;
+}
 
 fn rig() Rig {
     test_now = 50_000;
     var r: Rig = .{ .sw = sw_mod.Switch.init(t.io) };
     r.sw.now_fn = testNow;
+    r.sw.wall_fn = wallNow;
+    r.sw.spawn_watcher = false;
     return r;
 }
 
 fn wire(r: *Rig) void {
-    r.sw.formation = .{ .ctx = r, .start = Rig.start, .cancel = Rig.cancel, .release = Rig.release, .exit_process = Rig.exitProcess, .peers = Rig.peers, .stall_note = Rig.stallNote };
+    r.sw.formation = .{
+        .ctx = r,
+        .start = Rig.start,
+        .cancel = Rig.cancel,
+        .poll = Rig.poll,
+        .release = Rig.release,
+        .fall = Rig.fall,
+        .quarantined = Rig.quarantined,
+        .exit_process = Rig.exitProcess,
+        .peers = Rig.peers,
+        .stall_note = Rig.stallNote,
+    };
 }
 
-const CLK: Clocks = .{ .mono_ms = 50_000, .wall_ms = 1_700_000_000_000 };
+const WALL: i64 = 1_700_000_000_000;
 
 fn digestOf(key: []const u8) [32]u8 {
     var d: [32]u8 = undefined;
@@ -235,7 +257,7 @@ fn call(r: *Rig, key: ?[]const u8, method: []const u8, path: []const u8, auth: ?
     const S = struct {
         var buf: [1024]u8 = undefined;
     };
-    return handle(&r.sw, if (key) |k| digestOf(k) else null, .{ .method = method, .path = path, .authorization = auth, .body = body }, CLK, &S.buf);
+    return handle(&r.sw, if (key) |k| digestOf(k) else null, .{ .method = method, .path = path, .authorization = auth, .body = body }, WALL, &S.buf);
 }
 
 const BEARER = "Bearer " ++ KEY;
@@ -312,13 +334,13 @@ test "a refused command is 409 with the reason and the box's N" {
     try expectField(res.body, "n", "9");
 }
 
-test "tp4 hands the formation the time left to the router's wall-clock deadline" {
+test "tp4 hands the formation the router's wall-clock deadline, not a duration" {
     var r = rig();
     wire(&r);
     _ = call(&r, KEY, "POST", "/v1/internal/drain", BEARER, "{\"n\":1}");
     const res = call(&r, KEY, "POST", "/v1/internal/tp4", BEARER, "{\"n\":1,\"deadline_ms\":1700000001900}");
     try t.expectEqual(@as(u16, 200), res.status);
-    try t.expectEqual(@as(i64, 1_900), r.budget);
+    try t.expectEqual(@as(i64, 1_700_000_001_900), r.deadline);
 }
 
 test "a deadline in the past or more than ten seconds out is a 400" {
