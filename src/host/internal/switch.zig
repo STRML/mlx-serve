@@ -459,20 +459,35 @@ fn outcomeName(o: attempt.Outcome) []const u8 {
 
 /// The poll body the router reads each second. OS readings are sampled here on the HTTP thread.
 pub fn renderSnapshot(io: std.Io, buf: []u8, s: Snapshot) []const u8 {
-    const clock_ms = io_util.nowMs(io);
-    const room_mib = status.getFreeInactiveMemBytes() >> 20;
+    const room_bytes = status.getFreeInactiveMemBytes();
+    return renderWith(buf, s, io_util.nowMs(io), if (room_bytes) |b| b >> 20 else null);
+}
+
+/// `room_mib` null means the OS query failed; the router then skips a step-up on memory.
+fn renderWith(buf: []u8, s: Snapshot, clock_ms: i64, room_mib: ?u64) []const u8 {
+    var room_buf: [24]u8 = undefined;
+    const room = if (room_mib) |r| std.fmt.bufPrint(&room_buf, "{d}", .{r}) catch "null" else "null";
     var progress_buf: [24]u8 = undefined;
     const progress = if (s.progress) |p| std.fmt.bufPrint(&progress_buf, "{d}", .{p}) catch "null" else "null";
     var rank_buf: [16]u8 = undefined;
     const rank = if (s.failure_rank) |r| std.fmt.bufPrint(&rank_buf, "{d}", .{r}) catch "null" else "null";
     return std.fmt.bufPrint(buf, "{{\"mode\":\"{s}\",\"n\":{d},\"high_water\":{d},\"role\":\"{s}\",\"state\":\"{s}\",\"failure\":\"{s}\",\"failure_rank\":{s},\"peers\":{d}," ++
-        "\"in_flight\":{d},\"admitting\":{},\"quarantined\":{},\"progress\":{s},\"stalled_ms\":{d},\"clock_ms\":{d},\"room_mib\":{d}}}", .{
-        @tagName(s.mode), s.n,         s.high_water,  @tagName(s.role), @tagName(s.state), @tagName(s.failure), rank,     s.peers,
-        s.in_flight,      s.admitting, s.quarantined, progress,         s.stalled_ms,      clock_ms,            room_mib,
+        "\"in_flight\":{d},\"admitting\":{},\"quarantined\":{},\"progress\":{s},\"stalled_ms\":{d},\"clock_ms\":{d},\"room_mib\":{s}}}", .{
+        @tagName(s.mode), s.n,         s.high_water,  @tagName(s.role), @tagName(s.state), @tagName(s.failure), rank, s.peers,
+        s.in_flight,      s.admitting, s.quarantined, progress,         s.stalled_ms,      clock_ms,            room,
     }) catch "{}";
 }
 
 const t = std.testing;
+
+test "a failed memory query renders room_mib as null, never as a zero reading" {
+    var buf: [512]u8 = undefined;
+    const snap: Snapshot = .{ .mode = .tp1, .n = 0, .high_water = 0, .role = .none, .state = .idle, .failure = .none, .failure_rank = null, .peers = 0, .in_flight = 0, .admitting = true, .quarantined = false, .progress = null, .stalled_ms = 0, .stalled = false };
+    const body = renderWith(&buf, snap, 1, null);
+    try t.expect(std.mem.indexOf(u8, body, "\"room_mib\":null") != null);
+    const ok = renderWith(&buf, snap, 1, 7);
+    try t.expect(std.mem.indexOf(u8, ok, "\"room_mib\":7}") != null);
+}
 
 const Fake = struct {
     calls: std.ArrayList(u8) = .empty,

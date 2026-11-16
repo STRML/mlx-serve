@@ -202,11 +202,12 @@ pub fn getAvailableMemBytes() u64 {
     return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), host +| returnedNotShown(host));
 }
 
-/// `vm_stat` free + inactive bytes on Darwin; OS available RAM elsewhere. No MLX calls. 0 on failure.
-/// Mach's free_count includes speculative pages; vm_stat's "Pages free" excludes them.
-pub fn getFreeInactiveMemBytes() u64 {
+/// `vm_stat` free + inactive bytes on Darwin; OS available RAM elsewhere. No MLX calls. Null when the Darwin query
+/// fails, so a caller never reads a failure as no room. Mach's free_count includes speculative pages; vm_stat's
+/// "Pages free" excludes them.
+pub fn getFreeInactiveMemBytes() ?u64 {
     if (comptime !builtin.os.tag.isDarwin()) return hostAvailableMemBytes();
-    const v = darwinVm() orelse return 0;
+    const v = darwinVm() orelse return null;
     return ((@as(u64, v.vm.free_count) -| v.vm.speculative_count) + v.vm.inactive_count) * v.page;
 }
 
@@ -762,11 +763,11 @@ test "internal switch room counts only free and inactive pages at the host page 
     vm.purgeable_count = 40;
     for ([_]u64{ 4096, 16384 }) |page| {
         reading_override = .{ .vm = .{ .total = 16 << 30, .page = page, .vm = vm }, .footprint = 0, .now_ms = 1000 };
-        try std.testing.expectEqual(380 * page, getFreeInactiveMemBytes());
+        try std.testing.expectEqual(@as(?u64, 380 * page), getFreeInactiveMemBytes());
     }
     vm.free_count = std.math.maxInt(u32);
     vm.inactive_count = 1;
     vm.speculative_count = 0;
     reading_override = .{ .vm = .{ .total = 1 << 48, .page = 16384, .vm = vm }, .footprint = 0, .now_ms = 1000 };
-    try std.testing.expectEqual(@as(u64, 1) << 46, getFreeInactiveMemBytes());
+    try std.testing.expectEqual(@as(?u64, @as(u64, 1) << 46), getFreeInactiveMemBytes());
 }
