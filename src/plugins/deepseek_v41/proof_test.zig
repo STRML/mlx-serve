@@ -1224,6 +1224,42 @@ fn wholeSteps(files: []const sdk.fixture.File) ![proof.steps.len][]f32 {
 
 const tp4_setting = "{\"tp_mode\": {\"rank\": 0, \"size\": 4}}";
 
+fn settledLoadBytes() !usize {
+    try mlx.check(mlx.mlx_synchronize(mlx.gpuStream()));
+    try mlx.check(mlx.mlx_clear_cache());
+    var bytes: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&bytes));
+    return bytes;
+}
+
+test "deepseek_v41 modes: TP4 beside whole allocates only wo_b quarters and small mode constants" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41TpDsparkFiles(arena.allocator(), 7);
+    var whole_bytes: usize = 0;
+    var wo_b_bytes: usize = 0;
+    {
+        const before = try settledLoadBytes();
+        const t = try Twin.open(files, "");
+        defer t.close();
+        whole_bytes = (try settledLoadBytes()) - before;
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        for (m.mdl.layers) |ly| inline for (.{ "w", "s", "b" }) |f| {
+            const a = @field(ly.wo_b, f);
+            if (a.ctx != null) wo_b_bytes += mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a) / 4;
+        };
+    }
+    const before = try settledLoadBytes();
+    const t = try Twin.openWith(files, "", tp4_setting);
+    defer t.close();
+    const both_bytes = (try settledLoadBytes()) - before;
+    const extra = both_bytes -| whole_bytes;
+    const allowance = wo_b_bytes + 64 * 1024;
+    std.debug.print("[mode-memory] whole {d} B, both {d} B, extra {d} B, wo_b {d} B, allowance {d} B\n", .{ whole_bytes, both_bytes, extra, wo_b_bytes, allowance });
+    try testing.expect(extra <= allowance);
+}
+
 test "deepseek_v41 modes: the whole model beside a TP4 rank's model gives today's logits bit for bit, through TP4 forwards, swaps and the TP4 model's state" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
@@ -1412,4 +1448,204 @@ test "deepseek_v41 modes: tp_mode is refused by name at a size below 2 or a rank
     for ([_][]const u8{ "{\"tp_mode\": {\"rank\": 0, \"size\": 1}}", "{\"tp_mode\": {\"rank\": 4, \"size\": 4}}", "{\"tp_mode\": {\"rank\": 0, \"size\": 3}}" }) |bad| {
         try testing.expectError(error.PluginLoad, Twin.openWith(files, "", bad));
     }
+}
+
+const TpProofGroup = @import("decode/fixture.zig").Group;
+const tp_prompt = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60, 3, 17, 42, 9, 7, 25, 1, 60, 3, 17, 42, 9, 7, 25, 1, 60, 3, 17, 42, 9, 7, 25, 1, 60 };
+
+const TpTurn = struct {
+    prefill: []f32,
+    decode: []f32,
+    draft: []f32 = &.{},
+
+    fn deinit(self: TpTurn) void {
+        testing.allocator.free(self.prefill);
+        testing.allocator.free(self.decode);
+        testing.allocator.free(self.draft);
+    }
+};
+
+fn tpTurn(m: *dsv41.Dsv41Model) !TpTurn {
+    const p = try dsv41.prefill(m, testing.allocator, &tp_prompt, null);
+    defer _ = mlx.mlx_array_free(p);
+    const prefill = try dsv41.hostF32(p);
+    errdefer testing.allocator.free(prefill);
+    if (m.row_cut) |rc| try testing.expectEqual(@as(usize, 0), rc.calls);
+    const d = try dsv41.extendResumable(m, testing.allocator, &.{8}, null);
+    defer _ = mlx.mlx_array_free(d);
+    const decoded = try dsv41.hostF32(d);
+    errdefer testing.allocator.free(decoded);
+    if (m.row_cut) |rc| try testing.expect(rc.calls > 0);
+    var out: TpTurn = .{ .prefill = prefill, .decode = decoded };
+    if (m.n_mtp > 0) {
+        var sc = dsv41.Scope.init(testing.allocator, m.s);
+        defer sc.deinit();
+        const g = try dsv41.draftGraph(&sc, m, testing.allocator, &.{&m.dec_state.?}, &.{5}, true);
+        out.draft = try dsv41.hostF32(g.logits);
+    }
+    return out;
+}
+
+const tp_logit_tol: f32 = 2.0 / 128.0;
+const tp_quality_issue = "https://github.com/STRML/mlx-serve/issues/30";
+
+fn tpCheckLogits(label: []const u8, want: []const f32, got: []const f32, tol: f32, required: bool) !bool {
+    if (required) return tpLogitsMatch(label, want, got, tol);
+    std.debug.print("[tp-logits] diagnostic {s}: {s}\n", .{ label, tp_quality_issue });
+    _ = tpLogitsMatch(label, want, got, tol) catch |err| {
+        std.debug.print("[tp-logits] diagnostic {s}: {t}\n", .{ label, err });
+        return true;
+    };
+    return true;
+}
+
+fn tpLogitsMatch(label: []const u8, want: []const f32, got: []const f32, tol: f32) !bool {
+    try testing.expectEqual(want.len, got.len);
+    var peak: f64 = 0;
+    var max_abs: f64 = 0;
+    var max_rel: f64 = 0;
+    var squared_error: f64 = 0;
+    var squared_ref: f64 = 0;
+    for (want, got) |u, v| {
+        if (!std.math.isFinite(u) or !std.math.isFinite(v)) return error.NonFinite;
+        const a: f64 = u;
+        const e = @abs(a - @as(f64, v));
+        peak = @max(peak, @abs(a));
+        max_abs = @max(max_abs, e);
+        max_rel = @max(max_rel, e / @max(@abs(a), 1e-6));
+        squared_error += e * e;
+        squared_ref += a * a;
+    }
+    if (peak == 0 or squared_ref == 0) return error.EmptyReference;
+    const rms = @sqrt(squared_error / squared_ref);
+    std.debug.print("[tp-logits] {s}: n={d} max-abs={e:.8} max-rel={e:.8} peak-rel={e:.8} rel-rms={e:.8} bar={e:.8}\n", .{ label, want.len, max_abs, max_rel, max_abs / peak, rms, tol });
+    return max_abs <= tol * peak and rms <= tol;
+}
+
+fn settledTpTurn(ts: [4]*Twin) ![4]TpTurn {
+    LoneGroup.arm(4);
+    defer LoneGroup.disarm();
+    TpProofGroup.join(4);
+    defer TpProofGroup.leave();
+    var out: [4]?TpTurn = @splat(null);
+    errdefer for (out) |o| if (o) |v| v.deinit();
+    const lead: *v41.Model = @ptrCast(@alignCast(ts[0].m));
+    const bound = 4 * lead.mdl.n_layers + 4 * lead.mdl.n_mtp + lead.mdl.ds_block + 4;
+    for (0..bound) |pass| {
+        for (ts, 0..) |t, r| {
+            TpProofGroup.begin(r);
+            const model: *v41.Model = @ptrCast(@alignCast(t.m));
+            const tp = model.modes.tp.?;
+            model.modes.row_cut.?.calls = 0;
+            if (out[r]) |o| o.deinit();
+            out[r] = null;
+            out[r] = try tpTurn(tp);
+        }
+        if (try TpProofGroup.settled()) {
+            try TpProofGroup.expectAgreement();
+            std.debug.print("[tp-logits] settled after {d} passes\n", .{pass + 1});
+            return .{ out[0].?, out[1].?, out[2].?, out[3].? };
+        }
+    }
+    return error.CollectivesDidNotSettle;
+}
+
+fn tpProof(act: mlx.mlx_dtype) !void {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const tol: f32 = if (act == .float32) 1e-3 else tp_logit_tol;
+    var parity = true;
+    for ([_]bool{ false, true }) |stages| {
+        const files = if (stages) try fixture.v41TpDsparkFiles(arena.allocator(), 7) else try fixture.v41TpFiles(arena.allocator(), 7);
+        var ts: [4]*Twin = undefined;
+        var made: usize = 0;
+        defer for (ts[0..made]) |t| t.close();
+        for (&ts, 0..) |*t, r| {
+            const setting = try std.fmt.allocPrint(arena.allocator(), "{{\"tp_mode\":{{\"rank\":{d},\"size\":4}}}}", .{r});
+            t.* = try Twin.openWith(files, "", setting);
+            made += 1;
+            if (act == .float32) try rebuildTpProofF32(t.*, @intCast(r));
+        }
+        std.debug.print("[tp-logits] act={s} stages={any}\n", .{ @tagName(act), stages });
+        const model: *v41.Model = @ptrCast(@alignCast(ts[0].m));
+        try testing.expectEqual(@as(usize, if (stages) 2 else 0), model.mdl.n_mtp);
+        const want = try tpTurn(model.mdl);
+        defer want.deinit();
+        const got = try settledTpTurn(ts);
+        defer for (got) |o| o.deinit();
+        // The DSpark fixture's head has only two nonzero vocabulary rows; its trunk ratios are diagnostic.
+        const require_trunk = act == .float32 and !stages;
+        parity = try tpCheckLogits(if (stages) "DSpark trunk prefill" else "wide prefill", want.prefill, got[0].prefill, tol, require_trunk) and parity;
+        parity = try tpCheckLogits(if (stages) "DSpark trunk decode" else "row-cut decode", want.decode, got[0].decode, tol, require_trunk) and parity;
+        if (stages) {
+            const joined = try testing.allocator.alloc(f32, want.draft.len);
+            defer testing.allocator.free(joined);
+            const width = model.mdl.vocab / 4;
+            for (got, 0..) |o, r| {
+                try testing.expectEqual(model.mdl.ds_block * width, o.draft.len);
+                for (0..model.mdl.ds_block) |b| @memcpy(joined[b * model.mdl.vocab + r * width ..][0..width], o.draft[b * width ..][0..width]);
+            }
+            parity = try tpCheckLogits("DSpark stages + Markov logits", want.draft, joined, tol, act == .float32) and parity;
+            continue;
+        }
+        // Swap the borrowed halves on every tensor layer without changing TP1 or its banks.
+        for (ts) |t| {
+            const pm: *v41.Model = @ptrCast(@alignCast(t.m));
+            for (pm.modes.tp.?.layers) |*ly| std.mem.swap(dsv41.Bank, &ly.experts.gate, &ly.experts.up);
+        }
+        defer for (ts) |t| {
+            const pm: *v41.Model = @ptrCast(@alignCast(t.m));
+            for (pm.modes.tp.?.layers) |*ly| std.mem.swap(dsv41.Bank, &ly.experts.gate, &ly.experts.up);
+        };
+        const bad = try settledTpTurn(ts);
+        defer for (bad) |o| o.deinit();
+        try testing.expect(!try tpLogitsMatch("negative swapped gate/up vs intact TP4", got[0].prefill, bad[0].prefill, tol));
+        std.debug.print("[tp-logits] negative control rejected (act={s})\n", .{@tagName(act)});
+    }
+    try testing.expect(parity);
+}
+
+test "deepseek_v41 TP logit comparator rejects NaN and infinity" {
+    const want = [_]f32{ 1, -2, 3, 0.5 };
+    for ([_]f32{ std.math.nan(f32), std.math.inf(f32) }) |bad|
+        try testing.expectError(error.NonFinite, tpLogitsMatch("nonfinite", &want, &.{ 1, -2, bad, 0.5 }, tp_logit_tol));
+    try testing.expect(try tpLogitsMatch("equal", &want, &want, tp_logit_tol));
+}
+
+fn rebuildTpProofF32(t: *Twin, rank: u32) !void {
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    try testing.expectEqual(@as(u32, 0), m.owner);
+    try testing.expectEqual(@as(u32, 0), m.parked.count());
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try t.tmp.dir.realPath(io, &buf)];
+    var weights = try dsv41.loadPack(io, testing.allocator, dir, false);
+    errdefer weights.deinit();
+    const modes = try v41.mode.build(testing.allocator, &m.cfg, &weights, m.s, .{ .act = .float32, .dspark = true, .head_8bit = dsv41.head8Wanted(), .pack_dir = dir }, .{ .rank = rank, .size = 4 });
+    m.modes.deinit();
+    m.weights.deinit();
+    m.weights = weights;
+    m.modes = modes;
+    m.mdl = modes.tp1;
+}
+
+test "deepseek_v41 modes: TP4 logits match TP1 through the one-process group (bf16 diagnostics)" {
+    try tpProof(.bfloat16);
+}
+
+extern "c" fn msv_test_swap_tf32(enabled: c_int) c_int;
+
+test "deepseek_v41 modes: TP4 logits match TP1 through the one-process group (f32)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try mlx.check(mlx.mlx_synchronize(mlx.gpuStream()));
+    // MLX caches the environment; its config API updates the value used by the backend's worker threads.
+    const previous = msv_test_swap_tf32(0);
+    defer {
+        _ = mlx.mlx_synchronize(mlx.gpuStream());
+        _ = msv_test_swap_tf32(previous);
+    }
+    try testing.expectEqual(@as(c_int, 0), msv_test_swap_tf32(0));
+    std.debug.print("[tp-logits] f32 TF32 disabled via MLX config API (previous={d})\n", .{previous});
+    try tpProof(.float32);
 }

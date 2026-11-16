@@ -847,3 +847,10 @@ Nemotron-Transcribe packs carried the same layout. Cause: the scan resolves a du
 placement dropped any quant leaf whose weight's carrier was another shard; mlx-lm shards by size, so a leaf alone in the
 next shard is its pair's only copy. Fix: a leaf is a retired copy only when its own shard also carries its weight.
 Guard: `loadWeights keeps a quant triple the shards split, with no key duplicated` (valid and stale index).
+
+### A second serving mode fused its tensor views into new expert banks
+The TP-mode map sliced resident weights, but its initializer evaluated gate/up concatenations and repeated the
+whole model's casts and repacks. Both modes kept their own fused banks, exceeding the planned load footprint.
+Build TP1 first, then derive TP layers from its processed tensors and reuse one RowCut's wo_b quarters. Share
+DSpark and Engram projections too. The fixture plugin-load regression compares both modes' active memory against
+TP1 plus wo_b quarters and small constants; forward proofs retain TP1's exact logits.

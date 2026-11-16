@@ -193,6 +193,29 @@ pub const RowLayer = struct {
         return rl;
     }
 
+    pub fn tensorLayer(self: *RowLayer, s: S, whole: *const dsv41.Layer) !dsv41.Layer {
+        const k: Cutter = .{ .gpa = self.gpa, .s = s, .owned = &self.owned, .even = true };
+        var out = whole.*;
+        out.wq_b = self.wq_b;
+        out.wo_a = self.wo_a;
+        out.wo_b = self.wo_b;
+        out.sink = self.sink;
+        out.experts = self.experts;
+        out.shared = self.shared;
+        out.shared_gu = null;
+        const dn = whole.experts.down;
+        inline for (.{ "w", "s", "b" }) |f| {
+            const a = @field(dn, f);
+            if (a.ctx != null) @field(out.experts.down, f) = try k.arr(a, 2, .{ .len = @intCast(dim(a, 2)), .rank = self.rank, .size = self.size });
+        }
+        out.shared[2] = whole.shared[2];
+        inline for (.{ "w", "s", "b" }) |f| {
+            const a = @field(whole.shared[2], f);
+            if (a.ctx != null) @field(out.shared[2], f) = try k.arr(a, 1, .{ .len = @intCast(dim(a, 1)), .rank = self.rank, .size = self.size });
+        }
+        return out;
+    }
+
     pub fn deinit(self: *RowLayer) void {
         self.owned.deinit(self.gpa);
     }
