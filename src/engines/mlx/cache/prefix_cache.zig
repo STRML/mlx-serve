@@ -1669,6 +1669,7 @@ pub const HotPrefixCache = struct {
             index.append(.{ .session = kv.key_ptr.*, .id = tip.id, .n = tip.n, .variant = tip.variant, .seq = tip.seq }) catch |err| {
                 if (!self.index_append_failing) log.warn("[session-index] append failed, the tip stays unpersisted and retries on the next flush: {s}\n", .{@errorName(err)});
                 self.index_append_failing = true;
+                self.disk_dirty = true;
                 waiting = true;
                 break;
             };
@@ -2692,7 +2693,7 @@ pub const HotPrefixCache = struct {
     fn cancelPendingModules(self: *HotPrefixCache, reason: kv_disk_cache.DiskTier.ModuleCancellation) void {
         self.cancelPendingModule(&self.finishing_disk, reason);
         self.cancelPendingModule(&self.pending_disk, reason);
-        self.disk_dirty = self.diskOwed();
+        self.disk_dirty = self.flushOwed();
     }
 
     fn cancelModuleExports(self: *HotPrefixCache, reason: kv_disk_cache.DiskTier.ModuleCancellation) void {
@@ -2708,7 +2709,7 @@ pub const HotPrefixCache = struct {
             e.disk_dirty = false;
         };
         self.syncModuleLosses();
-        self.disk_dirty = self.diskOwed();
+        self.disk_dirty = self.flushOwed();
     }
 
     /// Commit the current `source_cache` state under the given key. Updates
@@ -3668,6 +3669,15 @@ pub const HotPrefixCache = struct {
         return self.modulePublicationPending();
     }
 
+    /// A tip whose index append failed is owed another try; `diskOwed` leaves it out so a shutdown does not wait on it.
+    fn indexRetryOwed(self: *const HotPrefixCache) bool {
+        return self.tips_unpersisted and self.index_append_failing;
+    }
+
+    fn flushOwed(self: *const HotPrefixCache) bool {
+        return self.diskOwed() or self.indexRetryOwed();
+    }
+
     fn modulePublicationPending(self: *const HotPrefixCache) bool {
         const d = if (self.disk) |*dd| dd else return false;
         for (d.entries.items) |e| {
@@ -3690,10 +3700,10 @@ pub const HotPrefixCache = struct {
         self.dropWrittenOverBudget(d);
         if (!self.diskOwed()) {
             self.persistDurableTips();
-            self.disk_dirty = false;
+            self.disk_dirty = self.indexRetryOwed();
             return null;
         }
-        defer self.disk_dirty = self.diskOwed();
+        defer self.disk_dirty = self.flushOwed();
         if (self.sliceStagedModule(d, s)) |r| return r;
         if (self.finishing_disk != null) return self.slicePending(d, &self.finishing_disk, s);
         // The live state captured at commit, not what the RAM entry kept after its trim.

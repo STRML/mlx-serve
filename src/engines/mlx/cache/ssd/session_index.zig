@@ -1,5 +1,6 @@
 //! The tip of each session, persisted by itself: a prefix entry is shared between sessions, so its record cannot
-//! carry one session's name. An append-only file of fixed records; a damaged or half-written record is skipped.
+//! carry one session's name. A header, then an append-only run of fixed records; a damaged or half-written record is
+//! skipped. A file without the current header holds identities of another scheme: it is set aside on open.
 
 const std = @import("std");
 const log = @import("../../../../sdk/util/log.zig");
@@ -7,6 +8,10 @@ const log = @import("../../../../sdk/util/log.zig");
 pub const Tip = struct { session: u64, id: u64, n: u64, variant: u64, seq: u64 };
 
 pub const RECORD_BYTES: usize = 48;
+const HEADER_BYTES: usize = 16;
+const MAGIC: u64 = 0x7365_7373_6964_7831;
+/// Bumped whenever what a record's `id` hashes changes.
+const FORMAT_VERSION: u64 = 1;
 pub const DEFAULT_CAP: usize = 65536;
 /// How many tips of distinct boundaries the file keeps for one session: its newest and the ones a lookup falls back to.
 pub const TIPS_PER_SESSION: usize = 4;
@@ -30,6 +35,20 @@ fn decode(record: *const [RECORD_BYTES]u8) ?Tip {
     var words: [5]u64 = undefined;
     for (&words, 0..) |*w, i| w.* = std.mem.readInt(u64, record[i * 8 ..][0..8], .little);
     return .{ .session = words[0], .id = words[1], .n = words[2], .variant = words[3], .seq = words[4] };
+}
+
+fn headerBytes() [HEADER_BYTES]u8 {
+    var out: [HEADER_BYTES]u8 = undefined;
+    std.mem.writeInt(u64, out[0..8], MAGIC, .little);
+    std.mem.writeInt(u64, out[8..16], FORMAT_VERSION, .little);
+    return out;
+}
+
+/// The records of a file with the current header; null for any other bytes.
+fn bodyOf(bytes: []const u8) ?[]const u8 {
+    const header = headerBytes();
+    if (bytes.len < HEADER_BYTES or !std.mem.eql(u8, bytes[0..HEADER_BYTES], &header)) return null;
+    return bytes[HEADER_BYTES..];
 }
 
 fn bySeq(_: void, a: Tip, b: Tip) bool {
@@ -71,7 +90,20 @@ pub const Index = struct {
     cap: usize,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8, cap: usize) !Index {
-        return .{ .allocator = allocator, .io = io, .path = try allocator.dupe(u8, path), .cap = cap };
+        var index: Index = .{ .allocator = allocator, .io = io, .path = try allocator.dupe(u8, path), .cap = cap };
+        errdefer index.deinit();
+        try index.setAsideStale();
+        return index;
+    }
+
+    fn setAsideStale(self: *Index) !void {
+        const bytes = self.readAll() orelse return;
+        defer self.allocator.free(bytes);
+        if (bytes.len == 0 or bodyOf(bytes) != null) return;
+        const aside = try std.fmt.allocPrint(self.allocator, "{s}.old", .{self.path});
+        defer self.allocator.free(aside);
+        try std.Io.Dir.renameAbsolute(self.path, aside, self.io);
+        log.warn("[session-index] {s} is not the current format: set aside as {s}, sessions start empty\n", .{ self.path, aside });
     }
 
     pub fn deinit(self: *Index) void {
@@ -83,8 +115,9 @@ pub const Index = struct {
     /// to (`findExcluding`); a file holding anything else (older tips, sessions past the cap, a damaged record) is
     /// rewritten to just those.
     pub fn load(self: *Index, out: *std.ArrayList(Tip)) !void {
-        const bytes = self.readAll() orelse return;
-        defer self.allocator.free(bytes);
+        const file = self.readAll() orelse return;
+        defer self.allocator.free(file);
+        const bytes = bodyOf(file) orelse return;
         var sessions = std.AutoHashMap(u64, Kept).init(self.allocator);
         defer sessions.deinit();
         var clean = bytes.len % RECORD_BYTES == 0;
@@ -120,8 +153,9 @@ pub const Index = struct {
     /// The newest tip the file holds for `session` whose boundary is not in `tried`: where a lookup falls back to when
     /// the records of the tips it has tried are gone.
     pub fn findExcluding(self: *Index, session: u64, tried: []const u64) ?Tip {
-        const bytes = self.readAll() orelse return null;
-        defer self.allocator.free(bytes);
+        const file = self.readAll() orelse return null;
+        defer self.allocator.free(file);
+        const bytes = bodyOf(file) orelse return null;
         var best: ?Tip = null;
         var at: usize = 0;
         while (at + RECORD_BYTES <= bytes.len) : (at += RECORD_BYTES) {
@@ -134,8 +168,9 @@ pub const Index = struct {
 
     /// The newest tip the file holds for `session`.
     pub fn find(self: *Index, session: u64) ?Tip {
-        const bytes = self.readAll() orelse return null;
-        defer self.allocator.free(bytes);
+        const file = self.readAll() orelse return null;
+        defer self.allocator.free(file);
+        const bytes = bodyOf(file) orelse return null;
         var best: ?Tip = null;
         var at: usize = 0;
         while (at + RECORD_BYTES <= bytes.len) : (at += RECORD_BYTES) {
@@ -150,16 +185,20 @@ pub const Index = struct {
         if (self.recordCount() >= COMPACT_FACTOR * self.cap) self.compact();
         const f = try std.Io.Dir.createFileAbsolute(self.io, self.path, .{ .truncate = false });
         defer f.close(self.io);
-        const len = try f.length(self.io);
+        var len = try f.length(self.io);
+        if (len == 0) {
+            try f.writePositionalAll(self.io, &headerBytes(), 0);
+            len = HEADER_BYTES;
+        }
         var record: [RECORD_BYTES]u8 = undefined;
         encode(tip, &record);
-        try f.writePositionalAll(self.io, &record, len - len % RECORD_BYTES);
+        try f.writePositionalAll(self.io, &record, HEADER_BYTES + (len - HEADER_BYTES) / RECORD_BYTES * RECORD_BYTES);
     }
 
     fn recordCount(self: *Index) usize {
         const f = std.Io.Dir.openFileAbsolute(self.io, self.path, .{}) catch return 0;
         defer f.close(self.io);
-        return @intCast((f.length(self.io) catch return 0) / RECORD_BYTES);
+        return @intCast(((f.length(self.io) catch return 0) -| HEADER_BYTES) / RECORD_BYTES);
     }
 
     fn compact(self: *Index) void {
@@ -188,6 +227,7 @@ pub const Index = struct {
             defer f.close(self.io);
             var buffer: [8192]u8 = undefined;
             var writer = f.writer(self.io, &buffer);
+            try writer.interface.writeAll(&headerBytes());
             var record: [RECORD_BYTES]u8 = undefined;
             for (tips) |tip| {
                 encode(tip, &record);
@@ -264,7 +304,7 @@ test "a session index keeps a session's newest tips of distinct boundaries throu
     try testing.expect(index.findExcluding(5, &tried) == null);
     const f = try std.Io.Dir.openFileAbsolute(testing.io, path, .{});
     defer f.close(testing.io);
-    try testing.expectEqual(@as(u64, TIPS_PER_SESSION * RECORD_BYTES), try f.length(testing.io));
+    try testing.expectEqual(@as(u64, HEADER_BYTES + TIPS_PER_SESSION * RECORD_BYTES), try f.length(testing.io));
 }
 
 test "a session index that holds C, A, B, A keeps C once compacted, and findExcluding walks A, B, C" {
@@ -299,8 +339,8 @@ test "a session index skips a half-written tail and a damaged record, and append
     {
         const f = try std.Io.Dir.openFileAbsolute(testing.io, path, .{ .mode = .read_write });
         defer f.close(testing.io);
-        try f.writePositionalAll(testing.io, "\xff", RECORD_BYTES + 9);
-        try f.setLength(testing.io, 3 * RECORD_BYTES - 10);
+        try f.writePositionalAll(testing.io, "\xff", HEADER_BYTES + RECORD_BYTES + 9);
+        try f.setLength(testing.io, HEADER_BYTES + 3 * RECORD_BYTES - 10);
     }
     var index = try Index.init(testing.allocator, testing.io, path, 16);
     defer index.deinit();
@@ -336,7 +376,7 @@ test "a session index counts a tip of one boundary once, so the fallback is anot
     try testing.expectEqual(first, index.findExcluding(5, &.{200}).?);
     const f = try std.Io.Dir.openFileAbsolute(testing.io, path, .{});
     defer f.close(testing.io);
-    try testing.expectEqual(@as(u64, 2 * RECORD_BYTES), try f.length(testing.io));
+    try testing.expectEqual(@as(u64, HEADER_BYTES + 2 * RECORD_BYTES), try f.length(testing.io));
 }
 
 test "a session index written before the format header is set aside on open, and new tips persist and reload" {
@@ -393,5 +433,5 @@ test "a session index keeps the newest sessions at its cap, and find reads the f
     try testing.expect(index.find(2) == null);
     const f = try std.Io.Dir.openFileAbsolute(testing.io, path, .{});
     defer f.close(testing.io);
-    try testing.expectEqual(@as(u64, 3 * RECORD_BYTES), try f.length(testing.io));
+    try testing.expectEqual(@as(u64, HEADER_BYTES + 3 * RECORD_BYTES), try f.length(testing.io));
 }
