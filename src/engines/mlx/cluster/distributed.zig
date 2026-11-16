@@ -2643,6 +2643,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     var chain = false;
     // `--formation-ms M`: each open must form within M ms (Config.formation_deadline_ms), bells and JACCL alike.
     var formation_ms: u64 = 0;
+    var ropts: RelinkOpts = .{ .n = 0 };
     var rest: [16][]const u8 = undefined;
     var n_rest: usize = 0;
     var ai: usize = 0;
@@ -2659,6 +2660,17 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, args[ai], "--formation-ms") and ai + 1 < args.len) {
             formation_ms = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
             ai += 1;
+        } else if (std.mem.eql(u8, args[ai], "--slot-ms") and ai + 1 < args.len) {
+            ropts.slot_ms = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
+            ai += 1;
+        } else if (std.mem.eql(u8, args[ai], "--slot-start") and ai + 1 < args.len) {
+            ropts.slot_start_ms = std.fmt.parseInt(i64, args[ai + 1], 10) catch return error.InvalidArgs;
+            ai += 1;
+        } else if (std.mem.eql(u8, args[ai], "--fail-cycles") and ai + 1 < args.len) {
+            ropts.fail_cycles = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
+            ai += 1;
+        } else if (std.mem.eql(u8, args[ai], "--sit-out")) {
+            ropts.sit_out = true;
         } else if (std.mem.eql(u8, args[ai], "--chain")) {
             chain = true;
         } else if (n_rest < rest.len) {
@@ -2667,7 +2679,12 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         }
     }
     const cfg = try parseArgs(rest[0..n_rest]);
-    if (relink > 0) return relinkProbe(io, cfg, relink, formation_ms);
+    if (relink > 0) {
+        ropts.n = relink;
+        ropts.formation_ms = formation_ms;
+        if (ropts.slot_ms > 0 and ropts.slot_start_ms == 0) return error.InvalidArgs;
+        return relinkProbe(io, cfg, ropts);
+    }
     if (sums > 0) return sumLoop(io, cfg, sums);
     var link = try Link.open(io, cfg);
     defer link.deinit();
@@ -2748,7 +2765,35 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
 /// process, N times. MLX caches each backend's group, so without the clear every open after the first got the same
 /// group back and formed nothing. Answers whether a live layout switch can form a group at switch time (plan 61c,
 /// gate G2b) and what it costs; each cycle's line carries the wall clock so a harness can line it up with its samples.
-fn relinkProbe(io: std.Io, cfg: Config, n: u64, formation_ms: u64) !void {
+/// Slotted relink (`--slot-ms S --slot-start EPOCH_MS`): cycle k starts at wall time EPOCH_MS + k*S on every rank, so
+/// ranks on different boxes line up without talking. With `--fail-cycles M` every cycle k with k % M != 0 is one where
+/// a rank sits out (that rank passes `--sit-out`): the others must fail the open by themselves and go on to the next
+/// cycle, so one process runs many failed formations. The probe checks each cycle against that expectation and exits
+/// 1 on any mismatch or slot overrun.
+const RelinkOpts = struct {
+    n: u64,
+    formation_ms: u64 = 0,
+    slot_ms: u64 = 0,
+    slot_start_ms: i64 = 0,
+    fail_cycles: u64 = 0,
+    sit_out: bool = false,
+
+    fn failing(o: RelinkOpts, k: u64) bool {
+        return o.fail_cycles > 0 and k % o.fail_cycles != 0;
+    }
+};
+
+/// Sleeps until cycle k's slot starts; false when the slot has already begun (the previous cycle overran it).
+fn waitForSlot(o: RelinkOpts, k: u64) bool {
+    if (o.slot_ms == 0) return true;
+    const start = o.slot_start_ms + @as(i64, @intCast(k * o.slot_ms));
+    const left = start - crt.wallMs();
+    if (left < 0) return false;
+    crt.sleepMs(@intCast(left));
+    return true;
+}
+
+fn relinkProbe(io: std.Io, cfg: Config, o: RelinkOpts) !void {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const shape = [_]c_int{10240};
@@ -2756,15 +2801,35 @@ fn relinkProbe(io: std.Io, cfg: Config, n: u64, formation_ms: u64) !void {
     try mlx.check(mlx.mlx_ones(&x, &shape, 1, .float32, s));
     defer _ = mlx.mlx_array_free(x);
     try evalOne(x);
+    var formed: u64 = 0;
+    var failed: u64 = 0;
+    var mismatches: u64 = 0;
     var k: u64 = 0;
-    while (k < n) : (k += 1) {
+    while (k < o.n) : (k += 1) {
+        if (!waitForSlot(o, k)) {
+            log.err("[dist-probe] relink {d}: slot overrun\n", .{k});
+            mismatches += 1;
+        }
+        if (o.sit_out and o.failing(k)) {
+            log.info("[dist-probe] relink {d}: sat out\n", .{k});
+            continue;
+        }
         var sw_open = io_util.Stopwatch.init(io);
         var c = cfg;
-        if (formation_ms > 0) c.formation_deadline_ms = @as(u64, @intCast(crt.monotonicMs())) + formation_ms;
+        if (o.formation_ms > 0) c.formation_deadline_ms = @as(u64, @intCast(crt.monotonicMs())) + o.formation_ms;
         var link = Link.open(io, c) catch |e| {
-            log.err("[dist-probe] relink {d}: open failed after {d} ms: {s}\n", .{ k, sw_open.read() / std.time.ns_per_ms, @errorName(e) });
-            return e;
+            log.err("[dist-probe] relink {d}: epoch_ms {d} open failed after {d} ms: {s}{s}\n", .{ k, crt.wallMs(), sw_open.read() / std.time.ns_per_ms, @errorName(e), if (o.failing(k)) " (expected)" else "" });
+            if (o.slot_ms == 0) return e;
+            mlx.check(mlx.mlx_distributed_clear_backends()) catch {};
+            failed += 1;
+            if (!o.failing(k)) mismatches += 1;
+            continue;
         };
+        if (o.failing(k)) {
+            log.err("[dist-probe] relink {d}: formed in a cycle where a rank sat out\n", .{k});
+            mismatches += 1;
+        }
+        formed += 1;
         const open_us = sw_open.read() / std.time.ns_per_us;
         var sw_sum = io_util.Stopwatch.init(io);
         const r = try link.allSum(x);
@@ -2783,7 +2848,12 @@ fn relinkProbe(io: std.Io, cfg: Config, n: u64, formation_ms: u64) !void {
         const free_us = sw_free.read() / std.time.ns_per_us;
         log.info("[dist-probe] relink {d}: epoch_ms {d} open {d} us, first all_sum {d} us (check {d} == {d}), free {d} us\n", .{ k, crt.wallMs(), open_us, sum_us, v, 10240 * cfg.size, free_us });
     }
-    log.info("[dist-probe] relink: {d} cycles clean\n", .{n});
+    if (o.slot_ms == 0) {
+        log.info("[dist-probe] relink: {d} cycles clean\n", .{o.n});
+        return;
+    }
+    log.info("[dist-probe] relink: {d} cycles, {d} formed, {d} failed, {d} mismatches\n", .{ o.n, formed, failed, mismatches });
+    if (mismatches > 0) return error.RelinkMismatch;
 }
 
 /// Waits out every stream, so no collective is still queued on a group about to be freed.
