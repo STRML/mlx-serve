@@ -330,13 +330,35 @@ const v41_vocab = 96;
 
 /// The V4.1 pipe layout with `stages` DSpark stages (`v41_dspark_keys`): stage layers and the drafter's head.
 pub fn v41WeightsWith(a: std.mem.Allocator, seed: u64, stages: usize) ![]u8 {
-    return v41Pack(a, seed, stages, false);
+    return v41Pack(a, seed, stages, false, .{});
+}
+
+/// A layer's head and expert widths (`v41Layer`).
+const V41Dims = struct { h: usize = 4, og: usize = 2, ol: usize = 32, inter: usize = 128 };
+/// Widths a tensor group of up to 4 ranks cuts on whole heads, output groups and quant groups.
+const v41_tp_dims: V41Dims = .{ .h = 8, .og = 4, .ol = 64, .inter = 256 };
+
+/// `v41Files` at `v41_tp_dims`: the pack a tensor group of 2 or 4 ranks splits (`deepseek_v41/mode.zig`).
+pub fn v41TpFiles(a: std.mem.Allocator, seed: u64) ![]const File {
+    var cfg: []const u8 = v41_config;
+    for ([_][2][]const u8{
+        .{ "\"moe_intermediate_size\": 128", "\"moe_intermediate_size\": 256" },
+        .{ "\"num_attention_heads\": 4", "\"num_attention_heads\": 8" },
+        .{ "\"o_lora_rank\": 32, \"o_groups\": 2", "\"o_lora_rank\": 64, \"o_groups\": 4" },
+    }) |r| {
+        if (std.mem.indexOf(u8, cfg, r[0]) == null) return error.FixtureConfigDrift;
+        cfg = try std.mem.replaceOwned(u8, a, cfg, r[0], r[1]);
+    }
+    return a.dupe(File, &.{
+        .{ .name = "config.json", .bytes = cfg },
+        .{ .name = "model.safetensors", .bytes = try v41Pack(a, seed, 0, false, v41_tp_dims) },
+    });
 }
 
 /// The Markov rank of a pack whose drafter heads are quantized: a whole group.
 const quant_rank = 64;
 
-fn v41Pack(a: std.mem.Allocator, seed: u64, stages: usize, quant_heads: bool) ![]u8 {
+fn v41Pack(a: std.mem.Allocator, seed: u64, stages: usize, quant_heads: bool, dims: V41Dims) ![]u8 {
     const r41 = [_]u8{ 0, 0, 2, 2, 2, 1, 1, 1 };
     const kv_sources = [_]usize{ 2, 5 };
     const index_sources = [_]usize{ 2, 5, 7 };
@@ -350,12 +372,12 @@ fn v41Pack(a: std.mem.Allocator, seed: u64, stages: usize, quant_heads: bool) ![
         var pfx_buf: [32]u8 = undefined;
         const kv = std.mem.indexOfScalar(usize, &kv_sources, li) != null;
         const ix = std.mem.indexOfScalar(usize, &index_sources, li) != null;
-        try v41Layer(&p, try std.fmt.bufPrint(&pfx_buf, "layers.{d}", .{li}), ratio, kv, ix);
+        try v41Layer(&p, try std.fmt.bufPrint(&pfx_buf, "layers.{d}", .{li}), ratio, kv, ix, dims);
     }
     if (stages > 0) {
         for (0..stages) |st| {
             var pfx_buf: [32]u8 = undefined;
-            try v41Layer(&p, try std.fmt.bufPrint(&pfx_buf, "mtp.{d}", .{st}), 0, false, false);
+            try v41Layer(&p, try std.fmt.bufPrint(&pfx_buf, "mtp.{d}", .{st}), 0, false, false, dims);
         }
         const last = stages - 1;
         try p.affine("mtp.0.main_proj", &.{v41_d}, v41_d * ds_targets.len, 8, 64);
@@ -376,14 +398,14 @@ fn v41Pack(a: std.mem.Allocator, seed: u64, stages: usize, quant_heads: bool) ![
 
 /// One V4.1 layer at `pfx` (`layers.N`, or `mtp.N` for a DSpark stage): `ratio` its compression, `kv` / `ix` whether
 /// it is a KV / indexer source.
-fn v41Layer(p: *Pack, pfx: []const u8, ratio: u8, kv: bool, ix: bool) !void {
+fn v41Layer(p: *Pack, pfx: []const u8, ratio: u8, kv: bool, ix: bool, dims: V41Dims) !void {
     const d = v41_d;
     const hd = 64;
     const ql = 64;
-    const h = 4;
-    const og = 2;
-    const ol = 32;
-    const inter = 128;
+    const h = dims.h;
+    const og = dims.og;
+    const ol = dims.ol;
+    const inter = dims.inter;
     const e = 8;
     const ih = 8;
     const ihd = 32;
@@ -453,7 +475,7 @@ pub fn v41DsparkQuantHeadFiles(a: std.mem.Allocator, seed: u64) ![]const File {
     const cfg = try std.mem.replaceOwned(u8, a, v41_config, "\"compress_ratios\": [0, 0, 2, 2, 2, 1, 1, 1]", keys);
     return a.dupe(File, &.{
         .{ .name = "config.json", .bytes = cfg },
-        .{ .name = "model.safetensors", .bytes = try v41Pack(a, seed, 2, true) },
+        .{ .name = "model.safetensors", .bytes = try v41Pack(a, seed, 2, true, .{}) },
     });
 }
 
