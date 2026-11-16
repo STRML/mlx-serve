@@ -169,7 +169,8 @@ pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
                 return Verdict.refuse(.unsupported, "a model hook table is older than this host's");
             if (t.spec) |s| if (!sized(model_abi.HeadHooks, s.head) or !sized(model_abi.NativeDrafter, s.native_drafter))
                 return Verdict.refuse(.unsupported, "a model hook table is older than this host's");
-            if (!sized(model_abi.AuxHooks, t.cache.aux)) return Verdict.refuse(.unsupported, "model auxiliary hook table is older than this host's");
+            if (t.cache.aux) |a| if (a.size < model_abi.AuxHooks.min_size)
+                return Verdict.refuse(.unsupported, "model auxiliary hook table is older than this host's");
         },
         .media => {
             if (head.version != media_abi.version) return Verdict.refuse(.unsupported, "media table version is not this host's");
@@ -338,7 +339,7 @@ test "abi dylib: plugin names are lower-case words, never paths" {
     for ([_][]const u8{ "", "Toy", "a/b", "a.b", "a-b", &long }) |n| try testing.expect(!validName(n));
 }
 
-test "abi dylib: auxiliary tables require the complete tail" {
+test "abi dylib: auxiliary tables require the required members and accept a table that ends before an optional tail" {
     var aux: model_abi.AuxHooks = .{
         .enabled = undefined,
         .describe = undefined,
@@ -370,15 +371,22 @@ test "abi dylib: auxiliary tables require the complete tail" {
         @offsetOf(model_abi.AuxHooks, "import_plan"),
         @offsetOf(model_abi.AuxHooks, "export_arrays"),
         @offsetOf(model_abi.AuxHooks, "import_arrays"),
-        @sizeOf(model_abi.AuxHooks) - 1,
+        model_abi.AuxHooks.min_size - 1,
     }) |size| {
         aux.size = size;
         const v = negotiate(&m, "p");
         try testing.expectEqual(Verdict.Code.unsupported, v.code);
         try testing.expectEqualStrings("model auxiliary hook table is older than this host's", v.why.slice());
     }
-    aux.size = @sizeOf(model_abi.AuxHooks) + 8;
-    try testing.expect(negotiate(&m, "p").isOk());
+    for ([_]u32{
+        model_abi.AuxHooks.min_size,
+        @offsetOf(model_abi.AuxHooks, "settings_key"),
+        @sizeOf(model_abi.AuxHooks),
+        @sizeOf(model_abi.AuxHooks) + 8,
+    }) |size| {
+        aux.size = size;
+        try testing.expect(negotiate(&m, "p").isOk());
+    }
     var short: [@alignOf(model_abi.AuxHooks)]u8 align(@alignOf(model_abi.AuxHooks)) = @splat(0);
     @as(*u32, @ptrCast(&short)).* = @sizeOf(u32);
     cache.aux = @ptrCast(&short);

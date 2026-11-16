@@ -255,6 +255,7 @@ test {
     _ = @import("plugins/bailing_hybrid/bill_test.zig");
     _ = @import("engines/mlx/plugin/deepseek_test.zig");
     _ = @import("plugins/deepseek_v41/engram.zig");
+    _ = @import("plugins/deepseek_v41/numerics.zig");
     _ = @import("sdk/weights/nocache_reader.zig");
     _ = @import("plugins/deepseek_v41/deepseek_v41.zig");
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig");

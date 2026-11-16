@@ -29,6 +29,7 @@ const Conn = @import("../../host/http/conn.zig").Conn;
 const router = @import("../../host/http/router.zig");
 const HostScheduler = @import("../../host/gpu_thread/scheduler.zig").Scheduler;
 const mlx_engine = @import("../../host/engines/mlx.zig");
+const flash_attn = @import("prompt/flash_attn.zig");
 
 const testing = std.testing;
 
@@ -1113,8 +1114,68 @@ test "dsv41 peer fetch: MLX_SERVE_DSV41_CED off refuses an import as settings" {
     try expectLeverRefusesImport(.MLX_SERVE_DSV41_CED, "0");
 }
 
-test "dsv41 peer fetch: MLX_SERVE_DSV41_FLASH_ATTN off refuses an import as settings" {
-    try expectLeverRefusesImport(.MLX_SERVE_DSV41_FLASH_ATTN, "0");
+test "dsv41 peer fetch: the settings key keeps the flash mode its model loaded with, whatever a later load sets" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chosen = flash_attn.ps().mode;
+    defer flash_attn.ps().mode = chosen;
+    const unset = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, null);
+    defer unset.restore();
+    const h = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
+    defer h.close();
+    try testing.expect(flash_attn.ps().mode == .off);
+    const loaded_off = peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm);
+
+    flash_attn.ps().mode = .on;
+    try testing.expectEqual(loaded_off, peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm));
+    {
+        const text = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, "1");
+        defer text.restore();
+        try testing.expectEqual(loaded_off, peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm));
+    }
+
+    const flash_on = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, "1");
+    defer flash_on.restore();
+    const h_on = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
+    defer h_on.close();
+    try testing.expect(flash_attn.ps().mode == .on);
+    try testing.expect(loaded_off != peer_transfer.modelSettingsKey(h_on.entry, &h_on.cfg, &h_on.xfm));
+}
+
+test "dsv41 peer fetch: a plugin's settings_key hook is part of the settings key and no hook adds nothing" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const h = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
+    defer h.close();
+    const Probe = struct {
+        var value: u64 = 1;
+        fn settingsKey(_: *anyopaque) callconv(.c) u64 {
+            return value;
+        }
+    };
+    const bound = h.xfm.plugin.?;
+    const old_table = bound.table;
+    defer bound.table = old_table;
+    var hooks = old_table.cache.aux.?.*;
+    var cache_hooks = old_table.cache.*;
+    cache_hooks.aux = &hooks;
+    var table = old_table.*;
+    table.cache = &cache_hooks;
+    bound.table = &table;
+
+    hooks.settings_key = &Probe.settingsKey;
+    const one = peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm);
+    Probe.value = 2;
+    const two = peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm);
+    try testing.expect(one != two);
+    hooks.settings_key = null;
+    const none = peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm);
+    try testing.expect(none != one and none != two);
+    hooks.size = @offsetOf(abi.AuxHooks, "settings_key");
+    hooks.settings_key = &Probe.settingsKey;
+    try testing.expectEqual(none, peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm));
 }
 
 test "dsv41 peer fetch: a DSV41_FUSED_SEG level refuses an import as settings" {
