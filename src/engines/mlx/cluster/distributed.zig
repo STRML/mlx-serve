@@ -318,6 +318,8 @@ pub fn primeEnv(cfg: Config) !void {
     var buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrintSentinel(&buf, "/tmp/mlx-serve-jaccl-{d}.json", .{std.c.getpid()}, 0);
     try setDistEnv(cfg, path);
+    // A switch forms its group long after this process's first fence; MLX reads the switch only there.
+    preferFastSynch();
 }
 
 pub fn envPrimed(cfg: Config) bool {
@@ -4085,6 +4087,16 @@ test "dist switch startup: rank one primes its environment and invalid device or
     bad.rank = 2;
     try std.testing.expectError(error.InvalidArgs, primeEnv(bad));
     try std.testing.expect(envPrimed(cfg));
+}
+
+test "dist switch startup: a switch-primed process turns on MLX fast sync before its first fence, unless set explicitly" {
+    env.unset(.MLX_METAL_FAST_SYNCH);
+    try primeEnv(.{ .rank = 1, .size = 2, .coordinator = "127.0.0.1:46202", .device = "rdma_en1,-" });
+    try std.testing.expect(envMatches("MLX_METAL_FAST_SYNCH", "1"));
+    env.set(.MLX_METAL_FAST_SYNCH, "0");
+    try primeEnv(.{ .rank = 1, .size = 2, .coordinator = "127.0.0.1:46202", .device = "rdma_en1,-" });
+    try std.testing.expect(envMatches("MLX_METAL_FAST_SYNCH", "0"));
+    env.unset(.MLX_METAL_FAST_SYNCH);
 }
 
 test "dist N-rank: past a pair rank 0 listens on every address, each worker dials its own" {
