@@ -416,12 +416,16 @@ test "dsv41 peer fetch: export from model A and importWireModule into model B pr
 }
 
 fn exportBySession(h: *PeerHarness, session: u64) @import("../../host/gpu_thread/requests.zig").CacheExportOutcome {
+    return exportBySessionCapped(h, session, router.max_cache_export_bytes);
+}
+
+fn exportBySessionCapped(h: *PeerHarness, session: u64, max_bytes: usize) @import("../../host/gpu_thread/requests.zig").CacheExportOutcome {
     var req: @import("../../host/gpu_thread/requests.zig").CacheExportRequest = .{
         .model = h.entry,
         .prompt_ids = &.{},
         .has_tools = false,
         .session = session,
-        .max_bytes = router.max_cache_export_bytes,
+        .max_bytes = max_bytes,
         .allocator = testing.allocator,
     };
     peer_transfer.runCacheExportRequest(&h.sch, &req);
@@ -510,6 +514,9 @@ test "peer transfer session: a session whose RAM entry is gone exports from the 
     try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
 
     try testing.expectEqual(@as(@TypeOf(exportBySession(model_a, 10)), .not_found), exportBySession(model_a, 10));
+    const capped = exportBySessionCapped(model_a, 9, 1);
+    try testing.expect(capped == .too_large);
+    try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
     const exported = exportBySession(model_a, 9);
     try testing.expect(exported == .ok);
     defer testing.allocator.free(exported.ok.bytes);
