@@ -53,6 +53,8 @@ pub const Config = struct {
     /// CLOCK_MONOTONIC ms (`crt.monotonicMs`) by which this rank's part of the group must form, bells included;
     /// 0 gives `default_formation_ms` from the start of `Link.open`.
     formation_deadline_ms: u64 = 0,
+    /// Completes the READY/GO handshake before returning the link.
+    ready_in_open: bool = false,
 };
 
 var jaccl_deadline_warned: std.atomic.Value(bool) = .init(false);
@@ -142,6 +144,8 @@ pub const Link = struct {
 
     /// Joins the group. Blocks until every rank has connected to the coordinator.
     pub fn open(io: std.Io, cfg: Config) !Link {
+        const started_ms: u64 = @intCast(crt.monotonicMs());
+        cluster().follower_ready.store(false, .release);
         if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable;
         if (!mlx.mlx_distributed_is_available("jaccl")) {
             log.err("[dist] JACCL is unavailable: RDMA over Thunderbolt needs macOS 26.2+ and `rdma_ctl enable` (Recovery)\n", .{});
@@ -199,6 +203,7 @@ pub const Link = struct {
             return error.RdmaInitFailed;
         };
         var link: Link = .{ .group = g, .rank = @intCast(mlx.mlx_distributed_group_rank(g)), .size = @intCast(mlx.mlx_distributed_group_size(g)) };
+        errdefer link.deinit();
         if (link.rank != cfg.rank or link.size != cfg.size) return error.RdmaGroupMismatch;
         if (link.rank != 0) {
             link.bells[0] = to_host;
@@ -216,8 +221,22 @@ pub const Link = struct {
             const missing = missingRanks(link.bellMask(), link.size, &mb);
             if (missing.len > 0) {
                 log.err("[dist] no bell connection from rank {s} by the formation deadline: is that worker an older mlx-serve?\n", .{missing});
-                link.deinit();
                 return error.DistNoBell;
+            }
+        }
+        if (cfg.ready_in_open) {
+            if (link.rank == 0) {
+                leaderAwaitReadyThenGo(&link.bells, link.size, deadline) catch |err| {
+                    if (err == error.DistPartialGo) distExit(.partial_go, null, null);
+                    return err;
+                };
+                cluster().heartbeat_active.store(true, .release);
+            } else {
+                var active: usize = 0;
+                _ = mlx.mlx_get_active_memory(&active);
+                try workerReadyAwaitGo(link.bells[0], deadline, .{ .resident_mib = @intCast(active >> 20), .load_ms = loadElapsedMs(started_ms) });
+                dist_watchdog.setBellTimeout(link.bells[0].fd, idleTimeoutMs());
+                cluster().follower_ready.store(true, .release);
             }
         }
         startWatchdog(&link);
@@ -295,6 +314,8 @@ const Bell = struct {
     const draft_byte: u8 = 3;
     const verify_byte: u8 = 4;
     const heartbeat_byte: u8 = 5;
+    const go_byte: u8 = 6;
+    const abort_byte: u8 = 7;
 
     /// No connection. `fd_t` is a HANDLE on Windows, where a cluster never forms.
     const none: std.c.fd_t = if (builtin.os.tag == .windows) std.os.windows.INVALID_HANDLE_VALUE else -1;
@@ -352,6 +373,7 @@ const Bell = struct {
     /// would never see the EOF that tells it to leave.
     fn noDelay(fd: std.c.fd_t) std.c.fd_t {
         const one: c_int = 1;
+        if (comptime builtin.os.tag == .macos) _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, &one, @sizeOf(c_int));
         _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &one, @sizeOf(c_int));
         _ = std.c.fcntl(fd, std.posix.F.SETFD, @as(c_int, std.posix.FD_CLOEXEC));
         return fd;
@@ -449,6 +471,198 @@ const Bell = struct {
         }
     }
 };
+
+const READY_TAG: u32 = 0xFFFFFF00;
+
+const ReadyFrame = struct {
+    code: u8 = 0,
+    resident_mib: u32 = 0,
+    calib_us: u32 = 0,
+    load_ms: u32 = 0,
+
+    fn encode(frame: ReadyFrame) [16]u8 {
+        var out: [16]u8 = undefined;
+        std.mem.writeInt(u32, out[0..4], READY_TAG | frame.code, .little);
+        std.mem.writeInt(u32, out[4..8], frame.resident_mib, .little);
+        std.mem.writeInt(u32, out[8..12], frame.calib_us, .little);
+        std.mem.writeInt(u32, out[12..16], frame.load_ms, .little);
+        return out;
+    }
+
+    fn decode(bytes: *const [16]u8) ReadyFrame {
+        return .{
+            .code = @truncate(std.mem.readInt(u32, bytes[0..4], .little)),
+            .resident_mib = std.mem.readInt(u32, bytes[4..8], .little),
+            .calib_us = std.mem.readInt(u32, bytes[8..12], .little),
+            .load_ms = std.mem.readInt(u32, bytes[12..16], .little),
+        };
+    }
+};
+
+const BellWord = union(enum) { step: u32, ready: ReadyFrame };
+
+const BellDecoder = struct {
+    bytes: [16]u8 = undefined,
+    used: usize = 0,
+    need: usize = 4,
+
+    fn read(self: *BellDecoder, bell: Bell) !?BellWord {
+        while (true) {
+            const n = std.c.recv(bell.fd, self.bytes[self.used..self.need].ptr, self.need - self.used, std.c.MSG.DONTWAIT);
+            if (n == 0) return error.DistPeerGone;
+            if (n < 0) switch (std.c._errno().*) {
+                @backingInt(std.c.E.INTR) => continue,
+                @backingInt(std.c.E.AGAIN) => return null,
+                else => return error.DistPeerGone,
+            };
+            self.used += @intCast(n);
+            if (self.used < self.need) continue;
+            const word = std.mem.readInt(u32, self.bytes[0..4], .little);
+            if (self.need == 4 and word >= READY_TAG) {
+                self.need = 16;
+                continue;
+            }
+            self.used = 0;
+            self.need = 4;
+            return if (word >= READY_TAG) .{ .ready = ReadyFrame.decode(&self.bytes) } else .{ .step = word };
+        }
+    }
+};
+
+fn sendReadyFrame(bell: Bell, frame: ReadyFrame) !void {
+    return bell.say(&frame.encode());
+}
+
+fn sendStepTime(bell: Bell, us: i64) !void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, @intCast(std.math.clamp(us, 0, READY_TAG - 1)), .little);
+    try bell.say(&bytes);
+}
+
+fn loadElapsedMs(start_ms: u64) u32 {
+    return @intCast(@min(@as(u64, @intCast(crt.monotonicMs())) -| start_ms, std.math.maxInt(u32)));
+}
+
+fn readyCodeName(code: u8) []const u8 {
+    return switch (code) {
+        0 => "ready",
+        LOAD_FAILED => "LOAD_FAILED",
+        NOT_FOUND => "NOT_FOUND",
+        MISMATCH => "MISMATCH",
+        else => "unknown",
+    };
+}
+
+const GoProgress = struct {
+    sent: u32 = 0,
+
+    fn check(self: GoProgress, now_ms: u64, deadline_ms: u64) !void {
+        if (now_ms < deadline_ms -| 200) return;
+        return self.writeFailed();
+    }
+
+    fn writeFailed(self: GoProgress) error{ DistPartialGo, DistNoGo } {
+        return if (self.sent > 0) error.DistPartialGo else error.DistNoGo;
+    }
+};
+
+fn abortBells(bells: []const Bell, size: u32) void {
+    for (bells[1..size]) |bell| _ = std.c.send(bell.fd, &[_]u8{Bell.abort_byte}, 1, std.c.MSG.DONTWAIT);
+}
+
+fn leaderAwaitReadyThenGo(bells: []const Bell, size: u32, deadline_ms: u64) !void {
+    var go: GoProgress = .{};
+    errdefer if (go.sent == 0) abortBells(bells, size);
+    var decoders: [max_ranks]BellDecoder = @splat(.{});
+    var fds: [max_ranks]std.posix.pollfd = undefined;
+    var ready: u32 = 0;
+    const all = ((@as(u32, 1) << @intCast(size)) - 1) & ~@as(u32, 1);
+    for (1..size) |k| fds[k] = .{ .fd = bells[k].fd, .events = std.posix.POLL.IN, .revents = 0 };
+    while (ready != all) {
+        const left = msLeft(deadline_ms);
+        if (left == 0) {
+            var buf: [64]u8 = undefined;
+            log.err("[dist] no READY from rank {s} by the formation deadline\n", .{missingRanks(ready, size, &buf)});
+            return error.DistNoReady;
+        }
+        _ = try std.posix.poll(fds[1..size], @intCast(@min(left, std.math.maxInt(i32))));
+        for (1..size) |k| {
+            if (fds[k].revents == 0) continue;
+            const message = try decoders[k].read(bells[k]) orelse continue;
+            const frame = switch (message) {
+                .ready => |frame| frame,
+                .step => return error.DistBadMessage,
+            };
+            if (frame.code != 0) {
+                log.err("[dist] rank {d} not ready: {s}\n", .{ k, readyCodeName(frame.code) });
+                return error.DistWorkerLoadFailed;
+            }
+            log.info("[dist] worker rank {d} READY: {d} MiB, load {d} ms\n", .{ k, frame.resident_mib, frame.load_ms });
+            ready |= @as(u32, 1) << @intCast(k);
+        }
+    }
+    for (1..size) |k| {
+        go.check(@intCast(crt.monotonicMs()), deadline_ms) catch |err| {
+            logGoFailure(go.sent, size);
+            return err;
+        };
+        if (std.c.send(bells[k].fd, &[_]u8{Bell.go_byte}, 1, std.c.MSG.DONTWAIT) != 1) {
+            logGoFailure(go.sent, size);
+            return go.writeFailed();
+        }
+        go.sent += 1;
+    }
+}
+
+fn logGoFailure(sent: u32, size: u32) void {
+    if (sent == 0) return;
+    const mask = ((@as(u32, 1) << @intCast(size)) - 1) & ~@as(u32, 1);
+    const formed = ((@as(u32, 1) << @intCast(sent + 1)) - 1) & ~@as(u32, 1);
+    var fb: [64]u8 = undefined;
+    var nb: [64]u8 = undefined;
+    log.err("[dist] partial GO: ranks {s} formed, {s} not\n", .{ missingRanks(mask & ~formed, size, &fb), missingRanks(formed, size, &nb) });
+}
+
+fn workerReadyAwaitGo(bell: Bell, deadline_ms: u64, frame: ReadyFrame) !void {
+    const unformed: Bell = .{ .fd = bell.fd };
+    sendReadyFrame(unformed, frame) catch return error.DistAborted;
+    var fds = [_]std.posix.pollfd{.{ .fd = bell.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    while (true) {
+        const left = msLeft(deadline_ms);
+        if (left == 0) return error.DistNoGo;
+        if (try std.posix.poll(&fds, @intCast(@min(left, std.math.maxInt(i32)))) == 0) return error.DistNoGo;
+        var byte: [1]u8 = undefined;
+        unformed.readAll(&byte) catch return error.DistAborted;
+        return switch (byte[0]) {
+            Bell.go_byte => {},
+            Bell.abort_byte => error.DistAborted,
+            else => error.DistBadMessage,
+        };
+    }
+}
+
+fn publishReady(state: *ClusterState, rank: usize, frame: ReadyFrame) void {
+    state.ready_resident_mib[rank].store(frame.resident_mib, .monotonic);
+    state.ready_calib_us[rank].store(frame.calib_us, .monotonic);
+    state.ready_load_ms[rank].store(frame.load_ms, .monotonic);
+    state.ready_code[rank].store(@as(u32, frame.code) + 1, .release);
+}
+
+fn awaitColdReady(state: *ClusterState, size: u32, deadline_ms: u64) !void {
+    while (true) {
+        const gone = state.worker_gone.load(.acquire);
+        var all = true;
+        for (1..size) |k| {
+            const code = state.ready_code[k].load(.acquire);
+            if (code > 1) return error.DistWorkerLoadFailed;
+            if (code == 0) all = false;
+        }
+        if (gone) return error.DistWorkerLeft;
+        if (all) return;
+        if (msLeft(deadline_ms) == 0) return error.DistReadyTimeout;
+        crt.sleepMs(10);
+    }
+}
 
 fn idleTimeoutMs() u32 {
     return @max(1, env.intValue(u32, env.get(.MLX_SERVE_DIST_IDLE_MS), 3_000));
@@ -577,8 +791,8 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC = wire.MAGIC;
-/// 10: a DeepSeek-V4.1 tensor verify carries its options (commit every row, chain the draft) in the header and the bell.
-const VERSION: i32 = 10;
+/// 11: READY frames on the bell; GO and ABORT before the watchdog starts.
+const VERSION: i32 = 11;
 pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
 pub const OP_STOP = wire.OP_STOP;
@@ -726,6 +940,7 @@ const Plan = struct {
         const g = cluster().group.?;
         const id = try modelIdentity(g.io, g.allocator, model_dir);
         const name = std.fs.path.basename(model_dir);
+        for (1..link.size) |k| cluster().ready_code[k].store(0, .release);
         for (1..link.size) |k| {
             const dst: u32 = @intCast(k);
             try sendMsg(link, p.msg(name.len), dst);
@@ -882,37 +1097,34 @@ pub const Peer = struct {
         return error.DistModelMismatch;
     }
 
-    /// Every worker's READY, in rank order.
+    /// Every worker's READY, bounded by the load deadline.
     fn awaitReady(self: *Peer) !void {
+        const seconds = env.intValue(u32, env.get(.MLX_SERVE_DIST_LOAD_DEADLINE_S), 900);
+        return self.awaitReadyUntil(cluster(), @as(u64, @intCast(crt.monotonicMs())) + @as(u64, seconds) * 1000);
+    }
+
+    fn awaitReadyUntil(self: *Peer, state: *ClusterState, deadline_ms: u64) !void {
         if (self.failed) return error.DistWorkerLoadFailed;
-        for (1..self.link.size) |k| {
-            const m = try recvMsg(&self.link, @intCast(k));
-            if (m[0] != MAGIC or m[1] != 0) {
-                self.failed = true;
-                switch (m[1]) {
+        awaitColdReady(state, self.link.size, deadline_ms) catch |err| {
+            self.failed = true;
+            for (1..self.link.size) |k| {
+                const code = state.ready_code[k].load(.acquire);
+                if (code <= 1) continue;
+                switch (code - 1) {
                     NOT_FOUND => log.err("[dist] worker rank {d} has no model named {s} in its model folders\n", .{ k, self.model }),
                     MISMATCH => log.err("[dist] worker rank {d}'s copy of {s} is not the same model (quantization, revision or geometry)\n", .{ k, self.model }),
                     else => log.err("[dist] worker rank {d} failed to load its part of {s}\n", .{ k, self.model }),
                 }
-                return error.DistWorkerLoadFailed;
             }
-            self.remotes[k].resident_mib = @intCast(@max(m[2], 0));
-            switch (self.mode) {
-                .pipeline => if (self.remote) |r|
-                    log.info("[dist] worker ready: layers {d}..{d} resident, {d} MiB\n", .{ r.start, r.end, m[2] })
-                else
-                    log.info("[dist] worker ready: layers {d}..{d} resident, {d} MiB\n", .{ self.span.end, self.span.total, m[2] }),
-                .tensor => log.info("[dist] worker rank {d} ready: its 1/{d} of every expert and head resident, {d} MiB\n", .{ k, self.link.size, m[2] }),
-                .rows => {
-                    self.worker_calib_us = @intCast(m[3]);
-                    log.info("[dist] worker ready: the whole DiT resident, {d} MiB\n", .{m[2]});
-                },
-            }
+            return err;
+        };
+        for (1..self.link.size) |k| {
+            const resident = state.ready_resident_mib[k].load(.monotonic);
+            self.remotes[k].resident_mib = resident;
+            if (self.mode == .rows) self.worker_calib_us = state.ready_calib_us[k].load(.monotonic);
         }
-        // The leader self-check and the heartbeat gate start at the first loop tick after this: the model load that got
-        // here ran inside a loop iteration that had already ticked, with no watched step.
-        cluster().loop_tick_ms.store(0, .release);
-        cluster().heartbeat_active.store(true, .release);
+        state.loop_tick_ms.store(0, .release);
+        state.heartbeat_active.store(true, .release);
         self.ready = true;
     }
 };
@@ -980,6 +1192,13 @@ const ClusterState = struct {
     lost_rank: std.atomic.Value(u32) = .init(0),
     /// The worker's compute time for its last step (µs), sent over the bell after each one.
     worker_us: std.atomic.Value(u32) = .init(0),
+    /// Zero before READY, else the wire code + 1; publishes the other frame fields.
+    ready_code: [max_ranks]std.atomic.Value(u32) = @splat(.init(0)),
+    ready_resident_mib: [max_ranks]std.atomic.Value(u32) = @splat(.init(0)),
+    ready_calib_us: [max_ranks]std.atomic.Value(u32) = @splat(.init(0)),
+    ready_load_ms: [max_ranks]std.atomic.Value(u32) = @splat(.init(0)),
+    /// A worker bell closed; receives from that worker cannot complete.
+    worker_gone: std.atomic.Value(bool) = .init(false),
     /// Receives from the worker in progress on the inference thread (`queuedRecv`).
     recvs: std.atomic.Value(u32) = .init(0),
     loop_ticks: std.atomic.Value(u64) = .init(0),
@@ -990,7 +1209,7 @@ const ClusterState = struct {
     /// The watchdog and (rank 0) heartbeat threads of the open link; `Link.deinit` joins them.
     watchdog_threads: [2]?std.Thread = .{ null, null },
     heartbeat_active: std.atomic.Value(bool) = .init(false),
-    /// Set once this worker has sent READY: from then on a silent or closed bell ends the process.
+    /// Set once this worker is ready (after GO for switch-time open): from then on a silent or closed bell ends the process.
     follower_ready: std.atomic.Value(bool) = .init(false),
     bell_mu: std.Io.Mutex = .init,
 };
@@ -1095,6 +1314,7 @@ fn stopWatchdog() void {
         t.join();
         slot.* = null;
     };
+    c.follower_ready.store(false, .release);
     c.heartbeat_active.store(false, .release);
     c.loop_tick_ms.store(0, .release);
     c.watchdog.done();
@@ -1138,10 +1358,6 @@ fn joinState(joined_now: bool, waited_ms: u64, timeout_s: u32) JoinState {
     if (joined_now) return .joined;
     return if (waited_ms < @as(u64, timeout_s) * 1000) .forming else .late;
 }
-/// The worker's bell connection closed: it left, and JACCL forms a group once per process,
-/// so this server must restart to pair again (the app does it, `/props` cluster "worker_gone").
-var worker_gone = std.atomic.Value(bool).init(false);
-
 /// Each worker's answer about the group's model, by rank.
 fn loadCopies() [max_ranks]i32 {
     var out: [max_ranks]i32 = undefined;
@@ -1162,7 +1378,7 @@ pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
     const g = cluster().group orelse return allocator.dupe(u8, "");
     var mb: [64]u8 = undefined;
     return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":false,\"worker_ready\":false,\"worker_model\":\"{s}\",\"worker_gone\":{},\"size\":{d},\"missing_ranks\":\"{s}\",\"lost_rank\":{d},\"jaccl_deadline\":{}}}", .{
-        @tagName(g.mode),                                               std.json.fmt(std.fs.path.basename(g.model), .{}), cluster().joined.load(.acquire),       workerCopyName(), worker_gone.load(.acquire), g.size,
+        @tagName(g.mode),                                               std.json.fmt(std.fs.path.basename(g.model), .{}), cluster().joined.load(.acquire),       workerCopyName(), cluster().worker_gone.load(.acquire), g.size,
         missingRanks(cluster().bells_seen.load(.acquire), g.size, &mb), cluster().lost_rank.load(.acquire),               mlx.jacclFormationDeadlineAvailable(),
     });
 }
@@ -1195,9 +1411,9 @@ fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
     }
     const w = p.worker();
     return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}],\"worker_model\":\"{s}\",\"worker_gone\":{},\"size\":{d},\"lost_rank\":{d},\"jaccl_deadline\":{},\"workers\":[{s}]}}", .{
-        @tagName(p.mode),                       std.json.fmt(std.fs.path.basename(p.model), .{}),                     cluster().joined.load(.acquire),  p.planned,               p.ready,           sp.total,                   sp.start,                          sp.end,
-        if (p.mode == .pipeline) sp.end else 0, sp.total,                                                             if (p.shard) |sh| sh.size else 0, w.hello.avail_mib,       w.hello.total_mib, p.exchanges,                std.json.fmt(p.workerName(), .{}), speed,
-        p.link_bytes_per_us / 1000,             std.json.fmt(cluster().last_job_buf[0..cluster().last_job_len], .{}), cluster().last_split[0],          cluster().last_split[1], workerCopyName(),  worker_gone.load(.acquire), p.link.size,                       cluster().lost_rank.load(.acquire),
+        @tagName(p.mode),                       std.json.fmt(std.fs.path.basename(p.model), .{}),                     cluster().joined.load(.acquire),  p.planned,               p.ready,           sp.total,                             sp.start,                          sp.end,
+        if (p.mode == .pipeline) sp.end else 0, sp.total,                                                             if (p.shard) |sh| sh.size else 0, w.hello.avail_mib,       w.hello.total_mib, p.exchanges,                          std.json.fmt(p.workerName(), .{}), speed,
+        p.link_bytes_per_us / 1000,             std.json.fmt(cluster().last_job_buf[0..cluster().last_job_len], .{}), cluster().last_split[0],          cluster().last_split[1], workerCopyName(),  cluster().worker_gone.load(.acquire), p.link.size,                       cluster().lost_rank.load(.acquire),
         mlx.jacclFormationDeadlineAvailable(),  workers.written(),
     });
 }
@@ -1877,32 +2093,28 @@ fn noteRoundTrip(us: i64) void {
 
 /// Worker, DeepSeek-V4.1: its run of layers (`pl.span`) and one step per OP_DSV41, or the whole model on its half of
 /// every expert and attention head and one step per OP_DSV41_TP, until rank 0 stops it.
-fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: []const u8, config: *model_mod.ModelConfig, pl: Plan) !bool {
+fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: []const u8, config: *model_mod.ModelConfig, pl: Plan, ready: *WorkerReady) !bool {
     switch (pl.mode) {
         .tensor => config.applyShard(.{ .rank = link.rank, .size = link.size, .stages = pl.stages }) catch |err| {
             log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
-            sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
             return err;
         },
         else => config.dist_dsv41 = .{ .lo = pl.span.start, .hi = pl.span.end, .worker = true },
     }
     var w = model_mod.loadModelWeights(io, allocator, dir, config, false) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
-        sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         return err;
     };
     defer w.deinit();
     const binding = config.plugin orelse return error.NotPluginServed;
     const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .dspark = pl.stages, .draft_shard = pl.stages, .head_8bit = dsv41_mod.head8Wanted(), .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
-        sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         return err;
     };
     defer m.deinit();
     // Rank 0 drafts with this rank's stages: without them its first draft would wait on this rank forever.
     if (pl.stages and !m.draft_shard) {
         log.err("[dist] worker load failed: rank 0 drafts on every rank but this copy loaded no DSpark stages\n", .{});
-        sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         return error.Dsv41DraftShardNoStages;
     }
     cluster().tp_link = link;
@@ -1920,10 +2132,8 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     defer dsv41_mod.dropSnaps(&snaps, allocator);
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
-    try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
+    try ready.send(0, @intCast(active >> 20), 0);
     log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
-    dist_watchdog.setBellTimeout(link.bells[0].fd, idleTimeoutMs());
-    cluster().follower_ready.store(true, .release);
     const d: c_int = @intCast(config.hidden_size);
     var steps: u64 = 0;
     while (true) {
@@ -1945,9 +2155,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                 defer for (out) |o| {
                     _ = mlx.mlx_array_free(o);
                 };
-                var took: [4]u8 = undefined;
-                std.mem.writeInt(u32, &took, @intCast(std.math.clamp(io_util.nowUsMonotonic(io) - t0, 0, std.math.maxInt(u32))), .little);
-                link.bells[0].writeAll(&took) catch {};
+                sendStepTime(link.bells[0], io_util.nowUsMonotonic(io) - t0) catch {};
                 try sendNow(link, out[0], 0);
                 try sendNow(link, out[1], 0);
                 steps += 1;
@@ -2136,11 +2344,11 @@ fn waitForWorker(io: std.Io, cfg: Config) void {
     watchWorker(link);
 }
 
-/// Waits on every worker's bell until one closes, and returns its rank (0: no bell to watch). After its answer a
-/// worker writes only each step's compute time (µs, u32), stored to `last_us` (`ClusterState.worker_us`).
-fn watchBells(link: *const Link, last_us: *u32) u32 {
+/// Reads worker READY frames and step times until a bell closes, returning its rank.
+fn watchBells(link: *const Link, state: *ClusterState) u32 {
     var fds: [max_ranks]std.posix.pollfd = undefined;
     var ranks: [max_ranks]u32 = undefined;
+    var decoders: [max_ranks]BellDecoder = @splat(.{});
     var n: usize = 0;
     for (1..link.size) |k| if (link.bells[k].open()) {
         fds[n] = .{ .fd = link.bells[k].fd, .events = std.posix.POLL.IN, .revents = 0 };
@@ -2148,16 +2356,25 @@ fn watchBells(link: *const Link, last_us: *u32) u32 {
         n += 1;
     };
     if (n == 0) return 0;
-    while (true) {
-        _ = std.posix.poll(fds[0..n], -1) catch return ranks[0];
+    const lost = outer: while (true) {
+        _ = std.posix.poll(fds[0..n], -1) catch break :outer ranks[0];
         for (fds[0..n], ranks[0..n]) |*f, k| {
             if (f.revents == 0) continue;
-            f.revents = 0;
-            var x: [4]u8 = undefined;
-            (Bell{ .fd = f.fd }).readAll(&x) catch return k;
-            @atomicStore(u32, last_us, std.mem.readInt(u32, &x, .little), .release);
+            const word = decoders[k].read(.{ .fd = f.fd }) catch break :outer k;
+            if (word) |message| switch (message) {
+                .step => |us| state.worker_us.store(us, .release),
+                .ready => |frame| {
+                    if (frame.code != 0) {
+                        log.err("[dist] rank {d} not ready: {s}\n", .{ k, readyCodeName(frame.code) });
+                    } else log.info("[dist] worker rank {d} READY: {d} MiB, load {d} ms\n", .{ k, frame.resident_mib, frame.load_ms });
+                    publishReady(state, k, frame);
+                },
+            };
         }
-    }
+    };
+    state.lost_rank.store(lost, .release);
+    state.worker_gone.store(true, .release);
+    return lost;
 }
 
 /// Dials rank 0's bell until it answers or `deadline_ms` (CLOCK_MONOTONIC) passes, waiting 20 ms and doubling to 1 s
@@ -2204,12 +2421,288 @@ test "a worker that dials before rank 0 listens joins once the listener opens" {
     _ = std.c.close(b.fd);
 }
 
+const TestBells = struct {
+    leader: Link = .{ .group = .{}, .rank = 0, .size = 2 },
+    worker: Bell,
+
+    fn open(port: u16) !TestBells {
+        const coord: Coordinator = .{ .ip4 = .{ 127, 0, 0, 1 }, .port = port };
+        const listener = Bell.listen(coord, 1);
+        if (listener == Bell.none) return error.TestListenFailed;
+        defer _ = std.c.close(listener);
+        const worker = Bell.connect(coord, 1);
+        if (!worker.open()) return error.TestConnectFailed;
+        errdefer _ = std.c.close(worker.fd);
+        const got = Bell.acceptRank(listener, 1000) orelse return error.TestAcceptFailed;
+        var out: TestBells = .{ .worker = worker };
+        out.leader.bells[1] = got.bell;
+        return out;
+    }
+
+    fn close(self: *TestBells) void {
+        if (self.worker.open()) _ = std.c.close(self.worker.fd);
+        for (self.leader.bells) |b| if (b.open()) {
+            _ = std.c.close(b.fd);
+        };
+    }
+};
+
+fn testDeadline(ms: u64) u64 {
+    return @as(u64, @intCast(crt.monotonicMs())) + ms;
+}
+
+fn testReadBellWord(decoder: *BellDecoder, bell: Bell) !BellWord {
+    const deadline = testDeadline(1000);
+    var fds = [_]std.posix.pollfd{.{ .fd = bell.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    while (msLeft(deadline) > 0) {
+        _ = try std.posix.poll(&fds, @intCast(msLeft(deadline)));
+        if (try decoder.read(bell)) |word| return word;
+    }
+    return error.TestBellTimeout;
+}
+
+const TestReadyWorker = struct {
+    bell: Bell,
+    deadline: u64,
+    frame: ReadyFrame = .{},
+    result: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        workerReadyAwaitGo(self.bell, self.deadline, self.frame) catch |err| {
+            self.result = err;
+        };
+    }
+};
+
+test "dist bell READY matrix 1: every worker receives GO" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair = try TestBells.open(46101);
+    defer pair.close();
+    var other = try TestBells.open(46103);
+    defer other.close();
+    pair.leader.size = 3;
+    pair.leader.bells[2] = other.leader.bells[1];
+    other.leader.bells[1] = .{};
+    const deadline = testDeadline(2000);
+    var a: TestReadyWorker = .{ .bell = pair.worker, .deadline = deadline };
+    var b: TestReadyWorker = .{ .bell = other.worker, .deadline = deadline };
+    const ta = try std.Thread.spawn(.{}, TestReadyWorker.run, .{&a});
+    const tb = try std.Thread.spawn(.{}, TestReadyWorker.run, .{&b});
+    const result = leaderAwaitReadyThenGo(&pair.leader.bells, 3, deadline);
+    ta.join();
+    tb.join();
+    try result;
+    try std.testing.expectEqual(@as(?anyerror, null), a.result);
+    try std.testing.expectEqual(@as(?anyerror, null), b.result);
+}
+
+test "dist bell READY matrix 3: missing READY aborts every worker" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair = try TestBells.open(46105);
+    defer pair.close();
+    var silent = try TestBells.open(46127);
+    defer silent.close();
+    pair.leader.size = 3;
+    pair.leader.bells[2] = silent.leader.bells[1];
+    silent.leader.bells[1] = .{};
+    var worker: TestReadyWorker = .{ .bell = pair.worker, .deadline = testDeadline(1500) };
+    const t = try std.Thread.spawn(.{}, TestReadyWorker.run, .{&worker});
+    const result = leaderAwaitReadyThenGo(&pair.leader.bells, 3, testDeadline(80));
+    t.join();
+    try std.testing.expectError(error.DistNoReady, result);
+    try std.testing.expectEqual(error.DistAborted, worker.result.?);
+    var byte: [1]u8 = undefined;
+    try silent.worker.readAll(&byte);
+    try std.testing.expectEqual(@as(u8, 7), byte[0]);
+}
+
+test "dist bell READY matrix 4: failure code aborts open on both ranks" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    for ([_]u8{ 1, 2, 3 }) |code| {
+        var pair = try TestBells.open(46107);
+        defer pair.close();
+        const deadline = testDeadline(1500);
+        var worker: TestReadyWorker = .{ .bell = pair.worker, .deadline = deadline, .frame = .{ .code = code } };
+        const t = try std.Thread.spawn(.{}, TestReadyWorker.run, .{&worker});
+        try std.testing.expectError(error.DistWorkerLoadFailed, leaderAwaitReadyThenGo(&pair.leader.bells, 2, deadline));
+        t.join();
+        try std.testing.expectEqual(error.DistAborted, worker.result.?);
+    }
+}
+
+test "dist bell READY matrix 5: leader EOF before GO is a clean abort" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair = try TestBells.open(46109);
+    defer pair.close();
+    var worker: TestReadyWorker = .{ .bell = pair.worker, .deadline = testDeadline(1000) };
+    const t = try std.Thread.spawn(.{}, TestReadyWorker.run, .{&worker});
+    var frame: [16]u8 = undefined;
+    try pair.leader.bells[1].readAll(&frame);
+    _ = std.c.close(pair.leader.bells[1].fd);
+    pair.leader.bells[1] = .{};
+    t.join();
+    try std.testing.expectEqual(error.DistAborted, worker.result.?);
+}
+
+test "dist bell READY matrix 6: partial GO uses the fatal exit cause" {
+    var go: GoProgress = .{};
+    try go.check(799, 1000);
+    go.sent = 1;
+    try std.testing.expectError(error.DistPartialGo, go.check(800, 1000));
+    try std.testing.expectEqual(error.DistPartialGo, go.writeFailed());
+    go.sent = 0;
+    try std.testing.expectError(error.DistNoGo, go.check(800, 1000));
+    try std.testing.expectEqual(error.DistNoGo, go.writeFailed());
+    var buf: [160]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, dist_watchdog.exitRecord(&buf, 1, .partial_go, null, 0, null), "cause=partial_go") != null);
+}
+
+test "dist bell READY matrix 7: no GO reaches the worker deadline" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair = try TestBells.open(46111);
+    defer pair.close();
+    try std.testing.expectError(error.DistNoGo, workerReadyAwaitGo(pair.worker, testDeadline(80), .{}));
+}
+
+test "dist bell READY matrix 8: unexpected GO byte is rejected" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair = try TestBells.open(46113);
+    defer pair.close();
+    try pair.leader.bells[1].writeAll(&.{5});
+    try std.testing.expectError(error.DistBadMessage, workerReadyAwaitGo(pair.worker, testDeadline(1000), .{}));
+}
+
+test "dist bell READY matrix 9: split frame assembles little endian words" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair = try TestBells.open(46115);
+    defer pair.close();
+    const bytes = [_]u8{ 0, 255, 255, 255, 0x34, 0x12, 0, 0, 0, 0, 0, 0, 0x78, 0x56, 0, 0 };
+    var decoder: BellDecoder = .{};
+    try pair.worker.writeAll(bytes[0..3]);
+    try std.testing.expectEqual(@as(?BellWord, null), try decoder.read(pair.leader.bells[1]));
+    try pair.worker.writeAll(bytes[3..9]);
+    try std.testing.expectEqual(@as(?BellWord, null), try decoder.read(pair.leader.bells[1]));
+    try pair.worker.writeAll(bytes[9..]);
+    const got = (try testReadBellWord(&decoder, pair.leader.bells[1])).ready;
+    try std.testing.expectEqual(@as(u32, 0x1234), got.resident_mib);
+    try std.testing.expectEqual(@as(u32, 0x5678), got.load_ms);
+    try std.testing.expectEqualSlices(u8, &bytes, &got.encode());
+}
+
+test "dist bell READY matrix 10: oversized step times stay below READY tag" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair = try TestBells.open(46117);
+    defer pair.close();
+    for ([_]i64{ -1, 0, 123, 0xFFFFFF00, std.math.maxInt(i64) }) |us| {
+        try sendStepTime(pair.worker, us);
+        var decoder: BellDecoder = .{};
+        const got = (try testReadBellWord(&decoder, pair.leader.bells[1])).step;
+        try std.testing.expectEqual(@as(u32, @intCast(std.math.clamp(us, 0, 0xFFFFFEFF))), got);
+    }
+}
+
+const TestBellWatcher = struct {
+    fn run(link: *const Link, state: *ClusterState) void {
+        _ = watchBells(link, state);
+    }
+};
+
+fn testColdPeer(link: Link) Peer {
+    return .{ .link = link, .mode = .rows, .model = "test", .split = null };
+}
+
+test "dist bell READY matrix 11: cold READY reaches awaitReady through watcher" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair = try TestBells.open(46119);
+    defer pair.close();
+    var state: ClusterState = .{};
+    var peer_state = testColdPeer(pair.leader);
+    const t = try std.Thread.spawn(.{}, TestBellWatcher.run, .{ &pair.leader, &state });
+    defer {
+        _ = std.c.shutdown(pair.worker.fd, std.c.SHUT.RDWR);
+        t.join();
+    }
+    try sendReadyFrame(pair.worker, .{ .resident_mib = 321, .load_ms = 789 });
+    try peer_state.awaitReadyUntil(&state, testDeadline(1000));
+    try std.testing.expect(peer_state.ready);
+    try std.testing.expectEqual(@as(u64, 321), peer_state.remotes[1].resident_mib);
+    try std.testing.expectEqual(@as(u32, 789), state.ready_load_ms[1].load(.acquire));
+    _ = std.c.close(pair.worker.fd);
+    pair.worker = .{};
+}
+
+test "dist bell READY matrix 12: cold load failure marks peer failed" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    for ([_]u8{ 1, 2, 3 }) |code| {
+        var pair = try TestBells.open(46121);
+        defer pair.close();
+        var state: ClusterState = .{};
+        var peer_state = testColdPeer(pair.leader);
+        try sendReadyFrame(pair.worker, .{ .code = code });
+        _ = std.c.close(pair.worker.fd);
+        pair.worker = .{};
+        const t = try std.Thread.spawn(.{}, TestBellWatcher.run, .{ &pair.leader, &state });
+        t.join();
+        try std.testing.expectError(error.DistWorkerLoadFailed, peer_state.awaitReadyUntil(&state, testDeadline(1000)));
+        try std.testing.expect(peer_state.failed);
+    }
+}
+
+test "dist bell READY matrix 13: cold load deadline marks peer failed" {
+    var state: ClusterState = .{};
+    var peer_state = testColdPeer(.{ .group = .{}, .rank = 0, .size = 2 });
+    try std.testing.expectError(error.DistReadyTimeout, peer_state.awaitReadyUntil(&state, testDeadline(20)));
+    try std.testing.expect(peer_state.failed);
+}
+
+test "dist bell READY matrix 14: bell EOF interrupts cold load promptly" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair = try TestBells.open(46123);
+    defer pair.close();
+    var state: ClusterState = .{};
+    var peer_state = testColdPeer(pair.leader);
+    const t = try std.Thread.spawn(.{}, TestBellWatcher.run, .{ &pair.leader, &state });
+    defer {
+        _ = std.c.shutdown(pair.worker.fd, std.c.SHUT.RDWR);
+        t.join();
+    }
+    _ = std.c.close(pair.worker.fd);
+    pair.worker = .{};
+    const start = crt.monotonicMs();
+    try std.testing.expectError(error.DistWorkerLeft, peer_state.awaitReadyUntil(&state, testDeadline(5000)));
+    try std.testing.expect(crt.monotonicMs() - start < 1000);
+    try std.testing.expect(peer_state.failed);
+}
+
+test "dist bell READY matrix 15: VERSION 10 worker is refused at hello" {
+    try std.testing.expectError(error.DistProtocolMismatch, Hello.parse(.{ MAGIC, 10, 0, 0, 0, 0, 0, 0 }));
+    _ = try Hello.parse(.{ MAGIC, 11, 0, 0, 0, 0, 0, 0 });
+}
+
+test "dist bell READY matrix 16: rows calibration reaches peer through frame" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    var pair = try TestBells.open(46125);
+    defer pair.close();
+    var state: ClusterState = .{};
+    var peer_state = testColdPeer(pair.leader);
+    const t = try std.Thread.spawn(.{}, TestBellWatcher.run, .{ &pair.leader, &state });
+    defer {
+        _ = std.c.shutdown(pair.worker.fd, std.c.SHUT.RDWR);
+        t.join();
+    }
+    try sendReadyFrame(pair.worker, .{ .resident_mib = 555, .calib_us = 23456, .load_ms = 123 });
+    try peer_state.awaitReadyUntil(&state, testDeadline(1000));
+    try std.testing.expectEqual(@as(u64, 23456), peer_state.worker_calib_us);
+    _ = std.c.close(pair.worker.fd);
+    pair.worker = .{};
+}
+
 /// Waits on the bells for a worker to leave: a read returns only at its end.
 fn watchWorker(link: *const Link) void {
-    const lost = watchBells(link, &cluster().worker_us.raw);
+    const lost = watchBells(link, cluster());
     if (lost == 0) return;
     cluster().lost_rank.store(lost, .release);
-    worker_gone.store(true, .release);
+    cluster().worker_gone.store(true, .release);
     cluster().joined.store(false, .release);
     log.warn("[dist] worker rank {d} left; this server restarts to form the group again\n", .{lost});
     // A receive from the worker, in progress or started later, never returns, and the inference thread with it: its
@@ -2386,9 +2879,40 @@ fn watchHost(b: Bell) void {
     followerExit(.eof);
 }
 
+const WorkerReady = struct {
+    link: *const Link,
+    started_ms: u64,
+    sent: bool = false,
+
+    fn send(self: *WorkerReady, code: u8, resident_mib: u32, calib_us: u32) !void {
+        try sendReadyFrame(self.link.bells[0], .{ .code = code, .resident_mib = resident_mib, .calib_us = calib_us, .load_ms = loadElapsedMs(self.started_ms) });
+        self.sent = true;
+        if (code != 0) return;
+        dist_watchdog.setBellTimeout(self.link.bells[0].fd, idleTimeoutMs());
+        cluster().follower_ready.store(true, .release);
+    }
+
+    fn rows(ctx: *anyopaque, resident_mib: u32, calib_us: u32) anyerror!void {
+        const self: *WorkerReady = @ptrCast(@alignCast(ctx));
+        try self.send(0, resident_mib, calib_us);
+    }
+};
+
 /// One plan: finds and loads this Mac's part, then serves until rank 0 stops it (false) or
 /// releases it (true: the host unloaded the model and may plan again).
 fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots: []const []const u8, pmsg: Msg) !bool {
+    var ready: WorkerReady = .{ .link = link, .started_ms = @intCast(crt.monotonicMs()) };
+    return servePlanReady(io, allocator, link, roots, pmsg, &ready) catch |err| {
+        if (!ready.sent) ready.send(switch (err) {
+            error.DistModelMismatch => MISMATCH,
+            error.DistModelNotFound => NOT_FOUND,
+            else => LOAD_FAILED,
+        }, 0, 0) catch {};
+        return err;
+    };
+}
+
+fn servePlanReady(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots: []const []const u8, pmsg: Msg, ready: *WorkerReady) !bool {
     var pl = try Plan.parse(pmsg);
     var name_buf: [256]u8 = undefined;
     const name_len: usize = @intCast(pmsg[5]);
@@ -2405,27 +2929,19 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
         .rows => log.info("[dist] worker: {s}, the whole DiT (video steps)\n", .{name}),
     }
 
-    const fail = struct {
-        fn send(l: *const Link, code: i32) void {
-            sendMsg(l, .{ MAGIC, code, 0, 0, 0, 0, 0, 0 }, 0) catch {};
-        }
-    };
     const found = findModel(io, allocator, roots, name, id) catch |err| {
         if (err == error.DistModelMismatch) log.err("[dist] worker: {s} here is not the host's copy (quantization or revision)\n", .{name});
-        fail.send(link, if (err == error.DistModelMismatch) MISMATCH else LOAD_FAILED);
         return err;
     };
     const dir = found orelse {
         log.err("[dist] worker: no model named {s} in {s}\n", .{ name, roots[0] });
-        fail.send(link, NOT_FOUND);
         return error.DistModelNotFound;
     };
     defer allocator.free(dir);
     if (pl.mode == .rows) {
         const wl = wireOf(link);
-        const released = h3_split.serveWorker(allocator, io, &wl, dir, pl.hidden, @intCast(pl.span.total)) catch |err| {
+        const released = h3_split.serveWorker(allocator, io, &wl, dir, pl.hidden, @intCast(pl.span.total), .{ .ctx = ready, .send = &WorkerReady.rows }) catch |err| {
             log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
-            fail.send(link, if (err == error.DistModelMismatch) MISMATCH else LOAD_FAILED);
             return err;
         };
         if (!released) log.info("[dist] worker: stopped by rank 0\n", .{});
@@ -2435,25 +2951,21 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
     defer config.deinit(allocator);
     if (!pl.matches(&config)) {
         log.err("[dist] worker: {s} here has a different geometry than the host's\n", .{dir});
-        fail.send(link, MISMATCH);
         return error.DistModelMismatch;
     }
-    if (config.isDsv41()) return serveDsv41(io, allocator, link, dir, &config, pl) catch |err| {
+    if (config.isDsv41()) return serveDsv41(io, allocator, link, dir, &config, pl, ready) catch |err| {
         log.err("[dist] worker: {s}\n", .{@errorName(err)});
         return err;
     };
     var xfm = load(io, allocator, dir, &config, pl.mode, pl.span, .{ .rank = link.rank, .size = link.size }) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
-        fail.send(link, LOAD_FAILED);
         return err;
     };
     defer xfm.deinit(allocator);
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
-    try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
+    try ready.send(0, @intCast(active >> 20), 0);
     log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
-    dist_watchdog.setBellTimeout(link.bells[0].fd, idleTimeoutMs());
-    cluster().follower_ready.store(true, .release);
 
     const t = &xfm.t;
     var ctx: ForwardCtx = .{ .cache = &xfm.cache, .moe_seq_offset = &xfm.off, .ssm_entries = xfm.entries, .capture_hidden = null, .vision_embeddings = null };
@@ -3212,7 +3724,7 @@ test "dist N-rank: the watcher names the worker whose bell closed, after reading
     var took: [4]u8 = undefined;
     std.mem.writeInt(u32, &took, 1234, .little);
     try (Bell{ .fd = pairs[1][1] }).writeAll(&took);
-    var last: u32 = 0;
+    var state: ClusterState = .{};
     // Rank 1's time is read first; then rank 2 leaves.
     const t = try std.Thread.spawn(.{}, struct {
         fn leave(fd: std.c.fd_t) void {
@@ -3221,8 +3733,8 @@ test "dist N-rank: the watcher names the worker whose bell closed, after reading
         }
     }.leave, .{pairs[2][1]});
     defer t.join();
-    try std.testing.expectEqual(@as(u32, 2), watchBells(&link, &last));
-    try std.testing.expectEqual(@as(u32, 1234), last);
+    try std.testing.expectEqual(@as(u32, 2), watchBells(&link, &state));
+    try std.testing.expectEqual(@as(u32, 1234), state.worker_us.load(.acquire));
 }
 
 test "dist N-rank: a load before every worker joined fails at once, as forming until the join timeout and late after it" {

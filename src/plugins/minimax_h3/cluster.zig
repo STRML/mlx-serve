@@ -267,7 +267,8 @@ pub fn begin(pack_dir: []const u8, io: std.Io, model: *h3.Model, turbo: bool, us
     // Diagnostic: diag h3-split-share=<0..1> keeps that share of the rows here, paying or not.
     const forced: ?u32 = if (env.span(.H3_SPLIT_SHARE)) |v| if (std.fmt.parseFloat(f64, v)) |f|
         std.math.clamp(@as(u32, @intFromFloat(@as(f64, @floatFromInt(rows)) * f)), 1, rows - 1)
-    else |_| null else null;
+    else |_|
+        null else null;
     const cut = forced orelse chooseCut(rows, p.host_calib_us.*, p.worker_calib_us, p.link_bytes_per_us.*, kv_row, @intCast(model.blocks.len)) orelse
         return alone("{d} rows: the swap would cost more than the worker saves", .{rows});
     try p.link.sendOp(.{ wire.OP_H3_JOB, @intFromBool(turbo), @intFromBool(bcast), 0, 0, 0, 0, 0 });
@@ -283,9 +284,14 @@ fn alone(comptime fmt: []const u8, args: anytype) ?Job {
     return null;
 }
 
+pub const Ready = struct {
+    ctx: *anyopaque,
+    send: *const fn (*anyopaque, u32, u32) anyerror!void,
+};
+
 /// The worker's side: loads the whole DiT from `dir`, reports its speed, then runs its rows of
 /// every step until rank 0 stops it.
-pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const wire.Link, dir: []const u8, hidden: i32, blocks: i32) !bool {
+pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const wire.Link, dir: []const u8, hidden: i32, blocks: i32, ready: Ready) !bool {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const dit = try std.fs.path.join(allocator, &.{ dir, "transformer.safetensors" });
@@ -300,7 +306,7 @@ pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const wire.L
     const calib = try calibrate(&model, io, s);
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
-    try link.sendOp(.{ wire.MAGIC, 0, @intCast(active >> 20), @intCast(calib), 0, 0, 0, 0 });
+    try ready.send(ready.ctx, @intCast(active >> 20), @intCast(@min(calib, std.math.maxInt(u32))));
     log.info("[dist] worker ready ({d} MiB resident, {d} us per {d}-row pass)\n", .{ active >> 20, calib, CALIB_ROWS });
     _ = try measureLink(link, io);
 
