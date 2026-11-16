@@ -135,6 +135,14 @@ fn dim(a: A, i: isize) c_int {
     return sh[if (i < 0) @intCast(@as(isize, @intCast(sh.len)) + i) else @intCast(i)];
 }
 
+/// Whether any weight a cut views is an outside quant plugin's: it holds no MLX arrays to view.
+fn readsOutside(ly: *const dsv41.Layer) bool {
+    if (ly.experts.ext != null) return true;
+    if (ly.shared_gu) |gu| if (gu.ext != null) return true;
+    for (ly.shared) |l| if (l.ext != null) return true;
+    return ly.wq_b.ext != null or ly.wo_a.ext != null or ly.wo_b.ext != null;
+}
+
 /// One rank's cut of a layer, built from the TP1 model's resident layer: the routed experts' w1/w3 a quarter of the
 /// intermediate rows and w2 a quarter of the hidden rows (middle-axis views of `[E, rows, cols]`), the shared expert
 /// the same, attention by heads (`wq_b` and `wo_a` rows, the per-head sink) and `wo_b`'s columns in a copy of its own.
@@ -157,7 +165,7 @@ pub const RowLayer = struct {
 
     pub fn init(gpa: std.mem.Allocator, s: S, ly: *const dsv41.Layer, rank: u32, size: u32) !RowLayer {
         const e = &ly.experts;
-        if (e.ext != null or ly.shared[2].ext != null or ly.wo_a.ext != null) return error.Dsv41RowCutOutsideQuant;
+        if (readsOutside(ly)) return error.Dsv41RowCutOutsideQuant;
         if (e.down.qp.mode == .gguf) return error.Dsv41RowCutGguf;
         var rl: RowLayer = .{ .gpa = gpa, .experts = undefined, .shared = undefined, .wq_b = undefined, .wo_a = undefined, .sink = none, .wo_b = undefined, .rank = rank, .size = size };
         if (e.gu) |gu| if (ly.shared_gu) |sgu| {
@@ -1005,6 +1013,37 @@ test "dsv41 row cut: a leader's prompt chunk ships the DSpark stage windows and 
         m.cfg.dsv41_index_sources &= have;
     }
     try expectLeaderShips(gpa, lead.m, follow.m);
+}
+
+test "dsv41 row cut: a layer with any linear in an outside quant plugin is refused by name" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    inline for (.{ false, true }) |fused| {
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .fused = fused });
+        defer fx.deinit();
+        const ly = fx.layer(20);
+        const w: @import("../../sdk/quant/outside.zig").Weight = .{ .t = undefined, .w = undefined };
+        var rl = try RowLayer.init(gpa, mlx.gpuStream(), ly, 0, 4);
+        rl.deinit();
+        var marked: usize = 0;
+        for (0..8) |which| {
+            var bad = ly.*;
+            switch (which) {
+                0 => bad.experts.ext = .{ w, w, w },
+                1, 2, 3 => bad.shared[which - 1].ext = w,
+                4 => bad.wq_b.ext = w,
+                5 => bad.wo_a.ext = w,
+                6 => bad.wo_b.ext = w,
+                else => if (bad.shared_gu) |*gu| {
+                    gu.ext = w;
+                } else continue,
+            }
+            marked += 1;
+            try testing.expectError(error.Dsv41RowCutOutsideQuant, RowLayer.init(gpa, mlx.gpuStream(), &bad, 0, 4));
+        }
+        try testing.expectEqual(@as(usize, if (ly.shared_gu != null) 8 else 7), marked);
+        if (fused) try testing.expect(ly.shared_gu != null);
+    }
 }
 
 test "dsv41 row cut: the parity bar fails a result that is not finite" {
