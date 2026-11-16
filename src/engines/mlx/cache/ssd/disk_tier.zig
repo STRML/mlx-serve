@@ -491,7 +491,7 @@ pub const DiskTier = struct {
         var best: ?*const IndexEntry = null;
         for (self.entries.items) |*e| {
             if (e.kind != .module or e.poisoned or e.module.?.state != .committed or e.kv_len != n) continue;
-            if (boundary_mod.id(@bitCast(e.module.?.manifest.prefix_key), e.tokens) != id) continue;
+            if (boundary_mod.id(@bitCast(e.module.?.manifest.prefix_key), e.tokens, e.media) != id) continue;
             if (best == null or e.id > best.?.id) best = e;
         }
         const e = best orelse return null;

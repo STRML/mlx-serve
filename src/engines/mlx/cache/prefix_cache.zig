@@ -2283,7 +2283,7 @@ pub const HotPrefixCache = struct {
         }
         // Only a prompt boundary a session tagged moves that session's tip.
         const seq: u64 = if (tail_from == 0 and session != 0) self.nextSessionSeq() else 0;
-        const boundary_key = boundary_mod.id(variantKey(prefix_key, binding.variant), ids);
+        const boundary_key = boundary_mod.id(variantKey(prefix_key, binding.variant), ids, eff_media);
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
             .tokens = keys[0],
