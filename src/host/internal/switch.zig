@@ -251,7 +251,7 @@ pub const Switch = struct {
         return switch (out) {
             .refused => |why| .{ .status = 409, .reason = @tagName(why), .snap = snap },
             .noop => .{ .status = 200, .snap = snap },
-            .ok => |effect| self.perform(cmd, effect, role, n, if (deadline_epoch_ms == 0) self.wall_fn(self.io) + default_formation_ms else deadline_epoch_ms, snap),
+            .ok => |effect| self.perform(cmd, effect, role, snap.n, if (deadline_epoch_ms == 0) self.wall_fn(self.io) + default_formation_ms else deadline_epoch_ms, snap),
         };
     }
 

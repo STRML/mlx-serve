@@ -5108,6 +5108,8 @@ const TestReleasePeer = struct {
     delay_ms: u32,
     result: ?anyerror = null,
     early_eof: bool = false,
+    sw: ?*switch_controller.Switch = null,
+    before_eof: ?switch_controller.Snapshot = null,
 
     fn run(self: *TestReleasePeer) void {
         dist_watchdog.setBellTimeout(self.bell.fd, 1000);
@@ -5124,6 +5126,7 @@ const TestReleasePeer = struct {
             self.result = error.TestExpectedRelease;
             return;
         }
+        if (self.sw) |sw| self.before_eof = sw.snapshot();
         crt.sleepMs(self.delay_ms);
         var byte: [1]u8 = undefined;
         self.early_eof = std.c.recv(self.bell.fd, &byte, 1, std.c.MSG.PEEK | std.c.MSG.DONTWAIT) == 0;
@@ -5778,6 +5781,35 @@ test "dist switch adapter: abort fallback reports release_timeout after FallRequ
     try std.testing.expect(switcher.poll(302) == null);
 }
 
+test "dist switch higher abort: forming cancels the running attempt and waits for confirmation" {
+    for ([_]bool{ false, true }) |follower| {
+        var t: TestAdapter = undefined;
+        try t.setup(follower, 5);
+        defer t.cleanup();
+        TestSwitchOpen.block = true;
+        TestSwitchOpen.ignore_cancel = true;
+        try std.testing.expectEqual(@as(u16, 200), t.sw.command(.drain, 5, 0).status);
+        try std.testing.expectEqual(@as(u16, 200), t.sw.command(if (follower) .join else .tp4, 5, 0).status);
+        try TestSwitchOpen.awaitEntered();
+        const reply = t.sw.command(.abort, 7, 0);
+        try std.testing.expectEqual(@as(u16, 200), reply.status);
+        try std.testing.expectEqual(.aborting, reply.snap.state);
+        try std.testing.expectEqual(@as(u64, 5), reply.snap.n);
+        try std.testing.expectEqual(@as(u64, 7), reply.snap.high_water);
+        try std.testing.expect(!reply.snap.admitting);
+        try std.testing.expect(switcher.poll(5) == null);
+        TestSwitchOpen.finish.store(true, .release);
+        try std.testing.expectEqual(.cancelled, try TestSwitchOpen.outcome(5));
+        _ = t.sw.pump();
+        const done = t.sw.snapshot();
+        try std.testing.expectEqual(.aborted, done.state);
+        try std.testing.expectEqual(.cancelled, done.failure);
+        try std.testing.expect(done.admitting);
+        try std.testing.expectEqualStrings("stale", t.sw.command(.join, 6, 0).reason);
+        try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
+    }
+}
+
 test "dist switch adapter: failed or absent swap hook consumes each role once" {
     for ([_]bool{ false, true }) |follower| for ([_]bool{ false, true }) |missing| {
         var t: TestAdapter = undefined;
@@ -6141,6 +6173,63 @@ test "dist switch mode: installed hook orders leader activate release and clears
         }
         try t.expectClear();
     }
+}
+
+test "dist switch higher abort: leader releases the running link and clears TP mode before publishing released" {
+    var t: TestModeAdapter = undefined;
+    try t.setup(false, 5);
+    defer t.cleanup();
+    _ = try t.base.form(false, 5);
+    _ = t.base.sw.pump();
+    try std.testing.expectEqual(.tp, t.model.modes.active);
+    var closer: TestReleasePeer = .{ .bell = TestSwitchOpen.peer_bell, .delay_ms = 20, .sw = &t.base.sw };
+    const th = try std.Thread.spawn(.{}, TestReleasePeer.run, .{&closer});
+    const reply = t.base.sw.command(.abort, 7, 0);
+    th.join();
+    try std.testing.expectEqual(@as(u16, 200), reply.status);
+    try std.testing.expectEqual(@as(?anyerror, null), closer.result);
+    try std.testing.expectEqual(.releasing, closer.before_eof.?.state);
+    try std.testing.expectEqual(@as(u64, 5), closer.before_eof.?.n);
+    try std.testing.expectEqual(@as(u64, 7), closer.before_eof.?.high_water);
+    try std.testing.expect(!closer.early_eof);
+    try std.testing.expectEqual(@as(usize, 2), t.swaps);
+    try std.testing.expectEqual(.released, reply.snap.state);
+    try std.testing.expectEqual(@as(u64, 7), reply.snap.high_water);
+    try std.testing.expect(t.base.sw.link == null);
+    try std.testing.expect(switcher.poll(5) == null);
+    try std.testing.expect(!switchHolds("/m/switch"));
+    try t.expectClear();
+    try std.testing.expectEqualStrings("stale", t.base.sw.command(.join, 6, 0).reason);
+}
+
+test "dist switch higher abort: follower arms the two second fall for the running attempt" {
+    var t: TestModeAdapter = undefined;
+    try t.setup(true, 5);
+    defer t.cleanup();
+    const link = try t.base.form(true, 5);
+    _ = t.base.sw.pump();
+    const began = crt.monotonicMs();
+    const reply = t.base.sw.command(.abort, 7, 0);
+    try std.testing.expectEqual(@as(u16, 200), reply.status);
+    try std.testing.expect(link.state.?.aborting.load(.acquire));
+    try std.testing.expectEqual(.aborting, reply.snap.state);
+    try std.testing.expectEqual(@as(u64, 5), reply.snap.n);
+    try std.testing.expectEqual(@as(u64, 7), reply.snap.high_water);
+    try std.testing.expectEqual(.tp, t.model.modes.active);
+    try std.testing.expect(switch_adapter.serveFollower());
+    const elapsed = crt.monotonicMs() - began;
+    try std.testing.expect(elapsed >= 1900 and elapsed < 4000);
+    const done = t.base.sw.snapshot();
+    try std.testing.expectEqual(.aborted, done.state);
+    try std.testing.expectEqual(.release_timeout, done.failure);
+    try std.testing.expect(!done.quarantined);
+    try std.testing.expectEqual(@as(u64, 7), done.high_water);
+    try std.testing.expectEqual(@as(usize, 2), t.swaps);
+    try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
+    try std.testing.expect(t.base.sw.link == null);
+    try std.testing.expect(switcher.poll(5) == null);
+    try std.testing.expect(!switchHolds("/m/switch"));
+    try t.expectClear();
 }
 
 test "dist switch mode: leader pipes through the formed link without a cold Peer" {

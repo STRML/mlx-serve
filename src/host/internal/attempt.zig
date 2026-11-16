@@ -44,10 +44,9 @@ pub const Outcome = union(enum) {
 pub const Machine = struct {
     cfg: Config = .{},
     state: State = .idle,
-    /// The latest attempt this box knows: its high-water, and the one every command is judged against.
+    /// The running attempt's identity, retained until its completion is reported.
     n: u64 = 0,
-    /// The highest N an abort named while this box was releasing a lower one: the release continues, and no attempt at or
-    /// below it starts afterwards.
+    /// A higher abort fences later commands without renaming the running attempt.
     fence: u64 = 0,
     role: Role = .none,
     entered_ms: i64 = 0,
@@ -62,7 +61,7 @@ pub const Machine = struct {
         self.tick(now_ms);
         if (self.quarantined) return .{ .refused = .quarantined };
         if (n == 0) return .{ .refused = .invalid };
-        if (n < self.n) return .{ .refused = .stale };
+        if (n < self.highWater()) return .{ .refused = .stale };
         return switch (cmd) {
             .drain => self.drain(n, now_ms),
             .tp4 => self.form(.leader, n, now_ms),
@@ -143,7 +142,9 @@ pub const Machine = struct {
                 break :blk .{ .ok = .none };
             },
         };
-        self.n = n;
+        if (self.state == .aborting or self.state == .releasing) {
+            if (n > self.n) self.fence = @max(self.fence, n);
+        } else self.n = n;
         return out;
     }
 
@@ -238,9 +239,10 @@ const Row = struct {
     cmd: Cmd,
     arg: u64,
     want: Outcome,
-    /// State and N after (the high-water moves with N).
+    /// State, reported N and the fence after the command.
     to: State,
     to_n: u64 = 5,
+    to_fence: u64 = 0,
 };
 
 const ok = struct {
@@ -301,7 +303,8 @@ const table = [_]Row{
     .{ .from = .formed, .role = .leader, .cmd = .abort, .arg = 5, .want = ok.e(.begin_release), .to = .releasing },
     .{ .from = .formed, .role = .follower, .cmd = .abort, .arg = 5, .want = ok.e(.await_release), .to = .aborting },
     .{ .from = .releasing, .cmd = .abort, .arg = 5, .want = .noop, .to = .releasing },
-    .{ .from = .releasing, .cmd = .abort, .arg = 7, .want = ok.e(.none), .to = .releasing },
+    .{ .from = .releasing, .cmd = .abort, .arg = 7, .want = ok.e(.none), .to = .releasing, .to_fence = 7 },
+    .{ .from = .aborting, .cmd = .abort, .arg = 7, .want = .noop, .to = .aborting, .to_fence = 7 },
     .{ .from = .released, .cmd = .abort, .arg = 5, .want = .noop, .to = .released },
     .{ .from = .aborted, .cmd = .abort, .arg = 5, .want = .noop, .to = .aborted },
     .{ .from = .aborted, .cmd = .abort, .arg = 4, .want = .{ .refused = .stale }, .to = .aborted },
@@ -311,9 +314,9 @@ const table = [_]Row{
     .{ .from = .released, .cmd = .abort, .arg = 7, .want = ok.e(.none), .to = .aborted, .to_n = 7 },
     .{ .from = .aborted, .cmd = .abort, .arg = 7, .want = ok.e(.none), .to = .aborted, .to_n = 7 },
     .{ .from = .draining, .cmd = .abort, .arg = 7, .want = ok.e(.reopen_admission), .to = .aborted, .to_n = 7 },
-    .{ .from = .forming, .cmd = .abort, .arg = 7, .want = ok.e(.cancel_formation), .to = .aborting, .to_n = 7 },
-    .{ .from = .formed, .role = .leader, .cmd = .abort, .arg = 7, .want = ok.e(.begin_release), .to = .releasing, .to_n = 7 },
-    .{ .from = .formed, .role = .follower, .cmd = .abort, .arg = 7, .want = ok.e(.await_release), .to = .aborting, .to_n = 7 },
+    .{ .from = .forming, .cmd = .abort, .arg = 7, .want = ok.e(.cancel_formation), .to = .aborting, .to_fence = 7 },
+    .{ .from = .formed, .role = .leader, .cmd = .abort, .arg = 7, .want = ok.e(.begin_release), .to = .releasing, .to_fence = 7 },
+    .{ .from = .formed, .role = .follower, .cmd = .abort, .arg = 7, .want = ok.e(.await_release), .to = .aborting, .to_fence = 7 },
 };
 
 fn machineIn(from: State, n: u64, role: Role) Machine {
@@ -328,6 +331,25 @@ test "attempt table: every command in every state" {
         try t.expectEqualDeep(row.want, got);
         try t.expectEqual(row.to, m.state);
         try t.expectEqual(row.to_n, m.n);
+        try t.expectEqual(@max(row.to_n, row.to_fence), m.highWater());
+    }
+}
+
+test "internal switch: a higher abort fences every command while preserving active completion callbacks" {
+    for ([_]State{ .forming, .formed, .releasing, .aborting }) |state| {
+        var m = machineIn(state, 5, .leader);
+        _ = m.command(.abort, 7, 100);
+        try t.expectEqual(@as(u64, 5), m.n);
+        try t.expectEqual(@as(u64, 7), m.highWater());
+        for (std.enums.values(Cmd)) |cmd| {
+            try t.expectEqual(Outcome{ .refused = .stale }, m.command(cmd, 6, 110));
+        }
+        const finished = if (m.state == .releasing) m.released(5, 120) else m.formationFailed(5, 120, .cancelled);
+        try t.expect(finished);
+        try t.expect(m.admits());
+        try t.expectEqual(Outcome{ .refused = .stale }, m.command(.join, 6, 130));
+        try t.expectEqual(Outcome{ .refused = .stale }, m.command(.drain, 7, 130));
+        try t.expectEqual(Outcome{ .ok = .close_admission }, m.command(.drain, 8, 140));
     }
 }
 
