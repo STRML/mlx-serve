@@ -326,6 +326,35 @@ pub const RouteCrc = struct {
     }
 };
 
+/// What a TP4 prompt chunk needs from the mode it runs in. Rank 0 runs the chunk on its TP1 model alone (`run`, which
+/// hands back the slot's snapshot after it), then `ship` sends that snapshot's cache tensors to every other rank under
+/// its id: `dsv41.tpLoad`'s path through the cluster's `tp_load` hook in serving, a recorder in a test.
+pub const LeaderPrefill = struct {
+    ctx: ?*anyopaque = null,
+    whole: *const dsv41.Dsv41Model,
+    run: *const fn (ctx: ?*anyopaque, ids: []const u32, p0: usize) anyerror!*const dsv41.Snap,
+    ship: *const fn (ctx: ?*anyopaque, id: u64, ids: []const u32, tensors: []const A) anyerror!void,
+};
+
+/// Rank 0's half of a prompt chunk (`ids` from position `p0`): the chunk on the TP1 model, then its state to the other
+/// ranks. Returns the snapshot `run` made.
+pub fn prefillOnLeader(gpa: std.mem.Allocator, g: Group, lp: LeaderPrefill, ids: []const u32, p0: usize) !*const dsv41.Snap {
+    if (g.rank != 0) return error.Dsv41RowCutNotLeader;
+    const sn = try lp.run(lp.ctx, ids, p0);
+    if (g.size == 1) return sn;
+    const xs = try dsv41.tpLoadTensors(lp.whole, gpa, sn);
+    defer dsv41.freeArrays(gpa, xs);
+    try lp.ship(lp.ctx, sn.tp_id, sn.ids, xs);
+    return sn;
+}
+
+/// A follower's half: rank 0's snapshot `id` rebuilt from the tensors it shipped, into `snaps` under that id (the next
+/// TP4 turn restores it). The KV is whole on every rank, so the follower's TP1 model takes it as is.
+pub fn importOnFollower(gpa: std.mem.Allocator, g: Group, whole: *const dsv41.Dsv41Model, snaps: *dsv41.Snaps, id: u64, ids: []const u32, tensors: []const A) !void {
+    if (g.rank == 0) return error.Dsv41RowCutLeaderImport;
+    try dsv41.tpWorkerLoad(whole, gpa, snaps, id, ids, tensors);
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -880,4 +909,71 @@ test "dsv41 row cut: the fused down launch over a rank's rows of the resident ba
             try testing.expect(decode.relRms(b, a) < 5e-3);
         }
     }
+}
+
+/// The test seam of a TP4 prompt chunk: `run` hands back a snapshot built from `disk`, `ship` imports what the leader
+/// sends into a follower's snapshots.
+const PrefillRig = struct {
+    gpa: std.mem.Allocator,
+    leader: *dsv41.Dsv41Model,
+    follower: *dsv41.Dsv41Model,
+    lead: dsv41.Snaps,
+    follow: dsv41.Snaps,
+    disk: []const A,
+    shipped: usize = 0,
+
+    fn run(ctx: ?*anyopaque, ids: []const u32, _: usize) anyerror!*const dsv41.Snap {
+        const self: *PrefillRig = @ptrCast(@alignCast(ctx.?));
+        try dsv41.tpWorkerLoad(self.leader, self.gpa, &self.lead, 7, ids, self.disk);
+        const sn = self.lead.getPtr(7).?;
+        sn.tp_id = 7;
+        return sn;
+    }
+
+    fn ship(ctx: ?*anyopaque, id: u64, ids: []const u32, tensors: []const A) anyerror!void {
+        const self: *PrefillRig = @ptrCast(@alignCast(ctx.?));
+        self.shipped += 1;
+        try importOnFollower(self.gpa, .{ .rank = 1, .size = 4, .gather = Group.solo.gather }, self.follower, &self.follow, id, ids, tensors);
+    }
+};
+
+test "dsv41 row cut: a prompt chunk on the leader reaches a follower as the same snapshot, under the leader's id" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const lead = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer lead.deinit();
+    const follow = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
+    defer follow.deinit();
+    const n = 301;
+    const plan = try dsv41.tpLoadPlan(lead.m, n);
+    var sc = Scope.init(gpa, lead.m.s);
+    defer sc.deinit();
+    const disk = try gpa.alloc(A, plan.len);
+    defer gpa.free(disk);
+    for (plan.specs(), disk, 0..) |spec, *x, k| {
+        const shape = [_]c_int{ @intCast(spec.rows), @intCast(spec.width) };
+        x.* = try sc.reshape(try sc.astype(try sc.arange(k, k + spec.rows * spec.width), spec.dtype), shape[0..spec.rank()]);
+    }
+    const ids = try gpa.alloc(u32, n);
+    defer gpa.free(ids);
+    @memset(ids, 5);
+    var rig: PrefillRig = .{ .gpa = gpa, .leader = lead.m, .follower = follow.m, .lead = .init(gpa), .follow = .init(gpa), .disk = disk };
+    defer dsv41.dropSnaps(&rig.lead, gpa);
+    defer dsv41.dropSnaps(&rig.follow, gpa);
+    const lp: LeaderPrefill = .{ .ctx = &rig, .whole = lead.m, .run = PrefillRig.run, .ship = PrefillRig.ship };
+    const four: Group = .{ .rank = 0, .size = 4, .gather = Group.solo.gather };
+    _ = try prefillOnLeader(gpa, four, lp, ids, 0);
+    try testing.expectEqual(@as(usize, 1), rig.shipped);
+    const got = rig.follow.getPtr(7) orelse return error.NotShipped;
+    try testing.expectEqual(@as(usize, n), got.n);
+    const want = try dsv41.tpLoadTensors(lead.m, gpa, rig.lead.getPtr(7).?);
+    defer dsv41.freeArrays(gpa, want);
+    const back = try dsv41.tpLoadTensors(follow.m, gpa, got);
+    defer dsv41.freeArrays(gpa, back);
+    for (want, back) |a, b| try testing.expect(try same(a, b));
+    // Only the leader prefills; only a follower imports; one rank ships nothing.
+    try testing.expectError(error.Dsv41RowCutNotLeader, prefillOnLeader(gpa, .{ .rank = 2, .size = 4, .gather = Group.solo.gather }, lp, ids, 0));
+    try testing.expectError(error.Dsv41RowCutLeaderImport, importOnFollower(gpa, four, follow.m, &rig.follow, 8, ids, want));
+    _ = try prefillOnLeader(gpa, Group.solo, lp, ids, 0);
+    try testing.expectEqual(@as(usize, 1), rig.shipped);
 }
