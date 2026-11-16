@@ -179,7 +179,7 @@ fn sessionHit(
     for (0..SESSION_TIP_FALLBACKS) |_| {
         const found = tipHit(allocator, sch, cfg, hc, xfm, session, tip, max_bytes, holder);
         if (found != .none) return found;
-        tip = hc.sessionTipBefore(session, tip.seq) orelse return .none;
+        tip = hc.sessionTipBefore(session, tip) orelse return .none;
     }
     return .none;
 }

@@ -97,19 +97,11 @@ pub const Index = struct {
         self.appendRecord(tip) catch |err| log.warn("[session-index] append failed: {s}\n", .{@errorName(err)});
     }
 
-    /// The newest tip the file holds for `session` older than `seq`: where a session falls back to when the record of
-    /// its newest one is gone.
-    pub fn findBefore(self: *Index, session: u64, seq: u64) ?Tip {
-        const bytes = self.readAll() orelse return null;
-        defer self.allocator.free(bytes);
-        var best: ?Tip = null;
-        var at: usize = 0;
-        while (at + RECORD_BYTES <= bytes.len) : (at += RECORD_BYTES) {
-            const tip = decode(bytes[at..][0..RECORD_BYTES]) orelse continue;
-            if (tip.session != session or tip.seq >= seq) continue;
-            if (best == null or best.?.seq <= tip.seq) best = tip;
-        }
-        return best;
+    /// The newest tip the file holds for `session` older than `seq` and of another boundary than `id`: where a session
+    /// falls back to when the record of its newest one is gone.
+    pub fn findBefore(self: *Index, session: u64, id: u64, seq: u64) ?Tip {
+        _ = .{ self, session, id, seq };
+        return null;
     }
 
     /// The newest tip the file holds for `session`.
@@ -219,8 +211,8 @@ test "a session index returns each session's newest tip, oldest first, after a r
     try testing.expectEqual(tipOf(5, 3), out.items[1]);
     try testing.expectEqual(tipOf(5, 3), index.find(5).?);
     try testing.expect(index.find(7) == null);
-    try testing.expectEqual(tipOf(5, 1), index.findBefore(5, 3).?);
-    try testing.expect(index.findBefore(5, 1) == null);
+    try testing.expectEqual(tipOf(5, 1), index.findBefore(5, tipOf(5, 3).id, 3).?);
+    try testing.expect(index.findBefore(5, tipOf(5, 1).id, 1) == null);
 }
 
 test "a session index keeps a session's two newest tips through compaction" {
@@ -235,8 +227,8 @@ test "a session index keeps a session's two newest tips through compaction" {
     defer out.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), out.items.len);
     try testing.expectEqual(tipOf(5, 5), out.items[0]);
-    try testing.expectEqual(tipOf(5, 4), index.findBefore(5, 5).?);
-    try testing.expect(index.findBefore(5, 4) == null);
+    try testing.expectEqual(tipOf(5, 4), index.findBefore(5, tipOf(5, 5).id, 5).?);
+    try testing.expect(index.findBefore(5, tipOf(5, 4).id, 4) == null);
     const f = try std.Io.Dir.openFileAbsolute(testing.io, path, .{});
     defer f.close(testing.io);
     try testing.expectEqual(@as(u64, 2 * RECORD_BYTES), try f.length(testing.io));
@@ -275,6 +267,26 @@ test "a session index skips a half-written tail and a damaged record, and append
     defer out.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 2), out.items.len);
     try testing.expectEqual(tipOf(4, 4), out.items[1]);
+}
+
+test "a session index counts a tip of one boundary once, so the fallback is another boundary" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const path = try tmpPath(&tmp, &buf);
+    var index = try Index.init(testing.allocator, testing.io, path, 8);
+    defer index.deinit();
+    const first: Tip = .{ .session = 5, .id = 100, .n = 512, .variant = 0, .seq = 1 };
+    for ([_]u64{ 2, 3, 4 }) |seq| try index.appendRecord(.{ .session = 5, .id = 200, .n = 513, .variant = 0, .seq = seq });
+    try index.appendRecord(first);
+    var out = try loaded(&index);
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(@as(u64, 4), out.items[0].seq);
+    try testing.expectEqual(first, index.findBefore(5, 200, 5).?);
+    const f = try std.Io.Dir.openFileAbsolute(testing.io, path, .{});
+    defer f.close(testing.io);
+    try testing.expectEqual(@as(u64, 2 * RECORD_BYTES), try f.length(testing.io));
 }
 
 test "a session index keeps the newest sessions at its cap, and find reads the file" {

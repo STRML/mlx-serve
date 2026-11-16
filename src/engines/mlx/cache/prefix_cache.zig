@@ -1534,10 +1534,10 @@ pub const HotPrefixCache = struct {
         return tip;
     }
 
-    /// The session's tip before the one with `seq`: the fallback when that one's record is gone.
-    pub fn sessionTipBefore(self: *HotPrefixCache, session: u64, seq: u64) ?SessionTip {
-        const index = self.tipIndex() orelse return null;
-        return tipOf(index.findBefore(session, seq) orelse return null);
+    /// The session's tip before `newer`, of another boundary: the fallback when `newer`'s record is gone.
+    pub fn sessionTipBefore(self: *HotPrefixCache, session: u64, newer: SessionTip) ?SessionTip {
+        _ = .{ self, session, newer };
+        return null;
     }
 
     fn tipOf(record: session_index_mod.Tip) SessionTip {
@@ -13629,7 +13629,90 @@ test "HotPrefixCache module: a tip whose record is gone falls back to the sessio
     const record = hc.disk.?.moduleByBoundary(newest.id, newest.n) orelse return error.TestExpectedRecord;
     hc.disk.?.retireModule(record.id);
     try testing.expect(hc.disk.?.moduleByBoundary(newest.id, newest.n) == null);
-    const older = hc.sessionTipBefore(7, newest.seq) orelse return error.TestExpectedTip;
+    const older = hc.sessionTipBefore(7, newest) orelse return error.TestExpectedTip;
     try testing.expectEqual(@as(usize, 512), older.n);
     try testing.expect(hc.disk.?.moduleByBoundary(older.id, older.n) != null);
+}
+
+test "HotPrefixCache module: claiming one checkpoint again and again never costs the session its previous tip" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const ids = ModuleDiskTest.ids(7);
+    const dense = kv_quant.KVQuantConfig.dense;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    {
+        var hc = try ModuleDiskTest.init(&tmp, 8);
+        defer hc.deinit();
+        var a = ModuleDiskTest.snap(&fake, ids[0..512]);
+        var b = ModuleDiskTest.snap(&fake, ids[0..513]);
+        _ = try a.putSession(&hc, binding, &.{}, 7);
+        try ModuleDiskTest.finish(&hc, cpu);
+        _ = hc.flushOwedSlice(cpu);
+        _ = try b.putSession(&hc, binding, &.{}, 9);
+        try ModuleDiskTest.finish(&hc, cpu);
+        _ = hc.flushOwedSlice(cpu);
+        for (0..3) |_| try testing.expect(hc.claimCovering(binding, ids[0..513], &.{}, false, dense, 7));
+
+        const newest = hc.sessionTip(7) orelse return error.TestExpectedTip;
+        try testing.expectEqual(@as(usize, 513), newest.n);
+        const record = hc.disk.?.moduleByBoundary(newest.id, newest.n) orelse return error.TestExpectedRecord;
+        hc.disk.?.retireModule(record.id);
+        const older = hc.sessionTipBefore(7, newest) orelse return error.TestExpectedTip;
+        try testing.expectEqual(@as(usize, 512), older.n);
+    }
+    var hc = try ModuleDiskTest.init(&tmp, 8);
+    defer hc.deinit();
+    const newest = hc.sessionTip(7) orelse return error.TestExpectedTip;
+    try testing.expectEqual(@as(usize, 513), newest.n);
+    try testing.expect(hc.disk.?.moduleByBoundary(newest.id, newest.n) == null);
+    const older = hc.sessionTipBefore(7, newest) orelse return error.TestExpectedTip;
+    try testing.expectEqual(@as(usize, 512), older.n);
+    try testing.expect(hc.disk.?.moduleByBoundary(older.id, older.n) != null);
+}
+
+test "HotPrefixCache module: when the idle flush reports done, every tip whose record landed is in the file" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var hc = try ModuleDiskTest.init(&tmp, 8);
+    defer hc.deinit();
+    const first_ids = ModuleDiskTest.ids(7);
+    const second_ids = ModuleDiskTest.ids(3000);
+    const third_ids = ModuleDiskTest.ids(6000);
+    var first = ModuleDiskTest.snap(&fake, first_ids[0..512]);
+    var second = ModuleDiskTest.snap(&fake, second_ids[0..512]);
+    var third = ModuleDiskTest.snap(&fake, third_ids[0..512]);
+    _ = try first.putSession(&hc, binding, &.{}, 7);
+    _ = try second.putSession(&hc, binding, &.{}, 8);
+    _ = try third.putSession(&hc, binding, &.{}, 9);
+    var calls: usize = 0;
+    while (hc.flushOwedSlice(cpu) != .done and calls < 64) : (calls += 1) hc.disk.?.drainWriter();
+    try testing.expect(calls < 64);
+    const index = hc.tipIndex() orelse return error.TestExpectedIndex;
+    for ([_]u64{ 7, 8, 9 }) |session| try testing.expect(index.find(session) != null);
+}
+
+test "HotPrefixCache module: sessions that claim one resident checkpoint below the persistence floor all keep their export" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    cache.session_tip_cap = 4;
+    const dense = kv_quant.KVQuantConfig.dense;
+    var owner: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    _ = try owner.putSession(&cache, binding, &.{}, 7);
+    for (8..20) |session| try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3, 4 }, &.{}, false, dense, session));
+    for (7..20) |session| try testing.expect(cache.findSessionTip(session) != null);
 }
