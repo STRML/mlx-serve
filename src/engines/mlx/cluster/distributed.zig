@@ -6543,3 +6543,57 @@ test "dist switch probe: immediate abort EOF cannot masquerade as the fallback" 
     try std.testing.expectError(error.ProbeFallEarly, switchProbeServe(402, link, .fall));
     try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
 }
+
+test "dist switch memory: repeated start poll release plateaus" {
+    if (!@import("build_options").slow_tests) return error.SkipZigTest;
+    const system = @import("../../../sdk/util/system.zig");
+    for ([_]switcher.Role{ .leader, .follower }) |role| {
+        TestSwitchOpen.setup();
+        defer TestSwitchOpen.cleanup();
+        var warm_rss: u32 = 0;
+        var warm_footprint: u32 = 0;
+        std.debug.print("[dist-memory] role={s} cycle=0 rss_mib={d} footprint_mib={d}\n", .{ @tagName(role), system.getAppRssMb(), system.getAppMemFootprintMb() });
+        for (1..2001) |n| {
+            var req = TestSwitchOpen.request(n);
+            req.role = role;
+            req.cfg.rank = if (role == .leader) 0 else 1;
+            try TestSwitchOpen.start(req);
+            const link = (try TestSwitchOpen.outcome(n)).formed.link;
+            try switcher.activate(n);
+            tickInferenceLoop();
+            parkInferenceLoop();
+            var peer_runner: TestReleasePeer = .{ .bell = TestSwitchOpen.peer_bell, .delay_ms = 0 };
+            const peer_thread = if (role == .leader)
+                try std.Thread.spawn(.{}, TestReleasePeer.run, .{&peer_runner})
+            else blk: {
+                try TestSwitchOpen.peer_bell.writeAll(&.{Bell.release_byte});
+                try std.testing.expectEqual(OP_RELEASE, (try recvMsg(link, 0))[0]);
+                break :blk null;
+            };
+            var rank: u32 = 99;
+            const result = switcher.release(n, link, &rank);
+            if (peer_thread) |thread| thread.join();
+            try result;
+            try std.testing.expectEqual(@as(?anyerror, null), peer_runner.result);
+            try std.testing.expect(!peer_runner.early_eof);
+            _ = std.c.close(TestSwitchOpen.peer_bell.fd);
+            TestSwitchOpen.peer_bell = .{};
+            try std.testing.expect(switcher.poll(n) == null);
+            try std.testing.expect(cluster().active_state == null and cluster().switch_group == null and cluster().tp_link == null);
+            try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
+            if (n % 100 != 0) continue;
+            const rss = system.getAppRssMb();
+            const footprint = system.getAppMemFootprintMb();
+            std.debug.print("[dist-memory] role={s} cycle={d} rss_mib={d} footprint_mib={d}\n", .{ @tagName(role), n, rss, footprint });
+            if (n == 200) {
+                try std.testing.expect(rss > 0 and footprint > 0);
+                warm_rss = rss;
+                warm_footprint = footprint;
+            }
+            if (n > 200) {
+                try std.testing.expect(rss <= warm_rss + 16);
+                try std.testing.expect(footprint <= warm_footprint + 16);
+            }
+        }
+    }
+}
