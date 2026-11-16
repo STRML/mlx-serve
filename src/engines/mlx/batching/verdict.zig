@@ -10,6 +10,7 @@ const testing = std.testing;
 
 const Scheduler = @import("../scheduler.zig").Scheduler;
 const SIBLING_MARGIN_BYTES = @import("../scheduler/params.zig").SIBLING_MARGIN_BYTES;
+const PromiseLedger = @import("../scheduler/params.zig").PromiseLedger;
 const Slot = @import("../slot.zig").Slot;
 
 /// Slots one batched forward can carry; the tail decodes serial this tick.
@@ -214,10 +215,11 @@ pub fn holdsForMemory(fits: bool, live_company: bool) bool {
     return !fits and live_company;
 }
 
-/// Does a prefill needing `need` fit `avail` beside siblings' unallocated promises, a running
+/// Does a prefill needing `need` fit `avail` (plus the hot cache a prefill's own eviction pass returns) beside siblings' unallocated promises, a running
 /// media job's reserve, and the sibling margin? Metal OOM is uncatchable, so a media step's
 /// transients are billed before chat may take them.
-pub fn admissionFits(need: u64, avail: u64, promised: u64, gen_reserve: u64, live: usize) bool {
+pub fn admissionFits(need: u64, avail: u64, reclaimable: u64, promised: u64, gen_reserve: u64, live: usize) bool {
+    _ = reclaimable;
     const margin: u64 = if (live > 0) SIBLING_MARGIN_BYTES else 0;
     return need +| promised +| gen_reserve +| margin <= avail;
 }
@@ -241,14 +243,31 @@ test "a prefill that does not fit waits only while another request is live" {
     try testing.expect(!holdsForMemory(true, true));
 }
 
+test "a full RAM tier does not serialize the requests: the hold counts the hot cache the prefill would evict" {
+    const gb: u64 = 1 << 30;
+    // DeepSeek-V4.1 iQ at 20k tokens bills about 3.5 GB; the 8 GB tier sits inside active memory and leaves 5 GB of the 13 GB.
+    const need = 7 * gb / 2;
+    const avail = 5 * gb;
+    const reclaimable = 6 * gb;
+    var ledger: PromiseLedger = .{};
+    var admitted: usize = 0;
+    for (0..4) |_| {
+        if (!admissionFits(need, avail, reclaimable, ledger.outstanding(0), 0, admitted)) break;
+        ledger.admit(need, 0);
+        admitted += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), admitted);
+    try testing.expect(!admissionFits(need, avail, 0, need, 0, 1)); // no cache to evict: the second still waits
+}
+
 test "a running media job's reserve is billed: a prefill that fits live memory alone holds" {
     const gb: u64 = 1 << 30;
-    try testing.expect(admissionFits(10 * gb, 20 * gb, 0, 0, 0));
-    try testing.expect(!admissionFits(10 * gb, 20 * gb, 0, 12 * gb, 0));
-    try testing.expect(holdsForMemory(admissionFits(10 * gb, 20 * gb, 0, 12 * gb, 0), 12 * gb > 0));
-    try testing.expect(!admissionFits(10 * gb, 20 * gb, 4 * gb, 7 * gb, 0)); // promises and reserve add
-    try testing.expect(admissionFits(17 * gb, 20 * gb, 0, 0, 1));
-    try testing.expect(!admissionFits(19 * gb, 20 * gb, 0, 0, 1)); // a sibling keeps its margin
+    try testing.expect(admissionFits(10 * gb, 20 * gb, 0, 0, 0, 0));
+    try testing.expect(!admissionFits(10 * gb, 20 * gb, 0, 0, 12 * gb, 0));
+    try testing.expect(holdsForMemory(admissionFits(10 * gb, 20 * gb, 0, 0, 12 * gb, 0), 12 * gb > 0));
+    try testing.expect(!admissionFits(10 * gb, 20 * gb, 0, 4 * gb, 7 * gb, 0)); // promises and reserve add
+    try testing.expect(admissionFits(17 * gb, 20 * gb, 0, 0, 0, 1));
+    try testing.expect(!admissionFits(19 * gb, 20 * gb, 0, 0, 0, 1)); // a sibling keeps its margin
 }
 
 test "modelBatchable rejects MoE / hybrid / encoder / sliding-window" {
