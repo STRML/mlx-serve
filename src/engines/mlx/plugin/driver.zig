@@ -1216,7 +1216,7 @@ pub fn auxBinding(xfm: *const Transformer) ?AuxBinding {
     const cache = b.table.cache;
     if (cache.size < @sizeOf(abi.CacheHooks)) return null;
     const hooks = cache.aux orelse return null;
-    if (hooks.size < @offsetOf(abi.AuxHooks, "import_plan_details")) return null;
+    if (hooks.size < abi.AuxHooks.min_size) return null;
     return .{ .model = b.model, .hooks = hooks };
 }
 
@@ -1758,7 +1758,7 @@ test "absent and short auxiliary tables refuse without calling hooks" {
             7 => hooks.size = @offsetOf(abi.AuxHooks, "import_plan"),
             8 => hooks.size = @offsetOf(abi.AuxHooks, "export_arrays"),
             9 => hooks.size = @offsetOf(abi.AuxHooks, "import_arrays"),
-            10 => hooks.size = @sizeOf(abi.AuxHooks) - 1,
+            10 => hooks.size = abi.AuxHooks.min_size - 1,
             11 => {
                 hooks.size = @sizeOf(abi.AuxHooks);
                 cache.size = @offsetOf(abi.CacheHooks, "aux");
@@ -1793,6 +1793,31 @@ test "plugin aux: eligibility is per instance" {
     try t.expect(!auxEnabled(&x));
     fake.on = true;
     try t.expect(auxEnabled(&x));
+}
+
+test "plugin aux: a table that ends at import_plan_details binds and contributes no settings key" {
+    const t = std.testing;
+    const Key = struct {
+        fn settingsKey(_: *anyopaque) callconv(.c) u64 {
+            return 99;
+        }
+    };
+    var fake: AuxFake = .{ .on = true };
+    var hooks = AuxFake.hooks;
+    hooks.settings_key = &Key.settingsKey;
+    var cache: abi.CacheHooks = .{ .aux = &hooks };
+    const table = AuxFake.table(&cache);
+    var bound: Bound = .{ .table = &table, .model = &fake };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    try t.expectEqual(@as(?u64, 99), auxSettingsKey(&x));
+    hooks.size = @offsetOf(abi.AuxHooks, "settings_key");
+    try t.expect(auxBinding(&x) != null);
+    try t.expect(auxEnabled(&x));
+    try t.expectEqual(@as(?u64, null), auxSettingsKey(&x));
+    hooks.size = abi.AuxHooks.min_size;
+    try t.expect(auxBinding(&x) != null);
+    try t.expectEqual(@as(?u64, null), auxSettingsKey(&x));
 }
 
 test "plugin aux: a missing or failed capture returns no snapshot" {

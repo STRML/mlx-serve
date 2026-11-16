@@ -748,6 +748,10 @@ pub const AuxExport = extern struct {
 /// Every call runs on the inference thread, except `free` at process teardown, which runs on the thread tearing the
 /// model down after the inference thread has exited. A snapshot's caller owns it until `free`.
 pub const AuxHooks = extern struct {
+    /// The smallest table a host accepts: the required members. `import_plan_details` and `settings_key` are optional
+    /// tails, absent from a table that ends before them.
+    pub const min_size = @offsetOf(AuxHooks, "import_plan_details");
+
     size: u32 = @sizeOf(AuxHooks),
     reserve: *const fn (m: *anyopaque, slot: u32, tokens: u64) callconv(.c) Verdict,
     commit: *const fn (m: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict,
