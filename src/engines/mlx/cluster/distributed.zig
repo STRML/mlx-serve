@@ -3335,6 +3335,12 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
             ropts.sit_out = true;
         } else if (std.mem.eql(u8, args[ai], "--ready-in-open")) {
             ropts.ready_in_open = true;
+        } else if (std.mem.eql(u8, args[ai], "--deadline-epoch-ms") and ai + 1 < args.len) {
+            ropts.deadline_epoch_ms = std.fmt.parseInt(i64, args[ai + 1], 10) catch return error.InvalidArgs;
+            ai += 1;
+        } else if (std.mem.eql(u8, args[ai], "--ready-lead-ms") and ai + 1 < args.len) {
+            ropts.ready_lead_ms = std.fmt.parseInt(i64, args[ai + 1], 10) catch return error.InvalidArgs;
+            ai += 1;
         } else if (std.mem.eql(u8, args[ai], "--withhold-ready")) {
             ropts.withhold_ready = true;
         } else if (std.mem.eql(u8, args[ai], "--chain")) {
@@ -3448,6 +3454,12 @@ const RelinkOpts = struct {
     /// `--withhold-ready`: this rank forms the group but sends no READY (it opens without the handshake), holds the
     /// link past the formation deadline, then fails; the others must fail the open by themselves (plan 61c row 2c).
     withhold_ready: bool = false,
+    /// `--deadline-epoch-ms E`: every rank's formation deadline is wall time E, as a router's shared deadline would be,
+    /// in place of `--formation-ms` from each process's own start.
+    deadline_epoch_ms: i64 = 0,
+    /// `--ready-lead-ms L`: this follower forms without the handshake, then sends READY L ms before the deadline and
+    /// waits for GO itself, so READY reaches rank 0 inside its GO margin (plan 61c item 4's too-late row).
+    ready_lead_ms: ?i64 = null,
 
     fn failing(o: RelinkOpts, k: u64) bool {
         return o.fail_cycles > 0 and k % o.fail_cycles != 0;
@@ -3488,7 +3500,8 @@ fn relinkProbe(io: std.Io, cfg: Config, o: RelinkOpts) !void {
         var sw_open = io_util.Stopwatch.init(io);
         var c = cfg;
         if (o.formation_ms > 0) c.formation_deadline_ms = @as(u64, @intCast(crt.monotonicMs())) + o.formation_ms;
-        c.ready_in_open = o.ready_in_open and !o.withhold_ready;
+        if (o.deadline_epoch_ms > 0) c.formation_deadline_ms = @intCast(@max(crt.monotonicMs() + (o.deadline_epoch_ms - crt.wallMs()), 1));
+        c.ready_in_open = o.ready_in_open and !o.withhold_ready and o.ready_lead_ms == null;
         var link = Link.open(io, c) catch |e| {
             log.err("[dist-probe] relink {d}: epoch_ms {d} open failed after {d} ms: {s}{s}\n", .{ k, crt.wallMs(), sw_open.read() / std.time.ns_per_ms, @errorName(e), if (o.failing(k)) " (expected)" else "" });
             if (o.slot_ms == 0) return e;
@@ -3500,6 +3513,21 @@ fn relinkProbe(io: std.Io, cfg: Config, o: RelinkOpts) !void {
         if (o.failing(k)) {
             log.err("[dist-probe] relink {d}: formed in a cycle where a rank sat out\n", .{k});
             mismatches += 1;
+        }
+        if (o.ready_lead_ms) |lead| {
+            const deadline_wall = crt.wallMs() + @as(i64, msLeft(c.formation_deadline_ms));
+            const wait = deadline_wall - lead - crt.wallMs();
+            if (wait > 0) crt.sleepMs(@intCast(wait));
+            workerReadyAwaitGo(link.bells[0], c.formation_deadline_ms, .{}) catch |e| {
+                log.err("[dist-probe] relink {d}: epoch_ms {d} open failed after {d} ms: {s} (READY sent {d} ms before the deadline)\n", .{ k, crt.wallMs(), sw_open.read() / std.time.ns_per_ms, @errorName(e), lead });
+                link.deinit();
+                mlx.check(mlx.mlx_distributed_clear_backends()) catch {};
+                return e;
+            };
+            log.err("[dist-probe] relink {d}: GO arrived for a READY sent {d} ms before the deadline\n", .{ k, lead });
+            link.deinit();
+            mlx.check(mlx.mlx_distributed_clear_backends()) catch {};
+            return error.ReadyLeadFormed;
         }
         if (o.withhold_ready) {
             log.err("[dist-probe] relink {d}: formed after {d} ms and withheld READY; holding the link past the deadline\n", .{ k, sw_open.read() / std.time.ns_per_ms });
