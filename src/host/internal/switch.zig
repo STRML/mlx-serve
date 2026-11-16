@@ -235,16 +235,22 @@ pub const Switch = struct {
     /// Apply one router command. `deadline_epoch_ms` is the router's wall-clock formation deadline for `tp4` and
     /// `join`; 0 means `default_formation_ms` from now.
     pub fn command(self: *Switch, cmd: attempt.Cmd, n: u64, deadline_epoch_ms: i64) Reply {
-        const now_ms = self.now();
         const needs_formation = cmd == .tp4 or cmd == .join or cmd == .tp1;
         self.lock();
+        const now_ms = self.now();
         if (needs_formation and self.formation == null) {
             const snap = self.snapshotLocked(now_ms);
             self.unlock();
             return .{ .status = 501, .reason = "no_formation", .snap = snap };
         }
         const out = self.m.command(cmd, n, now_ms);
-        if (out == .ok and out.ok == .start_formation) self.failure_rank = null;
+        var formation_deadline = deadline_epoch_ms;
+        if (out == .ok and out.ok == .start_formation) {
+            self.failure_rank = null;
+            const wall_ms = self.wall_fn(self.io);
+            if (formation_deadline == 0) formation_deadline = wall_ms +| default_formation_ms;
+            self.m.formation_cutoff_ms = now_ms +| @max(formation_deadline -| wall_ms, 0) +| attempt.formation_unwind_ms;
+        }
         const role = self.m.role;
         const snap = self.snapshotLocked(now_ms);
         self.unlock();
@@ -252,7 +258,7 @@ pub const Switch = struct {
         return switch (out) {
             .refused => |why| .{ .status = 409, .reason = @tagName(why), .snap = snap },
             .noop => .{ .status = 200, .snap = snap },
-            .ok => |effect| self.perform(cmd, effect, role, snap.n, if (deadline_epoch_ms == 0) self.wall_fn(self.io) + default_formation_ms else deadline_epoch_ms, snap),
+            .ok => |effect| self.perform(cmd, effect, role, snap.n, formation_deadline, snap),
         };
     }
 
@@ -722,6 +728,22 @@ test "join with no deadline gets the wall clock plus the 1,900 ms default" {
     try t.expect(!sw.snapshot().admitting);
 }
 
+test "internal switch: an eight second formation can publish after the old unwind limit" {
+    for ([_]attempt.Cmd{ .tp4, .join }) |cmd| {
+        var f: Fake = .{};
+        defer f.deinit();
+        var sw = newSwitch(&f);
+        _ = sw.command(.drain, 4, 0);
+        try t.expectEqual(@as(u16, 200), sw.command(cmd, 4, test_wall + 8000).status);
+        test_now += 7999;
+        try t.expectEqual(Health.ok, sw.health());
+        f.outcome = f.formedLink();
+        try t.expect(sw.pump());
+        try t.expectEqual(attempt.Mode.tp4, sw.snapshot().mode);
+        try t.expectEqual(cmd == .tp4, sw.snapshot().admitting);
+    }
+}
+
 test "a start that fails lands the box at aborted with the reason, TP1 admitting" {
     var f: Fake = .{ .start_err = error.ListenerTimeout };
     defer f.deinit();
@@ -1012,17 +1034,22 @@ test "a drain nobody follows expires into aborted on the next observation" {
 }
 
 test "quarantine: a formation that never unwinds closes admission and turns /health 503" {
-    var f: Fake = .{};
-    defer f.deinit();
-    var sw = newSwitch(&f);
-    _ = sw.command(.drain, 2, 0);
-    _ = sw.command(.tp4, 2, 0);
-    try t.expectEqual(Health.ok, sw.health());
-    test_now += 2500;
-    try t.expectEqual(Health.quarantined, sw.health());
-    try t.expect(!sw.enter());
-    try t.expectEqual(@as(u16, 409), sw.command(.abort, 2, 0).status);
-    try t.expect(!sw.pump());
+    for ([_]i64{ 0, 8000 }) |budget| {
+        var f: Fake = .{};
+        defer f.deinit();
+        var sw = newSwitch(&f);
+        _ = sw.command(.drain, 2, 0);
+        _ = sw.command(.tp4, 2, if (budget == 0) 0 else test_wall + budget);
+        test_now += (if (budget == 0) default_formation_ms else budget) + 999;
+        try t.expectEqual(Health.ok, sw.health());
+        test_now += 1;
+        try t.expectEqual(Health.ok, sw.health());
+        test_now += 1;
+        try t.expectEqual(Health.quarantined, sw.health());
+        try t.expect(!sw.enter());
+        try t.expectEqual(@as(u16, 409), sw.command(.abort, 2, 0).status);
+        try t.expect(!sw.pump());
+    }
 }
 
 test "the formation code's own poison flag quarantines the box on the next pump" {

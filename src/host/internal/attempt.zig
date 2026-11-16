@@ -11,6 +11,8 @@ pub const Cmd = enum { drain, tp4, join, tp1, abort };
 /// Why a formation ended without a group; the router's switch log names it.
 pub const Failure = enum { none, listener, join, ready, go, deadline, cancelled, drain_expired, release_timeout, other };
 
+pub const formation_unwind_ms = 1000;
+
 pub const Config = struct {
     /// A box that took "drain N" but saw no "tp4 N" or "join N" this long aborts N itself (1 s drain + 2 s formation + slack).
     drain_expiry_ms: i64 = 3500,
@@ -50,6 +52,8 @@ pub const Machine = struct {
     fence: u64 = 0,
     role: Role = .none,
     entered_ms: i64 = 0,
+    /// Local monotonic formation deadline plus the engine's unwind allowance.
+    formation_cutoff_ms: ?i64 = null,
     quarantined: bool = false,
     failure: Failure = .none,
     /// A follower aborting a formed group, still serving it until OP_RELEASE or the formation code's fall report.
@@ -97,6 +101,7 @@ pub const Machine = struct {
     fn form(self: *Machine, role: Role, n: u64, now_ms: i64) Outcome {
         if (n != self.n or self.state != .draining) return .{ .refused = .state };
         self.role = role;
+        self.formation_cutoff_ms = null;
         self.enter(.forming, now_ms);
         return .{ .ok = .start_formation };
     }
@@ -160,8 +165,9 @@ pub const Machine = struct {
                 const limit = self.cfg.unwind_limit_ms + if (self.awaiting_release) self.cfg.release_wait_ms else 0;
                 if (waited >= limit) self.quarantined = true;
             },
-            .forming => if (waited >= self.cfg.unwind_limit_ms) {
-                self.quarantined = true;
+            .forming => {
+                const overdue = if (self.formation_cutoff_ms) |cutoff| now_ms > cutoff else waited >= self.cfg.unwind_limit_ms;
+                if (overdue) self.quarantined = true;
             },
             else => {},
         }

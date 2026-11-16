@@ -541,7 +541,7 @@ test "the health body carries mode, n, role and peers; 503 names the cause" {
     _ = r.sw.command(.drain, 6, 0);
     wire(&r);
     _ = r.sw.command(.join, 6, 0);
-    test_now += 2500;
+    test_now += 3000;
     const q = healthResponse(&r.sw, &buf);
     try t.expectEqual(@as(u16, 503), q.status);
     try expectField(q.body, "status", "quarantined");

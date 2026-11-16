@@ -4694,6 +4694,94 @@ const TestSwitchOpen = struct {
     }
 };
 
+test "dist switch loopback: all four ranks dial with the converted epoch deadline and OpenControl" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    const Four = struct {
+        fn open(_: std.Io, cfg: Config) anyerror!Link {
+            const deadline = formationDeadline(cfg);
+            const left = msLeft(deadline);
+            if (!cfg.ready_in_open or cfg.open_control == null or left < 6000 or left > 8000)
+                return error.TestFormationBudgetLost;
+            const coord = try bellAddress(cfg);
+            if (cfg.rank != 0) {
+                const bell = dialBellControlled(coord, cfg.rank, deadline, cfg.open_control);
+                if (!bell.open()) return error.DistNoBell;
+                defer closeBell(cfg.open_control, bell.fd);
+                try workerReadyAwaitGo(bell, deadline, .{});
+                return error.TestBellsExchanged;
+            }
+            var rv: Rendezvous = .{ .deadline_ms = deadline, .listener = Bell.listen(coord, cfg.size - 1), .size = cfg.size, .control = cfg.open_control };
+            defer rv.close();
+            if (rv.listener == Bell.none) return error.TestListenFailed;
+            try cfg.open_control.?.publish(rv.listener);
+            const acceptor = try std.Thread.spawn(.{}, Rendezvous.run, .{&rv});
+            defer {
+                rv.stop.store(true, .release);
+                acceptor.join();
+            }
+            if (!rv.waitAll(msLeft(deadline))) return error.DistNoBell;
+            var bells: [max_ranks]Bell = @splat(.{});
+            rv.lock();
+            for (1..cfg.size) |rank| bells[rank] = .{ .fd = rv.fds[rank] };
+            rv.mu.unlock();
+            try leaderAwaitReadyThenGo(&bells, cfg.size, deadline);
+            return error.TestBellsExchanged;
+        }
+
+        fn run(rank: u32, coordinator: []const u8, deadline: i64) !void {
+            const devices = [_][]const u8{
+                "-,rdma_en2,rdma_en13,rdma_en3",
+                "rdma_en2,-,rdma_en4,rdma_en3",
+                "rdma_en13,rdma_en2,-,rdma_en4",
+                "rdma_en13,rdma_en2,rdma_en4,-",
+            };
+            const cfg: Config = .{ .rank = rank, .size = 4, .coordinator = coordinator, .device = devices[rank] };
+            try primeEnv(cfg);
+            switcher.testing.open = open;
+            defer switcher.testing.reset();
+            try switcher.start(.{ .cfg = cfg, .model_dir = "/m/switch" }, if (rank == 0) .leader else .follower, 501, deadline);
+            const end = testDeadline(9000);
+            while (msLeft(end) > 0) {
+                if (switcher.poll(501)) |out| {
+                    if (out != .failed) return error.TestUnexpectedOutcome;
+                    try std.testing.expectEqualStrings("TestBellsExchanged", out.failed.err);
+                    return;
+                }
+                crt.sleepMs(1);
+            }
+            return error.TestSwitchTimeout;
+        }
+    };
+    const coord = try closedBellCoordinator();
+    var buf: [64]u8 = undefined;
+    const coordinator = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{coord.port});
+    const deadline = crt.wallMs() + 8000;
+    var children: [3]std.c.pid_t = undefined;
+    var count: usize = 0;
+    defer for (children[0..count]) |pid| {
+        var status_code: c_int = 0;
+        _ = std.c.waitpid(pid, &status_code, 0);
+    };
+    for (1..4) |rank| {
+        const pid = std.c.fork();
+        if (pid < 0) return error.TestForkFailed;
+        if (pid == 0) {
+            Four.run(@intCast(rank), coordinator, deadline) catch std.c._exit(99);
+            std.c._exit(0);
+        }
+        children[count] = pid;
+        count += 1;
+    }
+    try Four.run(0, coordinator, deadline);
+    while (count > 0) {
+        count -= 1;
+        const pid = children[count];
+        var status_code: c_int = 0;
+        try std.testing.expectEqual(pid, std.c.waitpid(pid, &status_code, 0));
+        try std.testing.expectEqual(@as(c_int, 0), status_code);
+    }
+}
+
 test "dist switch matrix 1: READY and GO publish one borrowed heap Link" {
     TestSwitchOpen.setup();
     defer TestSwitchOpen.cleanup();

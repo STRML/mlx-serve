@@ -869,3 +869,10 @@ Defect: a locked temperature, a `ctx_size` and a `kv_quant` saved in Model Setti
 the two spellings byte for byte. Fix: request-path lookups take the entry's `real_path`, stored at registration, and a
 load resolves the path in `lookupPack`, the one load-time lookup. Guard: `tests/test_model_settings_symlink.sh`,
 `model_settings: a folder reached through a symlink answers to its real path's key…`.
+
+### A longer switch formation was quarantined before its deadline
+Defect: an eight-second formation could not publish after 2.5 seconds. Cause: the host's forming-state timer used
+the fixed abort unwind limit, independently of the router's deadline. Fix: map that deadline to the host's monotonic
+clock and quarantine only after the engine's shared unwind allowance. Abort and release retain their separate limits.
+Guard: `internal switch: an eight second formation can publish after the old unwind limit` and the formation
+quarantine test with default and explicit budgets.

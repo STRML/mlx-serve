@@ -71,6 +71,7 @@ Sampling + logprobs + streams:
 - **Grammar**: every state has a legal byte; the mask never walks the vocabulary (#380, `token_mask.buildMask`, `nextConstrained` lazy); NO whitespace OUTSIDE the root, the model's own layout inside (`MAX_FREE_WS` 16); token→bytes tables are per-MODEL (`grammarTokenBytes`). Guard: `tests/test_json_mode_multi_model.sh`.
 
 Layout switch (`host/internal/`):
+- **Formation quarantine follows the requested deadline plus the engine's unwind allowance**; a fixed timer from command receipt can quarantine a valid longer formation. Abort/release keep their own limits.
 - **`/v1/internal/*` takes its own key and nothing else** (`--internal-key-file`, 0600, never `--api-key`; the serving key is 401 and loopback is NOT exempt); no flag, no such paths. Dispatched BEFORE the serving-key and LAN gates.
 - **One attempt id per box, one table** (`attempt.zig`: 8 states x 5 commands, pure; `switch.zig`: its mutex, admission count, `Formation` seam). Every observation ticks the clock, so no timer thread exists; public inference counts in `enter`/`leave` and a drain waits on that count.
 - **LAN**: per-INTERFACE dns_sd callbacks, loopback-first fetches, eviction via `attemptKnown`; proxying bounded by the TUNNEL MARKER (`isTunneledRequest` at gate AND dispatch, ONE hop, `error.SelfFetch`).

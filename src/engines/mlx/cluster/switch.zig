@@ -3,6 +3,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const distributed = @import("distributed.zig");
 const crt = @import("../../../sdk/util/crt.zig");
+const attempt_machine = @import("../../../host/internal/attempt.zig");
 
 pub const Role = enum { leader, follower };
 pub const Context = struct { cfg: distributed.Config, model_dir: []const u8 };
@@ -37,7 +38,7 @@ const Attempt = struct {
             lock();
             defer mu.unlock();
             self.finished_ms = @intCast(crt.monotonicMs());
-            if (self.finished_ms > self.deadline_ms +| 1000) poisoned = true;
+            if (self.finished_ms > self.deadline_ms +| attempt_machine.formation_unwind_ms) poisoned = true;
             if (self.state.load(.acquire) == .formed and !poisoned) {
                 distributed.setSwitchGroup(&self.link, self.model_dir);
                 if (self.pending_abort) self.link.abortFormed();
@@ -215,7 +216,7 @@ fn elapsed(a: *const Attempt) u32 {
 fn refreshQuarantine() void {
     if (poisoned) return;
     const a = current orelse return;
-    const cutoff = a.deadline_ms +| 1000;
+    const cutoff = a.deadline_ms +| attempt_machine.formation_unwind_ms;
     if (a.returned.load(.acquire)) {
         if (a.finished_ms > cutoff) poisoned = true;
         return;
