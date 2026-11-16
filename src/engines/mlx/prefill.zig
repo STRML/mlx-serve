@@ -163,8 +163,8 @@ fn importModuleSnapshot(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, ma
     if (!plugin_driver.auxRestoreAt(binding.xfm, id, snapshot, match.n).isOk()) return error.ModuleRestoreFailed;
 }
 
-fn prefillProgressSink(sch: *Scheduler) ?*std.atomic.Value(u64) {
-    return if (sch.metrics != null) &sch.inflight_prefill_tokens else null;
+fn prefillProgressSink(sch: *Scheduler) *std.atomic.Value(u64) {
+    return &sch.inflight_prefill_tokens;
 }
 
 pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
@@ -173,9 +173,8 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // so the panel isn't blind until the first chunk lands; the chunk loop in
     // generate.zig stores absolute progress into `inflight_prefill_tokens`.
     //
-    // Gated on `--metrics`, per the observability contract: when it's off the
-    // prefill path executes NO extra instruction at all (the chunk loop's hook
-    // is null too — see the `prefill_progress` option below).
+    // Only `--metrics` publishes the phase and the expected total; the progress
+    // counter is always kept, because the layout switch's stall check reads it.
     const observe = sch.metrics != null;
     if (observe) {
         _ = sch.requests_prefilling.fetchAdd(1, .monotonic);
@@ -184,11 +183,13 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         defer sch.queue_mu.unlock(sch.io);
         publishLiveKvResidency(sch, slot, module_bytes);
     }
-    defer if (observe) {
-        _ = sch.requests_prefilling.fetchSub(1, .monotonic);
-        sch.inflight_prefill_tokens.store(0, .monotonic);
-        sch.inflight_prefill_expected.store(0, .monotonic);
-    };
+    defer {
+        if (observe) {
+            _ = sch.requests_prefilling.fetchSub(1, .monotonic);
+            sch.inflight_prefill_expected.store(0, .monotonic);
+        }
+        prefillProgressSink(sch).store(0, .monotonic);
+    }
 
     const sampling = slot.sampling;
     // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,
@@ -704,8 +705,7 @@ test "without --metrics a prefill that advances still moves the counter the layo
     var sch: Scheduler = undefined;
     sch.metrics = null;
     sch.inflight_prefill_tokens = std.atomic.Value(u64).init(0);
-    const sink: ?*std.atomic.Value(u64) = prefillProgressSink(&sch);
-    sink.?.store(4096, .monotonic);
+    prefillProgressSink(&sch).store(4096, .monotonic);
     try testing.expectEqual(@as(u64, 4096), sch.inflight_prefill_tokens.load(.monotonic));
 }
 

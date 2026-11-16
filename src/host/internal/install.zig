@@ -13,8 +13,8 @@ pub const LaunchError = error{ InternalKeyRefused, InternalKeyIsServingKey, OutO
 const Gauges = struct { generated: u64, prefill_done: u64, prefilling: u64 };
 
 /// Generation plus prefill tokens, in flight, from the scheduler's own atomics: only a change in the sum matters. The
-/// prefill phase is published with `--metrics`; without it a long prefill cannot be told from a stall, so the box holds
-/// the longer prefill limit.
+/// token counts move without `--metrics`; the prefill phase is published only with it, so without it the box holds the
+/// longer prefill limit.
 fn progressOf(g: Gauges, metrics_on: bool) sw_mod.Progress {
     return .{ .sum = g.generated + g.prefill_done, .prefilling = g.prefilling > 0 or !metrics_on };
 }

@@ -45,12 +45,14 @@ pub fn isInference(method: []const u8, path: []const u8) bool {
     return true;
 }
 
+/// `isInference`, plus a Responses WebSocket upgrade: it can cold-load a model before the first turn, so that load counts.
+/// The router releases the count once the load ends, and each turn is admitted again by the socket.
 pub fn admitsRequest(method: []const u8, path: []const u8, ws_upgrade: bool) bool {
-    _ = ws_upgrade;
+    if (ws_upgrade and std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses")) return true;
     return isInference(method, path);
 }
 
-pub const refusal_message ="Layout switch in progress or this box follows a TP4 leader";
+pub const refusal_message = "Layout switch in progress or this box follows a TP4 leader";
 
 /// One counted unit of public inference: a request, or one turn of a WebSocket.
 pub const Admission = struct {
@@ -62,8 +64,11 @@ pub const Admission = struct {
         return .{ .sw = s };
     }
 
-    pub fn leave(self: Admission) void {
-        if (self.sw) |s| s.leave();
+    /// Safe to call twice: the second call counts nothing.
+    pub fn leave(self: *Admission) void {
+        const s = self.sw orelse return;
+        self.sw = null;
+        s.leave();
     }
 };
 
@@ -434,14 +439,14 @@ test "a Responses WebSocket upgrade is not inference: each turn is admitted by t
 
 test "a turn that was refused leaves no count, and an idle socket between turns never holds a drain" {
     var r = rig();
-    const first = try Admission.enter(&r.sw);
+    var first = try Admission.enter(&r.sw);
     first.leave();
     var res = call(&r, KEY, "POST", "/v1/internal/drain", BEARER, "{\"n\":3}");
     try expectField(res.body, "drained", "true");
     try t.expectError(error.Refused, Admission.enter(&r.sw));
     try t.expectEqual(@as(u32, 0), r.sw.snapshot().in_flight);
     res = call(&r, KEY, "POST", "/v1/internal/abort", BEARER, "{\"n\":3}");
-    const second = try Admission.enter(&r.sw);
+    var second = try Admission.enter(&r.sw);
     try t.expectEqual(@as(u32, 1), r.sw.snapshot().in_flight);
     second.leave();
     try t.expectEqual(@as(u32, 0), r.sw.snapshot().in_flight);
@@ -472,7 +477,7 @@ test "an upgrade admitted before a drain holds the count until its load ends; on
 }
 
 test "no switch installed: admission always passes and counts nothing" {
-    const a = try Admission.enter(null);
+    var a = try Admission.enter(null);
     a.leave();
 }
 

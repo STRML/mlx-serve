@@ -316,7 +316,8 @@ pub fn handleConnection(
     }
 
     // ── Layout switch (plan 61c): public inference is admitted in TP1 and by the TP4 leader, counted so a drain can wait for zero.
-    const admitted = internal_ep.Admission.enter(if (internal_ep.isInference(method, path)) http_server.internalSwitch() else null) catch {
+    const ws_upgrade = std.mem.eql(u8, method, "GET") and isRoute(path, "/v1/responses") and ws_mod.isUpgrade(request[0..header_end_pos]);
+    var admitted = internal_ep.Admission.enter(if (internal_ep.admitsRequest(method, path, ws_upgrade)) http_server.internalSwitch() else null) catch {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", internal_ep.refusal_message, 503);
         return;
     };
@@ -639,11 +640,12 @@ pub fn handleConnection(
     // Detect Upgrade: websocket BEFORE the regular route dispatch so the
     // GET method (used for the upgrade handshake) doesn't fall through to
     // the 404 branch.
-    if (std.mem.eql(u8, method, "GET") and isRoute(path, "/v1/responses") and ws_mod.isUpgrade(request[0..header_end_pos])) {
+    if (ws_upgrade) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
         }
+        admitted.leave();
         try handleResponsesWebSocket(allocator, stream, request[0..header_end_pos], lm);
         return;
     }

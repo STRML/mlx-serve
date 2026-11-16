@@ -249,7 +249,7 @@ pub fn handleResponsesWebSocket(
         }
 
         // A turn is admitted and counted alone: an idle socket between turns never holds a drain.
-        const admission = internal_ep.Admission.enter(http_server.internalSwitch()) catch {
+        var admission = internal_ep.Admission.enter(http_server.internalSwitch()) catch {
             try wsSendErrorTurn(allocator, &ws_conn, 503, "service_unavailable", internal_ep.refusal_message);
             continue;
         };
