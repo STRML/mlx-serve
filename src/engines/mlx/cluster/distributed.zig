@@ -4194,6 +4194,7 @@ fn switchProbe(cfg: Config, o: SwitchProbeOpts) !void {
 }
 
 fn relinkProbe(io: std.Io, cfg: Config, o: RelinkOpts) !void {
+    bindInferenceThread();
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const shape = [_]c_int{10240};
@@ -4266,9 +4267,7 @@ fn relinkProbe(io: std.Io, cfg: Config, o: RelinkOpts) !void {
         _ = mlx.mlx_array_free(r);
         const sum_us = sw_sum.read() / std.time.ns_per_us;
         var sw_free = io_util.Stopwatch.init(io);
-        drainProbeStreams();
-        link.deinit();
-        try mlx.check(mlx.mlx_distributed_clear_backends());
+        try relinkProbeTeardown(&link);
         const free_us = sw_free.read() / std.time.ns_per_us;
         log.info("[dist-probe] relink {d}: epoch_ms {d} open {d} us, first all_sum {d} us (check {d} == {d}), free {d} us\n", .{ k, crt.wallMs(), open_us, sum_us, v, 10240 * cfg.size, free_us });
     }
@@ -4280,14 +4279,20 @@ fn relinkProbe(io: std.Io, cfg: Config, o: RelinkOpts) !void {
     if (mismatches > 0) return error.RelinkMismatch;
 }
 
-/// Waits out every stream, so no collective is still queued on a group about to be freed.
-fn drainProbeStreams() void {
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
-    _ = mlx.mlx_synchronize(cpu);
-    const gpu = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(gpu);
-    _ = mlx.mlx_synchronize(gpu);
+fn relinkProbeTeardown(link: *Link) !void {
+    errdefer link.deinit();
+    if (link.rank != 0) {
+        if ((try recvMsg(link, 0))[0] != OP_RELEASE) return error.DistBadMessage;
+    }
+    link.disarm();
+    try link.drain();
+    var rank: u32 = 0;
+    link.release(&rank) catch |err| {
+        log.err("[dist-probe] relink release failed at rank {d}: {s}\n", .{ rank, @errorName(err) });
+        return err;
+    };
+    link.deinit();
+    try mlx.check(mlx.mlx_distributed_clear_backends());
 }
 
 /// `--sums N`: N back-to-back all_sums of a decode-row-sized tensor, the shape of a TP decode step. Kill one rank
@@ -6411,6 +6416,82 @@ test "dist switch probe: absolute deadlines and cancel precedence" {
     try std.testing.expect(switchProbeExpected(.fall, 1, .fell));
     try std.testing.expect(!switchProbeExpected(.normal, 1, .fell));
     try std.testing.expect(!switchProbeExpected(.fall, 1, .formed));
+}
+
+test "dist relink probe: planned teardown preserves a ready_in_open follower" {
+    TestSwitchOpen.setup();
+    defer TestSwitchOpen.cleanup();
+    try TestSwitchOpen.start(TestSwitchOpen.request(403));
+    const leader = (try TestSwitchOpen.outcome(403)).formed.link;
+    var exits: TestDistExit = .{};
+    var state: LinkState = .{ .rank = 1, .switch_open = true, .go_committed = true, .test_exits = &exits };
+    var follower: Link = .{ .state = &state, .group = .{}, .rank = 1, .size = 2 };
+    follower.bells[0] = TestSwitchOpen.peer_bell;
+    follower.attachBells();
+    try startWatchers(&follower);
+    defer {
+        state.closing.store(true, .release);
+        if (state.watcher) |t| t.join();
+    }
+    const RelinkPeer = struct {
+        link: *Link,
+        failure: ?anyerror = null,
+        early_eof: bool = false,
+
+        fn run(self: *@This()) void {
+            const msg = recvMsg(self.link, 0) catch |err| {
+                self.failure = err;
+                crt.sleepMs(100);
+                return;
+            };
+            if (msg[0] != OP_RELEASE) self.failure = error.TestExpectedRelease;
+            crt.sleepMs(100);
+            var byte: [1]u8 = undefined;
+            self.early_eof = std.c.recv(self.link.bells[0].fd, &byte, 1, std.c.MSG.PEEK | std.c.MSG.DONTWAIT) == 0;
+            self.link.state.?.closing.store(true, .release);
+            _ = std.c.shutdown(self.link.bells[0].fd, std.c.SHUT.RDWR);
+        }
+    };
+    var peer_runner: RelinkPeer = .{ .link = &follower };
+    const thread = try std.Thread.spawn(.{}, RelinkPeer.run, .{&peer_runner});
+    const result = relinkProbeTeardown(leader);
+    thread.join();
+    try result;
+    try std.testing.expectEqual(@as(u32, 0), exits.count.load(.acquire));
+    try std.testing.expectEqual(@as(?anyerror, null), peer_runner.failure);
+    try std.testing.expect(!peer_runner.early_eof);
+}
+
+test "dist relink probe: follower waits for RELEASE before closing" {
+    TestSwitchOpen.setup();
+    defer TestSwitchOpen.cleanup();
+    var req = TestSwitchOpen.request(404);
+    req.role = .follower;
+    req.cfg.rank = 1;
+    try TestSwitchOpen.start(req);
+    const link = (try TestSwitchOpen.outcome(404)).formed.link;
+    const Leader = struct {
+        bell: Bell,
+        early_eof: bool = false,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            crt.sleepMs(100);
+            var byte: [1]u8 = undefined;
+            self.early_eof = std.c.recv(self.bell.fd, &byte, 1, std.c.MSG.PEEK | std.c.MSG.DONTWAIT) == 0;
+            self.bell.writeAll(&.{Bell.release_byte}) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var leader: Leader = .{ .bell = TestSwitchOpen.peer_bell };
+    const thread = try std.Thread.spawn(.{}, Leader.run, .{&leader});
+    const result = relinkProbeTeardown(link);
+    thread.join();
+    try result;
+    try std.testing.expect(!leader.early_eof);
+    try std.testing.expectEqual(@as(?anyerror, null), leader.failure);
+    try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
 }
 
 test "dist switch probe: cancel retires without forming or exiting" {
