@@ -263,18 +263,18 @@ pub fn forward(sc: *Scope, m: *const dsv41.Dsv41Model, rl: *const RowLayer, g: G
     return sc.astype(try sc.reshape(ys, &.{ L, dim(ys, 2) }), m.act);
 }
 
-/// Pins the kernel launch shapes a box probes for itself (`topk_tg`, `hc_tg`) to the smallest any rank runs, so every
-/// rank reduces in the same order and routes its rows alike.
-pub fn pinThreads(gpa: std.mem.Allocator, m: *dsv41.Dsv41Model, g: Group) !void {
-    const mine = [_]u32{ @intCast(m.topk_tg), @intCast(m.hc_tg) };
+/// The launch shapes every rank pins (`topk_tg`, `hc_tg`): the smallest any rank's GPU grants, so every rank reduces in
+/// the same order and attends and routes its rows alike. `granted` is this box's grant (not a shape an earlier pin
+/// lowered, or a second agreement could only go down); the caller applies the result (`pinLaunchShapes`).
+pub fn agreeThreads(gpa: std.mem.Allocator, g: Group, granted: [2]usize) ![2]usize {
+    const mine = [_]u32{ @intCast(granted[0]), @intCast(granted[1]) };
     const all = try gatherHost(gpa, g, &mine);
     defer gpa.free(all);
-    var lo = mine;
+    var lo = granted;
     for (0..g.size) |r| for (&lo, all[r * 2 ..][0..2]) |*l, v| {
         l.* = @min(l.*, v);
     };
-    m.topk_tg = lo[0];
-    m.hc_tg = lo[1];
+    return lo;
 }
 
 /// Every rank's `mine` (the same length on each), rank-major on the host (caller frees).
@@ -804,17 +804,13 @@ const Stub = struct {
     }
 };
 
-test "dsv41 row cut: the ranks pin the probed launch shapes to the smallest any of them runs" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+test "dsv41 row cut: the ranks agree on the smallest launch shapes any of their GPUs grants" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
-    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
-    defer fx.deinit();
-    fx.m.topk_tg = 1024;
-    fx.m.hc_tg = 512;
     var stub: Stub = .{ .rank = 1, .others = &.{ &.{ 1024, 512 }, &.{ 512, 512 }, &.{ 1024, 256 } } };
-    try pinThreads(gpa, fx.m, stub.group());
-    try testing.expectEqual(@as(usize, 512), fx.m.topk_tg);
-    try testing.expectEqual(@as(usize, 256), fx.m.hc_tg);
+    try testing.expectEqual([2]usize{ 512, 256 }, try agreeThreads(gpa, stub.group(), .{ 1024, 512 }));
+    var alone: Stub = .{ .rank = 0, .others = &.{} };
+    try testing.expectEqual([2]usize{ 1024, 512 }, try agreeThreads(gpa, alone.group(), .{ 1024, 512 }));
 }
 
 test "dsv41 row cut: the route CRC names the first layer a rank routed differently" {
