@@ -31,9 +31,6 @@ pub const final_source = kernelSource("plugins/deepseek_v41/kernels/markov_final
 
 var step_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var final_kernel: ?mlx.mlx_fast_metal_kernel = null;
-/// The confidence head whose weights were checked (`plan.exact16`) and the answer.
-var conf_seen: ?*anyopaque = null;
-var conf_exact: bool = false;
 var refusal_said: bool = false;
 
 /// A draft's inputs, the model's arrays.
@@ -49,6 +46,8 @@ pub const In = struct {
     mh: A,
     /// f32 [1, dim + rank]: the confidence head
     cw: A,
+    /// `exact(cw)`, as its model keeps it; null checks the weights on this call.
+    cw_exact: ?bool = null,
     want_conf: bool,
     /// the biased rows too (the sampled path's)
     keep: bool,
@@ -92,16 +91,13 @@ fn kernels() !struct { step: mlx.mlx_fast_metal_kernel, final: mlx.mlx_fast_meta
     return .{ .step = step_kernel.?, .final = final_kernel.? };
 }
 
-/// Whether the confidence head's weights are all 16-bit floats' values, checked once per head.
-fn confExact(cw: A) !bool {
-    if (conf_seen == cw.ctx) return conf_exact;
+/// Whether the confidence head's weights are all 16-bit floats' values (`plan.exact16`): its logit is then the last
+/// kernel's. A model asks once at load and keeps the answer (`In.cw_exact`).
+pub fn exact(cw: A) !bool {
     try mlx.check(mlx.mlx_array_eval(cw));
     const n = mlx.mlx_array_size(cw);
     const data = mlx.mlx_array_data_float32(cw) orelse return error.NoData;
-    conf_exact = plan.exact16(data[0..n]);
-    conf_seen = cw.ctx;
-    log.info("deepseek_v41: Markov chain: the confidence head's {d} weights are {s}\n", .{ n, if (conf_exact) "16-bit floats' values: its logit is the last kernel's" else "not all 16-bit floats' values: its logit stays on MLX's ops" });
-    return conf_exact;
+    return plan.exact16(data[0..n]);
 }
 
 fn apply(kern: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config, ins: []const A, s: mlx.mlx_stream, out: []A) !void {
@@ -141,7 +137,7 @@ pub fn chain(s: mlx.mlx_stream, in: In) !?Out {
     }
     if (dimOf(in.emb, 0) != sh.vocab or dimOf(in.emb, 1) != sh.rank or dimOf(in.logits, 1) != sh.vocab or dimOf(in.hout, 0) != sh.block) return error.MarkovShape;
     const k = try kernels();
-    const conf = in.want_conf and plan.confFused(sh, try confExact(in.cw));
+    const conf = in.want_conf and plan.confFused(sh, in.cw_exact orelse try exact(in.cw));
     const B = sh.block;
     const V = sh.vocab;
     const nt = plan.step_groups;

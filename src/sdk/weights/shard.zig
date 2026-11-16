@@ -100,6 +100,55 @@ pub const Shard = struct {
     }
 };
 
+/// A per-model `tp_mode` setting: a rank of a tensor group, or a value that names none, which the load refuses by
+/// name rather than treating it as unset.
+pub const TpModeSetting = union(enum) {
+    group: struct { rank: u32, size: u32 },
+    malformed,
+
+    pub fn of(v: std.json.Value) TpModeSetting {
+        const o = switch (v) {
+            .object => |o| o,
+            else => return .malformed,
+        };
+        if (o.count() != 2) return .malformed;
+        const rank = u32Field(o, "rank") orelse return .malformed;
+        const size = u32Field(o, "size") orelse return .malformed;
+        return .{ .group = .{ .rank = rank, .size = size } };
+    }
+
+    fn u32Field(o: std.json.ObjectMap, name: []const u8) ?u32 {
+        const x = o.get(name) orelse return null;
+        if (x != .integer) return null;
+        return std.math.cast(u32, x.integer);
+    }
+
+    /// The setting as the plugin's load settings carry it.
+    pub fn write(self: TpModeSetting, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .group => |g| try w.print("\"tp_mode\":{{\"rank\":{d},\"size\":{d}}}", .{ g.rank, g.size }),
+            .malformed => try w.writeAll("\"tp_mode\":\"malformed\""),
+        }
+    }
+};
+
+test "TpModeSetting: a rank and a size are a group, anything else is malformed" {
+    const cases = [_]struct { json: []const u8, want: TpModeSetting }{
+        .{ .json = "{\"rank\":1,\"size\":4}", .want = .{ .group = .{ .rank = 1, .size = 4 } } },
+        .{ .json = "{\"rank\":0}", .want = .malformed },
+        .{ .json = "{\"rank\":-1,\"size\":4}", .want = .malformed },
+        .{ .json = "{\"rank\":0,\"size\":\"4\"}", .want = .malformed },
+        .{ .json = "{\"rank\":0,\"size\":4,\"extra\":1}", .want = .malformed },
+        .{ .json = "4", .want = .malformed },
+        .{ .json = "null", .want = .malformed },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, c.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualDeep(c.want, TpModeSetting.of(parsed.value));
+    }
+}
+
 /// Tensors only rank 0 reads: the MTP head and the vision/audio towers.
 pub fn headOnly(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "mtp.") or std.mem.indexOf(u8, key, ".mtp.") != null or

@@ -58,6 +58,11 @@ const Served = struct {
     after_greedy: bool = false,
 
     fn open(table: *const abi.ModelTable, files: []const sdk.fixture.File, tape: []const u8) !*Served {
+        return openWith(table, files, tape, null);
+    }
+
+    /// `open` with the model's `tp_mode` setting stamped on the config, as `applyModelSettings` does.
+    fn openWith(table: *const abi.ModelTable, files: []const sdk.fixture.File, tape: []const u8, tp_mode: ?model.TpModeSetting) !*Served {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         const p = try a.create(Served);
@@ -73,6 +78,7 @@ const Served = struct {
         p.cfg = try model.parseConfig(io, a, dir);
         errdefer p.cfg.deinit(a);
         if (p.cfg.plugin == null or p.cfg.plugin.?.table != table) return error.NotServed;
+        p.cfg.tp_mode_override = tp_mode;
         p.xfm = try driver.load(io, a, &p.cfg, dir, mlx.gpuStream());
         try p.slot.init();
         return p;
@@ -159,6 +165,24 @@ test "deepseek_v41 served: chunked prefill, host and pipelined decodes and a new
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try expectServed(@import("../deepseek_v41/plugin.zig"), try fixture.v41Files(arena.allocator(), 7), @embedFile("../deepseek_v41/fixtures/served.tape"));
+}
+
+test "deepseek_v41 served: the model's tp_mode setting reaches the plugin through the driver's load, and a malformed one is refused" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v41 = @import("../deepseek_v41/plugin.zig");
+    const files = try fixture.v41TpFiles(arena.allocator(), 7);
+    v41.mode.LoneGroup.arm(4);
+    defer v41.mode.LoneGroup.disarm();
+    const p = try Served.openWith(&v41.table, files, "", .{ .group = .{ .rank = 0, .size = 4 } });
+    defer p.close();
+    const m: *v41.Model = @ptrCast(@alignCast(intree.module(&p.xfm).?));
+    const tp = m.modes.tp orelse return error.TpModeDropped;
+    try testing.expectEqual(@as(usize, 4), m.modes.tp1.cfg.num_attention_heads / tp.cfg.num_attention_heads);
+    for ([_]model.TpModeSetting{ .malformed, .{ .group = .{ .rank = 4, .size = 4 } } }) |bad|
+        try testing.expectError(error.PluginLoadFailed, Served.openWith(&v41.table, files, "", bad));
 }
 
 test "deepseek_v41 served: two slots decode in one batched tick through the driver, each slot's step following its state" {

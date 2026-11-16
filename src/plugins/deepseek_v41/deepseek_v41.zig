@@ -444,6 +444,8 @@ pub const DsparkW = struct {
     markov_embed: A, // [vocab, rank]
     markov_head: A, // [vocab, rank] in the activation dtype: a draft step reads all of it
     conf: A, // f32 [1, dim + rank]
+    /// `markov.exact(conf)`, asked at load.
+    conf_exact: bool = false,
 };
 
 /// Rope as MLX `fast_rope` periods (`1 / inv_freq`), and their negation
@@ -631,7 +633,7 @@ pub const Dsv41Model = struct {
         self.cache_pack_kernels.deinit();
         _ = mlx.mlx_fast_metal_kernel_free(self.engram_kernel);
         self.dec.deinit();
-        gtwin.deinit();
+        gtwin.release();
         self.freeQuant();
         freeRegions(self);
         self.gpa.destroy(self);
@@ -1840,10 +1842,13 @@ pub const InitOpts = struct {
     quant: ?*const outside.Format = null,
 };
 
+pub const tpGeometryFits = @import("config.zig").tpGeometryFits;
+
 pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opts: InitOpts) !*Dsv41Model {
-    var sliced = whole.*;
     // A streamed bank reads whole experts and only rank 0 opens one; a split's ranks hold half of each.
     if (opts.tp != null and opts.streamed_experts) return error.Dsv41TpStreamedExperts;
+    if (opts.tp) |t| if (!tpGeometryFits(whole, t.size)) return error.Dsv41ShardUneven;
+    var sliced = whole.*;
     // An MLX pack's stream opens slot rows for every routed layer, where a layer split bills each Mac its share.
     if (opts.pair != null and opts.streamed_experts and opts.quant == null) return error.Dsv41PairStreamedExperts;
     // A split slices the weights as MLX arrays; an outside plugin's stay whole.
@@ -2012,6 +2017,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             .markov_head = if (getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) != null) try markovHead(m, w, rank, "mtp.{d}.markov_head.markov_w2", .{last}) else try markovHead(m, w, rank, "mtp.{d}.markov_head.head", .{last}),
             .conf = try ownDense(m, w, cfg.hidden_size + rank, "mtp.{d}.confidence_head.proj", .{last}, .float32),
         };
+        m.dspark.?.conf_exact = try markov.exact(m.dspark.?.conf);
+        log.info("deepseek_v41: Markov chain: the confidence head's weights are {s}\n", .{if (m.dspark.?.conf_exact) "16-bit floats' values: its logit is the last kernel's" else "not all 16-bit floats' values: its logit stays on MLX's ops"});
         m.n_mtp = n_stages;
         if (opts.tp) |t| log.info("deepseek_v41: tensor rank {d} of {d}: DSpark {s}\n", .{ t.rank, t.size, if (m.draft_shard) "stages and Markov head split, every rank drafts (DSV41_DRAFT_SHARD=0: rank 0 alone)" else "drafts on rank 0 alone" });
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
@@ -2035,6 +2042,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     // The ring twins compiled now, not in a prompt's first wide layer (FLASH_ATTN on: the flash kernel and its heads
     // twin in their place).
     if (m.attn_gather != null) try warmRing(m);
+    gtwin.retain();
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages{s}{s}\n", .{ n_layers, m.engrams.len, n_stages, if (opts.quant != null) ", weights on " else "", if (opts.quant) |q| q.name() else "" });
     if (m.dec.moe_fp4 != null) log.info("deepseek_v41: fused mxfp4 MoE decode kernels on\n", .{});
     return m;
@@ -7934,7 +7942,7 @@ pub fn draftTail(sc: *Scope, m: *const Dsv41Model, x: A, pre: A, firsts: A, want
 fn fusedTail(sc: *Scope, m: *const Dsv41Model, hout: A, logits: A, t1: A, want_conf: bool, keep_logits: bool) !?DraftGraph {
     const ds = &m.dspark.?;
     const B = m.ds_block;
-    const f = (try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = t1, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .want_conf = want_conf, .keep = keep_logits })) orelse return null;
+    const f = (try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = t1, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .cw_exact = ds.conf_exact, .want_conf = want_conf, .keep = keep_logits })) orelse return null;
     const toks = try sc.keep(f.toks);
     const rows = if (f.rows) |r| try sc.keep(r) else toks;
     if (!want_conf) return .{ .ids = toks, .conf = toks, .logits = rows };
