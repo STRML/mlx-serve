@@ -32,6 +32,8 @@ const chunkNeedsMtpHistory = @import("prefill_chunk.zig").chunkNeedsMtpHistory;
 const commitAdaptiveWidth = @import("prefill_chunk.zig").commitAdaptiveWidth;
 const countSpliceRows = @import("prefill_chunk.zig").countSpliceRows;
 const decodeShareCapped = @import("prefill_chunk.zig").decodeShareCapped;
+const archCapped = @import("prefill_chunk.zig").archCapped;
+const cappedEnd = @import("prefill_chunk.zig").cappedEnd;
 const dsparkArmFor = @import("../spec/dspark.zig").dsparkArmFor;
 const dsparkEnabled = @import("../spec/dspark.zig").dsparkEnabled;
 const effectiveMtpHistoryWindow = @import("prefill_chunk.zig").effectiveMtpHistoryWindow;
@@ -202,7 +204,7 @@ pub fn initWithOptions(
     // start at ssm_checkpoint_pos_offset, so the final KV length is that
     // offset plus everything we're about to forward.
     const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-    const PREFILL_CHUNK: usize = decodeShareCapped(xfm.config.cappedPrefillChunk(effectivePrefillChunk(
+    const PREFILL_CHUNK: usize = archCapped(decodeShareCapped(xfm.config.cappedPrefillChunk(effectivePrefillChunk(
         xfm.config.prefillScoreHeadDim(),
         xfm.config.num_attention_heads,
         total_ctx_for_chunk,
@@ -210,7 +212,7 @@ pub fn initWithOptions(
         xfm.config.isMoe(),
         xfm.config.longCtxGated(),
         options.pinned_prefill_chunk,
-    )), options.decode_share_width_cap);
+    )), options.decode_share_width_cap), &xfm.config);
     // Phase-level prefill instrumentation. Enabled at debug level OR via
     // diag prefill-trace (which forces the trace line at info).
     // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
@@ -364,7 +366,7 @@ pub fn initWithOptions(
         // The scaled tail-merge bound reads the arch predicate, never `chunk_width_hook != null`
         // (installed process-wide).
         const width_is_adaptive = options.adaptive_chunk_width;
-        const cap_adapt: u32 = @intCast(effectivePrefillChunk(
+        const cap_adapt: u32 = @intCast(archCapped(effectivePrefillChunk(
             xfm.config.prefillScoreHeadDim(),
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,
@@ -372,7 +374,7 @@ pub fn initWithOptions(
             xfm.config.isMoe(),
             xfm.config.longCtxGated(),
             0,
-        ));
+        ), &xfm.config));
         adapt_state.width_min = @intCast(PREFILL_CHUNK);
         adapt_state.width_max = @intCast(PREFILL_CHUNK);
         var cur_chunk: usize = PREFILL_CHUNK;
@@ -446,7 +448,7 @@ pub fn initWithOptions(
             // chunk-locally. Boundary alignment is in ABSOLUTE position
             // (pos + offset), so the saved snapshot list is correct for
             // the full prompt, not the truncated tail.
-            const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid);
+            const end = cappedEnd(pos, nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid), xfm.config.prefillWidths().max);
             if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
             const chunk_len: c_int = @intCast(end - pos);
             const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -750,15 +752,21 @@ pub fn initWithOptions(
         ctx.prefill_progress = options.prefill_progress;
     }
     defer ctx.prefill_progress = null;
-    // It is handed the spans and checkpoint positions the chunk loop would have run, and files its checkpoints onto the
-    // loop's list through `CacheOps.checkpoint`.
+    // It is handed the spans the chunk loop would have run and the checkpoint positions the loop's list would keep, and
+    // files its checkpoints onto that list through `CacheOps.checkpoint`.
     var whole_plan: ?WholePromptPlan = null;
     defer if (whole_plan) |*wp| wp.deinit(allocator);
     var prompt_cps: PromptCheckpoints = undefined;
     var prompt_cp_sink: CheckpointSink = undefined;
     if (final_start == 0 and tail_len > 1) {
-        whole_plan = try wholePromptPlan(allocator, prompt_ids.len, PREFILL_CHUNK, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, options.adaptive_chunk_width, dense_low_grid);
+        whole_plan = try wholePromptPlan(allocator, prompt_ids.len, PREFILL_CHUNK, xfm.config.prefillWidths().max, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, options.adaptive_chunk_width, dense_low_grid, .{
+            .max = options.ssm_checkpoint_max,
+            .thin = cp_thin,
+            .low_anchors = options.ssm_low_anchors,
+        });
         ctx.prompt_spans = whole_plan.?.spans;
+        // The cache capacity the chunk loop reserves: a model that appends span by span grows it no more often.
+        ctx.cache.reserve(@intCast(reservedPrefillTokens(&xfm.config, total_ctx_for_chunk, max_tokens, PREFILL_CHUNK)));
         if (whole_plan.?.checkpoints.len > 0) {
             prompt_cps = .{
                 .allocator = allocator,
@@ -790,35 +798,56 @@ pub fn initWithOptions(
     // History entries for the held-back span: (hidden[j], token[j+1]) for
     // j in [final_start, prefix_len) — same pairing as the chunk loop.
     // The last row's pair (hidden[last], t1) is appended by the first
-    // nextMtp round, exactly as before.
+    // nextMtp round, exactly as before. A whole-prompt prefill appends its
+    // history over the chunk loop's spans, window rule included, each span
+    // evaluated before the next: one head forward over the whole prompt would
+    // score every row against every key at once.
     if (tail_mtp_capture) {
-        if (!mtp_history_started) {
-            std.debug.assert(mtp_cache.?.step() == 0);
-            mtp_position_base = ssm_cp_offset + final_start;
-            mtp_history_started = true;
+        const prefix_len = prompt_ids.len - 1;
+        const ends: []const u64 = if (whole_plan) |wp| wp.spans else &.{};
+        const hist_window = effectiveMtpHistoryWindow(prefix_len, generate_mod.mtp_history_window_override);
+        var lo: usize = final_start;
+        var k: usize = 0;
+        while (lo < prefix_len) : (k += 1) {
+            const last = k + 1 >= ends.len;
+            const hi: usize = if (last) prefix_len else @intCast(ends[k] - ssm_cp_offset);
+            if (hi <= lo) continue;
+            defer lo = hi;
+            if (!last and !chunkNeedsMtpHistory(lo, hi, prefix_len, hist_window)) continue;
+            if (!mtp_history_started) {
+                std.debug.assert(mtp_cache.?.step() == 0);
+                mtp_position_base = ssm_cp_offset + lo;
+                mtp_history_started = true;
+            }
+            var span_hidden = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(span_hidden);
+            const all_shape = mlx.getShape(tail_hidden_all);
+            const start = [_]c_int{ 0, @intCast(lo - final_start), 0 };
+            const stop = [_]c_int{ all_shape[0], @intCast(hi - final_start), all_shape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&span_hidden, tail_hidden_all, &start, 3, &stop, 3, &strides, 3, xfm.s));
+            const tail_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
+                .pos = positions,
+                .total = ctx.mrope_total,
+                .delta = ctx.mrope_delta,
+                .base = mtp_position_base,
+            } else null;
+            try options.mtp.?.appendHistory(
+                xfm,
+                &mtp_cache.?,
+                prompt_ids[lo + 1 .. hi + 1],
+                span_hidden,
+                @intCast(mtp_cache.?.step()),
+                tail_mrope_ctx,
+                allocator,
+            );
+            if (!last) {
+                const eval_vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(eval_vec);
+                mtp_cache.?.appendEvalArrays(eval_vec);
+                try mlx.check(mlx.mlx_eval(eval_vec));
+            }
         }
-        var tail_hist_hidden = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(tail_hist_hidden);
-        const all_shape = mlx.getShape(tail_hidden_all);
-        const start = [_]c_int{ 0, 0, 0 };
-        const stop = [_]c_int{ all_shape[0], @intCast(tail_len - 1), all_shape[2] };
-        const strides = [_]c_int{ 1, 1, 1 };
-        try mlx.check(mlx.mlx_slice(&tail_hist_hidden, tail_hidden_all, &start, 3, &stop, 3, &strides, 3, xfm.s));
-        const tail_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
-            .pos = positions,
-            .total = ctx.mrope_total,
-            .delta = ctx.mrope_delta,
-            .base = mtp_position_base,
-        } else null;
-        try options.mtp.?.appendHistory(
-            xfm,
-            &mtp_cache.?,
-            prompt_ids[final_start + 1 .. prompt_ids.len],
-            tail_hist_hidden,
-            @intCast(mtp_cache.?.step()),
-            tail_mrope_ctx,
-            allocator,
-        );
     }
     if (dflash_active) {
         ctx.capture_layers = null;
@@ -982,7 +1011,7 @@ pub fn initWithOptions(
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
-            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else null else null,
+            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .plain = xfm.dspark_plain, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else null else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,

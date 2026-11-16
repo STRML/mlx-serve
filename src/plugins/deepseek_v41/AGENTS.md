@@ -26,9 +26,62 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   `flash_attn`: the lossy flash kernel, default on beside a plugin bank only).
 - `spec/markov.zig`: DSpark's Markov chain in B + 1 launches; `decode/engram_decode.zig` the Engram LRU,
   `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
-- `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built only
-  without NAX (unmeasured on M5); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or
-  128 (the expert-pruned packs are 2-bit g128). Otherwise `routed` runs.
+- `DSV41_ATTN_BW=0` keeps the first in_proj / wq_b / wo_a layouts (bit-equal; `decode.zig` tests both arms' bytes and
+  times them at a rank of four against a streaming read).
+- `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built on
+  every GPU (NAX too); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the
+  expert-pruned packs are 2-bit g128). Otherwise `routed` runs. `DSV41_MOE_BW=0` keeps the first launches (bit-equal).
+  Its ubench times both arms at the per-rank widths 2304 / 1152 / 576 against a streaming read.
+- `decode/seg.zig`: `DSV41_FUSED_SEG=0-5` (unset is 0, the stock path byte for byte) picks the fused decode segment level
+  and `serves` / `covers` decide per model, rows and layer: TP4, NAX, resident mxfp4 experts, bf16, one row; the attention
+  segment skips layers 0 1 2 8 14 20 24 28 32 36 (30 of 40 covered), the FFN segment covers all 40. Every rank logs
+  `[dsv41] fused seg level <N> (<tag>) on` at load and, each 1,000 one-row forwards at level 1 or above, its segment launches
+  (once a layer), declines and forwards (once a whole model step). `seg_bounds.zig` holds
+  the kernel map's `ffn:nopre` / `ffn:oracle` ceilings; its `seg:<0-5>` and `seg:broken` arms run `segCheck` per phase
+  (`SEG-CHECK-OK`).
+- `decode/seg_proto.zig` + `kernels/seg_proto_header.metal`: the phase boundary inside one fused-segment launch.
+  `seg.Counters` are generation-stamped words (`gen << 16 | arrivals`, 16 a (layer, segment) slot), so a step never zeroes
+  the previous one's and a counter left dirty by an abort cannot satisfy a wait; `seg_wait` is bounded
+  (`SEG_SPIN_POLLS_DEFAULT`) and fails into `State.status`, which `seg.afterStep` reads after the step's evaluation
+  (latches `fused_seg` off, `error.Dsv41FusedSegTimeout`). MLX binds an input of under 16 words as constant memory, so any
+  array a kernel writes (counters, status) keeps 16. The ubench is `MLX_SERVE_DIAG=dsv41-seg-probe` (grids
+  `dsv41-seg-probe-groups=<lo>-<hi>`); `probeResidency` finds the co-resident grid and `seg.spinGrid` derates it.
+- Phase data crossing groups inside one fused launch: every word another group reads in the same launch is written
+  through `seg_write_peer_output` or `seg_write_peer_f32` and read through `seg_read_peer_output`, `seg_read_peer_f32`
+  or `seg_read_peer_bf16x2` (`seg_proto_header.metal`; `coherent(device)` stores and loads from Metal 3.2, relaxed
+  atomics below), never a plain `device` store or load. The order is the coherent stores, then `seg_release()` and the
+  arrival, then (after the wait or last-arriver check and `seg_acquire()`) the coherent reads. Both halves fail on the
+  two-die M5 Ultra and pass on the M5 Max's one die, so a one-die test cannot catch either and the review must: a plain
+  load of a peer's output returns a stale value, and a plain store from lane 0 of a simdgroup, or one word in each of
+  many lines, is still invisible to another group's coherent or atomic load after the device fence, padded to aligned
+  rows or not. The level-1 kernel's last arrivers read the output buffer's previous bytes in every launch that way while
+  the bytes after the launch were right. A simdgroup storing 32 consecutive aligned words happened to pass, which is
+  how the probe missed it; do not rely on it. `seg_proto.zig` test 1 runs every arm with six access modes (`atomic`,
+  `coherent`, `peer` asserted; `plain`, `atomic_load`, `peer_read` = plain stores or loads, reported not asserted) in
+  two layouts (a group's words contiguous, or interleaved across groups, one word a line a store); a kernel may use only
+  the asserted ones. `scripts/lint_pins.txt` pins the level-1 kernel's partials and scores to the pair.
+- `decode/seg_ffn_in.zig` + `kernels/dec_seg_ffn_in.metal` (level 1, `DSV41_FUSED_SEG=1`): a tensor rank's FFN entry in one
+  launch. Every mix and router threadgroup rebuilds the stream expand and collapse from `x`, the summed attention output
+  and the attention split; the mixes' last arriver reduces the Sinkhorn split, the router's last arriver takes the top
+  K (last-arriver word 0 and 1 of the layer's FFN slot). Its sums are in a fixed order, so the ranks route bit for bit;
+  weights differ from the chain's by summation order only.
+- `decode/seg_ffn.zig` + `kernels/dec_seg_ffn.metal` (level 2, `DSV41_FUSED_SEG=2`): the whole FFN at one row in one launch of
+  `seg_ffn.Geometry.items` threadgroups of 256 threads. A group takes its item with a generation-stamped ticket (word 0 of the
+  layer's FFN slot; the probe's raw ticket arithmetic breaks when a slot sees gaps in the generations): items 0..P-1 the
+  mixes, then the router groups (`dec_seg_ffn_phases_header.metal`, the level-1 phases as device functions), then the shared
+  gate/up (waits on all router arrivals, word 2), the routed gate/up (waits on top K, word 3), then the down tiles (wait on the
+  top K and, per simdgroup, on their slot's activations, words 4 + slot). Cross-group data lives in one `scratch` output (parts,
+  scores, h2, idx, wts, act) read and written only through `seg_*_peer_*`; h2 is staged once a group into threadgroup memory
+  (`ReadMode.staged`; `peer` and `plain` are kernel-map arms `seg:2c` / `seg:2p`, plain never a service path). The kernel
+  fails `grid_mismatch` when its grid is not its item count. A launch that declines (an unusual bank, more than six picks) runs
+  level 1's launch, then stock. 31 buffers is Metal's limit: inputs under 16 words are bound as
+  constant memory, so scalars ride in the 16-word `par` input.
+- A MoE ubench routes scattered experts and cycles 80+ weight sets: consecutive expert ids read far slower on M5 Max
+  than a router's picks, and one reused set reads from the cache.
+- Under `tp` each `tpSum` is a CPU-stream JACCL all_sum, two a layer. With `MLX_METAL_FAST_SYNCH` (on in a group) MLX
+  hands off through its fences (`mlx/backend/metal/fence.cpp`): the GPU dispatches `input_coherent` and `fence_update`
+  before the sum and spins in the one-thread `fence_wait` kernel until the CPU finishes it, so the collective's wait
+  counts as GPU busy time. `DSV41_DEC_UBENCH` also times that hand-off without the network (decode.zig).
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
   (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.
@@ -53,8 +106,24 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   `spec.trunk_weight` lends the embedding and head; a pair's load re-reads `distributed.planFor` (idempotent).
 - A tensor pair (`InitOpts.tp`, `--dist tensor`) halves the experts and attention heads at load (the sliced `cfg` says so);
   both ranks run every layer and `tpSum` each attention and MoE output. Every rank must build the same sums in the same
-  order: `blockFused` and `batchedLayer` sum between their stages (`tpFfn`). DSpark drafts on rank 0 alone: its stages
-  load whole and sum nothing, and the worker follows each verify's rollback.
+  order: `blockFused` and `batchedLayer` sum between their stages (`tpFfn`).
+- DSpark under `tp` (`DSV41_DRAFT_SHARD`, rank 0's plan decides): every rank drafts on its slice of the stages and rows
+  of both heads, after rank 0's `tp_draft`; each Markov step gathers every rank's best `[value, id]`. A worker's verify
+  follow commits the kept main rows to its windows (`finishVerify`), or its next draft reads stale rows.
+- Under `tp` a plain decode step whose token is still on the GPU goes by bell alone (`DSV41_TP_PIPE`): every rank gathers
+  rank 0's token in its graph (`tpToken`). Rank 0 pipes only the state the workers last stepped, where they left it
+  (distributed.zig `TpLive`, cleared by any other message), never a step a header carries (snapshot, verify, all rows).
+- A 1-row decode step's Engram rows for every layer are read at once on GCD before its first Engram layer is built
+  (`Prefetch.readNow`, `DSV41_ENGRAM_EARLY`); a prompt's and a DSpark verify chunk's stay on the prefetch thread, the
+  verify's layers before the first Engram layer handed to the GPU before the hash (`DSV41_ENGRAM_LEAD`). `MLX_SERVE_DIAG=engram-laps` times
+  each host phase of a GPU-token decode step (`Laps`).
+- Under `tp` with `DSV41_DSPARK_PIPE=1` a DSpark round of the live state goes on the bells: the draft with the kept count and
+  first token after the byte, the verify with its row count, each rank's ids from its own draft (`Drafted`). Rank 0 rings
+  one only on what the workers last did (distributed.zig `TpSpec`, cleared by any other message); a copied draft keeps its header.
+- `DSV41_DSPARK_CHAIN=1` (greedy rounds, `dsparkRoundChain`): the verify's kept count and next token are argmaxes on the
+  GPU, the stage windows take all the verify's rows (`DSV41_DSPARK_COMMIT_ALL`, so the commit's matmuls see one row
+  count), and the next draft is built at the GPU position before the host reads; the next `dsparkDraft` from that token
+  takes it (`Chained`). Workers chain on the verify's flag (`workerChain`) and rank 0 marks them drafted (`tp_chained`).
 - Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
   worker keeps it; a step on another state (`st != &dec_state`) is refused.
 - Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken
@@ -64,6 +133,7 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   FIRST (`init` consumes its map). `swapMode` frees every slot's state with no `tpFree`; turns restore from the cache.
 - Under `tp` rank 0 alone holds the vision tower: a chunk's image rows ride with its step (`tp_step` `images`), the
   worker splices them at offset 0, so a rank's splice must depend only on the chunk's own rows (`chunkImageRows`).
+- Packed v2 snapshot entries are readable by this plugin; older binaries drop them during SSD scan.
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.
 - Metal only: a CPU host stream loads on this thread's GPU stream; no GPU = refused by name.
 
@@ -97,7 +167,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - The model runs in three `-Dunits` units (plugin, engine, modules): a setting or per-prompt region the load sets is
   a `Shared` (`ps()`), never a plain `var`, or the rounds and the streamer run on another unit's defaults.
 - A plugin-streamed bank's greedy DSpark round verifies the whole block (`DflashPol.pin_rows`): its 6-row verify costs
-  about a plain tick, and the adaptive policy's prior ladder cut novel text from 54 to 40 tok/s.
+  about a plain tick, and the adaptive policy's prior ladder cut novel text from 54 to 40 tok/s. A group round prices
+  its rows from this machine's own rounds instead (`GroupCost`: a base by state count, one row slope).
 - A streamed bank's phase follows its decode capacity (`promptPhase`): a call past the decode regions OR past
   `Routed.decode_ids` routed ids runs the prompt phase; a 9-16 token prompt on the EXL3 bank failed `NotPrefill`.
 - Engram tables are read whole and past the page cache only beside a streamed bank (`Table.readDirect`): on a resident
@@ -148,9 +219,7 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - Without NAX (M4 and older) `attn`, `idx_score` and the `wo_a` / `ffn_in` fusion behind them stay off: decode runs the
   pre-NAX split kernel and the compiled regions. The affine `moe_up` / `moe_down` stay off too (they lose to the
   compiled MoE there); `moe_fp4` is the non-NAX one.
-- Prefill is chunked at 8192 at most (`prefillChunkMax`, an explicit `--prefill-chunk` included), one MoE call per
-  chunk: each chunk still reads every expert bank once (the CED replay runs the decoder layers), so a narrower chunk
-  pays that read twice as often.
+- Prefill is chunked at 8192 at most (`prefillChunkMax`; explicit `--prefill-chunk` included), one MoE call per chunk. CED replay reads each expert bank again. Beside decoders it narrows to 4096 (`prefillWidths().beside_decode`), not the engine's 2048 / 1024.
 - Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
   allocation): DSpark at 8192 crosses it on a 256 GB Mac at the default `iogpu.wired_limit_mb`; raise it to bench.
 - DSpark on prose falls back to plain (acceptance 1.04/round): correct, prose runs ~54 tok/s.

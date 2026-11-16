@@ -99,14 +99,15 @@ fn restoreModuleMatch(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.Mo
     return if (restored) match.n else 0;
 }
 
-const ModuleImportProbe = struct {
+pub const ModuleImportProbe = struct {
     sch: *Scheduler,
     cfg: *const model_mod.ModelConfig,
     peak: u64,
+    body_bytes: u64 = 0,
 
-    fn fits(ctx: ?*anyopaque) bool {
+    pub fn fits(ctx: ?*anyopaque) bool {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
-        const staged = @import("cache/budget.zig").stagedHostBytes(self.sch);
+        const staged = @import("cache/budget.zig").stagedHostBytes(self.sch) -| self.body_bytes;
         return self.peak <= @import("admission/prefill_chunk.zig").prefillHeadroomNow(self.cfg, staged);
     }
 };
@@ -137,7 +138,7 @@ fn restoreDiskModule(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.Mod
 
 /// A matching inventory uses the planner's full peak; a mismatching one must be rejected
 /// before destination allocation. Bound its loader overlap, maps and header/name copies too.
-fn moduleImportPeak(planned: u64, inventory: []const kv_disk_cache.module_record.Tensor) !u64 {
+pub fn moduleImportPeak(planned: u64, inventory: []const kv_disk_cache.module_record.Tensor) !u64 {
     var loaded: u64 = 0;
     for (inventory) |tensor| loaded = try std.math.add(u64, loaded, tensor.bytes);
     const host = try std.math.add(u64, 4 * kv_disk_cache.module_record.MAX_ENVELOPE_BYTES, try std.math.mul(u64, inventory.len, 4096));
@@ -600,8 +601,8 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             else
                 0,
             // The width the admission guard billed for this request; the forward can never run wider.
-            .pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk, scheduler_mod.decodingCount(sch)),
-            .decode_share_width_cap = promptLogprobsWidthCap(slot.prompt_logprobs, decodeShareAdmissionCap(scheduler_mod.liveDecodingCount(sch), prefillDecodeShare())),
+            .pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk, scheduler_mod.decodingCount(sch), xfm_ptr.config.prefillWidths().beside_decode),
+            .decode_share_width_cap = promptLogprobsWidthCap(slot.prompt_logprobs, decodeShareAdmissionCap(scheduler_mod.liveDecodingCount(sch), prefillDecodeShare(), xfm_ptr.config.prefillWidths().beside_decode)),
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled

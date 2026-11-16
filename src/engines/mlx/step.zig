@@ -35,11 +35,13 @@ const publishFirstToken = @import("spec/wiring.zig").publishFirstToken;
 const hasWorkPendingLocked = @import("runtime/loop.zig").hasWorkPendingLocked;
 const warm_requests = @import("warm_requests.zig");
 const drainSideQueues = @import("runtime/loop.zig").drainSideQueues;
+const distributed = @import("cluster/distributed.zig");
 
 /// Caller holds queue_mu. Recheck arrivals under the lock before the short, wakeable retry wait.
 fn waitForDiskRetryLocked(sch: *Scheduler, ms: u32) void {
     if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) return;
     sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .boot } }) catch {};
+    distributed.tickInferenceLoop();
 }
 
 const ChatPassMode = enum { main, yield };
@@ -129,6 +131,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     var ran = mode == .yield and drainSideQueues(sch);
     var to_prefill: [16]*Slot = undefined;
     var n_prefill: usize = 0;
+    var has_decode = false;
     {
         sch.queue_mu.lockUncancelable(sch.io);
         defer sch.queue_mu.unlock(sch.io);
@@ -152,7 +155,11 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                 if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) continue;
                 // No later tick runs while parked, so release here.
                 sleep_inhibit.setActive(holdsSleepWhileParked(sch));
-                sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
+                distributed.parkInferenceLoop();
+                sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .boot } }) catch {};
+                // A request that woke the wait is served in this same iteration: reopen the watched step for it.
+                distributed.tickInferenceLoop();
+                break;
             }
             // Hold until the loop parks again.
             if (!sch.shutdown.load(.acquire)) sleep_inhibit.setActive(true);
@@ -161,6 +168,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
 
         // If only vision/embed/cleanup/load work is pending, loop back to drain it.
         if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) return if (ran) .ran else .idle;
+        has_decode = sch.decoding.items.len > 0;
 
         // Single-flight admission (the dsv4 class): a model with
         // MODULE-OWNED decode state admits at most one live slot.
@@ -498,6 +506,8 @@ test "a busy disk retry parks until its bounded timeout or pending work" {
     sch.load_queue = .empty;
     sch.gen_queue = .empty;
     sch.unload_queue = .empty;
+    sch.cache_export_queue = .empty;
+    sch.cache_import_queue = .empty;
     sch.warm_queue = .empty;
     sch.queue_mu.lockUncancelable(sch.io);
     defer sch.queue_mu.unlock(sch.io);

@@ -133,7 +133,7 @@ pub const StartupResponder = struct {
 
     fn answer(self: *StartupResponder, conn: *Conn) !void {
         const raw = (try readRequest(self.allocator, conn)) orelse return;
-        defer self.allocator.free(raw.buf);
+        defer raw.deinit(self.allocator);
         const line_end = std.mem.indexOf(u8, raw.buf[0..raw.len], "\r\n") orelse return;
         var words = std.mem.splitScalar(u8, raw.buf[0..line_end], ' ');
         _ = words.next();

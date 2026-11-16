@@ -23,6 +23,13 @@ const nan = std.math.nan(f32);
 /// An object the engine owns and the plugin only passes back (a slot's KV cache): opaque until P3 types it.
 pub const Handle = ?*anyopaque;
 
+pub const AuxImportPlan = extern struct {
+    size: u32 = @sizeOf(AuxImportPlan),
+    peak: u64 = 0,
+    loaded: u64 = 0,
+    destination: u64 = 0,
+};
+
 /// The layers this process serves when a model is split across machines; null = all of them.
 pub const LayerSpan = extern struct {
     size: u32 = @sizeOf(LayerSpan),
@@ -775,6 +782,7 @@ pub const AuxHooks = extern struct {
     /// Borrows all inputs; validates every name/shape/dtype before allocating destination state. Success returns
     /// an evaluated, independent snapshot with growth headroom; failure frees partial state and leaves out null.
     import_arrays: *const fn (m: *anyopaque, ids: Span(u32), header: Str, arrays: Span(AuxTensor), out: *Handle) callconv(.c) Verdict,
+    import_plan_details: ?*const fn (m: *anyopaque, header: Str, out: *AuxImportPlan) callconv(.c) Verdict = null,
 };
 
 pub const CacheHooks = extern struct {

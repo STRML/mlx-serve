@@ -1491,6 +1491,8 @@ memory and the next pass ran it. Fix: `complete` unlists again after every wait 
 from a list only under `queue_mu`, so unlisted with `in_pass` at 0 means nothing holds it. Guard: `complete: a slot
 its pass puts back in pending while complete waits is unlisted before cleanup owns it`.
 
+### A packed peer cache import evicted entries before refusing its resident size
+Defect: a packed cache envelope fit `max_kv_bytes`, but its restored bf16 state did not; admission evicted other sessions before `commitModule` declined it. Cause: the precheck summed wire tensor bytes, not the plugin's planned destination. Fix: `AuxImportPlan.destination` is checked before eviction. Guard: `peer import budget uses resident size before evicting cache entries`.
 
 ### DeepSeek-V4.1 prefilled again what it had just written, and a changed tail cost the whole context
 Defect: every agent turn prefilled the previous turn's answer again, a second conversation under the same system

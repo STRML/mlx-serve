@@ -46,6 +46,8 @@ pub const Api = struct {
     run_generation: *const fn (*Scheduler, *requests.GenRequest) Err,
     compute_embeddings: *const fn (*Scheduler, *requests.EmbedRequest, *[][]f32) Err,
     encode_vision: *const fn (*Scheduler, *requests.VisionEncodeRequest, *mlx.mlx_array) Err,
+    export_cache: *const fn (*Scheduler, *requests.CacheExportRequest) Err,
+    import_cache: *const fn (*Scheduler, *requests.CacheImportRequest) Err,
     /// Qwen3-ForcedAligner: the 80 ms step each `<timestamp>` in `ids` lands on, run on the inference thread.
     timestamp_classes: *const fn (std.mem.Allocator, *LoadedModel, []const u32, mlx.mlx_array, u32, *[]u32) Err,
     /// A speech plugin's own timing (`MediaHooks.word_times`): a start and an end in ms per unit, inference thread.
@@ -68,10 +70,11 @@ pub const Api = struct {
     plugin_stub: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8) ?PluginStub,
     gauges: *const fn (*Gauges) void,
     /// The Thunderbolt cluster: `mlx-serve dist-worker`, `dist-probe`, and the host side's `--dist` connect
-    /// (`mode` is the cluster's `Mode` tag).
+    /// (`mode` is the cluster's `Mode` tag; `size` Macs in the group, rank 0 included; `join_timeout_s` how long the
+    /// group model's load waits for the workers, null = the size's default).
     cluster_worker: *const fn (std.Io, std.mem.Allocator, []const []const u8) Err,
     cluster_probe: *const fn (std.Io, []const []const u8) Err,
-    cluster_connect: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8, u8, []const u8, ?u32) Err,
+    cluster_connect: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8, u8, []const u8, ?u32, u32, ?u32) Err,
     /// `--prompt` without `--serve`: one generation on the calling thread.
     run_offline: *const fn (*const Offline) Err,
     // ── process-wide engine settings, set once from the launch flags
@@ -210,6 +213,16 @@ pub fn encodeVision(sch: *Scheduler, req: *requests.VisionEncodeRequest) !mlx.ml
     var out: mlx.mlx_array = .{ .ctx = null };
     try err_name.check(api().encode_vision(sch, req, &out));
     return out;
+}
+
+pub fn exportCache(sch: *Scheduler, req: *requests.CacheExportRequest) !requests.CacheExportOutcome {
+    try err_name.check(api().export_cache(sch, req));
+    return req.outcome;
+}
+
+pub fn importCache(sch: *Scheduler, req: *requests.CacheImportRequest) !requests.CacheImportOutcome {
+    try err_name.check(api().import_cache(sch, req));
+    return req.outcome;
 }
 
 pub fn timestampClasses(gpa: std.mem.Allocator, lm: *LoadedModel, ids: []const u32, rows: mlx.mlx_array, timestamp_token: u32) ![]u32 {

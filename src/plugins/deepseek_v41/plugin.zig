@@ -335,11 +335,11 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     defer if (quant) |q| q.close();
     // A pack an outside plugin reads has no tower reader here: its weights leave before the bank sizes its rows.
     if (quant != null) m.weights.dropPrefix("vision.");
-    m.modes = try mode.build(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant }, try tpModeSetting(ctx.settings_json.slice()));
+    m.modes = try mode.build(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .draft_shard = ctx.tp_size > 1 and dsv41.draftShardWanted(ctx.tp_size), .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant }, try tpModeSetting(ctx.settings_json.slice()));
     errdefer m.modes.deinit();
     m.mdl = m.modes.tp1;
     // The fused Markov chain's kernels compiled now, not in the first draft.
-    if (m.mdl.dspark) |*w| try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
+    if (m.mdl.dspark) |*w| if (!m.mdl.draft_shard) try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
     m.bank = null;
     m.bank_streams = false;
     m.owner = 0;
@@ -550,7 +550,7 @@ fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {
 fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.VisionRows, dev: mlx.mlx_array) !mlx.mlx_array {
     const mdl = m.mdl;
     var one: [1]u32 = undefined;
-    const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and mdl.tp == null;
+    const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and (mdl.tp == null or dsv41.tpPipeOn());
     const ids = if (dev.ctx != null and !gpu_decode) blk: {
         one[0] = try v4plugin.hostToken(dev);
         if (one[0] >= m.cfg.vocab_size) return error.TokenPastVocabulary;
@@ -638,6 +638,7 @@ const aux_hooks = abi.AuxHooks{
     .prefix_key = &auxPrefixKey,
     .begin_prompt = &auxBeginPrompt,
     .import_plan = &auxImportPlan,
+    .import_plan_details = &auxImportPlanDetails,
     .export_arrays = &auxExportArrays,
     .import_arrays = &auxImportArrays,
     .reserve = &auxReserve,
@@ -807,7 +808,18 @@ fn auxImportPlan(mp: *anyopaque, header: abi.Str, out: *u64) callconv(.c) Verdic
     out.* = 0;
     if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
-    out.* = dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    out.* = (dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e))).peak;
+    return .ok;
+}
+
+fn auxImportPlanDetails(mp: *anyopaque, header: abi.Str, out: *abi.AuxImportPlan) callconv(.c) Verdict {
+    out.* = .{};
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
+    const m: *Model = @ptrCast(@alignCast(mp));
+    const plan = dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    out.peak = plan.peak;
+    out.loaded = plan.loaded;
+    out.destination = plan.destination;
     return .ok;
 }
 

@@ -1,0 +1,165 @@
+--- a/mlx/distributed/jaccl/lib/jaccl/mesh_impl.h
++++ b/mlx/distributed/jaccl/lib/jaccl/mesh_impl.h
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ // Copyright © 2026 Apple Inc.
+ 
+ #pragma once
+@@ -290,13 +291,157 @@
+     }
+   }
+ 
++  // jaccl-ordered-patch v2
++  static bool ordered_rs_enabled() {
++    static const bool on = [] {
++      const char* e = std::getenv("JACCL_ORDERED_RS");
++      return e != nullptr && e[0] == '1';
++    }();
++    return on;
++  }
++
+   template <typename T, typename ReduceOp>
++  void sum_scatter_ordered(
++      const T* in,
++      T* out,
++      int64_t count,
++      int64_t stride,
++      ReduceOp reduce_op) {
++    // Peers are reduced in rank order, whatever order their tiles arrive in,
++    // so the result is the same bits on every run. Our own chunk is staged
++    // tile by tile because `in` may alias `out`, and rank 0's tile is written
++    // to the output first.
++    const T* our_chunk = in + static_cast<int64_t>(rank_) * stride;
++
++    auto [sz, buffer_size] = buffer_size_from_message(count * sizeof(T));
++    int64_t N = buffer_size / sizeof(T);
++    constexpr int PIPELINE = 2;
++    constexpr int WC_NUM = PIPELINE * MESH_MAX_PEERS * 2;
++    int64_t total = static_cast<int64_t>(count);
++    int64_t total_chunks = (total + N - 1) / N;
++    int num_peers = size_ - 1;
++
++    auto own_staging = [&](int buff) -> T* {
++      return reinterpret_cast<T*>(staging_mem_.get() + buff * MAX_BUFFER_SIZE);
++    };
++    auto stage_own = [&](int64_t chunk, int buff) {
++      int64_t off = chunk * N;
++      std::copy_n(our_chunk + off, std::min(N, total - off), own_staging(buff));
++    };
++
++    int in_flight = 0;
++    int64_t read_offset = 0;
++    int completed_send_count[PIPELINE] = {0};
++    int recv_end[MESH_MAX_PEERS] = {0};
++    int64_t reduce_chunk = 0;
++    int reduce_rank = 0;
++
++    int buff = 0;
++    while (read_offset < total && buff < PIPELINE) {
++      int64_t elems = std::min(N, total - read_offset);
++      scatter_post_recv_all(sz, buff);
++      for (int p = 0; p < size_; p++) {
++        if (p == rank_) {
++          continue;
++        }
++        const T* src = in + static_cast<int64_t>(p) * stride + read_offset;
++        std::copy(
++            src, src + elems, scatter_send_buffer(sz, buff, p).begin<T>());
++      }
++      stage_own(buff, buff);
++      scatter_post_send_all(sz, buff);
++
++      buff++;
++      in_flight += 2 * num_peers;
++      read_offset += N;
++    }
++
++    while (reduce_chunk < total_chunks || read_offset < total) {
++      ibv_wc wc[WC_NUM];
++      int n = poll(connections_, WC_NUM, wc);
++      for (int i = 0; i < n; i++) {
++        int work_type = wc[i].wr_id >> 16;
++        int buff = (wc[i].wr_id >> 8) & 0xff;
++        int rank = wc[i].wr_id & 0xff;
++
++        in_flight--;
++
++        if (work_type == SEND_WR && read_offset < total) {
++          completed_send_count[buff]++;
++          if (completed_send_count[buff] == num_peers) {
++            int64_t elems = std::min(N, total - read_offset);
++            for (int p = 0; p < size_; p++) {
++              if (p == rank_) {
++                continue;
++              }
++              const T* src =
++                  in + static_cast<int64_t>(p) * stride + read_offset;
++              std::copy(
++                  src,
++                  src + elems,
++                  scatter_send_buffer(sz, buff, p).begin<T>());
++            }
++            scatter_post_send_all(sz, buff);
++
++            completed_send_count[buff] = 0;
++            in_flight += num_peers;
++            read_offset += N;
++          }
++        } else if (work_type == RECV_WR) {
++          recv_end[rank]++;
++        }
++      }
++
++      while (reduce_chunk < total_chunks) {
++        bool own = reduce_rank == rank_;
++        if (!own && recv_end[reduce_rank] <= reduce_chunk) {
++          break;
++        }
++        int b = reduce_chunk % PIPELINE;
++        int64_t w = reduce_chunk * N;
++        int64_t elems = std::min(N, total - w);
++        const T* src = own ? own_staging(b)
++                           : scatter_recv_buffer(sz, b, reduce_rank).begin<T>();
++        if (reduce_rank == 0) {
++          std::copy_n(src, elems, out + w);
++        } else {
++          reduce_op(src, out + w, elems);
++        }
++
++        int64_t next_chunk = reduce_chunk + PIPELINE;
++        if (next_chunk < total_chunks) {
++          if (own) {
++            stage_own(next_chunk, b);
++          } else {
++            scatter_recv_from(sz, reduce_rank, b);
++            in_flight++;
++          }
++        }
++
++        if (++reduce_rank >= size_) {
++          reduce_rank = 0;
++          reduce_chunk++;
++        }
++      }
++    }
++
++    while (in_flight > 0) {
++      ibv_wc wc[WC_NUM];
++      in_flight -= poll(connections_, WC_NUM, wc);
++    }
++  }
++
++  template <typename T, typename ReduceOp>
+   void sum_scatter(
+       const T* in,
+       T* out,
+       int64_t count,
+       int64_t stride,
+       ReduceOp reduce_op) {
++    if (ordered_rs_enabled()) {
++      sum_scatter_ordered(in, out, count, stride, reduce_op);
++      return;
++    }
+     // Fully connected reduce scatter.
+     //
+     // The input holds size_ chunks of `count` elements each, `stride` elements

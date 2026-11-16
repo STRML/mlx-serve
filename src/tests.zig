@@ -71,6 +71,8 @@ test {
     _ = @import("plugins/deepseek_v4/proof_test.zig");
     _ = @import("plugins/deepseek_v4/served_test.zig");
     _ = @import("plugins/deepseek_v41/proof_test.zig");
+    _ = @import("plugins/deepseek_v41/draft_test.zig");
+    _ = @import("plugins/deepseek_v41/peer_fetch_test.zig");
     _ = @import("plugins/muse_glimmer/proof_test.zig");
     _ = @import("plugins/qwen3_asr/proof_test.zig");
     _ = @import("plugins/qwen3_5/proof_test.zig");
@@ -267,6 +269,9 @@ test {
     _ = @import("sdk/tokenizer/tokenizer.zig");
     _ = @import("engines/mlx/cache/prefix_cache.zig");
     _ = @import("engines/mlx/cache/restore_dump.zig");
+    _ = @import("engines/mlx/cache/peer_wire.zig");
+    _ = @import("engines/mlx/cache/peer_transfer.zig");
+    _ = @import("engines/mlx/cache/pack_identity.zig");
     _ = @import("host/metrics/metrics.zig");
     _ = @import("sdk/util/system.zig");
     _ = @import("engines/mlx/runtime/sleep_inhibit.zig");

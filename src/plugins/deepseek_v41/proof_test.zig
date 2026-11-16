@@ -3,6 +3,7 @@
 //! in `fixtures/` (`../deepseek_v4/proof_test.zig`).
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
@@ -554,7 +555,159 @@ test "deepseek_v41 aux: candidate image key ignores later rows and eligibility e
 }
 
 const codec = @import("cache_codec.zig");
+const cache_pack = @import("cache_pack.zig");
 const dsv41 = @import("deepseek_v41.zig");
+
+test "cache pack kernels round trip signed bf16 rows and mark one off-grid group corrupt" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const stream = mlx.gpuStream();
+    var kernels = try cache_pack.Kernels.init();
+    defer kernels.deinit();
+    const gpa = testing.allocator;
+    const levels = [_]u16{ 0, 0x3f00, 0x3f80, 0x3fc0, 0x4000, 0x4040, 0x4080, 0x40c0 };
+    for ([_]codec.Encoding{ .fp4_e4m3_g16, .fp4_ue8m0_g32, .fp8_ue8m0_g32 }) |encoding| {
+        const group: usize = if (encoding == .fp4_e4m3_g16) 16 else 32;
+        const width = group * 300;
+        const rows = 2;
+        const input = try gpa.alloc(u16, rows * width);
+        defer gpa.free(input);
+        for (input, 0..) |*value, i| {
+            const lane = i % 8;
+            const sign: u16 = if (i % 3 == 0) 0x8000 else 0;
+            value.* = levels[lane] | sign;
+        }
+        if (encoding == .fp4_e4m3_g16) {
+            @memset(input[0..group], 0);
+            input[0] = 0x8000;
+            input[1] = 0x3b00;
+        }
+        const spec: codec.Spec = .{ .kind = if (encoding == .fp4_e4m3_g16) .comp else if (encoding == .fp4_ue8m0_g32) .index else .win, .rows = rows, .width = width, .dtype = .bfloat16 };
+        const shape = [_]c_int{ @intCast(rows), @intCast(width) };
+        const original = mlx.mlx_array_new_data(input.ptr, &shape, 2, .bfloat16);
+        defer _ = mlx.mlx_array_free(original);
+        var bits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bits);
+        try mlx.check(mlx.mlx_view(&bits, original, .uint16, stream));
+        const output = try cache_pack.encode(&kernels, stream, bits, encoding);
+        defer _ = mlx.mlx_array_free(output);
+        try mlx.check(mlx.mlx_array_eval(output));
+        const encoded = mlx.mlx_array_data_uint8(output) orelse return error.NoData;
+        const row_bytes = codec.packedRowBytes(encoding, width).?;
+        if (encoding == .fp4_e4m3_g16) try testing.expectEqual(@as(u8, 1), encoded[width / 2]);
+        const zig_decoded = try gpa.alloc(u16, input.len);
+        defer gpa.free(zig_decoded);
+        try codec.unpackBf16(spec, encoded[0 .. rows * row_bytes], zig_decoded);
+        try testing.expectEqualSlices(u16, input, zig_decoded);
+        const restored = try cache_pack.decode(&kernels, stream, output, spec, encoding);
+        defer _ = mlx.mlx_array_free(restored.bits);
+        defer _ = mlx.mlx_array_free(restored.status);
+        const evaluated = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ restored.bits, restored.status }, 2);
+        defer _ = mlx.mlx_vector_array_free(evaluated);
+        try mlx.check(mlx.mlx_eval(evaluated));
+        const status = mlx.mlx_array_data_uint32(restored.status) orelse return error.NoData;
+        for (status[0 .. rows * (width / group)]) |flag| try testing.expectEqual(@as(u32, 0), flag);
+        var restored_bf16 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(restored_bf16);
+        try mlx.check(mlx.mlx_view(&restored_bf16, restored.bits, .bfloat16, stream));
+        try mlx.check(mlx.mlx_array_eval(restored_bf16));
+        try testing.expectEqualSlices(u16, input, mlx.mlx_array_data_bfloat16(restored_bf16).?[0..input.len]);
+    }
+
+    const bad_values = [_]u16{ 0x3f01, 0x4040, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const bad_shape = [_]c_int{ 1, 16 };
+    const bad_input = mlx.mlx_array_new_data(&bad_values, &bad_shape, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(bad_input);
+    var bad_bits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bad_bits);
+    try mlx.check(mlx.mlx_view(&bad_bits, bad_input, .uint16, stream));
+    const bad_spec: codec.Spec = .{ .kind = .comp, .rows = 1, .width = 16, .dtype = .bfloat16 };
+    const bad_output = try cache_pack.encode(&kernels, stream, bad_bits, .fp4_e4m3_g16);
+    defer _ = mlx.mlx_array_free(bad_output);
+    try mlx.check(mlx.mlx_array_eval(bad_output));
+    const bad_bytes = mlx.mlx_array_data_uint8(bad_output) orelse return error.NoData;
+    try testing.expectEqual(@as(u8, 0), bad_bytes[8]);
+    const rejected = try cache_pack.decode(&kernels, stream, bad_output, bad_spec, .fp4_e4m3_g16);
+    defer _ = mlx.mlx_array_free(rejected.bits);
+    defer _ = mlx.mlx_array_free(rejected.status);
+    const rejected_arrays = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ rejected.bits, rejected.status }, 2);
+    defer _ = mlx.mlx_vector_array_free(rejected_arrays);
+    try mlx.check(mlx.mlx_eval(rejected_arrays));
+    try testing.expectEqual(@as(u32, 1), mlx.mlx_array_data_uint32(rejected.status).?[0]);
+}
+
+// Two l20.comp groups from a live 32k export (rows 8 and 71). The writer took the scale from the max before rounding
+// (about 4.5-5.0 x 2^-8, E4M3 subnormal 2^-8), so the stored max is 4 x scale, and re-deriving the scale from it gives
+// 2^-9, which puts 0.015625 at 8 x scale, off the grid.
+test "cache pack keeps comp groups whose stored max rounded down to 4 x a subnormal scale" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const stream = mlx.gpuStream();
+    var kernels = try cache_pack.Kernels.init();
+    defer kernels.deinit();
+    const values = [_]u16{
+        0x3c00, 0x3b80, 0x3b00, 0xbb00, 0xbc00, 0x3b00, 0x3c00, 0xbbc0, 0x3b80, 0xbc40, 0x3c40, 0xbbc0, 0x3c40, 0x3c80, 0x3c80, 0xbc40,
+        0x3c80, 0x3b00, 0xbb00, 0xbb00, 0x3c40, 0xbc00, 0x3c00, 0x3b00, 0x0000, 0x3c00, 0xbb00, 0x3b80, 0x3bc0, 0xbb00, 0x3b00, 0x3b80,
+    };
+    const shape = [_]c_int{ 2, 16 };
+    const input = mlx.mlx_array_new_data(&values, &shape, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(input);
+    var bits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bits);
+    try mlx.check(mlx.mlx_view(&bits, input, .uint16, stream));
+    const output = try cache_pack.encode(&kernels, stream, bits, .fp4_e4m3_g16);
+    defer _ = mlx.mlx_array_free(output);
+    try mlx.check(mlx.mlx_array_eval(output));
+    const encoded = mlx.mlx_array_data_uint8(output) orelse return error.NoData;
+    const spec: codec.Spec = .{ .kind = .comp, .rows = 2, .width = 16, .dtype = .bfloat16 };
+    const row_bytes = codec.packedRowBytes(.fp4_e4m3_g16, 16).?;
+    // E4M3 subnormal 2 x 2^-9 = 2^-8.
+    for (0..2) |row| try testing.expectEqual(@as(u8, 0x02), encoded[row * row_bytes + 8]);
+    var decoded: [32]u16 = undefined;
+    try codec.unpackBf16(spec, encoded[0 .. 2 * row_bytes], &decoded);
+    try testing.expectEqualSlices(u16, &values, &decoded);
+}
+
+test "cache pack keeps sentinel scales nonzero after exhaustive bf16 decode" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const stream = mlx.gpuStream();
+    var kernels = try cache_pack.Kernels.init();
+    defer kernels.deinit();
+    const rows: usize = 32640;
+    for ([_]codec.Encoding{ .fp4_e4m3_g16, .fp4_ue8m0_g32, .fp8_ue8m0_g32 }) |encoding| {
+        const group: usize = if (encoding == .fp4_e4m3_g16) 16 else 32;
+        const width = group;
+        const input = try testing.allocator.alloc(u16, rows * width);
+        defer testing.allocator.free(input);
+        @memset(input, 0);
+        var row: usize = 0;
+        for (0..255) |exponent| {
+            if (exponent == 255) continue;
+            for (0..128) |mantissa| {
+                input[row * width] = @intCast((exponent << 7) | mantissa);
+                row += 1;
+            }
+        }
+        try testing.expectEqual(rows, row);
+        const shape = [_]c_int{ @intCast(rows), @intCast(width) };
+        const original = mlx.mlx_array_new_data(input.ptr, &shape, 2, .bfloat16);
+        defer _ = mlx.mlx_array_free(original);
+        var bits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bits);
+        try mlx.check(mlx.mlx_view(&bits, original, .uint16, stream));
+        const packed_bits = try cache_pack.encode(&kernels, stream, bits, encoding);
+        defer _ = mlx.mlx_array_free(packed_bits);
+        const spec: codec.Spec = .{ .kind = if (encoding == .fp4_e4m3_g16) .comp else if (encoding == .fp4_ue8m0_g32) .index else .win, .rows = rows, .width = width, .dtype = .bfloat16 };
+        const decoded = try cache_pack.decode(&kernels, stream, packed_bits, spec, encoding);
+        defer _ = mlx.mlx_array_free(decoded.bits);
+        defer _ = mlx.mlx_array_free(decoded.status);
+        const repacked = try cache_pack.encode(&kernels, stream, decoded.bits, encoding);
+        defer _ = mlx.mlx_array_free(repacked);
+        try mlx.check(mlx.mlx_array_eval(repacked));
+        const bytes = mlx.mlx_array_data_uint8(repacked) orelse return error.NoData;
+        const row_bytes = codec.packedRowBytes(encoding, width).?;
+        const code_bytes = if (encoding == .fp8_ue8m0_g32) width else width / 2;
+        for (0..rows) |i| try testing.expect(bytes[i * row_bytes + code_bytes] != 0);
+    }
+}
 
 const Exported = struct {
     tensors: [codec.max_tensors]abi.AuxTensor = undefined,
@@ -754,6 +907,12 @@ fn codecRoundTrip(files: []const sdk.fixture.File, p: []const u32, dspark: bool)
         defer origin.close();
         try e.capture(origin, p);
     }
+    try testing.expectEqualStrings("DV41A002", e.bytes().slice()[0..8]);
+    for (e.arrays()) |tensor| {
+        const name = tensor.name.slice();
+        const candidate = std.mem.endsWith(u8, name, ".comp") or std.mem.endsWith(u8, name, ".index") or std.mem.endsWith(u8, name, ".win");
+        if (candidate) try testing.expectEqual(mlx.mlx_dtype.uint8, mlx.mlx_array_dtype(.{ .ctx = tensor.array.ctx }));
+    }
     const t = try Twin.open(files, "");
     defer t.close();
     const m: *v41.Model = @ptrCast(@alignCast(t.m));
@@ -799,6 +958,13 @@ fn codecRoundTrip(files: []const sdk.fixture.File, p: []const u32, dspark: bool)
 
 test "codec round trip survives origin destruction at odd and even compressor boundaries with DSpark on and off" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old = env.get(.DSV41_CACHE_PACK);
+    defer if (old) |value| {
+        _ = env.setForeign("DSV41_CACHE_PACK", value);
+    } else {
+        env.unsetForeign("DSV41_CACHE_PACK");
+    };
+    env.set(.DSV41_CACHE_PACK, "1");
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var p: [27]u32 = undefined;
@@ -807,6 +973,83 @@ test "codec round trip survives origin destruction at odd and even compressor bo
         const files = if (dspark) try fixture.v41DsparkFiles(arena.allocator(), 7) else try fixture.v41Files(arena.allocator(), 7);
         for ([_]usize{ 2, 3, 8, 9, 26, 27 }) |len| try codecRoundTrip(files, p[0..len], dspark);
     }
+}
+
+test "packed snapshot restore refuses the zero scale corruption sentinel" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const origin = try Twin.open(files, "");
+    defer origin.close();
+    const p = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    var e: Exported = .{};
+    try e.capture(origin, &p);
+    defer e.deinit();
+    try testing.expectEqualStrings("DV41A002", e.bytes().slice()[0..8]);
+    for (e.arrays()) |tensor| if (mlx.mlx_array_dtype(.{ .ctx = tensor.array.ctx }) == .uint8) {
+        var ready = true;
+        try mlx.check(mlx._mlx_array_is_available(&ready, .{ .ctx = tensor.array.ctx }));
+        try testing.expect(!ready);
+    };
+    var packed_index: ?usize = null;
+    for (e.arrays(), 0..) |tensor, i| {
+        if (mlx.mlx_array_dtype(.{ .ctx = tensor.array.ctx }) == .uint8 and std.mem.indexOf(u8, tensor.name.slice(), ".comp") != null) {
+            packed_index = i;
+            break;
+        }
+    }
+    const i = packed_index orelse return error.MissingPackedComp;
+    const original = mlx.mlx_array{ .ctx = e.arrays()[i].array.ctx };
+    try mlx.check(mlx.mlx_array_eval(original));
+    const shape = mlx.getShape(original);
+    const size = mlx.mlx_array_size(original);
+    const changed = try testing.allocator.dupe(u8, mlx.mlx_array_data_uint8(original).?[0..size]);
+    defer testing.allocator.free(changed);
+    changed[@intCast(shape[1] - 1)] = 0;
+    const damaged = mlx.mlx_array_new_data(changed.ptr, shape.ptr, @intCast(shape.len), .uint8);
+    _ = mlx.mlx_array_free(original);
+    e.arrays()[i].array.ctx = damaged.ctx;
+    const receiver = try Twin.open(files, "");
+    defer receiver.close();
+    try expectImportRefused(receiver, &e, p[0 .. p.len - 1], e.arrays());
+}
+
+test "cache packing kill lever keeps the v1 header and raw tensor inventory" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old = env.get(.DSV41_CACHE_PACK);
+    defer if (old) |value| {
+        _ = env.setForeign("DSV41_CACHE_PACK", value);
+    } else {
+        env.unsetForeign("DSV41_CACHE_PACK");
+    };
+    env.set(.DSV41_CACHE_PACK, "0");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    const p = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    var e: Exported = .{};
+    try e.capture(t, &p);
+    defer e.deinit();
+    try testing.expectEqualStrings("DV41A001", e.bytes().slice()[0..8]);
+    for (e.arrays()) |tensor| try testing.expect(mlx.mlx_array_dtype(.{ .ctx = tensor.array.ctx }) != .uint8);
+    const receiver = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer receiver.close();
+    var imported: abi.Handle = null;
+    try testing.expect(v41.table.cache.aux.?.import_arrays(receiver.m, .of(p[0 .. p.len - 1]), e.bytes(), .of(e.arrays()), &imported).isOk());
+    defer v41.table.cache.aux.?.free(receiver.m, imported);
+
+    env.set(.DSV41_CACHE_PACK, "1");
+    const qat_off = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer qat_off.close();
+    const model: *v41.Model = @ptrCast(@alignCast(qat_off.m));
+    model.mdl.qat_off = true;
+    var raw_v2: Exported = .{};
+    try raw_v2.capture(qat_off, &p);
+    defer raw_v2.deinit();
+    try testing.expectEqualStrings("DV41A002", raw_v2.bytes().slice()[0..8]);
+    for (raw_v2.arrays()) |tensor| try testing.expect(mlx.mlx_array_dtype(.{ .ctx = tensor.array.ctx }) != .uint8);
 }
 
 test "codec refuses changed loaded settings and invalid IDs before allocating" {
@@ -954,7 +1197,7 @@ const LoneGroup = struct {
         try mlx.check(mlx.mlx_array_set(&o, x));
         return o;
     }
-    fn step(_: []const u32, _: usize, _: bool, _: bool, _: bool, _: u64, _: ?mlx.mlx_array) anyerror!void {}
+    fn step(_: []const u32, _: usize, _: bool, _: bool, _: dsv41.VerifyOpts, _: u64, _: ?mlx.mlx_array) anyerror!void {}
     fn batch(_: []const u64, _: []const usize, _: []const []const u32, _: bool) anyerror!void {}
     fn free(_: u64) void {}
     fn snap(_: dsv41.SnapOp, _: u64, _: u64) void {}

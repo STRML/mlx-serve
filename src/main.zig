@@ -28,7 +28,7 @@ const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
 const chat_mod = @import("host/chat/chat.zig");
 const server_mod = @import("host/http/server.zig");
 const ablation_api = @import("host/api/ablation.zig");
-const effectiveSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").effectiveSsmCheckpointStride;
+const launchSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").launchSsmCheckpointStride;
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const ane_lm = @import("engines/ane/lm.zig");
 const status = @import("host/status.zig");
@@ -149,6 +149,8 @@ fn printUsage(io: std.Io) void {
         \\                      (every pulled model loads on demand by name)
         \\  worker              Lend this Mac to another Mac's --dist host:
         \\                      --coordinator <ip:port> --device <rdma_enX>
+        \\                      [--rank k --size n] (default 1 of 2; past a pair
+        \\                      --device lists the port facing each rank, own `-`)
         \\                      [--model-dir <dir>]... (default ~/.mlx-serve/models)
         \\  dist-probe          Measure the RDMA link: --rank 0|1 --coordinator
         \\                      <ip:port> --device <rdma_enX> [--soak N]
@@ -547,6 +549,15 @@ fn printUsage(io: std.Io) void {
         \\  --dist-coordinator <ip:port>  This Mac's address the worker dials
         \\  --dist-device <rdma_enX>  The RDMA port facing the worker (`ibv_devinfo`)
         \\  --dist-split <n>    Pipeline: layers kept here (default: by free memory)
+        \\  --dist-size <n>     Macs in the group, this one included (default 2).
+        \\                        Past 2: DeepSeek-V4.1 with --dist tensor only;
+        \\                        --dist-device lists the port facing each rank
+        \\                        in rank order, this Mac's own `-` (rank 0), and
+        \\                        each worker runs `worker --rank k --size n`
+        \\  --dist-join-timeout <s>  How long after startup a missing worker reads as
+        \\                        the group forming before the log names its rank
+        \\                        (default 0 for a pair, 600 past it; the load
+        \\                        fails with 503 at once either way)
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --log-file <path>   Persist the server log ("off" disables).
         \\                      Default: ~/.mlx-serve/logs/mlx-serve-<port>.log
@@ -702,6 +713,8 @@ pub fn main(init: std.process.Init) !void {
     var dist_device: ?[]const u8 = null;
     var dist_split: ?u32 = null;
     var dist_model: ?[]const u8 = null;
+    var dist_size: u32 = 2;
+    var dist_join_timeout: ?u32 = null;
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
@@ -817,6 +830,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--dist-split") and i + 1 < args.len) {
             i += 1;
             dist_split = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--dist-size") and i + 1 < args.len) {
+            i += 1;
+            dist_size = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--dist-join-timeout") and i + 1 < args.len) {
+            i += 1;
+            dist_join_timeout = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--ctx-size") and i + 1 < args.len) {
             i += 1;
             ctx_size = try std.fmt.parseInt(u32, args[i], 10);
@@ -1496,7 +1515,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
-        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @intFromEnum(mode), group_model, dist_split));
+        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @intFromEnum(mode), group_model, dist_split, dist_size, dist_join_timeout));
     }
 
     if (serve_mode) {
@@ -1857,7 +1876,7 @@ fn withLaunchFlags(base: LoadParams, spec: SpecLoadFlags, kv: KVQuantConfig) Loa
     p.prefix_cache_mem_bytes = l.prefix_cache_mem_bytes;
     p.prefix_cache_clamp = true;
     p.prefix_cache_disk_bytes = l.prefix_cache_disk_bytes;
-    p.ssm_checkpoint_stride = effectiveSsmCheckpointStride(l.ssm_checkpoint_stride, l.prefix_cache_capacity, l.prefix_cache_ram_enabled, l.prefix_cache_disk_bytes);
+    p.ssm_checkpoint_stride = launchSsmCheckpointStride();
     p.ssm_checkpoint_max = l.ssm_checkpoint_max;
     p.tokenize_cache_entries = server_mod.tokenize_cache_entries;
     p.launch_warmup_eager = warmup_eager;

@@ -46,6 +46,7 @@ pub fn build(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: mlx.m
         errdefer out.tp_weights.?.deinit();
         var o = opts;
         o.tp = g;
+        o.draft_shard = dsv41.draftShardWanted(g.size);
         out.tp = try dsv41.init(gpa, whole, &out.tp_weights.?, s, o);
     }
     errdefer if (out.tp) |t| {
@@ -106,7 +107,7 @@ const LoneGroup = struct {
         try mlx.check(mlx.mlx_array_set(&o, x));
         return o;
     }
-    fn step(_: []const u32, _: usize, _: bool, _: bool, _: bool, _: u64, _: ?mlx.mlx_array) anyerror!void {}
+    fn step(_: []const u32, _: usize, _: bool, _: bool, _: dsv41.VerifyOpts, _: u64, _: ?mlx.mlx_array) anyerror!void {}
     fn batch(_: []const u64, _: []const usize, _: []const []const u32, _: bool) anyerror!void {}
     fn free(_: u64) void {}
     fn snap(_: dsv41.SnapOp, _: u64, _: u64) void {}
