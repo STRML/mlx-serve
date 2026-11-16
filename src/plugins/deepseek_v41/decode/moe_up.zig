@@ -67,7 +67,7 @@ pub fn moeUp(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernel, ly: *co
     if (sgu.qp.mode != .mxfp8 or sgu.qp.bits != 8 or sgu.qp.group_size != 32) return null;
     const n: usize = @intCast(@divExact(gw[1], 2));
     const dt = mlx.mlx_array_dtype(h2);
-    if (dt != m.act or mlx.mlx_array_dtype(gu.s) != dt or mlx.mlx_array_dtype(gu.b) != dt) return null;
+    if (dt != .bfloat16 or dt != m.act or mlx.mlx_array_dtype(gu.s) != dt or mlx.mlx_array_dtype(gu.b) != dt) return null;
     if (mlx.mlx_array_dtype(idx) != .uint32 or mlx.mlx_array_dtype(wts) != .float32) return null;
     const sw = mlx.getShape(sgu.w);
     const ss = mlx.getShape(sgu.s);
@@ -110,7 +110,7 @@ pub fn moeUpRows(sc: *dsv41.Scope, kern: Kernel, gu: dsv41.Bank, sgu: dsv41.Lin,
     const inter: usize = @intCast(@divExact(gw[1], 2));
     const n = inter / size;
     const dt = mlx.mlx_array_dtype(h2);
-    if (mlx.mlx_array_dtype(gu.s) != dt or mlx.mlx_array_dtype(gu.b) != dt) return null;
+    if (dt != .bfloat16 or mlx.mlx_array_dtype(gu.s) != dt or mlx.mlx_array_dtype(gu.b) != dt) return null;
     if (mlx.mlx_array_dtype(idx) != .uint32 or mlx.mlx_array_dtype(wts) != .float32) return null;
     const sw = mlx.getShape(sgu.w);
     const ss = mlx.getShape(sgu.s);
@@ -595,6 +595,27 @@ test "dsv41 dec moe_up: a rank's row launch is the declared row-cut launch, byte
         const theirs = (try moeUpRows(&sc, .{ .k = kern.k, .lim = c.args[8] }, gu, sgu, 0, 4, c.args[0], c.args[6], c.args[7])) orelse return error.Declined;
         try testing.expectEqualSlices(u8, try c.rig.bytesOf(&.{theirs}), mine);
     };
+}
+
+test "dsv41 dec moe_up: a rank's row launch declines activations and affine parameters that are not bf16" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var c = kit.Case(MoeUp).init(a, &moe_up_l, .{ .bits = 2, .gs = 64, .cut = 4 });
+    defer c.deinit();
+    try testing.expect(try c.prepare(.{ .rows = 1, .n = 24, .k = 2048 }, .random, 7));
+    var sc = dsv41.Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const kern = try build(10);
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern.k);
+    defer _ = mlx.mlx_array_free(kern.lim);
+    const sgu: dsv41.Lin = .{ .w = c.args[4], .s = c.args[5], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
+    const ku: Kernel = .{ .k = kern.k, .lim = c.args[8] };
+    const bf: dsv41.Bank = .{ .w = c.args[1], .s = c.args[2], .b = c.args[3], .qp = .{ .bits = 2, .group_size = 64 } };
+    try testing.expect(try moeUpRows(&sc, ku, bf, sgu, 0, 4, c.args[0], c.args[6], c.args[7]) != null);
+    for ([_]mlx.mlx_dtype{ .float16, .float32 }) |dt| {
+        const gu: dsv41.Bank = .{ .w = c.args[1], .s = try sc.astype(c.args[2], dt), .b = try sc.astype(c.args[3], dt), .qp = bf.qp };
+        try testing.expect(try moeUpRows(&sc, ku, gu, sgu, 0, 4, try sc.astype(c.args[0], dt), c.args[6], c.args[7]) == null);
+    }
 }
 
 test "dsv41 dec moe_up: formats and shapes it does not serve are declined" {
