@@ -3183,6 +3183,10 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
             ai += 1;
         } else if (std.mem.eql(u8, args[ai], "--sit-out")) {
             ropts.sit_out = true;
+        } else if (std.mem.eql(u8, args[ai], "--ready-in-open")) {
+            ropts.ready_in_open = true;
+        } else if (std.mem.eql(u8, args[ai], "--withhold-ready")) {
+            ropts.withhold_ready = true;
         } else if (std.mem.eql(u8, args[ai], "--chain")) {
             chain = true;
         } else if (n_rest < rest.len) {
@@ -3289,6 +3293,11 @@ const RelinkOpts = struct {
     slot_start_ms: i64 = 0,
     fail_cycles: u64 = 0,
     sit_out: bool = false,
+    /// `--ready-in-open`: each open finishes READY and GO inside `Link.open`, as a live switch's does.
+    ready_in_open: bool = false,
+    /// `--withhold-ready`: this rank forms the group but sends no READY (it opens without the handshake), holds the
+    /// link past the formation deadline, then fails; the others must fail the open by themselves (plan 61c row 2c).
+    withhold_ready: bool = false,
 
     fn failing(o: RelinkOpts, k: u64) bool {
         return o.fail_cycles > 0 and k % o.fail_cycles != 0;
@@ -3329,6 +3338,7 @@ fn relinkProbe(io: std.Io, cfg: Config, o: RelinkOpts) !void {
         var sw_open = io_util.Stopwatch.init(io);
         var c = cfg;
         if (o.formation_ms > 0) c.formation_deadline_ms = @as(u64, @intCast(crt.monotonicMs())) + o.formation_ms;
+        c.ready_in_open = o.ready_in_open and !o.withhold_ready;
         var link = Link.open(io, c) catch |e| {
             log.err("[dist-probe] relink {d}: epoch_ms {d} open failed after {d} ms: {s}{s}\n", .{ k, crt.wallMs(), sw_open.read() / std.time.ns_per_ms, @errorName(e), if (o.failing(k)) " (expected)" else "" });
             if (o.slot_ms == 0) return e;
@@ -3340,6 +3350,13 @@ fn relinkProbe(io: std.Io, cfg: Config, o: RelinkOpts) !void {
         if (o.failing(k)) {
             log.err("[dist-probe] relink {d}: formed in a cycle where a rank sat out\n", .{k});
             mismatches += 1;
+        }
+        if (o.withhold_ready) {
+            log.err("[dist-probe] relink {d}: formed after {d} ms and withheld READY; holding the link past the deadline\n", .{ k, sw_open.read() / std.time.ns_per_ms });
+            crt.sleepMs(@intCast(o.formation_ms + 500));
+            link.deinit();
+            mlx.check(mlx.mlx_distributed_clear_backends()) catch {};
+            return error.ReadyWithheld;
         }
         formed += 1;
         const open_us = sw_open.read() / std.time.ns_per_us;
