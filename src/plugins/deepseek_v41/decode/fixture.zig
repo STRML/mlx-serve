@@ -1136,7 +1136,7 @@ fn expectSameF32s(a: []const []f32, b: []const []f32) !void {
 /// Tensor ranks in one process: a collective meets the other ranks' parts from their latest run of the same program,
 /// and each pass reruns every rank's whole program until no part changes (a part depends only on those before it, so a
 /// pass fixes at least one more). A part not yet shaped as the caller's stands as zeros.
-const Group = struct {
+pub const Group = struct {
     const max = 4;
     const Kind = enum { sum, gather };
     var rank: usize = 0;
@@ -1145,13 +1145,13 @@ const Group = struct {
     var prev: [max]std.ArrayList(A) = @splat(.empty);
     var kinds: [max]std.ArrayList(Kind) = @splat(.empty);
 
-    fn join(n: usize) void {
+    pub fn join(n: usize) void {
         size = n;
         dsv41.clusterHooks().tp_sum = &sum;
         dsv41.clusterHooks().tp_gather = &gather;
     }
 
-    fn leave() void {
+    pub fn leave() void {
         dsv41.clusterHooks().tp_sum = null;
         dsv41.clusterHooks().tp_gather = null;
         for (&parts, &prev, &kinds) |*a, *b, *k| {
@@ -1166,7 +1166,7 @@ const Group = struct {
         }
     }
 
-    fn begin(r: usize) void {
+    pub fn begin(r: usize) void {
         rank = r;
         clear(&prev[r]);
         std.mem.swap(std.ArrayList(A), &prev[r], &parts[r]);
@@ -1234,7 +1234,18 @@ const Group = struct {
         return o;
     }
 
-    fn settled() !bool {
+    pub fn expectAgreement() !void {
+        for (1..size) |r| {
+            try std.testing.expectEqualSlices(Kind, kinds[0].items, kinds[r].items);
+            try std.testing.expectEqual(parts[0].items.len, parts[r].items.len);
+            for (parts[0].items, parts[r].items) |a, b| {
+                try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+                try std.testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
+            }
+        }
+    }
+
+    pub fn settled() !bool {
         for (0..size) |r| {
             if (parts[r].items.len != prev[r].items.len) return false;
             for (parts[r].items, prev[r].items) |a, b| {
