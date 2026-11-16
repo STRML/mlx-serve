@@ -2,7 +2,7 @@
 # Fetch the pinned Zig release and stage it at .zig-toolchain/ (stable path,
 # independent of the version string in the tarball's own top-level dir name).
 #
-# Pinned to Zig 0.17.0 stable. 0.16.0's bundled libc++ fails to compile
+# Pinned to Zig 0.17.1. 0.16.0's bundled libc++ fails to compile
 # against the macOS 27 SDK (`use of undeclared identifier 'INFINITY'` in its
 # vendored <random> — see build.zig's version-gate comptime block).
 #
@@ -10,7 +10,7 @@
 # ZIG_VERSION to upgrade; CI and local builds re-fetch automatically.
 set -euo pipefail
 
-ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
+ZIG_VERSION="${ZIG_VERSION:-0.17.1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
