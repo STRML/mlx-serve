@@ -103,7 +103,7 @@ for op in /tokenize /detokenize /v1/load-model /v1/unload-model; do
 done
 W="$(curl -s -m 10 -o "$WORK/body" -w '%{http_code}' -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$BASE/v1/responses"; printf ' %s' "$(cat "$WORK/body")")"
 check "a Responses WebSocket upgrade is refused while draining, before it can load a model" "$([ "$(status "$W")" = 503 ] && [ "$(has "$W" 'Layout switch')" = 1 ] && echo 1 || echo 0)"
-check "/v1/models still answers""$(eq "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/models")" 200)"
+check "/v1/models still answers" "$(eq "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/models")" 200)"
 check "/health still 200 while draining" "$(eq "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/health")" 200)"
 A="$(post /v1/internal/abort '{"n":7}' "$KEY")"
 check "abort 7 is 200, state aborted" "$([ "$(status "$A")" = 200 ] && [ "$(field "$A" state)" = aborted ] && echo 1 || echo 0)"
