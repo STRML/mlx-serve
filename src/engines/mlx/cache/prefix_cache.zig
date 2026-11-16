@@ -1535,26 +1535,28 @@ pub const HotPrefixCache = struct {
         return tip;
     }
 
-    /// The session's tip before `newer`, of another boundary: the fallback when `newer`'s record is gone.
-    pub fn sessionTipBefore(self: *HotPrefixCache, session: u64, newer: SessionTip) ?SessionTip {
+    /// The session's newest tip of a boundary not in `tried`: the fallback when the records of the tips tried are gone.
+    pub fn sessionTipExcluding(self: *HotPrefixCache, session: u64, tried: []const u64) ?SessionTip {
         const index = self.tipIndex() orelse return null;
-        return tipOf(index.findBefore(session, newer.id, newer.seq) orelse return null);
+        return tipOf(index.findExcluding(session, tried) orelse return null);
     }
 
+    /// A session's tips newest first, each boundary once: a lookup tries one, and `next` is another boundary when its
+    /// record is gone. Visits at most the boundaries the persisted index keeps.
     pub const TipWalk = struct {
         session: u64,
-        last: ?SessionTip = null,
+        tried: [session_index_mod.TIPS_PER_SESSION]u64 = undefined,
+        count: usize = 0,
 
         pub fn next(self: *TipWalk, hc: *HotPrefixCache) ?SessionTip {
-            const tip = if (self.last) |l| hc.sessionTipBefore(self.session, l) else hc.sessionTip(self.session);
-            self.last = tip;
+            if (self.count == self.tried.len) return null;
+            const found = if (self.count == 0) hc.sessionTip(self.session) else hc.sessionTipExcluding(self.session, self.tried[0..self.count]);
+            const tip = found orelse return null;
+            self.tried[self.count] = tip.id;
+            self.count += 1;
             return tip;
         }
     };
-
-    pub fn tipWalk(_: *HotPrefixCache, session: u64) TipWalk {
-        return .{ .session = session };
-    }
 
     fn tipOf(record: session_index_mod.Tip) SessionTip {
         return .{ .id = record.id, .n = @intCast(record.n), .variant = record.variant, .seq = record.seq, .persisted = true };
@@ -1613,14 +1615,14 @@ pub const HotPrefixCache = struct {
         _ = self.dropOldestSessionTip(false);
     }
 
-    /// Drops a tip whose boundary is in neither RAM nor a committed SSD record.
+    /// Drops a tip whose boundary is in neither RAM nor an SSD record, committed or still being written.
     fn dropGoneSessionTip(self: *HotPrefixCache) bool {
         const d = if (self.disk) |*dd| dd else null;
         var it = self.session_tips.iterator();
         while (it.next()) |kv| {
             const tip = kv.value_ptr.*;
             if (self.ramHoldsBoundary(tip)) continue;
-            if (d) |tier| if (tier.moduleByBoundaryNow(tip.id, tip.n) != null) continue;
+            if (d) |tier| if (tier.moduleByBoundaryNow(tip.id, tip.n) != null or tier.moduleWritePending(tip.id, tip.n)) continue;
             return self.session_tips.remove(kv.key_ptr.*);
         }
         return false;
@@ -13669,7 +13671,7 @@ test "HotPrefixCache module: a tip whose record is gone falls back to the sessio
     const record = hc.disk.?.moduleByBoundary(newest.id, newest.n) orelse return error.TestExpectedRecord;
     hc.disk.?.retireModule(record.id);
     try testing.expect(hc.disk.?.moduleByBoundary(newest.id, newest.n) == null);
-    const older = hc.sessionTipBefore(7, newest) orelse return error.TestExpectedTip;
+    const older = hc.sessionTipExcluding(7, &.{newest.id}) orelse return error.TestExpectedTip;
     try testing.expectEqual(@as(usize, 512), older.n);
     try testing.expect(hc.disk.?.moduleByBoundary(older.id, older.n) != null);
 }
@@ -13702,7 +13704,7 @@ test "HotPrefixCache module: claiming one checkpoint again and again never costs
         try testing.expectEqual(@as(usize, 513), newest.n);
         const record = hc.disk.?.moduleByBoundary(newest.id, newest.n) orelse return error.TestExpectedRecord;
         hc.disk.?.retireModule(record.id);
-        const older = hc.sessionTipBefore(7, newest) orelse return error.TestExpectedTip;
+        const older = hc.sessionTipExcluding(7, &.{newest.id}) orelse return error.TestExpectedTip;
         try testing.expectEqual(@as(usize, 512), older.n);
     }
     var hc = try ModuleDiskTest.init(&tmp, 8);
@@ -13710,7 +13712,7 @@ test "HotPrefixCache module: claiming one checkpoint again and again never costs
     const newest = hc.sessionTip(7) orelse return error.TestExpectedTip;
     try testing.expectEqual(@as(usize, 513), newest.n);
     try testing.expect(hc.disk.?.moduleByBoundary(newest.id, newest.n) == null);
-    const older = hc.sessionTipBefore(7, newest) orelse return error.TestExpectedTip;
+    const older = hc.sessionTipExcluding(7, &.{newest.id}) orelse return error.TestExpectedTip;
     try testing.expectEqual(@as(usize, 512), older.n);
     try testing.expect(hc.disk.?.moduleByBoundary(older.id, older.n) != null);
 }
@@ -13731,7 +13733,7 @@ fn expectWalkVisitsEachBoundaryOnce(compact: bool) !void {
     }
     var visited: [8]u64 = undefined;
     var count: usize = 0;
-    var walk = hc.tipWalk(7);
+    var walk: HotPrefixCache.TipWalk = .{ .session = 7 };
     while (walk.next(&hc)) |tip| : (count += 1) {
         if (count == visited.len) break;
         visited[count] = tip.id;

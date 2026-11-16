@@ -495,8 +495,8 @@ pub const DiskTier = struct {
     pub fn moduleByBoundaryNow(self: *const DiskTier, id: u64, n: usize) ?ModuleRef {
         var best: ?*const IndexEntry = null;
         for (self.entries.items) |*e| {
-            if (e.kind != .module or e.poisoned or e.module.?.state != .committed or e.kv_len != n) continue;
-            if (boundary_mod.id(@bitCast(e.module.?.manifest.prefix_key), e.tokens, e.media) != id) continue;
+            if (e.kind != .module or e.poisoned or e.module.?.state != .committed) continue;
+            if (!moduleIsBoundary(e, id, n)) continue;
             if (best == null or e.id > best.?.id) best = e;
         }
         const e = best orelse return null;
@@ -508,6 +508,20 @@ pub const DiskTier = struct {
             .quant = e.quant,
             .prefix_key = @bitCast(e.module.?.manifest.prefix_key),
         };
+    }
+
+    /// Whether a record of that prompt boundary is registered and still being written, so it may yet commit.
+    pub fn moduleWritePending(self: *const DiskTier, id: u64, n: usize) bool {
+        for (self.entries.items) |*e| {
+            if (e.kind != .module or e.poisoned) continue;
+            if (e.module.?.state != .registered and e.module.?.state != .exporting and e.module.?.state != .submitted) continue;
+            if (moduleIsBoundary(e, id, n)) return true;
+        }
+        return false;
+    }
+
+    fn moduleIsBoundary(e: *const IndexEntry, id: u64, n: usize) bool {
+        return e.kv_len == n and boundary_mod.id(@bitCast(e.module.?.manifest.prefix_key), e.tokens, e.media) == id;
     }
 
     pub const ModuleSlice = enum { progress, busy, done };

@@ -161,10 +161,8 @@ const DiskSession = struct {
 
 const SessionLookup = union(enum) { none, hit: RamModuleHit, refused: requests.CacheExportOutcome };
 
-const SESSION_TIP_FALLBACKS: usize = 3;
-
-/// The prompt boundary a session's newest tip names, else the one before it when that tip's record is gone from RAM
-/// and the SSD (`tipHit`). A session whose every tip is gone is `none`: the caller sees `session_not_found`.
+/// The prompt boundary a session's newest tip names, else the next boundary of the session that has a record, in RAM or
+/// on the SSD (`tipHit`). A session whose every tip is gone is `none`: the caller sees `session_not_found`.
 fn sessionHit(
     allocator: std.mem.Allocator,
     sch: *const Scheduler,
@@ -175,11 +173,10 @@ fn sessionHit(
     max_bytes: usize,
     holder: *DiskSession,
 ) SessionLookup {
-    var tip = hc.sessionTip(session) orelse return .none;
-    for (0..SESSION_TIP_FALLBACKS) |_| {
+    var walk: prefix_cache_mod.HotPrefixCache.TipWalk = .{ .session = session };
+    while (walk.next(hc)) |tip| {
         const found = tipHit(allocator, sch, cfg, hc, xfm, session, tip, max_bytes, holder);
         if (found != .none) return found;
-        tip = hc.sessionTipBefore(session, tip) orelse return .none;
     }
     return .none;
 }
