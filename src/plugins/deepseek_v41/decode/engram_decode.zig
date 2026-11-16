@@ -518,6 +518,37 @@ test "engram decode LRU: a grid's rows taken by id across tables, the least rece
     try testing.expectEqual(@as(u64, 0), size().rows);
 }
 
+test "engram decode LRU: two models' copies of one table share no row, and one model's close leaves the other no stale row" {
+    const saved = ps().lru_mb;
+    defer {
+        ps().lru_mb = saved;
+        resetForTest();
+    }
+    ps().lru_mb = 1;
+    resetForTest();
+    // The same table opened by the whole model (fd 9001) and a tensor group's rank (fd 9002); each read its own bytes.
+    const whole: c_int = 9001;
+    const rank: c_int = 9002;
+    keep(whole, 8, 4, 0, &.{7}, &@as([8]u8, @splat(1)), &@as([4]u8, @splat(10)), &.{});
+    keep(rank, 8, 4, 0, &.{7}, &@as([8]u8, @splat(2)), &@as([4]u8, @splat(20)), &.{});
+    var w: [8]u8 = undefined;
+    var s: [4]u8 = undefined;
+    var held: [1]bool = undefined;
+    try testing.expectEqual(@as(usize, 1), take(whole, &.{7}, 8, 4, 0, &w, &s, &.{}, &held));
+    try testing.expectEqual(@as(u8, 1), w[0]);
+    try testing.expectEqual(@as(usize, 1), take(rank, &.{7}, 8, 4, 0, &w, &s, &.{}, &held));
+    try testing.expectEqual(@as(u8, 2), w[0]);
+    // The rank's model freed: the whole model's next read misses and reads its table again, never another's row.
+    forget(rank);
+    try testing.expectEqual(@as(usize, 0), take(whole, &.{7}, 8, 4, 0, &w, &s, &.{}, &held));
+    @memset(&w, 1);
+    @memset(&s, 10);
+    putMisses(whole, &.{7}, &held, 8, 4, 0, &w, &s, &.{});
+    @memset(&w, 0);
+    try testing.expectEqual(@as(usize, 1), take(whole, &.{7}, 8, 4, 0, &w, &s, &.{}, &held));
+    try testing.expectEqual(@as(u8, 1), w[0]);
+}
+
 test "engram decode pool: every item once, on the pool's threads and the caller's, job after job" {
     const Count = struct {
         hits: [1000]std.atomic.Value(u32) = @splat(.init(0)),

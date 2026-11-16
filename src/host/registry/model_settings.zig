@@ -12,6 +12,7 @@ const generation = @import("../api/generation_settings.zig");
 const engine_pick = @import("../../sdk/quant/gguf/engine_pick.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
 const gguf_files = @import("../../sdk/quant/gguf/files.zig");
+const model_cfg = @import("../../sdk/config/model.zig");
 
 /// What can serve a model; the per-model `engine` setting (Model Settings' engine picker) and each
 /// `/v1/models` row's `engines` use these names. No setting leaves the choice to the server.
@@ -31,6 +32,9 @@ pub const Override = struct {
     ane: ?bool = null,
     /// Stream the routed experts from the pack as downloaded: `true`, or the slot rows per layer.
     stream_experts: ?streamed.Setting = null,
+    /// A tensor group's rank loaded beside the whole model (`{"rank": 1, "size": 4}`); a malformed value is kept so
+    /// the load refuses it by name.
+    tp_mode: ?model_cfg.TpModeSetting = null,
     /// The engine serving the model; outranks `ane` and, on a GGUF, `--engine`.
     engine: ?Engine = null,
     /// Extra template variables as a JSON object (vLLM/llama.cpp
@@ -42,7 +46,7 @@ pub const Override = struct {
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.int8_prefill == null and o.lm_head_mxfp8 == null and o.ane == null and o.stream_experts == null and o.engine == null and o.chat_template_kwargs == null and o.drafter == null;
+            o.mtp_greedy_tail == null and o.int8_prefill == null and o.lm_head_mxfp8 == null and o.ane == null and o.stream_experts == null and o.tp_mode == null and o.engine == null and o.chat_template_kwargs == null and o.drafter == null;
     }
 
     /// Whether the model runs on the Neural Engine: the engine setting's choice, else the `ane` switch.
@@ -224,6 +228,7 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
         else => {},
     };
     if (obj.get("stream_experts")) |se| o.stream_experts = streamed.Setting.of(se);
+    if (obj.get("tp_mode")) |t| o.tp_mode = model_cfg.TpModeSetting.of(t);
     if (obj.get("engine")) |e| if (e == .string) {
         o.engine = std.meta.stringToEnum(Engine, e.string);
     };
@@ -697,6 +702,17 @@ test "model_settings: stream_experts is true or a row count, anything else is un
     try std.testing.expectEqual(@as(?streamed.Setting, .{ .rows = 32 }), s.lookup(t, "/m/b").stream_experts);
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
     try std.testing.expect(s.lookup(t, "/m/d").isEmpty());
+}
+
+test "model_settings: tp_mode is kept as a group or as malformed, never dropped" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"tp_mode": {"rank": 1, "size": 4}}, "/m/b": {"tp_mode": {"rank": 0}}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqualDeep(@as(?model_cfg.TpModeSetting, .{ .group = .{ .rank = 1, .size = 4 } }), s.lookup(t, "/m/a").tp_mode);
+    try std.testing.expectEqualDeep(@as(?model_cfg.TpModeSetting, .malformed), s.lookup(t, "/m/b").tp_mode);
+    try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
 }
 
 test "model_settings: bad values ignored, bad JSON = empty" {
