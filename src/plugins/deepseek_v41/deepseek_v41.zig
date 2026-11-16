@@ -7330,6 +7330,12 @@ fn startPromptReadAhead(m: *Dsv41Model, prompt: []const u32, images: bool, budge
     log.info("[dsv41] Engram read-ahead on: {d} MiB reserved, cap {d} MiB\n", .{ ra.bytes >> 20, budget >> 20 });
 }
 
+/// The headroom auxBeginPrompt measured belongs to the one prompt armed next; any later arm measures its own or has none.
+fn takeReadAheadLimit(m: *Dsv41Model) u64 {
+    defer m.read_ahead_limit = std.math.maxInt(u64);
+    return m.read_ahead_limit;
+}
+
 /// Arms only this live State; candidate identity covers the boundary's ids and image rows.
 pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: bool) !void {
     m.dropReadAhead();
@@ -7337,7 +7343,8 @@ pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: 
     m.prompt = &.{};
     m.prompt = try m.gpa.dupe(u32, prompt);
     const st = &m.dec_state.?;
-    if (st.n == 0 and prompt.len > region_rows) startPromptReadAhead(m, prompt, vision_rows != null, @intCast(@min(engram.readAheadBudget(env.span(.MLX_SERVE_DSV41_ENGRAM_READAHEAD_MB)), m.read_ahead_limit)), system.getAvailableMemBytes()) catch |err| {
+    const limit = takeReadAheadLimit(m);
+    if (st.n == 0 and prompt.len > region_rows) startPromptReadAhead(m, prompt, vision_rows != null, @intCast(@min(engram.readAheadBudget(env.span(.MLX_SERVE_DSV41_ENGRAM_READAHEAD_MB)), limit)), system.getAvailableMemBytes()) catch |err| {
         log.warn("[dsv41] Engram read-ahead skipped: {s}\n", .{@errorName(err)});
     };
     if (st.snap) |*sn| sn.deinit(st.gpa);
@@ -11733,6 +11740,13 @@ test "dsv41 pair: a layer split refuses an MLX pack's streamed experts by name b
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.Dsv41PairStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 4, .hi = 8, .worker = false }, .streamed_experts = true }));
+}
+
+test "dsv41 engram read-ahead: a measured headroom limit applies to one arm only" {
+    var m: Dsv41Model = undefined;
+    m.read_ahead_limit = 0;
+    try testing.expectEqual(@as(u64, 0), takeReadAheadLimit(&m));
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), takeReadAheadLimit(&m));
 }
 
 test "dsv41 engram read-ahead: known prompt hashes later chunks before any forward" {
