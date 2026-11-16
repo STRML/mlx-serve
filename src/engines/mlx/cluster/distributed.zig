@@ -772,7 +772,11 @@ const Bell = struct {
         if (control) |ctrl| if (ctrl.cancelled.load(.acquire)) return error.DistAborted;
         var addr: std.posix.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, coord.port +% 1), .addr = @bitCast(coord.ip4) };
         if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) == 0) return true;
-        if (std.c._errno().* != @backingInt(std.c.E.INPROGRESS)) return error.DistPeerGone;
+        const e = std.c._errno().*;
+        if (e != @backingInt(std.c.E.INPROGRESS)) {
+            log.err("[dist-diag] bell connect {d}.{d}.{d}.{d}:{d} failed at once: errno {d}\n", .{ coord.ip4[0], coord.ip4[1], coord.ip4[2], coord.ip4[3], coord.port +% 1, e });
+            return error.DistPeerGone;
+        }
         return false;
     }
 
@@ -786,7 +790,10 @@ const Bell = struct {
             if (control) |ctrl| if (ctrl.cancelled.load(.acquire)) return error.DistAborted;
             var err: c_int = 0;
             var len: std.posix.socklen_t = @sizeOf(c_int);
-            if (std.c.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, &err, &len) != 0 or err != 0) return error.DistPeerGone;
+            if (std.c.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, &err, &len) != 0 or err != 0) {
+                log.err("[dist-diag] bell connect completed with SO_ERROR {d}\n", .{err});
+                return error.DistPeerGone;
+            }
             return;
         }
         return error.DistNoBell;
@@ -2962,6 +2969,7 @@ fn watchBells(link: *const Link, state: *LinkState) u32 {
 /// between tries as JACCL's connect does; a closed bell when the deadline passes first. A worker that starts a few ms
 /// before rank 0 listens joins instead of going on without a bell.
 fn dialBellControlled(coord: Coordinator, rank: u32, deadline_ms: u64, control: ?*OpenControl) Bell {
+    log.err("[dist-diag] rank {d} dialing bell {d}.{d}.{d}.{d}:{d}, {d} ms left\n", .{ rank, coord.ip4[0], coord.ip4[1], coord.ip4[2], coord.ip4[3], coord.port +% 1, msLeft(deadline_ms) });
     var wait: u32 = 20;
     while (msLeft(deadline_ms) > 0) {
         if (control) |ctrl| if (ctrl.cancelled.load(.acquire)) return .{};
