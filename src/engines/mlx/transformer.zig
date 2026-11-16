@@ -417,6 +417,8 @@ pub const Transformer = struct {
     mtp_group_cost: group_cost_mod.Table = .{},
     /// What a DSpark group round's verify costs on this model (`spec/dspark_group.zig`). Inference thread only.
     dspark_group_cost: @import("spec/dflash/policy.zig").GroupCost = .{},
+    /// The drafting backoff this model's DSpark group rounds share (`GroupBackoff.group`). Inference thread only.
+    dspark_group_drafting: @import("spec/dflash/policy.zig").Drafting = .{},
     /// What a plain DSpark step costs on this model, carried from request to request. Inference thread only.
     dspark_plain: @import("spec/dflash/policy.zig").PlainCost = .{},
     /// Drafted DSpark rounds run since the load, up to the warm-up count. Inference thread only.

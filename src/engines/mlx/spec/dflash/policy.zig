@@ -223,6 +223,66 @@ pub const Drafting = struct {
             self.period = @min(self.period * 2, MAX_PERIOD);
         }
     }
+
+    /// A round another backoff decided (a DSpark group's) counted in this one's stats; its own debt is left as it was.
+    pub fn countFollowed(self: *Drafting, drafted: bool, probe: bool) void {
+        if (!drafted) self.skipped += 1 else if (probe) self.probes += 1;
+    }
+};
+
+/// Which backoff decides whether a DSpark group round's slots stage-draft (`DSV41_DSPARK_GROUP_BACKOFF`).
+pub const GroupBackoff = enum {
+    /// The model's one backoff: every eligible slot drafts on the same rounds, and a round is scored on its totals, so
+    /// the stage pass is paid once for all of them.
+    group,
+    /// Each slot's own backoff, charged its share of the stage pass and its own rows.
+    slot,
+
+    /// Writes whether each slot stage-drafts this round to `stage`. `eligible[k]`: slot k can (no copied draft, a row to
+    /// spare); `own[k]`: its backoff, null for a slot without a policy, which always drafts.
+    pub fn choose(self: GroupBackoff, group: *Drafting, own: []const ?*Drafting, eligible: []const bool, stage: []bool) void {
+        switch (self) {
+            .slot => for (own, eligible, stage) |d, e, *s| {
+                s.* = e and if (d) |x| x.shouldDraft() else true;
+            },
+            .group => {
+                var consulted = false;
+                for (own, eligible) |d, e| consulted = consulted or (e and d != null);
+                const probes = group.probes;
+                const draft = !consulted or group.shouldDraft();
+                const probe = group.probes > probes;
+                for (own, eligible, stage) |d, e, *s| {
+                    s.* = e and (d == null or draft);
+                    if (e) if (d) |x| x.countFollowed(draft, probe);
+                }
+            },
+        }
+    }
+
+    /// What a round teaches the backoff: each stage-drafted slot's kept drafts (`accepted`) at the group's plain step a
+    /// token (`token_ms`) against the stage pass (`draft_ms`) and its verify rows (`rows`, `row_ms` each). `learn[k]`: slot
+    /// k's round says something about its drafts (it bought a row, or the verify had one to give); a slot that a full
+    /// verify left no row adds to neither side. Under `group` a round whose learning slots bought no row still pays the
+    /// stage pass; under `slot` each learning slot pays its share of it.
+    pub fn record(self: GroupBackoff, group: *Drafting, own: []const ?*Drafting, stage: []const bool, learn: []const bool, rows: []const u32, accepted: []const u32, token_ms: f32, row_ms: f32, draft_ms: f32) void {
+        var n_stage: u32 = 0;
+        for (stage) |s| n_stage += @intFromBool(s);
+        var kept: u32 = 0;
+        var bought: u32 = 0;
+        var taught = false;
+        for (own, learn, rows, accepted) |d, l, b, a| if (l) {
+            kept += a;
+            bought += b;
+            taught = taught or d != null;
+        };
+        switch (self) {
+            .group => if (taught) group.record(@as(f32, @floatFromInt(kept)) * token_ms, draft_ms + @as(f32, @floatFromInt(bought)) * row_ms),
+            .slot => for (own, learn, rows, accepted) |d, l, b, a| if (l) if (d) |x| {
+                const spent = draft_ms / @as(f32, @floatFromInt(n_stage)) + @as(f32, @floatFromInt(b)) * row_ms;
+                x.record(@as(f32, @floatFromInt(a)) * token_ms, spent);
+            },
+        }
+    }
 };
 
 /// Rows one batched verify carries at most: the module batches its compiled stretches up to this many.

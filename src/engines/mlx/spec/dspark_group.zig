@@ -6,6 +6,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
+const env = @import("../../../env.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
 const dflash_policy = @import("dflash/policy.zig");
@@ -153,20 +154,17 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     var suffix: [MAX_SLOTS]u32 = @splat(0);
     var made: usize = 0;
     defer for (drafts[0..made]) |*d| d.deinit(gpa);
-    var staged: [MAX_SLOTS]usize = undefined;
-    var n_stage: usize = 0;
+    var eligible: [MAX_SLOTS]bool = undefined;
+    var own: [MAX_SLOTS]?*dflash_policy.Drafting = undefined;
     for (gens, 0..) |gen, k| {
         const t1 = gen.next_token_id;
         caps[k] = capAcceptedForTokenBudget(std.math.maxInt(u32), gen.completion_tokens, gen.max_tokens);
         const idx = try gen.mtpLookupIndex(allocs[k]);
         const found = idx.matchBest(t1, @intCast(dsv41_mod.maxVerifyDrafts(mdl)));
         const copy = dsparkCopyLen(found, gen.max_tokens -| gen.completion_tokens -| 1, mdl.ds_block);
-        const stage = copy == 0 and if (gen.dspark_pol) |*pol| pol.drafting.shouldDraft() else true;
-        kinds[k] = if (copy > 0) .copy else if (stage) .stage else .plain;
-        if (stage) {
-            staged[n_stage] = k;
-            n_stage += 1;
-        }
+        eligible[k] = copy == 0;
+        own[k] = if (gen.dspark_pol) |*pol| &pol.drafting else null;
+        kinds[k] = if (copy > 0) .copy else .plain;
         const ids_k = try gpa.alloc(u32, copy + 1);
         ids_k[0] = t1;
         if (copy > 0) {
@@ -176,6 +174,16 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         drafts[k] = .{ .ids = ids_k, .len = copy, .logits = &.{}, .confidence = &.{} };
         made += 1;
     }
+    const backoff = groupBackoff();
+    var stage: [MAX_SLOTS]bool = undefined;
+    backoff.choose(&xfm.dspark_group_drafting, own[0..n], eligible[0..n], stage[0..n]);
+    var staged: [MAX_SLOTS]usize = undefined;
+    var n_stage: usize = 0;
+    for (stage[0..n], 0..) |s, k| if (s) {
+        kinds[k] = .stage;
+        staged[n_stage] = k;
+        n_stage += 1;
+    };
     var draft_ms: f32 = 0;
     if (n_stage > 0) {
         const draft_watch = io_util.Stopwatch.init(gens[0].timer.io);
@@ -292,8 +300,8 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     }
     sampleVerifies(cost, chunks[0..n], width, msOf(verify_watch.read()));
 
-    // Each slot keeps its prefix, and teaches its drafting backoff what drafting cost the round (its share of the draft,
-    // its rows) against what its accepted drafts saved (the group's plain step a token).
+    // Each slot keeps its prefix; the drafting backoff learns what drafting cost the round (the stage pass, the rows)
+    // against what the accepted drafts saved (the group's plain step a token).
     var done: usize = 0;
     errdefer for (out[0..done], allocs[0..done]) |r, a| a.free(r.tokens);
     for (gens, states[0..n], drafts[0..n], kinds[0..n], 0..) |gen, st, d, kind, k| {
@@ -322,10 +330,14 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     // A slot whose drafts were priced out with rows to spare learns the draft cost it lost, as a solo round does; one
     // that a full verify left no row says nothing about its drafts.
     const token_ms = cost.ms(n, n) / @as(f32, @floatFromInt(n));
-    for (gens, kinds[0..n], accepted[0..n], rows_k[0..n], full[0..n]) |gen, kind, a, b, f| if (kind == .stage and (b > 0 or !f)) if (gen.dspark_pol) |*pol| {
-        const spent = draft_ms / @as(f32, @floatFromInt(n_stage)) + @as(f32, @floatFromInt(b)) * cost.rowMs();
-        pol.drafting.record(@as(f32, @floatFromInt(a)) * token_ms, spent);
-    };
+    var learn: [MAX_SLOTS]bool = undefined;
+    for (stage[0..n], rows_k[0..n], full[0..n], learn[0..n]) |s, b, f, *l| l.* = s and (b > 0 or !f);
+    backoff.record(&xfm.dspark_group_drafting, own[0..n], stage[0..n], learn[0..n], rows_k[0..n], accepted[0..n], token_ms, cost.rowMs(), draft_ms);
+}
+
+fn groupBackoff() dflash_policy.GroupBackoff {
+    const v = env.span(.DSV41_DSPARK_GROUP_BACKOFF) orelse return .group;
+    return std.meta.stringToEnum(dflash_policy.GroupBackoff, v) orelse .group;
 }
 
 fn rowsOfChunks(chunks: []const []const u32) usize {
