@@ -6903,13 +6903,18 @@ fn cacheSetting(h: *std.hash.Wyhash, value: anytype) void {
     }
 }
 
+/// Hash values rather than struct padding or the model_type slice's process-local address.
+fn layoutSettings(cfg: *const Config, knobs: anytype) u64 {
+    var h = std.hash.Wyhash.init(0x4141);
+    cacheSetting(&h, cfg.*);
+    std.hash.autoHash(&h, knobs);
+    return h.final();
+}
+
 pub fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
     if (m.n_layers > 64) return error.Dsv41CacheGeometry;
-    var h = std.hash.Wyhash.init(0x4141);
-    // Hash values rather than struct padding or the model_type slice's process-local address. Every rank holds the
-    // same cache whatever the split, so the whole config keys it: an entry moves between widths.
-    cacheSetting(&h, m.whole_cfg);
-    std.hash.autoHash(&h, .{ m.n_mtp, m.ds_block, m.span, m.moe_rows, m.ced_split, m.ced_min_skip, m.hc_tg, m.topk_tg, m.qat_off, m.attn_f16, m.head.qp });
+    // Every rank holds the same cache whatever the split, so the whole config keys it: an entry moves between widths.
+    const settings = layoutSettings(&m.whole_cfg, .{ m.n_mtp, m.ds_block, m.span, m.moe_rows, m.ced_split, m.ced_min_skip, m.hc_tg, m.topk_tg, m.qat_off, m.attn_f16, m.head.qp });
     var l: cache_codec.Layout = .{
         .layers = m.n_layers,
         .stages = m.n_mtp,
@@ -6921,7 +6926,7 @@ pub fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
         .kv_sources = m.cfg.dsv41_kv_sources,
         .index_sources = m.cfg.dsv41_index_sources,
         .engram = m.hash != null,
-        .settings = h.final(),
+        .settings = settings,
     };
     @memcpy(l.ratios[0..m.n_layers], m.cfg.dsv4_compress_ratios[0..m.n_layers]);
     return l;
@@ -11246,10 +11251,16 @@ test "dsv41 tensor parallel: two ranks sum a bf16 part as it is, a wider part at
     }
 }
 
-test "dsv41 cache identity: the config's part of the key is the value SSD entries were written under" {
-    var h = std.hash.Wyhash.init(0x4141);
-    cacheSetting(&h, @as(Config, .{}));
-    try testing.expectEqual(@as(u64, 5617875741235430630), h.final());
+test "dsv41 cache identity: the iQ pack's settings hash is the value SSD entries were written under" {
+    const abi = @import("../../abi/plugin.zig");
+    const iq = @embedFile("../../fixtures/model-configs/deepseek_v41-iq-mlx-3.0bpw.json");
+    const mem: @import("../../sdk/root.zig").fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = iq }} };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try testing.expect(@import("config.zig").parse(&dir, abi.Str.of(iq), .{}, null, true, &p).isOk());
+    defer @import("config.zig").freeParsed(&p);
+    const knobs = .{ @as(usize, 3), @as(usize, 16), SPAN, MOE_ROWS, @as(?usize, null), CED_MIN_SKIP, HC_TG, @as(usize, 1024), false, true, QuantParams{ .bits = 8, .group_size = 64 } };
+    try testing.expectEqual(@as(u64, 1683361957965207653), layoutSettings(@import("config.zig").of(&p), knobs));
 }
 
 test "dsv41 head: the 8-bit head is the default, MLX_SERVE_DSV41_HEAD8=0 keeps the head as the pack ships it" {
