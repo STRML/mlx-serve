@@ -56,6 +56,7 @@ pub fn build(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: mlx.m
         errdefer out.row_cut.?.destroy();
         o.resident = .{ .model = out.tp1, .rows = out.row_cut.? };
         out.tp = try dsv41.init(gpa, whole, w, s, o);
+        if (g.rank == 0) out.tp.?.prefill_whole = out.tp1;
     }
     return out;
 }
@@ -107,13 +108,14 @@ pub const LoneGroup = struct {
     fn batch(_: []const u64, _: []const usize, _: []const []const u32, _: bool) anyerror!void {}
     fn draft(_: []const u64, _: []const usize, _: []const u32) anyerror!void {}
     fn load(_: u64, _: []const u32, _: []const mlx.mlx_array) anyerror!void {}
+    fn prefill(_: u64, _: usize, _: usize, _: bool, _: []const mlx.mlx_array, _: usize) anyerror!void {}
     fn free(_: u64) void {}
     fn snap(_: dsv41.SnapOp, _: u64, _: u64) void {}
 
     pub fn arm(n: usize) void {
         size = n;
         sums = 0;
-        dsv41.clusterHooks().* = .{ .tp_sum = &sum, .tp_gather = &gather, .tp_step = &step, .tp_batch = &batch, .tp_draft = &draft, .tp_load = &load, .tp_free = &free, .tp_snap = &snap };
+        dsv41.clusterHooks().* = .{ .tp_sum = &sum, .tp_gather = &gather, .tp_step = &step, .tp_batch = &batch, .tp_draft = &draft, .tp_load = &load, .tp_prefill = &prefill, .tp_free = &free, .tp_snap = &snap };
     }
     pub fn disarm() void {
         dsv41.clusterHooks().* = .{};

@@ -1278,8 +1278,8 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC = wire.MAGIC;
-/// 11: READY frames on the bell; GO and ABORT before the watchdog starts.
-const VERSION: i32 = 11;
+/// 12: incremental state from a leader-only TP prefill chunk.
+const VERSION: i32 = 12;
 pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
 pub const OP_STOP = wire.OP_STOP;
@@ -1303,6 +1303,7 @@ const OP_DSV41_TP_DRAFT: i32 = 14;
 const OP_DSV41_TP_PIPE: i32 = 15;
 const OP_DSV41_TP_DRAFT_PIPE: i32 = 16;
 const OP_DSV41_TP_VERIFY_PIPE: i32 = 17;
+const OP_DSV41_TP_PREFILL: i32 = 18;
 pub const OP_RELEASE = wire.OP_RELEASE;
 
 /// `link` as a plugin's split job talks over it (`sdk/util/wire.zig`).
@@ -2263,6 +2264,7 @@ pub fn installDsv41Tp(link: *const Link) void {
     hooks.tp_free = &dsv41TpFree;
     hooks.tp_snap = &dsv41TpSnap;
     hooks.tp_load = &dsv41TpLoad;
+    hooks.tp_prefill = &dsv41TpPrefill;
 }
 
 pub fn clearDsv41Tp() void {
@@ -2510,6 +2512,19 @@ fn dsv41TpLoad(id: u64, ids: []const u32, tensors: []const mlx.mlx_array) anyerr
         for (tensors) |t| try sendNow(link, t, dst);
     }
     if (link.size >= 2) log.info("[dist] snapshot {d}: {d} MiB to {d} workers in {d} ms\n", .{ id, bytes >> 20, link.size - 1, @divTrunc(io_util.nowUsMonotonic(io) - t0, 1000) });
+}
+
+fn dsv41TpPrefill(gen: u64, p0: usize, n: usize, capture: bool, tensors: []const mlx.mlx_array, stages: usize) anyerror!void {
+    if (n <= p0 or stages > 128) return error.DistBadMessage;
+    const link = try tpLeader(true);
+    link.state.?.watchdog.progress(@intCast(crt.monotonicMs()));
+    const flags: i32 = @as(i32, @intCast(stages)) | @as(i32, @intFromBool(capture)) << 16;
+    const header: Msg = .{ OP_DSV41_TP_PREFILL, @intCast(gen & 0x7fffffff), @intCast(gen >> 31), @intCast(p0 & 0x7fffffff), @intCast(p0 >> 31), @intCast(n & 0x7fffffff), @intCast(n >> 31), flags };
+    for (1..link.size) |k| {
+        const dst: u32 = @intCast(k);
+        try sendMsg(link, header, dst);
+        for (tensors) |x| try sendNow(link, x, dst);
+    }
 }
 
 /// Host: what it did with a snapshot (`dsv41.SnapOp`); the worker does the same with its copy.
@@ -2839,6 +2854,26 @@ fn dsv41StepLoop(io: std.Io, allocator: std.mem.Allocator, link: *const Link, m:
                     got += 1;
                 }
                 try dsv41_mod.tpWorkerLoad(m, allocator, &snaps, joined(msg[1], msg[2]), ids, xs);
+            },
+            OP_DSV41_TP_PREFILL => {
+                for (msg[1..]) |word| if (word < 0) return error.DistBadMessage;
+                if (msg[7] & ~@as(i32, 0x1ffff) != 0) return error.DistBadMessage;
+                const p0: usize = @intCast(joined(msg[3], msg[4]));
+                const n: usize = @intCast(joined(msg[5], msg[6]));
+                const stages: usize = @intCast(msg[7] & 0xffff);
+                const p = try dsv41_mod.prefillPlan(m, p0, n, stages);
+                const xs = try allocator.alloc(mlx.mlx_array, p.len);
+                var got: usize = 0;
+                defer {
+                    for (xs[0..got]) |x| _ = mlx.mlx_array_free(x);
+                    allocator.free(xs);
+                }
+                for (p.specs(), xs) |spec, *x| {
+                    const shape = [_]c_int{ @intCast(spec.rows), @intCast(spec.width) };
+                    x.* = try transport.recvNow(shape[0..spec.rank()], spec.dtype, 0);
+                    got += 1;
+                }
+                try dsv41_mod.tpWorkerPrefill(m, allocator, &parked, joined(msg[1], msg[2]), p0, n, msg[7] & (1 << 16) != 0, xs, stages);
             },
             else => return error.DistBadMessage,
         }
@@ -3374,9 +3409,9 @@ test "dist bell READY matrix 14: bell EOF interrupts cold load promptly" {
     try std.testing.expect(peer_state.failed);
 }
 
-test "dist bell READY matrix 15: VERSION 10 worker is refused at hello" {
-    try std.testing.expectError(error.DistProtocolMismatch, Hello.parse(.{ MAGIC, 10, 0, 0, 0, 0, 0, 0 }));
-    _ = try Hello.parse(.{ MAGIC, 11, 0, 0, 0, 0, 0, 0 });
+test "dist bell READY matrix 15: workers without the current protocol are refused at hello" {
+    for ([_]i32{ 10, 11 }) |old| try std.testing.expectError(error.DistProtocolMismatch, Hello.parse(.{ MAGIC, old, 0, 0, 0, 0, 0, 0 }));
+    _ = try Hello.parse(.{ MAGIC, VERSION, 0, 0, 0, 0, 0, 0 });
 }
 
 test "dist bell READY matrix 16: rows calibration reaches peer through frame" {
@@ -6317,6 +6352,95 @@ const TestWorkerHeaders = struct {
         break :blk v;
     };
 };
+
+const TestPrefillWire = struct {
+    model: *dsv41_mod.Dsv41Model,
+    capture: bool,
+    messages: usize = 0,
+    tensors: usize = 0,
+    const gen: u64 = (@as(u64, 7) << 31) | 37;
+
+    fn receive(ctx: *const anyopaque) !Msg {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(ctx)));
+        const next = self.messages;
+        self.messages += 1;
+        if (next == 1 or next == 2) {
+            const n: usize = if (next == 1) 25 else 50;
+            try std.testing.expectEqual(gen, self.model.state_gen);
+            const st = self.model.dec_state orelse return error.TestPrefillStateMissing;
+            try std.testing.expectEqual(n, st.n);
+            if (self.capture) try std.testing.expectEqual(n, (st.snap orelse return error.TestPrefillCaptureMissing).n);
+        }
+        return switch (next) {
+            0, 1 => .{ 18, 37, 7, if (next == 0) 0 else 25, 0, if (next == 0) 25 else 50, 0, if (self.capture) 1 << 16 else 0 },
+            2 => .{ OP_DSV41_TP_FREE, 37, 7, 0, 0, 0, 0, 0 },
+            3 => blk: {
+                try std.testing.expect(self.model.dec_state == null);
+                break :blk .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 };
+            },
+            else => error.TestPrefillUnexpectedMessage,
+        };
+    }
+
+    fn tensor(ctx: *const anyopaque, shape: []const c_int, dtype: mlx.mlx_dtype, src: u32) !mlx.mlx_array {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(ctx)));
+        try std.testing.expectEqualSlices(c_int, &.{ 32, 64 }, shape);
+        try std.testing.expectEqual(mlx.mlx_dtype.float32, dtype);
+        try std.testing.expectEqual(@as(u32, 0), src);
+        self.tensors += 1;
+        var x = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_zeros(&x, shape.ptr, shape.len, dtype, self.model.s));
+        return x;
+    }
+
+    const vt = blk: {
+        var v = WireOps.vt;
+        v.recv_op = receive;
+        v.recv_now = tensor;
+        break :blk v;
+    };
+};
+
+test "dist dsv41 leader prefill: the shared follower loop imports each chunk before FREE and RELEASE" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |capture| {
+        var m: dsv41_mod.Dsv41Model = undefined;
+        m.gpa = std.testing.allocator;
+        m.s = mlx.gpuStream();
+        m.cfg = .{ .model_type = "deepseek_v41", .hidden_size = 4, .num_hidden_layers = 1, .head_dim = 64, .sliding_window = 16, .dsv4_index_head_dim = 32 };
+        m.whole_cfg = m.cfg;
+        m.n_layers = 1;
+        m.n_mtp = 0;
+        m.vocab = 128;
+        m.act = .float32;
+        m.tp = .{ .rank = 1, .size = 4 };
+        m.head = .{ .w = .{ .ctx = null } };
+        m.hash = null;
+        m.granted_tg = null;
+        m.topk_tg = 32;
+        m.hc_tg = 32;
+        m.ds_block = 0;
+        m.span = 1;
+        m.moe_rows = 1;
+        m.ced_split = null;
+        m.ced_min_skip = 0;
+        m.qat_off = true;
+        m.attn_f16 = false;
+        m.dec_state = null;
+        m.state_gen = 0;
+        m.tp_drafted = null;
+        m.ds_chain = null;
+        defer if (m.dec_state) |*st| st.deinit();
+        var state: LinkState = .{};
+        const link: Link = .{ .state = &state, .group = .{ .ctx = null }, .rank = 1, .size = 4 };
+        var supplied: TestPrefillWire = .{ .model = &m, .capture = capture };
+        const transport: wire.Link = .{ .ctx = &supplied, .vt = &TestPrefillWire.vt };
+        try std.testing.expect(try dsv41StepLoop(std.testing.io, std.testing.allocator, &link, &m, transport));
+        try std.testing.expectEqual(@as(usize, 4), supplied.messages);
+        try std.testing.expectEqual(@as(usize, 2), supplied.tensors);
+    }
+}
 
 test "dist switch mode: follower executes FREE and RELEASE in the cold worker loop without weights" {
     var t: TestModeAdapter = undefined;

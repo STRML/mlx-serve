@@ -1539,6 +1539,10 @@ fn settledTpTurn(ts: [4]*Twin) ![4]TpTurn {
             model.modes.row_cut.?.calls = 0;
             if (out[r]) |o| o.deinit();
             out[r] = null;
+            // Keep the conventional tensor proof independent of the leader-prefill route.
+            const whole = tp.prefill_whole;
+            tp.prefill_whole = null;
+            defer tp.prefill_whole = whole;
             out[r] = try tpTurn(tp);
         }
         if (try TpProofGroup.settled()) {
@@ -1648,4 +1652,350 @@ test "deepseek_v41 modes: TP4 logits match TP1 through the one-process group (f3
     try testing.expectEqual(@as(c_int, 0), msv_test_swap_tf32(0));
     std.debug.print("[tp-logits] f32 TF32 disabled via MLX config API (previous={d})\n", .{previous});
     try tpProof(.float32);
+}
+
+const LeaderReplay = struct {
+    const A = mlx.mlx_array;
+    const Chunk = struct { gen: u64, p0: usize, n: usize, capture: bool, xs: []A, stages: usize };
+    var chunks: std.ArrayList(Chunk) = .empty;
+    var rank: usize = 0;
+    var wide_steps: usize = 0;
+
+    fn clear() void {
+        for (chunks.items) |c| dsv41.freeArrays(testing.allocator, c.xs);
+        chunks.deinit(testing.allocator);
+        chunks = .empty;
+        wide_steps = 0;
+    }
+
+    fn step(ids: []const u32, _: usize, _: bool, _: bool, _: dsv41.VerifyOpts, _: u64, _: ?A) anyerror!void {
+        if (ids.len > @import("rowcut.zig").max_rows) wide_steps += 1;
+    }
+
+    fn ship(gen: u64, p0: usize, n: usize, capture: bool, xs: []const A, stages: usize) anyerror!void {
+        const kept = try testing.allocator.alloc(A, xs.len);
+        for (kept, xs) |*o, x| {
+            o.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(o, x));
+        }
+        try chunks.append(testing.allocator, .{ .gen = gen, .p0 = p0, .n = n, .capture = capture, .xs = kept, .stages = stages });
+    }
+
+    fn install() void {
+        dsv41.clusterHooks().tp_step = &step;
+        dsv41.clusterHooks().tp_prefill = &ship;
+    }
+
+    fn imported(m: *dsv41.Dsv41Model, p0: usize, n: usize) !bool {
+        if (rank == 0) return false;
+        for (chunks.items) |c| if (c.p0 == p0 and c.n == n) {
+            var parked: dsv41.Parked = .init(testing.allocator);
+            defer dsv41.dropParked(&parked);
+            try dsv41.tpWorkerPrefill(m, testing.allocator, &parked, m.state_gen, p0, n, c.capture, c.xs, c.stages);
+            return true;
+        };
+        return false;
+    }
+};
+
+fn leaderTurn(m: *dsv41.Dsv41Model, widths: []const usize) !TpTurn {
+    try dsv41.reset(m, testing.allocator);
+    var p0: usize = 0;
+    var prefill: []f32 = &.{};
+    errdefer testing.allocator.free(prefill);
+    for (widths) |width| {
+        testing.allocator.free(prefill);
+        prefill = &.{};
+        if (m.tp != null and try LeaderReplay.imported(m, p0, p0 + width)) {
+            p0 += width;
+            continue;
+        }
+        const p = try dsv41.extendResumable(m, testing.allocator, (tp_prompt ++ tp_prompt)[p0..][0..width], null);
+        defer _ = mlx.mlx_array_free(p);
+        prefill = try dsv41.hostF32(p);
+        p0 += width;
+    }
+    const d = try dsv41.extendResumable(m, testing.allocator, &.{8}, null);
+    defer _ = mlx.mlx_array_free(d);
+    const decoded = try dsv41.hostF32(d);
+    if (m.hash != null) {
+        const prompt = tp_prompt ++ tp_prompt;
+        try testing.expectEqualSlices(u32, prompt[0..p0], m.dec_state.?.hist.items[0..p0]);
+        try testing.expectEqual(p0 + 1, m.dec_state.?.hist.items.len);
+    }
+    var out: TpTurn = .{ .prefill = prefill, .decode = decoded };
+    errdefer testing.allocator.free(decoded);
+    if (m.n_mtp > 0) {
+        var sc = dsv41.Scope.init(testing.allocator, m.s);
+        defer sc.deinit();
+        const g = try dsv41.draftGraph(&sc, m, testing.allocator, &.{&m.dec_state.?}, &.{5}, true);
+        out.draft = try dsv41.hostF32(g.logits);
+    }
+    return out;
+}
+
+fn settledLeaderTurn(ts: [4]*Twin, widths: []const usize) ![4]TpTurn {
+    LoneGroup.arm(4);
+    defer LoneGroup.disarm();
+    LeaderReplay.install();
+    defer LeaderReplay.clear();
+    TpProofGroup.join(4);
+    defer TpProofGroup.leave();
+    var out: [4]?TpTurn = @splat(null);
+    errdefer for (out) |o| if (o) |v| v.deinit();
+    for (0..40) |pass| {
+        LeaderReplay.clear();
+        for (ts, 0..) |t, r| {
+            TpProofGroup.begin(r);
+            LeaderReplay.rank = r;
+            const pm: *v41.Model = @ptrCast(@alignCast(t.m));
+            if (out[r]) |o| o.deinit();
+            out[r] = null;
+            out[r] = try leaderTurn(pm.modes.tp.?, widths);
+        }
+        if (try TpProofGroup.settled()) {
+            try TpProofGroup.expectAgreement();
+            try testing.expectEqual(@as(usize, 0), LeaderReplay.wide_steps);
+            try testing.expect(LeaderReplay.chunks.items.len > 0);
+            std.debug.print("[leader-prefill] settled in {d} passes, {d} leader chunks\n", .{ pass + 1, LeaderReplay.chunks.items.len });
+            return .{ out[0].?, out[1].?, out[2].?, out[3].? };
+        }
+    }
+    return error.TpGroupDidNotSettle;
+}
+
+fn leaderProofPack(widths: []const usize, stages: bool, shard: bool) !void {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const previous = msv_test_swap_tf32(0);
+    defer {
+        _ = mlx.mlx_synchronize(mlx.gpuStream());
+        _ = msv_test_swap_tf32(previous);
+    }
+    _ = setenv("DSV41_DRAFT_SHARD", if (shard) "1" else "0", 1);
+    defer _ = unsetenv("DSV41_DRAFT_SHARD");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = if (stages) try fixture.v41TpDsparkFiles(arena.allocator(), 7) else try fixture.v41TpFiles(arena.allocator(), 7);
+    var ts: [4]*Twin = undefined;
+    var made: usize = 0;
+    defer for (ts[0..made]) |t| t.close();
+    for (&ts, 0..) |*t, r| {
+        const setting = try std.fmt.allocPrint(arena.allocator(), "{{\"tp_mode\":{{\"rank\":{d},\"size\":4}}}}", .{r});
+        t.* = try Twin.openWith(files, "", setting);
+        made += 1;
+        try rebuildTpProofF32(t.*, @intCast(r));
+        const model: *v41.Model = @ptrCast(@alignCast(t.*.m));
+        for ([_]*dsv41.Dsv41Model{ model.modes.tp1, model.modes.tp.? }) |m| {
+            var cfg = m.cfg;
+            @import("decode/fixture.zig").engramConfig(&cfg, .{ 1, 3 });
+            m.hash = try engram.Hash.init(&cfg, 2);
+            m.token_map = try m.gpa.alloc(u32, m.vocab);
+            for (m.token_map, 0..) |*v, k| v.* = @intCast(k);
+        }
+    }
+    const pm: *v41.Model = @ptrCast(@alignCast(ts[0].m));
+    const want = try leaderTurn(pm.modes.tp1, widths);
+    defer want.deinit();
+    const got = try settledLeaderTurn(ts, widths);
+    defer for (got) |o| o.deinit();
+    try testing.expect(try tpLogitsMatch("leader wide prefill", want.prefill, got[0].prefill, 1e-3));
+    for (got) |o| try testing.expect(try tpLogitsMatch("decode after leader prefill", want.decode, o.decode, 1e-3));
+    if (stages) {
+        const joined = try testing.allocator.alloc(f32, want.draft.len);
+        defer testing.allocator.free(joined);
+        if (shard) {
+            const width = pm.mdl.vocab / 4;
+            for (got, 0..) |o, r| for (0..pm.mdl.ds_block) |b| {
+                @memcpy(joined[b * pm.mdl.vocab + r * width ..][0..width], o.draft[b * width ..][0..width]);
+            };
+        } else @memcpy(joined, got[0].draft);
+        try testing.expect(try tpLogitsMatch("leader DSpark and Markov", want.draft, joined, 1e-3));
+        return;
+    }
+    for (ts) |t| {
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        for (m.modes.row_cut.?.layers) |*layer| if (layer.*) |*rl| {
+            rl.fused = null;
+            std.mem.swap(dsv41.Bank, &rl.experts.gate, &rl.experts.up);
+        };
+    }
+    const bad = try settledLeaderTurn(ts, widths);
+    defer for (bad) |o| o.deinit();
+    try testing.expect(!try tpLogitsMatch("negative after leader prefill", got[0].decode, bad[0].decode, 1e-3));
+}
+
+test "deepseek_v41 leader prefill: a wide chunk ships state before TP4 decode" {
+    for ([_]bool{ false, true }) |stages| try leaderProofPack(&.{32}, stages, true);
+    try leaderProofPack(&.{32}, true, false);
+}
+
+test "deepseek_v41 leader prefill: wide chunks and a narrow tail keep TP4 logits" {
+    for ([_]bool{ false, true }) |stages| try leaderProofPack(&.{ 25, 32, 7 }, stages, true);
+}
+const LeaderCacheRig = struct {
+    models: [3]*dsv41.Dsv41Model,
+    parked: [3]dsv41.Parked,
+    snaps: [3]dsv41.Snaps,
+    loads: usize = 0,
+    fail_ship: bool = false,
+    failed_ship_seen: bool = false,
+    failure: ?anyerror = null,
+    var active: *@This() = undefined;
+
+    fn init(ts: [4]*Twin) @This() {
+        var out: @This() = undefined;
+        for (ts[1..], 0..) |t, i| {
+            const pm: *v41.Model = @ptrCast(@alignCast(t.m));
+            out.models[i] = pm.modes.tp.?;
+            out.parked[i] = .init(testing.allocator);
+            out.snaps[i] = .init(testing.allocator);
+        }
+        out.loads = 0;
+        out.fail_ship = false;
+        out.failed_ship_seen = false;
+        out.failure = null;
+        return out;
+    }
+
+    fn deinit(self: *@This()) void {
+        for (&self.parked, &self.snaps) |*p, *s| {
+            dsv41.dropParked(p);
+            dsv41.dropSnaps(s, testing.allocator);
+        }
+    }
+
+    fn reform(self: *@This(), lead: *v41.Model) void {
+        self.deinit();
+        for (self.models, &self.parked, &self.snaps) |m, *p, *s| {
+            if (m.dec_state) |*st| st.deinit();
+            m.dec_state = null;
+            p.* = .init(testing.allocator);
+            s.* = .init(testing.allocator);
+        }
+        v41.groupFormed(lead);
+    }
+
+    fn ship(gen: u64, p0: usize, n: usize, capture: bool, xs: []const mlx.mlx_array, stages: usize) anyerror!void {
+        const self = active;
+        for (self.models, &self.parked, 0..) |m, *p, i| {
+            if (self.fail_ship and i == 1) {
+                self.failed_ship_seen = true;
+                return error.TestLeaderShipFailed;
+            }
+            try dsv41.tpWorkerPrefill(m, testing.allocator, p, gen, p0, n, capture, xs, stages);
+        }
+    }
+
+    fn load(id: u64, ids: []const u32, xs: []const mlx.mlx_array) anyerror!void {
+        const self = active;
+        for (self.models, &self.snaps) |m, *s| try dsv41.tpWorkerLoad(m, testing.allocator, s, id, ids, xs);
+        self.loads += 1;
+    }
+
+    fn snap(op: dsv41.SnapOp, a: u64, b: u64) void {
+        const self = active;
+        for (self.models, &self.parked, &self.snaps) |m, *p, *s|
+            dsv41.tpWorkerSnap(m, testing.allocator, p, s, op, a, b) catch |err| {
+                self.failure = err;
+                return;
+            };
+    }
+
+    fn free(gen: u64) void {
+        const self = active;
+        for (self.models, &self.parked) |m, *p| dsv41.tpWorkerFree(m, p, gen);
+    }
+};
+
+test "deepseek_v41 leader prefill: aborted chunks restore and reload after group formation, failed shipping cannot snapshot" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41TpFiles(arena.allocator(), 7);
+    var ts: [4]*Twin = undefined;
+    var made: usize = 0;
+    defer for (ts[0..made]) |t| t.close();
+    for (&ts, 0..) |*t, r| {
+        const setting = try std.fmt.allocPrint(arena.allocator(), "{{\"tp_mode\":{{\"rank\":{d},\"size\":4}}}}", .{r});
+        t.* = try Twin.openWith(files, "", setting);
+        made += 1;
+        try rebuildTpProofF32(t.*, @intCast(r));
+        const pm: *v41.Model = @ptrCast(@alignCast(t.*.m));
+        try v41.swapMode(pm, .tp);
+    }
+    const lead: *v41.Model = @ptrCast(@alignCast(ts[0].m));
+    v41.groupFormed(lead);
+    var rig = LeaderCacheRig.init(ts);
+    defer rig.deinit();
+    LeaderCacheRig.active = &rig;
+    dsv41.clusterHooks().* = .{ .tp_prefill = &LeaderCacheRig.ship, .tp_load = &LeaderCacheRig.load, .tp_snap = &LeaderCacheRig.snap, .tp_free = &LeaderCacheRig.free };
+    defer dsv41.clusterHooks().* = .{};
+    const aux = v41.table.cache.aux.?;
+    const prompt = tp_prompt ++ tp_prompt;
+    try testing.expect(aux.begin_prompt(ts[0].m, 1, .of(&prompt), .{}, 0, true).isOk());
+    testing.allocator.free(try slotForward(ts[0], .prefill, &.{1}, prompt[0..25], &.{0}));
+    var sn: abi.Handle = null;
+    try testing.expect(aux.snapshot(ts[0].m, 1, &sn).isOk());
+    defer aux.free(ts[0].m, sn);
+    const saved: *dsv41.Snap = @ptrCast(@alignCast(sn orelse return error.MissingSnapshot));
+    try testing.expectEqual(@as(usize, 25), saved.n);
+    try testing.expectEqualSlices(u32, prompt[0..25], saved.ids);
+    try testing.expect(rig.failure == null);
+    for (&rig.snaps) |*s| try testing.expectEqual(@as(usize, 25), (s.getPtr(saved.tp_id) orelse return error.FollowerSnapshotMissing).n);
+    var clone: abi.Handle = null;
+    try testing.expect(aux.slice(ts[0].m, sn, saved.n, &clone).isOk());
+    defer aux.free(ts[0].m, clone);
+    try testing.expect(aux.restore_at(ts[0].m, 2, clone, saved.n).isOk());
+    for (rig.models) |m| try testing.expectEqual(saved.n, m.dec_state.?.n);
+    try testing.expect(rig.failure == null);
+    rig.reform(lead);
+    try testing.expect(aux.restore_at(ts[0].m, 3, sn, saved.n).isOk());
+    try testing.expectEqual(@as(usize, 1), rig.loads);
+    try testing.expect(aux.restore_at(ts[0].m, 3, sn, saved.n).isOk());
+    try testing.expectEqual(@as(usize, 1), rig.loads);
+    for (rig.models) |m| try testing.expectEqual(saved.n, m.dec_state.?.n);
+    try testing.expect(rig.failure == null);
+    rig.fail_ship = true;
+    try testing.expect(aux.begin_prompt(ts[0].m, 4, .of(&prompt), .{}, 0, true).isOk());
+    try testing.expectError(error.TestLeaderShipFailed, dsv41.extendResumable(lead.mdl, testing.allocator, prompt[0..25], null));
+    try testing.expect(rig.failed_ship_seen);
+    var refused: abi.Handle = null;
+    try testing.expectEqual(abi.Verdict.Code.failed, aux.snapshot(ts[0].m, 4, &refused).code);
+    try testing.expect(refused == null);
+}
+test "deepseek_v41 leader prefill: Engram read-ahead stays with the active TP state across wide chunks" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fxmod = @import("decode/fixture.zig");
+    const rcmod = @import("rowcut.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try fxmod.writeEngramPack(gpa, td.dir, 1024, .{ 0, 1 });
+    var path: [512]u8 = undefined;
+    const dir = path[0..try td.dir.realPath(io, &path)];
+    const fx = try fxmod.Fixture.initWhole(gpa, .{ .layers = 2, .engram_dir = dir, .engram_layers = .{ 0, 1 } });
+    defer fx.deinit();
+    fx.m.cfg.dsv41_kv_sources &= 3;
+    fx.m.cfg.dsv41_index_sources &= 3;
+    fx.m.whole_cfg = fx.m.cfg;
+    const rows = try rcmod.RowCut.create(gpa, fx.m.s, fx.m, 0, fx.m.n_layers, 0, 4);
+    defer rows.destroy();
+    const tp = try dsv41.init(gpa, &fx.m.cfg, &fx.w, fx.m.s, .{ .tp = .{ .rank = 0, .size = 4 }, .resident = .{ .model = fx.m, .rows = rows }, .pack_dir = dir });
+    defer tp.deinit();
+    tp.prefill_whole = fx.m;
+    LoneGroup.arm(4);
+    defer LoneGroup.disarm();
+    var prompt: [96]u32 = undefined;
+    for (&prompt, 0..) |*id, i| id.* = @intCast((i * 13 + 3) % 1024);
+    try dsv41.reset(tp, gpa);
+    try dsv41.armPrompt(tp, &prompt, null, true);
+    for ([_]usize{ 0, 32 }) |p0| {
+        _ = mlx.mlx_array_free(try dsv41.extendResumable(tp, gpa, prompt[p0..][0..32], null));
+        const ahead = tp.ahead orelse return error.LeaderPrefillDroppedEngramReadAhead;
+        try testing.expect(ahead.covers(p0 + 32, 32));
+        try testing.expect(fx.m.ahead == null);
+        try testing.expectEqualSlices(u32, prompt[0 .. p0 + 32], tp.dec_state.?.hist.items);
+    }
+    try testing.expectEqual(@as(usize, 0), fx.m.prompt.len);
 }
