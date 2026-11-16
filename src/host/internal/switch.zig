@@ -5,6 +5,7 @@ const std = @import("std");
 const attempt = @import("attempt.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const log = @import("../../sdk/util/log.zig");
+const status = @import("../status.zig");
 
 /// The formation deadline, past `t1`, a router gives when it names none (plan 61c item 4: t1 + 1,900 ms).
 pub const default_formation_ms: i64 = 1900;
@@ -456,16 +457,18 @@ fn outcomeName(o: attempt.Outcome) []const u8 {
     };
 }
 
-/// The poll body the router reads each second: `{mode, n, high_water, role, state, peers, ...}`.
-pub fn renderSnapshot(buf: []u8, s: Snapshot) []const u8 {
+/// The poll body the router reads each second. OS readings are sampled here on the HTTP thread.
+pub fn renderSnapshot(io: std.Io, buf: []u8, s: Snapshot) []const u8 {
+    const clock_ms = io_util.nowMs(io);
+    const room_mib = status.getFreeInactiveMemBytes() >> 20;
     var progress_buf: [24]u8 = undefined;
     const progress = if (s.progress) |p| std.fmt.bufPrint(&progress_buf, "{d}", .{p}) catch "null" else "null";
     var rank_buf: [16]u8 = undefined;
     const rank = if (s.failure_rank) |r| std.fmt.bufPrint(&rank_buf, "{d}", .{r}) catch "null" else "null";
     return std.fmt.bufPrint(buf, "{{\"mode\":\"{s}\",\"n\":{d},\"high_water\":{d},\"role\":\"{s}\",\"state\":\"{s}\",\"failure\":\"{s}\",\"failure_rank\":{s},\"peers\":{d}," ++
-        "\"in_flight\":{d},\"admitting\":{},\"quarantined\":{},\"progress\":{s},\"stalled_ms\":{d}}}", .{
-        @tagName(s.mode), s.n,         s.high_water,  @tagName(s.role), @tagName(s.state), @tagName(s.failure), rank, s.peers,
-        s.in_flight,      s.admitting, s.quarantined, progress,         s.stalled_ms,
+        "\"in_flight\":{d},\"admitting\":{},\"quarantined\":{},\"progress\":{s},\"stalled_ms\":{d},\"clock_ms\":{d},\"room_mib\":{d}}}", .{
+        @tagName(s.mode), s.n,         s.high_water,  @tagName(s.role), @tagName(s.state), @tagName(s.failure), rank,     s.peers,
+        s.in_flight,      s.admitting, s.quarantined, progress,         s.stalled_ms,      clock_ms,            room_mib,
     }) catch "{}";
 }
 
@@ -732,7 +735,7 @@ test "a failed outcome lands at aborted with the formation's reason and the rank
     try t.expectEqual(@as(?u32, 3), s.failure_rank);
     try t.expect(s.admitting);
     var buf: [512]u8 = undefined;
-    try t.expect(std.mem.indexOf(u8, renderSnapshot(&buf, s), "\"failure_rank\":3") != null);
+    try t.expect(std.mem.indexOf(u8, renderSnapshot(t.io, &buf, s), "\"failure_rank\":3") != null);
 }
 
 test "an unknown error name is `other`; a cancelled outcome is `cancelled`" {
@@ -1077,7 +1080,7 @@ test "the mode snapshot carries mode, N, role, peers and the stall note an abort
     var sw = newSwitch(&f);
     try formedAs(&sw, &f, .leader, 6);
     var buf: [512]u8 = undefined;
-    const body = renderSnapshot(&buf, sw.snapshot());
+    const body = renderSnapshot(t.io, &buf, sw.snapshot());
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, body, .{});
     defer parsed.deinit();
     const o = parsed.value.object;
