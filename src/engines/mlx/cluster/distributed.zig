@@ -309,6 +309,12 @@ fn envMatches(name: [*:0]const u8, value: []const u8) bool {
 
 /// Main thread at startup, before background environment readers.
 pub fn primeEnv(cfg: Config) !void {
+    if (cfg.size < 2 or cfg.size > max_ranks or cfg.rank >= cfg.size) return error.InvalidArgs;
+    var matrix: [1024]u8 = undefined;
+    _ = deviceMatrixJson(cfg, &matrix) catch |err| {
+        log.err("[dist] {s}: --dist-device needs {d} entries in rank order with this box's own `-` at rank {d}: got \"{s}\"\n", .{ @errorName(err), cfg.size, cfg.rank, cfg.device });
+        return err;
+    };
     var buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrintSentinel(&buf, "/tmp/mlx-serve-jaccl-{d}.json", .{std.c.getpid()}, 0);
     try setDistEnv(cfg, path);
@@ -4066,6 +4072,21 @@ test "dist N-rank: a device list names each peer's port in this rank's row, and 
     try std.testing.expectError(error.DistDeviceList, deviceMatrixJson(.{ .rank = 0, .size = 4, .coordinator = "x:1", .device = "-,a,,c" }, &buf));
 }
 
+test "dist switch startup: rank one primes its environment and invalid device order cannot change it" {
+    const cfg: Config = .{ .rank = 1, .size = 2, .coordinator = "127.0.0.1:46201", .device = "rdma_en1,-" };
+    try primeEnv(cfg);
+    try std.testing.expect(envMatches("MLX_RANK", "1"));
+    try std.testing.expect(envPrimed(cfg));
+    var bad = cfg;
+    bad.rank = 0;
+    try std.testing.expectError(error.DistDeviceList, primeEnv(bad));
+    try std.testing.expect(envPrimed(cfg));
+    bad = cfg;
+    bad.rank = 2;
+    try std.testing.expectError(error.InvalidArgs, primeEnv(bad));
+    try std.testing.expect(envPrimed(cfg));
+}
+
 test "dist N-rank: past a pair rank 0 listens on every address, each worker dials its own" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("10.254.77.1:32323", try jacclCoordinator(.{ .rank = 0, .size = 2, .coordinator = "10.254.77.1:32323", .device = "d" }, &buf));
@@ -5115,6 +5136,7 @@ test "dist switch slice3 release: leader waits for both follower EOFs" {
     defer TestSwitchOpen.cleanup();
     var req = TestSwitchOpen.request(83);
     req.cfg.size = 3;
+    req.cfg.device = "-,loopback,loopback";
     try TestSwitchOpen.start(req);
     const link = (try TestSwitchOpen.outcome(83)).formed.link;
     var one: TestReleasePeer = .{ .bell = TestSwitchOpen.peer_bell, .delay_ms = 70 };
@@ -5153,6 +5175,7 @@ test "dist switch slice3 release: send failure returns the missing rank without 
     defer TestSwitchOpen.cleanup();
     var req = TestSwitchOpen.request(85);
     req.cfg.size = 3;
+    req.cfg.device = "-,loopback,loopback";
     try TestSwitchOpen.start(req);
     const link = (try TestSwitchOpen.outcome(85)).formed.link;
     _ = std.c.shutdown(link.bells[2].fd, std.c.SHUT.WR);

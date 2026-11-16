@@ -7,7 +7,7 @@ pub const Config = struct {
     coordinator: []const u8,
     device: []const u8,
     model_dir: []const u8,
-    rank: u32 = 0,
+    rank: u32,
     size: u32 = 2,
 };
 

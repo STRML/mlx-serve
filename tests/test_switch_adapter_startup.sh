@@ -92,5 +92,45 @@ M="$(mode)"
 check "the box is aborted" "$([ "$(field "$M" state)" = aborted ] && echo 1)"
 check "admission is reopened" "$([ "$(field "$M" admitting)" = true ] && echo 1)"
 
+echo "[6] invalid switch configuration is refused before listening"
+srv_stop "$SRV"; SRV=""
+for CASE in rank negative device; do
+    EXTRA=()
+    case "$CASE" in
+        rank) EXTRA=(--dist-rank 4); NAMED="[dist] --dist-rank" ;;
+        negative) EXTRA=(--dist-rank -1); NAMED="[dist] --dist-rank" ;;
+        device) EXTRA=(--dist-size 4); NAMED="DistDeviceList" ;;
+    esac
+    "$BINARY" --serve --host 127.0.0.1 --model-dir "$WORK/models" --port "$PORT" --log-file off \
+        --internal-key-file "$WORK/internal.key" --dist tensor --dist-size 4 \
+        --dist-coordinator "127.0.0.1:$((PORT + 30000))" --dist-device "rdma_en1,-,rdma_en3,rdma_en4" \
+        --dist-model "$WORK/tp-model" "${EXTRA[@]}" > "$LOG" 2>&1 &
+    SRV=$!
+    UP=0
+    srv_wait_health "$BASE" 20 0.1 "$SRV" && UP=1
+    check "$CASE is refused before listening" "$([ "$UP" = 0 ] && ! kill -0 "$SRV" 2>/dev/null && echo 1)"
+    check "$CASE refusal names $NAMED" "$(grep -Fq -- "$NAMED" "$LOG" && echo 1)"
+    srv_stop "$SRV"; SRV=""
+done
+
+echo "[7] rank one accepts follower join after drain"
+"$BINARY" --serve --host 127.0.0.1 --model-dir "$WORK/models" --port "$PORT" --log-file off \
+    --internal-key-file "$WORK/internal.key" --dist tensor --dist-size 2 --dist-rank 1 \
+    --dist-coordinator "127.0.0.1:$((PORT + 30000))" --dist-device "rdma_en1,-" \
+    --dist-model "$WORK/tp-model" > "$LOG" 2>&1 &
+SRV=$!
+UP=0
+srv_wait_health "$BASE" 60 0.5 "$SRV" && UP=1
+check "rank one boots healthy" "$UP"
+if [ "$UP" = 1 ]; then
+    R="$(post /v1/internal/drain '{"n":5}')"
+    check "rank one drains" "$([ "${R%% *}" = 200 ] && echo 1)"
+    R="$(post /v1/internal/join '{"n":5}')"
+    check "rank one join is accepted (200, got ${R%% *})" "$([ "${R%% *}" = 200 ] && echo 1)"
+    check "rank one reports follower" "$([ "$(field "${R#* }" role)" = follower ] && echo 1)"
+else
+    tail -20 "$LOG"
+fi
+
 echo "TESTS: $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

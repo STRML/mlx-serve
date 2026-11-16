@@ -77,6 +77,7 @@ test "with a distributed configuration the installed switch has a formation back
         .coordinator = "127.0.0.1:46311",
         .device = "-,rdma_en2",
         .model_dir = "/tmp/no-model",
+        .rank = 0,
     })).?;
     defer std.testing.allocator.destroy(inst.sw);
     try std.testing.expect(inst.sw.formation != null);

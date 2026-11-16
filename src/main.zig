@@ -558,8 +558,10 @@ fn printUsage(io: std.Io) void {
         \\  --dist-size <n>     Macs in the group, this one included (default 2).
         \\                        Past 2: DeepSeek-V4.1 with --dist tensor only;
         \\                        --dist-device lists the port facing each rank
-        \\                        in rank order, this Mac's own `-` (rank 0), and
+        \\                        in rank order, this Mac's own `-` at its rank, and
         \\                        each worker runs `worker --rank k --size n`
+        \\  --dist-rank <r>     This box's rank for --internal-key-file switches
+        \\                        (default 0; must be below --dist-size).
         \\  --dist-join-timeout <s>  How long after startup a missing worker reads as
         \\                        the group forming before the log names its rank
         \\                        (default 0 for a pair, 600 past it; the load
@@ -720,6 +722,7 @@ pub fn main(init: std.process.Init) !void {
     var dist_split: ?u32 = null;
     var dist_model: ?[]const u8 = null;
     var dist_size: u32 = 2;
+    var dist_rank: u32 = 0;
     var dist_join_timeout: ?u32 = null;
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
@@ -840,6 +843,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--dist-size") and i + 1 < args.len) {
             i += 1;
             dist_size = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--dist-rank") and i + 1 < args.len) {
+            i += 1;
+            dist_rank = std.fmt.parseInt(u32, args[i], 10) catch {
+                log.err("[dist] --dist-rank takes an integer >= 0, got '{s}'\n", .{args[i]});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, args[i], "--dist-join-timeout") and i + 1 < args.len) {
             i += 1;
             dist_join_timeout = try std.fmt.parseInt(u32, args[i], 10);
@@ -1250,12 +1259,21 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+    if (dist_rank >= dist_size) {
+        log.err("[dist] --dist-rank {d} must be below --dist-size {d}\n", .{ dist_rank, dist_size });
+        return error.InvalidArgs;
+    }
+    if (dist_rank != 0 and (internal_key_file == null or dist_mode == null)) {
+        log.err("[dist] --dist-rank above 0 requires --internal-key-file and --dist\n", .{});
+        return error.InvalidArgs;
+    }
     const switch_config: ?@import("host/internal/formation.zig").Config = if (internal_key_file != null and dist_mode != null) blk: {
         const cfg: @import("host/internal/formation.zig").Config = .{
             .coordinator = dist_coordinator orelse return error.InvalidArgs,
             .device = dist_device orelse return error.InvalidArgs,
             .model_dir = dist_model orelse run_model_dir orelse model_dir,
             .size = dist_size,
+            .rank = dist_rank,
         };
         if (cfg.size < 2 or cfg.size > @import("engines/mlx/cluster/distributed.zig").max_ranks or cfg.rank >= cfg.size or cfg.model_dir.len == 0) return error.InvalidArgs;
         try @import("engines/mlx/cluster/distributed.zig").primeEnv(.{ .rank = cfg.rank, .size = cfg.size, .coordinator = cfg.coordinator, .device = cfg.device });
