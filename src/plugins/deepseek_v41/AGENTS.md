@@ -132,6 +132,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - Under `tp` rank 0 alone holds the vision tower: a chunk's image rows ride with its step (`tp_step` `images`), the
   worker splices them at offset 0, so a rank's splice must depend only on the chunk's own rows (`chunkImageRows`).
 - Packed v2 snapshot entries are readable by this plugin; older binaries drop them during SSD scan.
+- The cache key hashes the whole config and the GPU's own `granted_tg`, never a rank's slice or the launch shapes a tensor
+  group pinned (`pinLaunchShapes`): an entry written at TP1 loads at any width, and the reverse.
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.
 - Metal only: a CPU host stream loads on this thread's GPU stream; no GPU = refused by name.
 
