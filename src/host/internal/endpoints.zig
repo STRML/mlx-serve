@@ -193,6 +193,12 @@ const Rig = struct {
     fn poll(_: *anyopaque, _: u64) ?sw_mod.FormOutcome {
         return null;
     }
+    fn activate(ctx: *anyopaque, _: u64, _: *anyopaque) sw_mod.ActivateError!void {
+        me(ctx).note('a');
+    }
+    fn abortFormed(ctx: *anyopaque, _: u64) void {
+        me(ctx).note('b');
+    }
     fn release(ctx: *anyopaque, _: u64, _: *anyopaque, _: *?u32) sw_mod.ReleaseError!void {
         me(ctx).note('r');
     }
@@ -236,6 +242,8 @@ fn wire(r: *Rig) void {
         .start = Rig.start,
         .cancel = Rig.cancel,
         .poll = Rig.poll,
+        .activate = Rig.activate,
+        .abort_formed = Rig.abortFormed,
         .release = Rig.release,
         .fall = Rig.fall,
         .quarantined = Rig.quarantined,

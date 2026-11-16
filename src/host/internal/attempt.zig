@@ -16,7 +16,8 @@ pub const Config = struct {
     drain_expiry_ms: i64 = 3500,
     /// A formation or an abort that has not unwound by now leaves the thread's resources untouched and quarantines the box.
     unwind_limit_ms: i64 = 2500,
-    /// A follower told to abort a formed group serves it this long for the leader's OP_RELEASE, then falls by itself.
+    /// A follower told to abort a formed group serves it this long for the leader's OP_RELEASE, then the formation code
+    /// falls by itself (step 4 owns that timer). The box quarantines if no report follows within `unwind_limit_ms` more.
     release_wait_ms: i64 = 2000,
 };
 
@@ -52,9 +53,8 @@ pub const Machine = struct {
     entered_ms: i64 = 0,
     quarantined: bool = false,
     failure: Failure = .none,
-    /// A follower aborting a formed group, still serving it until OP_RELEASE or `release_wait_ms`.
+    /// A follower aborting a formed group, still serving it until OP_RELEASE or the formation code's fall report.
     awaiting_release: bool = false,
-    fall_due: bool = false,
     /// Set from `formed` until the link is gone: a follower waiting out its abort still serves TP4.
     grouped: bool = false,
 
@@ -155,14 +155,9 @@ pub const Machine = struct {
                 self.failure = .drain_expired;
                 self.enter(.aborted, now_ms);
             },
-            .aborting => if (self.awaiting_release) {
-                if (waited >= self.cfg.release_wait_ms) {
-                    self.awaiting_release = false;
-                    self.fall_due = true;
-                    self.enter(.aborting, now_ms);
-                }
-            } else if (waited >= self.cfg.unwind_limit_ms) {
-                self.quarantined = true;
+            .aborting => {
+                const limit = self.cfg.unwind_limit_ms + if (self.awaiting_release) self.cfg.release_wait_ms else 0;
+                if (waited >= limit) self.quarantined = true;
             },
             .forming => if (waited >= self.cfg.unwind_limit_ms) {
                 self.quarantined = true;
@@ -196,13 +191,6 @@ pub const Machine = struct {
         self.awaiting_release = false;
         self.enter(.releasing, now_ms);
         return true;
-    }
-
-    /// True once after a follower's wait for OP_RELEASE ran out: the caller falls, then reports `formationFailed(.release_timeout)`.
-    pub fn takeFallDue(self: *Machine) bool {
-        const due = self.fall_due;
-        self.fall_due = false;
-        return due;
     }
 
     /// The box freed its link, cleared MLX's cached group and swapped back to the TP1 model.
@@ -512,35 +500,29 @@ test "a follower's abort of a formed group waits for the leader's OP_RELEASE, th
     try t.expectEqual(State.releasing, m.state);
     try t.expect(m.released(3, 900));
     m.tick(100 + 2000);
-    try t.expect(!m.takeFallDue());
     try t.expectEqual(State.released, m.state);
 }
 
-test "a follower with no OP_RELEASE for 2 s falls by itself, and the fall is due once" {
+test "a follower's abort leaves the 2 s fallback to step 4: its fall report ends the attempt in TP1" {
     var m = formedFollower(3);
     _ = m.command(.abort, 3, 100);
-    m.tick(100 + 1999);
-    try t.expect(!m.takeFallDue());
-    m.tick(100 + 2000);
-    try t.expect(m.takeFallDue());
-    try t.expect(!m.takeFallDue());
-    try t.expect(!m.releasing(3, 2200));
-    try t.expect(m.formationFailed(3, 2300, .release_timeout));
+    m.tick(100 + 3000);
+    try t.expect(m.awaiting_release);
+    try t.expectEqual(State.aborting, m.state);
+    try t.expectEqual(Mode.tp4, m.mode());
+    try t.expect(m.formationFailed(3, 3200, .release_timeout));
     try t.expectEqual(State.aborted, m.state);
     try t.expectEqual(Failure.release_timeout, m.failure);
     try t.expectEqual(Mode.tp1, m.mode());
     try t.expect(m.admits());
 }
 
-test "a follower's wait does not count toward the unwind limit; its fall does" {
+test "a follower's abort that step 4 never reports quarantines once its 2 s fallback plus the unwind limit passed" {
     var m = formedFollower(3);
     _ = m.command(.abort, 3, 0);
-    m.tick(2000 + 2499);
-    try t.expect(m.takeFallDue());
+    m.tick(4499);
     try t.expect(!m.quarantined);
-    m.tick(2000 + 2499 + 2499);
-    try t.expect(!m.quarantined);
-    m.tick(2000 + 2499 + 2500);
+    m.tick(4500);
     try t.expect(m.quarantined);
 }
 

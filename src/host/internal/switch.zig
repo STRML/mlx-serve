@@ -13,10 +13,12 @@ pub const stall_limit_ms: i64 = 120_000;
 pub const prefill_stall_limit_ms: i64 = 300_000;
 const watch_interval_ms: i64 = 5;
 
-pub const StartError = error{ ListenerTimeout, Unavailable, Busy, InvalidArgs };
+pub const StartError = error{ ListenerTimeout, Unavailable, Busy, InvalidArgs, DistEnvNotPrimed };
+/// The box could not swap to its TP model on the formed group; the group is released.
+pub const ActivateError = error{SwapFailed};
 /// `release` also sets the rank it could not reach.
 pub const ReleaseError = error{ReleaseSendFailed};
-pub const CancelResult = enum { cancelled, already_formed, unknown };
+pub const CancelResult = enum { cancelled, already_formed, already_finished, unknown };
 
 /// A formed group: the formation code's link (opaque here) and how long its open and its READY-to-last-GO took.
 pub const Link = struct { ptr: *anyopaque, open_ms: u32 = 0, ready_to_go_ms: u32 = 0 };
@@ -26,6 +28,8 @@ pub const FormOutcome = union(enum) { formed: Link, failed: Failed, cancelled, q
 
 /// What the group code behind `tp4 N`, `join N`, `tp1 N` and `abort N` provides (mlx's `cluster/switch.zig`, step 4,
 /// behind an adapter). Every call runs on an HTTP thread or the attempt's watcher, never under the controller's lock.
+/// `activate`, `release` and `fall` touch the group on the inference thread in step 4: the adapter marshals each there
+/// and returns when it is done.
 /// The outcome of a formation is POLLED (`poll`); `releasing` and `released` come back as events, from whatever thread
 /// read OP_RELEASE or finished the swap to TP1.
 pub const Formation = struct {
@@ -33,10 +37,16 @@ pub const Formation = struct {
     /// Begin forming the group as `role`. `deadline_epoch_ms` is the router's wall-clock deadline, shared by every rank
     /// (the formation code converts it to its own clock). A leader returns once its listener is open.
     start: *const fn (ctx: *anyopaque, role: attempt.Role, n: u64, deadline_epoch_ms: i64) StartError!void,
-    /// Ask an in-progress formation to unwind. `already_formed`: it finished first, and `poll` will say so.
+    /// Ask an in-progress formation to unwind. `already_formed` and `already_finished`: it ended first, and `poll` will say so.
     cancel: *const fn (ctx: *anyopaque, n: u64) CancelResult,
     /// This attempt's outcome once its thread has returned; null while it runs or for another N.
     poll: *const fn (ctx: *anyopaque, n: u64) ?FormOutcome,
+    /// A formed group, before it is published: swap the box to its TP model, then tell the link it is live. Blocks until
+    /// the inference thread has done both. On an error the caller releases (leader) or falls (follower) the group.
+    activate: *const fn (ctx: *anyopaque, n: u64, link: *anyopaque) ActivateError!void,
+    /// A follower is told to abort a formed group: it keeps serving until OP_RELEASE, and the formation code falls by
+    /// itself after its own 2 s window, then reports through `formationFailed(n, .release_timeout)`.
+    abort_formed: *const fn (ctx: *anyopaque, n: u64) void,
     /// Leader only: send OP_RELEASE to every follower, then tear the link down. A failure names the rank in `rank`.
     release: *const fn (ctx: *anyopaque, n: u64, link: *anyopaque, rank: *?u32) ReleaseError!void,
     /// A follower leaves the group by itself (no OP_RELEASE came): bell shutdown, join the watchers, free the link.
@@ -250,14 +260,17 @@ pub const Switch = struct {
                 f.start(f.ctx, role, n, deadline_epoch_ms) catch |err| {
                     const why: attempt.Failure = if (err == error.ListenerTimeout) .listener else .other;
                     _ = self.formationFailed(n, why);
-                    return .{ .status = 502, .reason = @tagName(why), .snap = self.snapshot() };
+                    return .{ .status = 502, .reason = if (err == error.DistEnvNotPrimed) "dist_env_not_primed" else @tagName(why), .snap = self.snapshot() };
                 };
                 self.watch();
             },
             .cancel_formation => if (f.cancel(f.ctx, n) == .unknown) {
                 _ = self.formationFailed(n, .cancelled);
             } else self.watch(),
-            .await_release => self.watch(),
+            .await_release => {
+                f.abort_formed(f.ctx, n);
+                self.watch();
+            },
             .begin_release => return self.beginRelease(f, n),
         }
         return .{ .status = 200, .snap = self.snapshot() };
@@ -301,15 +314,10 @@ pub const Switch = struct {
         self.m.tick(self.now());
         const n = self.m.n;
         const state = self.m.state;
-        const fall_due = self.m.takeFallDue();
         const polls = state == .forming or (state == .aborting and !self.m.awaiting_release and self.link == null);
         const gone = self.m.quarantined;
         self.unlock();
         if (gone) return false;
-        if (fall_due) {
-            self.fall(f, n);
-            return true;
-        }
         if (state != .forming and state != .aborting) return false;
         if (f.quarantined(f.ctx)) {
             self.lock();
@@ -343,34 +351,34 @@ pub const Switch = struct {
 
     fn onFormed(self: *Switch, f: Formation, n: u64, l: Link) void {
         self.lock();
+        const live = n == self.m.n and self.m.state == .forming and !self.m.quarantined;
+        self.unlock();
+        var swap_failed = false;
+        if (live) {
+            f.activate(f.ctx, n, l.ptr) catch {
+                log.err("[switch] n={d}: the swap to the TP model failed; releasing the group\n", .{n});
+                swap_failed = true;
+            };
+        }
+        self.lock();
         const live_before = self.m.state;
         const role = self.m.role;
         const same_n = n == self.m.n;
-        const ok = self.m.formed(n, self.now());
+        const ok = !swap_failed and self.m.formed(n, self.now());
         if (ok) self.link = l.ptr;
         const quarantined = self.m.quarantined;
         self.unlock();
         log.info("[switch] formed n={d} published={} open_ms={d} ready_to_go_ms={d}\n", .{ n, ok, l.open_ms, l.ready_to_go_ms });
         if (ok or quarantined) return;
         const aborting = same_n and live_before == .aborting;
-        if (aborting and role == .leader) {
+        if (role == .leader and (aborting or swap_failed)) {
             var rank: ?u32 = null;
             f.release(f.ctx, n, l.ptr, &rank) catch {
                 log.err("[switch] release n={d} failed to reach rank {d}; exiting\n", .{ n, rank orelse 0 });
                 f.exit_process(f.ctx, n);
             };
         } else f.fall(f.ctx, n, l.ptr);
-        if (aborting) _ = self.formationFailed(n, .cancelled);
-    }
-
-    fn fall(self: *Switch, f: Formation, n: u64) void {
-        self.lock();
-        const link = self.link;
-        self.link = null;
-        self.unlock();
-        log.warn("[switch] n={d}: no OP_RELEASE within the wait; falling to TP1\n", .{n});
-        if (link) |l| f.fall(f.ctx, n, l);
-        _ = self.formationFailed(n, .release_timeout);
+        if (aborting or swap_failed) _ = self.formationFailed(n, if (swap_failed) .other else .cancelled);
     }
 
     /// Start the attempt's watcher unless one runs. It stops once no attempt is forming or waiting out an abort.
@@ -409,6 +417,7 @@ pub const Switch = struct {
         self.lock();
         defer self.unlock();
         const ok = self.m.formationFailed(n, self.now(), why);
+        if (ok) self.link = null;
         log.warn("[switch] formation n={d} ended: {s} published={}\n", .{ n, @tagName(why), ok });
         return ok;
     }
@@ -420,7 +429,7 @@ pub const Switch = struct {
         return self.m.releasing(n, self.now());
     }
 
-    /// The link is freed, MLX's cached group cleared and the TP1 model swapped back in.
+    /// The link is freed, MLX's cached group cleared and the TP1 model swap_failed back in.
     pub fn released(self: *Switch, n: u64) bool {
         self.lock();
         defer self.unlock();
@@ -465,6 +474,10 @@ const Fake = struct {
     started_deadline: i64 = 0,
     handed_link: ?*anyopaque = null,
     slot: u8 = 0,
+    activate_err: ?ActivateError = null,
+    sw: ?*Switch = null,
+    state_at_activate: attempt.State = .idle,
+    aborted_n: u64 = 0,
 
     fn deinit(self: *Fake) void {
         self.calls.deinit(t.allocator);
@@ -508,6 +521,17 @@ fn fakePoll(ctx: *anyopaque, _: u64) ?FormOutcome {
     f.outcome = null;
     return out;
 }
+fn fakeActivate(ctx: *anyopaque, _: u64, link: *anyopaque) ActivateError!void {
+    const f = fake(ctx);
+    f.note('a');
+    f.handed_link = link;
+    if (f.sw) |sw| f.state_at_activate = sw.snapshot().state;
+    if (f.activate_err) |e| return e;
+}
+fn fakeAbortFormed(ctx: *anyopaque, n: u64) void {
+    fake(ctx).note('b');
+    fake(ctx).aborted_n = n;
+}
 fn fakeRelease(ctx: *anyopaque, _: u64, link: *anyopaque, rank: *?u32) ReleaseError!void {
     const f = fake(ctx);
     f.note('r');
@@ -540,6 +564,8 @@ fn fakeFormation(f: *Fake) Formation {
         .start = fakeStart,
         .cancel = fakeCancel,
         .poll = fakePoll,
+        .activate = fakeActivate,
+        .abort_formed = fakeAbortFormed,
         .release = fakeRelease,
         .fall = fakeFall,
         .quarantined = fakeQuarantined,
@@ -730,7 +756,7 @@ test "tp1 hands the link to the backend's release; a failed release exits, names
     try t.expect(sw.released(4));
     try t.expectEqual(attempt.Mode.tp1, sw.snapshot().mode);
     try t.expectEqual(@as(u16, 200), sw.command(.tp1, 4, 0).status);
-    try t.expectEqualStrings("sr", f.calls.items);
+    try t.expectEqualStrings("sar", f.calls.items);
 
     var g: Fake = .{ .release_err = error.ReleaseSendFailed };
     defer g.deinit();
@@ -739,7 +765,7 @@ test "tp1 hands the link to the backend's release; a failed release exits, names
     const r = sw2.command(.tp1, 1, 0);
     try t.expectEqual(@as(u16, 500), r.status);
     try t.expectEqualStrings("release_failed", r.reason);
-    try t.expectEqualStrings("srx", g.calls.items);
+    try t.expectEqualStrings("sarx", g.calls.items);
     try t.expectEqual(@as(?u32, 2), sw2.snapshot().failure_rank);
     try t.expect(!sw2.snapshot().admitting);
 }
@@ -750,10 +776,10 @@ test "abort of a formed group at the leader is the planned down; a repeat of it 
     var sw = newSwitch(&f);
     try formedAs(&sw, &f, .leader, 4);
     try t.expectEqual(@as(u16, 200), sw.command(.abort, 4, 0).status);
-    try t.expectEqualStrings("sr", f.calls.items);
+    try t.expectEqualStrings("sar", f.calls.items);
     try t.expectEqual(attempt.State.releasing, sw.snapshot().state);
     try t.expectEqual(@as(u16, 200), sw.command(.abort, 4, 0).status);
-    try t.expectEqualStrings("sr", f.calls.items);
+    try t.expectEqualStrings("sar", f.calls.items);
     const fenced = sw.command(.abort, 6, 0);
     try t.expectEqual(@as(u16, 200), fenced.status);
     try t.expectEqual(attempt.State.releasing, fenced.snap.state);
@@ -761,27 +787,38 @@ test "abort of a formed group at the leader is the planned down; a repeat of it 
     try t.expectEqual(@as(u64, 6), fenced.snap.high_water);
 }
 
-test "abort of a formed group at a follower serves the group until OP_RELEASE, then releases" {
+test "abort of a formed group at a follower hands it to the formation code and serves it until OP_RELEASE, then releases" {
     var f: Fake = .{};
     defer f.deinit();
     var sw = newSwitch(&f);
     try formedAs(&sw, &f, .follower, 4);
     _ = sw.command(.abort, 4, 0);
-    try t.expectEqualStrings("s", f.calls.items);
+    try t.expectEqualStrings("sab", f.calls.items);
+    try t.expectEqual(@as(u64, 4), f.aborted_n);
     try t.expectEqual(attempt.Mode.tp4, sw.snapshot().mode);
     try t.expect(sw.pump());
     test_now += 1999;
     try t.expect(sw.pump());
-    try t.expectEqualStrings("s", f.calls.items);
+    try t.expectEqualStrings("sab", f.calls.items);
     try t.expect(sw.releasing(4));
     try t.expect(sw.released(4));
     test_now += 5000;
     try t.expect(!sw.pump());
-    try t.expectEqualStrings("s", f.calls.items);
+    try t.expectEqualStrings("sab", f.calls.items);
     try t.expectEqual(attempt.State.released, sw.snapshot().state);
 }
 
-test "a follower with no OP_RELEASE for 2 s falls with its link and lands at aborted in TP1" {
+test "a repeat of the follower's abort does not hand the group over twice" {
+    var f: Fake = .{};
+    defer f.deinit();
+    var sw = newSwitch(&f);
+    try formedAs(&sw, &f, .follower, 4);
+    _ = sw.command(.abort, 4, 0);
+    _ = sw.command(.abort, 4, 0);
+    try t.expectEqualStrings("sab", f.calls.items);
+}
+
+test "the follower's 2 s fall belongs to the formation code: it reports it and the box lands at aborted in TP1" {
     var f: Fake = .{};
     defer f.deinit();
     var sw = newSwitch(&f);
@@ -789,14 +826,104 @@ test "a follower with no OP_RELEASE for 2 s falls with its link and lands at abo
     _ = sw.command(.abort, 4, 0);
     test_now += 2000;
     try t.expect(sw.pump());
-    try t.expectEqualStrings("sf", f.calls.items);
-    try t.expectEqual(@intFromPtr(&f.slot), @intFromPtr(f.handed_link.?));
+    try t.expectEqualStrings("sab", f.calls.items);
+    try t.expectEqual(attempt.State.aborting, sw.snapshot().state);
+    try t.expect(sw.formationFailed(4, .release_timeout));
     const s = sw.snapshot();
     try t.expectEqual(attempt.State.aborted, s.state);
     try t.expectEqual(attempt.Failure.release_timeout, s.failure);
     try t.expectEqual(attempt.Mode.tp1, s.mode);
     try t.expect(s.admitting);
     try t.expect(!sw.pump());
+}
+
+test "a follower's abort the formation code never reports quarantines the box" {
+    var f: Fake = .{};
+    defer f.deinit();
+    var sw = newSwitch(&f);
+    try formedAs(&sw, &f, .follower, 4);
+    _ = sw.command(.abort, 4, 0);
+    test_now += 4500;
+    try t.expectEqual(Health.quarantined, sw.health());
+    try t.expect(!sw.pump());
+    try t.expectEqualStrings("sab", f.calls.items);
+}
+
+test "a formed group is activated, with its link, before it is published" {
+    var f: Fake = .{};
+    defer f.deinit();
+    var sw = newSwitch(&f);
+    f.sw = &sw;
+    try formedAs(&sw, &f, .leader, 4);
+    try t.expectEqualStrings("sa", f.calls.items);
+    try t.expectEqual(@intFromPtr(&f.slot), @intFromPtr(f.handed_link.?));
+    try t.expectEqual(attempt.State.forming, f.state_at_activate);
+    try t.expectEqual(attempt.Mode.tp4, sw.snapshot().mode);
+}
+
+test "a swap that fails releases the leader's group and lands at aborted in TP1" {
+    var f: Fake = .{ .activate_err = error.SwapFailed };
+    defer f.deinit();
+    var sw = newSwitch(&f);
+    _ = sw.command(.drain, 4, 0);
+    _ = sw.command(.tp4, 4, 0);
+    f.outcome = f.formedLink();
+    try t.expect(sw.pump());
+    try t.expectEqualStrings("sar", f.calls.items);
+    const s = sw.snapshot();
+    try t.expectEqual(attempt.State.aborted, s.state);
+    try t.expectEqual(attempt.Failure.other, s.failure);
+    try t.expectEqual(attempt.Mode.tp1, s.mode);
+    try t.expect(s.admitting);
+}
+
+test "a swap that fails makes a follower fall" {
+    var f: Fake = .{ .activate_err = error.SwapFailed };
+    defer f.deinit();
+    var sw = newSwitch(&f);
+    _ = sw.command(.drain, 4, 0);
+    _ = sw.command(.join, 4, 0);
+    f.outcome = f.formedLink();
+    try t.expect(sw.pump());
+    try t.expectEqualStrings("saf", f.calls.items);
+    try t.expectEqual(attempt.State.aborted, sw.snapshot().state);
+}
+
+test "a leader whose release fails after a failed swap exits" {
+    var f: Fake = .{ .activate_err = error.SwapFailed, .release_err = error.ReleaseSendFailed };
+    defer f.deinit();
+    var sw = newSwitch(&f);
+    _ = sw.command(.drain, 4, 0);
+    _ = sw.command(.tp4, 4, 0);
+    f.outcome = f.formedLink();
+    _ = sw.pump();
+    try t.expectEqualStrings("sarx", f.calls.items);
+}
+
+test "a start before the environment is primed is a 502 that names it and lands at aborted" {
+    var f: Fake = .{ .start_err = error.DistEnvNotPrimed };
+    defer f.deinit();
+    var sw = newSwitch(&f);
+    _ = sw.command(.drain, 4, 0);
+    const r = sw.command(.tp4, 4, 0);
+    try t.expectEqual(@as(u16, 502), r.status);
+    try t.expectEqualStrings("dist_env_not_primed", r.reason);
+    try t.expectEqual(attempt.State.aborted, r.snap.state);
+    try t.expectEqual(attempt.Failure.other, r.snap.failure);
+}
+
+test "a cancel that finds the formation already finished lets the polled outcome end the attempt" {
+    var f: Fake = .{ .cancel_result = .already_finished };
+    defer f.deinit();
+    var sw = newSwitch(&f);
+    _ = sw.command(.drain, 4, 0);
+    _ = sw.command(.join, 4, 0);
+    _ = sw.command(.abort, 4, 0);
+    try t.expectEqual(attempt.State.aborting, sw.snapshot().state);
+    f.outcome = .{ .failed = .{ .err = "DistNoReady", .rank = 1, .elapsed_ms = 1900 } };
+    try t.expect(sw.pump());
+    try t.expectEqual(attempt.State.aborted, sw.snapshot().state);
+    try t.expectEqualStrings("sc", f.calls.items);
 }
 
 test "a refusal is a 409 carrying the box's N so the router can adopt it" {
