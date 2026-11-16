@@ -481,6 +481,8 @@ pub const Dsv41Model = struct {
     hc_tg: usize = HC_TG,
     /// Threads per top-k threadgroup (`probeTopkThreads`); the picks are the same at any width.
     topk_tg: usize = 1024,
+    /// What this GPU granted `topk_tg` and `hc_tg` before a tensor group pinned them (`pinLaunchShapes`): the cache key's.
+    granted_tg: ?[2]usize = null,
     /// Bytes per indexer score block (tests narrow it to drive several).
     /// Test-only: named intermediates of a one-span forward.
     trace: ?*Trace = null,
@@ -6911,10 +6913,20 @@ fn layoutSettings(cfg: *const Config, knobs: anytype) u64 {
     return h.final();
 }
 
+/// Pins the hc and top-k launch shapes to the smallest any rank of a tensor group runs. The first pin keeps what the
+/// GPU granted, so a group formed again, or none, never moves the cache key.
+pub fn pinLaunchShapes(m: *Dsv41Model, topk_tg: usize, hc_tg: usize) void {
+    if (m.granted_tg == null) m.granted_tg = .{ m.topk_tg, m.hc_tg };
+    m.topk_tg = topk_tg;
+    m.hc_tg = hc_tg;
+}
+
 pub fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
     if (m.n_layers > 64) return error.Dsv41CacheGeometry;
-    // Every rank holds the same cache whatever the split, so the whole config keys it: an entry moves between widths.
-    const settings = layoutSettings(&m.whole_cfg, .{ m.n_mtp, m.ds_block, m.span, m.moe_rows, m.ced_split, m.ced_min_skip, m.hc_tg, m.topk_tg, m.qat_off, m.attn_f16, m.head.qp });
+    const topk_tg, const hc_tg = m.granted_tg orelse .{ m.topk_tg, m.hc_tg };
+    // Every rank holds the same cache whatever the split, so the whole config and the GPU's own launch shapes key it:
+    // an entry moves between widths and between modes.
+    const settings = layoutSettings(&m.whole_cfg, .{ m.n_mtp, m.ds_block, m.span, m.moe_rows, m.ced_split, m.ced_min_skip, hc_tg, topk_tg, m.qat_off, m.attn_f16, m.head.qp });
     var l: cache_codec.Layout = .{
         .layers = m.n_layers,
         .stages = m.n_mtp,
