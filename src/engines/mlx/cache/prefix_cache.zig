@@ -1462,17 +1462,31 @@ pub const HotPrefixCache = struct {
         };
     }
 
-    /// The newest committed tip a session tagged: never a rung (a longer entry of its conversation exists), never an
-    /// entry a slot has checked out. Untagged entries (0) belong to no session.
+    /// The newest committed prompt boundary a session tagged: never a rung (a longer boundary of its conversation
+    /// exists), never a decode-end tail, never an entry a slot has checked out. Untagged entries (0) belong to no session.
     pub fn findSessionTip(self: *const HotPrefixCache, session: u64) ?RamModuleHit {
         if (session == 0) return null;
         var best: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
-            if (e.session != session or e.module == null or e.checked_out_by != null) continue;
-            if (self.isModuleRung(i)) continue;
+            const m = e.module orelse continue;
+            if (e.session != session or e.checked_out_by != null or m.tail_from != 0) continue;
+            if (self.isSessionRung(i)) continue;
             if (best == null or e.id > self.entries.items[best.?].id) best = i;
         }
         return ramHit(&self.entries.items[best orelse return null]);
+    }
+
+    /// `isModuleRung` among prompt boundaries: a decode-end tail is RAM-only and exports as no boundary, so it
+    /// does not make the boundary it extends a rung.
+    fn isSessionRung(self: *const HotPrefixCache, i: usize) bool {
+        const e = &self.entries.items[i];
+        for (self.entries.items, 0..) |*o, j| {
+            if (j == i or o.tokens.len <= e.tokens.len) continue;
+            const m = o.module orelse continue;
+            if (m.tail_from != 0) continue;
+            if (moduleRungOf(e, m.binding, o.tokens, o.media, o.has_tools, o.quant_config)) return true;
+        }
+        return false;
     }
 
     pub fn findRamModule(
@@ -13046,4 +13060,24 @@ test "HotPrefixCache module: the same tokens under a changed image are not cover
     try testing.expect(cache.hasModuleCovering(binding, &.{ 1, 2 }, &media, false, dense));
     try testing.expect(!cache.hasModuleCovering(binding, &.{ 1, 2, 3, 4 }, &changed, false, dense));
     try testing.expect(!cache.hasModuleCovering(binding, &.{ 1, 2, 3, 4 }, &.{}, false, dense));
+}
+
+test "HotPrefixCache module: a session's tip is its prompt boundary, not the decode-end tail that follows it" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const dense = kv_quant.KVQuantConfig.dense;
+    var rung: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+    var boundary: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var tail: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 6 }, .key = 21 };
+    _ = try rung.putSession(&cache, binding, &.{}, 7);
+    _ = try boundary.putSession(&cache, binding, &.{}, 7);
+    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 7, 4);
+
+    const tip = cache.findSessionTip(7).?;
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, tip.tokens);
+    try testing.expectEqual(@as(usize, 0), tip.payload.tail_from);
 }

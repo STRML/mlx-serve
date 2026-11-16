@@ -201,7 +201,7 @@ fn exportWireModuleWithBudget(
     defer inv_arena.deinit();
     const inv = try exp.inventory(inv_arena.allocator());
 
-    const total_len = try peer_wire.encodedSize(hit.tokens.len, hit.media.len, exp.out.header_len, inv);
+    const total_len = try peer_wire.encodedSize(hit.tokens.len, hit.media.len, hit.session, exp.out.header_len, inv);
     if (total_len > max_bytes) {
         return .{ .too_large = @intCast(total_len) };
     }
