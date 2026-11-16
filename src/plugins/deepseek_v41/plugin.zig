@@ -105,9 +105,14 @@ pub const Model = struct {
     owner: u32 = 0,
     parked: std.AutoHashMapUnmanaged(u32, Kept) = .empty,
     idle: ?Kept = null,
-    /// The last id a snapshot was given for the other tensor ranks (`Snap.tp_id`).
-    tp_snaps: u64 = 0,
+    /// The ids snapshots were given for the other tensor ranks (`Snap.tp_id`), and where the current group began.
+    tp_ids: dsv41.TpIds = .{},
 };
+
+/// A tensor group just formed over this process: the other ranks hold none of the snapshots it took before.
+pub fn groupFormed(m: *Model) void {
+    m.tp_ids.formed();
+}
 
 /// A state off the module, with its identity (`Dsv41Model.state_gen`).
 const Kept = struct {
@@ -334,6 +339,28 @@ test "tpModeSetting: absent is unset; present and naming no rank of a group is r
     }) |bad| try std.testing.expectError(error.Dsv41TpModeSetting, tpModeSetting(bad));
 }
 
+/// The fields `gpa.create(Model)` leaves undefined that no load step sets: the bank, the slot ownership, and the
+/// tensor snapshot ids (a struct default does not apply to a `create`d allocation).
+fn initSlotState(m: *Model) void {
+    m.bank = null;
+    m.bank_streams = false;
+    m.owner = 0;
+    m.parked = .empty;
+    m.idle = null;
+    m.tp_ids = .{};
+}
+
+test "dsv41 plugin: a created model starts with no bank, no slot owner and fresh tensor snapshot ids" {
+    var m: Model = undefined;
+    @memset(std.mem.asBytes(&m), 0xAA);
+    initSlotState(&m);
+    try std.testing.expectEqual(@as(u64, 0), m.tp_ids.last);
+    try std.testing.expectEqual(@as(u64, 0), m.tp_ids.formed_at);
+    try std.testing.expectEqual(@as(u32, 0), m.owner);
+    try std.testing.expect(m.idle == null and m.bank == null and !m.bank_streams);
+    try std.testing.expectEqual(@as(u32, 0), m.parked.count());
+}
+
 fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     const io = std.Io.Threaded.global_single_threaded.io();
     const c = config.of(ctx.parsed);
@@ -362,11 +389,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.mdl = m.modes.tp1;
     // The fused Markov chain's kernels compiled now, not in the first draft.
     if (m.mdl.dspark) |*w| if (!m.mdl.draft_shard) try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
-    m.bank = null;
-    m.bank_streams = false;
-    m.owner = 0;
-    m.parked = .empty;
-    m.idle = null;
+    initSlotState(m);
     if (c.dsv41_streamed) {
         const dir = ctx.model_dir.slice();
         if (c.dsv41_exl3_bank) try openBank(m, quant, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes, start) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
@@ -745,8 +768,7 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
     owned.* = sn;
     live.st.snap = null;
     if (m.mdl.tp != null) {
-        m.tp_snaps += 1;
-        owned.tp_id = m.tp_snaps;
+        owned.tp_id = m.tp_ids.next();
         dsv41.tpSnap(m.mdl, .take, live.gen, owned.tp_id);
     }
     out.* = owned;
@@ -758,6 +780,7 @@ fn auxRestoreAt(mp: *anyopaque, slot: u32, handle: abi.Handle, pos: u64) callcon
     const sn = snapOf(handle) orelse return Verdict.refuse(.unsupported, "deepseek_v41: no snapshot to restore");
     if (pos != sn.n or sn.n != sn.ids.len) return Verdict.refuse(.unsupported, "deepseek_v41: restore requires the snapshot's exact position");
     const m: *Model = @ptrCast(@alignCast(mp));
+    dsv41.tpEnsure(m.mdl, gpa, &m.tp_ids, sn) catch |e| return Verdict.named(.failed, @errorName(e));
     var fresh = dsv41.stateFromSnapshot(m.mdl, gpa, sn) catch |e| return Verdict.named(.failed, @errorName(e));
     if (!sn.whole) dsv41.rewind(m.mdl, gpa, &fresh, sn.ids) catch |e| {
         fresh.deinit();
@@ -790,9 +813,13 @@ fn auxSlice(mp: *anyopaque, handle: abi.Handle, len: u64, out: *abi.Handle) call
         gpa.destroy(owned);
         return Verdict.refuse(.unsupported, "deepseek_v41: the snapshot holds no restorable prefix of that length");
     };
-    if (sn.tp_id != 0) {
-        m.tp_snaps += 1;
-        owned.tp_id = m.tp_snaps;
+    if (m.mdl.tp != null) {
+        dsv41.tpEnsure(m.mdl, gpa, &m.tp_ids, sn) catch |e| {
+            owned.deinit(gpa);
+            gpa.destroy(owned);
+            return Verdict.named(.failed, @errorName(e));
+        };
+        owned.tp_id = m.tp_ids.next();
         dsv41.tpSnap(m.mdl, .clone, sn.tp_id, owned.tp_id);
     }
     out.* = owned;
@@ -864,8 +891,7 @@ fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: 
     const sn = dsv41.importSnapshot(m.mdl, gpa, ids.slice(), header.slice(), arrays.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
     if (m.mdl.tp != null) {
         // Rank 0's snapshot holds the worker's cache too (`dsv41.tpLoadPlan`): it goes over under a new id.
-        m.tp_snaps += 1;
-        sn.tp_id = m.tp_snaps;
+        sn.tp_id = m.tp_ids.next();
         dsv41.tpLoad(m.mdl, gpa, sn) catch |e| {
             auxFree(mp, sn);
             return Verdict.named(.failed, @errorName(e));
@@ -960,6 +986,7 @@ test {
     _ = mode;
     _ = bill_mod;
     _ = media;
+    _ = @import("tp_ids.zig");
     _ = @import("contract.zig");
     _ = @import("decode/decode.zig");
 }
