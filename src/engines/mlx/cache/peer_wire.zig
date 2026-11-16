@@ -4,10 +4,18 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const kv_quant = @import("../../../sdk/blocks/attention/kv_quant.zig");
 const module_record = @import("ssd/module_record.zig");
+const MediaSpan = @import("../../../sdk/kv/media_span.zig").MediaSpan;
 
 pub const MAGIC: [8]u8 = "MSVPFC\x00\x00".*;
-pub const VERSION: u32 = 1;
+/// v2 adds, after the token ids: the media span count (u32), the session tag (u64) and the spans (u32 start, u64 key).
+/// A v1 envelope has none of it; an entry with no spans and no session tag is still written as v1, which an older
+/// destination reads.
+pub const VERSION: u32 = 2;
+const VERSION_NO_MEDIA: u32 = 1;
 pub const FIXED_HEADER_BYTES: usize = 96;
+pub const V2_FIXED_BYTES: usize = 12;
+const SPAN_BYTES: usize = 12;
+pub const MAX_MEDIA_SPANS: usize = 4096;
 pub const MAX_TENSORS: usize = 1024;
 
 pub const DecodeError = error{
@@ -16,6 +24,7 @@ pub const DecodeError = error{
     BadEnvelope,
     UnsupportedEnvelopeVersion,
     BadQuantConfig,
+    BadMediaSpans,
     BadTensorName,
     BadTensorDtype,
     BadTensorShape,
@@ -45,6 +54,8 @@ pub const EnvelopeInput = struct {
     ids: []const u32,
     plugin_header: []const u8,
     tensors: []const module_record.Tensor,
+    media: []const MediaSpan = &.{},
+    session: u64 = 0,
 };
 
 pub const DecodedEnvelope = struct {
@@ -62,6 +73,8 @@ pub const DecodedEnvelope = struct {
     tensors: []const module_record.Tensor,
     descriptors: []const WireDescriptor,
     payload: []const u8,
+    media: []const MediaSpan,
+    session: u64,
 
     pub fn deinit(self: *DecodedEnvelope) void {
         self.arena.deinit();
@@ -104,13 +117,29 @@ fn canonicalName(name: []const u8) bool {
     return true;
 }
 
-pub fn encodedMetaSize(n_tokens: usize, header_len: usize, tensors: []const module_record.Tensor) !usize {
+/// Spans lie inside the ids and ascend strictly, as `spansBelow` and `mediaSharedBound` assume.
+fn validSpans(spans: []const MediaSpan, n_tokens: usize) bool {
+    if (spans.len > MAX_MEDIA_SPANS) return false;
+    for (spans, 0..) |sp, i| {
+        if (sp.start >= n_tokens) return false;
+        if (i > 0 and sp.start <= spans[i - 1].start) return false;
+    }
+    return true;
+}
+
+fn mediaSectionBytes(n_media: usize, session: u64) usize {
+    return if (n_media == 0 and session == 0) 0 else V2_FIXED_BYTES + n_media * SPAN_BYTES;
+}
+
+pub fn encodedMetaSize(n_tokens: usize, n_media: usize, session: u64, header_len: usize, tensors: []const module_record.Tensor) !usize {
     if (n_tokens == 0 or n_tokens > std.math.maxInt(u32)) return error.BadEnvelope;
     const token_bytes = try std.math.mul(usize, n_tokens, 4);
     if (@as(u64, token_bytes) > module_record.MAX_TOKEN_BYTES) return error.BadEnvelope;
     if (header_len == 0 or header_len > module_record.MAX_HEADER_BYTES) return error.BadEnvelope;
     if (tensors.len == 0 or tensors.len > MAX_TENSORS) return error.BadEnvelope;
+    if (n_media > MAX_MEDIA_SPANS) return error.BadMediaSpans;
     var size = try std.math.add(usize, FIXED_HEADER_BYTES, token_bytes);
+    size = try std.math.add(usize, size, mediaSectionBytes(n_media, session));
     size = try std.math.add(usize, size, header_len);
     for (tensors) |t| {
         if (!canonicalName(t.name)) return error.BadTensorName;
@@ -122,8 +151,8 @@ pub fn encodedMetaSize(n_tokens: usize, header_len: usize, tensors: []const modu
     return size;
 }
 
-pub fn encodedSize(n_tokens: usize, header_len: usize, tensors: []const module_record.Tensor) !usize {
-    var total = try encodedMetaSize(n_tokens, header_len, tensors);
+pub fn encodedSize(n_tokens: usize, n_media: usize, session: u64, header_len: usize, tensors: []const module_record.Tensor) !usize {
+    var total = try encodedMetaSize(n_tokens, n_media, session, header_len, tensors);
     for (tensors) |t| {
         const tb = std.math.cast(usize, t.bytes) orelse return error.BadTensorShape;
         total = try std.math.add(usize, total, tb);
@@ -134,7 +163,9 @@ pub fn encodedSize(n_tokens: usize, header_len: usize, tensors: []const module_r
 /// Writes everything up to the tensor payload into `out` and returns the byte offset where payload bytes begin.
 /// Call `stampChecksum(out)` once the payload bytes are written.
 pub fn writeEnvelopePrefix(out: []u8, in: EnvelopeInput) !usize {
-    const meta_len = try encodedMetaSize(in.ids.len, in.plugin_header.len, in.tensors);
+    const meta_len = try encodedMetaSize(in.ids.len, in.media.len, in.session, in.plugin_header.len, in.tensors);
+    const version = if (mediaSectionBytes(in.media.len, in.session) == 0) VERSION_NO_MEDIA else VERSION;
+    if (!validSpans(in.media, in.ids.len)) return error.BadMediaSpans;
     var payload_bytes: u64 = 0;
     for (in.tensors, 0..) |t, i| {
         for (in.tensors[0..i]) |prev| {
@@ -164,7 +195,7 @@ pub fn writeEnvelopePrefix(out: []u8, in: EnvelopeInput) !usize {
     }
 
     @memcpy(out[0..8], &MAGIC);
-    std.mem.writeInt(u32, out[8..12], VERSION, .little);
+    std.mem.writeInt(u32, out[8..12], version, .little);
     out[12] = if (in.has_tools) 1 else 0;
     out[13] = scheme_byte;
     out[14] = in.quant_config.bits;
@@ -186,6 +217,16 @@ pub fn writeEnvelopePrefix(out: []u8, in: EnvelopeInput) !usize {
     for (in.ids) |id| {
         std.mem.writeInt(u32, out[cursor..][0..4], id, .little);
         cursor += 4;
+    }
+    if (version == VERSION) {
+        std.mem.writeInt(u32, out[cursor..][0..4], @intCast(in.media.len), .little);
+        std.mem.writeInt(u64, out[cursor + 4 ..][0..8], in.session, .little);
+        cursor += V2_FIXED_BYTES;
+        for (in.media) |sp| {
+            std.mem.writeInt(u32, out[cursor..][0..4], sp.start, .little);
+            std.mem.writeInt(u64, out[cursor + 4 ..][0..8], sp.key, .little);
+            cursor += SPAN_BYTES;
+        }
     }
     @memcpy(out[cursor..][0..in.plugin_header.len], in.plugin_header);
     cursor += in.plugin_header.len;
@@ -232,7 +273,7 @@ pub fn stampChecksum(out: []u8) void {
 
 pub fn encodeAlloc(a: std.mem.Allocator, in: EnvelopeInput, tensor_payloads: []const []const u8) ![]u8 {
     if (tensor_payloads.len != in.tensors.len) return error.BadTensorOffsets;
-    const total = try encodedSize(in.ids.len, in.plugin_header.len, in.tensors);
+    const total = try encodedSize(in.ids.len, in.media.len, in.session, in.plugin_header.len, in.tensors);
     const out = try a.alloc(u8, total);
     errdefer a.free(out);
     const payload_off = try writeEnvelopePrefix(out, in);
@@ -250,7 +291,7 @@ pub fn decode(a: std.mem.Allocator, body: []const u8) DecodeError!DecodedEnvelop
     if (body.len < FIXED_HEADER_BYTES) return error.TruncatedEnvelope;
     if (!std.mem.eql(u8, body[0..8], &MAGIC)) return error.BadEnvelope;
     const version = std.mem.readInt(u32, body[8..12], .little);
-    if (version != VERSION) return error.UnsupportedEnvelopeVersion;
+    if (version != VERSION and version != VERSION_NO_MEDIA) return error.UnsupportedEnvelopeVersion;
     const flags = body[12];
     if (flags & ~@as(u8, 1) != 0 or body[15] != 0) return error.BadEnvelope;
     const has_tools = (flags & 1) != 0;
@@ -297,6 +338,22 @@ pub fn decode(a: std.mem.Allocator, body: []const u8) DecodeError!DecodedEnvelop
     for (ids) |*id| {
         id.* = std.mem.readInt(u32, body[cursor..][0..4], .little);
         cursor += 4;
+    }
+    var media: []MediaSpan = &.{};
+    var session: u64 = 0;
+    if (version == VERSION) {
+        if (body.len - cursor < V2_FIXED_BYTES) return error.TruncatedEnvelope;
+        const n_media: usize = @intCast(std.mem.readInt(u32, body[cursor..][0..4], .little));
+        session = std.mem.readInt(u64, body[cursor + 4 ..][0..8], .little);
+        cursor += V2_FIXED_BYTES;
+        if (n_media > MAX_MEDIA_SPANS) return error.BadMediaSpans;
+        if ((body.len - cursor) / SPAN_BYTES < n_media) return error.TruncatedEnvelope;
+        media = try aa.alloc(MediaSpan, n_media);
+        for (media) |*sp| {
+            sp.* = .{ .start = std.mem.readInt(u32, body[cursor..][0..4], .little), .key = std.mem.readInt(u64, body[cursor + 4 ..][0..8], .little) };
+            cursor += SPAN_BYTES;
+        }
+        if (!validSpans(media, n_tokens)) return error.BadMediaSpans;
     }
     if (body.len - cursor < header_len) return error.TruncatedEnvelope;
     const plugin_header = body[cursor..][0..header_len];
@@ -390,6 +447,8 @@ pub fn decode(a: std.mem.Allocator, body: []const u8) DecodeError!DecodedEnvelop
         .tensors = tensors,
         .descriptors = descriptors,
         .payload = payload,
+        .media = media,
+        .session = session,
     };
 }
 
@@ -536,4 +595,89 @@ test "dsv41 peer fetch: envelope rejects bad tensor dtype, shape and payload off
     @memcpy(trailing[0..wire.len], wire);
     trailing[wire.len] = 0;
     try testing.expectError(error.BadTensorOffsets, decode(testing.allocator, trailing));
+}
+
+const image_spans = [_]MediaSpan{ .{ .start = 1, .key = 0xA11CE }, .{ .start = 2, .key = 0xB0B } };
+
+fn sampleImageEnvelope(a: std.mem.Allocator, media: []const MediaSpan, session: u64) ![]u8 {
+    const s0 = [_]u64{3};
+    const tensors = [_]module_record.Tensor{.{ .name = "hist", .dtype = "U32", .shape = &s0, .bytes = 12 }};
+    const p0 = [_]u8{ 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32 };
+    return encodeAlloc(a, .{
+        .layout_key = 1,
+        .pack_identity = 2,
+        .settings = 3,
+        .prefix_key = 4,
+        .cache_key = 5,
+        .variant = 0,
+        .has_tools = false,
+        .quant_config = kv_quant.KVQuantConfig.dense,
+        .ids = &.{ 10, 20, 30 },
+        .plugin_header = "hdr",
+        .tensors = &tensors,
+        .media = media,
+        .session = session,
+    }, &.{&p0});
+}
+
+test "peer wire v2: an image session's media spans and session tag round-trip" {
+    const wire = try sampleImageEnvelope(testing.allocator, &image_spans, 0x5e55_1011);
+    defer testing.allocator.free(wire);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, wire[8..12], .little));
+    var dec = try decode(testing.allocator, wire);
+    defer dec.deinit();
+    try testing.expectEqualSlices(MediaSpan, &image_spans, dec.media);
+    try testing.expectEqual(@as(u64, 0x5e55_1011), dec.session);
+    try testing.expectEqualSlices(u32, &.{ 10, 20, 30 }, dec.ids);
+    try testing.expectEqual(@as(usize, 12), dec.payload.len);
+}
+
+test "peer wire v2: a session tag with no spans is v2, and an untagged text entry is v1" {
+    const tagged = try sampleImageEnvelope(testing.allocator, &.{}, 9);
+    defer testing.allocator.free(tagged);
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, tagged[8..12], .little));
+    var dec = try decode(testing.allocator, tagged);
+    defer dec.deinit();
+    try testing.expectEqual(@as(usize, 0), dec.media.len);
+    try testing.expectEqual(@as(u64, 9), dec.session);
+
+    const plain = try sampleImageEnvelope(testing.allocator, &.{}, 0);
+    defer testing.allocator.free(plain);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, plain[8..12], .little));
+    try testing.expectEqual(tagged.len - V2_FIXED_BYTES, plain.len);
+    var dec1 = try decode(testing.allocator, plain);
+    defer dec1.deinit();
+    try testing.expectEqual(@as(usize, 0), dec1.media.len);
+    try testing.expectEqual(@as(u64, 0), dec1.session);
+    try testing.expectEqualStrings("hdr", dec1.plugin_header);
+}
+
+test "peer wire v2: the checksum covers the media spans and the session tag" {
+    const wire = try sampleImageEnvelope(testing.allocator, &image_spans, 7);
+    defer testing.allocator.free(wire);
+    const section = FIXED_HEADER_BYTES + 3 * 4;
+    const other_key = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(other_key);
+    other_key[section + V2_FIXED_BYTES + 4] ^= 1;
+    try testing.expectError(error.BadChecksum, decode(testing.allocator, other_key));
+    const other_session = try testing.allocator.dupe(u8, wire);
+    defer testing.allocator.free(other_session);
+    other_session[section + 4] ^= 1;
+    try testing.expectError(error.BadChecksum, decode(testing.allocator, other_session));
+}
+
+test "peer wire v2: spans that are descending, repeated or past the ids are refused on both ends" {
+    const bad = [_][]const MediaSpan{
+        &.{ .{ .start = 2, .key = 1 }, .{ .start = 1, .key = 2 } },
+        &.{ .{ .start = 1, .key = 1 }, .{ .start = 1, .key = 2 } },
+        &.{.{ .start = 3, .key = 1 }},
+    };
+    for (bad) |spans| try testing.expectError(error.BadMediaSpans, sampleImageEnvelope(testing.allocator, spans, 0));
+
+    const wire = try sampleImageEnvelope(testing.allocator, &image_spans, 0);
+    defer testing.allocator.free(wire);
+    const second_start = FIXED_HEADER_BYTES + 3 * 4 + V2_FIXED_BYTES + SPAN_BYTES;
+    std.mem.writeInt(u32, wire[second_start..][0..4], 1, .little);
+    stampChecksum(wire);
+    try testing.expectError(error.BadMediaSpans, decode(testing.allocator, wire));
 }
