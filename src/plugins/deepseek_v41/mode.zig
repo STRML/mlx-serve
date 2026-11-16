@@ -7,6 +7,7 @@ const dsv41 = @import("deepseek_v41.zig");
 const Config = @import("config.zig").Config;
 pub const Shard = @import("../../sdk/weights/shard.zig").Shard;
 const Weights = @import("../../sdk/weights/resident.zig").Weights;
+const rowcut = @import("rowcut.zig");
 
 pub const Mode = enum(u8) { tp1, tp };
 
@@ -16,6 +17,8 @@ pub const Modes = struct {
     tp: ?*dsv41.Dsv41Model = null,
     /// `tp`'s weights: views of this rank's part of the pack's tensors. The model reads its linears from here.
     tp_weights: ?Weights = null,
+    /// `tp`'s row cut of `tp1`'s layers, which its MoE runs at decode widths.
+    row_cut: ?*rowcut.RowCut = null,
     active: Mode = .tp1,
 
     pub fn model(self: *const Modes, mode: Mode) ?*dsv41.Dsv41Model {
@@ -30,6 +33,7 @@ pub const Modes = struct {
     }
 
     pub fn deinit(self: *Modes) void {
+        if (self.row_cut) |rc| rc.destroy();
         if (self.tp) |t| t.deinit();
         if (self.tp_weights) |*w| w.deinit();
         self.tp1.deinit();
@@ -56,6 +60,11 @@ pub fn build(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: mlx.m
         out.tp_weights.?.deinit();
     };
     out.tp1 = try dsv41.init(gpa, whole, w, s, opts);
+    if (group) |g| {
+        errdefer out.tp1.deinit();
+        out.row_cut = try rowcut.RowCut.create(gpa, s, out.tp1, 0, out.tp1.layers.len, g.rank, g.size);
+        out.tp.?.row_cut = out.row_cut;
+    }
     return out;
 }
 

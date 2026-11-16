@@ -27,6 +27,7 @@ const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwi
 const engram = @import("engram.zig");
 const system = @import("../../sdk/util/system.zig");
 const cache_codec = @import("cache_codec.zig");
+const rowcut = @import("rowcut.zig");
 const cache_pack = @import("cache_pack.zig");
 const cache_abi = @import("../../abi/plugin.zig");
 const glm5 = @import("../glm5_next/glm5_next.zig");
@@ -558,6 +559,8 @@ pub const Dsv41Model = struct {
     pair: ?Pair = null,
     /// This process's slice of every expert (`cfg.moe_intermediate_size` is already its width).
     tp: ?Shard = null,
+    /// A tensor mode's row cut of the whole model (`mode.Modes` owns it): its MoE runs there at decode widths.
+    row_cut: ?*rowcut.RowCut = null,
     /// Tensor parallel with the vocabulary split (`vocabSplit`): this rank's rows of the LM head. Every rank projects
     /// its part of each step's logits and the parts are gathered (`headLogits`); rank 0 still holds the whole head.
     head_part: ?HeadPart = null,
@@ -4548,6 +4551,7 @@ pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
     const ly = &m.layers[li];
     const r = try route(sc, m, ly, x, img);
     try VerifyPicks.note(m, li, r.idx);
+    if (m.row_cut) |rc| if (rc.layer(m, li, @intCast(dim(x, 0)))) |rl| return rc.run(sc, m, rl, x, r.idx, r.wts);
     // The DSpark stages' experts stay resident.
     if (li < m.n_layers) if (m.streamed) |src| {
         // A wide call's routed sum and the shared expert in one combine (the same f32 words).
@@ -4934,6 +4938,13 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
 /// A tensor split's FFN at decode width, from the summed attention output `ao`: this rank's experts over the routes,
 /// summed with the other ranks', then the hc expand. `pre` becomes the FFN's mix.
 pub fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, pre: *A) !A {
+    if (m.row_cut) |rc| if (rc.layer(m, li, @intCast(dim(x, 0)))) |rl| {
+        var p: [7]A = undefined;
+        try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
+        try VerifyPicks.note(m, li, p[5]);
+        pre.* = p[1];
+        return hcExpand(sc, p[0], try rc.run(sc, m, rl, p[4], p[5], p[6]), &.{ .pre = p[1], .post = p[2], .comb = p[3] });
+    };
     if (try dkern.seg_bounds.tpFfn(sc, m, li, x, ao, sa, pre)) |y| return y;
     const ly = &m.layers[li];
     if (dkern.seg.on(m, li, .ffn, dim(x, 0), .ffn_entry)) {
@@ -6021,14 +6032,24 @@ pub fn tpFree(m: *const Dsv41Model, gen: u64) void {
 /// off the same summed stream through whole KV weights, so rank 0's are theirs; the DSpark windows too when every rank
 /// drafts, else they are rank 0's alone.
 pub fn tpLoadPlan(m: *const Dsv41Model, n: usize) !cache_codec.Plan {
+    return shipPlan(m, n, if (m.draft_shard) m.n_mtp else 0);
+}
+
+/// A snapshot of `n` positions as one rank ships it to another: every layer's caches and Engram history, and the
+/// windows and main rows of `stages` DSpark stages.
+pub fn shipPlan(m: *const Dsv41Model, n: usize, stages: usize) !cache_codec.Plan {
     var l = try cacheLayout(m);
-    if (!m.draft_shard) l.stages = 0;
+    l.stages = stages;
     return cache_codec.Plan.init(l, n, 0);
 }
 
 /// `sn`'s tensors of `tpLoadPlan`, evaluated (caller frees with `freeArrays`).
 pub fn tpLoadTensors(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap) ![]A {
-    const p = try tpLoadPlan(m, sn.n);
+    return planTensors(m, gpa, sn, try tpLoadPlan(m, sn.n));
+}
+
+/// `sn`'s tensors of `p`, evaluated (caller frees with `freeArrays`).
+pub fn planTensors(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap, p: cache_codec.Plan) ![]A {
     const out = try gpa.alloc(A, p.len);
     var made: usize = 0;
     errdefer freeArrays(gpa, out[0..made]);
@@ -6067,7 +6088,11 @@ pub fn tpEnsure(m: *const Dsv41Model, gpa: std.mem.Allocator, ids: *TpIds, sn: *
 
 /// Tensor-parallel rank past 0: rank 0's snapshot `id` read from disk, as `tpLoadPlan`'s tensors in order.
 pub fn tpWorkerLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, id: u64, ids: []const u32, tensors: []const A) !void {
-    const p = try tpLoadPlan(m, ids.len);
+    return importPlan(m, gpa, snaps, id, ids, tensors, try tpLoadPlan(m, ids.len));
+}
+
+/// Snapshot `id` rebuilt from `p`'s tensors in order, into `snaps` under that id.
+pub fn importPlan(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, id: u64, ids: []const u32, tensors: []const A, p: cache_codec.Plan) !void {
     if (tensors.len != p.len) return error.DistPeerDiverged;
     const header = try gpa.alloc(u8, cache_codec.max_header);
     defer gpa.free(header);

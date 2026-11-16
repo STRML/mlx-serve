@@ -1,6 +1,7 @@
 // dec_moe_down: the routed (affine BITS 2 or 3, group GS 64 or 128) and shared down projections of ROWS decode rows, the combine and the hc expand into the next
 // stream. A thread owns one output row and one 128-value unit of the reduction axis; a threadgroup RB rows, every
-// expert the rows pick (each distinct one read once) and the shared expert.
+// expert the rows pick (each distinct one read once) and the shared expert. Expert e's rows start at row e * ES of `w`
+// (N for a whole bank, the whole hidden width for a rank's row view); XP 0 writes the rows' y `[ROWS, N]` and no stream.
 constexpr int UNITS = K / 128;
 constexpr int NT = RB * UNITS;
 constexpr int NV = K / 8;
@@ -112,7 +113,7 @@ for (int f = 0; f < PAIRS; ++f) {
   const int cur = f & 1;
   if (f + 1 < PAIRS) STAGEQ(ROWS > 1 ? jx[f + 1] : uint(f + 1), cur ^ 1) else STAGE8(uint(TOPK), cur ^ 1)
   if (ROWS == 1 || jn[f] != 0u) {
-    const size_t row = size_t(ROWS > 1 ? je[f] : uint(inds[f])) * N + d0 + rb;
+    const size_t row = size_t(ROWS > 1 ? je[f] : uint(inds[f])) * ES + d0 + rb;
     const device uint4* wp = (const device uint4*)(w + row * KW + 4 * BITS * u);
     for (int i = 0; i < BITS; ++i) wr[i] = wp[i];
     if constexpr (GS == 64) {  // the unit's two groups
@@ -194,6 +195,10 @@ for (uint i = t; i < uint(ROWS * RB); i += NT) {
   const uint r = i / RB, d = d0 + i % RB;
   float s = 0.0f;
   for (int uu = 0; uu < UNITS; ++uu) s += red[i * UNITS + uu];
+  if constexpr (XP == 0) {
+    out[r * N + d] = T(s);
+    continue;
+  }
   const float y = float(T(s));
   for (int h = 0; h < HC; ++h) {
     float a = 0.0f;

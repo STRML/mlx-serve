@@ -264,12 +264,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     return loadModel(ctx, s) catch |e| {
-        // Too little free memory is a refusal the host answers by name, not a fault.
-        const refused = switch (@as(anyerror, e)) {
-            error.StreamedRowsDoNotFit, error.Dsv41TpModeSetting, error.Dsv41ShardUneven, error.Dsv41ModeBesideSplit => true,
-            else => false,
-        };
-        if (refused) std.log.warn("deepseek_v41: load refused: {t}", .{e}) else std.log.err("deepseek_v41: load failed: {t}", .{e});
+        if (refusedLoad(e)) std.log.warn("deepseek_v41: load refused: {t}", .{e}) else std.log.err("deepseek_v41: load failed: {t}", .{e});
         out.* = switch (@as(anyerror, e)) {
             error.OutOfMemory => Verdict.refuse(.failed, "deepseek_v41: out of memory"),
             error.MissingWeight => Verdict.refuse(.failed, "deepseek_v41: a weight is missing"),
@@ -280,7 +275,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
             error.Dsv41TpModeSetting => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode must be {\"rank\": r, \"size\": n} with n of 2 or more and r below n"),
             error.Dsv41ModeBesideSplit => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode does not load beside a --dist split"),
             error.Dsv41ShardUneven => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode's size does not divide the attention heads, output groups and expert widths"),
-            error.Dsv41TpOutsideQuant => Verdict.refuse(.unsupported, "deepseek_v41: a pack read by an outside quant plugin does not run split across two Macs"),
+            error.Dsv41RowCutOutsideQuant => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode's row cut does not read a pack an outside quant plugin loads"),
+            error.Dsv41RowCutGguf => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode's row cut does not read GGUF expert banks"),
+            error.Dsv41RowCutUneven => Verdict.refuse(.unsupported, "deepseek_v41: tp_mode's size does not divide the expert and shared-expert widths into equal row cuts"),
+            error.Dsv41TpOutsideQuant =>Verdict.refuse(.unsupported, "deepseek_v41: a pack read by an outside quant plugin does not run split across two Macs"),
             error.OutsideQuantRefused => Verdict.refuse(.unsupported, "deepseek_v41: the outside quant plugin refused the pack (the log names why)"),
             error.StreamedBankUnclaimed => Verdict.refuse(.unsupported, "deepseek_v41: no installed quant plugin streams this pack's experts.bin (OpensourceWTF's EXL3 repacks: install turboexl3_ds41)"),
             else => Verdict.refuse(.failed, "deepseek_v41: the pack does not load"),
@@ -315,6 +313,20 @@ fn mtpSetting(settings_json: []const u8) ?bool {
     const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
     return parsed.value.mtp;
+}
+
+/// A load the pack or its settings refuse by name (too little free memory, a tensor mode it cannot serve), not a fault.
+fn refusedLoad(e: anyerror) bool {
+    return switch (e) {
+        error.StreamedRowsDoNotFit, error.Dsv41TpModeSetting, error.Dsv41ShardUneven, error.Dsv41ModeBesideSplit => true,
+        error.Dsv41RowCutOutsideQuant, error.Dsv41RowCutGguf, error.Dsv41RowCutUneven => true,
+        else => false,
+    };
+}
+
+test "deepseek_v41: a tensor mode the row cut cannot serve is a refusal, not a load failure" {
+    for ([_]anyerror{ error.Dsv41RowCutOutsideQuant, error.Dsv41RowCutGguf, error.Dsv41RowCutUneven, error.Dsv41ShardUneven }) |e| try std.testing.expect(refusedLoad(e));
+    try std.testing.expect(!refusedLoad(error.MissingWeight));
 }
 
 /// The per-model `tp_mode` setting (`{"tp_mode": {"rank": 1, "size": 4}}`): this box's rank of the tensor group whose
@@ -1000,4 +1012,5 @@ test {
     _ = @import("tp_ids.zig");
     _ = @import("contract.zig");
     _ = @import("decode/decode.zig");
+    _ = @import("rowcut.zig");
 }
