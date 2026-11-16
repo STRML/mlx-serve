@@ -1247,13 +1247,45 @@ fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, ou
     try testing.expect(drafted > 0);
 }
 
-test "deepseek_v41 served: a group slot whose drafts are priced out with rows to spare backs off, as a solo slot does" {
+test "deepseek_v41 served: under the group backoff, priced-out drafts teach the group's backoff and leave each slot's own debt" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
     defer ds.restore();
+    const per_group = env.override(.DSV41_DSPARK_GROUP_BACKOFF, "group");
+    defer per_group.restore();
+    var g: Group = undefined;
+    try g.open(try fixture.v41DsparkFiles(arena.allocator(), 7), &.{ &.{ 3, 17, 42, 9, 7, 25, 1, 60 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6 } });
+    defer g.close();
+    for (&g.gens) |*gen| {
+        gen.dspark_pol.?.calib.seen = @splat(1e6);
+        gen.dspark_pol.?.calib.hit = @splat(0);
+    }
+    const Skip = struct {
+        fn each(_: void, _: usize, _: []const u32) !void {}
+    };
+    try g.round({}, Skip.each);
+    var staged: usize = 0;
+    for (g.gens) |gen| {
+        if (gen.dspark_copies > 0) continue;
+        staged += 1;
+        try testing.expect(gen.dspark_pol.?.drafting.owed == 0 and gen.dspark_pol.?.drafting.wall == 0);
+    }
+    try testing.expect(staged > 0);
+    try testing.expect(g.p.xfm.dspark_group_drafting.wall > 0);
+}
+
+test "deepseek_v41 served: a group slot whose drafts are priced out with rows to spare backs off, as a solo slot does (slot backoff)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
+    defer ds.restore();
+    const per_slot = env.override(.DSV41_DSPARK_GROUP_BACKOFF, "slot");
+    defer per_slot.restore();
     var g: Group = undefined;
     try g.open(try fixture.v41DsparkFiles(arena.allocator(), 7), &.{ &.{ 3, 17, 42, 9, 7, 25, 1, 60 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6 } });
     defer g.close();
