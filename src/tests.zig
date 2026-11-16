@@ -368,6 +368,7 @@ test {
     _ = @import("host/cli/cli.zig");
     _ = @import("host/launch/launch.zig");
     _ = @import("host/lan/lan.zig");
+    _ = @import("host/internal/attempt.zig");
     _ = @import("host/api/providers.zig");
     _ = @import("host/launch/budget.zig");
     _ = @import("host/registry/modality.zig");
