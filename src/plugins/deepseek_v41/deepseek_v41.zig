@@ -1843,6 +1843,8 @@ pub const InitOpts = struct {
     pack_dir: ?[]const u8 = null,
     /// The outside quant plugin that reads the weights the pack stores in its format (`outside.Format.open`).
     quant: ?*const outside.Format = null,
+    /// The whole mode outlives this model and owns its shared, transformed tensors.
+    resident: ?struct { model: *const Dsv41Model, rows: *rowcut.RowCut } = null,
 };
 
 pub const tpGeometryFits = @import("config.zig").tpGeometryFits;
@@ -1865,9 +1867,10 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     const m = try gpa.create(Dsv41Model);
     errdefer gpa.destroy(m);
     const n_layers = cfg.num_hidden_layers;
+    const source_model = if (opts.resident) |r| r.model else null;
     // A tensor split's rank 0 holds the DSpark stages whole and drafts alone, unless every rank holds its slice of them.
     const n_stages: usize = if (opts.dspark and (opts.tp == null or opts.tp.?.rank == 0 or opts.draft_shard) and cfg.dsv4_dspark_block_size > 0 and (getOpt(w, "mtp.0.main_proj.weight", .{}) != null or (opts.quant != null and getOpt(w, "mtp.0.main_norm.weight", .{}) != null)))
-        cfg.dsv4_n_compress_ratios - n_layers
+        if (source_model) |r| r.n_mtp else cfg.dsv4_n_compress_ratios - n_layers
     else
         0;
     m.* = .{
@@ -1912,6 +1915,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     };
     m.pair = opts.pair;
     m.tp = opts.tp;
+    m.row_cut = if (opts.resident) |r| r.rows else null;
     m.draft_shard = opts.draft_shard and opts.tp != null and n_stages > 0;
     m.streamed_experts = opts.streamed_experts;
     m.quant = opts.quant;
@@ -1959,6 +1963,12 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         m.embed = .{ .w = none };
         m.head = .{ .w = none };
         m.norm = none;
+    } else if (source_model) |r| {
+        m.embed = r.embed;
+        const split = vocabSplit(opts.tp);
+        m.head = if (tp_worker) .{ .w = none } else r.head;
+        if (split) |t| m.head_part = try headPart(m, w, r.head, t, true, false);
+        m.norm = r.norm;
     } else {
         // A streamed bank's pack reads a bf16 table's rows at each lookup: its bytes go to the bank's slot rows.
         m.embed_tab = if (opts.streamed_experts and opts.pack_dir != null) ep.Table.open(gpa, opts.pack_dir.?, @intCast(cfg.vocab_size), @intCast(cfg.hidden_size)) catch null else null;
@@ -1989,9 +1999,11 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         } else if (t.size > 1) log.info("deepseek_v41: tensor rank {d} of {d}: lm head whole on rank 0 (DSV41_VOCAB_HEAD=0)\n", .{ t.rank, t.size });
         m.norm = try ownCast(m, try getW(w, "norm.weight", .{}), m.act);
     }
-    m.rope_plain = try buildRope(m, cfg.rope_theta, 0, 1, 0, 0);
-    m.rope_yarn = try buildRope(m, cfg.dsv4_compress_rope_theta, if (cfg.rope_yarn) cfg.yarn_orig_max_pos else 0, cfg.yarn_factor, cfg.yarn_beta_fast, cfg.yarn_beta_slow);
-    for (0..n_layers) |li| m.layers[li] = if (!m.held(li)) std.mem.zeroes(Layer) else try loadLayer(m, w, "layers", li, li);
+    m.rope_plain = if (source_model) |r| r.rope_plain else try buildRope(m, cfg.rope_theta, 0, 1, 0, 0);
+    m.rope_yarn = if (source_model) |r| r.rope_yarn else try buildRope(m, cfg.dsv4_compress_rope_theta, if (cfg.rope_yarn) cfg.yarn_orig_max_pos else 0, cfg.yarn_factor, cfg.yarn_beta_fast, cfg.yarn_beta_slow);
+    for (0..n_layers) |li| m.layers[li] = if (opts.resident) |r|
+        try r.rows.layers[li].?.tensorLayer(s, &r.model.layers[li])
+    else if (!m.held(li)) std.mem.zeroes(Layer) else try loadLayer(m, w, "layers", li, li);
     m.ced_split = cedSplit(cfg);
     try probeHcThreads(gpa, m);
     try hcFuseInit(gpa, m);
@@ -2007,11 +2019,14 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     try compileRegions(m);
     if (n_stages > 0) {
         if (m.draft_shard and m.head_part == null) return error.Dsv41DraftShardNeedsVocabHead;
-        for (0..n_stages) |si| m.layers[n_layers + si] = try loadLayer(m, w, "mtp", si, null);
+        for (0..n_stages) |si| m.layers[n_layers + si] = if (opts.resident) |r|
+            if (m.draft_shard) try r.rows.layers[n_layers + si].?.tensorLayer(s, &r.model.layers[n_layers + si]) else r.model.layers[n_layers + si]
+        else
+            try loadLayer(m, w, "mtp", si, null);
         const last = n_stages - 1;
         const targets = cfg.dsv4_n_dspark_target_layers;
         const rank = cfg.dsv4_dspark_markov_rank;
-        m.dspark = .{
+        m.dspark = if (source_model) |r| r.dspark.? else .{
             .main_proj = try getLin(m, w, cfg.hidden_size * targets, "mtp.0.main_proj", .{}),
             .main_norm = try ownCast(m, try getW(w, "mtp.0.main_norm.weight", .{}), m.act),
             .norm = try ownCast(m, try getW(w, "mtp.{d}.norm.weight", .{last}), m.act),
@@ -2020,14 +2035,18 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             .markov_head = if (getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) != null) try markovHead(m, w, rank, "mtp.{d}.markov_head.markov_w2", .{last}) else try markovHead(m, w, rank, "mtp.{d}.markov_head.head", .{last}),
             .conf = try ownDense(m, w, cfg.hidden_size + rank, "mtp.{d}.confidence_head.proj", .{last}, .float32),
         };
-        m.dspark.?.conf_exact = try markov.exact(m.dspark.?.conf);
+        if (source_model != null and m.draft_shard) {
+            const p = m.head_part.?;
+            m.dspark.?.markov_head = try ownRows(m, source_model.?.dspark.?.markov_head, p.lo, p.hi, false);
+        }
+        if (source_model == null) m.dspark.?.conf_exact = try markov.exact(m.dspark.?.conf);
         log.info("deepseek_v41: Markov chain: the confidence head's weights are {s}\n", .{if (m.dspark.?.conf_exact) "16-bit floats' values: its logit is the last kernel's" else "not all 16-bit floats' values: its logit stays on MLX's ops"});
         m.n_mtp = n_stages;
         if (opts.tp) |t| log.info("deepseek_v41: tensor rank {d} of {d}: DSpark {s}\n", .{ t.rank, t.size, if (m.draft_shard) "stages and Markov head split, every rank drafts (DSV41_DRAFT_SHARD=0: rank 0 alone)" else "drafts on rank 0 alone" });
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
         m.ds_block = cfg.dsv4_dspark_block_size;
     }
-    if (!worker) if (opts.pack_dir) |dir| try initEngram(m, w, dir);
+    if (!worker) if (opts.pack_dir) |dir| try initEngram(m, w, dir, source_model);
     {
         const k: usize = cfg.num_experts_per_tok;
         var ks: [64]u32 = undefined;
@@ -2223,7 +2242,7 @@ fn droppedBytes(gpa: std.mem.Allocator, dir_path: []const u8, dspark: bool, visi
 
 /// Engram for the pack in `dir`: the token map, the hash, and each layer's
 /// table and projections. Without Engram layers in the config this is a no-op.
-fn initEngram(m: *Dsv41Model, w: *Weights, dir: []const u8) !void {
+fn initEngram(m: *Dsv41Model, w: *Weights, dir: []const u8, source_model: ?*const Dsv41Model) !void {
     const c = &m.cfg;
     if (c.dsv41_n_engram_layers == 0) return;
     m.token_map = try engram.loadTokenMap(m.gpa, dir, c.vocab_size, c.dsv41_engram_compressed_vocab);
@@ -2240,30 +2259,34 @@ fn initEngram(m: *Dsv41Model, w: *Weights, dir: []const u8) !void {
     const cols = m.hash.?.cols();
     for (0..n) |k| {
         const l: usize = c.dsv41_engram_layers[k];
-        // The re-split GGUF ships the product folded (`qk`, f32); the others the two vectors.
-        var prod = mlx.mlx_array_new();
-        if (getOpt(w, "layers.{d}.engram.qk", .{l})) |qk| try mlx.check(mlx.mlx_astype(&prod, qk, .float32, m.s)) else {
-            const qw = try getW(w, "layers.{d}.engram.q_weight", .{l});
-            const kw = try getW(w, "layers.{d}.engram.k_weight", .{l});
-            var q32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(q32);
-            var k32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(k32);
-            try mlx.check(mlx.mlx_astype(&q32, qw, .float32, m.s));
-            try mlx.check(mlx.mlx_astype(&k32, kw, .float32, m.s));
-            try mlx.check(mlx.mlx_multiply(&prod, q32, k32, m.s));
-        }
-        _ = try m.own(prod);
-        try mlx.check(mlx.mlx_array_eval(prod));
+        const prod = if (source_model) |r| r.engrams[k].qk else try engramProduct(m, w, l);
         m.engrams[k] = .{
             .layer = l,
-            .wkv = try actLin(m, w, try getLin(m, w, cols * c.dsv41_engram_head_dim, "layers.{d}.engram.wkv", .{l})),
+            .wkv = if (source_model) |r| r.engrams[k].wkv else try actLin(m, w, try getLin(m, w, cols * c.dsv41_engram_head_dim, "layers.{d}.engram.wkv", .{l})),
             .qk = prod,
             .table = try engram.Table.open(m.gpa, dir, k, l, c.dsv41_engram_rows[k], c.dsv41_engram_head_dim),
         };
         if (c.dsv41_streamed) m.engrams[k].table.readDirect() else m.engrams[k].table.openCodes();
         opened += 1;
     }
+}
+
+fn engramProduct(m: *Dsv41Model, w: *const Weights, l: usize) !A {
+    var prod = mlx.mlx_array_new();
+    if (getOpt(w, "layers.{d}.engram.qk", .{l})) |qk| try mlx.check(mlx.mlx_astype(&prod, qk, .float32, m.s)) else {
+        const qw = try getW(w, "layers.{d}.engram.q_weight", .{l});
+        const kw = try getW(w, "layers.{d}.engram.k_weight", .{l});
+        var q32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q32);
+        var k32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k32);
+        try mlx.check(mlx.mlx_astype(&q32, qw, .float32, m.s));
+        try mlx.check(mlx.mlx_astype(&k32, kw, .float32, m.s));
+        try mlx.check(mlx.mlx_multiply(&prod, q32, k32, m.s));
+    }
+    _ = try m.own(prod);
+    try mlx.check(mlx.mlx_array_eval(prod));
+    return prod;
 }
 
 // ── per-request state ────────────────────────────────────────────────────

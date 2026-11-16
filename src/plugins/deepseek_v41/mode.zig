@@ -15,8 +15,6 @@ pub const Modes = struct {
     tp1: *dsv41.Dsv41Model,
     /// This box's rank of a tensor group, built beside `tp1`; null when the load named no group.
     tp: ?*dsv41.Dsv41Model = null,
-    /// `tp`'s weights: views of this rank's part of the pack's tensors. The model reads its linears from here.
-    tp_weights: ?Weights = null,
     /// `tp`'s row cut of `tp1`'s layers, which its MoE runs at decode widths.
     row_cut: ?*rowcut.RowCut = null,
     active: Mode = .tp1,
@@ -33,75 +31,33 @@ pub const Modes = struct {
     }
 
     pub fn deinit(self: *Modes) void {
-        if (self.row_cut) |rc| rc.destroy();
         if (self.tp) |t| t.deinit();
-        if (self.tp_weights) |*w| w.deinit();
+        if (self.row_cut) |rc| rc.destroy();
         self.tp1.deinit();
     }
 };
 
-/// Both modes from one weights map: `group`'s model first, over views of `w` (`shardViews`), then the whole model,
-/// which consumes `w` as today's load does. `opts` is the whole model's; null `group` builds `tp1` alone.
+/// Build the whole model once, then its tensor mode from the resident, transformed arrays.
 pub fn build(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: mlx.mlx_stream, opts: dsv41.InitOpts, group: ?Shard) !Modes {
-    var out: Modes = .{ .tp1 = undefined };
     if (group) |g| {
         if (opts.tp != null or opts.pair != null) return error.Dsv41ModeBesideSplit;
+        if (opts.streamed_experts) return error.Dsv41TpStreamedExperts;
+        if (opts.quant != null) return error.Dsv41TpOutsideQuant;
         if (!dsv41.tpGeometryFits(whole, g.size)) return error.Dsv41ShardUneven;
+    }
+    var out: Modes = .{ .tp1 = try dsv41.init(gpa, whole, w, s, opts) };
+    errdefer out.tp1.deinit();
+    if (group) |g| {
         var o = opts;
         o.draft_shard = dsv41.draftShardWanted(g.size);
-        // As a `--dist tensor` rank loads: with a sharded draft every rank holds its slice of the DSpark stages.
         o.tp = .{ .rank = g.rank, .size = g.size, .stages = o.draft_shard };
-        out.tp_weights = try shardViews(gpa, w, o.tp.?, s);
-        errdefer out.tp_weights.?.deinit();
-        out.tp = try dsv41.init(gpa, whole, &out.tp_weights.?, s, o);
-    }
-    errdefer if (out.tp) |t| {
-        t.deinit();
-        out.tp_weights.?.deinit();
-    };
-    out.tp1 = try dsv41.init(gpa, whole, w, s, opts);
-    if (group) |g| {
-        errdefer out.tp1.deinit();
-        out.row_cut = try rowcut.RowCut.create(gpa, s, out.tp1, 0, out.tp1.layers.len, g.rank, g.size);
-        out.tp.?.row_cut = out.row_cut;
+        const hi = if (o.draft_shard) out.tp1.layers.len else out.tp1.n_layers;
+        out.row_cut = try rowcut.RowCut.create(gpa, s, out.tp1, 0, hi, g.rank, g.size);
+        errdefer out.row_cut.?.destroy();
+        o.resident = .{ .model = out.tp1, .rows = out.row_cut.? };
+        out.tp = try dsv41.init(gpa, whole, w, s, o);
     }
     return out;
-}
-
-/// A map of `w`'s tensors as rank `sh` of a tensor group reads them: each one `sh.axisOf` cuts as a slice of the
-/// resident array, every other one the same array. Nothing is copied here; the arrays stay `w`'s.
-pub fn shardViews(gpa: std.mem.Allocator, w: *const Weights, sh: Shard, s: mlx.mlx_stream) !Weights {
-    var out = Weights.init(gpa);
-    errdefer out.deinit();
-    var it = w.map.iterator();
-    while (it.next()) |kv| {
-        const v = try viewOf(kv.value_ptr.*, sh.axisOf(kv.key_ptr.*), sh, s);
-        out.put(kv.key_ptr.*, v) catch |e| {
-            _ = mlx.mlx_array_free(v);
-            return e;
-        };
-    }
-    return out;
-}
-
-fn viewOf(x: mlx.mlx_array, axis: ?Shard.Axis, sh: Shard, s: mlx.mlx_stream) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(o);
-    const a = axis orelse {
-        try mlx.check(mlx.mlx_array_set(&o, x));
-        return o;
-    };
-    const shape = mlx.getShape(x);
-    const ax = a.of(shape.len);
-    const part = std.math.divExact(c_int, shape[ax], @intCast(sh.size)) catch return error.Dsv41ShardUneven;
-    var start: [4]c_int = @splat(0);
-    var stop: [4]c_int = undefined;
-    const strides: [4]c_int = @splat(1);
-    @memcpy(stop[0..shape.len], shape);
-    start[ax] = part * @as(c_int, @intCast(sh.rank));
-    stop[ax] = start[ax] + part;
-    try mlx.check(mlx.mlx_slice(&o, x, &start, shape.len, &stop, shape.len, &strides, shape.len, s));
-    return o;
 }
 
 test "mode.build: a tensor group's mode beside a --dist split is refused before it reads a weight" {
@@ -118,6 +74,13 @@ test "mode.build: a group size the release geometry's heads or output groups can
     try std.testing.expect(dsv41.tpGeometryFits(&cfg, 4));
     for ([_]u32{ 16, 3, 128 }) |size|
         try std.testing.expectError(error.Dsv41ShardUneven, build(std.testing.allocator, &cfg, &w, .{ .ctx = null }, .{}, .{ .rank = 0, .size = size }));
+}
+
+test "mode.build: streamed experts are refused before building either mode" {
+    var w = Weights.init(std.testing.allocator);
+    defer w.deinit();
+    const cfg: Config = .{ .model_type = "deepseek_v41", .num_attention_heads = 64, .dsv4_o_groups = 8, .moe_intermediate_size = 2048, .shared_expert_intermediate_size = 2048 };
+    try std.testing.expectError(error.Dsv41TpStreamedExperts, build(std.testing.allocator, &cfg, &w, .{ .ctx = null }, .{ .streamed_experts = true }, .{ .rank = 0, .size = 4 }));
 }
 
 /// A tensor group of `size` ranks in one process, for a rank-0 model's tests: every rank's part is rank 0's, so a sum
