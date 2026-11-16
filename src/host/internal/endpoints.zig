@@ -67,19 +67,18 @@ pub fn statusLine(status: u16) []const u8 {
     };
 }
 
-fn keyMatches(key: []const u8, presented: []const u8) bool {
-    var a: [32]u8 = undefined;
-    var b: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(key, &a, .{});
-    std.crypto.hash.sha2.Sha256.hash(presented, &b, .{});
-    return std.crypto.timing_safe.eql([32]u8, a, b);
+/// The internal key is held as its sha256 (`ablation.readKey`); digests compare in constant time, so neither length nor content leaks.
+pub fn keyMatches(digest: [32]u8, presented: []const u8) bool {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.trim(u8, presented, " \t\r\n"), &d, .{});
+    return std.crypto.timing_safe.eql([32]u8, d, digest);
 }
 
-fn authorized(key: []const u8, authorization: ?[]const u8) bool {
+fn authorized(digest: [32]u8, authorization: ?[]const u8) bool {
     const h = authorization orelse return false;
     const bearer = "Bearer ";
     if (!std.mem.startsWith(u8, h, bearer)) return false;
-    return keyMatches(key, std.mem.trim(u8, h[bearer.len..], " \t"));
+    return keyMatches(digest, h[bearer.len..]);
 }
 
 const Params = struct { n: u64, deadline_ms: ?i64 = null, wait_ms: i64 = max_drain_wait_ms };
@@ -130,7 +129,7 @@ fn monotonicDeadline(wall_deadline_ms: i64, clk: Clocks) ?i64 {
     return clk.mono_ms + ahead;
 }
 
-pub fn handle(sw: *sw_mod.Switch, internal_key: ?[]const u8, req: Request, clk: Clocks, buf: []u8) Response {
+pub fn handle(sw: *sw_mod.Switch, internal_key: ?[32]u8, req: Request, clk: Clocks, buf: []u8) Response {
     const key = internal_key orelse return plain(buf, 404, "not found");
     if (!authorized(key, req.authorization)) return plain(buf, 401, "unauthorized");
     const route = req.path[@min(prefix.len, req.path.len)..];
@@ -226,11 +225,17 @@ fn wire(r: *Rig) void {
 
 const CLK: Clocks = .{ .mono_ms = 50_000, .wall_ms = 1_700_000_000_000 };
 
+fn digestOf(key: []const u8) [32]u8 {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &d, .{});
+    return d;
+}
+
 fn call(r: *Rig, key: ?[]const u8, method: []const u8, path: []const u8, auth: ?[]const u8, body: []const u8) Response {
     const S = struct {
         var buf: [1024]u8 = undefined;
     };
-    return handle(&r.sw, key, .{ .method = method, .path = path, .authorization = auth, .body = body }, CLK, &S.buf);
+    return handle(&r.sw, if (key) |k| digestOf(k) else null, .{ .method = method, .path = path, .authorization = auth, .body = body }, CLK, &S.buf);
 }
 
 const BEARER = "Bearer " ++ KEY;
