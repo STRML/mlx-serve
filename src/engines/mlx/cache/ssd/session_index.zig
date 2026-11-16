@@ -48,13 +48,15 @@ pub const Index = struct {
         self.allocator.free(self.path);
     }
 
-    /// The newest tip of each of the newest `cap` sessions, oldest first. A file holding anything else (older tips of
-    /// a session, sessions past the cap, a damaged record) is rewritten to just these.
+    /// The newest tip of each of the newest `cap` sessions, oldest first. The file keeps each of those sessions' two
+    /// newest tips, so a session whose newest record is gone has one to fall back to (`findBefore`); a file holding
+    /// anything else (older tips, sessions past the cap, a damaged record) is rewritten to just those.
     pub fn load(self: *Index, out: *std.ArrayList(Tip)) !void {
         const bytes = self.readAll() orelse return;
         defer self.allocator.free(bytes);
-        var newest = std.AutoHashMap(u64, Tip).init(self.allocator);
-        defer newest.deinit();
+        const Pair = struct { newest: Tip, previous: ?Tip = null };
+        var pairs = std.AutoHashMap(u64, Pair).init(self.allocator);
+        defer pairs.deinit();
         var clean = bytes.len % RECORD_BYTES == 0;
         var records: usize = 0;
         var at: usize = 0;
@@ -64,18 +66,31 @@ pub const Index = struct {
                 continue;
             };
             records += 1;
-            const held = try newest.getOrPut(tip.session);
-            if (!held.found_existing or held.value_ptr.seq <= tip.seq) held.value_ptr.* = tip;
+            const held = try pairs.getOrPut(tip.session);
+            if (!held.found_existing) {
+                held.value_ptr.* = .{ .newest = tip };
+            } else if (tip.seq >= held.value_ptr.newest.seq) {
+                if (tip.seq > held.value_ptr.newest.seq) held.value_ptr.previous = held.value_ptr.newest;
+                held.value_ptr.newest = tip;
+            } else if (held.value_ptr.previous == null or tip.seq >= held.value_ptr.previous.?.seq) {
+                held.value_ptr.previous = tip;
+            }
         }
-        const first = out.items.len;
-        var it = newest.valueIterator();
-        while (it.next()) |tip| try out.append(self.allocator, tip.*);
-        std.mem.sort(Tip, out.items[first..], {}, bySeq);
-        const kept = @min(out.items.len - first, self.cap);
-        const drop = out.items.len - first - kept;
-        if (drop > 0) std.mem.copyForwards(Tip, out.items[first..][0..kept], out.items[first + drop ..][0..kept]);
-        out.shrinkRetainingCapacity(first + kept);
-        if (!clean or records != kept) self.rewrite(out.items[first..]);
+        var newest = std.ArrayList(Tip).empty;
+        defer newest.deinit(self.allocator);
+        var it = pairs.valueIterator();
+        while (it.next()) |pair| try newest.append(self.allocator, pair.newest);
+        std.mem.sort(Tip, newest.items, {}, bySeq);
+        const kept = newest.items[newest.items.len -| self.cap..];
+        var survivors = std.ArrayList(Tip).empty;
+        defer survivors.deinit(self.allocator);
+        for (kept) |tip| {
+            try survivors.append(self.allocator, tip);
+            if (pairs.get(tip.session).?.previous) |previous| try survivors.append(self.allocator, previous);
+        }
+        std.mem.sort(Tip, survivors.items, {}, bySeq);
+        try out.appendSlice(self.allocator, kept);
+        if (!clean or records != survivors.items.len) self.rewrite(survivors.items);
     }
 
     pub fn append(self: *Index, tip: Tip) void {
@@ -85,8 +100,16 @@ pub const Index = struct {
     /// The newest tip the file holds for `session` older than `seq`: where a session falls back to when the record of
     /// its newest one is gone.
     pub fn findBefore(self: *Index, session: u64, seq: u64) ?Tip {
-        _ = .{ self, session, seq };
-        return null;
+        const bytes = self.readAll() orelse return null;
+        defer self.allocator.free(bytes);
+        var best: ?Tip = null;
+        var at: usize = 0;
+        while (at + RECORD_BYTES <= bytes.len) : (at += RECORD_BYTES) {
+            const tip = decode(bytes[at..][0..RECORD_BYTES]) orelse continue;
+            if (tip.session != session or tip.seq >= seq) continue;
+            if (best == null or best.?.seq <= tip.seq) best = tip;
+        }
+        return best;
     }
 
     /// The newest tip the file holds for `session`.

@@ -533,6 +533,7 @@ pub fn shutdownPersist(targets: []const FlushTarget, clock: anytype, deadline_ms
         t.checked_out += x.hc.checkedOutOwed();
         t.dropped_bytes += d.drainWriterUntil(clock, deadline_ms);
         d.pollModuleWrites();
+        x.hc.persistDurableTips();
         modules_after += x.hc.moduleCommittedCount();
         t.left_deadline += unfinished -| (x.hc.moduleCommittedCount() -| committed);
         x.hc.cancelModuleExports(.shutdown_expiry);
@@ -738,6 +739,7 @@ pub const HotPrefixCache = struct {
     session_tips: std.AutoHashMapUnmanaged(u64, SessionTip) = .empty,
     session_seq: u64 = 0,
     session_tips_seeded: bool = false,
+    tips_unpersisted: bool = false,
     session_index: ?session_index_mod.Index = null,
     /// Tips held in memory, and sessions the persisted index keeps: fields so a test reaches either cheaply.
     session_tip_cap: usize = MAX_SESSION_TIPS,
@@ -772,6 +774,7 @@ pub const HotPrefixCache = struct {
 
     pub fn deinit(self: *HotPrefixCache) void {
         if (self.disk) |*d| d.pollModuleWrites();
+        self.persistDurableTips();
         self.cancelModuleExports(.unload);
         for (self.entries.items) |*e| {
             freeEntryOwnedState(self.allocator, e);
@@ -1476,10 +1479,14 @@ pub const HotPrefixCache = struct {
         };
     }
 
-    /// The RAM entry a session's tip names: its prompt boundary as the index recorded it, never a decode-end tail and
-    /// never an entry a slot has checked out. Null when the entry has left RAM (the SSD may still hold it).
+    /// The RAM entry a session's newest tip names (`ramHitOfTip`).
     pub fn findSessionTip(self: *HotPrefixCache, session: u64) ?RamModuleHit {
-        const tip = self.sessionTip(session) orelse return null;
+        return self.ramHitOfTip(self.sessionTip(session) orelse return null, session);
+    }
+
+    /// The RAM entry a tip names: its prompt boundary as the index recorded it, never a decode-end tail and never an
+    /// entry a slot has checked out. Null when the entry has left RAM (the SSD may still hold it).
+    pub fn ramHitOfTip(self: *const HotPrefixCache, tip: SessionTip, session: u64) ?RamModuleHit {
         for (self.entries.items) |*e| {
             const m = e.module orelse continue;
             if (m.tail_from != 0 or e.checked_out_by != null) continue;
@@ -1506,7 +1513,14 @@ pub const HotPrefixCache = struct {
 
     /// Where a session's newest prompt boundary is: `boundary.id` and the token count name the entry in RAM or on the
     /// SSD, `seq` orders a session's commits across restarts.
-    pub const SessionTip = struct { id: u64, n: usize, variant: u64, seq: u64 };
+    pub const SessionTip = struct {
+        id: u64,
+        n: usize,
+        variant: u64,
+        seq: u64,
+        /// In the persisted index: a tip goes there only once its record is committed on the SSD (`persistDurableTips`).
+        persisted: bool = false,
+    };
 
     pub const MAX_SESSION_TIPS: usize = 4096;
 
@@ -1522,12 +1536,12 @@ pub const HotPrefixCache = struct {
 
     /// The session's tip before the one with `seq`: the fallback when that one's record is gone.
     pub fn sessionTipBefore(self: *HotPrefixCache, session: u64, seq: u64) ?SessionTip {
-        _ = .{ self, session, seq };
-        return null;
+        const index = self.tipIndex() orelse return null;
+        return tipOf(index.findBefore(session, seq) orelse return null);
     }
 
     fn tipOf(record: session_index_mod.Tip) SessionTip {
-        return .{ .id = record.id, .n = @intCast(record.n), .variant = record.variant, .seq = record.seq };
+        return .{ .id = record.id, .n = @intCast(record.n), .variant = record.variant, .seq = record.seq, .persisted = true };
     }
 
     /// The persisted index, opened beside the SSD tier's records once there is a tier.
@@ -1560,28 +1574,61 @@ pub const HotPrefixCache = struct {
         return self.session_seq;
     }
 
-    /// A newer commit of a session replaces its tip; an older one never does. A commit goes to the persisted index too.
-    fn noteSessionTip(self: *HotPrefixCache, session: u64, tip: SessionTip, persist: bool) void {
+    /// A newer commit of a session replaces its tip; an older one never does. A `fresh` tip (a commit, not a read of the
+    /// index) serves RAM exports at once and reaches the persisted index when its record is durable.
+    fn noteSessionTip(self: *HotPrefixCache, session: u64, tip: SessionTip, fresh: bool) void {
         if (session == 0) return;
         if (self.session_tips.get(session)) |old| if (old.seq > tip.seq) return;
-        if (self.session_tips.count() >= self.session_tip_cap and !self.session_tips.contains(session)) self.dropOldestSessionTip();
-        self.session_tips.put(self.allocator, session, tip) catch return;
-        if (!persist) return;
-        const index = self.tipIndex() orelse return;
-        index.append(.{ .session = session, .id = tip.id, .n = tip.n, .variant = tip.variant, .seq = tip.seq });
+        if (self.session_tips.count() >= self.session_tip_cap and !self.session_tips.contains(session)) self.makeRoomForSessionTip();
+        var held = tip;
+        held.persisted = !fresh;
+        self.session_tips.put(self.allocator, session, held) catch return;
+        if (!fresh) return;
+        self.tips_unpersisted = true;
+        self.persistDurableTips();
     }
 
-    fn dropOldestSessionTip(self: *HotPrefixCache) void {
+    /// Memory gives up a persisted tip, which the file still holds; an unpersisted one leaves only when they are all
+    /// that is left, twice over the cap.
+    fn makeRoomForSessionTip(self: *HotPrefixCache) void {
+        if (self.dropOldestSessionTip(true)) return;
+        if (self.session_tips.count() >= 2 * self.session_tip_cap) _ = self.dropOldestSessionTip(false);
+    }
+
+    fn dropOldestSessionTip(self: *HotPrefixCache, persisted_only: bool) bool {
         var oldest: ?u64 = null;
         var oldest_seq: u64 = std.math.maxInt(u64);
         var it = self.session_tips.iterator();
         while (it.next()) |kv| {
+            if (persisted_only and !kv.value_ptr.persisted) continue;
             if (kv.value_ptr.seq < oldest_seq) {
                 oldest_seq = kv.value_ptr.seq;
                 oldest = kv.key_ptr.*;
             }
         }
-        if (oldest) |k| _ = self.session_tips.remove(k);
+        return if (oldest) |k| self.session_tips.remove(k) else false;
+    }
+
+    /// Appends to the persisted index each tip whose record is committed on the SSD. A tip published before its record
+    /// is written would outlive a stop in between, and a restart would find a session pointing at nothing.
+    fn persistDurableTips(self: *HotPrefixCache) void {
+        if (!self.tips_unpersisted) return;
+        const d = if (self.disk) |*dd| dd else return;
+        const index = self.tipIndex() orelse return;
+        var waiting = false;
+        var it = self.session_tips.iterator();
+        while (it.next()) |kv| {
+            const tip = kv.value_ptr;
+            if (tip.persisted) continue;
+            if (d.moduleByBoundary(tip.id, tip.n) == null) {
+                waiting = true;
+                continue;
+            }
+            index.append(.{ .session = kv.key_ptr.*, .id = tip.id, .n = tip.n, .variant = tip.variant, .seq = tip.seq });
+            tip.persisted = true;
+        }
+        self.tips_unpersisted = waiting;
+        while (self.session_tips.count() > self.session_tip_cap and self.dropOldestSessionTip(true)) {}
     }
 
     /// Whether a session other than `session` has the prompt boundary of `e` as its tip: a commit that supersedes `e`
@@ -3589,6 +3636,7 @@ pub const HotPrefixCache = struct {
     fn flushSlice(self: *HotPrefixCache, s: mlx.mlx_stream, order: SliceOrder) ?SliceResult {
         const d = if (self.disk) |*dd| dd else return null;
         d.pollModuleWrites();
+        self.persistDurableTips();
         d.cleanupModules();
         self.syncModuleLosses();
         self.dropWrittenOverBudget(d);
@@ -13473,6 +13521,7 @@ test "HotPrefixCache module: a session past the in-memory index still resolves f
     _ = try second.putSession(&hc, binding, &.{}, 8);
     _ = try third.putSession(&hc, binding, &.{}, 9);
     try ModuleDiskTest.finish(&hc, cpu);
+    _ = hc.flushOwedSlice(cpu);
 
     try testing.expectEqual(@as(u32, 2), hc.session_tips.count());
     const oldest = hc.sessionTip(7) orelse return error.TestExpectedTip;

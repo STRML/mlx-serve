@@ -162,11 +162,10 @@ const DiskSession = struct {
 
 const SessionLookup = union(enum) { none, hit: RamModuleHit, refused: requests.CacheExportOutcome };
 
-/// The prompt boundary a session's tip names, found by identity: the RAM entry with that prefix key and length, else
-/// the SSD record with it. The record is read back into a snapshot (`holder` frees it) so it exports the way a RAM
-/// entry does, under the variant the tip was committed with. The envelope carries the asking session, so the
-/// importer records it as an owner even when another session wrote the entry. A tip whose entry is gone, or whose
-/// record cannot be read, is `none`: the caller sees `session_not_found`.
+const SESSION_TIP_FALLBACKS: usize = 3;
+
+/// The prompt boundary a session's newest tip names, else the one before it when that tip's record is gone from RAM
+/// and the SSD (`tipHit`). A session whose every tip is gone is `none`: the caller sees `session_not_found`.
 fn sessionHit(
     allocator: std.mem.Allocator,
     sch: *const Scheduler,
@@ -177,8 +176,31 @@ fn sessionHit(
     max_bytes: usize,
     holder: *DiskSession,
 ) SessionLookup {
-    const tip = hc.sessionTip(session) orelse return .none;
-    if (hc.findSessionTip(session)) |hit| return .{ .hit = hit };
+    var tip = hc.sessionTip(session) orelse return .none;
+    for (0..SESSION_TIP_FALLBACKS) |_| {
+        const found = tipHit(allocator, sch, cfg, hc, xfm, session, tip, max_bytes, holder);
+        if (found != .none) return found;
+        tip = hc.sessionTipBefore(session, tip.seq) orelse return .none;
+    }
+    return .none;
+}
+
+/// The prompt boundary a tip names, found by identity: the RAM entry with that id and length, else the SSD record with
+/// it. The record is read back into a snapshot (`holder` frees it) so it exports the way a RAM entry does, under the
+/// variant the tip was committed with. The envelope carries the asking session, so the importer records it as an owner
+/// even when another session wrote the entry. A tip whose entry is gone, or whose record cannot be read, is `none`.
+fn tipHit(
+    allocator: std.mem.Allocator,
+    sch: *const Scheduler,
+    cfg: *const ModelConfig,
+    hc: *prefix_cache_mod.HotPrefixCache,
+    xfm: *Transformer,
+    session: u64,
+    tip: prefix_cache_mod.HotPrefixCache.SessionTip,
+    max_bytes: usize,
+    holder: *DiskSession,
+) SessionLookup {
+    if (hc.ramHitOfTip(tip, session)) |hit| return .{ .hit = hit };
     const d = if (hc.disk) |*dd| dd else return .none;
     const ref = d.moduleByBoundary(tip.id, tip.n) orelse return .none;
     const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, tip.variant) orelse return .none;
