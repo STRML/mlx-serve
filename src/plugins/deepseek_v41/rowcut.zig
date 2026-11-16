@@ -739,7 +739,8 @@ test "dsv41 row cut: the views copy no weight bytes, and the row-cut forward rea
         for ([_]A{ rl.experts.gate.w, rl.experts.up.w, rl.experts.down.w, rl.shared[0].w, rl.shared[1].w, rl.shared[2].w }) |a| smallest = @min(smallest, nbytes(a));
         for (rl.owned.items.items) |a| try mlx.check(mlx.mlx_array_eval(a));
     }
-    const grew = activeBytes() - before;
+    const grew = activeBytes() -| before;
+    std.debug.print("[rowcut] views: grew {d} B, wo_b copies {d} B, smallest view {d} B\n", .{ grew, wo_b, smallest });
     try testing.expect(wo_b > 0 and grew >= wo_b and grew - wo_b < smallest);
 
     var sc = Scope.init(gpa, mlx.gpuStream());
@@ -755,6 +756,7 @@ test "dsv41 row cut: the views copy no weight bytes, and the row-cut forward rea
         try mlx.check(mlx.mlx_array_eval(try simulate(&fsc, fx.m, rls, in.x, in.r.idx, in.r.wts)));
         var peak: usize = 0;
         _ = mlx.mlx_get_peak_memory(&peak);
+        std.debug.print("[rowcut] forward peak over base {d} B (bar {d})\n", .{ peak -| base, smallest / 2 });
         try testing.expect(peak -| base < smallest / 2);
     }
     // The planted control: a gate view with a row stride makes the gather copy it, and the counter sees the copy.
@@ -765,6 +767,7 @@ test "dsv41 row cut: the views copy no weight bytes, and the row-cut forward rea
     const iq: usize = @intCast(dim(rls[0].experts.gate.w, 1));
     planted.experts.gate = try strided(gpa, &extra, ly.experts.gu.?, iq);
     const copied = try stagePeak(gpa, fx, &planted, in.x, in.r.idx, in.r.wts);
+    std.debug.print("[rowcut] up stage peak in place {d} B, planted copy {d} B (gate view {d} B)\n", .{ in_place, copied, nbytes(planted.experts.gate.w) });
     try testing.expect(in_place < smallest / 2);
     try testing.expect(copied >= nbytes(planted.experts.gate.w));
 }
