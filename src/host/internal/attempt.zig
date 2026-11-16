@@ -21,7 +21,7 @@ pub const Config = struct {
 };
 
 /// What the caller does after an accepted command.
-pub const Effect = enum { none, close_admission, reopen_admission, start_formation, cancel_formation, begin_release, await_release, exit_process };
+pub const Effect = enum { none, close_admission, reopen_admission, start_formation, cancel_formation, begin_release, await_release };
 
 pub const Refusal = enum {
     /// Attempt 0, which no router issues.
@@ -45,6 +45,9 @@ pub const Machine = struct {
     state: State = .idle,
     /// The latest attempt this box knows: its high-water, and the one every command is judged against.
     n: u64 = 0,
+    /// The highest N an abort named while this box was releasing a lower one: the release continues, and no attempt at or
+    /// below it starts afterwards.
+    fence: u64 = 0,
     role: Role = .none,
     entered_ms: i64 = 0,
     quarantined: bool = false,
@@ -82,6 +85,7 @@ pub const Machine = struct {
     }
 
     fn drain(self: *Machine, n: u64, now_ms: i64) Outcome {
+        if (n <= self.fence) return .{ .refused = .stale };
         if (n == self.n) return if (self.state == .draining) .noop else .{ .refused = .state };
         if (!self.atRest()) return .{ .refused = .state };
         self.n = n;
@@ -129,9 +133,9 @@ pub const Machine = struct {
                 self.enter(.aborting, now_ms);
                 break :blk .{ .ok = .await_release };
             },
-            .releasing => blk: {
-                self.enter(.aborting, now_ms);
-                break :blk .{ .ok = .exit_process };
+            .releasing => {
+                if (n > self.n) self.fence = @max(self.fence, n);
+                return if (n == self.n) .noop else .{ .ok = .none };
             },
             .aborting => .noop,
             .idle, .released, .aborted => if (n == self.n) .noop else blk: {
@@ -223,6 +227,10 @@ pub const Machine = struct {
         return self.atRest() or (self.state == .formed and self.role == .leader);
     }
 
+    pub fn highWater(self: *const Machine) u64 {
+        return @max(self.n, self.fence);
+    }
+
     pub fn mode(self: *const Machine) Mode {
         return switch (self.state) {
             .formed, .releasing => .tp4,
@@ -304,7 +312,8 @@ const table = [_]Row{
     .{ .from = .aborting, .cmd = .abort, .arg = 5, .want = .noop, .to = .aborting },
     .{ .from = .formed, .role = .leader, .cmd = .abort, .arg = 5, .want = ok.e(.begin_release), .to = .releasing },
     .{ .from = .formed, .role = .follower, .cmd = .abort, .arg = 5, .want = ok.e(.await_release), .to = .aborting },
-    .{ .from = .releasing, .cmd = .abort, .arg = 5, .want = ok.e(.exit_process), .to = .aborting },
+    .{ .from = .releasing, .cmd = .abort, .arg = 5, .want = .noop, .to = .releasing },
+    .{ .from = .releasing, .cmd = .abort, .arg = 7, .want = ok.e(.none), .to = .releasing },
     .{ .from = .released, .cmd = .abort, .arg = 5, .want = .noop, .to = .released },
     .{ .from = .aborted, .cmd = .abort, .arg = 5, .want = .noop, .to = .aborted },
     .{ .from = .aborted, .cmd = .abort, .arg = 4, .want = .{ .refused = .stale }, .to = .aborted },
@@ -545,4 +554,21 @@ test "the leader's abort of a formed group is the planned down: releasing, then 
     try t.expect(l.released(3, 50));
     try t.expectEqual(Outcome.noop, l.command(.abort, 3, 60));
     try t.expectEqual(State.released, l.state);
+}
+
+test "abort of the same N while releasing is a no-op; a higher N is recorded and the release continues" {
+    var l: Machine = .{};
+    _ = l.command(.drain, 3, 0);
+    _ = l.command(.tp4, 3, 0);
+    _ = l.formed(3, 5);
+    _ = l.command(.tp1, 3, 10);
+    try t.expectEqual(Outcome.noop, l.command(.abort, 3, 20));
+    try t.expectEqual(State.releasing, l.state);
+    try t.expectEqual(Outcome{ .ok = .none }, l.command(.abort, 6, 30));
+    try t.expectEqual(State.releasing, l.state);
+    try t.expectEqual(@as(u64, 3), l.n);
+    try t.expectEqual(@as(u64, 6), l.highWater());
+    try t.expect(l.released(3, 40));
+    try t.expectEqual(Outcome{ .refused = .stale }, l.command(.drain, 6, 50));
+    try t.expectEqual(Outcome{ .ok = .close_admission }, l.command(.drain, 7, 60));
 }

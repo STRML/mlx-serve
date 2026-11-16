@@ -43,7 +43,7 @@ pub const Formation = struct {
     fall: *const fn (ctx: *anyopaque, n: u64, link: *anyopaque) void,
     /// A formation thread outlived its unwind limit: the process is poisoned.
     quarantined: *const fn (ctx: *anyopaque) bool,
-    /// Log the cause and `_exit(1)`: an abort of a releasing box, or a failed release send.
+    /// Log the cause and `_exit(1)` after a failed release send.
     exit_process: *const fn (ctx: *anyopaque, n: u64) void,
     peers: *const fn (ctx: *anyopaque) u8,
     /// The stalled op, the last completed collective and the peer waited on, for the abort's log line.
@@ -72,6 +72,7 @@ pub const Health = enum { ok, quarantined, aborting, stalled };
 pub const Snapshot = struct {
     mode: attempt.Mode,
     n: u64,
+    high_water: u64,
     role: attempt.Role,
     state: attempt.State,
     failure: attempt.Failure,
@@ -158,6 +159,7 @@ pub const Switch = struct {
         return .{
             .mode = self.m.mode(),
             .n = self.m.n,
+            .high_water = self.m.highWater(),
             .role = self.m.role,
             .state = self.m.state,
             .failure = self.m.failure,
@@ -256,7 +258,6 @@ pub const Switch = struct {
                 _ = self.formationFailed(n, .cancelled);
             } else self.watch(),
             .await_release => self.watch(),
-            .exit_process => f.exit_process(f.ctx, n),
             .begin_release => return self.beginRelease(f, n),
         }
         return .{ .status = 200, .snap = self.snapshot() };
@@ -446,7 +447,7 @@ pub fn renderSnapshot(buf: []u8, s: Snapshot) []const u8 {
     const rank = if (s.failure_rank) |r| std.fmt.bufPrint(&rank_buf, "{d}", .{r}) catch "null" else "null";
     return std.fmt.bufPrint(buf, "{{\"mode\":\"{s}\",\"n\":{d},\"high_water\":{d},\"role\":\"{s}\",\"state\":\"{s}\",\"failure\":\"{s}\",\"failure_rank\":{s},\"peers\":{d}," ++
         "\"in_flight\":{d},\"admitting\":{},\"quarantined\":{},\"progress\":{s},\"stalled_ms\":{d}}}", .{
-        @tagName(s.mode), s.n,         s.n,           @tagName(s.role), @tagName(s.state), @tagName(s.failure), rank, s.peers,
+        @tagName(s.mode), s.n,         s.high_water,  @tagName(s.role), @tagName(s.state), @tagName(s.failure), rank, s.peers,
         s.in_flight,      s.admitting, s.quarantined, progress,         s.stalled_ms,
     }) catch "{}";
 }
@@ -743,7 +744,7 @@ test "tp1 hands the link to the backend's release; a failed release exits, names
     try t.expect(!sw2.snapshot().admitting);
 }
 
-test "abort of a formed group at the leader is the planned down; a second abort while releasing exits" {
+test "abort of a formed group at the leader is the planned down; a repeat of it changes nothing" {
     var f: Fake = .{};
     defer f.deinit();
     var sw = newSwitch(&f);
@@ -751,8 +752,13 @@ test "abort of a formed group at the leader is the planned down; a second abort 
     try t.expectEqual(@as(u16, 200), sw.command(.abort, 4, 0).status);
     try t.expectEqualStrings("sr", f.calls.items);
     try t.expectEqual(attempt.State.releasing, sw.snapshot().state);
-    _ = sw.command(.abort, 4, 0);
-    try t.expectEqualStrings("srx", f.calls.items);
+    try t.expectEqual(@as(u16, 200), sw.command(.abort, 4, 0).status);
+    try t.expectEqualStrings("sr", f.calls.items);
+    const fenced = sw.command(.abort, 6, 0);
+    try t.expectEqual(@as(u16, 200), fenced.status);
+    try t.expectEqual(attempt.State.releasing, fenced.snap.state);
+    try t.expectEqual(@as(u64, 4), fenced.snap.n);
+    try t.expectEqual(@as(u64, 6), fenced.snap.high_water);
 }
 
 test "abort of a formed group at a follower serves the group until OP_RELEASE, then releases" {
