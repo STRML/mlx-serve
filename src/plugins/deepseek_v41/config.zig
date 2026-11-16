@@ -18,6 +18,14 @@ pub const model_types = [_][]const u8{"deepseek_v41"};
 pub const claims = sdk.claimsByType(&model_types);
 
 pub const Config = v4.Config;
+
+/// Whether a `size`-rank tensor split leaves every rank a whole, non-empty share of each width the split divides:
+/// the attention heads, the output groups (whole groups a rank) and the expert widths.
+pub fn tpGeometryFits(cfg: *const Config, size: u32) bool {
+    if (size == 0) return false;
+    for ([_]u32{ cfg.num_attention_heads, cfg.dsv4_o_groups, cfg.moe_intermediate_size }) |n| if (n == 0 or n % size != 0) return false;
+    return cfg.shared_expert_intermediate_size % size == 0;
+}
 pub const of = v4.of;
 pub const freeParsed = v4.freeParsed;
 
@@ -189,6 +197,18 @@ test "deepseek_v41 config: the release pack parses with its sources, Engram, DSp
     try testing.expectEqual(abi.ThinkingDefault.on, p.chat.thinking_default);
     try testing.expectEqual(abi.EffortVocab.dsv41, p.chat.effort_vocab);
     try testing.expectEqual(@as(u32, 3), p.spec.native_stages);
+}
+
+test "deepseek_v41 config: both release packs split evenly into tensor groups of 2 and 4, not 16" {
+    for ([_][]const u8{ iq3, @embedFile("../../fixtures/model-configs/deepseek_v41-oq2.5e-mtp.json") }) |json| {
+        var p: abi.Parsed = .{};
+        try testing.expect(parseFiles(&.{.{ .name = "config.json", .bytes = json }}, true, &p).isOk());
+        defer freeParsed(&p);
+        const c = of(&p);
+        try testing.expect(c.moe_intermediate_size > 0 and c.dsv4_o_groups > 0);
+        try testing.expect(tpGeometryFits(c, 2) and tpGeometryFits(c, 4));
+        try testing.expect(!tpGeometryFits(c, 16) and !tpGeometryFits(c, 0));
+    }
 }
 
 test "deepseek_v41 config: an experts.bin bank streams, its prompt passed whole" {
