@@ -253,12 +253,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     return loadModel(ctx, s) catch |e| {
-        // Too little free memory is a refusal the host answers by name, not a fault.
-        const refused = switch (@as(anyerror, e)) {
-            error.StreamedRowsDoNotFit, error.Dsv41TpModeSetting, error.Dsv41ShardUneven, error.Dsv41ModeBesideSplit => true,
-            else => false,
-        };
-        if (refused) std.log.warn("deepseek_v41: load refused: {t}", .{e}) else std.log.err("deepseek_v41: load failed: {t}", .{e});
+        if (refusedLoad(e)) std.log.warn("deepseek_v41: load refused: {t}", .{e}) else std.log.err("deepseek_v41: load failed: {t}", .{e});
         out.* = switch (@as(anyerror, e)) {
             error.OutOfMemory => Verdict.refuse(.failed, "deepseek_v41: out of memory"),
             error.MissingWeight => Verdict.refuse(.failed, "deepseek_v41: a weight is missing"),
@@ -307,6 +302,20 @@ fn mtpSetting(settings_json: []const u8) ?bool {
     const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
     return parsed.value.mtp;
+}
+
+/// A load the pack or its settings refuse by name (too little free memory, a tensor mode it cannot serve), not a fault.
+fn refusedLoad(e: anyerror) bool {
+    return switch (e) {
+        error.StreamedRowsDoNotFit, error.Dsv41TpModeSetting, error.Dsv41ShardUneven, error.Dsv41ModeBesideSplit => true,
+        error.Dsv41RowCutOutsideQuant, error.Dsv41RowCutGguf, error.Dsv41RowCutUneven => true,
+        else => false,
+    };
+}
+
+test "deepseek_v41: a tensor mode the row cut cannot serve is a refusal, not a load failure" {
+    for ([_]anyerror{ error.Dsv41RowCutOutsideQuant, error.Dsv41RowCutGguf, error.Dsv41RowCutUneven, error.Dsv41ShardUneven }) |e| try std.testing.expect(refusedLoad(e));
+    try std.testing.expect(!refusedLoad(error.MissingWeight));
 }
 
 /// The per-model `tp_mode` setting (`{"tp_mode": {"rank": 1, "size": 4}}`): this box's rank of the tensor group whose
