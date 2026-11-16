@@ -218,7 +218,26 @@ fn configFor(sh: *Shape, rows: usize) !mlx.mlx_fast_metal_kernel_config {
     return cfg;
 }
 
-/// Every launch shape's kernel and configs freed (the model's deinit; a second call finds none).
+/// The models in this process that serve through the table (a box holds one per mode).
+var models: usize = 0;
+
+/// A model built: the table lives until its `release`.
+pub fn retain() void {
+    models += 1;
+}
+
+/// A model gone: the table is freed with the last one.
+pub fn release() void {
+    models -|= 1;
+    if (models == 0) deinit();
+}
+
+/// The launch shapes made so far.
+pub fn shapesHeld() usize {
+    return n_shapes;
+}
+
+/// Every launch shape's kernel and configs freed (a second call finds none).
 pub fn deinit() void {
     for (shapes[0..n_shapes]) |*sh| {
         for (&sh.cfgs) |*c| {

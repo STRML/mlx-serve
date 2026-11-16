@@ -943,6 +943,8 @@ fn importForAllocationTest(gpa: std.mem.Allocator, m: *const dsv41.Dsv41Model, i
     defer sn.deinit(gpa);
 }
 
+const gemv_twin = @import("decode/gemv_twin.zig");
+
 /// A tensor group in one process, for a rank-0 model whose peers are absent: every rank's part is the sum.
 const LoneGroup = struct {
     var sums: usize = 0;
@@ -1101,6 +1103,34 @@ test "deepseek_v41 modes: on the wide prompt path the whole model gives today's 
     var pos: u32 = 0;
     for (proof.steps, want) |st, w| {
         _ = mlx.mlx_array_free(try dsv41.prefill(tp, testing.allocator, &.{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5 }, null));
+        const got = try stepLogits(t, 1, st, pos);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(f32, w, got);
+        pos += @intCast(st.ids.len);
+    }
+}
+
+test "deepseek_v41 modes: freeing the TP4 model leaves the whole model's launch table and its logits as they were" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41TpFiles(arena.allocator(), 7);
+    const want = try wholeSteps(files);
+    defer for (want) |w| testing.allocator.free(w);
+    LoneGroup.arm();
+    defer LoneGroup.disarm();
+    const t = try Twin.openWith(files, "", tp4_setting);
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    _ = mlx.mlx_array_free(try dsv41.prefill(m.modes.tp.?, testing.allocator, &.{ 3, 1, 4, 1, 5, 9, 2, 6 }, null));
+    const held = gemv_twin.shapesHeld();
+    try testing.expect(held > 0);
+    m.modes.tp.?.deinit();
+    m.modes.tp = null;
+    try testing.expectEqual(held, gemv_twin.shapesHeld());
+    var pos: u32 = 0;
+    for (proof.steps, want) |st, w| {
         const got = try stepLogits(t, 1, st, pos);
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(f32, w, got);

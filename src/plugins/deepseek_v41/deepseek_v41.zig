@@ -408,6 +408,8 @@ pub const DsparkW = struct {
     markov_embed: A, // [vocab, rank]
     markov_head: A, // [vocab, rank] in the activation dtype: a draft step reads all of it
     conf: A, // f32 [1, dim + rank]
+    /// `markov.exact(conf)`, asked at load.
+    conf_exact: bool = false,
 };
 
 /// Rope as MLX `fast_rope` periods (`1 / inv_freq`), and their negation
@@ -572,7 +574,7 @@ pub const Dsv41Model = struct {
         _ = mlx.mlx_fast_metal_kernel_free(self.kv_row_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.engram_kernel);
         self.dec.deinit();
-        gtwin.deinit();
+        gtwin.release();
         self.freeQuant();
         freeRegions(self);
         self.gpa.destroy(self);
@@ -1822,6 +1824,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             .markov_head = if (getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) != null) try ownDense(m, w, rank, "mtp.{d}.markov_head.markov_w2", .{last}, m.act) else try ownDense(m, w, rank, "mtp.{d}.markov_head.head", .{last}, m.act),
             .conf = try ownDense(m, w, cfg.hidden_size + rank, "mtp.{d}.confidence_head.proj", .{last}, .float32),
         };
+        m.dspark.?.conf_exact = try markov.exact(m.dspark.?.conf);
+        log.info("deepseek_v41: Markov chain: the confidence head's weights are {s}\n", .{if (m.dspark.?.conf_exact) "16-bit floats' values: its logit is the last kernel's" else "not all 16-bit floats' values: its logit stays on MLX's ops"});
         m.n_mtp = n_stages;
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
         m.ds_block = cfg.dsv4_dspark_block_size;
@@ -1844,6 +1848,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     // The ring twins compiled now, not in a prompt's first wide layer (FLASH_ATTN on: the flash kernel and its heads
     // twin in their place).
     if (m.attn_gather != null) try warmRing(m);
+    gtwin.retain();
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages{s}{s}\n", .{ n_layers, m.engrams.len, n_stages, if (opts.quant != null) ", weights on " else "", if (opts.quant) |q| q.name() else "" });
     if (m.dec.moe_fp4 != null) log.info("deepseek_v41: fused mxfp4 MoE decode kernels on\n", .{});
     return m;
@@ -6872,7 +6877,7 @@ fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool
     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
     // The fused chain (`markov.chain`: the op chain's bytes in B + 1 launches), null for a draft it does not take (the op
     // chain below).
-    const fused: ?markov.Out = try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = cur, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .want_conf = want_conf, .keep = keep_logits });
+    const fused: ?markov.Out = try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = cur, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .cw_exact = ds.conf_exact, .want_conf = want_conf, .keep = keep_logits });
     if (fused) |f| {
         _ = try sc.keep(f.toks);
         if (f.conf) |fc| _ = try sc.keep(fc);
