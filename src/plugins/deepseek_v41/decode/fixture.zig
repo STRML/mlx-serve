@@ -747,7 +747,7 @@ test "dsv41 cache identity: a model and its tensor rank 0 hash the same layout" 
     try std.testing.expect(split.m.cfg.num_attention_heads != whole.m.cfg.num_attention_heads);
     const a = try dsv41.cacheLayout(whole.m);
     const b = try dsv41.cacheLayout(split.m);
-    try std.testing.expectEqual(a.settings, b.settings);
+    try std.testing.expectEqualDeep(a, b);
 }
 
 /// One step's input rows: a stream and its mix.
