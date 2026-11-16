@@ -16,6 +16,7 @@ pub const fns = struct {
     pub const dsv41_vision_forward = Dsv41Vision.forward;
     pub const dsv41_vision_deinit = Dsv41Vision.deinit;
     // the Thunderbolt cluster's worker (`mlx-serve dist-worker`): whole models served for rank 0
+    pub const dsv41_serve_steps = @import("../cluster/distributed.zig").serveDsv41Steps;
     pub const cluster_worker = @import("../cluster/distributed.zig").cmdWorker;
     // Sushi packs' EXL3 routed experts
     pub const exl3_routed = @import("../../../sdk/quant/exl3/format.zig").routed;

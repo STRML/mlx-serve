@@ -16,6 +16,7 @@ pub const Known = error{
     InsufficientMemory,
     DistWorkerNotJoined,
     DistSwitchActive,
+    FallRequested,
     DistTeardownWrongThread,
     DistTeardownBusy,
     LoadFailed,
@@ -74,4 +75,8 @@ test "err_name: a known name comes back as the same error; an unknown one keeps 
     try std.testing.expectEqual(error.MissingVisionWeights, toError("MissingVisionWeights"));
     try std.testing.expectEqualStrings("InvalidQwen4Indexer", last());
     try check(null);
+}
+
+test "dist switch worker: FallRequested survives the compile-unit error bridge" {
+    try std.testing.expectEqual(error.FallRequested, toError("FallRequested"));
 }

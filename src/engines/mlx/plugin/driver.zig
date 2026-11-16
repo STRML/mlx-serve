@@ -61,6 +61,13 @@ pub const Bound = struct {
     /// Each layer's kind (`CacheHooks.layout`), `.full` past the layout or without one.
     kinds: [128]abi.LayerKind = @splat(.full),
 
+    pub fn swapMode(b: *const Bound, to: abi.ServingMode) error{SwapFailed}!void {
+        if (b.table.size < @offsetOf(abi.ModelTable, "swap_mode") + @sizeOf(@FieldType(abi.ModelTable, "swap_mode"))) return error.SwapFailed;
+        const swap = b.table.swap_mode orelse return error.SwapFailed;
+        const verdict = swap(b.model, to);
+        if (!verdict.isOk()) return error.SwapFailed;
+    }
+
     /// A layer holding recurrent state a batched tick merges.
     pub fn recurrentAt(b: *const Bound, layer: usize) bool {
         return layer < b.kinds.len and switch (b.kinds[layer]) {
@@ -2028,7 +2035,7 @@ test "absent and short auxiliary tables refuse without calling hooks" {
             7 => hooks.size = @offsetOf(abi.AuxHooks, "import_plan"),
             8 => hooks.size = @offsetOf(abi.AuxHooks, "export_arrays"),
             9 => hooks.size = @offsetOf(abi.AuxHooks, "import_arrays"),
-            10 => hooks.size = @sizeOf(abi.AuxHooks) - 1,
+            10 => hooks.size = @offsetOf(abi.AuxHooks, "import_arrays") + @sizeOf(@FieldType(abi.AuxHooks, "import_arrays")) - 1,
             11 => {
                 hooks.size = @sizeOf(abi.AuxHooks);
                 cache.size = @offsetOf(abi.CacheHooks, "aux");
@@ -2279,4 +2286,37 @@ test "plugin driver: a native round and a finish move moe_seq_offset with cache.
     try t.expectEqual(@as(u64, 21), try nativeFinish(&x, &ctx, 1));
     try t.expectEqual(@as(usize, 21), kv.step);
     try t.expectEqual(kv.step, off);
+}
+
+test "plugin swap mode: ABI reaches DSv4.1 and refuses unsupported or absent modes by name" {
+    const p = @import("../../../plugins/deepseek_v41/plugin.zig");
+    var whole: p.Module = undefined;
+    whole.dec_state = null;
+    var tensor: p.Module = undefined;
+    tensor.dec_state = null;
+    var m: p.Model = undefined;
+    m.mdl = &whole;
+    m.modes = .{ .tp1 = &whole, .tp = &tensor };
+    m.parked = .empty;
+    m.idle = null;
+    m.owner = 42;
+    m.tp_ids = .{};
+    var b: Bound = .{ .table = &p.table, .model = &m };
+    try b.swapMode(.tp);
+    try std.testing.expectEqual(.tp, m.modes.active);
+    try std.testing.expectEqual(&tensor, m.mdl);
+    try std.testing.expectEqual(@as(u32, 0), m.owner);
+    try b.swapMode(.tp1);
+    try std.testing.expectEqual(.tp1, m.modes.active);
+    try std.testing.expectEqual(&whole, m.mdl);
+    m.modes.tp = null;
+    try std.testing.expectError(error.SwapFailed, b.swapMode(.tp));
+    try std.testing.expectEqual(.tp1, m.modes.active);
+    b.table = &@import("../../../plugins/llama/plugin.zig").table;
+    try std.testing.expectError(error.SwapFailed, b.swapMode(.tp));
+    m.modes.tp = &tensor;
+    var older = p.table;
+    older.size = @offsetOf(abi.ModelTable, "swap_mode");
+    b.table = &older;
+    try std.testing.expectError(error.SwapFailed, b.swapMode(.tp));
 }

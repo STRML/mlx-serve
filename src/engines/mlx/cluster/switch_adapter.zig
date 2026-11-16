@@ -5,9 +5,11 @@ const switcher = @import("switch.zig");
 const controller = @import("../../../host/internal/switch.zig");
 const bridge = @import("../../../host/internal/formation.zig");
 const Scheduler = @import("../../../host/gpu_thread/scheduler.zig").Scheduler;
+const abi = @import("../../../abi/plugin.zig");
+const driver = @import("../plugin/driver.zig");
 const log = @import("../../../sdk/util/log.zig");
 
-pub const SwapHook = *const fn (u64, *distributed.Link, switcher.Role) anyerror!void;
+pub const SwapHook = *const fn (u64, *distributed.Link, switcher.Role, abi.ServingMode) anyerror!void;
 var swap_hook: std.atomic.Value(?SwapHook) = .init(null);
 var warned: std.atomic.Value(bool) = .init(false);
 
@@ -154,18 +156,25 @@ const Work = struct {
                     self.leave() catch distributed.exitSwitchAbort(self.n);
                     return error.SwapFailed;
                 };
+                active_mode = .{ .n = self.n, .link = self.link };
                 switcher.activate(self.n) catch {
+                    self.restore() catch distributed.exitSwitchAbort(self.n);
                     self.leave() catch distributed.exitSwitchAbort(self.n);
                     return error.SwapFailed;
                 };
             },
             .release => {
+                try self.restore();
                 _ = self.owner.sw.releasing(self.n);
                 try self.releaseLink();
                 _ = self.owner.sw.released(self.n);
             },
-            .fall => try switcher.fall(self.n, self.link),
+            .fall => {
+                try self.restore();
+                try switcher.fall(self.n, self.link);
+            },
             .follower_fell => {
+                try self.restore();
                 try switcher.fall(self.n, self.link);
                 _ = self.owner.sw.formationFailed(self.n, .release_timeout);
             },
@@ -177,7 +186,16 @@ const Work = struct {
             if (!warned.swap(true, .acq_rel)) log.err("no TP mode is wired (step 1)\n", .{});
             return error.SwapFailed;
         };
-        try hook(self.n, self.link, if (self.link.rank == 0) .leader else .follower);
+        try hook(self.n, self.link, if (self.link.rank == 0) .leader else .follower, .tp);
+    }
+
+    fn restore(self: *Work) !void {
+        const live = active_mode orelse return;
+        if (live.n != self.n or live.link != self.link) return;
+        active_mode = null;
+        follower_pending.store(false, .release);
+        const hook = swap_hook.load(.acquire) orelse return;
+        try hook(self.n, self.link, if (self.link.rank == 0) .leader else .follower, .tp1);
     }
 
     fn leave(self: *Work) !void {
@@ -200,6 +218,9 @@ var scheduler: ?*Scheduler = null;
 var head: ?*Work = null;
 var tail: ?*Work = null;
 var pending: std.atomic.Value(bool) = .init(false);
+var follower_pending: std.atomic.Value(bool) = .init(false);
+var follower: Work = undefined;
+var active_mode: ?struct { n: u64, link: *distributed.Link } = null;
 
 fn lock() void {
     while (!mu.tryLock()) std.atomic.spinLoopHint();
@@ -213,11 +234,70 @@ pub fn bindInferenceThread(sch: ?*Scheduler) void {
     scheduler = sch;
 }
 
+pub fn installSwapHook() void {
+    setSwapHook(&swapMode);
+}
+
+fn modelTransformer() !*@import("../transformer.zig").Transformer {
+    const self = installed orelse return error.SwapFailed;
+    const sch = scheduler orelse return error.SwapFailed;
+    const entry = sch.registry.peekByPath(self.context.model_dir) orelse return error.SwapFailed;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    if (entry.state != .ready) return error.SwapFailed;
+    return entry.transformer orelse error.SwapFailed;
+}
+
+fn modelBinding() !*driver.Bound {
+    const xfm = try modelTransformer();
+    return xfm.plugin orelse error.SwapFailed;
+}
+
+pub fn serveFollower() bool {
+    if (!follower_pending.load(.acquire)) return false;
+    var work = follower;
+    const snap = work.owner.sw.snapshot();
+    if (snap.quarantined) distributed.exitSwitchAbort(work.n);
+    if (snap.mode != .tp4) return false;
+    if (!follower_pending.swap(false, .acq_rel)) return false;
+    distributed.parkInferenceLoop();
+    defer distributed.tickInferenceLoop();
+    const xfm = modelTransformer() catch |err| distributed.exitWorker(err);
+    const m = @import("../plugin/intree.zig").dsv41(xfm) orelse distributed.exitWorker(error.NotPluginServed);
+    const released = @import("../modules/call.zig").call("dsv41_serve_steps", .{ work.owner.sw.io, std.heap.page_allocator, work.link, m }) catch |err| {
+        if (err != error.FallRequested) distributed.exitWorker(err);
+        followerFell(work.n, work.link);
+        return true;
+    };
+    if (!released) distributed.exitWorker(null);
+    work.run();
+    if (work.failure != null) distributed.exitSwitchAbort(work.n);
+    return true;
+}
+
+fn swapMode(n: u64, link: *distributed.Link, role: switcher.Role, to: abi.ServingMode) !void {
+    if (to == .tp1) {
+        defer distributed.clearDsv41Tp();
+        const b = try modelBinding();
+        return b.swapMode(to);
+    }
+    distributed.installDsv41Tp(link);
+    errdefer distributed.clearDsv41Tp();
+    const b = try modelBinding();
+    try b.swapMode(to);
+    if (role == .follower) {
+        follower = .{ .owner = installed.?, .n = n, .link = link, .op = .release };
+        follower_pending.store(true, .release);
+    }
+}
+
 pub fn unbindInferenceThread() void {
     lock();
     defer mu.unlock();
     inference_thread = null;
     scheduler = null;
+    active_mode = null;
+    follower_pending.store(false, .release);
     while (head) |work| {
         head = work.next;
         work.failure = "Unavailable";
@@ -228,7 +308,7 @@ pub fn unbindInferenceThread() void {
 }
 
 pub fn hasPending() bool {
-    return pending.load(.acquire);
+    return pending.load(.acquire) or follower_pending.load(.acquire);
 }
 
 fn dispatch(work: *Work) void {
@@ -266,7 +346,10 @@ pub fn drain() bool {
         lock();
         const work = head orelse {
             mu.unlock();
-            return ran;
+            if (serveFollower()) return true;
+            if (!follower_pending.load(.acquire)) return ran;
+            std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(1), .real) catch {};
+            continue;
         };
         head = work.next;
         if (head == null) tail = null;

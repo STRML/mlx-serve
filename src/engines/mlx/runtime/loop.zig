@@ -58,6 +58,7 @@ pub const idleEvictTickMs = @import("../../../host/http/server.zig").idleEvictTi
 
 pub fn inferenceLoop(ctx: ThreadCtx) void {
     const sch = ctx.scheduler;
+    switch_adapter.installSwapHook();
     switch_adapter.bindInferenceThread(sch);
     defer switch_adapter.unbindInferenceThread();
     const params = ctx.params;

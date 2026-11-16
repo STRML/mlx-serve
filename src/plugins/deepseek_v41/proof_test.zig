@@ -1064,15 +1064,15 @@ test "codec refuses changed loaded settings and invalid IDs before allocating" {
     try e.capture(t, &p);
     defer e.deinit();
     const ids = p[0 .. p.len - 1];
-    const cfg = m.mdl.cfg;
-    defer m.mdl.cfg = cfg;
+    const cfg = m.mdl.whole_cfg;
+    defer m.mdl.whole_cfg = cfg;
     for (0..5) |change| {
         switch (change) {
-            0 => m.mdl.cfg.sliding_window += 1,
-            1 => m.mdl.cfg.dsv4_dspark_target_layers[0] += 1,
-            2 => m.mdl.cfg.quant_bits += 1,
-            3 => m.mdl.cfg.dsv41_engram_compressed_vocab += 1,
-            4 => m.mdl.cfg.dsv4_compress_ratios[2] += 1,
+            0 => m.mdl.whole_cfg.sliding_window += 1,
+            1 => m.mdl.whole_cfg.dsv4_dspark_target_layers[0] += 1,
+            2 => m.mdl.whole_cfg.quant_bits += 1,
+            3 => m.mdl.whole_cfg.dsv41_engram_compressed_vocab += 1,
+            4 => m.mdl.whole_cfg.dsv4_compress_ratios[2] += 1,
             else => unreachable,
         }
         var peak: u64 = 123;
@@ -1080,7 +1080,7 @@ test "codec refuses changed loaded settings and invalid IDs before allocating" {
         try testing.expectEqual(abi.Verdict.Code.failed, verdict.code);
         try testing.expectEqual(@as(u64, 0), peak);
         try expectInvalidImport(t, &e, ids, e.arrays());
-        m.mdl.cfg = cfg;
+        m.mdl.whole_cfg = cfg;
     }
     const stages = m.mdl.n_mtp;
     m.mdl.n_mtp = 0;

@@ -1139,6 +1139,14 @@ pub fn exitSwitchAbort(n: u64) noreturn {
     std.c._exit(1);
 }
 
+pub fn exitWorker(err: ?anyerror) noreturn {
+    if (err) |e| {
+        noteDistExit(.worker_error, 0, null);
+        log.err("[dist] worker: {s}\n", .{@errorName(e)});
+    }
+    std.process.exit(if (err != null) 1 else 0);
+}
+
 pub fn switchStallNote(buf: []u8) []const u8 {
     const c = cluster();
     lock(&c.state_mu);
@@ -2205,22 +2213,9 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
             const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts), .stages = stages };
             self.plan_id = try pl.send(&self.link, model_dir);
             self.planned = true;
-            cluster().tp_link = &self.link;
-            dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
-            dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
-            dsv41_mod.clusterHooks().tp_step = &dsv41TpStep;
-            dsv41_mod.clusterHooks().tp_pipe = if (tpPipeWanted(&self.link)) &dsv41TpPipe else null;
+            installDsv41Tp(&self.link);
             log.info("[dist] tensor: decode steps {s}\n", .{if (dsv41_mod.tpPipeOn()) "keep their token on the GPU, each rung on the bells alone (DSV41_TP_PIPE=0: an id header per step)" else "each send their id in a header"});
-            dsv41_mod.clusterHooks().tp_batch = &dsv41TpBatch;
-            dsv41_mod.clusterHooks().tp_draft = &dsv41TpDraft;
-            const ds_pipe = dsparkPipeWanted(&self.link);
-            dsv41_mod.clusterHooks().tp_draft_pipe = if (ds_pipe) &dsv41TpDraftPipe else null;
-            dsv41_mod.clusterHooks().tp_verify_pipe = if (ds_pipe) &dsv41TpVerifyPipe else null;
-            dsv41_mod.clusterHooks().tp_chained = &dsv41TpChained;
-            log.info("[dist] tensor: DSpark drafts and verifies {s}\n", .{if (ds_pipe) "of the live state rung on the bells, their values after the byte (DSV41_DSPARK_PIPE)" else "each send a header"});
-            dsv41_mod.clusterHooks().tp_free = &dsv41TpFree;
-            dsv41_mod.clusterHooks().tp_snap = &dsv41TpSnap;
-            dsv41_mod.clusterHooks().tp_load = &dsv41TpLoad;
+            log.info("[dist] tensor: DSpark drafts and verifies {s}\n", .{if (dsparkPipeWanted(&self.link)) "of the live state rung on the bells, their values after the byte (DSV41_DSPARK_PIPE)" else "each send a header"});
             return;
         },
         .rows => {
@@ -2237,6 +2232,36 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
     self.plan_id = try pl.send(&self.link, model_dir);
     self.planned = true;
     dsv41_mod.clusterHooks().pair_exchange = &dsv41Exchange;
+}
+
+pub fn installDsv41Tp(link: *const Link) void {
+    cluster().tp_link = link;
+    cluster().tp_live = null;
+    cluster().tp_spec = null;
+    cluster().tp_sums = 0;
+    cluster().tp_values = 0;
+    cluster().tp_last = .{};
+    dsv41_mod.clusterHooks().* = .{ .tp_sum = &dsv41TpSum, .tp_gather = &dsv41TpGather };
+    if (link.rank != 0) return;
+    const hooks = dsv41_mod.clusterHooks();
+    hooks.tp_step = &dsv41TpStep;
+    hooks.tp_pipe = if (tpPipeWanted(link)) &dsv41TpPipe else null;
+    hooks.tp_batch = &dsv41TpBatch;
+    hooks.tp_draft = &dsv41TpDraft;
+    const ds_pipe = dsparkPipeWanted(link);
+    hooks.tp_draft_pipe = if (ds_pipe) &dsv41TpDraftPipe else null;
+    hooks.tp_verify_pipe = if (ds_pipe) &dsv41TpVerifyPipe else null;
+    hooks.tp_chained = &dsv41TpChained;
+    hooks.tp_free = &dsv41TpFree;
+    hooks.tp_snap = &dsv41TpSnap;
+    hooks.tp_load = &dsv41TpLoad;
+}
+
+pub fn clearDsv41Tp() void {
+    dsv41_mod.clusterHooks().* = .{};
+    cluster().tp_link = null;
+    cluster().tp_live = null;
+    cluster().tp_spec = null;
 }
 
 /// DeepSeek-V4.1 tensor, every rank: `x` summed over the group, lazily on this thread's CPU stream.
@@ -2265,26 +2290,41 @@ fn noteTpStep(p0: usize, rows: usize) void {
     c.tp_last = .{ .p0 = p0, .rows = rows };
 }
 
+fn tpLeader(wait_ready: bool) !*const Link {
+    const link = cluster().tp_link orelse return error.DistWorkerNotJoined;
+    if (link.rank != 0) return error.DistWorkerNotJoined;
+    if (peer()) |p| if (&p.link == link and !p.ready) {
+        if (!wait_ready) return error.DistWorkerNotJoined;
+        try p.awaitReady();
+    };
+    return link;
+}
+
+fn noteTpExchange(link: *const Link) void {
+    if (peer()) |p| if (&p.link == link) {
+        p.exchanges += 1;
+    };
+}
+
 /// Host, DeepSeek-V4.1 tensor: one step's ids to the worker, which runs the same forward on its halves.
 fn dsv41TpStep(ids: []const u32, p0: usize, snap: bool, all: bool, vo: dsv41_mod.VerifyOpts, gen: u64, images: ?mlx.mlx_array) anyerror!void {
     const verify = vo.open;
-    const self = peer() orelse return error.DistWorkerNotJoined;
-    if (!self.ready) try self.awaitReady();
+    const link = try tpLeader(true);
     noteTpStep(p0, ids.len);
     // Ids fit an int32 (the vocabulary is checked before any forward).
     const a = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
-    self.exchanges += 1;
+    noteTpExchange(link);
     const flags = @as(i32, @intFromBool(snap)) | @as(i32, @intFromBool(all)) << 1 | @as(i32, @intFromBool(verify)) << 2 | @as(i32, @intFromBool(images != null)) << 3 | @as(i32, vo.bits()) << 4;
     // Sent now, on the CPU stream alone: `sendOrdered` chains its sends through the GPU stream, and a GPU wait on a send
     // that blocks until the worker's receive deadlocked MLX's fast fences. Each worker gets its whole step before the
     // next, and all of them before this rank builds the step's first sum: a worker blocks only in a sum, which needs
     // every rank, so no send waits on a rank that waits on another.
-    for (1..self.link.size) |k| {
+    for (1..link.size) |k| {
         const dst: u32 = @intCast(k);
-        try sendMsg(&self.link, tpHeader(ids, p0, flags, gen), dst);
-        if (ids.len > 1) try sendNow(&self.link, a, dst);
-        if (images) |r| try sendNow(&self.link, r, dst);
+        try sendMsg(link, tpHeader(ids, p0, flags, gen), dst);
+        if (ids.len > 1) try sendNow(link, a, dst);
+        if (images) |r| try sendNow(link, r, dst);
     }
     cluster().tp_live = TpLive.after(gen, p0 + ids.len, verify);
     cluster().tp_spec = TpSpec.afterStep(gen, p0, ids.len, verify);
@@ -2314,25 +2354,25 @@ const TpSpec = union(enum) {
 };
 
 fn dsv41TpDraftPipe(gen: u64, p0: usize, t1: u32) anyerror!bool {
-    const self = peer() orelse return error.DistWorkerNotJoined;
+    const link = try tpLeader(true);
     const c = cluster();
     const keep = TpSpec.keep(c.tp_spec, gen, p0) orelse return false;
     noteTpStep(p0, 0);
     var bytes: [6]u8 = .{ Bell.draft_byte, keep, 0, 0, 0, 0 };
     std.mem.writeInt(u32, bytes[2..6], t1, .little);
-    for (1..self.link.size) |k| try self.link.bells[k].say(&bytes);
+    for (1..link.size) |k| try link.bells[k].say(&bytes);
     c.tp_spec = .{ .drafted = .{ .gen = gen, .n = p0 } };
     return true;
 }
 
 fn dsv41TpVerifyPipe(gen: u64, n: usize, rows: usize, flags: u8) anyerror!bool {
-    const self = peer() orelse return error.DistWorkerNotJoined;
+    const link = try tpLeader(true);
     const c = cluster();
     if (!TpSpec.follows(c.tp_spec, gen, n, rows)) return false;
     noteTpStep(n, rows);
-    self.exchanges += 1;
+    noteTpExchange(link);
     const bytes = [_]u8{ Bell.verify_byte, @intCast(rows), flags };
-    for (1..self.link.size) |k| try self.link.bells[k].say(&bytes);
+    for (1..link.size) |k| try link.bells[k].say(&bytes);
     c.tp_spec = TpSpec.afterStep(gen, n, rows, true);
     return true;
 }
@@ -2369,12 +2409,12 @@ const TpLive = struct {
 /// every rank takes the step's token from rank 0 in its graph (`dsv41.tpToken`). False when the workers did not last
 /// step `gen` to `n`, or heard anything since: the step goes with its header.
 fn dsv41TpPipe(gen: u64, n: usize) anyerror!bool {
-    const self = peer() orelse return error.DistWorkerNotJoined;
+    const link = try tpLeader(true);
     const c = cluster();
     if (!TpLive.follows(c.tp_live, gen, n)) return false;
     noteTpStep(n, 1);
-    self.exchanges += 1;
-    for (1..self.link.size) |k| try self.link.bells[k].pipe();
+    noteTpExchange(link);
+    for (1..link.size) |k| try link.bells[k].pipe();
     c.tp_live = .{ .gen = gen, .n = n + 1 };
     c.tp_spec = null;
     return true;
@@ -2390,8 +2430,7 @@ fn tpPipeWanted(link: *const Link) bool {
 
 /// Host: one batched step over the states `gens`, each at its position `p0s[k]` with its ids `chunks[k]`.
 fn dsv41TpBatch(gens: []const u64, p0s: []const usize, chunks: []const []const u32, verify: bool) anyerror!void {
-    const self = peer() orelse return error.DistWorkerNotJoined;
-    if (!self.ready) try self.awaitReady();
+    const link = try tpLeader(true);
     var rows: usize = 0;
     for (chunks) |ch| rows += ch.len;
     noteTpStep(p0s[0], rows);
@@ -2400,10 +2439,10 @@ fn dsv41TpBatch(gens: []const u64, p0s: []const usize, chunks: []const []const u
     tpBatchPack(body, gens, p0s, chunks);
     const a = mlx.mlx_array_new_data(body.ptr, &[_]c_int{@intCast(body.len)}, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
-    self.exchanges += 1;
-    for (1..self.link.size) |k| {
-        try sendMsg(&self.link, .{ OP_DSV41_TP_BATCH, @intCast(gens.len), @intCast(rows), @intFromBool(verify), 0, 0, 0, 0 }, @intCast(k));
-        try sendNow(&self.link, a, @intCast(k));
+    noteTpExchange(link);
+    for (1..link.size) |k| {
+        try sendMsg(link, .{ OP_DSV41_TP_BATCH, @intCast(gens.len), @intCast(rows), @intFromBool(verify), 0, 0, 0, 0 }, @intCast(k));
+        try sendNow(link, a, @intCast(k));
     }
 }
 
@@ -2417,8 +2456,7 @@ fn dsv41DraftShard(config: *const model_mod.ModelConfig, size: u32) bool {
 /// Host: a sharded DSpark draft over the states `gens`, each at `p0s[k]` drafting from `t1s[k]` (a batch body with one
 /// id a state). Its sums are not a step's: the tally restarts with no rows, so the next step logs only its own.
 fn dsv41TpDraft(gens: []const u64, p0s: []const usize, t1s: []const u32) anyerror!void {
-    const self = peer() orelse return error.DistWorkerNotJoined;
-    if (!self.ready) try self.awaitReady();
+    const link = try tpLeader(true);
     noteTpStep(p0s[0], 0);
     var chunks: [dsv41_mod.region_rows][]const u32 = undefined;
     for (chunks[0..t1s.len], t1s) |*ch, *t| ch.* = t[0..1];
@@ -2427,18 +2465,17 @@ fn dsv41TpDraft(gens: []const u64, p0s: []const usize, t1s: []const u32) anyerro
     tpBatchPack(body[0..len], gens, p0s, chunks[0..gens.len]);
     const a = mlx.mlx_array_new_data(&body, &[_]c_int{@intCast(len)}, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
-    for (1..self.link.size) |k| {
-        try sendMsg(&self.link, .{ OP_DSV41_TP_DRAFT, @intCast(gens.len), 0, 0, 0, 0, 0, 0 }, @intCast(k));
-        try sendNow(&self.link, a, @intCast(k));
+    for (1..link.size) |k| {
+        try sendMsg(link, .{ OP_DSV41_TP_DRAFT, @intCast(gens.len), 0, 0, 0, 0, 0, 0 }, @intCast(k));
+        try sendNow(link, a, @intCast(k));
     }
     if (gens.len == 1) cluster().tp_spec = .{ .drafted = .{ .gen = gens[0], .n = p0s[0] } };
 }
 
 /// Host: the state `gen` is gone; the workers drop their copies.
 fn dsv41TpFree(gen: u64) void {
-    const self = peer() orelse return;
-    if (!self.ready) return;
-    sendAll(&self.link, .{ OP_DSV41_TP_FREE, @intCast(gen & 0x7fffffff), @intCast(gen >> 31), 0, 0, 0, 0, 0 });
+    const link = tpLeader(false) catch return;
+    sendAll(link, .{ OP_DSV41_TP_FREE, @intCast(gen & 0x7fffffff), @intCast(gen >> 31), 0, 0, 0, 0, 0 });
 }
 
 /// A control message with no payload to every worker. Best effort, like the pair's: a worker it misses has left,
@@ -2449,29 +2486,28 @@ fn sendAll(link: *const Link, m: Msg) void {
 
 /// Host: the snapshot `id` it read from disk, as its ids and then `dsv41.tpLoadPlan`'s tensors in order.
 fn dsv41TpLoad(id: u64, ids: []const u32, tensors: []const mlx.mlx_array) anyerror!void {
-    const self = peer() orelse return error.DistWorkerNotJoined;
-    if (!self.ready) try self.awaitReady();
+    const link = try tpLeader(true);
     cluster().tp_link.?.state.?.watchdog.progress(@intCast(crt.monotonicMs()));
     const a = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
-    const t0 = io_util.nowUsMonotonic(cluster().group.?.io);
+    const io = if (cluster().group) |g| g.io else std.Io.Threaded.global_single_threaded.io();
+    const t0 = io_util.nowUsMonotonic(io);
     var bytes: usize = 0;
     for (tensors) |t| bytes += mlx.mlx_array_size(t) * mlx.mlx_array_itemsize(t);
     // One worker after another, each its whole snapshot.
-    for (1..self.link.size) |k| {
+    for (1..link.size) |k| {
         const dst: u32 = @intCast(k);
-        try sendMsg(&self.link, .{ OP_DSV41_TP_LOAD, @intCast(id & 0x7fffffff), @intCast(id >> 31), @intCast(ids.len & 0x7fffffff), @intCast(ids.len >> 31), @intCast(tensors.len), 0, 0 }, dst);
-        try sendNow(&self.link, a, dst);
-        for (tensors) |t| try sendNow(&self.link, t, dst);
+        try sendMsg(link, .{ OP_DSV41_TP_LOAD, @intCast(id & 0x7fffffff), @intCast(id >> 31), @intCast(ids.len & 0x7fffffff), @intCast(ids.len >> 31), @intCast(tensors.len), 0, 0 }, dst);
+        try sendNow(link, a, dst);
+        for (tensors) |t| try sendNow(link, t, dst);
     }
-    if (self.link.size >= 2) log.info("[dist] snapshot {d}: {d} MiB to {d} workers in {d} ms\n", .{ id, bytes >> 20, self.link.size - 1, @divTrunc(io_util.nowUsMonotonic(cluster().group.?.io) - t0, 1000) });
+    if (link.size >= 2) log.info("[dist] snapshot {d}: {d} MiB to {d} workers in {d} ms\n", .{ id, bytes >> 20, link.size - 1, @divTrunc(io_util.nowUsMonotonic(io) - t0, 1000) });
 }
 
 /// Host: what it did with a snapshot (`dsv41.SnapOp`); the worker does the same with its copy.
 fn dsv41TpSnap(op: dsv41_mod.SnapOp, a: u64, b: u64) void {
-    const self = peer() orelse return;
-    if (!self.ready) return;
-    sendAll(&self.link, .{ OP_DSV41_TP_SNAP, @backingInt(op), @intCast(a & 0x7fffffff), @intCast(a >> 31), @intCast(b & 0x7fffffff), @intCast(b >> 31), 0, 0 });
+    const link = tpLeader(false) catch return;
+    sendAll(link, .{ OP_DSV41_TP_SNAP, @backingInt(op), @intCast(a & 0x7fffffff), @intCast(a >> 31), @intCast(b & 0x7fffffff), @intCast(b >> 31), 0, 0 });
 }
 
 /// A tensor step's header: its rows, position, flags, the state it advances and, for one row, the id itself.
@@ -2636,27 +2672,41 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
         log.err("[dist] worker load failed: rank 0 drafts on every rank but this copy loaded no DSpark stages\n", .{});
         return error.Dsv41DraftShardNoStages;
     }
-    cluster().tp_link = link;
-    dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
-    dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
-    defer {
-        dsv41_mod.clusterHooks().tp_sum = null;
-        dsv41_mod.clusterHooks().tp_gather = null;
-        cluster().tp_link = null;
+    installDsv41Tp(link);
+    defer clearDsv41Tp();
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    try ready.send(0, @intCast(active >> 20), 0);
+    log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
+    return serveDsv41Steps(io, allocator, link, m);
+}
+
+pub fn serveDsv41Steps(io: std.Io, allocator: std.mem.Allocator, link: *const Link, m: *dsv41_mod.Dsv41Model) !bool {
+    return dsv41StepLoop(io, allocator, link, m, .{ .ctx = link, .vt = &Dsv41WorkerWire.vt });
+}
+
+const Dsv41WorkerWire = struct {
+    const vt = blk: {
+        var v = WireOps.vt;
+        v.recv_op = receive;
+        break :blk v;
+    };
+
+    fn receive(ctx: *const anyopaque) !Msg {
+        return recvMsg(WireOps.of(ctx), 0);
     }
+};
+
+fn dsv41StepLoop(io: std.Io, allocator: std.mem.Allocator, link: *const Link, m: *dsv41_mod.Dsv41Model, transport: wire.Link) !bool {
     // Rank 0's other live states (its parked slots and idle state), by gen; the module holds the one it advances.
     var parked: dsv41_mod.Parked = .init(allocator);
     defer dsv41_mod.dropParked(&parked);
     var snaps: dsv41_mod.Snaps = .init(allocator);
     defer dsv41_mod.dropSnaps(&snaps, allocator);
-    var active: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active);
-    try ready.send(0, @intCast(active >> 20), 0);
-    log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
-    const d: c_int = @intCast(config.hidden_size);
+    const d: c_int = @intCast(m.cfg.hidden_size);
     var steps: u64 = 0;
     while (true) {
-        const msg = try recvMsg(link, 0);
+        const msg = try transport.recvOp();
         const tracked = msg[0] != OP_DSV41_TP_LOAD;
         if (tracked) beginDistStep();
         defer if (tracked) link.state.?.watchdog.done();
@@ -2665,9 +2715,9 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
             OP_RELEASE => return true,
             OP_DSV41 => {
                 const p0: usize = @as(usize, @intCast(msg[2])) | (@as(usize, @intCast(msg[3])) << 31);
-                const x = try queuedRecv(link, &.{ msg[1], msg[5], d }, @fromBackingInt(@intCast(msg[6])), 0);
+                const x = try transport.recvNow(&.{ msg[1], msg[5], d }, @fromBackingInt(@intCast(msg[6])), 0);
                 defer _ = mlx.mlx_array_free(x);
-                const pre = try queuedRecv(link, &.{ msg[1], msg[5] }, @fromBackingInt(@intCast(msg[7])), 0);
+                const pre = try transport.recvNow(&.{ msg[1], msg[5] }, @fromBackingInt(@intCast(msg[7])), 0);
                 defer _ = mlx.mlx_array_free(pre);
                 const t0 = io_util.nowUsMonotonic(io);
                 const out = try dsv41_mod.workerStep(m, allocator, x, pre, p0, msg[4] & 1 != 0, msg[4] & 2 != 0);
@@ -2675,8 +2725,8 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                     _ = mlx.mlx_array_free(o);
                 };
                 sendStepTime(link.bells[0], io_util.nowUsMonotonic(io) - t0) catch {};
-                try sendNow(link, out[0], 0);
-                try sendNow(link, out[1], 0);
+                try transport.sendNow(out[0], 0);
+                try transport.sendNow(out[1], 0);
                 steps += 1;
                 if (msg[1] > 1 or steps % 256 == 0) log.info("[dist] worker: step {d}: {d} rows at {d}\n", .{ steps, msg[1], p0 });
             },
@@ -2689,7 +2739,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                     _ = mlx.mlx_array_free(sent);
                 };
                 const ids = if (L == 1) one[0..] else blk: {
-                    sent = try queuedRecv(link, &.{msg[1]}, .int32, 0);
+                    sent = try transport.recvNow(&.{msg[1]}, .int32, 0);
                     const data = mlx.mlx_array_data_int32(sent) orelse return error.NoData;
                     break :blk @as([*]const u32, @ptrCast(data))[0..L];
                 };
@@ -2698,7 +2748,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                 defer if (images.ctx != null) {
                     _ = mlx.mlx_array_free(images);
                 };
-                if (msg[4] & 8 != 0) images = try queuedRecv(link, &.{ @intCast(m.imageRows(ids)), @intCast(m.cfg.hidden_size) }, m.act, 0);
+                if (msg[4] & 8 != 0) images = try transport.recvNow(&.{ @intCast(m.imageRows(ids)), @intCast(m.cfg.hidden_size) }, m.act, 0);
                 noteTpStep(p0, L);
                 try dsv41_mod.tpWorkerStep(m, allocator, &parked, joined(msg[6], msg[7]), ids, p0, msg[4] & 1 != 0, if (msg[4] & 2 != 0) .all else .last, dsv41_mod.VerifyOpts.fromBits(msg[4] & 4 != 0, @intCast((msg[4] >> 4) & 0xff)), if (images.ctx != null) images else null);
                 steps += 1;
@@ -2721,7 +2771,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
             OP_DSV41_TP_BATCH => {
                 const n: usize = @intCast(msg[1]);
                 const rows: usize = @intCast(msg[2]);
-                const sent = try queuedRecv(link, &.{@intCast(tpBatchLen(n, rows))}, .int32, 0);
+                const sent = try transport.recvNow(&.{@intCast(tpBatchLen(n, rows))}, .int32, 0);
                 defer _ = mlx.mlx_array_free(sent);
                 const body = (mlx.mlx_array_data_int32(sent) orelse return error.NoData)[0..tpBatchLen(n, rows)];
                 var gens: [dsv41_mod.region_rows]u64 = undefined;
@@ -2741,7 +2791,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
             OP_DSV41_TP_DRAFT => {
                 const n: usize = @intCast(msg[1]);
                 if (n == 0 or n > dsv41_mod.region_rows) return error.DistBadMessage;
-                const sent = try queuedRecv(link, &.{@intCast(tpBatchLen(n, n))}, .int32, 0);
+                const sent = try transport.recvNow(&.{@intCast(tpBatchLen(n, n))}, .int32, 0);
                 defer _ = mlx.mlx_array_free(sent);
                 const body = (mlx.mlx_array_data_int32(sent) orelse return error.NoData)[0..tpBatchLen(n, n)];
                 var gens: [dsv41_mod.region_rows]u64 = undefined;
@@ -2764,7 +2814,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
             },
             OP_DSV41_TP_LOAD => {
                 const n: usize = @intCast(joined(msg[3], msg[4]));
-                const sent = try queuedRecv(link, &.{@intCast(n)}, .int32, 0);
+                const sent = try transport.recvNow(&.{@intCast(n)}, .int32, 0);
                 defer _ = mlx.mlx_array_free(sent);
                 const ids = @as([*]const u32, @ptrCast(mlx.mlx_array_data_int32(sent) orelse return error.NoData))[0..n];
                 const p = try dsv41_mod.tpLoadPlan(m, n);
@@ -2777,7 +2827,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                 }
                 for (p.specs(), xs) |spec, *x| {
                     const shape = [_]c_int{ @intCast(spec.rows), @intCast(spec.width) };
-                    x.* = try queuedRecv(link, shape[0..spec.rank()], spec.dtype, 0);
+                    x.* = try transport.recvNow(shape[0..spec.rank()], spec.dtype, 0);
                     got += 1;
                 }
                 try dsv41_mod.tpWorkerLoad(m, allocator, &snaps, joined(msg[1], msg[2]), ids, xs);
@@ -2977,11 +3027,17 @@ const TestBells = struct {
     leader: Link = .{ .group = .{}, .rank = 0, .size = 2 },
     worker: Bell,
 
-    fn open(port: u16) !TestBells {
-        const coord: Coordinator = .{ .ip4 = .{ 127, 0, 0, 1 }, .port = port };
+    fn open(port: ?u16) !TestBells {
+        var coord: Coordinator = .{ .ip4 = .{ 127, 0, 0, 1 }, .port = port orelse std.math.maxInt(u16) };
         const listener = Bell.listen(coord, 1);
         if (listener == Bell.none) return error.TestListenFailed;
         defer _ = std.c.close(listener);
+        if (port == null) {
+            var addr: std.posix.sockaddr.in = undefined;
+            var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+            if (std.c.getsockname(listener, @ptrCast(&addr), &len) != 0) return error.TestSocketNameFailed;
+            coord.port = std.mem.bigToNative(u16, addr.port) -% 1;
+        }
         const worker = Bell.connect(coord, 1, null, testDeadline(3000));
         if (!worker.open()) return error.TestConnectFailed;
         errdefer _ = std.c.close(worker.fd);
@@ -4526,11 +4582,11 @@ const TestSwitchOpen = struct {
         errdefer link.deinit();
         errdefer link.captureFailureRank();
         link.state.?.test_exits = &exits;
-        const pair = try TestBells.open(46201);
+        const pair = try TestBells.open(null);
         link.bells[if (cfg.rank == 0) @as(usize, 1) else 0] = if (cfg.rank == 0) pair.leader.bells[1] else pair.worker;
         peer_bell = if (cfg.rank == 0) pair.worker else pair.leader.bells[1];
         if (cfg.rank == 0 and cfg.size == 3) {
-            const extra = try TestBells.open(46215);
+            const extra = try TestBells.open(null);
             link.bells[2] = extra.leader.bells[1];
             extra_peer = extra.worker;
             try cfg.open_control.?.publish(link.bells[2].fd);
@@ -5639,7 +5695,8 @@ const TestAdapter = struct {
         TestSwitchOpen.cleanup();
     }
 
-    fn swap(_: u64, link: *Link, role: switcher.Role) !void {
+    fn swap(_: u64, link: *Link, role: switcher.Role, to: @import("../../../abi/plugin.zig").ServingMode) !void {
+        if (to == .tp1) return;
         const self = active.?;
         self.hook_thread = std.Thread.getCurrentId();
         try std.testing.expectEqual(role == .leader, link.rank == 0);
@@ -5967,5 +6024,256 @@ test "dist switch adapter: invalid configuration is refused before installation"
         const name = switch_adapter.install(&sw, .{ .coordinator = "127.0.0.1:46201", .device = "loopback", .model_dir = "/m/switch", .size = bad.size, .rank = bad.rank }, &backend);
         try std.testing.expectEqualStrings("InvalidArgs", name orelse "success");
         try std.testing.expect(backend == null);
+    }
+}
+
+const TestModeAdapter = struct {
+    base: TestAdapter = undefined,
+    sch: @import("../../../host/gpu_thread/scheduler.zig").Scheduler = undefined,
+    reg: *@import("../../../host/registry/registry.zig").ModelRegistry = undefined,
+    entry: *@import("../../../host/registry/registry.zig").LoadedModel = undefined,
+    xfm: @import("../transformer.zig").Transformer = undefined,
+    whole: dsv41_mod.Dsv41Model = undefined,
+    tensor: dsv41_mod.Dsv41Model = undefined,
+    model: @import("../../../plugins/deepseek_v41/plugin.zig").Model = undefined,
+    table: @import("../../../abi/plugin.zig").ModelTable = undefined,
+    bound: @import("../plugin/driver.zig").Bound = undefined,
+    swaps: usize = 0,
+    fail: bool = false,
+    var active: *@This() = undefined;
+
+    fn setup(self: *@This(), follower: bool, n: u64) !void {
+        try self.base.setup(follower, n);
+        self.swaps = 0;
+        self.fail = false;
+        self.whole.dec_state = null;
+        self.tensor.dec_state = null;
+        self.tensor.cfg = .{ .hidden_size = 4 };
+        self.model.mdl = &self.whole;
+        self.model.modes = .{ .tp1 = &self.whole, .tp = &self.tensor };
+        self.model.parked = .empty;
+        self.model.idle = null;
+        self.model.owner = 0;
+        self.model.tp_ids = .{};
+        self.table = @import("../../../plugins/deepseek_v41/plugin.zig").table;
+        self.table.swap_mode = observe;
+        self.bound = .{ .table = &self.table, .model = &self.model };
+        self.xfm.plugin = &self.bound;
+        self.reg = try @import("../../../host/registry/registry.zig").ModelRegistry.init(std.testing.allocator, std.testing.io, null, 1, 0, null);
+        self.entry = try self.reg.registerStub("switch", "/m/switch", 0);
+        self.entry.state = .ready;
+        self.entry.transformer = &self.xfm;
+        self.sch.registry = self.reg;
+        self.sch.io = std.testing.io;
+        active = self;
+        switch_adapter.installSwapHook();
+        switch_adapter.bindInferenceThread(&self.sch);
+    }
+
+    fn cleanup(self: *@This()) void {
+        self.entry.transformer = null;
+        self.entry.state = .unloaded;
+        self.reg.deinit();
+        self.base.cleanup();
+    }
+
+    fn observe(mp: *anyopaque, to: @import("../../../abi/plugin.zig").ServingMode) callconv(.c) @import("../../../abi/plugin.zig").Verdict {
+        const t = active;
+        std.debug.assert(cluster().tp_link != null);
+        std.debug.assert(dsv41_mod.clusterHooks().tp_sum != null);
+        std.debug.assert(dsv41_mod.clusterHooks().tp_gather != null);
+        std.debug.assert((to == .tp) == (t.model.modes.active == .tp1));
+        if (cluster().tp_link.?.rank == 0) std.debug.assert(dsv41_mod.clusterHooks().tp_step != null);
+        t.swaps += 1;
+        if (t.fail and to == .tp) return .refuse(.failed, "TestSwapFailed");
+        return @import("../../../plugins/deepseek_v41/plugin.zig").table.swap_mode.?(mp, to);
+    }
+
+    fn expectClear(self: *@This()) !void {
+        try std.testing.expectEqual(.tp1, self.model.modes.active);
+        try std.testing.expect(cluster().tp_link == null);
+        try std.testing.expectEqualDeep(@as(@TypeOf(dsv41_mod.clusterHooks().*), .{}), dsv41_mod.clusterHooks().*);
+    }
+};
+
+test "dist switch mode: installed hook orders leader activate release and clears failed swaps" {
+    for ([_]bool{ false, true }) |fail| {
+        var t: TestModeAdapter = undefined;
+        try t.setup(false, 401);
+        defer t.cleanup();
+        t.fail = fail;
+        _ = try t.base.form(false, 401);
+        var closer: TestReleasePeer = .{ .bell = TestSwitchOpen.peer_bell, .delay_ms = 0 };
+        const th = try std.Thread.spawn(.{}, TestReleasePeer.run, .{&closer});
+        defer th.join();
+        _ = t.base.sw.pump();
+        if (fail) {
+            try std.testing.expectEqual(.aborted, t.base.sw.snapshot().state);
+            try std.testing.expectEqual(@as(usize, 1), t.swaps);
+        } else {
+            try std.testing.expectEqual(.tp, t.model.modes.active);
+            try std.testing.expectEqual(@as(u16, 200), t.base.sw.command(.tp1, 401, 0).status);
+            try std.testing.expectEqual(@as(usize, 2), t.swaps);
+            try std.testing.expectEqual(.released, t.base.sw.snapshot().state);
+        }
+        try t.expectClear();
+    }
+}
+
+test "dist switch mode: leader pipes through the formed link without a cold Peer" {
+    var t: TestModeAdapter = undefined;
+    try t.setup(false, 402);
+    defer t.cleanup();
+    _ = try t.base.form(false, 402);
+    _ = t.base.sw.pump();
+    try std.testing.expect(peer() == null);
+    cluster().tp_live = .{ .gen = 7, .n = 2 };
+    try std.testing.expect(try dsv41_mod.clusterHooks().tp_pipe.?(7, 2));
+    const other: Link = .{ .group = .{}, .rank = 1, .size = 2, .bells = blk: {
+        var bells: [max_ranks]Bell = @splat(.{});
+        bells[0] = TestSwitchOpen.peer_bell;
+        break :blk bells;
+    } };
+    try std.testing.expectEqual(OP_DSV41_TP_PIPE, (try recvMsg(&other, 0))[0]);
+    var closer: TestReleasePeer = .{ .bell = TestSwitchOpen.peer_bell, .delay_ms = 0 };
+    const th = try std.Thread.spawn(.{}, TestReleasePeer.run, .{&closer});
+    defer th.join();
+    _ = t.base.sw.command(.tp1, 402, 0);
+    try t.expectClear();
+}
+
+test "dist switch mode: follower serves RELEASE and abort fallback through the shared loop" {
+    for ([_]bool{ false, true }) |abort| {
+        var t: TestModeAdapter = undefined;
+        try t.setup(true, 403);
+        defer t.cleanup();
+        _ = try t.base.form(true, 403);
+        _ = t.base.sw.pump();
+        try std.testing.expectEqual(.tp, t.model.modes.active);
+        if (abort) {
+            _ = t.base.sw.command(.abort, 403, 0);
+        } else {
+            try TestSwitchOpen.peer_bell.say(&.{ Bell.heartbeat_byte, Bell.release_byte });
+        }
+        try std.testing.expect(switch_adapter.serveFollower());
+        try std.testing.expectEqual(if (abort) @as(@TypeOf(t.base.sw.snapshot().failure), .release_timeout) else .none, t.base.sw.snapshot().failure);
+        try std.testing.expectEqual(if (abort) @as(@TypeOf(t.base.sw.snapshot().state), .aborted) else .released, t.base.sw.snapshot().state);
+        try std.testing.expectEqual(@as(usize, 2), t.swaps);
+        try std.testing.expect(t.base.sw.link == null);
+        try std.testing.expect(switcher.poll(403) == null);
+        try t.expectClear();
+    }
+}
+
+test "dist switch mode: stale fall cannot restore a newer active mode" {
+    var t: TestModeAdapter = undefined;
+    try t.setup(true, 404);
+    defer t.cleanup();
+    const link = try t.base.form(true, 404);
+    _ = t.base.sw.pump();
+    const f = t.base.sw.formation.?;
+    f.fall(f.ctx, 403, link);
+    try std.testing.expectEqual(.tp, t.model.modes.active);
+    try std.testing.expectEqual(link, cluster().tp_link.?);
+    try TestSwitchOpen.peer_bell.say(&.{Bell.release_byte});
+    try std.testing.expect(switch_adapter.serveFollower());
+    try t.expectClear();
+}
+
+const TestWorkerHeaders = struct {
+    fn receive(ctx: *const anyopaque) !Msg {
+        const link: *const Link = @ptrCast(@alignCast(ctx));
+        var msg: Msg = undefined;
+        try link.bells[0].readAll(std.mem.asBytes(&msg));
+        return msg;
+    }
+
+    const vt = blk: {
+        var v = WireOps.vt;
+        v.recv_op = receive;
+        break :blk v;
+    };
+};
+
+test "dist switch mode: follower executes FREE and RELEASE in the cold worker loop without weights" {
+    var t: TestModeAdapter = undefined;
+    try t.setup(true, 405);
+    defer t.cleanup();
+    const link = try t.base.form(true, 405);
+    _ = t.base.sw.pump();
+    t.tensor.dec_state = .{ .gpa = std.testing.allocator, .layers = &.{} };
+    t.tensor.state_gen = 7;
+    const free: Msg = .{ OP_DSV41_TP_FREE, 7, 0, 0, 0, 0, 0, 0 };
+    const release_msg: Msg = .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 };
+    try TestSwitchOpen.peer_bell.say(std.mem.asBytes(&free));
+    try TestSwitchOpen.peer_bell.say(std.mem.asBytes(&release_msg));
+    const transport: wire.Link = .{ .ctx = link, .vt = &TestWorkerHeaders.vt };
+    try std.testing.expect(try dsv41StepLoop(std.testing.io, std.testing.allocator, link, &t.tensor, transport));
+    try std.testing.expect(t.tensor.dec_state == null);
+    const f = t.base.sw.formation.?;
+    var rank: ?u32 = null;
+    try f.release(f.ctx, 405, link, &rank);
+    try std.testing.expectEqual(.released, t.base.sw.snapshot().state);
+    try t.expectClear();
+}
+
+test "dist cold worker loop: STOP returns false and unknown messages keep their error" {
+    for ([_]i32{ OP_STOP, -1 }) |op| {
+        TestSwitchOpen.setup();
+        defer TestSwitchOpen.cleanup();
+        var req = TestSwitchOpen.request(406);
+        req.role = .follower;
+        req.cfg.rank = 1;
+        try TestSwitchOpen.start(req);
+        const link = (try TestSwitchOpen.outcome(406)).formed.link;
+        var m: dsv41_mod.Dsv41Model = undefined;
+        m.cfg = .{ .hidden_size = 4 };
+        const msg: Msg = .{ op, 0, 0, 0, 0, 0, 0, 0 };
+        try TestSwitchOpen.peer_bell.say(std.mem.asBytes(&msg));
+        const transport: wire.Link = .{ .ctx = link, .vt = &TestWorkerHeaders.vt };
+        const result = dsv41StepLoop(std.testing.io, std.testing.allocator, link, &m, transport);
+        if (op == OP_STOP) try std.testing.expect(!try result) else try std.testing.expectError(error.DistBadMessage, result);
+        try switcher.fall(406, link);
+    }
+}
+
+test "dist switch mode: an abort before publication leaves the follower available for teardown" {
+    var t: TestModeAdapter = undefined;
+    try t.setup(true, 407);
+    defer t.cleanup();
+    const link = try t.base.form(true, 407);
+    const f = t.base.sw.formation.?;
+    try f.activate(f.ctx, 407, link);
+    _ = t.base.sw.command(.abort, 407, 0);
+    try std.testing.expectEqual(.tp1, t.base.sw.snapshot().mode);
+    try TestSwitchOpen.peer_bell.say(&.{Bell.release_byte});
+    try std.testing.expect(!switch_adapter.serveFollower());
+    try std.testing.expectEqual(.tp, t.model.modes.active);
+    f.fall(f.ctx, 407, link);
+    try t.expectClear();
+}
+
+test "dist dsv41 worker: every TP4 follower receives control from rank zero" {
+    for (1..4) |rank| {
+        TestSwitchOpen.setup();
+        defer TestSwitchOpen.cleanup();
+        var req = TestSwitchOpen.request(408);
+        req.role = .follower;
+        req.cfg.rank = @intCast(rank);
+        req.cfg.size = 4;
+        req.cfg.device = switch (rank) {
+            1 => "loopback,-,loopback,loopback",
+            2 => "loopback,loopback,-,loopback",
+            3 => "loopback,loopback,loopback,-",
+            else => unreachable,
+        };
+        try TestSwitchOpen.start(req);
+        const link = (try TestSwitchOpen.outcome(408)).formed.link;
+        var m: dsv41_mod.Dsv41Model = undefined;
+        m.cfg = .{ .hidden_size = 4 };
+        try TestSwitchOpen.peer_bell.say(&.{Bell.release_byte});
+        try std.testing.expect(try serveDsv41Steps(std.testing.io, std.testing.allocator, link, &m));
+        try switcher.fall(408, link);
+        try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
     }
 }
