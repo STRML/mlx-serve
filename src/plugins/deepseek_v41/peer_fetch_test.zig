@@ -849,24 +849,33 @@ test "dsv41 peer fetch: MLX_SERVE_DSV41_CED off refuses an import as settings" {
     try expectLeverRefusesImport(.MLX_SERVE_DSV41_CED, "0");
 }
 
-test "dsv41 peer fetch: the flash mode the load chose decides the settings key, the lever's text does not" {
+test "dsv41 peer fetch: the settings key keeps the flash mode its model loaded with, whatever a later load sets" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const h = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
-    defer h.close();
-    const unset = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, null);
-    defer unset.restore();
-    const key_unset = peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm);
-    {
-        const off = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, "0");
-        defer off.restore();
-        try testing.expectEqual(key_unset, peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm));
-    }
     const chosen = flash_attn.ps().mode;
     defer flash_attn.ps().mode = chosen;
-    flash_attn.ps().mode = if (chosen == .on) .off else .on;
-    try testing.expect(key_unset != peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm));
+    const unset = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, null);
+    defer unset.restore();
+    const h = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
+    defer h.close();
+    try testing.expect(flash_attn.ps().mode == .off);
+    const loaded_off = peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm);
+
+    flash_attn.ps().mode = .on;
+    try testing.expectEqual(loaded_off, peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm));
+    {
+        const text = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, "1");
+        defer text.restore();
+        try testing.expectEqual(loaded_off, peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm));
+    }
+
+    const flash_on = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, "1");
+    defer flash_on.restore();
+    const h_on = try PeerHarness.open(try fixture.v41Files(arena.allocator(), 7));
+    defer h_on.close();
+    try testing.expect(flash_attn.ps().mode == .on);
+    try testing.expect(loaded_off != peer_transfer.modelSettingsKey(h_on.entry, &h_on.cfg, &h_on.xfm));
 }
 
 test "dsv41 peer fetch: a plugin's settings_key hook is part of the settings key and no hook adds nothing" {

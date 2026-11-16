@@ -18,13 +18,14 @@ pub fn ced() bool {
 /// says `1`), so its entry is the mode this load chose.
 pub const Resolved = struct { attn_f16: bool, ced: bool, flash_attn: flash_attn.Mode, fused_seg: seg.Level };
 
-pub fn resolved() Resolved {
-    return .{ .attn_f16 = attnF16(), .ced = ced(), .flash_attn = flash_attn.ps().mode, .fused_seg = seg.levelFromEnv() };
+pub fn resolved(flash: flash_attn.Mode) Resolved {
+    return .{ .attn_f16 = attnF16(), .ced = ced(), .flash_attn = flash, .fused_seg = seg.levelFromEnv() };
 }
 
-pub fn key() u64 {
+/// `flash` is the mode the model was loaded with: the process-wide mode belongs to whichever load ran last.
+pub fn key(flash: flash_attn.Mode) u64 {
     var h = std.hash.Wyhash.init(0x6473_7634_315f_6e75);
-    std.hash.autoHash(&h, resolved());
+    std.hash.autoHash(&h, resolved(flash));
     return h.final();
 }
 
@@ -92,24 +93,20 @@ test "dsv41 numerics: every kill lever is classified once, and the table holds o
     }
 }
 
-test "dsv41 numerics: the key follows each lever and the flash mode the load chose, not the flash lever's text" {
-    const chosen = flash_attn.ps().mode;
-    defer flash_attn.ps().mode = chosen;
+test "dsv41 numerics: the key follows each lever and the flash mode it is given, not the flash lever's text" {
     const unset = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, null);
     defer unset.restore();
-    const base = key();
+    const base = key(.off);
 
-    const flash_text = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, if (chosen == .on) "0" else "1");
-    try testing.expectEqual(base, key());
+    const flash_text = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, "1");
+    try testing.expectEqual(base, key(.off));
     flash_text.restore();
 
-    flash_attn.ps().mode = if (chosen == .on) .off else .on;
-    try testing.expect(base != key());
-    flash_attn.ps().mode = chosen;
+    try testing.expect(base != key(.on));
 
     inline for (.{ .{ .MLX_SERVE_DSV41_ATTN_F16, "0" }, .{ .MLX_SERVE_DSV41_CED, "0" }, .{ .DSV41_FUSED_SEG, "2" } }) |lever| {
         const saved = env.override(lever[0], lever[1]);
         defer saved.restore();
-        try testing.expect(base != key());
+        try testing.expect(base != key(.off));
     }
 }
