@@ -1999,3 +1999,191 @@ test "deepseek_v41 leader prefill: Engram read-ahead stays with the active TP st
     }
     try testing.expectEqual(@as(usize, 0), fx.m.prompt.len);
 }
+const WarmRestore = struct {
+    const Step = struct { ids: [16]u32 = undefined, len: usize, p0: usize, snap: bool, all: bool, verify: dsv41.VerifyOpts, gen: u64 };
+    const Snap = struct { op: dsv41.SnapOp, a: u64, b: u64 };
+    const Op = union(enum) { step: Step, chunk: usize, snap: Snap, free: u64 };
+    var events: std.ArrayList(Op) = .empty;
+    var failed: bool = false;
+    const suffix = tp_prompt ++ [_]u32{ 9, 7, 25, 1, 60, 3, 17, 42 };
+
+    fn clear() void {
+        events.deinit(testing.allocator);
+        events = .empty;
+        LeaderReplay.clear();
+        failed = false;
+    }
+
+    fn install() void {
+        dsv41.clusterHooks().tp_step = &step;
+        dsv41.clusterHooks().tp_prefill = &ship;
+        dsv41.clusterHooks().tp_snap = &snap;
+        dsv41.clusterHooks().tp_free = &free;
+    }
+
+    fn step(ids: []const u32, p0: usize, capture: bool, all: bool, verify: dsv41.VerifyOpts, gen: u64, images: ?mlx.mlx_array) anyerror!void {
+        if (images != null or ids.len > 16) return error.TestUnexpectedResult;
+        var op: Step = .{ .len = ids.len, .p0 = p0, .snap = capture, .all = all, .verify = verify, .gen = gen };
+        @memcpy(op.ids[0..ids.len], ids);
+        try events.append(testing.allocator, .{ .step = op });
+    }
+
+    fn ship(gen: u64, p0: usize, n: usize, capture: bool, xs: []const mlx.mlx_array, stages: usize) anyerror!void {
+        const index = LeaderReplay.chunks.items.len;
+        try LeaderReplay.ship(gen, p0, n, capture, xs, stages);
+        try events.append(testing.allocator, .{ .chunk = index });
+    }
+
+    fn snap(op: dsv41.SnapOp, a: u64, b: u64) void {
+        events.append(testing.allocator, .{ .snap = .{ .op = op, .a = a, .b = b } }) catch {
+            failed = true;
+        };
+    }
+
+    fn free(gen: u64) void {
+        events.append(testing.allocator, .{ .free = gen }) catch {
+            failed = true;
+        };
+    }
+
+    fn leader(t: *Twin, keep: usize) !void {
+        const aux = v41.table.cache.aux.?;
+        const pm: *v41.Model = @ptrCast(@alignCast(t.m));
+        try testing.expect(aux.begin_prompt(t.m, 1, .of(&tp_prompt), .{}, 0, false).isOk());
+        testing.allocator.free(try stepLogits(t, 1, .{ .mode = .prefill, .ids = &tp_prompt }, 0));
+        testing.allocator.free(try stepLogits(t, 1, .{ .mode = .decode, .ids = &.{8} }, 32));
+        try dsv41.armVerify(&pm.mdl.dec_state.?, pm.mdl.n_layers);
+        const verified = try dsv41.extend(pm.mdl, testing.allocator, &pm.mdl.dec_state.?, &.{ 3, 17, 42, 9, 7, 25 }, .all);
+        _ = mlx.mlx_array_free(verified);
+        try dsv41.finishVerify(pm.mdl, testing.allocator, &pm.mdl.dec_state.?, keep);
+        const n = 33 + keep;
+        var held: [40]u32 = undefined;
+        const accepted = tp_prompt ++ [_]u32{ 8, 3, 17, 42, 9, 7, 25 };
+        @memcpy(held[0..n], accepted[0..n]);
+        held[n] = 0;
+        try testing.expect(aux.begin_prompt(t.m, 1, .of(held[0 .. n + 1]), .{}, n, true).isOk());
+        var sn: abi.Handle = null;
+        try testing.expect(aux.snapshot(t.m, 1, &sn).isOk());
+        defer aux.free(t.m, sn);
+        const saved: *dsv41.Snap = @ptrCast(@alignCast(sn orelse return error.MissingSnapshot));
+        try testing.expectEqual(n, saved.n);
+        v41.table.release_slot.?(t.m, 1);
+        try testing.expect(aux.restore_at(t.m, 1, sn, n).isOk());
+        var next: [80]u32 = undefined;
+        @memcpy(next[0..n], accepted[0..n]);
+        @memcpy(next[n..][0..suffix.len], &suffix);
+        next[n + suffix.len] = 11;
+        try testing.expect(aux.begin_prompt(t.m, 1, .of(next[0 .. n + suffix.len + 1]), .{}, n, true).isOk());
+        const skipped = pm.mdl.prefill_whole orelse pm.mdl;
+        const before = skipped.ced_stats.skipped;
+        testing.allocator.free(try stepLogits(t, 1, .{ .mode = .prefill, .ids = &suffix }, @intCast(n)));
+        try testing.expectEqual(@as(u64, suffix.len - skipped.cfg.sliding_window), skipped.ced_stats.skipped - before);
+        try testing.expect(suffix.len - skipped.cfg.sliding_window > @import("rowcut.zig").max_rows);
+        try testing.expect(!failed);
+    }
+
+    fn replay(m: *dsv41.Dsv41Model, end: usize, keep: usize) !void {
+        var parked: dsv41.Parked = .init(testing.allocator);
+        defer dsv41.dropParked(&parked);
+        var snaps: dsv41.Snaps = .init(testing.allocator);
+        defer dsv41.dropSnaps(&snaps, testing.allocator);
+        var restored: usize = 0;
+        for (events.items[0..end]) |op| switch (op) {
+            .step => |s| try dsv41.tpWorkerStep(m, testing.allocator, &parked, s.gen, s.ids[0..s.len], s.p0, s.snap, if (s.all) .all else .last, s.verify, null),
+            .chunk => |index| {
+                const c = LeaderReplay.chunks.items[index];
+                if (m.dec_state != null and m.dec_state.?.n != c.p0)
+                    std.debug.print("[warm-restore] rank={d} import base={d} live={d} end={d}\n", .{ m.tp.?.rank, c.p0, m.dec_state.?.n, c.n });
+                try dsv41.tpWorkerPrefill(m, testing.allocator, &parked, c.gen, c.p0, c.n, c.capture, c.xs, c.stages);
+            },
+            .snap => |s| {
+                try dsv41.tpWorkerSnap(m, testing.allocator, &parked, &snaps, s.op, s.a, s.b);
+                if (s.op == .restore) restored = m.dec_state.?.n;
+            },
+            .free => |gen| dsv41.tpWorkerFree(m, &parked, gen),
+        };
+        try testing.expectEqual(33 + keep, restored);
+    }
+
+    fn tail(m: *dsv41.Dsv41Model) ![]f32 {
+        var out: std.ArrayList(f32) = .empty;
+        errdefer out.deinit(testing.allocator);
+        for ([_]u32{ 11, 5, 8 }) |id| {
+            const logits = try dsv41.extendResumable(m, testing.allocator, &.{id}, null);
+            defer _ = mlx.mlx_array_free(logits);
+            const vals = try dsv41.hostF32(logits);
+            defer testing.allocator.free(vals);
+            try out.appendSlice(testing.allocator, vals);
+        }
+        return out.toOwnedSlice(testing.allocator);
+    }
+};
+
+test "deepseek_v41 leader prefill: RAM decode checkpoint settles pending verify before CED suffix and TP4 decode" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const previous = msv_test_swap_tf32(0);
+    defer {
+        _ = mlx.mlx_synchronize(mlx.gpuStream());
+        _ = msv_test_swap_tf32(previous);
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try arena.allocator().dupe(sdk.fixture.File, try fixture.v41TpDsparkFiles(arena.allocator(), 7));
+    files[0].bytes = try std.mem.replaceOwned(u8, arena.allocator(), files[0].bytes, "\"dspark_target_layer_ids\": [2, 3]", "\"dspark_target_layer_ids\": [5, 7]");
+    var ts: [4]*Twin = undefined;
+    var made: usize = 0;
+    defer for (ts[0..made]) |t| t.close();
+    for (&ts, 0..) |*t, r| {
+        const setting = try std.fmt.allocPrint(arena.allocator(), "{{\"tp_mode\":{{\"rank\":{d},\"size\":4}}}}", .{r});
+        t.* = try Twin.openWith(files, "", setting);
+        made += 1;
+        try rebuildTpProofF32(t.*, @intCast(r));
+        const pm: *v41.Model = @ptrCast(@alignCast(t.*.m));
+        for ([_]*dsv41.Dsv41Model{ pm.modes.tp1, pm.modes.tp.? }) |m| {
+            try testing.expect(m.ced_split != null);
+            m.ced_min_skip = m.cfg.sliding_window;
+        }
+        try v41.swapMode(pm, .tp);
+    }
+    const lead: *v41.Model = @ptrCast(@alignCast(ts[0].m));
+    for ([_]usize{ 3, 6 }) |keep| {
+        try v41.swapMode(lead, .tp1);
+        try WarmRestore.leader(ts[0], keep);
+        const want = try WarmRestore.tail(lead.mdl);
+        defer testing.allocator.free(want);
+        try v41.swapMode(lead, .tp);
+        LoneGroup.arm(4);
+        TpProofGroup.join(4);
+        defer {
+            TpProofGroup.leave();
+            LoneGroup.disarm();
+            WarmRestore.clear();
+        }
+        var settled = false;
+        for (0..40) |pass| {
+            WarmRestore.clear();
+            WarmRestore.install();
+            TpProofGroup.begin(0);
+            try WarmRestore.leader(ts[0], keep);
+            const end = WarmRestore.events.items.len;
+            dsv41.clusterHooks().tp_step = &LeaderReplay.step;
+            var decoded: [4]?[]f32 = @splat(null);
+            defer for (decoded) |values| if (values) |v| testing.allocator.free(v);
+            decoded[0] = try WarmRestore.tail(lead.mdl);
+            for (ts[1..], 1..) |t, rank| {
+                TpProofGroup.begin(rank);
+                const pm: *v41.Model = @ptrCast(@alignCast(t.m));
+                try WarmRestore.replay(pm.mdl, end, keep);
+                decoded[rank] = try WarmRestore.tail(pm.mdl);
+            }
+            if (try TpProofGroup.settled()) {
+                try TpProofGroup.expectAgreement();
+                for (decoded) |values| try testing.expect(try tpLogitsMatch("RAM restore TP4 decode", want, values.?, 1e-3));
+                std.debug.print("[warm-restore] keep={d}/6 settled in {d} passes\n", .{ keep, pass + 1 });
+                settled = true;
+                break;
+            }
+        }
+        try testing.expect(settled);
+    }
+}

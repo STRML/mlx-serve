@@ -750,7 +750,7 @@ test "dsv41 tensor parallel: a worker keeps its copy of rank 0's snapshots by id
     try std.testing.expectEqual(@as(u64, 7), m.state_gen);
     try std.testing.expectEqual(@as(usize, 50), m.dec_state.?.n);
     try std.testing.expect(parked.contains(5));
-    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .capture, 7, 0);
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .capture, 7, 50);
     try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .take, 7, 3);
     try std.testing.expectEqual(@as(usize, 50), snaps.get(3).?.n);
     try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .free, 3, 0);

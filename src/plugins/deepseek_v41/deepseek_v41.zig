@@ -1739,7 +1739,8 @@ const ClusterHooksState = struct {
 };
 
 /// What rank 0 did with a snapshot, for the other ranks to do with their copy: `take` (state `a`'s snapshot kept as
-/// id `b`), `restore` (id `a` made state `b`), `clone` (id `a` copied to id `b`), `free` (id `a`).
+/// id `b`), `restore` (id `a` made state `b`), `clone` (id `a` copied to id `b`), `free` (id `a`),
+/// `capture` (state `a` settled and captured at position `b`).
 pub const SnapOp = enum(i32) { take, restore, clone, free, capture };
 pub const clusterHooks_shared = @import("../../sdk/util/shared.zig").Shared(ClusterHooksState, "dsv41_cluster", .{});
 pub inline fn clusterHooks() *ClusterHooksState {
@@ -6237,7 +6238,9 @@ pub fn tpWorkerSnap(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, sna
     switch (op) {
         .capture => {
             const st = try tpStateOf(m, parked, a);
-            st.snap_at = st.n;
+            try followVerifyOf(m, st, b);
+            if (st.n != b) return error.DistPeerDiverged;
+            st.snap_at = b;
             try snapshotStateIfDue(st, a);
         },
         .take => {
@@ -7366,7 +7369,7 @@ pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: 
     st.snap_vision_key = key;
     try snapshotIfDue(m);
     // A restored prompt can stand at its boundary already: no step will carry the snapshot to the other ranks.
-    if (st.snap != null) tpSnap(m, .capture, m.state_gen, 0);
+    if (st.snap != null) tpSnap(m, .capture, m.state_gen, st.n);
 }
 
 pub fn prefixKey(m: *const Dsv41Model, ids: []const u32, rows: ?A) !u64 {

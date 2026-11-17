@@ -127,8 +127,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
   worker keeps it; a step on another state (`st != &dec_state`) is refused.
 - Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken
-  outside a step (`armPrompt` at a restored boundary) goes as `.capture`. The ranks' caches are equal (`tpStream`
-  asserts it), so the SSD tier writes rank 0's and a disk import sends the worker its tensors (`tpLoad`).
+  outside a step goes as `.capture` with the leader's committed position, settling any pending verify before capture.
+  The ranks' caches are equal (`tpStream` asserts it); the SSD tier writes rank 0's and imports send its tensors (`tpLoad`).
 - `tp_mode` builds TP1 first and borrows its transformed tensors through one `RowCut`: fusing raw TP slices copies
   the expert banks. Only `wo_b` quarters own weight buffers. Free TP before the cut and TP1; swaps drop slot states.
 - A mode's chunks wider than `rowcut.max_rows` run TP1 on rank 0; followers import new whole-width MLA rows before
