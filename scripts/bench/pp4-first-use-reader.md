@@ -1,7 +1,7 @@
 # PP4 first-use row reader
 
-This CPU-only companion measures sorted first-use Engram buckets while the
-window's sole model server executes GPU prefill. It reuses the production hash,
+This CPU-only companion measures sorted first-use Engram buckets before the
+window starts its model server. It reuses the production hash,
 compressed-token map and `Table.readSorted`; cold-page probing and tokenizer CLI
 come from `engram_scale_bench.zig` on `perf/engram-read-scale`.
 
@@ -17,11 +17,13 @@ pp4-first-use CLONED_PACK TOKENS.u32 32768 32 0 2048
 ```
 
 The second command reads one global sorted ordinal quarter (`rank` 0–3).
-Run quarters sequentially on one borrowed box while the same one server is under
-GPU load. `CLONED_PACK` must hold fresh APFS clones of the two table files and the
-source config/token map. Before every bucket, all selected code/scale spans must
-have zero resident pages under `mincore`. Direct reads do not fill those caches.
-A warm selected page fails the utility. Clone cleanup belongs to the window.
+Run every selected sample and quarter sequentially before any server starts. `CLONED_PACK` must hold fresh APFS clones of the two table files and the
+source config/token map. Before every bucket, `mincore` classifies selected code/scale spans. A row is
+fully cold only when both parts have zero resident pages. The reader times fully
+cold rows separately, reads cached rows afterward, and restores the original
+sorted payload order. Direct reads do not fill those caches. A reader completes
+only with at least 90% fully cold rows across both tables and all chunks; it
+prints every bucket and a coverage record before refusing lower coverage. Clone cleanup belongs to the window.
 
 The window passes a sample's offset slice as its own `tokens.u32`, identical to
 the HTTP prompt. The reader uses the first `N-1` exact tokenizer ids, preserving
@@ -38,7 +40,8 @@ its own descriptor mapping before qualification.
 |---|---|
 | `pp4_tokens` | Exact encoded count and corpus byte count |
 | `pp4_catalog` | Depth, `prefill_tokens=N-1`, rank, chunk width, readers; start/ready timestamps, hash/catalog/prepare ns; global/shard row counts and digests, owner bytes, token digest |
-| `pp4_bucket` | Rank/table/chunk, `p0`, width; rows/bytes; cache refusal result; raw read timestamps, local-copy completion, elapsed/probe/read/copy ns; row and payload digests |
+| `pp4_bucket` | Rank/table/chunk, `p0`, width; rows/bytes; `cached_parts`, `cold_rows`, `cold_read_ns`; raw read timestamps, local-copy completion, elapsed/probe/read/copy ns; row and payload digests |
+| `pp4_reader_coverage` | Total selected/cold rows and required fraction (0.9), emitted before qualification |
 | `pp4_reader_done` | Depth, rank and total elapsed ns; absent on failure |
 
 `*_ns` timestamps use the same awake monotonic clock on this host.
@@ -48,7 +51,8 @@ reads, host copies and prior bucket/report overhead. `prepare_ns` precedes it.
 The copy timer measures one real local host copy into retained owner storage.
 It excludes network, dequantization and scatter into model spans.
 
-These are one-SSD measurements under GPU load. A max of sequential quarter
+These are one-SSD measurements with the GPU idle. Older schema-1 concurrent
+captures retain their original load qualification. A max of sequential quarter
 completion timelines is a modeled four-SSD input. Keep that projection, cable
 transport, two-chunk read credits and other boxes' speed separate from measured
 claims. First-use service cannot be inferred by dividing whole-request time by
@@ -59,10 +63,10 @@ four or by averaging per-chunk times.
 | Cross-chunk repeated row | Dedup whole request; earliest use wins | Assign latest use/drop first row | Catalog oracle checks rows and earliest chunks |
 | Sorted ordinal quarters | Assign before first-use ordering | Per-chunk re-shard/overlap/omission | Uneven fixture proves exact global quarters |
 | First-use order | Read chunks monotonically | Reverse chunk comparator | Schedule oracle exposes reordered rows |
-| Cached selected span | Require zero code/scale residency | Omit cache refusal | Warm original fails; cold clone returns exact bytes |
+| Cached selected span | Partition fully cold rows; read both subsets | Count cached rows as cold or drop bytes | Warm/cold payload oracle and 90% schedule coverage guard |
 | Read/output failure | Abort utility | Short table read or stdout write | Nonzero exit; no completion record |
 
-Catalog, schedule and cache-refusal tests were written red first. Mutations to
-retain latest use, reverse first-use order and skip the residency refusal each
-fail their named test. Existing production reader tests own concurrency/byte
-ordering; this utility adds the first-use and cold-refusal boundaries.
+Catalog and schedule tests protect earliest use and global shard ownership.
+Reader tests check exact cold/cached payload bytes, separate cold timing, and the
+90% coverage boundary. Window tests enforce all readers finishing before server
+startup. Existing production reader tests own concurrency and byte ordering.

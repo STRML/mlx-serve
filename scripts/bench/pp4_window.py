@@ -30,10 +30,12 @@ def read_tokens(path):
     return list(struct.unpack('<' + 'I' * (len(raw) // 4), raw))
 
 
-def sample_schedule():
+def sample_schedule(depths=(32768, 131072)):
+    if not depths or len(set(depths)) != len(depths) or any(d not in (32768, 131072) for d in depths):
+        raise ValueError("depths must select 32768 and/or 131072 once")
     for block, arm in enumerate(('control', 'profile', 'control')):
-        yield dict(block=block, arm=arm, depth=32768, rep=-1, rank=None, warmup=True)
-        for depth in (32768, 131072):
+        yield dict(block=block, arm=arm, depth=depths[0], rep=-1, rank=None, warmup=True)
+        for depth in depths:
             for rep in range(6):
                 ranks = (None,)
                 if arm == 'profile':
@@ -48,10 +50,10 @@ def sample_ids(ids, sample):
     return ids[offset:offset + sample['depth']]
 
 
-def plan_samples(ids, deadline=None):
+def plan_samples(ids, deadline=None, depths=(32768, 131072)):
     deadline = time.monotonic() + 30 if deadline is None else deadline
     plan, first_tokens = [], set()
-    for ordinal, sample in enumerate(sample_schedule()):
+    for ordinal, sample in enumerate(sample_schedule(depths)):
         span = len(ids) - sample['depth'] + 1
         if span <= 0:
             raise ValueError('real corpus too short')
@@ -75,34 +77,6 @@ def plan_samples(ids, deadline=None):
             raise ValueError('sample has a short or repeated corpus prefix')
         prefixes.add(prefix)
     return plan
-
-
-def compute_overlap_fraction(events, reads):
-    waits = {}
-    for e in events:
-        if e['kind'] == 'pp4_engram':
-            waits.setdefault((e['p0'], e['rows']), []).append((e['needed_us'], e['taken_us']))
-    waits = {key: sorted(spans) for key, spans in waits.items()}
-    compute = []
-    for e in events:
-        if e['kind'] != 'pp4_layer':
-            continue
-        cursor, end = e['start_us'], e['end_us']
-        epoch_offset = e['epoch_us'] - cursor
-        for lo, hi in waits.get((e['p0'], e['rows']), []):
-            lo, hi = max(cursor, lo), min(end, hi)
-            if hi <= lo:
-                continue
-            if cursor < lo:
-                compute.append(((epoch_offset + cursor) * 1000, (epoch_offset + lo) * 1000))
-            cursor = hi
-        if cursor < end:
-            compute.append(((epoch_offset + cursor) * 1000, (epoch_offset + end) * 1000))
-    read_time = sum(e['read_ns'] for e in reads)
-    overlap = sum(max(0, min(e['read_start_epoch_ns'] + e['read_ns'], hi) -
-                      max(e['read_start_epoch_ns'], lo))
-                  for e in reads for lo, hi in compute)
-    return overlap / read_time if read_time else 0
 
 
 def http(path, body=None, timeout=10):
@@ -161,7 +135,7 @@ def cold_pack(pack, parent):
                                    clone_inode=b.st_ino, bytes=a.st_size))
         return root, provenance
     except BaseException:
-        subprocess.run(['rm', '-rf', str(root)], check=True)
+        subprocess.run(['/usr/bin/trash', str(root)], check=True)
         raise
 
 
@@ -174,14 +148,19 @@ class Window:
         self.failure = None
         self.samples = []
         self.warmups = []
+        self.readers_ready = set()
+        self.binary_sha = None
         self.active_request = False
         self.stopping = False
         self.base = args.out
         self.log = None
 
     def save(self):
+        if self.binary_sha is None:
+            self.binary_sha = hashlib.sha256(self.args.binary.read_bytes()).hexdigest()
         meta = dict(samples=self.samples, warmups=self.warmups, failure=self.failure, chunk=2048,
-                    prefix_cold=True, selected_rows='reader clones cold, server pages uncontrolled',
+                    depths=self.args.depths, binary_sha256=self.binary_sha,
+                    prefix_cold=True, selected_rows='reader clones probed before server startup; >=90% fully cold rows; server pages uncontrolled',
                     corpus_sha256=hashlib.sha256(self.args.corpus.read_bytes()).hexdigest(),
                     tokens_sha256=hashlib.sha256((self.base / 'corpus.u32').read_bytes()).hexdigest())
         (self.base / 'manifest.json').write_text(json.dumps(meta, indent=2) + '\n')
@@ -206,7 +185,7 @@ class Window:
                         row['footprint_top'] = subprocess.check_output(
                             ['top', '-l', '1', '-pid', str(own), '-stats', 'pid,mem'], text=True)
                     out.write(json.dumps(row) + '\n')
-                if free < 16 << 30 or (own is not None and foreign):
+                if free < 16 << 30 or foreign:
                     raise RuntimeError('memory floor16GiB or one-server invariant failed')
             except Exception as error:
                 current_server = self.server
@@ -285,13 +264,13 @@ class Window:
             raise ValueError('prefix cache hit')
         return response, begin, end
 
-    def sample(self, spec):
+    def sample_input(self, spec):
         arm, depth, rep, rank = (spec[k] for k in ('arm', 'depth', 'rep', 'rank'))
         tag = f'{arm}-d{depth}-r{rep}' + (f'-s{rank}' if rank is not None else '')
         if spec['warmup']:
             tag = f'{arm}-b{spec["block"]}-warmup'
         dest = self.base / tag
-        dest.mkdir()
+        dest.mkdir(exist_ok=True)
         ids = sample_ids(self.ids, spec)
         token_file = dest / 'tokens.u32'
         raw = struct.pack('<' + 'I' * len(ids), *ids)
@@ -299,91 +278,26 @@ class Window:
         input_meta = dict(spec, tokens=f'{tag}/tokens.u32',
                           tokens_sha256=hashlib.sha256(raw).hexdigest())
         (dest / 'input.json').write_text(json.dumps(input_meta, indent=2) + '\n')
-        if spec['warmup']:
-            response, begin, end = self.request(ids)
-            (dest / 'response.json').write_text(json.dumps(response, indent=2) + '\n')
-            self.warmups.append(dict(input_meta, request_start_epoch_ns=begin,
-                                     request_end_epoch_ns=end))
-            self.save()
-            return
-        logpath = self.base / f'{arm}.log'
-        offset = logpath.stat().st_size
+        return dest, ids, input_meta
+
+    def read_sample(self, spec):
+        dest, _, _ = self.sample_input(spec)
+        depth, rank = spec['depth'], spec['rank']
         clone = None
-        worker = None
         try:
-            if rank is not None:
-                clone, provenance = cold_pack(self.args.pack, dest)
-                (dest / 'clone.json').write_text(json.dumps(provenance, indent=2) + '\n')
-                out = (dest / 'reader.jsonl').open('w')
-                err = (dest / 'reader.err').open('w')
-                # Send the request first; begin reader when GPU layer trace proves active work.
-                result = {}
-                def run_request():
-                    try:
-                        result['value'] = self.request(ids)
-                    except BaseException as error:
-                        result['error'] = error
-                worker = threading.Thread(target=run_request)
-                worker.start()
-                deadline = time.monotonic() + 120
-                while 'pp4_layer' not in self.log_tail(logpath, offset).decode(errors='replace'):
-                    self.check()
-                    if not worker.is_alive() or time.monotonic() > deadline:
-                        raise RuntimeError('no GPU trace before reader start')
-                    time.sleep(.01)
+            clone, provenance = cold_pack(self.args.pack, dest)
+            (dest / 'clone.json').write_text(json.dumps(provenance, indent=2) + '\n')
+            with (dest / 'reader.jsonl').open('w') as out, (dest / 'reader.err').open('w') as err:
                 self.reader = subprocess.Popen([str(self.args.reader), str(clone),
-                    str(token_file), str(depth), '32', str(rank), '2048'],
+                    str(dest / 'tokens.u32'), str(depth), '32', str(rank), '2048'],
                     stdout=out, stderr=err)
                 rc = self.reader.wait(timeout=120)
                 self.reader = None
-                out.close()
-                err.close()
-                worker.join(1200)
-                if worker.is_alive():
-                    raise TimeoutError('request stalled')
-                if 'error' in result:
-                    raise result['error']
-                if rc:
-                    raise RuntimeError(f'first-use reader exited {rc}')
-                response, begin, end = result['value']
-            else:
-                response, begin, end = self.request(ids)
-            (dest / 'response.json').write_text(json.dumps(response, indent=2) + '\n')
-            trace = self.log_tail(logpath, offset)
-            (dest / 'trace.log').write_bytes(trace)
-            # Existing production trace reports prefill wall time in milliseconds.
-            trace_text = trace.decode(errors='replace')
-            matches = re.findall(r'\[prefill-trace\].*', trace_text)
-            (dest / 'prefill-lines.txt').write_text('\n'.join(matches))
-            timing = re.findall(r'\[prefill-trace\] tokens=(\d+).*?total=(\d+)ms', trace_text)
-            if len(timing) != 1 or int(timing[0][0]) != depth or int(timing[0][1]) <= 0:
-                raise ValueError('missing or mismatched production prefill timing')
-            elapsed = (end - begin) / 1e9
-            sample = dict(input_meta,
-                          request_start_epoch_ns=begin, request_end_epoch_ns=end,
-                          wall_s=elapsed, prefill_s=int(timing[0][1]) / 1000,
-                          trace=f'{tag}/trace.log', reader=f'{tag}/reader.jsonl')
-            from pp4_step0 import records, chunk_costs, deliveries
-            if rank is not None:
-                events = records(dest / 'trace.log')
-                chunk_costs(events)
-                read = records(dest / 'reader.jsonl')
-                deliveries(read, depth, rank)
-                reads = [e for e in read if e['kind'] == 'pp4_bucket' and e['rows']]
-                layers = [e for e in events if e['kind'] == 'pp4_layer']
-                if not reads or not layers:
-                    raise ValueError('missing read/GPU activity')
-                gpu_start = min(e['epoch_us'] for e in layers) * 1000
-                gpu_end = max(e['epoch_us'] + e['elapsed_us'] for e in layers) * 1000
-                if any(e['read_start_epoch_ns'] < gpu_start or
-                       e['read_start_epoch_ns'] + e['read_ns'] > gpu_end for e in reads):
-                    raise ValueError('first-use reader did not remain under GPU prefill load')
-                sample['compute_overlap_fraction'] = compute_overlap_fraction(events, reads)
-                if sample['compute_overlap_fraction'] < .5:
-                    raise ValueError('less than50% of reader time overlaps synchronized compute intervals')
-            self.samples.append(sample)
-            self.save()
-            print('PP4-SAMPLE', tag, elapsed, flush=True)
+            if rc:
+                raise RuntimeError(f'first-use reader exited {rc}')
+            from pp4_step0 import records, deliveries
+            deliveries(records(dest / 'reader.jsonl'), depth, rank)
+            self.readers_ready.add(dest.name)
         finally:
             if self.reader and self.reader.poll() is None:
                 self.reader.terminate()
@@ -393,19 +307,57 @@ class Window:
                     self.reader.kill()
                     self.reader.wait()
             self.reader = None
-            if worker and worker.is_alive():
-                worker.join(120)
-                if worker.is_alive():
-                    self.failure = 'request did not drain within120s'
             if clone:
-                subprocess.run(['rm', '-rf', str(clone)], check=True)
+                subprocess.run(['/usr/bin/trash', str(clone)], check=True)
+
+    def sample(self, spec):
+        arm, depth, rank = spec['arm'], spec['depth'], spec['rank']
+        dest, ids, input_meta = self.sample_input(spec)
+        tag = dest.name
+        if spec['warmup']:
+            response, begin, end = self.request(ids)
+            (dest / 'response.json').write_text(json.dumps(response, indent=2) + '\n')
+            self.warmups.append(dict(input_meta, request_start_epoch_ns=begin,
+                                     request_end_epoch_ns=end))
+            self.save()
+            return
+        logpath = self.base / f'{arm}.log'
+        offset = logpath.stat().st_size
+        if rank is not None and tag not in self.readers_ready:
+            self.read_sample(spec)
+        response, begin, end = self.request(ids)
+        (dest / 'response.json').write_text(json.dumps(response, indent=2) + '\n')
+        trace = self.log_tail(logpath, offset)
+        (dest / 'trace.log').write_bytes(trace)
+        # Existing production trace reports prefill wall time in milliseconds.
+        trace_text = trace.decode(errors='replace')
+        matches = re.findall(r'\[prefill-trace\].*', trace_text)
+        (dest / 'prefill-lines.txt').write_text('\n'.join(matches))
+        timing = re.findall(r'\[prefill-trace\] tokens=(\d+).*?total=(\d+)ms', trace_text)
+        if len(timing) != 1 or int(timing[0][0]) != depth or int(timing[0][1]) <= 0:
+            raise ValueError('missing or mismatched production prefill timing')
+        elapsed = (end - begin) / 1e9
+        sample = dict(input_meta,
+                      request_start_epoch_ns=begin, request_end_epoch_ns=end,
+                      wall_s=elapsed, prefill_s=int(timing[0][1]) / 1000,
+                      trace=f'{tag}/trace.log', reader=f'{tag}/reader.jsonl')
+        from pp4_step0 import records, chunk_costs, deliveries
+        if rank is not None:
+            events = records(dest / 'trace.log')
+            chunk_costs(events)
+            read = records(dest / 'reader.jsonl')
+            deliveries(read, depth, rank)
+            sample['reader_mode'] = 'before_request_idle_gpu'
+        self.samples.append(sample)
+        self.save()
+        print('PP4-SAMPLE', tag, elapsed, flush=True)
 
     def run(self):
         deadline = time.monotonic() + 30
         subprocess.run([str(self.args.reader), 'tokenize', str(self.args.pack),
                         str(self.args.corpus), str(self.base / 'corpus.u32')], check=True, timeout=30)
         self.ids = read_tokens(self.base / 'corpus.u32')
-        plan = plan_samples(self.ids, deadline)
+        plan = plan_samples(self.ids, deadline, self.args.depths)
         (self.base / 'sample-plan.json').write_text(json.dumps(plan, indent=2) + '\n')
         print(f'PP4-OFFLINE-CHECK OK samples={len(plan)} prefix_tokens={PREFIX_TOKENS}', flush=True)
         if model_pids() or free_bytes() < 16 << 30:
@@ -413,6 +365,9 @@ class Window:
         watch = threading.Thread(target=self.watch, daemon=True)
         watch.start()
         try:
+            for spec in plan:
+                if spec['rank'] is not None:
+                    self.read_sample(spec)
             for spec in plan:
                 if spec['warmup']:
                     self.stop_server()
@@ -432,13 +387,14 @@ class Window:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--depths', type=int, nargs='+', choices=(32768, 131072), default=[32768, 131072])
     ap.add_argument('--check-tokens', type=Path, help='check every sample offline within 30 seconds')
     for name in ('binary', 'reader', 'pack', 'corpus', 'out'):
         ap.add_argument('--' + name, type=Path)
     args = ap.parse_args()
     if args.check_tokens:
         deadline = time.monotonic() + 30
-        plan = plan_samples(read_tokens(args.check_tokens), deadline)
+        plan = plan_samples(read_tokens(args.check_tokens), deadline, args.depths)
         print(f'PP4-OFFLINE-CHECK OK samples={len(plan)} prefix_tokens={PREFIX_TOKENS}')
         return
     for name in ('binary', 'reader', 'pack', 'corpus', 'out'):

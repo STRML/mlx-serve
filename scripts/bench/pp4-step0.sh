@@ -14,13 +14,15 @@ One server at a time, loopback :18754, prefix caches off, chunk=2048.
 Read real ~/bench/engram-corpus.md with pack tokenizer. Depths 32768/131072.
 Before model load: 30s offline check of 75 distinct sample/warm-up prefixes.
 Controls before/after: 6 per depth. Profile: 6 per depth per shard (4 shards).
-CPU-only cold first-use reads overlap sole server GPU; memory floor16GiB.
+CPU-only cold first-use reads finish before any server starts; memory floor16GiB.
+--run --depths 131072 selects only that depth, including warmups.
+PP4_BINARY selects an existing signed server for a matching-SHA continuation.
 No live binary install. Cleanup drains private request, stops owned PIDs.
 Output ~/bench/pp4-step0-<timestamp>/bound.{json,md}; borrow returns S4.
 EOF
     exit 0 ;;
---run) ;;
-*) echo 'usage: pp4-step0.sh --dry-run|--run' >&2; exit 2 ;;
+--run) shift ;;
+*) echo 'usage: pp4-step0.sh --dry-run|--run [--depths 32768 131072]' >&2; exit 2 ;;
 esac
 if [ "${BORROW:-}" != S4 ] || [ "${BORROW_BOXES:-}" != studio4 ] || [ "$(hostname -s)" != studio4 ]; then
     echo 'requires studio4 borrow (BORROW=S4 BORROW_BOXES=studio4)' >&2
@@ -52,16 +54,21 @@ for mode in ReleaseFast Debug; do
     zig test src/plugins/deepseek_v41/pp4_step0.zig -lc -O "$mode" > "$OUT/diag-test-$mode.log" 2>&1
     zig test src/pp4_first_use_bench.zig -lc -O "$mode" --test-filter 'pp4 first use' > "$OUT/reader-test-$mode.log" 2>&1
 done
-zig build -Doptimize=ReleaseFast -Dunits=false > "$OUT/build.log" 2>&1
+SERVER_BINARY=${PP4_BINARY:-$BUILD/zig-out/bin/mlx-serve}
+if [ -z "${PP4_BINARY:-}" ]; then
+    zig build -Doptimize=ReleaseFast -Dunits=false > "$OUT/build.log" 2>&1
+    bash "$HOME/bench/signbin.sh" "$SERVER_BINARY" > "$OUT/sign.log" 2>&1
+fi
 zig build-exe src/pp4_first_use_bench.zig -lc -O ReleaseFast -femit-bin="$OUT/pp4-first-use" > "$OUT/reader-build.log" 2>&1
-imports=$(dyld_info -imports zig-out/bin/mlx-serve | grep -c _mlx_)
+imports=$(dyld_info -imports "$SERVER_BINARY" | grep -c _mlx_)
 [ "$imports" -gt 200 ]
-bash "$HOME/bench/signbin.sh" zig-out/bin/mlx-serve > "$OUT/sign.log" 2>&1
-shasum -a 256 zig-out/bin/mlx-serve "$OUT/pp4-first-use" > "$OUT/binaries.sha256"
+shasum -a 256 "$SERVER_BINARY" "$OUT/pp4-first-use" > "$OUT/binaries.sha256"
 echo "PP4-STEP0-BUILT $OUT $(date -u +%FT%TZ)"
-taskpolicy -c utility /usr/bin/python3 scripts/bench/pp4_window.py --binary "$BUILD/zig-out/bin/mlx-serve" \
+window_rc=0
+taskpolicy -c utility /usr/bin/python3 scripts/bench/pp4_window.py --binary "$SERVER_BINARY" \
     --reader "$OUT/pp4-first-use" --out "$OUT" \
     --pack "$HOME/models-iq/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw" \
-    --corpus "$HOME/bench/engram-corpus.md"
+    --corpus "$HOME/bench/engram-corpus.md" "$@" || window_rc=$?
 /usr/bin/python3 scripts/bench/pp4_step0.py "$OUT"
+[ "$window_rc" -eq 0 ] || exit "$window_rc"
 echo "PP4-STEP0-OK $OUT $(date -u +%FT%TZ)"

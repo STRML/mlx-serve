@@ -81,17 +81,10 @@ const Probe = struct {
         return any;
     }
 
-    fn cached(p: *Probe, table: *const engram.Table, ids: []const u32) !usize {
-        p.last = std.math.maxInt(u64);
-        var count: usize = 0;
-        for (ids) |id| if (try p.span(table.w_off + @as(u64, id) * table.w_stride, table.wlen)) {
-            count += 1;
-        };
-        p.last = std.math.maxInt(u64);
-        for (ids) |id| if (try p.span(table.s_off + @as(u64, id) * table.s_stride, table.slen)) {
-            count += 1;
-        };
-        return count;
+    fn parts(p: *Probe, table: *const engram.Table, id: u32) !usize {
+        const w = try p.span(table.w_off + @as(u64, id) * table.w_stride, table.wlen);
+        const sc = try p.span(table.s_off + @as(u64, id) * table.s_stride, table.slen);
+        return @intFromBool(w) + @as(usize, @intFromBool(sc));
     }
 };
 
@@ -133,20 +126,75 @@ fn epochNs() i128 {
 
 const ReadResult = struct {
     data: engram.Table.Raw,
+    cached_parts: usize,
+    cold_rows: usize,
+    cold_read_ns: i128,
     probe_ns: i128,
     read_start_ns: i128,
     read_start_epoch_ns: i128,
     read_end_ns: i128,
 };
 
+const Coverage = struct {
+    rows: usize = 0,
+    cold: usize = 0,
+
+    fn add(self: *Coverage, rows: usize, cold: usize) void {
+        self.rows += rows;
+        self.cold += cold;
+    }
+
+    fn qualify(self: Coverage) !void {
+        if (self.rows == 0 or self.cold * 10 < self.rows * 9) return error.InsufficientColdCoverage;
+    }
+};
+
 fn readCold(gpa: std.mem.Allocator, table: *const engram.Table, probe: *Probe, ids: []const u32, readers: usize) !ReadResult {
     if (readers == 0 or readers > 32) return error.InvalidReaders;
+    if (table.mode != .mxfp8) return error.UnsupportedTableLayout;
     const probe_start_ns = nowNs();
-    if (try probe.cached(table, ids) != 0) return error.CachedTablePages;
+    const order = try gpa.alloc(u32, ids.len * 2);
+    defer gpa.free(order);
+    const warm = try gpa.alloc(bool, ids.len);
+    defer gpa.free(warm);
+    var cold_n: usize = 0;
+    var warm_n: usize = 0;
+    var cached_parts: usize = 0;
+    probe.last = std.math.maxInt(u64);
+    for (ids, 0..) |id, i| {
+        const parts = try probe.parts(table, id);
+        cached_parts += parts;
+        warm[i] = parts > 0;
+        if (warm[i]) {
+            order[ids.len + warm_n] = id;
+            warm_n += 1;
+        } else {
+            order[cold_n] = id;
+            cold_n += 1;
+        }
+    }
     const read_start_ns = nowNs();
     const read_start_epoch_ns = epochNs();
-    const data = try table.readSorted(gpa, ids, readers);
-    return .{ .data = data, .probe_ns = read_start_ns - probe_start_ns, .read_start_ns = read_start_ns, .read_start_epoch_ns = read_start_epoch_ns, .read_end_ns = nowNs() };
+    const cold = try table.readSorted(gpa, order[0..cold_n], readers);
+    const cold_read_ns = if (cold_n > 0) nowNs() - read_start_ns else 0;
+    if (warm_n == 0) return .{ .data = cold, .cached_parts = 0, .cold_rows = cold_n, .cold_read_ns = cold_read_ns, .probe_ns = read_start_ns - probe_start_ns, .read_start_ns = read_start_ns, .read_start_epoch_ns = read_start_epoch_ns, .read_end_ns = nowNs() };
+    defer cold.deinit(gpa);
+    const cached = try table.readSorted(gpa, order[ids.len..][0..warm_n], readers);
+    defer cached.deinit(gpa);
+    const w = try gpa.alignedAlloc(u8, .@"4", ids.len * table.wlen);
+    errdefer gpa.free(w);
+    const sc = try gpa.alignedAlloc(u8, .@"4", ids.len * table.slen);
+    errdefer gpa.free(sc);
+    const bi = try gpa.alignedAlloc(u8, .@"4", 0);
+    var at: [2]usize = .{ 0, 0 };
+    for (warm, 0..) |is_warm, i| {
+        const part: usize = @intFromBool(is_warm);
+        const data = if (is_warm) cached else cold;
+        @memcpy(w[i * table.wlen ..][0..table.wlen], data.w[at[part] * table.wlen ..][0..table.wlen]);
+        @memcpy(sc[i * table.slen ..][0..table.slen], data.s[at[part] * table.slen ..][0..table.slen]);
+        at[part] += 1;
+    }
+    return .{ .data = .{ .w = w, .s = sc, .b = bi }, .cached_parts = cached_parts, .cold_rows = cold_n, .cold_read_ns = cold_read_ns, .probe_ns = read_start_ns - probe_start_ns, .read_start_ns = read_start_ns, .read_start_epoch_ns = read_start_epoch_ns, .read_end_ns = nowNs() };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -241,7 +289,7 @@ pub fn main(init: std.process.Init) !void {
     const ready_ns = nowNs();
     try jsonLine(gpa, .{
         .kind = "pp4_catalog",
-        .schema = 1,
+        .schema = 2,
         .depth = depth,
         .prefill_tokens = n,
         .chunk_width = chunk,
@@ -265,6 +313,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(ids);
     var at: [2]usize = .{ 0, 0 };
     var copied: [2]usize = .{ 0, 0 };
+    var coverage: Coverage = .{};
     var chunk_index: usize = 0;
     while (chunk_index * chunk < n) : (chunk_index += 1) {
         for (&tables, &probes, 0..) |*table, *probe, slot| {
@@ -274,6 +323,7 @@ pub fn main(init: std.process.Init) !void {
             for (bucket, 0..) |entry, i| ids[i] = entry.row;
             const selected = ids[0..bucket.len];
             const result = try readCold(gpa, table, probe, selected, readers);
+            coverage.add(selected.len, result.cold_rows);
             const data = result.data;
             defer data.deinit(gpa);
             const copy_start_ns = nowNs();
@@ -284,7 +334,7 @@ pub fn main(init: std.process.Init) !void {
             const copy_end_ns = nowNs();
             try jsonLine(gpa, .{
                 .kind = "pp4_bucket",
-                .schema = 1,
+                .schema = 2,
                 .depth = depth,
                 .rank = rank,
                 .shards = 4,
@@ -296,7 +346,9 @@ pub fn main(init: std.process.Init) !void {
                 .layer = cfg.dsv41_engram_layers[slot],
                 .rows = selected.len,
                 .payload_bytes = owner.len,
-                .cached_parts = @as(usize, 0),
+                .cached_parts = result.cached_parts,
+                .cold_rows = result.cold_rows,
+                .cold_read_ns = result.cold_read_ns,
                 .read_start_ns = result.read_start_ns,
                 .read_start_epoch_ns = result.read_start_epoch_ns,
                 .read_end_ns = result.read_end_ns,
@@ -315,7 +367,9 @@ pub fn main(init: std.process.Init) !void {
     for (copied, owners, at, entries) |bytes, owner, end, list| {
         if (bytes != owner.len or end != list.len) return error.IncompleteSchedule;
     }
-    try jsonLine(gpa, .{ .kind = "pp4_reader_done", .schema = 1, .depth = depth, .rank = rank, .elapsed_ns = nowNs() - start_ns });
+    try jsonLine(gpa, .{ .kind = "pp4_reader_coverage", .rows = coverage.rows, .cold_rows = coverage.cold, .minimum_cold_fraction = 0.9 });
+    try coverage.qualify();
+    try jsonLine(gpa, .{ .kind = "pp4_reader_done", .schema = 2, .depth = depth, .rank = rank, .elapsed_ns = nowNs() - start_ns });
 }
 
 test "pp4 first use: earliest chunk dedup preserves global sorted shard ownership" {
@@ -359,12 +413,12 @@ test "pp4 first use: scheduled quarter keeps first-use order without changing ow
     try testing.expectEqual(@as(u32, 2), entries[1].chunk);
 }
 
-test "pp4 first use: cold clone delivers exact bytes and warm selected page is refused" {
+test "pp4 first use: cold clone and cached rows deliver exact bytes with separate cold timing" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = testing.tmpDir(.{});
     defer td.cleanup();
     var bytes: [49152]u8 = undefined;
-    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i * 7 + 3);
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate((i * 7 + 3) ^ (i >> 8));
     try td.dir.writeFile(io, .{ .sub_path = "source", .data = &bytes });
     var pb: [1024]u8 = undefined;
     const dir = pb[0..try td.dir.realPath(io, &pb)];
@@ -384,7 +438,12 @@ test "pp4 first use: cold clone delivers exact bytes and warm selected page is r
     defer edir.unregister(source_fd);
     var source_probe = try Probe.open(source_fd);
     defer std.posix.munmap(source_probe.map);
-    try testing.expectError(error.CachedTablePages, readCold(testing.allocator, &source, &source_probe, &.{ 0, 512 }, 1));
+    const warm = try readCold(testing.allocator, &source, &source_probe, &.{ 0, 512 }, 1);
+    defer warm.data.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), warm.cached_parts);
+    try testing.expectEqual(@as(usize, 0), warm.cold_rows);
+    try testing.expectEqual(@as(i128, 0), warm.cold_read_ns);
+    try testing.expectEqualSlices(u8, bytes[0..4], warm.data.w[0..4]);
     const clone_fd = std.c.open(dst, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     try testing.expect(clone_fd >= 0);
     defer _ = std.c.close(clone_fd);
@@ -400,5 +459,27 @@ test "pp4 first use: cold clone delivers exact bytes and warm selected page is r
     try testing.expectEqualSlices(u8, bytes[0..4], raw.w[0..4]);
     try testing.expectEqualSlices(u8, bytes[2048..2052], raw.w[4..8]);
     try testing.expectEqualSlices(u8, &.{ bytes[32768], bytes[33280] }, raw.s);
-    try testing.expectEqual(@as(usize, 0), try clone_probe.cached(&clone, &.{ 0, 512 }));
+    try testing.expectEqual(@as(usize, 0), try clone_probe.parts(&clone, 0));
+    const first_page: *const volatile u8 = @ptrCast(clone_probe.map.ptr);
+    try testing.expectEqual(bytes[0], first_page.*);
+    clone.rows = 16384;
+    const mixed = try readCold(testing.allocator, &clone, &clone_probe, &.{ 0, 8192 }, 1);
+    defer mixed.data.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), mixed.cold_rows);
+    try testing.expectEqual(@as(usize, 1), mixed.cached_parts);
+    try testing.expect(mixed.cold_read_ns > 0);
+    try testing.expectEqualSlices(u8, bytes[0..4], mixed.data.w[0..4]);
+    try testing.expectEqualSlices(u8, bytes[32768..32772], mixed.data.w[4..8]);
+    try testing.expectEqualSlices(u8, &.{ bytes[32768], bytes[40960] }, mixed.data.s);
+}
+
+test "pp4 first use: cold coverage qualifies ninety percent over the full schedule" {
+    var coverage: Coverage = .{};
+    coverage.add(100, 90);
+    try coverage.qualify();
+    coverage.add(100, 89);
+    try testing.expectError(error.InsufficientColdCoverage, coverage.qualify());
+    coverage.add(100, 100);
+    try coverage.qualify();
+    try testing.expectError(error.InsufficientColdCoverage, (Coverage{}).qualify());
 }

@@ -13,6 +13,49 @@ pp4 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pp4)
 
 
+def write_artifact(root, depths=(32768, 131072)):
+    samples = []
+    for depth in depths:
+        trace, reader = [], []
+        for p0 in range(0, depth - 1, 2048):
+            width = min(2048, depth - 1 - p0)
+            for layer in range(20):
+                trace.append(dict(kind='pp4_layer', p0=p0, rows=width,
+                                  phase='encoder', layer=layer, compute_us=1000))
+            trace += [dict(kind='pp4_chunk', p0=p0, rows=width,
+                           elapsed_us=31000, encoder_us=20000, compressor_us=1000,
+                           decoder_us=6000, dspark_us=3000, head_us=1000,
+                           x_us=10000, dspark_enabled=True),
+                      dict(kind='pp4_engram', p0=p0, needed_us=p0 * 10)]
+            k = p0 // 2048
+            for layer, step in ((1, 1), (14, 2)):
+                start = (k * 2 + step) * 50000000
+                reader.append(dict(kind='pp4_bucket', depth=depth, rank=0,
+                    chunk_index=k, p0=p0, width=width, layer=layer,
+                    cached_parts=0, rows=1, payload_bytes=264,
+                    read_start_ns=start, read_end_ns=start + 1000000,
+                    copy_end_ns=start + 2000000))
+        trace_name = f'trace-{depth}.log'
+        (root / trace_name).write_text(''.join(json.dumps(e) + '\n' for e in trace))
+        for rep in range(6):
+            for rank in range(4):
+                name = f'reader-{depth}-{rank}-{rep}.jsonl'
+                events = [dict(kind='pp4_catalog', depth=depth, rank=rank, start_ns=0, ready_ns=0,
+                               prefill_tokens=depth - 1, chunk_width=2048, readers=32, shards=4,
+                               token_digest=rep * 4 + rank,
+                               catalog_digest=[456 + rep, 789 + rank], distinct_rows=[4, 4])]
+                events += [dict(e, rank=rank) for e in reader]
+                events += [dict(kind='pp4_reader_done', depth=depth, rank=rank, elapsed_ns=10**12)]
+                (root / name).write_text(''.join(json.dumps(e) + '\n' for e in events))
+                samples.append(dict(depth=depth, arm='profile', rank=rank,
+                                    trace=trace_name, reader=name))
+        samples += [dict(depth=depth, arm='control', prefill_s=9 if depth == 32768 else 30)
+                    for _ in range(12)]
+    (root / "manifest.json").write_text(json.dumps(dict(samples=samples, corpus_sha256="corpus")))
+    (root / "binaries.sha256").write_text("binary  build/zig-out/bin/mlx-serve\nreader  pp4-first-use\n")
+    return samples
+
+
 class BoundContract(unittest.TestCase):
     def test_tail_and_hops_change_both_cut_bounds(self):
         # Independent serial pipeline: e=.2, stages=(.1,.2,.3,.4), M=16.
@@ -55,43 +98,7 @@ class BoundContract(unittest.TestCase):
     def test_full_artifact_summary_refuses_partial_reader_and_recomputes_gate(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            samples = []
-            for depth in (32768, 131072):
-                trace, reader = [], []
-                for p0 in range(0, depth - 1, 2048):
-                    width = min(2048, depth - 1 - p0)
-                    for layer in range(20):
-                        trace.append(dict(kind='pp4_layer', p0=p0, rows=width,
-                                          phase='encoder', layer=layer, compute_us=1000))
-                    trace += [dict(kind='pp4_chunk', p0=p0, rows=width,
-                                   elapsed_us=31000, encoder_us=20000, compressor_us=1000,
-                                   decoder_us=6000, dspark_us=3000, head_us=1000,
-                                   x_us=10000, dspark_enabled=True),
-                              dict(kind='pp4_engram', p0=p0, needed_us=p0 * 10)]
-                    k = p0 // 2048
-                    for layer, step in ((1, 1), (14, 2)):
-                        start = (k * 2 + step) * 50000000
-                        reader.append(dict(kind='pp4_bucket', depth=depth, rank=0,
-                            chunk_index=k, p0=p0, width=width, layer=layer,
-                            cached_parts=0, rows=1, payload_bytes=264,
-                            read_start_ns=start, read_end_ns=start + 1000000,
-                            copy_end_ns=start + 2000000))
-                trace_name = f'trace-{depth}.log'
-                (root / trace_name).write_text(''.join(json.dumps(e) + '\n' for e in trace))
-                for rep in range(6):
-                    for rank in range(4):
-                        name = f'reader-{depth}-{rank}-{rep}.jsonl'
-                        events = [dict(kind='pp4_catalog', depth=depth, rank=rank, start_ns=0, ready_ns=0,
-                                       prefill_tokens=depth - 1, chunk_width=2048, readers=32, shards=4,
-                                       token_digest=rep * 4 + rank,
-                                       catalog_digest=[456 + rep, 789 + rank], distinct_rows=[4, 4])]
-                        events += [dict(e, rank=rank) for e in reader]
-                        events += [dict(kind='pp4_reader_done', depth=depth, rank=rank, elapsed_ns=10**12)]
-                        (root / name).write_text(''.join(json.dumps(e) + '\n' for e in events))
-                        samples.append(dict(depth=depth, arm='profile', rank=rank,
-                                            trace=trace_name, reader=name))
-                samples += [dict(depth=depth, arm='control', prefill_s=9 if depth == 32768 else 30)
-                            for _ in range(12)]
+            samples = write_artifact(root)
             manifest = root / 'manifest.json'
             manifest.write_text(json.dumps(dict(samples=samples)))
             result = pp4.summarize(root)
@@ -107,8 +114,87 @@ class BoundContract(unittest.TestCase):
             variants = [original[:-1], [original[0], *reversed(original[1:-1]), original[-1]]]
             for lines in variants:
                 target.write_text('\n'.join(lines) + '\n')
-                with self.subTest(kind='missing-or-reordered'), self.assertRaises(ValueError):
-                    pp4.summarize(root)
+                with self.subTest(kind='missing-or-reordered'):
+                    partial = pp4.summarize(root)
+                    self.assertEqual(partial['missing_depths'], [32768])
+                    self.assertEqual(set(partial['depths']), {131072})
+                    self.assertEqual(partial['status'], 'PARTIAL')
+                    self.assertRegex(partial['missing_reasons'][32768], 'completion|bucket')
+
+    def test_failed_window_preserves_complete_depth_with_one_control_block(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            samples = write_artifact(root, (32768,))
+            profiles = [s for s in samples if s['arm'] == 'profile']
+            controls = [s for s in samples if s['arm'] == 'control'][:6]
+            (root / 'manifest.json').write_text(json.dumps(dict(
+                samples=controls + profiles, failure='first-use reader exited 1')))
+            result = pp4.summarize(root)
+            self.assertEqual(result['status'], 'PARTIAL')
+            self.assertEqual(result['missing_depths'], [131072])
+            self.assertEqual(result['verdict'], 'PARTIAL')
+            row = result['depths'][32768]
+            self.assertEqual(row['control_coverage'], 'preceding_only')
+            self.assertAlmostEqual(row['x_share'], .16 / 9)
+            self.assertEqual(row['cuts']['2/8/14']['ratio_gate'], 'NO_GO')
+            self.assertIn('131072', result['missing_reasons'][131072])
+
+    def test_analysis_cli_writes_outside_read_only_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'evidence'
+            out = Path(temp) / 'analysis'
+            root.mkdir()
+            write_artifact(root, (32768,))
+            root.chmod(0o555)
+            try:
+                run = subprocess.run([sys.executable, pp4.__file__, str(root), '--out', str(out)],
+                                     capture_output=True, text=True)
+            finally:
+                root.chmod(0o755)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(json.loads((out / 'bound.json').read_text())['missing_depths'], [131072])
+            self.assertIn('PARTIAL', (out / 'bound.md').read_text())
+            self.assertFalse((root / 'bound.json').exists())
+
+    def test_merge_depth_runs_requires_matching_binary_and_corpus(self):
+        with tempfile.TemporaryDirectory() as temp:
+            roots = [Path(temp) / str(i) for i in range(2)]
+            for root, depth in zip(roots, (32768, 131072)):
+                root.mkdir()
+                write_artifact(root, (depth,))
+            result = pp4.summarize(roots)
+            self.assertEqual(set(result['depths']), {32768, 131072})
+            self.assertEqual(result['status'], 'PROJECTION_ONLY')
+            self.assertEqual(len(result['sources']), 2)
+            for mismatch in ('binary', 'corpus', 'missing'):
+                with self.subTest(mismatch=mismatch):
+                    write_artifact(roots[1], (131072,))
+                    if mismatch == 'binary':
+                        (roots[1] / 'binaries.sha256').write_text('different  mlx-serve\n')
+                    else:
+                        path = roots[1] / 'manifest.json'
+                        manifest = json.loads(path.read_text())
+                        manifest['corpus_sha256'] = None if mismatch == 'missing' else 'different'
+                        path.write_text(json.dumps(manifest))
+                    with self.assertRaisesRegex(ValueError, 'identity'):
+                        pp4.summarize(roots)
+            write_artifact(roots[1], (32768,))
+            with self.assertRaisesRegex(ValueError, 'overlapping depth'):
+                pp4.summarize(roots)
+
+    def test_depth_only_cli_checks_only_requested_depth(self):
+        import pp4_window as window_module
+        with tempfile.TemporaryDirectory() as temp:
+            tokens = Path(temp) / 'tokens.u32'
+            tokens.write_bytes(struct.pack('<140000I', *range(140000)))
+            run = subprocess.run([sys.executable, window_module.__file__, '--check-tokens',
+                str(tokens), '--depths', '131072'], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn('samples=39', run.stdout)
+            plan = window_module.plan_samples(list(range(140000)), depths=[131072])
+            self.assertEqual({s['depth'] for s in plan}, {131072})
+            with self.assertRaisesRegex(ValueError, 'depth'):
+                window_module.plan_samples(list(range(140000)), depths=[8192])
 
     def test_two_chunk_credit_horizon_holds_early_reader(self):
         result = pp4.simulate([[1, 0, 0, 0]] * 3,
@@ -134,98 +220,94 @@ class BoundContract(unittest.TestCase):
             window.server.terminate.assert_called_once_with()
             window.reader.terminate.assert_called_once_with()
 
-    def test_window_overlap_excludes_waits_at_their_recorded_positions(self):
+    def test_reader_finishes_before_matching_request_and_failure_prevents_request(self):
         from types import SimpleNamespace
         from unittest.mock import Mock, patch
         import pp4_window as window_module
-
-        cases = [
-            ('middle-wait', [(50, 90)], (50, 90), None),
-            ('start-and-middle-waits', [(0, 20), (50, 90)], (50, 90), None),
-            ('compute-between-waits', [(0, 20), (50, 90)], (20, 50), 1.),
-            ('partial-compute', [(50, 90)], (0, 100), .6),
-            ('overlapping-unsorted-waits', [(60, 90), (50, 80)], (0, 100), .6),
-            ('waits-in-previous-layer', [(0, 20), (50, 90)], (100, 200), 1.),
-            ('fully-waiting-layer', [(0, 100)], (0, 100), None),
-            ('half-compute-boundary', [(0, 50)], (0, 100), .5),
-            ('no-waits', [], (0, 100), 1.),
-        ]
-        for name, waits, (read_lo, read_hi), fraction in cases:
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+        for exitcode in (0, 1):
+            with self.subTest(exitcode=exitcode), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
-                epoch, mono, depth = 900000, 10000, 101
-                layers = [dict(kind='pp4_layer', p0=0, rows=100, layer=i,
-                               phase='encoder', start_us=mono + i * 100,
-                               end_us=mono + (i + 1) * 100,
-                               epoch_us=epoch + i * 100, elapsed_us=100,
-                               engram_wait_us=sum(hi - lo for lo, hi in waits) if i == 0 else 0,
-                               compute_us=100) for i in range(20)]
-                events = layers + [dict(kind='pp4_chunk', p0=0, rows=100,
-                    elapsed_us=5000, encoder_us=2000, compressor_us=1000,
-                    decoder_us=1000, dspark_us=1000, head_us=0, x_us=3000,
-                    dspark_enabled=True)]
-                events += [dict(kind='pp4_engram', p0=0, rows=100, table=0,
-                                needed_us=mono + lo, taken_us=mono + hi,
-                                epoch_us=epoch + lo) for lo, hi in waits]
-                # Other chunks' waits must not remove this chunk's compute.
-                events.append(dict(kind='pp4_engram', p0=2048, rows=100, table=0,
-                                   needed_us=mono, taken_us=mono + 100, epoch_us=epoch))
-                trace = ('[prefill-trace] tokens=101 total=1ms\n' +
-                         ''.join(json.dumps(e) + '\n' for e in events)).encode()
-                reader = [dict(kind='pp4_catalog', depth=depth, rank=0, start_ns=0,
-                               ready_ns=0, prefill_tokens=100, chunk_width=2048,
-                               shards=4, readers=32),
-                          dict(kind='pp4_bucket', chunk_index=0, layer=1, p0=0,
-                               width=100, depth=depth, rank=0, cached_parts=0,
-                               rows=1, payload_bytes=264, read_start_ns=0,
-                               read_end_ns=1, copy_end_ns=1,
-                               read_start_epoch_ns=(epoch + read_lo) * 1000,
-                               read_ns=(read_hi - read_lo) * 1000),
-                          dict(kind='pp4_bucket', chunk_index=0, layer=14, p0=0,
-                               width=100, depth=depth, rank=0, cached_parts=0,
-                               rows=0, payload_bytes=0, read_start_ns=1,
-                               read_end_ns=1, copy_end_ns=1),
-                          dict(kind='pp4_reader_done', depth=depth, rank=0, elapsed_ns=1)]
-                reads = [e for e in reader if e['kind'] == 'pp4_bucket' and e['rows']]
-                self.assertAlmostEqual(window_module.compute_overlap_fraction(events, reads),
-                                       0. if fraction is None else fraction)
+                write_artifact(root, (32768,))
                 (root / 'profile.log').touch()
+                trace = (root / 'trace-32768.log').read_bytes()
+                trace += b'[prefill-trace] tokens=32768 total=9000ms\n'
+                reader = (root / 'reader-32768-0-0.jsonl').read_text()
                 window = window_module.Window(SimpleNamespace(out=root, pack=root, reader='reader'))
-                window.ids = list(range(469416))
-                (root / 'corpus.u32').write_bytes(struct.pack('<469416I', *window.ids))
-                window.request = Mock(return_value=({}, 0, 1000000))
-                window.log_tail = Mock(return_value=trace)
+                window.ids = list(range(40000))
                 window.save = Mock()
-
-                reader_ids = []
+                window.log_tail = Mock(return_value=trace)
+                order = []
+                def request(ids):
+                    order.append('request')
+                    self.assertEqual(order[:2], ['reader-start', 'reader-done'])
+                    return {}, 0, 10**10
+                window.request = Mock(side_effect=request)
                 def run_reader(command, stdout, **kwargs):
-                    raw = Path(command[2]).read_bytes()
-                    self.assertEqual(len(raw), depth * 4)
-                    reader_ids.append(list(struct.unpack('<' + 'I' * depth, raw)))
-                    stdout.write(''.join(json.dumps(e) + '\n' for e in reader))
+                    order.append('reader-start')
+                    self.assertEqual(Path(command[2]).read_bytes(), struct.pack('<32768I', *range(32768)))
+                    stdout.write(reader)
                     stdout.flush()
-                    return Mock(wait=Mock(return_value=0), poll=Mock(return_value=0))
-
+                    def wait(timeout):
+                        order.append('reader-done')
+                        return exitcode
+                    return Mock(wait=wait, poll=Mock(return_value=exitcode))
                 with patch.object(window_module, 'cold_pack', return_value=(None, [])), \
                         patch.object(window_module.subprocess, 'Popen', side_effect=run_reader):
-                    def sample(rep):
-                        return window.sample(dict(arm='profile', depth=depth, rep=rep,
-                            rank=0, block=1, warmup=False, token_offset=4093 * (rep + 1)))
-                    if fraction is None:
-                        with self.assertRaisesRegex(ValueError, 'less than50%'):
-                            sample(0)
-                        self.assertEqual(window.samples, [])
+                    spec = dict(arm='profile', depth=32768, rep=0, rank=0,
+                                block=1, warmup=False, token_offset=0)
+                    if exitcode:
+                        with self.assertRaisesRegex(RuntimeError, 'reader exited 1'):
+                            window.sample(spec)
+                        window.request.assert_not_called()
                     else:
-                        sample(0)
-                        self.assertAlmostEqual(window.samples[0]['compute_overlap_fraction'], fraction)
-                        if name == 'no-waits':
-                            sample(1)
-                            prompts = [call.args[0] for call in window.request.call_args_list]
-                            self.assertNotEqual(prompts[0][0], prompts[1][0])
-                            self.assertEqual(reader_ids, prompts)
-                            for sample, prompt in zip(window.samples, prompts):
-                                offset = sample['token_offset']
-                                self.assertEqual(prompt, window.ids[offset:offset + depth])
+                        window.sample(spec)
+                        self.assertEqual(order, ['reader-start', 'reader-done', 'request'])
+                        self.assertEqual(window.samples[0]['reader_mode'], 'before_request_idle_gpu')
+
+    def test_window_reads_all_depths_before_any_server_can_touch_the_rows(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        import pp4_window as window_module
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'corpus.u32').write_bytes(struct.pack('<140000I', *range(140000)))
+            window = window_module.Window(SimpleNamespace(out=root, reader='reader',
+                pack=root, corpus=root / 'corpus', depths=[32768, 131072]))
+            read = []
+            window.read_sample = Mock(side_effect=lambda spec: read.append((spec['depth'], spec['rep'], spec['rank'])))
+            def start(arm):
+                self.assertEqual(len(read), 48)
+                self.assertEqual({d for d, _, _ in read}, {32768, 131072})
+            window.start_server = Mock(side_effect=start)
+            window.sample = Mock()
+            window.save = Mock()
+            with patch.object(window_module.subprocess, 'run'), \
+                    patch.object(window_module, 'model_pids', return_value=[]), \
+                    patch.object(window_module, 'free_bytes', return_value=32 << 30), \
+                    patch.object(window_module.threading, 'Thread'):
+                window.run()
+            self.assertEqual(window.start_server.call_count, 3)
+
+    def test_cached_parts_require_cold_timing_and_ninety_percent_coverage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write_artifact(root, (32768,))
+            events = pp4.records(root / 'reader-32768-0-0.jsonl')
+            for event in events:
+                if event['kind'] == 'pp4_bucket':
+                    event.update(rows=100, payload_bytes=26400, cached_parts=5,
+                                 cold_rows=95, cold_read_ns=500000)
+            ready = pp4.deliveries(events, 32768, 0)
+            self.assertEqual(len(ready), 16)
+            events[1]['cold_rows'] = 89
+            for event in events:
+                if event['kind'] == 'pp4_bucket':
+                    event.update(cold_rows=89, cached_parts=11)
+            with self.assertRaisesRegex(ValueError, 'cold coverage'):
+                pp4.deliveries(events, 32768, 0)
+            events[1].pop('cold_read_ns')
+            with self.assertRaisesRegex(ValueError, 'cold'):
+                pp4.deliveries(events, 32768, 0)
 
     def test_offline_plan_covers_warmups_and_rejects_repeated_prefixes_before_load(self):
         from types import SimpleNamespace
@@ -259,7 +341,7 @@ class BoundContract(unittest.TestCase):
                 token_file = root / 'corpus.u32'
                 token_file.write_bytes(struct.pack('<' + 'I' * len(bad), *bad))
                 window = window_module.Window(SimpleNamespace(out=root, reader='reader',
-                    corpus=root / 'corpus.md', pack=root))
+                    corpus=root / 'corpus.md', pack=root, depths=[32768, 131072]))
                 window.start_server = Mock()
                 with patch.object(window_module.subprocess, 'run'), \
                         self.assertRaisesRegex(ValueError, 'corpus|distinct'):

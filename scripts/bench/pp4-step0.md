@@ -6,9 +6,12 @@ borrow. Build, sign, and test before loading the sole private server. Keep the
 live launcher and installed binaries untouched; the borrow returns S4 afterward.
 
 ```text
+cold readers (all selected depths, before any server starts)
+    |
+    v
 control block       profile block                       control block
 6/depth        ->    6/depth/global ordinal quarter   ->  6/depth
-                    sole server + CPU-only reader
+                    sole server; readers already finished
                                   |
               exact corpus ids, C=2048, N=32768/131072
                                   |
@@ -61,11 +64,14 @@ present. Actual chunk descriptors include the final 2,047-row chunk. Only
 2,048-row requests are qualified here; the plan's later 4,096-row lead/subchunk
 case needs a separate descriptor mapping.
 
-The [first-use reader](pp4-first-use-reader.md) executes one ordinal quarter at
-a time against its own fresh table clones. All reads must lie inside active
-prefill, and at least 50% of their aggregate duration must overlap synchronized
-layer intervals excluding Engram waits. The overlap includes CPU graph
-construction, not just GPU execution. The manifest records the fraction.
+The [first-use reader](pp4-first-use-reader.md) executes every selected sample
+on fresh table clones before starting any server. Each bucket probes both codes
+and scales, times fully cold rows separately, then reads cached rows and restores
+the sorted payload order. A completion marker requires at least 90% fully cold
+rows across that reader sample. Buckets report `cached_parts`, `cold_rows`, and
+`cold_read_ns`, including on a coverage failure. The manifest records
+`reader_mode=before_request_idle_gpu`. These reads measure an idle GPU; the
+older concurrent readers remain labeled `concurrent_gpu_prefill` in analysis.
 `memory.jsonl` samples free+inactive, server RSS, and `top`'s footprint. The
 watchdog aborts the owned processes below 16 GiB or on a foreign model process.
 
@@ -75,12 +81,15 @@ watchdog aborts the owned processes below 16 GiB or on a foreign model process.
 python3 scripts/bench/pp4_step0.py ~/bench/pp4-step0-YYYYMMDD-HHMMSS
 ```
 
-The analyzer requires six profiles per rank/depth, six controls before and six
-after, complete contiguous chunks and encoder layers, native DSpark/X fields,
-sample-specific catalogs, ordered cold reader buckets, and a completion marker. A
-failed window cannot produce a verdict.
+The analyzer validates each depth independently: six profiles per rank, a full
+six-sample control block, complete chunks and encoder layers, native DSpark/X
+fields, ordered reader buckets, at least 90% fully cold rows, and a completion
+marker. A failed window retains its valid depths as `PARTIAL` and names missing
+depths and reasons. A single control block is labeled `preceding_only` or
+`following_only`; the overall result remains partial even after both depths
+are present. Corrupt evidence excludes its depth from the bound.
 
-For each depth it uses the faster neighboring control median `T1`,
+For each depth it uses the faster available control-block median `T1`,
 `M=ceil((N-1)/2048)`, `t=T1/M`, and reports `X/t`, where
 `X=compressor+decoder+DSpark`. It sums actual layer compute for cuts 2/8/14 and
 8/14/20. Residual embedding/preparation stays on stage 0. Every measured head
@@ -139,3 +148,38 @@ zig build test -Doptimize=Debug -Dtest-filter='pp4 step0'
 The physical fixture compares logits and committed DSpark rings with and
 without synchronized diagnostics. Tests and dry-run establish preparation
 correctness; measured performance remains pending the window.
+
+## Resume one depth and merge evidence
+
+The shell forwards `--depths` to the window. A 131k-only run has 39 inputs
+(36 measured requests and three warm-ups), all at 131,072 tokens. Reuse the
+original signed server with `PP4_BINARY` so the server SHA stays identical; the
+shell builds the updated reader separately. Run only inside the same Studio
+borrow described above:
+
+```bash
+PP4_BINARY=EXISTING_RUN/build/zig-out/bin/mlx-serve \
+  bash scripts/bench/pp4-step0.sh --run --depths 131072
+```
+
+`EXISTING_RUN` is the absolute path of the original run. Reader binaries may
+differ because the cold-page policy changed. The analyzer requires identical
+server-binary and corpus SHA256 values across inputs and refuses overlapping
+complete depths. Older manifests use `binaries.sha256` for the server identity.
+A failed window also gets `bound.json` and `bound.md`; the shell preserves the
+window's failure exit status.
+
+Read-only copies stay untouched when `--out` selects another directory:
+
+```bash
+python3 scripts/bench/pp4_step0.py /private/tmp/claude/pp4-run2 \
+  --out /private/tmp/claude/pp4-run2-analysis
+python3 scripts/bench/pp4_step0.py /private/tmp/claude/pp4-run2 RUN_131K \
+  --out /private/tmp/claude/pp4-merged-analysis
+```
+
+`RUN_131K` is the copied 131k-only evidence directory. The merged output keeps
+source failures, one-sided controls, and reader-load modes visible. Cold-only
+read time excludes cached-row reads; the first-use simulation uses full bucket
+completion, including cached rows and copies. Cached-row timings do not establish
+an all-cold delivery guarantee.
