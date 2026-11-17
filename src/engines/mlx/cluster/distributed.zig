@@ -1132,8 +1132,8 @@ fn followerExit(state: *LinkState, reason: dist_watchdog.BellFailure) void {
 
 /// Writes the `[dist-exit]` record (fsynced), without exiting: for a path that leaves through `main`.
 fn noteDistExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64) void {
-    var buf: [160]u8 = undefined;
-    log.err("{s}", .{dist_watchdog.exitRecord(&buf, crt.wallMs(), cause, peer_rank, liveness().step, waited_ms)});
+    var buf: [256]u8 = undefined;
+    log.err("{s}", .{dist_watchdog.exitRecord(&buf, crt.wallMs(), cause, peer_rank, liveness().step, waited_ms, log.requestId())});
     log.syncFile();
 }
 
@@ -1141,9 +1141,13 @@ pub fn exitReleaseFailed(rank: u32) noreturn {
     distExit(.release_failed, rank, null);
 }
 
-pub fn exitSwitchAbort(n: u64) noreturn {
-    log.err("[dist-exit] epoch_ms={d} cause=switch_abort n={d} peer=- step={d} waited_ms=-\n", .{ crt.wallMs(), n, liveness().step });
+fn noteSwitchAbort(n: u64) void {
+    log.err("[dist-exit] epoch_ms={d} cause=switch_abort n={d} peer=- step={d} waited_ms=- req={f}\n", .{ crt.wallMs(), n, liveness().step, log.requestTag(log.requestId()) });
     log.syncFile();
+}
+
+pub fn exitSwitchAbort(n: u64) noreturn {
+    noteSwitchAbort(n);
     std.c._exit(1);
 }
 
@@ -1676,7 +1680,7 @@ const ClusterState = struct {
     tp_sums: u32 = 0,
     /// Values summed this step: the ranks agree on it as on the count, or their sums pair up wrong.
     tp_values: usize = 0,
-    tp_last: struct { p0: usize = 0, rows: usize = 0 } = .{},
+    tp_last: struct { p0: usize = 0, rows: usize = 0, request_id: u64 = 0 } = .{},
     /// Rank 0: the state the workers last stepped, while no other message has reached them since (`sendMsg` clears it).
     tp_live: ?TpLive = null,
     tp_spec: ?TpSpec = null,
@@ -2294,10 +2298,10 @@ fn noteTpStep(p0: usize, rows: usize) void {
     const c = cluster();
     c.tp_link.?.state.?.watchdog.progress(@intCast(crt.monotonicMs()));
     if (env.on(.DIST_STEPS)) log.info("[dist-step] epoch_ms={d} rows={d} step={d}\n", .{ crt.wallMs(), rows, c.tp_link.?.state.?.watchdog.step.load(.monotonic) });
-    if (c.tp_last.rows > 0 and (c.tp_last.rows > 1 or c.tp_sums != 80)) log.info("[dist] tensor step at {d}: {d} rows, {d} sums of {d} values\n", .{ c.tp_last.p0, c.tp_last.rows, c.tp_sums, c.tp_values });
+    if (c.tp_last.rows > 0 and (c.tp_last.rows > 1 or c.tp_sums != 80)) log.info("[dist] tensor step at {d}: {d} rows, {d} sums of {d} values req={f}\n", .{ c.tp_last.p0, c.tp_last.rows, c.tp_sums, c.tp_values, log.requestTag(c.tp_last.request_id) });
     c.tp_sums = 0;
     c.tp_values = 0;
-    c.tp_last = .{ .p0 = p0, .rows = rows };
+    c.tp_last = .{ .p0 = p0, .rows = rows, .request_id = log.requestId() };
 }
 
 fn tpLeader(wait_ready: bool) !*const Link {
@@ -3289,7 +3293,7 @@ test "dist bell READY matrix 6: partial GO uses the fatal exit cause" {
     try std.testing.expectError(error.DistNoGo, go.check(800, 1000));
     try std.testing.expectEqual(error.DistNoGo, go.writeFailed());
     var buf: [160]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, dist_watchdog.exitRecord(&buf, 1, .partial_go, null, 0, null), "cause=partial_go") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dist_watchdog.exitRecord(&buf, 1, .partial_go, null, 0, null, 0), "cause=partial_go") != null);
 }
 
 test "dist bell READY matrix 7: no GO reaches the worker deadline" {
@@ -3452,12 +3456,16 @@ test "dist bell a rows worker's READY leaves its idle exit unarmed" {
     try std.testing.expect(!state.follower_pending.load(.acquire));
 }
 
+fn noteWorkerLeft(state: *const LinkState, lost: u32) void {
+    log.warn("[dist] attempt={d} worker rank {d} left req={f}\n", .{ state.n, lost, log.requestTag(log.requestId()) });
+}
+
 /// Waits on the bells for a worker to leave: a read returns only at its end.
 fn watchWorker(link: Link) void {
     const state = link.state.?;
     const lost = watchBells(&link, state);
     if (lost == 0 or state.closing.load(.acquire)) return;
-    log.warn("[dist] attempt={d} worker rank {d} left\n", .{ state.n, lost });
+    noteWorkerLeft(state, lost);
     if (!state.switch_open and link.size == 2) {
         while (state.recvs.load(.acquire) == 0) if (sleepUnlessStopped(state, 100)) return;
     }
@@ -6523,4 +6531,77 @@ test "dist dsv41 worker: every TP4 follower receives control from rank zero" {
         try switcher.fall(408, link);
         try std.testing.expectEqual(@as(u32, 0), TestSwitchOpen.exits.count.load(.acquire));
     }
+}
+
+test "request id: tensor step keeps its own request across consecutive requests" {
+    const c = cluster();
+    const saved_link = c.tp_link;
+    const saved_last = c.tp_last;
+    const saved_sums = c.tp_sums;
+    const saved_values = c.tp_values;
+    const previous = log.setRequestId(73);
+    defer {
+        c.tp_link = saved_link;
+        c.tp_last = saved_last;
+        c.tp_sums = saved_sums;
+        c.tp_values = saved_values;
+        _ = log.setRequestId(previous);
+    }
+    var state: LinkState = .{};
+    var link: Link = .{ .group = .{}, .rank = 0, .size = 2, .state = &state };
+    c.tp_link = &link;
+    c.tp_last = .{};
+    const text = try @import("../../../sdk/testing/log_capture.zig").capture(std.testing.allocator, struct {
+        fn run() void {
+            noteTpStep(100, 5);
+            cluster().tp_sums = 40;
+            cluster().tp_values = 200;
+            _ = log.setRequestId(74);
+            noteTpStep(200, 3);
+            cluster().tp_sums = 20;
+            cluster().tp_values = 300;
+            _ = log.setRequestId(0);
+            noteTpStep(300, 2);
+        }
+    }.run, .{});
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[dist] tensor step at 100: 5 rows, 40 sums of 200 values req=chatcmpl-73\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[dist] tensor step at 200: 3 rows, 20 sums of 300 values req=chatcmpl-74\n") != null);
+}
+
+test "request id: worker-left and dist-exit name the active request or dash when idle" {
+    const previous = log.setRequestId(73);
+    defer _ = log.setRequestId(previous);
+    const text = try @import("../../../sdk/testing/log_capture.zig").capture(std.testing.allocator, struct {
+        fn run() void {
+            var state: LinkState = .{ .n = 8 };
+            noteWorkerLeft(&state, 2);
+            noteDistExit(.worker_left, 2, null);
+            _ = log.setRequestId(0);
+            noteWorkerLeft(&state, 3);
+            noteDistExit(.stall, null, 30001);
+        }
+    }.run, .{});
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[dist] attempt=8 worker rank 2 left req=chatcmpl-73\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[dist] attempt=8 worker rank 3 left req=-\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cause=worker_left peer=2 step=0 waited_ms=- req=chatcmpl-73\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cause=stall peer=- step=0 waited_ms=30001 req=-\n") != null);
+}
+
+test "request id: switch-abort exit keeps the request and existing attempt fields" {
+    const previous = log.setRequestId(73);
+    defer _ = log.setRequestId(previous);
+    const text = try @import("../../../sdk/testing/log_capture.zig").capture(std.testing.allocator, struct {
+        fn run() void {
+            noteSwitchAbort(8);
+            _ = log.setRequestId(0);
+            noteSwitchAbort(9);
+        }
+    }.run, .{});
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cause=switch_abort n=8 peer=- step=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, " waited_ms=- req=chatcmpl-73\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cause=switch_abort n=9 peer=- step=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, " waited_ms=- req=-\n") != null);
 }

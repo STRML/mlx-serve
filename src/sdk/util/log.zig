@@ -35,6 +35,7 @@ pub const Level = enum {
 /// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
 const SinksState = struct {
     current_level: Level = .info,
+    inference_request: std.atomic.Value(u64) = .init(0),
     /// Read outside the mutex on every log call, so keep it atomic. When false the
     /// sink costs one relaxed load and nothing else.
     sink_active: bool = false,
@@ -65,6 +66,27 @@ pub const sinks_shared = @import("shared.zig").Shared(SinksState, "log_state", .
 inline fn sinks() *SinksState {
     return sinks_shared.get();
 }
+
+/// The inference thread nests request work at prefill boundaries; exit watchers read the published id atomically.
+pub fn setRequestId(id: u64) u64 {
+    return sinks().inference_request.swap(id, .acq_rel);
+}
+
+pub fn requestId() u64 {
+    return sinks().inference_request.load(.acquire);
+}
+
+pub fn requestTag(id: u64) RequestTag {
+    return .{ .id = id };
+}
+
+pub const RequestTag = struct {
+    id: u64,
+    pub fn format(self: RequestTag, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.id == 0) return w.writeAll("-");
+        try w.print("chatcmpl-{d}", .{self.id});
+    }
+};
 
 pub fn setLevel(level: Level) void {
     sinks().current_level = level;
@@ -447,4 +469,30 @@ test "enabled/atLevel: the level check a caller can ask BEFORE building its argu
     sinks().current_level = .info;
     atLevel(.debug, "suppressed {d}\n", .{1});
     atLevel(.info, "written {d}\n", .{2});
+}
+
+test "request id: nested inference work restores the outer request on error and idle" {
+    const old = setRequestId(0);
+    defer _ = setRequestId(old);
+    const outer = setRequestId(73);
+    try std.testing.expectEqual(@as(u64, 0), outer);
+    const nested = struct {
+        fn run() !void {
+            const previous = setRequestId(74);
+            defer _ = setRequestId(previous);
+            var observed: u64 = 0;
+            const thread = try std.Thread.spawn(.{}, struct {
+                fn read(out: *u64) void {
+                    out.* = requestId();
+                }
+            }.read, .{&observed});
+            thread.join();
+            try std.testing.expectEqual(@as(u64, 74), observed);
+            return error.Cancelled;
+        }
+    }.run;
+    try std.testing.expectError(error.Cancelled, nested());
+    try std.testing.expectEqual(@as(u64, 73), requestId());
+    _ = setRequestId(outer);
+    try std.testing.expectEqual(@as(u64, 0), requestId());
 }

@@ -201,6 +201,7 @@ pub fn nonStreamingViaScheduler(
     const audio_codes: ?[]u32 = if (slot.audio_codes.items.len > 0) slot.audio_codes.toOwnedSlice(slot.allocator) catch null else null;
 
     return .{
+        .request_id = slot.request_id,
         .text = text,
         .audio_samples = audio_samples,
         .audio_codes = audio_codes,

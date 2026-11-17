@@ -3,9 +3,9 @@ const std = @import("std");
 const testing = std.testing;
 const LogprobResult = @import("logprob.zig").LogprobResult;
 
-
 /// Generation result (for non-streaming use).
 pub const GenerationResult = struct {
+    request_id: u64 = 0,
     text: []u8,
     token_ids: []u32,
     prompt_tokens: u32,
@@ -62,7 +62,6 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
 }
 
 // ── tests ──
-
 
 test "GenerationResult fields" {
     // Just verifying the struct shape compiles correctly with all fields

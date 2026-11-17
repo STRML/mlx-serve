@@ -53,8 +53,12 @@ fn appendDecodeEndCheckpoint(
         return cps;
     };
     out[out.len - 1] = cp;
-    log.info("  [hot-cache] decode-end checkpoint at {d} ({d} prompt + {d} generated)\n", .{ total_len, slot.full_prompt.len, total_len - slot.full_prompt.len });
+    logDecodeEndCheckpoint(slot, total_len);
     return out;
+}
+
+fn logDecodeEndCheckpoint(slot: *const Slot, total_len: usize) void {
+    log.info("  [hot-cache] decode-end checkpoint at {d} ({d} prompt + {d} generated) req={f}\n", .{ total_len, slot.full_prompt.len, total_len - slot.full_prompt.len, log.requestTag(slot.request_id) });
 }
 
 /// PURE: the live state must describe exactly the committed tokens, past every prefill snapshot.
@@ -104,7 +108,7 @@ fn commitModuleDecodeEnd(sch: *Scheduler, slot: *Slot, gen: *Generator, binding:
             log.warn("[hot-cache] module decode-end commit failed: {s}\n", .{@errorName(err)});
             return;
         };
-        if (st == .ok) log.info("  [hot-cache] decode-end checkpoint at {d} ({d} prompt + {d} generated)\n", .{ ids.len, slot.full_prompt.len, ids.len - slot.full_prompt.len });
+        if (st == .ok) logDecodeEndCheckpoint(slot, ids.len);
         return;
     }
     log.debug("[hot-cache] decode-end checkpoint skipped: the module stands past {d} prompt + {d} generated\n", .{ slot.full_prompt.len, forwarded.len });
@@ -143,6 +147,8 @@ fn commitCancelledModule(sch: *Scheduler, slot: *Slot, xfm: *transformer_mod.Tra
 /// `waitNext`). Skipped for pad-only generations, vision-bearing slots
 /// (stale embeddings would be reused), and slots with no generated tokens.
 pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
+    const previous_req = log.setRequestId(slot.request_id);
+    defer _ = log.setRequestId(previous_req);
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.prefix_cache) |p| p else return;
     if (slot.error_code != null) return;
@@ -411,4 +417,20 @@ test "decode-end checkpoint: taken only where the live state is the committed pr
     try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1201, 970));
     try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1199, 970));
     try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1200, 1200));
+}
+
+test "request id: SSM and module decode-end checkpoints log their slot" {
+    const text = try @import("../../sdk/testing/log_capture.zig").capture(testing.allocator, struct {
+        fn run() void {
+            var slot: Slot = undefined;
+            slot.request_id = 73;
+            slot.full_prompt = @constCast(&[_]u32{ 1, 2, 3 });
+            logDecodeEndCheckpoint(&slot, 5);
+            slot.request_id = 74;
+            logDecodeEndCheckpoint(&slot, 7);
+        }
+    }.run, .{});
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "  [hot-cache] decode-end checkpoint at 5 (3 prompt + 2 generated) req=chatcmpl-73\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "  [hot-cache] decode-end checkpoint at 7 (3 prompt + 4 generated) req=chatcmpl-74\n") != null);
 }

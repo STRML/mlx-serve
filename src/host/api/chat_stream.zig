@@ -16,7 +16,6 @@ const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
 const io_util = @import("../../sdk/util/io_util.zig");
-const nowMs = io_util.nowMs;
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
 
@@ -43,8 +42,7 @@ const pickStreamMode = @import("request_options.zig").pickStreamMode;
 const StreamLogprobs = @import("logprobs.zig").StreamLogprobs;
 const sendSSEChunk = @import("../http/sse.zig").sendSSEChunk;
 const sendSSEUsageChunk = @import("../http/sse.zig").sendSSEUsageChunk;
-const SSE_ALLOW_HEADERS_DEFAULT = @import("../http/respond.zig").SSE_ALLOW_HEADERS_DEFAULT;
-const sendSseHeaders = @import("../http/respond.zig").sendSseHeaders;
+const sendChatSseHeaders = @import("../http/respond.zig").sendChatSseHeaders;
 const logHttpSseData = @import("../http/respond.zig").logHttpSseData;
 const utf8TrailingIncomplete = @import("format.zig").utf8TrailingIncomplete;
 const formatChatUsageWithReasoning = @import("format.zig").formatChatUsageWithReasoning;
@@ -79,6 +77,7 @@ pub const StreamingTokenStream = struct {
     eos_token_ids: []const u32,
     finished: bool = false,
 
+    request_id: u64 = 0,
     prompt_tokens: u32 = 0,
     cached_tokens: u32 = 0,
     completion_tokens: u32 = 0,
@@ -91,7 +90,7 @@ pub const StreamingTokenStream = struct {
 
     /// `mode` is recorded for telemetry: the engine already routed PLD/drafter/MTP.
     pub fn initFromStream(stream: *Stream, mode: StreamMode, eos: []const u32) StreamingTokenStream {
-        return .{ .stream = stream, .mode = mode, .eos_token_ids = eos };
+        return .{ .stream = stream, .request_id = stream.request_id, .mode = mode, .eos_token_ids = eos };
     }
 
     pub fn deinit(_: *StreamingTokenStream, _: std.mem.Allocator) void {}
@@ -112,6 +111,7 @@ pub const StreamingTokenStream = struct {
     /// their post-generation tail with the non-streaming path.
     pub fn generationResult(self: *const StreamingTokenStream, text: []u8, token_ids: []u32, finish_reason: []const u8, constraint_payload_byte: ?usize) generate_mod.GenerationResult {
         return .{
+            .request_id = self.request_id,
             .text = text,
             .token_ids = token_ids,
             .prompt_tokens = self.prompt_tokens,
@@ -193,7 +193,6 @@ pub fn handleStreamingGeneration(
     }
 
     const config = lm.config.?;
-    const chat_id = nowMs(stream.io);
 
     // Template-opened think block (Qwen 3.5/3.6): unclosed buffered output is
     // reasoning, never content (mirrors the non-streaming split policy).
@@ -266,7 +265,7 @@ pub fn handleStreamingGeneration(
     defer ts.deinit(allocator);
 
     // Send SSE headers (no Content-Length — we stream until done)
-    try sendSseHeaders(stream, "chat.completions", SSE_ALLOW_HEADERS_DEFAULT);
+    const chat_id = try sendChatSseHeaders(stream, running.?.stream.request_id);
 
     // Logprobs ride the chunks beside their deltas. Requesting them already
     // forced this stream off every speculative path (see `pickStreamMode`), so
@@ -1067,7 +1066,9 @@ fn sendStreamTail(
     if (usage) |u| {
         const usage_json = try formatChatUsageWithReasoning(allocator, u.prompt, u.completion, u.cached, u.reasoning);
         defer allocator.free(usage_json);
-        try sendSSEUsageChunk(allocator, stream, chat_id, model_name, usage_json, timings);
+        const request_usage = try @import("format.zig").chatUsageRequestId(allocator, usage_json, @intCast(chat_id));
+        defer allocator.free(request_usage);
+        try sendSSEUsageChunk(allocator, stream, chat_id, model_name, request_usage, timings);
     }
     logHttpSseData("[DONE]");
     try stream.writeAll("data: [DONE]\n\n");
@@ -1129,4 +1130,39 @@ test "a chat stream's usage chunk reports its reasoning tokens" {
     try testing.expectEqual(@as(usize, 2), events.len);
     const usage = events[1].object.get("usage").?.object;
     try testing.expectEqual(@as(?i64, 40), if (usage.get("completion_tokens_details")) |d| d.object.get("reasoning_tokens").?.integer else null);
+}
+
+test "request id: streaming chat header and final usage match every chunk" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]bool{ false, true }) |include_usage| {
+        const raw = try capture(a, struct {
+            fn run(conn: *Conn, al: std.mem.Allocator, with_usage: bool) !void {
+                const id = try sendChatSseHeaders(conn, 73);
+                const usage: ?StreamUsage = if (with_usage) .{ .prompt = 10, .completion = 2, .cached = 3, .reasoning = 0 } else null;
+                try sendStreamTail(al, conn, id, "m", .{ .reason = "stop", .details = null }, null, usage, null);
+            }
+        }.run, .{ a, include_usage });
+        try testing.expect(std.mem.indexOf(u8, raw, "x-mlx-request-id: chatcmpl-73\r\n") != null);
+        var it = std.mem.tokenizeSequence(u8, raw[std.mem.indexOf(u8, raw, "\r\n\r\n").? + 4 ..], "\n\n");
+        var chunks: usize = 0;
+        var usage_chunks: usize = 0;
+        while (it.next()) |ev| {
+            const data = ev["data: ".len..];
+            if (std.mem.eql(u8, data, "[DONE]")) continue;
+            const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{})).object;
+            try testing.expectEqualStrings("chatcmpl-73", root.get("id").?.string);
+            if (root.get("usage").? == .object) {
+                usage_chunks += 1;
+                const usage = root.get("usage").?.object;
+                try testing.expect(usage.get("request_id") != null);
+                try testing.expectEqualStrings("chatcmpl-73", usage.get("request_id").?.string);
+                try testing.expectEqual(@as(i64, 3), usage.get("prompt_tokens_details").?.object.get("cached_tokens").?.integer);
+            }
+            chunks += 1;
+        }
+        try testing.expectEqual(@as(usize, if (include_usage) 1 else 0), usage_chunks);
+        try testing.expectEqual(@as(usize, if (include_usage) 2 else 1), chunks);
+    }
 }

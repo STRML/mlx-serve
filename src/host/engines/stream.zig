@@ -26,6 +26,7 @@ pub const Stream = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
 
+    request_id: u64 = 0,
     state: State = .pending_prefill,
     out_mu: std.Io.Mutex = .init,
     out_cond: std.Io.Condition = .init,

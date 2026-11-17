@@ -5562,7 +5562,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         try cedReplayIn(m, gpa, st, &sp, &tsp, enc_hi);
         m.ced_stats.chunks += 1;
         m.ced_stats.skipped += L - tl;
-        log.info("[dsv41] CED prefill: {d} rows encoder-only, replay {d} rows\n", .{ L - tl, tl });
+        logCedPrefill(L - tl, tl);
         if (prefetch) |pf| log.debug("[dsv41] the chunk waited {d} ms on its Engram rows{s}\n", .{ pf.waited_ms, if (m.engrams[0].table.past_cache.load(.acquire)) ", codes past the page cache" else "" });
         try runLayers(m, gpa, st, &tsp, held, enc_hi, m.n_layers);
         sp = tsp;
@@ -7207,6 +7207,10 @@ fn failedCacheGroups(status: []const u32) usize {
     var count: usize = 0;
     for (status) |failure| count += @intFromBool(failure != 0);
     return count;
+}
+
+fn logCedPrefill(encoded: usize, replayed: usize) void {
+    log.info("[dsv41] CED prefill: {d} rows encoder-only, replay {d} rows req={f}\n", .{ encoded, replayed, log.requestTag(log.requestId()) });
 }
 
 test "failedCacheGroups counts every non-zero group status" {
@@ -11745,4 +11749,12 @@ test "dsv41 pair: a layer split refuses an MLX pack's streamed experts by name b
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.Dsv41PairStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 4, .hi = 8, .worker = false }, .streamed_experts = true }));
+}
+
+test "request id: dsv41 CED prefill logs the current request" {
+    const prev = log.setRequestId(73);
+    defer _ = log.setRequestId(prev);
+    const text = try @import("../../sdk/testing/log_capture.zig").capture(testing.allocator, logCedPrefill, .{ @as(usize, 100), @as(usize, 16) });
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "[dsv41] CED prefill: 100 rows encoder-only, replay 16 rows req=chatcmpl-73\n") != null);
 }

@@ -280,8 +280,8 @@ pub fn addUnitTests(g: *const Graph) Tests {
     test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
     // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig);
-    // a filtered run is one process.
-    const shards: u32 = if (test_filter != null) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
+    // a filtered run defaults to one process.
+    const shards: u32 = b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse (if (test_filter != null) 1 else defaultShards());
     const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
     // A Run step given an env var copies the WHOLE configure-time environment into the cached configuration, so the

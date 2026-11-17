@@ -89,6 +89,7 @@ pub const Conn = struct {
     ablation: ?AblationRequest = null,
     ablation_header: [192]u8 = undefined,
     ablation_header_len: usize = 0,
+    chat_request_id: u64 = 0,
     cache_export: bool = false,
     /// The current request's `X-Session-Key`, hashed by `sessionTag` (0 = none).
     session_key: u64 = 0,
@@ -99,6 +100,7 @@ pub const Conn = struct {
         c.stream = stream;
         c.io = io;
         c.client = .other;
+        c.chat_request_id = 0;
         c.clearAblation();
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
@@ -113,6 +115,11 @@ pub const Conn = struct {
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 
+    pub fn requestIdHeader(c: *const Conn, buf: []u8) []const u8 {
+        if (c.chat_request_id == 0) return "";
+        return std.fmt.bufPrint(buf, "x-mlx-request-id: chatcmpl-{d}\r\n", .{c.chat_request_id}) catch "";
+    }
+
     /// Replaces the previous request's client, so a request without a User-Agent never inherits it.
     pub fn noteRequestHeaders(c: *Conn, headers: []const u8) void {
         c.noteRequestHeadersAt(headers, nowMsMonotonic(c.io));
@@ -120,6 +127,7 @@ pub const Conn = struct {
 
     pub fn noteRequestHeadersAt(c: *Conn, headers: []const u8, head_read_ms: i64) void {
         c.client = instr.Client.fromUserAgent(findHeaderValue(headers, "user-agent"));
+        c.chat_request_id = 0;
         c.clearAblation();
         c.ablation_key = findHeaderValue(headers, "x-ablation-key");
         c.cache_export = if (findHeaderValue(headers, "x-cache-export")) |v| std.mem.eql(u8, v, "1") else false;

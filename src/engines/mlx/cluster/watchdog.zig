@@ -1,5 +1,6 @@
 //! Distributed stall detection: a step with a collective in flight longer than the deadline means a peer died or froze.
 const std = @import("std");
+const log = @import("../../../sdk/util/log.zig");
 
 pub const State = struct {
     in_flight: std.atomic.Value(bool) = .init(false),
@@ -44,18 +45,12 @@ pub const ExitCause = enum { stall, self_check, bell_eof, bell_timeout, worker_l
 
 /// The one line every exit path writes before `_exit`: `[dist-exit] epoch_ms=<wall ms> cause=<c> peer=<rank|-> step=<n>
 /// waited_ms=<n|->`. A harness on another host compares `epoch_ms` with its own wall clock.
-pub fn exitRecord(buf: []u8, epoch_ms: i64, cause: ExitCause, peer: ?u32, step: u64, waited_ms: ?u64) []const u8 {
+pub fn exitRecord(buf: []u8, epoch_ms: i64, cause: ExitCause, peer: ?u32, step: u64, waited_ms: ?u64, request_id: u64) []const u8 {
     var pb: [12]u8 = undefined;
     var wb: [24]u8 = undefined;
     const p = if (peer) |v| std.fmt.bufPrint(&pb, "{d}", .{v}) catch "-" else "-";
     const w = if (waited_ms) |v| std.fmt.bufPrint(&wb, "{d}", .{v}) catch "-" else "-";
-    return std.fmt.bufPrint(buf, "[dist-exit] epoch_ms={d} cause={s} peer={s} step={d} waited_ms={s}\n", .{ epoch_ms, @tagName(cause), p, step, w }) catch buf[0..0];
-}
-
-test "exitRecord: every field, with - for an unknown peer or wait" {
-    var buf: [160]u8 = undefined;
-    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=1794778000123 cause=worker_left peer=2 step=41 waited_ms=-\n", exitRecord(&buf, 1794778000123, .worker_left, 2, 41, null));
-    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=5 cause=stall peer=- step=0 waited_ms=30001\n", exitRecord(&buf, 5, .stall, null, 0, 30001));
+    return std.fmt.bufPrint(buf, "[dist-exit] epoch_ms={d} cause={s} peer={s} step={d} waited_ms={s} req={f}\n", .{ epoch_ms, @tagName(cause), p, step, w, log.requestTag(request_id) }) catch buf[0..0];
 }
 
 /// The peer of a TCP socket has closed or reset it, read from the kernel's connection state (macOS
@@ -205,4 +200,10 @@ test "a TCP peer that closed reads as gone even with its last bytes unread" {
     var tries: usize = 0;
     while (!tcpPeerGone(cli) and tries < 100) : (tries += 1) _ = std.c.poll(&none, 0, 1);
     try std.testing.expect(tcpPeerGone(cli));
+}
+
+test "request id: dist-exit preserves every field with an active or idle request" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=1794778000123 cause=worker_left peer=2 step=41 waited_ms=- req=chatcmpl-73\n", exitRecord(&buf, 1794778000123, .worker_left, 2, 41, null, 73));
+    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=5 cause=stall peer=- step=0 waited_ms=30001 req=-\n", exitRecord(&buf, 5, .stall, null, 0, 30001, 0));
 }
