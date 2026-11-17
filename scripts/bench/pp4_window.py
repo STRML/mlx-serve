@@ -22,6 +22,34 @@ from lib.server import wait_health
 PORT = 18754
 
 
+def compute_overlap_fraction(events, reads):
+    waits = {}
+    for e in events:
+        if e['kind'] == 'pp4_engram':
+            waits.setdefault((e['p0'], e['rows']), []).append((e['needed_us'], e['taken_us']))
+    waits = {key: sorted(spans) for key, spans in waits.items()}
+    compute = []
+    for e in events:
+        if e['kind'] != 'pp4_layer':
+            continue
+        cursor, end = e['start_us'], e['end_us']
+        epoch_offset = e['epoch_us'] - cursor
+        for lo, hi in waits.get((e['p0'], e['rows']), []):
+            lo, hi = max(cursor, lo), min(end, hi)
+            if hi <= lo:
+                continue
+            if cursor < lo:
+                compute.append(((epoch_offset + cursor) * 1000, (epoch_offset + lo) * 1000))
+            cursor = hi
+        if cursor < end:
+            compute.append(((epoch_offset + cursor) * 1000, (epoch_offset + end) * 1000))
+    read_time = sum(e['read_ns'] for e in reads)
+    overlap = sum(max(0, min(e['read_start_epoch_ns'] + e['read_ns'], hi) -
+                      max(e['read_start_epoch_ns'], lo))
+                  for e in reads for lo, hi in compute)
+    return overlap / read_time if read_time else 0
+
+
 def http(path, body=None, timeout=10):
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(f'http://127.0.0.1:{PORT}' + path, data=data,
@@ -278,13 +306,7 @@ class Window:
                 if any(e['read_start_epoch_ns'] < gpu_start or
                        e['read_start_epoch_ns'] + e['read_ns'] > gpu_end for e in reads):
                     raise ValueError('first-use reader did not remain under GPU prefill load')
-                compute = [(e['epoch_us'] * 1000 + e['engram_wait_us'] * 1000,
-                            (e['epoch_us'] + e['elapsed_us']) * 1000) for e in layers]
-                read_time = sum(e['read_ns'] for e in reads)
-                overlap = sum(max(0, min(e['read_start_epoch_ns'] + e['read_ns'], hi) -
-                                  max(e['read_start_epoch_ns'], lo))
-                              for e in reads for lo, hi in compute)
-                sample['compute_overlap_fraction'] = overlap / read_time if read_time else 0
+                sample['compute_overlap_fraction'] = compute_overlap_fraction(events, reads)
                 if sample['compute_overlap_fraction'] < .5:
                     raise ValueError('less than50% of reader time overlaps synchronized compute intervals')
             self.samples.append(sample)

@@ -132,6 +132,83 @@ class BoundContract(unittest.TestCase):
             window.server.terminate.assert_called_once_with()
             window.reader.terminate.assert_called_once_with()
 
+    def test_window_overlap_excludes_waits_at_their_recorded_positions(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        import pp4_window as window_module
+
+        cases = [
+            ('middle-wait', [(50, 90)], (50, 90), None),
+            ('start-and-middle-waits', [(0, 20), (50, 90)], (50, 90), None),
+            ('compute-between-waits', [(0, 20), (50, 90)], (20, 50), 1.),
+            ('partial-compute', [(50, 90)], (0, 100), .6),
+            ('overlapping-unsorted-waits', [(60, 90), (50, 80)], (0, 100), .6),
+            ('waits-in-previous-layer', [(0, 20), (50, 90)], (100, 200), 1.),
+            ('fully-waiting-layer', [(0, 100)], (0, 100), None),
+            ('half-compute-boundary', [(0, 50)], (0, 100), .5),
+            ('no-waits', [], (0, 100), 1.),
+        ]
+        for name, waits, (read_lo, read_hi), fraction in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                epoch, mono, depth = 900000, 10000, 101
+                layers = [dict(kind='pp4_layer', p0=0, rows=100, layer=i,
+                               phase='encoder', start_us=mono + i * 100,
+                               end_us=mono + (i + 1) * 100,
+                               epoch_us=epoch + i * 100, elapsed_us=100,
+                               engram_wait_us=sum(hi - lo for lo, hi in waits) if i == 0 else 0,
+                               compute_us=100) for i in range(20)]
+                events = layers + [dict(kind='pp4_chunk', p0=0, rows=100,
+                    elapsed_us=5000, encoder_us=2000, compressor_us=1000,
+                    decoder_us=1000, dspark_us=1000, head_us=0, x_us=3000,
+                    dspark_enabled=True)]
+                events += [dict(kind='pp4_engram', p0=0, rows=100, table=0,
+                                needed_us=mono + lo, taken_us=mono + hi,
+                                epoch_us=epoch + lo) for lo, hi in waits]
+                # Other chunks' waits must not remove this chunk's compute.
+                events.append(dict(kind='pp4_engram', p0=2048, rows=100, table=0,
+                                   needed_us=mono, taken_us=mono + 100, epoch_us=epoch))
+                trace = ('[prefill-trace] tokens=101 total=1ms\n' +
+                         ''.join(json.dumps(e) + '\n' for e in events)).encode()
+                reader = [dict(kind='pp4_catalog', depth=depth, rank=0, start_ns=0,
+                               ready_ns=0, prefill_tokens=100, chunk_width=2048,
+                               shards=4, readers=32),
+                          dict(kind='pp4_bucket', chunk_index=0, layer=1, p0=0,
+                               width=100, depth=depth, rank=0, cached_parts=0,
+                               rows=1, payload_bytes=264, read_start_ns=0,
+                               read_end_ns=1, copy_end_ns=1,
+                               read_start_epoch_ns=(epoch + read_lo) * 1000,
+                               read_ns=(read_hi - read_lo) * 1000),
+                          dict(kind='pp4_bucket', chunk_index=0, layer=14, p0=0,
+                               width=100, depth=depth, rank=0, cached_parts=0,
+                               rows=0, payload_bytes=0, read_start_ns=1,
+                               read_end_ns=1, copy_end_ns=1),
+                          dict(kind='pp4_reader_done', depth=depth, rank=0, elapsed_ns=1)]
+                reads = [e for e in reader if e['kind'] == 'pp4_bucket' and e['rows']]
+                self.assertAlmostEqual(window_module.compute_overlap_fraction(events, reads),
+                                       0. if fraction is None else fraction)
+                (root / 'profile.log').touch()
+                window = window_module.Window(SimpleNamespace(out=root, pack=root, reader='reader'))
+                window.ids = list(range(depth))
+                window.request = Mock(return_value=({}, 0, 1000000))
+                window.log_tail = Mock(return_value=trace)
+                window.save = Mock()
+
+                def run_reader(*args, stdout, **kwargs):
+                    stdout.write(''.join(json.dumps(e) + '\n' for e in reader))
+                    stdout.flush()
+                    return Mock(wait=Mock(return_value=0), poll=Mock(return_value=0))
+
+                with patch.object(window_module, 'cold_pack', return_value=(None, [])), \
+                        patch.object(window_module.subprocess, 'Popen', side_effect=run_reader):
+                    if fraction is None:
+                        with self.assertRaisesRegex(ValueError, 'less than50%'):
+                            window.sample('profile', depth, 0, 0)
+                        self.assertEqual(window.samples, [])
+                    else:
+                        window.sample('profile', depth, 0, 0)
+                        self.assertAlmostEqual(window.samples[0]['compute_overlap_fraction'], fraction)
+
     def test_dry_run_has_no_effects_and_unborrowed_run_refuses(self):
         script = Path(__file__).with_name('pp4-step0.sh')
         p = subprocess.run(['bash', str(script), '--dry-run'], capture_output=True, text=True)
