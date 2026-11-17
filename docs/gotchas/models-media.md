@@ -866,3 +866,13 @@ latent width even when query heads are sharded. Snapshot captures keep their pos
 ship marks the live state unsynchronized and prevents capture publication. Engram read-ahead follows the active state
 between model objects. The fixed-point TP4 fixture proves decode parity, mixed chunks and a corrupt-bank negative
 control; the shared follower loop and abort/restore tests guard ordering and cache ownership.
+
+### A TP4 RAM checkpoint captured the follower's speculative position
+
+A decode-end checkpoint after a partially accepted DSpark verify restored rank zero at its committed position,
+but followers at the verify's speculative end. The capture message carried no position, and workers captured
+before settling the pending verify. Restore discarded the verify metadata, so a leader-only CED suffix then
+failed its follower import's base-position check. Capture now carries the committed position and settles the
+verify before taking the snapshot. The four-rank RAM-restore proof covers partial and full acceptance, CED
+prefill and f32 decode parity against TP1. Tensor-step logs print the previous step, which can appear behind
+the restored position without a rewind.

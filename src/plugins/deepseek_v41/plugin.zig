@@ -797,7 +797,7 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
     if (!live.st.tp_synced) return Verdict.refuse(.failed, "deepseek_v41: tensor state import did not complete");
     if (live.st.snap == null and (m.mdl.tp == null or m.mdl.prefill_whole != null)) {
         dsv41.snapshotStateAtChunk(m.mdl, live.st, live.gen) catch |e| return Verdict.named(.failed, @errorName(e));
-        if (live.st.snap != null) dsv41.tpSnap(m.mdl, .capture, live.gen, 0);
+        if (live.st.snap != null) dsv41.tpSnap(m.mdl, .capture, live.gen, live.st.n);
     }
     const sn = live.st.snap orelse return .ok;
     if (sn.n != sn.ids.len) return Verdict.refuse(.failed, "deepseek_v41: snapshot boundary differs from its ids");
