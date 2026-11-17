@@ -384,6 +384,7 @@ pub const vars = struct {
     pub const MUSIC3_COST_PROBE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/music3", .since = "26.8.6", .doc = "Music3 depth decoder cost laps" };
     pub const PREFILL_QMM_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/blocks/linear", .since = "26.7.10", .doc = "prefill qmm µbench: stock qmm vs dequant+GEMM at 27B prefill shapes" };
     pub const PREFILL_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "engines/mlx/generate", .since = "26.5.6", .doc = "prefill phase trace at info (exactly 1)" };
+    pub const PP4_STEP0: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "synchronized native TP1 text-prefill layer, CED compressor, decoder, DSpark and Engram delivery JSONL for PP4 bound measurement" };
     pub const QWEN4_DEBUG_SCORES: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/qwen4_exp/qsa", .since = "26.8.11", .doc = "set: qwen4 QSA indexer scores on stderr" };
     pub const QWEN4_DUMP_QSA_BLOCKS: Var = .{ .kind = .diag, .type = .text, .default = "off", .owner = "plugins/qwen4_exp/qsa", .since = "26.9.3", .doc = "dump the QSA selected blocks" };
     pub const QWEN4_GDN_CHECK: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/blocks/gdn", .since = "26.8.11", .doc = "check the fused GDN arm against the op chain per layer" };

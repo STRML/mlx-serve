@@ -25,6 +25,7 @@ const gather_nax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
 const log = @import("../../sdk/util/log.zig");
 const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 const engram = @import("engram.zig");
+const pp4_step0 = @import("pp4_step0.zig");
 const system = @import("../../sdk/util/system.zig");
 const cache_codec = @import("cache_codec.zig");
 const rowcut = @import("rowcut.zig");
@@ -505,6 +506,7 @@ pub const Dsv41Model = struct {
     /// The request's prompt, whose later chunks' Engram rows are read while an earlier one runs.
     prompt: []u32 = &.{},
     ahead: ?*engram.Prefetch = null,
+    pp4_trace: ?*pp4_step0.Trace = null,
     /// The rows the next call brings when this module cut a chunk itself (`extendCold`): what the read-ahead reads.
     next_rows: ?usize = null,
     rope_plain: Rope,
@@ -5394,6 +5396,16 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     if (m.prefill_whole != null and given == .host and L > rowcut.max_rows)
         return leaderPrefill(m, gpa, st, given.host, want, vision);
     const p0 = st.n;
+    var pp4_trace: pp4_step0.Trace = .{ .p0 = p0, .rows = L, .want = @tagName(want), .start_us = 0, .epoch_us = 0 };
+    const saved_pp4_trace = m.pp4_trace;
+    const pp4_enabled = env.one(.PP4_STEP0) and given == .host and L > region_rows and (want == .last or want == .encode) and vision == null and m.pair == null and m.tp == null and st.verify == null and m.trace == null;
+    if (pp4_enabled) {
+        pp4_trace.start_us = monoUs();
+        pp4_trace.epoch_us = @intCast(@divTrunc(std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .real).toNanoseconds(), 1000));
+        pp4_trace.dspark_enabled = m.n_mtp > 0;
+        m.pp4_trace = &pp4_trace;
+    }
+    defer m.pp4_trace = saved_pp4_trace;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
     Laps.begin();
@@ -5543,22 +5555,37 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     }
     if (want == .encode and (m.ced_split == null or m.pair != null or st.verify != null)) return error.Dsv41EncodeUnsupported;
     const enc_hi = if (tail != null or want == .encode) m.ced_split.? else m.n_layers;
+    if (m.pp4_trace) |tr| {
+        tr.enc_hi = enc_hi;
+        tr.tail_rows = tail orelse 0;
+    }
     try runLayers(m, gpa, st, &sp, held, from, enc_hi);
     Laps.lap(.build);
     if (want == .encode) {
+        const comp_start = if (m.pp4_trace != null) monoUs() else 0;
         try cedCompress(m, gpa, st, &sp, enc_hi);
         st.n = p0 + L;
         var ev: std.ArrayList(A) = .empty;
         defer ev.deinit(gpa);
         for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
-        try asyncEvalAll(ev.items);
+        if (m.pp4_trace) |tr| {
+            try evalAll(ev.items);
+            tr.compressor_us = monoUs() - comp_start;
+            var line: [2048]u8 = undefined;
+            std.debug.print("{s}", .{try tr.formatChunk(&line, monoUs())});
+        } else try asyncEvalAll(ev.items);
         return none;
     }
     if (tail) |tl| {
         var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
         tsp.whole = held[held.len - 2 ..][0..2];
         tsp.floor = tsp.p0;
+        const comp_start = if (m.pp4_trace != null) monoUs() else 0;
         try cedReplayIn(m, gpa, st, &sp, &tsp, enc_hi);
+        if (m.pp4_trace) |tr| {
+            try pp4Drain(gpa, st, held, enc_hi, enc_hi + 1);
+            tr.compressor_us = monoUs() - comp_start;
+        }
         m.ced_stats.chunks += 1;
         m.ced_stats.skipped += L - tl;
         log.info("[dsv41] CED prefill: {d} rows encoder-only, replay {d} rows\n", .{ L - tl, tl });
@@ -5570,6 +5597,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
 
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
+    const dspark_start = if (m.pp4_trace != null) monoUs() else 0;
     if (m.n_mtp > 0) {
         var rows: std.ArrayList(A) = .empty;
         defer rows.deinit(gpa);
@@ -5579,6 +5607,14 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
             v.mh = sc.out(all);
         } else try commitMain(&sc, m, st, all, sp.p0);
     }
+    if (m.pp4_trace) |tr| if (m.n_mtp > 0) {
+        var ds_ev: std.ArrayList(A) = .empty;
+        defer ds_ev.deinit(gpa);
+        for (st.ds) |r| try ds_ev.append(gpa, r.buf);
+        if (st.mh.ctx != null) try ds_ev.append(gpa, st.mh);
+        try evalAll(ds_ev.items);
+        tr.dspark_us = monoUs() - dspark_start;
+    };
     if (want == .replay) {
         var ev: std.ArrayList(A) = .empty;
         defer ev.deinit(gpa);
@@ -5590,6 +5626,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     }
 
     // The final collapse uses the last layer's FFN mix.
+    const head_start = if (m.pp4_trace != null) monoUs() else 0;
     var h: A = undefined;
     if (want == .last) {
         const k = sp.xs.len - 1;
@@ -5609,10 +5646,17 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     for (st.ds) |r| try ev.append(gpa, r.buf);
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
-    try mlx.check(mlx.mlx_async_eval(vec));
+    if (m.pp4_trace) |tr| {
+        try mlx.check(mlx.mlx_eval(vec));
+        tr.head_us = monoUs() - head_start;
+    } else try mlx.check(mlx.mlx_async_eval(vec));
     Laps.lap(.submit);
     Laps.end(m);
     try dkern.seg.afterStep(m, L);
+    if (m.pp4_trace) |tr| {
+        var line: [2048]u8 = undefined;
+        std.debug.print("{s}", .{try tr.formatChunk(&line, monoUs())});
+    }
     return sc.out(logits);
 }
 
@@ -5997,7 +6041,10 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
     const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
     // The kept projection outputs: a kept set no wide layer of this pass took is let go at its end.
     defer tkeep.drop();
+    if (m.pp4_trace != null) try pp4Drain(gpa, st, held, lo, lo);
     for (lo..hi) |li| {
+        const layer_start = if (m.pp4_trace != null) monoUs() else 0;
+        if (m.pp4_trace) |tr| tr.layer_wait_us = 0;
         if (wide) try wideLayer(m, gpa, st, sp, li, li + 1 < hi, li > lo) else for (0..n_spans) |k| {
             // A span's intermediates are dropped as soon as it is built, so the
             // layer's evaluation frees each one when its consumers are done.
@@ -6015,7 +6062,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
             hold(&sp.cands[k], sh.cand);
         }
         const decode = n_spans == 1 and sp.L <= region_rows;
-        if (n_spans > 1 or (decode and li + 1 < hi)) {
+        if (m.pp4_trace == null and (n_spans > 1 or (decode and li + 1 < hi))) {
             var ev: std.ArrayList(A) = .empty;
             defer ev.deinit(gpa);
             for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
@@ -6038,8 +6085,23 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
                 if (li == 0) RoundLaps.mark(.handed);
             }
         }
+        if (m.pp4_trace) |tr| {
+            try pp4Drain(gpa, st, held, li, li + 1);
+            const layer_end = monoUs();
+            var line: [1024]u8 = undefined;
+            std.debug.print("{s}", .{try tr.formatLayer(&line, li, sp.L, layer_start, layer_end)});
+            tr.noteLayer(li, layer_end - layer_start);
+        }
     }
     RoundLaps.mark(.layers);
+}
+
+fn pp4Drain(gpa: std.mem.Allocator, st: *const State, held: []const A, lo: usize, hi: usize) !void {
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+    for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
+    for (st.layers[lo..hi]) |*ls| try appendLayerState(gpa, &ev, ls);
+    try evalAll(ev.items);
 }
 
 /// Host: every span's stream and mix to the worker, and back as they stand after its layers.
@@ -6668,6 +6730,11 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
             const got = if (sp.offs.len > 0) try pf.take(k, ek, 0) else try pf.take(sp.p0, ek, k);
             defer got.raw.deinit(gpa);
             const t1 = monoUs();
+            if (m.pp4_trace) |tr| {
+                tr.layer_wait_us += got.taken_us - got.needed_us;
+                var line: [1024]u8 = undefined;
+                std.debug.print("{s}", .{try tr.formatEngram(&line, ek, k, got.read_start_us, got.ready_us, got.needed_us, got.taken_us)});
+            }
             const out = try sc.keep(try e.table.dequant(got.raw, (hi - lo) * nc, sc.s));
             Laps.engram(ek, got.us, t1 - t0, monoUs() - t1);
             break :blk out;
@@ -11742,4 +11809,60 @@ test "dsv41 pair: a layer split refuses an MLX pack's streamed experts by name b
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.Dsv41PairStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 4, .hi = 8, .worker = false }, .streamed_experts = true }));
+}
+
+test "pp4 step0: synchronized CED and DSpark diagnostics preserve logits and committed state" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const files = try @import("../deepseek_v4/fixture.zig").v41DsparkFiles(a, 7);
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    for (files) |f| {
+        const bytes = if (std.mem.eql(u8, f.name, "config.json")) try std.mem.replaceOwned(u8, a, f.bytes, "\"dspark_target_layer_ids\": [2, 3]", "\"dspark_target_layer_ids\": [5, 6]") else f.bytes;
+        try td.dir.writeFile(io, .{ .sub_path = f.name, .data = bytes });
+    }
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try td.dir.realPath(io, &path_buf)];
+    const cfg = try testConfig(io, path);
+    var weights = try loadPack(io, gpa, path, false);
+    defer weights.deinit();
+    const m = try init(gpa, &cfg, &weights, mlx.gpuStream(), .{ .pack_dir = path, .dspark = true });
+    defer m.deinit();
+    m.span = 8;
+    m.ced_min_skip = 8;
+    try testing.expect(m.ced_split != null and m.n_mtp > 0);
+    var ids: [32]u32 = undefined;
+    for (&ids, 0..) |*id, k| id.* = @intCast(k % m.vocab);
+    var plain = try initState(m, gpa);
+    defer plain.deinit();
+    const expected = try extendIds(m, gpa, &plain, .{ .host = &ids }, .last, null);
+    defer _ = mlx.mlx_array_free(expected);
+    try evalAll(&.{expected});
+    var metered = try initState(m, gpa);
+    defer metered.deinit();
+    var trace: pp4_step0.Trace = .{ .p0 = 0, .rows = ids.len, .want = "last", .start_us = monoUs(), .epoch_us = 0, .dspark_enabled = true };
+    m.pp4_trace = &trace;
+    defer m.pp4_trace = null;
+    const got = try extendIds(m, gpa, &metered, .{ .host = &ids }, .last, null);
+    defer _ = mlx.mlx_array_free(got);
+    try evalAll(&.{got});
+    const expected_host = try hostF32(expected);
+    defer gpa.free(expected_host);
+    const got_host = try hostF32(got);
+    defer gpa.free(got_host);
+    for (expected_host, got_host) |x, y| try testing.expectApproxEqAbs(x, y, 1e-4);
+    try testing.expectEqual(plain.n, metered.n);
+    for (plain.ds, metered.ds) |x, y| {
+        const x_host = try hostF32(x.buf);
+        defer gpa.free(x_host);
+        const y_host = try hostF32(y.buf);
+        defer gpa.free(y_host);
+        for (x_host, y_host) |xx, yy| try testing.expectApproxEqAbs(xx, yy, 1e-4);
+    }
+    try testing.expect(trace.encoder_us > 0 and trace.compressor_us > 0 and trace.decoder_us > 0 and trace.dspark_us > 0);
+    try testing.expectEqual(@as(usize, 8), trace.tail_rows);
 }

@@ -567,7 +567,7 @@ pub const Table = struct {
     /// each a contiguous run of them: a row's codes through the blocks that hold them, its scales (and biases) from the
     /// block the run read last when it holds them, so neighbouring rows' scales cost one read. Rows in `ids`'s order.
     /// `cap`: the threads the read may run on (at most `GRID_THREADS`).
-    fn readSorted(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, cap: usize) !Raw {
+    pub fn readSorted(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, cap: usize) !Raw {
         const n = ids.len;
         const w = try gpa.alignedAlloc(u8, .@"4", n * self.wlen);
         errdefer gpa.free(w);
@@ -829,6 +829,7 @@ pub const Prefetch = struct {
     /// What `take` spent waiting for rows the drive had not handed over yet: the forward's time at an Engram layer
     /// with nothing for the GPU to do.
     waited_ms: i64 = 0,
+    trace_delivery: bool = false,
 
     /// `ids` is `[len][tables.len][nc]` row ids (`Hash.rows`).
     pub const Spec = struct { at: usize, len: usize, ids: []const u32 };
@@ -844,6 +845,8 @@ pub const Prefetch = struct {
         state: std.atomic.Value(u8) = .init(pending),
         /// How long its read took (µs).
         us: u32 = 0,
+        read_start_us: i64 = 0,
+        ready_us: i64 = 0,
     };
     const pending = 0;
     const done = 1;
@@ -882,6 +885,10 @@ pub const Prefetch = struct {
         const t0 = nowUs();
         item.raw = self.readSpan(g, self.tables[layer], layer, k) catch null;
         item.us = @intCast(@min(nowUs() - t0, std.math.maxInt(u32)));
+        if (self.trace_delivery) {
+            item.read_start_us = t0;
+            item.ready_us = nowUs();
+        }
         item.state.store(if (item.raw != null) done else failed, .release);
     }
 
@@ -911,7 +918,7 @@ pub const Prefetch = struct {
             g.* = .{ .at = sp.at, .len = sp.len, .ids = ids, .items = items };
             made += 1;
         }
-        self.* = .{ .gpa = gpa, .tables = own_tables, .grids = grids, .span = span, .nc = nc, .across = across };
+        self.* = .{ .gpa = gpa, .tables = own_tables, .grids = grids, .span = span, .nc = nc, .across = across, .trace_delivery = @import("../../env.zig").one(.PP4_STEP0) };
         return self;
     }
 
@@ -948,6 +955,7 @@ pub const Prefetch = struct {
     /// reads them all before its eval). A failed read fails every span of the table, as a failed span read fails that
     /// span.
     fn readGridTable(self: *Prefetch, g: *Grid, table: *const Table, layer: usize, n_spans: usize) void {
+        const read_start_us = if (self.trace_delivery) nowUs() else 0;
         const nc = self.nc;
         const nt = self.tables.len;
         const all = self.gpa.alloc(u32, g.len * nc) catch return failTable(g, layer, n_spans);
@@ -971,6 +979,10 @@ pub const Prefetch = struct {
             const hi = @min(g.len, lo + self.span);
             const item = &g.items[layer * n_spans + k];
             item.raw = spanRows(self.gpa, table, uniq[0..nu], u, all[lo * nc .. hi * nc]) catch null;
+            if (self.trace_delivery) {
+                item.read_start_us = read_start_us;
+                item.ready_us = nowUs();
+            }
             item.state.store(if (item.raw != null) done else failed, .release);
         }
         // the grid's distinct rows into the LRU, once its spans are handed over.
@@ -1019,9 +1031,10 @@ pub const Prefetch = struct {
     }
 
     /// The rows of `layer`'s span `k` of the grid at `at`, once read (the caller frees them), and how long the read took.
-    pub fn take(self: *Prefetch, at: usize, layer: usize, k: usize) !struct { raw: Table.Raw, us: u32 } {
+    pub fn take(self: *Prefetch, at: usize, layer: usize, k: usize) !struct { raw: Table.Raw, us: u32, read_start_us: i64, ready_us: i64, needed_us: i64, taken_us: i64 } {
         for (self.grids) |*g| if (g.at == at) {
             const item = &g.items[layer * (g.items.len / self.tables.len) + k];
+            const needed_us = if (self.trace_delivery) nowUs() else 0;
             if (item.state.load(.acquire) == pending) {
                 const t0 = crt.monotonicMs();
                 while (item.state.load(.acquire) == pending) std.Thread.yield() catch {};
@@ -1029,7 +1042,7 @@ pub const Prefetch = struct {
             }
             const raw = item.raw orelse return error.EngramRead;
             item.raw = null;
-            return .{ .raw = raw, .us = item.us };
+            return .{ .raw = raw, .us = item.us, .read_start_us = item.read_start_us, .ready_us = item.ready_us, .needed_us = needed_us, .taken_us = if (self.trace_delivery) nowUs() else 0 };
         };
         return error.EngramRead;
     }
