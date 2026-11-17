@@ -58,25 +58,30 @@ pub const Probe = struct {
     last: u64 = std.math.maxInt(u64),
     hit: bool = false,
 
-    pub fn snapshot(gpa: std.mem.Allocator, fd: c_int) ![]u8 {
+    pub const mapping_cap = 64 << 20;
+
+    pub fn snapshot(gpa: std.mem.Allocator, fd: c_int) !std.DynamicBitSet {
         const size = std.c.lseek(fd, 0, std.c.SEEK.END);
         if (size <= 0) return error.TableSize;
+        const bytes: usize = @intCast(size);
         const page = std.heap.pageSize();
-        const pages = std.math.divCeil(usize, @intCast(size), page) catch unreachable;
+        const pages = try std.math.divCeil(usize, bytes, page);
         if (pages > 32 << 20) return error.TableTooLarge;
-        const vec = try gpa.alloc(u8, pages);
-        errdefer gpa.free(vec);
+        var bits = try std.DynamicBitSet.initEmpty(gpa, pages);
+        errdefer bits.deinit();
+        const vec = try gpa.alloc(u8, @min(pages, mapping_cap / page));
+        defer gpa.free(vec);
         var at: usize = 0;
         while (at < pages) {
-            const count = @min(pages - at, (64 << 20) / page);
-            const len = @min(count * page, @as(usize, @intCast(size)) - at * page);
-            const map = try std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, @intCast(at * page));
-            defer std.posix.munmap(map);
-            if (mincore(map.ptr, len, vec[at..].ptr) != 0) return error.MincoreFailed;
-            for (vec[at..][0..count]) |*v| v.* &= 1;
+            const count = @min(pages - at, vec.len);
+            const len = @min(count * page, bytes - at * page);
+            const mapped = try std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, @intCast(at * page));
+            defer std.posix.munmap(mapped);
+            if (mincore(mapped.ptr, len, vec.ptr) != 0) return error.MincoreFailed;
+            for (vec[0..count], at..) |v, i| bits.setValue(i, v & 1 != 0);
             at += count;
         }
-        return vec;
+        return bits;
     }
 
     fn open(fd: c_int) !Probe {

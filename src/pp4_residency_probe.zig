@@ -5,6 +5,39 @@ const engram = @import("plugins/deepseek_v41/engram.zig");
 const testing = std.testing;
 const Config = @import("plugins/deepseek_v41/config.zig").Config;
 
+const allocation_cap = 384 << 20;
+const mapping_cap = reader.Probe.mapping_cap;
+
+const BoundedPages = struct {
+    live: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *BoundedPages) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+
+    fn charge(len: usize, alignment: std.mem.Alignment) usize {
+        const page = std.heap.pageSize();
+        return std.mem.alignForward(usize, len, page) + (alignment.toByteUnits() -| page);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *BoundedPages = @ptrCast(@alignCast(ctx));
+        const bytes = charge(len, alignment);
+        if (bytes > allocation_cap - self.live) return null;
+        const ptr = std.heap.page_allocator.rawAlloc(len, alignment, ra) orelse return null;
+        self.live += bytes;
+        self.peak = @max(self.peak, self.live);
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *BoundedPages = @ptrCast(@alignCast(ctx));
+        std.heap.page_allocator.rawFree(buf, alignment, ra);
+        self.live -= charge(buf.len, alignment);
+    }
+};
+
 const Fraction = struct {
     pages: usize,
     resident_pages: usize,
@@ -15,7 +48,7 @@ const Fraction = struct {
     }
 };
 
-fn selectedPart(bitmap: []const u8, table: *const engram.Table, entries: []const reader.Entry, off: u64, stride: u64, len: usize) !Fraction {
+fn selectedPart(bitmap: std.DynamicBitSet, table: *const engram.Table, entries: []const reader.Entry, off: u64, stride: u64, len: usize) !Fraction {
     const page = std.heap.pageSize();
     var pages: usize = 0;
     var resident: usize = 0;
@@ -28,18 +61,18 @@ fn selectedPart(bitmap: []const u8, table: *const engram.Table, entries: []const
         const start = off + @as(u64, entry.row) * stride;
         var at = start / page;
         const end = (start + len - 1) / page;
-        if (end >= bitmap.len) return error.TableSize;
+        if (end >= bitmap.capacity()) return error.TableSize;
         while (at <= end) : (at += 1) {
             if (last != null and at <= last.?) continue;
             pages += 1;
-            resident += bitmap[@intCast(at)] & 1;
+            resident += @intFromBool(bitmap.isSet(@intCast(at)));
             last = at;
         }
     }
     return .of(pages, resident);
 }
 
-fn selectedPages(bitmap: []const u8, table: *const engram.Table, entries: []const reader.Entry) !struct { code: Fraction, scale: Fraction } {
+fn selectedPages(bitmap: std.DynamicBitSet, table: *const engram.Table, entries: []const reader.Entry) !struct { code: Fraction, scale: Fraction } {
     return .{
         .code = try selectedPart(bitmap, table, entries, table.w_off, table.w_stride, table.wlen),
         .scale = try selectedPart(bitmap, table, entries, table.s_off, table.s_stride, table.slen),
@@ -68,12 +101,12 @@ fn validateLayout(spec: reader.TableLayout) !void {
         return error.InvalidLayout;
 }
 
-fn regionFraction(bitmap: []const u8, offset: u64, len: u64) Fraction {
+fn regionFraction(bitmap: std.DynamicBitSet, offset: u64, len: u64) Fraction {
     const page = std.heap.pageSize();
     const lo: usize = @intCast(offset / page);
     const hi: usize = @intCast((offset + len - 1) / page + 1);
     var resident: usize = 0;
-    for (bitmap[lo..hi]) |v| resident += v & 1;
+    for (lo..hi) |i| resident += @intFromBool(bitmap.isSet(i));
     return .of(hi - lo, resident);
 }
 
@@ -109,13 +142,11 @@ fn probeTable(io: std.Io, gpa: std.mem.Allocator, pack: []const u8, spec: reader
     var st: std.c.Stat = undefined;
     if (std.c.fstat(fd, &st) != 0 or st.size <= 0 or @as(u64, @intCast(st.size)) != spec.file_bytes) return error.TableSize;
     const start = clockNs();
-    const bitmap = try reader.Probe.snapshot(gpa, fd);
-    defer gpa.free(bitmap);
+    var bitmap = try reader.Probe.snapshot(gpa, fd);
+    defer bitmap.deinit();
     const end = clockNs();
     const table: engram.Table = .{ .fd = fd, .rows = spec.rows, .head_dim = 256, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = spec.w_off, .w_stride = spec.w_stride, .wlen = spec.wlen, .s_off = spec.s_off, .s_stride = spec.s_stride, .slen = spec.slen };
-    var resident: usize = 0;
-    for (bitmap) |v| resident += v & 1;
-    var result: TableResult = .{ .layer = spec.layer, .path = real, .device = @intCast(st.dev), .inode = st.ino, .file_bytes = spec.file_bytes, .snapshot_start_epoch_ns = start, .snapshot_end_epoch_ns = end, .whole = .of(bitmap.len, resident), .code = regionFraction(bitmap, spec.w_off, spec.rows * spec.w_stride), .scale = regionFraction(bitmap, spec.s_off, spec.rows * spec.s_stride), .samples = undefined };
+    var result: TableResult = .{ .layer = spec.layer, .path = real, .device = @intCast(st.dev), .inode = st.ino, .file_bytes = spec.file_bytes, .snapshot_start_epoch_ns = start, .snapshot_end_epoch_ns = end, .whole = .of(bitmap.capacity(), bitmap.count()), .code = regionFraction(bitmap, spec.w_off, spec.rows * spec.w_stride), .scale = regionFraction(bitmap, spec.s_off, spec.rows * spec.s_stride), .samples = undefined };
     const hash = try engram.Hash.init(cfg, map[cfg.dsv41_engram_pad_id]);
     const cols: usize = hash.cols();
     if (cols != 24) return error.HashGeometry;
@@ -150,28 +181,40 @@ pub fn main(init: std.process.Init) !void {
     const start = clockNs();
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 4) return error.Usage_pack_corpus_exported_layout_json;
-    const backing = try std.heap.page_allocator.alloc(u8, 384 << 20);
-    defer std.heap.page_allocator.free(backing);
-    var fixed = std.heap.FixedBufferAllocator.init(backing);
-    const gpa = fixed.allocator();
+    var backing: BoundedPages = .{};
+    var heap: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .thread_safe = false }) = .{ .backing_allocator = backing.allocator() };
+    defer _ = heap.deinit();
+    const gpa = heap.allocator();
     const io = init.io;
     const pack = try std.Io.Dir.cwd().realPathFileAlloc(io, args[1], gpa);
+    defer gpa.free(pack);
     const layout_raw = try std.Io.Dir.cwd().readFileAlloc(io, args[3], gpa, .limited(1 << 20));
+    defer gpa.free(layout_raw);
     const layout = try std.json.parseFromSlice(reader.Layout, gpa, layout_raw, .{});
+    defer layout.deinit();
     if (layout.value.schema != 1) return error.LayoutSchema;
     const config_path = try std.fs.path.join(gpa, &.{ pack, "config.json" });
+    defer gpa.free(config_path);
     const config_raw = try std.Io.Dir.cwd().readFileAlloc(io, config_path, gpa, .limited(8 << 20));
+    defer gpa.free(config_raw);
     const config_digest = reader.sha256(config_raw);
     if (!std.mem.eql(u8, layout.value.config_sha256, &config_digest)) return error.LayoutConfigMismatch;
     const cfg = try reader.loadConfig(io, gpa, pack);
     if (cfg.dsv41_n_engram_layers != 2 or cfg.dsv41_engram_layers[0] != 1 or cfg.dsv41_engram_layers[1] != 14 or
         cfg.dsv41_engram_head_dim != 256) return error.LayerMismatch;
     const encoded = try reader.tokenize(io, gpa, pack, args[2]);
+    defer gpa.free(encoded.ids);
     _ = try sampleOffsets(encoded.ids.len, 131072);
     const map = try engram.loadTokenMap(gpa, pack, cfg.vocab_size, cfg.dsv41_engram_compressed_vocab);
+    defer gpa.free(map);
     if (cfg.dsv41_engram_pad_id >= map.len) return error.TokenOutOfVocab;
     var tables: [2]TableResult = undefined;
-    for (&tables, layout.value.tables, 0..) |*result, spec, slot| result.* = try probeTable(io, gpa, pack, spec, slot, &cfg, map, encoded.ids);
+    var table_count: usize = 0;
+    defer for (tables[0..table_count]) |table| gpa.free(table.path);
+    for (&tables, layout.value.tables, 0..) |*result, spec, slot| {
+        result.* = try probeTable(io, gpa, pack, spec, slot, &cfg, map, encoded.ids);
+        table_count += 1;
+    }
     var hostname: [256]u8 = @splat(0);
     if (std.c.gethostname(&hostname, hostname.len) != 0) return error.Hostname;
     const layout_digest = reader.sha256(layout_raw);
@@ -190,7 +233,9 @@ pub fn main(init: std.process.Init) !void {
         .page_bytes = std.heap.pageSize(),
         .started_epoch_ns = start,
         .elapsed_s = @as(f64, @floatFromInt(clockNs() - start)) / 1e9,
-        .allocation_cap_bytes = backing.len,
+        .allocation_cap_bytes = allocation_cap,
+        .peak_allocation_bytes = backing.peak,
+        .mapping_cap_bytes = mapping_cap,
         .tables = tables,
     });
 }
@@ -210,6 +255,10 @@ test "pp4 residency: fixture probe preserves cold pages and deduplicates code an
     defer testing.allocator.free(src);
     const dst = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/clone", .{dir}, 0);
     defer testing.allocator.free(dst);
+    const source = std.c.open(src, .{ .ACCMODE = .RDWR }, @as(std.c.mode_t, 0));
+    try testing.expect(source >= 0);
+    defer _ = std.c.close(source);
+    try testing.expectEqual(@as(c_int, 0), std.c.ftruncate(source, @intCast(mapping_cap + page * 5 - 3)));
     const apfs = struct {
         extern "c" fn clonefile([*:0]const u8, [*:0]const u8, c_int) c_int;
     };
@@ -221,10 +270,20 @@ test "pp4 residency: fixture probe preserves cold pages and deduplicates code an
     defer std.posix.munmap(map);
     const first: *const volatile u8 = @ptrCast(map.ptr);
     try testing.expectEqual(@as(u8, 7), first.*);
-    const before = try reader.Probe.snapshot(testing.allocator, fd);
-    defer testing.allocator.free(before);
-    try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0 }, before);
-    const table: engram.Table = .{ .fd = fd, .rows = 4, .head_dim = 256, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = page - 128, .w_stride = 256, .wlen = 256, .s_off = page * 3 - 8, .s_stride = 8, .slen = 8 };
+    const edge_map = try std.posix.mmap(null, page, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, mapping_cap - page);
+    defer std.posix.munmap(edge_map);
+    const edge: *const volatile u8 = @ptrCast(edge_map.ptr);
+    try testing.expectEqual(@as(u8, 0), edge.*);
+    const tail_map = try std.posix.mmap(null, page - 3, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, mapping_cap + page * 4);
+    defer std.posix.munmap(tail_map);
+    const tail: *const volatile u8 = @ptrCast(tail_map.ptr);
+    try testing.expectEqual(@as(u8, 0), tail.*);
+    var before = try reader.Probe.snapshot(testing.allocator, fd);
+    defer before.deinit();
+    try testing.expectEqual(@as(usize, mapping_cap / page + 5), before.capacity());
+    try testing.expectEqual(@as(usize, 3), before.count());
+    try testing.expect(before.isSet(0));
+    const table: engram.Table = .{ .fd = fd, .rows = 4, .head_dim = 256, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = mapping_cap - 128, .w_stride = 256, .wlen = 256, .s_off = mapping_cap + page * 3 - 8, .s_stride = 8, .slen = 8 };
     const entries = [_]reader.Entry{ .{ .row = 0, .chunk = 0 }, .{ .row = 1, .chunk = 0 }, .{ .row = 1, .chunk = 1 }, .{ .row = 2, .chunk = 1 } };
     const result = try selectedPages(before, &table, &entries);
     const crossing = try selectedPages(before, &table, entries[0..1]);
@@ -237,9 +296,22 @@ test "pp4 residency: fixture probe preserves cold pages and deduplicates code an
     try testing.expectEqual(@as(usize, 0), result.scale.resident_pages);
     try testing.expectEqual(@as(f64, 0), result.scale.resident_fraction);
     try testing.expectError(error.RowOutOfRange, selectedPages(before, &table, &.{.{ .row = 4, .chunk = 0 }}));
-    const after = try reader.Probe.snapshot(testing.allocator, fd);
-    defer testing.allocator.free(after);
-    try testing.expectEqualSlices(u8, before, after);
+    var after = try reader.Probe.snapshot(testing.allocator, fd);
+    defer after.deinit();
+    try testing.expect(before.eql(after));
+}
+
+test "pp4 residency: backing budget rejects excess pages and reclaims freed allocations" {
+    var budget: BoundedPages = .{};
+    const a = budget.allocator();
+    const bytes = try a.alloc(u8, allocation_cap);
+    try testing.expectError(error.OutOfMemory, a.alloc(u8, 1));
+    a.free(bytes);
+    try testing.expectEqual(@as(usize, 0), budget.live);
+    const reused = try a.alloc(u8, 1);
+    defer a.free(reused);
+    try testing.expectEqual(std.heap.pageSize(), budget.live);
+    try testing.expectEqual(@as(usize, allocation_cap), budget.peak);
 }
 
 test "pp4 residency: samples use three distinct real token slices and exclude final token" {
