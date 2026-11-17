@@ -510,6 +510,7 @@ test "Conn: a request's X-Ablation line rides both response heads, and the next 
         const line = "X-Ablation: profile=p; strength=1.000; hash=00000000000000aa\r\n";
         @memcpy(conn.ablation_header[0..line.len], line);
         conn.ablation_header_len = line.len;
+        conn.chat_request_id = 73;
         if (sse) try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_DEFAULT) else try sendResponseFramed(&conn, "200 OK", "application/json", "{}");
         var buf: [1024]u8 = undefined;
         const n = std.c.recv(sv[1], &buf, buf.len, 0);
@@ -519,10 +520,13 @@ test "Conn: a request's X-Ablation line rides both response heads, and the next 
         try testing.expect(std.mem.indexOf(u8, head, "\r\n" ++ line) != null);
         // A browser may send the key cross-origin and read the X-Ablation line back.
         try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Ablation-Key\r\n") != null);
-        try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Expose-Headers: X-Ablation\r\n") != null);
+        try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Expose-Headers: X-Ablation, x-mlx-request-id\r\n") != null);
+        try testing.expect(std.mem.indexOf(u8, head, "\r\nx-mlx-request-id: chatcmpl-73\r\n") != null);
         try testing.expect(std.mem.indexOf(u8, got, "secret-value") == null);
         conn.noteRequestHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n");
         try testing.expect(conn.ablation_key == null and conn.ablation == null and conn.ablationHeader().len == 0);
+        var request_buf: [64]u8 = undefined;
+        try testing.expectEqualStrings("", conn.requestIdHeader(&request_buf));
     }
 }
 

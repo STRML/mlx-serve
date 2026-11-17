@@ -21,6 +21,7 @@ const wire = @import("../../../sdk/util/wire.zig");
 const lan = @import("../../../host/lan/lan.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
 const dist_watchdog = @import("watchdog.zig");
+const Slot = @import("../slot.zig").Slot;
 
 pub const Mode = enum {
     /// Each rank owns a contiguous range of layers; the hidden stream hops at the seams.
@@ -184,6 +185,8 @@ const LinkState = struct {
     recvs: std.atomic.Value(u32) = .init(0),
     loop_tick_ms: std.atomic.Value(u64) = .init(0),
     watchdog: dist_watchdog.State = .{},
+    requests: std.DoublyLinkedList = .{},
+    request_owner: u64 = 0,
     watchdog_started: std.atomic.Value(bool) = .init(false),
     watchdog_stop: std.atomic.Value(bool) = .init(false),
     /// The watchdog and (rank 0) heartbeat threads of the open link; `Link.deinit` joins them.
@@ -196,6 +199,10 @@ const LinkState = struct {
     ready_to_go_ms: u32 = 0,
 
     fn exit(self: *LinkState, detected: dist_watchdog.ExitCause, rank: ?u32, waited: ?u64) void {
+        self.exitWithEvidence(detected, rank, waited, null);
+    }
+
+    fn exitWithEvidence(self: *LinkState, detected: dist_watchdog.ExitCause, rank: ?u32, waited: ?u64, saved: ?*const ExitEvidence) void {
         lock(&self.exit_mu);
         defer self.exit_mu.unlock();
         if (detected == .teardown_timeout and self.teardown_done.load(.acquire)) return;
@@ -212,7 +219,13 @@ const LinkState = struct {
             return;
         };
         log.err("[dist] attempt={d} cause={s}\n", .{ self.n, @tagName(cause) });
-        distExit(cause, rank, waited);
+        if (saved) |evidence| {
+            noteDistExit(cause, rank, waited, evidence);
+        } else {
+            const evidence = captureExit(self);
+            noteDistExit(cause, rank, waited, &evidence);
+        }
+        std.c._exit(1);
     }
 };
 
@@ -1130,11 +1143,23 @@ fn followerExit(state: *LinkState, reason: dist_watchdog.BellFailure) void {
     state.exit(if (reason == .eof) .bell_eof else .bell_timeout, 0, if (reason == .timeout) idleTimeoutMs() else null);
 }
 
-/// Writes the `[dist-exit]` record (fsynced), without exiting: for a path that leaves through `main`.
-fn noteDistExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64) void {
-    var buf: [256]u8 = undefined;
-    log.err("{s}", .{dist_watchdog.exitRecord(&buf, crt.wallMs(), cause, peer_rank, liveness().step, waited_ms, log.requestId())});
+fn noteDistExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64, evidence: *const ExitEvidence) void {
+    const record: dist_watchdog.ExitRecord = .{
+        .epoch_ms = crt.wallMs(),
+        .cause = cause,
+        .peer = peer_rank,
+        .step = evidence.step,
+        .waited_ms = waited_ms,
+        .requests = evidence.tags(),
+    };
+    log.err("{f}", .{record});
     log.syncFile();
+}
+
+fn noteWorkerExit() void {
+    var evidence = captureExit(null);
+    defer evidence.deinit();
+    noteDistExit(.worker_error, 0, null, &evidence);
 }
 
 pub fn exitReleaseFailed(rank: u32) noreturn {
@@ -1142,7 +1167,9 @@ pub fn exitReleaseFailed(rank: u32) noreturn {
 }
 
 fn noteSwitchAbort(n: u64) void {
-    log.err("[dist-exit] epoch_ms={d} cause=switch_abort n={d} peer=- step={d} waited_ms=- req={f}\n", .{ crt.wallMs(), n, liveness().step, log.requestTag(log.requestId()) });
+    var evidence = captureExit(null);
+    defer evidence.deinit();
+    log.err("[dist-exit] epoch_ms={d} cause=switch_abort n={d} peer=- step={d} waited_ms=- req={f}\n", .{ crt.wallMs(), n, evidence.step, evidence.tags() });
     log.syncFile();
 }
 
@@ -1153,7 +1180,7 @@ pub fn exitSwitchAbort(n: u64) noreturn {
 
 pub fn exitWorker(err: ?anyerror) noreturn {
     if (err) |e| {
-        noteDistExit(.worker_error, 0, null);
+        noteWorkerExit();
         log.err("[dist] worker: {s}\n", .{@errorName(e)});
     }
     std.process.exit(if (err != null) 1 else 0);
@@ -1170,7 +1197,8 @@ pub fn switchStallNote(buf: []u8) []const u8 {
 }
 
 fn distExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64) noreturn {
-    noteDistExit(cause, peer_rank, waited_ms);
+    const evidence = captureExit(null);
+    noteDistExit(cause, peer_rank, waited_ms, &evidence);
     std.c._exit(1);
 }
 
@@ -1720,6 +1748,94 @@ fn switchShardFor(model: []const u8) ?Shard {
 
 pub fn switchHolds(model: []const u8) bool {
     return switchShardFor(model) != null;
+}
+
+// The link's request list uses the cluster lock so exit threads never need the scheduler's queue lock.
+pub fn trackRequest(slot: *Slot) void {
+    const c = cluster();
+    lock(&c.state_mu);
+    defer c.state_mu.unlock();
+    const state = c.active_state orelse return;
+    if (state.rank != 0) return;
+    const model = if (c.switch_group) |g| g.model else if (c.group) |g| g.model else return;
+    if (!samePath(model, slot.model.path)) return;
+    state.requests.append(&slot.dist_node);
+}
+
+pub fn untrackRequest(slot: *Slot) void {
+    const c = cluster();
+    lock(&c.state_mu);
+    defer c.state_mu.unlock();
+    const state = c.active_state orelse return;
+    if (tracksRequest(state, slot)) state.requests.remove(&slot.dist_node);
+}
+
+fn tracksRequest(state: *const LinkState, slot: *const Slot) bool {
+    var node = state.requests.first;
+    while (node) |n| : (node = n.next) if (n == &slot.dist_node) return true;
+    return false;
+}
+
+pub const RequestScope = struct {
+    link: ?*LinkState = null,
+    previous: u64 = 0,
+
+    pub fn restore(self: RequestScope) void {
+        const link = self.link orelse return;
+        const c = cluster();
+        lock(&c.state_mu);
+        defer c.state_mu.unlock();
+        if (c.active_state == link) link.request_owner = self.previous;
+    }
+};
+
+pub fn scopeRequest(slot: ?*const Slot) RequestScope {
+    const c = cluster();
+    lock(&c.state_mu);
+    defer c.state_mu.unlock();
+    const state = c.active_state orelse return .{};
+    if (state.rank != 0) return .{};
+    const previous = state.request_owner;
+    state.request_owner = if (slot) |s| (if (tracksRequest(state, s)) s.request_id else 0) else 0;
+    return .{ .link = state, .previous = previous };
+}
+
+const ExitEvidence = struct {
+    step: u64,
+    request_ids: std.ArrayList(u64) = .empty,
+    unavailable: bool = false,
+
+    fn deinit(self: *ExitEvidence) void {
+        self.request_ids.deinit(std.heap.page_allocator);
+    }
+
+    fn tags(self: *const ExitEvidence) dist_watchdog.RequestTags {
+        return .{ .ids = self.request_ids.items, .unavailable = self.unavailable };
+    }
+};
+
+fn captureExit(link: ?*const LinkState) ExitEvidence {
+    const c = cluster();
+    lock(&c.state_mu);
+    defer c.state_mu.unlock();
+    const state = link orelse c.active_state orelse return .{ .step = c.last_liveness.step };
+    var evidence: ExitEvidence = .{ .step = state.watchdog.step.load(.monotonic) };
+    captureRequestIds(state, &evidence.request_ids) catch {
+        evidence.unavailable = true;
+    };
+    return evidence;
+}
+
+fn captureRequestIds(state: *const LinkState, ids: *std.ArrayList(u64)) !void {
+    var node = state.requests.first;
+    while (node) |n| : (node = n.next) {
+        const slot: *const Slot = @alignCast(@fieldParentPtr("dist_node", n));
+        if (slot.request_id == state.request_owner) {
+            ids.clearRetainingCapacity();
+            return ids.append(std.heap.page_allocator, slot.request_id);
+        }
+        try ids.append(std.heap.page_allocator, slot.request_id);
+    }
 }
 
 fn beginDistStep() void {
@@ -3293,7 +3409,7 @@ test "dist bell READY matrix 6: partial GO uses the fatal exit cause" {
     try std.testing.expectError(error.DistNoGo, go.check(800, 1000));
     try std.testing.expectEqual(error.DistNoGo, go.writeFailed());
     var buf: [160]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, dist_watchdog.exitRecord(&buf, 1, .partial_go, null, 0, null, 0), "cause=partial_go") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try std.fmt.bufPrint(&buf, "{f}", .{dist_watchdog.ExitRecord{ .epoch_ms = 1, .cause = .partial_go }}), "cause=partial_go") != null);
 }
 
 test "dist bell READY matrix 7: no GO reaches the worker deadline" {
@@ -3456,8 +3572,8 @@ test "dist bell a rows worker's READY leaves its idle exit unarmed" {
     try std.testing.expect(!state.follower_pending.load(.acquire));
 }
 
-fn noteWorkerLeft(state: *const LinkState, lost: u32) void {
-    log.warn("[dist] attempt={d} worker rank {d} left req={f}\n", .{ state.n, lost, log.requestTag(log.requestId()) });
+fn noteWorkerLeft(state: *const LinkState, lost: u32, evidence: *const ExitEvidence) void {
+    log.warn("[dist] attempt={d} worker rank {d} left req={f}\n", .{ state.n, lost, evidence.tags() });
 }
 
 /// Waits on the bells for a worker to leave: a read returns only at its end.
@@ -3465,14 +3581,16 @@ fn watchWorker(link: Link) void {
     const state = link.state.?;
     const lost = watchBells(&link, state);
     if (lost == 0 or state.closing.load(.acquire)) return;
-    noteWorkerLeft(state, lost);
+    var evidence = captureExit(state);
+    defer evidence.deinit();
+    noteWorkerLeft(state, lost, &evidence);
     if (!state.switch_open and link.size == 2) {
         while (state.recvs.load(.acquire) == 0) if (sleepUnlessStopped(state, 100)) return;
     }
     if (state.closing.load(.acquire) or state.releasing.load(.acquire)) return;
     if (@import("../../../host/http/server.zig").launch().global_scheduler) |sch| @import("../scheduler.zig").failInFlight(sch, "DistWorkerLeft");
     if (sleepUnlessStopped(state, 2000)) return;
-    state.exit(.worker_left, lost, null);
+    state.exitWithEvidence(.worker_left, lost, null, &evidence);
 }
 
 /// Right after the worker joins, over the bell connection (no MLX off the inference thread):
@@ -3566,7 +3684,7 @@ fn sameModel(io: std.Io, allocator: std.mem.Allocator, parts: []const []const u8
 /// model folders, `~/.mlx-serve/models` by default), then runs forwards until rank 0 stops it.
 pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     bindInferenceThread();
-    errdefer noteDistExit(.worker_error, 0, null);
+    errdefer noteWorkerExit();
     // JACCL (RDMA over Thunderbolt) exists only on macOS.
     if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable;
     preferFastSynch();
@@ -5738,7 +5856,7 @@ test "dist fix2 public exit: release failure records rank and exits one" {
     defer std.testing.allocator.free(record);
     try std.testing.expect(std.mem.startsWith(u8, record, "[dist-exit] epoch_ms="));
     try std.testing.expect(std.mem.indexOf(u8, record, " cause=release_failed peer=3 step=") != null);
-    try std.testing.expect(std.mem.endsWith(u8, record, " waited_ms=-\n"));
+    try std.testing.expect(std.mem.endsWith(u8, record, " waited_ms=- req=-\n"));
 }
 
 const switch_adapter = @import("switch_adapter.zig");
@@ -6570,38 +6688,125 @@ test "request id: tensor step keeps its own request across consecutive requests"
 }
 
 test "request id: worker-left and dist-exit name the active request or dash when idle" {
-    const previous = log.setRequestId(73);
+    const previous = log.setRequestId(999);
     defer _ = log.setRequestId(previous);
+    var state: LinkState = .{ .n = 8 };
+    state.watchdog.step.store(17, .monotonic);
+    var slot: Slot = undefined;
+    slot.dist_node = .{};
+    slot.request_id = 73;
+    state.requests.append(&slot.dist_node);
     const text = try @import("../../../sdk/testing/log_capture.zig").capture(std.testing.allocator, struct {
-        fn run() void {
-            var state: LinkState = .{ .n = 8 };
-            noteWorkerLeft(&state, 2);
-            noteDistExit(.worker_left, 2, null);
-            _ = log.setRequestId(0);
-            noteWorkerLeft(&state, 3);
-            noteDistExit(.stall, null, 30001);
+        fn run(link: *LinkState, active: *Slot) void {
+            var evidence = captureExit(link);
+            defer evidence.deinit();
+            noteWorkerLeft(link, 2, &evidence);
+            noteDistExit(.worker_left, 2, null, &evidence);
+
+            link.requests.remove(&active.dist_node);
+            var idle = captureExit(link);
+            defer idle.deinit();
+            noteWorkerLeft(link, 3, &idle);
+            noteDistExit(.stall, null, 30001, &idle);
         }
-    }.run, .{});
+    }.run, .{ &state, &slot });
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "[dist] attempt=8 worker rank 2 left req=chatcmpl-73\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "[dist] attempt=8 worker rank 3 left req=-\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "cause=worker_left peer=2 step=0 waited_ms=- req=chatcmpl-73\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "cause=stall peer=- step=0 waited_ms=30001 req=-\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cause=worker_left peer=2 step=17 waited_ms=- req=chatcmpl-73\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cause=stall peer=- step=17 waited_ms=30001 req=-\n") != null);
 }
 
 test "request id: switch-abort exit keeps the request and existing attempt fields" {
-    const previous = log.setRequestId(73);
-    defer _ = log.setRequestId(previous);
+    var link = try newLink(.{ .rank = 0, .size = 2, .coordinator = "127.0.0.1:46225", .device = "loopback" });
+    defer link.deinit();
+    var slot: Slot = undefined;
+    slot.dist_node = .{};
+    slot.request_id = 73;
+    const state = link.state.?;
+    state.requests.append(&slot.dist_node);
     const text = try @import("../../../sdk/testing/log_capture.zig").capture(std.testing.allocator, struct {
-        fn run() void {
+        fn run(active: *Slot) void {
             noteSwitchAbort(8);
-            _ = log.setRequestId(0);
+            untrackRequest(active);
             noteSwitchAbort(9);
         }
-    }.run, .{});
+    }.run, .{&slot});
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "cause=switch_abort n=8 peer=- step=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, " waited_ms=- req=chatcmpl-73\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "cause=switch_abort n=9 peer=- step=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, " waited_ms=- req=-\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cause=switch_abort n=8 peer=- step=0 waited_ms=- req=chatcmpl-73\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cause=switch_abort n=9 peer=- step=0 waited_ms=- req=-\n") != null);
+}
+
+test "dist exit evidence names concurrent requests in slot order after a worker leaves" {
+    const t = std.testing;
+    const scheduler = @import("../scheduler.zig");
+    var link = try newLink(.{ .rank = 0, .size = 2, .coordinator = "127.0.0.1:46225", .device = "loopback" });
+    defer link.deinit();
+    setSwitchGroup(&link, "/m/dist-exit");
+    var cfg: model_mod.ModelConfig = .{ .num_hidden_layers = 0 };
+    var model: @import("../../../host/registry/registry.zig").LoadedModel = undefined;
+    model.path = "/m/dist-exit";
+    model.config = &cfg;
+    model.engine = null;
+    model.transformer = null;
+    model.prefix_cache = null;
+    var sch: scheduler.Scheduler = undefined;
+    sch.allocator = t.allocator;
+    sch.io = t.io;
+    sch.kv_quant_config = .dense;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.queue_cap = 2;
+    sch.in_flight = 0;
+    sch.submit_waiting = 0;
+    sch.shutdown = .init(false);
+    sch.pending = .empty;
+    defer {
+        for (sch.pending.items) |slot| slot.deinit();
+        sch.pending.deinit(t.allocator);
+    }
+
+    const params: scheduler.SubmitParams = .{ .model = &model, .prompt_ids = &.{1}, .eos_token_ids = &.{}, .max_tokens = 1, .sampling = .{} };
+    const first = try scheduler.submitNow(&sch, params);
+    const second = try scheduler.submitNow(&sch, params);
+    const previous = log.setRequestId(0);
+    defer _ = log.setRequestId(previous);
+    const state = link.state.?;
+    state.watchdog.step.store(41, .monotonic);
+    const output = try @import("../../../sdk/testing/log_capture.zig").capture(t.allocator, struct {
+        fn run(s: *LinkState, a: *Slot, b: *Slot) void {
+            {
+                const owner = scopeRequest(b);
+                defer owner.restore();
+                var step = captureExit(s);
+                defer step.deinit();
+                noteDistExit(.stall, null, 30001, &step);
+
+                const batch = scopeRequest(null);
+                defer batch.restore();
+                var shared = captureExit(s);
+                defer shared.deinit();
+                noteDistExit(.self_check, null, null, &shared);
+            }
+
+            var lost = captureExit(s);
+            defer lost.deinit();
+            noteWorkerLeft(s, 2, &lost);
+            a.markError("DistWorkerLeft");
+            b.markFinished("stop");
+            var idle = captureExit(s);
+            defer idle.deinit();
+            noteDistExit(.stall, null, null, &idle);
+            noteDistExit(.worker_left, 2, null, &lost);
+        }
+    }.run, .{ state, first, second });
+    defer t.allocator.free(output);
+    const owner_line = try std.fmt.allocPrint(t.allocator, "cause=stall peer=- step=41 waited_ms=30001 req=chatcmpl-{d}\n", .{second.request_id});
+    defer t.allocator.free(owner_line);
+    try t.expect(std.mem.indexOf(u8, output, owner_line) != null);
+    const expected = try std.fmt.allocPrint(t.allocator, " req=chatcmpl-{d},chatcmpl-{d}\n", .{ first.request_id, second.request_id });
+    defer t.allocator.free(expected);
+    try t.expectEqual(@as(usize, 3), std.mem.count(u8, output, expected));
+    try t.expect(std.mem.endsWith(u8, output, expected));
+    try t.expect(std.mem.indexOf(u8, output, "cause=stall peer=- step=41 waited_ms=- req=-\n") != null);
 }

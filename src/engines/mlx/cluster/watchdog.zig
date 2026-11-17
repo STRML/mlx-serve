@@ -43,15 +43,37 @@ pub const BellFailure = enum { timeout, eof };
 /// Why a rank leaves the group by `_exit`; the `[dist-exit]` record names it.
 pub const ExitCause = enum { stall, self_check, bell_eof, bell_timeout, worker_left, worker_error, watchdog_thread, heartbeat_thread, partial_go, cancelled_after_go, teardown_timeout, release_failed };
 
-/// The one line every exit path writes before `_exit`: `[dist-exit] epoch_ms=<wall ms> cause=<c> peer=<rank|-> step=<n>
-/// waited_ms=<n|->`. A harness on another host compares `epoch_ms` with its own wall clock.
-pub fn exitRecord(buf: []u8, epoch_ms: i64, cause: ExitCause, peer: ?u32, step: u64, waited_ms: ?u64, request_id: u64) []const u8 {
-    var pb: [12]u8 = undefined;
-    var wb: [24]u8 = undefined;
-    const p = if (peer) |v| std.fmt.bufPrint(&pb, "{d}", .{v}) catch "-" else "-";
-    const w = if (waited_ms) |v| std.fmt.bufPrint(&wb, "{d}", .{v}) catch "-" else "-";
-    return std.fmt.bufPrint(buf, "[dist-exit] epoch_ms={d} cause={s} peer={s} step={d} waited_ms={s} req={f}\n", .{ epoch_ms, @tagName(cause), p, step, w, log.requestTag(request_id) }) catch buf[0..0];
-}
+pub const RequestTags = struct {
+    ids: []const u64,
+    unavailable: bool = false,
+
+    pub fn format(self: RequestTags, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.unavailable) return writer.writeAll("?");
+        if (self.ids.len == 0) return writer.writeAll("-");
+        for (self.ids, 0..) |id, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.print("{f}", .{log.requestTag(id)});
+        }
+    }
+};
+
+/// A harness on another host compares `epoch_ms` with its own wall clock.
+pub const ExitRecord = struct {
+    epoch_ms: i64,
+    cause: ExitCause,
+    peer: ?u32 = null,
+    step: u64 = 0,
+    waited_ms: ?u64 = null,
+    requests: RequestTags = .{ .ids = &.{} },
+
+    pub fn format(self: ExitRecord, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        var pb: [12]u8 = undefined;
+        var wb: [24]u8 = undefined;
+        const p = if (self.peer) |v| std.fmt.bufPrint(&pb, "{d}", .{v}) catch unreachable else "-";
+        const w = if (self.waited_ms) |v| std.fmt.bufPrint(&wb, "{d}", .{v}) catch unreachable else "-";
+        try writer.print("[dist-exit] epoch_ms={d} cause={s} peer={s} step={d} waited_ms={s} req={f}\n", .{ self.epoch_ms, @tagName(self.cause), p, self.step, w, self.requests });
+    }
+};
 
 /// The peer of a TCP socket has closed or reset it, read from the kernel's connection state (macOS
 /// `TCP_CONNECTION_INFO`), so an EOF queued behind bytes nobody has read still counts. False when the state is unknown.
@@ -204,6 +226,6 @@ test "a TCP peer that closed reads as gone even with its last bytes unread" {
 
 test "request id: dist-exit preserves every field with an active or idle request" {
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=1794778000123 cause=worker_left peer=2 step=41 waited_ms=- req=chatcmpl-73\n", exitRecord(&buf, 1794778000123, .worker_left, 2, 41, null, 73));
-    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=5 cause=stall peer=- step=0 waited_ms=30001 req=-\n", exitRecord(&buf, 5, .stall, null, 0, 30001, 0));
+    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=1794778000123 cause=worker_left peer=2 step=41 waited_ms=- req=chatcmpl-73\n", try std.fmt.bufPrint(&buf, "{f}", .{ExitRecord{ .epoch_ms = 1794778000123, .cause = .worker_left, .peer = 2, .step = 41, .requests = .{ .ids = &.{73} } }}));
+    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=5 cause=stall peer=- step=0 waited_ms=30001 req=-\n", try std.fmt.bufPrint(&buf, "{f}", .{ExitRecord{ .epoch_ms = 5, .cause = .stall, .waited_ms = 30001 }}));
 }

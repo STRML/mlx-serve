@@ -1,6 +1,7 @@
 //! A request slot: per-request state the inference thread drives and the connection thread drains.
 
 const std = @import("std");
+const distributed = @import("cluster/distributed.zig");
 const abi = @import("../../abi/engine.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("transformer.zig");
@@ -74,6 +75,7 @@ pub const Slot = struct {
     session: u64 = 0,
     client: metrics_mod.Client = .other,
     request_id: u64 = 0,
+    dist_node: std.DoublyLinkedList.Node = .{},
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
     restored_entry: u64 = 0,
     skip_prefix_cache: bool = false,
@@ -411,6 +413,7 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
+        distributed.untrackRequest(self);
         // A slot freed before its terminator (a cancel pulled into cleanup) still tells its stream it is done.
         if (self.sink != null) self.emitFinished(.cancelled, null);
         if (self.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.markQsaPooledRopeStale();
@@ -552,6 +555,7 @@ pub const Slot = struct {
         if (self.finished) return;
         self.finished = true;
         self.state = .finished;
+        distributed.untrackRequest(self);
         self.finish_reason = reason;
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
@@ -587,6 +591,7 @@ pub const Slot = struct {
         if (self.error_code != null or self.finished) return;
         self.error_code = self.allocator.dupe(u8, name) catch null;
         self.state = .errored;
+        distributed.untrackRequest(self);
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
         self.emitFinished(.failed, name);

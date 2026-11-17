@@ -604,6 +604,7 @@ fn submitWaiting(self: *Scheduler, params: SubmitParams, wait: bool) !*Slot {
         if (slot.holds_session) releaseSessionLocked(self, slot);
         return err;
     };
+    distributed.trackRequest(slot);
     self.in_flight += 1;
     self.queue_cond.broadcast(self.io);
     return slot;
@@ -710,6 +711,7 @@ pub fn complete(self: *Scheduler, slot: *Slot) void {
         unlistLocked(self, slot);
     }
 
+    distributed.untrackRequest(slot);
     self.cleanup_queue.append(self.allocator, slot) catch {
         // OOM on the cleanup list — fall back to inline deinit. This
         // races on mlx but is strictly better than the leak; the slot
