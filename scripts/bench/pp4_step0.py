@@ -110,15 +110,19 @@ def chunk_costs(events):
     return out
 
 
-def deliveries(events, depth, rank):
+def deliveries(events, depth, rank, readers=None):
     catalog = [e for e in events if e['kind'] == 'pp4_catalog']
     buckets = [e for e in events if e['kind'] == 'pp4_bucket']
     if len(catalog) != 1:
         raise ValueError('expected one first-use catalog')
     expected_catalog = dict(depth=depth, rank=rank, prefill_tokens=depth - 1,
-                            chunk_width=2048, shards=4, readers=32)
+                            chunk_width=2048, shards=4)
     if any(catalog[0].get(k) != v for k, v in expected_catalog.items()):
         raise ValueError('reader catalog identity mismatch')
+    count_readers = catalog[0].get('readers')
+    if (type(count_readers) is not int or not 1 <= count_readers <= 32 or
+            (readers is not None and count_readers != readers)):
+        raise ValueError('reader count mismatch or outside 1..32')
     if sum(e['kind'] == 'pp4_reader_done' for e in events) != 1:
         raise ValueError('reader completion record missing')
     done = next(e for e in events if e['kind'] == 'pp4_reader_done')
@@ -138,6 +142,8 @@ def deliveries(events, depth, rank):
         key = (e['chunk_index'], e['layer'])
         if key in found or e['rank'] != rank or e['depth'] != depth:
             raise ValueError('duplicate or wrong-shard bucket')
+        if e.get('readers', count_readers) != count_readers:
+            raise ValueError('bucket reader count mismatch')
         numeric = [e[k] for k in ('read_start_ns', 'read_end_ns', 'copy_end_ns', 'rows', 'payload_bytes')]
         if any(not isinstance(v, int) or v < 0 for v in numeric):
             raise ValueError('nonfinite or negative reader value')
@@ -180,14 +186,14 @@ def run_identity(root, manifest):
     return binary, manifest.get('corpus_sha256')
 
 
-def summarize_depth(root, depth, controls, profiles, coverage):
+def summarize_depth(root, depth, controls, profiles, coverage, readers=None):
     e = SSD[depth]
     # With both blocks, choose the faster median to keep the ratio conservative.
     if any(not math.isfinite(v) or v <= 0 for v in controls):
         raise ValueError('invalid control timing')
     control = min(statistics.median(controls[:6]), statistics.median(controls[-6:]))
     all_chunks, ready_by_rank = [], [[] for _ in range(4)]
-    actual_demands, reader_evidence = [], []
+    actual_demands, reader_evidence, reader_counts = [], [], set()
     for sample in profiles:
         chunks = chunk_costs(records(root / sample['trace']))
         expected = [(p0, min(2048, depth - 1 - p0)) for p0 in range(0, depth - 1, 2048)]
@@ -204,8 +210,11 @@ def summarize_depth(root, depth, controls, profiles, coverage):
         if not demands:
             raise ValueError('Engram demand trace missing')
         actual_demands.append(demands)
-        ready_by_rank[sample['rank']].append(deliveries(rows, depth, sample['rank']))
+        ready_by_rank[sample['rank']].append(deliveries(rows, depth, sample['rank'], readers))
+        reader_counts.add(next(e['readers'] for e in rows if e['kind'] == 'pp4_catalog'))
         all_chunks.append(chunks)
+    if len(reader_counts) != 1:
+        raise ValueError('mixed reader counts within depth')
     count = len(all_chunks[0])
     if any(len(c) != count for c in all_chunks):
         raise ValueError('chunk descriptor count changed')
@@ -219,6 +228,7 @@ def summarize_depth(root, depth, controls, profiles, coverage):
     profiled = [s['prefill_s'] for s in profiles if 'prefill_s' in s]
     row = dict(control_coverage=coverage, source=str(root), control_samples=len(controls),
                reader_modes=sorted({s.get('reader_mode', 'concurrent_gpu_prefill') for s in profiles}),
+               reader_counts=sorted(reader_counts),
                control_s=control, t_s=control / count, x_s=x,
                profile_prefill_s=statistics.median(profiled) if profiled else None,
                trace_inflation=statistics.median(profiled) / control if profiled else None,
@@ -280,16 +290,16 @@ def summarize(roots):
                     coverage = 'following_only'
                 else:
                     raise ValueError('control block split around profiles')
-            candidates.append((root, controls, profiles, coverage))
+            candidates.append((root, controls, profiles, coverage, manifest.get('readers')))
         if len(candidates) > 1:
             raise ValueError(f'overlapping depth {depth}; supply one evidence set per depth')
         if not candidates:
             output['missing_depths'].append(depth)
             output['missing_reasons'][depth] = f'{depth}: requires six profiles per shard and a six-sample control block'
             continue
-        root, controls, profiles, coverage = candidates[0]
+        root, controls, profiles, coverage, readers = candidates[0]
         try:
-            output['depths'][depth] = summarize_depth(root, depth, controls, profiles, coverage)
+            output['depths'][depth] = summarize_depth(root, depth, controls, profiles, coverage, readers)
         except (ValueError, OSError, KeyError) as error:
             output['missing_depths'].append(depth)
             output['missing_reasons'][depth] = f'{depth}: {error}'

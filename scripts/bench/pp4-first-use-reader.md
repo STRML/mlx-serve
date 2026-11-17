@@ -31,7 +31,9 @@ full preceding mapped history. Each table deduplicates the whole request and
 retains each row's earliest chunk. It assigns contiguous sorted ordinal quarters
 before ordering that quarter by first-use chunk, then row. Buckets execute chunk 0 layer 1,
 chunk 0 layer 14, chunk 1 layer 1, and so on. One pool of at most 32 readers runs
-at a time. All selected shard bytes remain in owner buffers until exit.
+at a time. The window's `--readers N` selects 1–32 (default 32). Each catalog
+and bucket records that cap. All selected shard bytes remain in owner buffers
+until exit.
 
 Only 2,048-token chunks are supported. The 4,096-row path's stock lead split needs
 its own descriptor mapping before qualification.

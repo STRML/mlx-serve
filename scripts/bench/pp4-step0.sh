@@ -16,13 +16,14 @@ Before model load: 30s offline check of 75 distinct sample/warm-up prefixes.
 Controls before/after: 6 per depth. Profile: 6 per depth per shard (4 shards).
 CPU-only cold first-use reads finish before any server starts; memory floor16GiB.
 --run --depths 131072 selects only that depth, including warmups.
+--readers 1..32 configures each first-use reader (default 32).
 PP4_BINARY selects an existing signed server for a matching-SHA continuation.
 No live binary install. Cleanup drains private request, stops owned PIDs.
 Output ~/bench/pp4-step0-<timestamp>/bound.{json,md}; borrow returns S4.
 EOF
     exit 0 ;;
 --run) shift ;;
-*) echo 'usage: pp4-step0.sh --dry-run|--run [--depths 32768 131072]' >&2; exit 2 ;;
+*) echo 'usage: pp4-step0.sh --dry-run|--run [--depths 32768 131072] [--readers N]' >&2; exit 2 ;;
 esac
 if [ "${BORROW:-}" != S4 ] || [ "${BORROW_BOXES:-}" != studio4 ] || [ "$(hostname -s)" != studio4 ]; then
     echo 'requires studio4 borrow (BORROW=S4 BORROW_BOXES=studio4)' >&2

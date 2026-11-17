@@ -191,6 +191,7 @@ class BoundContract(unittest.TestCase):
                 str(tokens), '--depths', '131072'], capture_output=True, text=True)
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn('samples=39', run.stdout)
+            self.assertIn('readers=32', run.stdout)
             plan = window_module.plan_samples(list(range(140000)), depths=[131072])
             self.assertEqual({s['depth'] for s in plan}, {131072})
             with self.assertRaisesRegex(ValueError, 'depth'):
@@ -201,6 +202,34 @@ class BoundContract(unittest.TestCase):
                               [[.1, .2], [.3, .4], [.5, .6]], 3)
         self.assertAlmostEqual(result['paced_ready_s'][2][0], 1.2)
         self.assertAlmostEqual(result['paced_ready_s'][2][1], 1.3)
+
+    def test_reader_count_is_configurable_and_manifest_mismatch_refuses_depth(self):
+        import pp4_window as window_module
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            tokens = root / 'tokens.u32'
+            tokens.write_bytes(struct.pack('<140000I', *range(140000)))
+            for readers in (6, 16, 32, 0, 33):
+                run = subprocess.run([sys.executable, window_module.__file__, '--check-tokens',
+                    str(tokens), '--depths', '131072', '--readers', str(readers)],
+                    capture_output=True, text=True)
+                with self.subTest(readers=readers):
+                    self.assertEqual(run.returncode, 0 if 1 <= readers <= 32 else 2, run.stderr)
+                    if run.returncode == 0:
+                        self.assertIn(f'readers={readers}', run.stdout)
+            samples = write_artifact(root, (32768,))
+            manifest = root / 'manifest.json'
+            manifest.write_text(json.dumps(dict(samples=samples, readers=16)))
+            result = pp4.summarize(root)
+            self.assertEqual(result['missing_depths'], [32768, 131072])
+            self.assertIn('reader', result['missing_reasons'][32768])
+            for sample in samples:
+                if sample['arm'] == 'profile':
+                    path = root / sample['reader']
+                    path.write_text(path.read_text().replace('"readers": 32', '"readers": 16'))
+            result = pp4.summarize(root)
+            self.assertEqual(set(result['depths']), {32768})
+            self.assertEqual(result['depths'][32768]['reader_counts'], [16])
 
 
     def test_watchdog_first_poll_error_publishes_failure_and_stops_owned_processes(self):
@@ -232,7 +261,7 @@ class BoundContract(unittest.TestCase):
                 trace = (root / 'trace-32768.log').read_bytes()
                 trace += b'[prefill-trace] tokens=32768 total=9000ms\n'
                 reader = (root / 'reader-32768-0-0.jsonl').read_text()
-                window = window_module.Window(SimpleNamespace(out=root, pack=root, reader='reader'))
+                window = window_module.Window(SimpleNamespace(out=root, pack=root, reader='reader', readers=16))
                 window.ids = list(range(40000))
                 window.save = Mock()
                 window.log_tail = Mock(return_value=trace)
@@ -244,8 +273,9 @@ class BoundContract(unittest.TestCase):
                 window.request = Mock(side_effect=request)
                 def run_reader(command, stdout, **kwargs):
                     order.append('reader-start')
+                    self.assertEqual(command[4], '16')
                     self.assertEqual(Path(command[2]).read_bytes(), struct.pack('<32768I', *range(32768)))
-                    stdout.write(reader)
+                    stdout.write(reader.replace('"readers": 32', '"readers": 16'))
                     stdout.flush()
                     def wait(timeout):
                         order.append('reader-done')

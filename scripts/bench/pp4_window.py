@@ -159,7 +159,7 @@ class Window:
         if self.binary_sha is None:
             self.binary_sha = hashlib.sha256(self.args.binary.read_bytes()).hexdigest()
         meta = dict(samples=self.samples, warmups=self.warmups, failure=self.failure, chunk=2048,
-                    depths=self.args.depths, binary_sha256=self.binary_sha,
+                    depths=self.args.depths, readers=self.args.readers, binary_sha256=self.binary_sha,
                     prefix_cold=True, selected_rows='reader clones probed before server startup; >=90% fully cold rows; server pages uncontrolled',
                     corpus_sha256=hashlib.sha256(self.args.corpus.read_bytes()).hexdigest(),
                     tokens_sha256=hashlib.sha256((self.base / 'corpus.u32').read_bytes()).hexdigest())
@@ -289,14 +289,14 @@ class Window:
             (dest / 'clone.json').write_text(json.dumps(provenance, indent=2) + '\n')
             with (dest / 'reader.jsonl').open('w') as out, (dest / 'reader.err').open('w') as err:
                 self.reader = subprocess.Popen([str(self.args.reader), str(clone),
-                    str(dest / 'tokens.u32'), str(depth), '32', str(rank), '2048'],
+                    str(dest / 'tokens.u32'), str(depth), str(self.args.readers), str(rank), '2048'],
                     stdout=out, stderr=err)
                 rc = self.reader.wait(timeout=120)
                 self.reader = None
             if rc:
                 raise RuntimeError(f'first-use reader exited {rc}')
             from pp4_step0 import records, deliveries
-            deliveries(records(dest / 'reader.jsonl'), depth, rank)
+            deliveries(records(dest / 'reader.jsonl'), depth, rank, self.args.readers)
             self.readers_ready.add(dest.name)
         finally:
             if self.reader and self.reader.poll() is None:
@@ -346,7 +346,7 @@ class Window:
             events = records(dest / 'trace.log')
             chunk_costs(events)
             read = records(dest / 'reader.jsonl')
-            deliveries(read, depth, rank)
+            deliveries(read, depth, rank, self.args.readers)
             sample['reader_mode'] = 'before_request_idle_gpu'
         self.samples.append(sample)
         self.save()
@@ -388,6 +388,7 @@ class Window:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--depths', type=int, nargs='+', choices=(32768, 131072), default=[32768, 131072])
+    ap.add_argument('--readers', type=int, choices=range(1, 33), default=32)
     ap.add_argument('--check-tokens', type=Path, help='check every sample offline within 30 seconds')
     for name in ('binary', 'reader', 'pack', 'corpus', 'out'):
         ap.add_argument('--' + name, type=Path)
@@ -395,7 +396,7 @@ def main():
     if args.check_tokens:
         deadline = time.monotonic() + 30
         plan = plan_samples(read_tokens(args.check_tokens), deadline, args.depths)
-        print(f'PP4-OFFLINE-CHECK OK samples={len(plan)} prefix_tokens={PREFIX_TOKENS}')
+        print(f'PP4-OFFLINE-CHECK OK samples={len(plan)} prefix_tokens={PREFIX_TOKENS} readers={args.readers}')
         return
     for name in ('binary', 'reader', 'pack', 'corpus', 'out'):
         if getattr(args, name) is None:

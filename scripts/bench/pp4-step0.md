@@ -151,7 +151,9 @@ correctness; measured performance remains pending the window.
 
 ## Resume one depth and merge evidence
 
-The shell forwards `--depths` to the window. A 131k-only run has 39 inputs
+The shell forwards `--depths` and `--readers` to the window. Reader counts are
+1–32, default 32, recorded in the manifest and checked against each catalog.
+A 131k-only run has 39 inputs
 (36 measured requests and three warm-ups), all at 131,072 tokens. Reuse the
 original signed server with `PP4_BINARY` so the server SHA stays identical; the
 shell builds the updated reader separately. Run only inside the same Studio
@@ -159,7 +161,7 @@ borrow described above:
 
 ```bash
 PP4_BINARY=EXISTING_RUN/build/zig-out/bin/mlx-serve \
-  bash scripts/bench/pp4-step0.sh --run --depths 131072
+  bash scripts/bench/pp4-step0.sh --run --depths 131072 --readers 32
 ```
 
 `EXISTING_RUN` is the absolute path of the original run. Reader binaries may
@@ -183,3 +185,36 @@ source failures, one-sided controls, and reader-load modes visible. Cold-only
 read time excludes cached-row reads; the first-use simulation uses full bucket
 completion, including cached rows and copies. Cached-row timings do not establish
 an all-cold delivery guarantee.
+
+## Offline reader and layer-cut sensitivity
+
+```bash
+python3 scripts/bench/pp4_levers.py /private/tmp/claude/pp4-run2 \
+  --out /private/tmp/claude/pp4-levers.json
+```
+
+The 32k sensitivity uses measured decoder layers 20–39 and searches contiguous
+four-stage partitions. Layer 1 stays on stage 0. The objective is the larger
+of the scalar envelope and the conservative per-chunk delivery simulation.
+Encoder costs take each layer's maximum across repetitions/ranks at that chunk;
+decoder segments take the maximum of their measured sum. An intact decoder
+retains the original maximum X, so existing cuts reproduce the original bound.
+Compressor work follows layer 20; DSpark and the head remain on stage 3.
+
+Only bucket read intervals scale with the single-SSD 32k rows/s curve from the
+Engram scaling report. Six-reader throughput is linearly interpolated between
+four and eight readers, per table. Preparation, probes, copies and inter-bucket
+gaps stay fixed. Catalog start is request arrival; two-chunk credits still apply.
+The measured four-SSD storage floor stays 0.2411 s/chunk. No additional factor
+of four applies to timelines that already describe a quarter per box.
+
+The output anchors to the artifact's recorded reader count. It also includes
+a conditional six-reader anchor to check that premise separately. Run 2 records
+32 readers, with six repetitions per rank. Ratios against a six-reader anchor
+therefore describe a hypothetical source measurement.
+
+Arbitrary cuts need shared compressed KV, index keys, picks and candidate state
+in addition to activations. Those transfers are unmeasured and omitted from
+this optimistic sensitivity. `best_activation_only` restricts boundaries to
+2/8/14/20; `best_decoder_cut` requires a boundary inside layers 20–39. Neither
+output implements a distributed executor or qualifies its memory use.
