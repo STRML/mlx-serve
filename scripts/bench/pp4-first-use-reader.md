@@ -16,6 +16,9 @@ pp4-first-use tokenize PACK CORPUS TOKENS.u32
 pp4-first-use CLONED_PACK TOKENS.u32 32768 32 0 2048
 ```
 
+The reader also exports offline table geometry with `pp4-first-use layout PACK`.
+See [live residency](pp4-residency.md) for the strictly mincore-only live path.
+
 The second command reads one global sorted ordinal quarter (`rank` 0–3).
 Run every selected sample and quarter sequentially before any server starts. `CLONED_PACK` must hold fresh APFS clones of the two table files and the
 source config/token map. Before every bucket, `mincore` classifies selected code/scale spans. A row is

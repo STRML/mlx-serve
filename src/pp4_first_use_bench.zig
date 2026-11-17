@@ -4,13 +4,13 @@ const engram = @import("plugins/deepseek_v41/engram.zig");
 const edir = @import("plugins/deepseek_v41/prompt/engram_direct.zig");
 const testing = std.testing;
 
-const Entry = struct { row: u32, chunk: u32 };
+pub const Entry = struct { row: u32, chunk: u32 };
 
-const Catalog = struct {
+pub const Catalog = struct {
     storage: []Entry,
     unique: []Entry,
 
-    fn init(gpa: std.mem.Allocator, grid: []const u32, rows: usize, layers: usize, slot: usize, cols: usize, chunk: usize) !Catalog {
+    pub fn init(gpa: std.mem.Allocator, grid: []const u32, rows: usize, layers: usize, slot: usize, cols: usize, chunk: usize) !Catalog {
         if (chunk == 0 or chunk > 8192 or layers == 0 or slot >= layers or cols == 0 or grid.len != rows * layers * cols) return error.InvalidGrid;
         const entries = try gpa.alloc(Entry, rows * cols);
         errdefer gpa.free(entries);
@@ -53,10 +53,31 @@ const Catalog = struct {
 
 extern "c" fn mincore(addr: *const anyopaque, len: usize, vec: [*]u8) c_int;
 
-const Probe = struct {
+pub const Probe = struct {
     map: []align(std.heap.page_size_min) const u8,
     last: u64 = std.math.maxInt(u64),
     hit: bool = false,
+
+    pub fn snapshot(gpa: std.mem.Allocator, fd: c_int) ![]u8 {
+        const size = std.c.lseek(fd, 0, std.c.SEEK.END);
+        if (size <= 0) return error.TableSize;
+        const page = std.heap.pageSize();
+        const pages = std.math.divCeil(usize, @intCast(size), page) catch unreachable;
+        if (pages > 32 << 20) return error.TableTooLarge;
+        const vec = try gpa.alloc(u8, pages);
+        errdefer gpa.free(vec);
+        var at: usize = 0;
+        while (at < pages) {
+            const count = @min(pages - at, (64 << 20) / page);
+            const len = @min(count * page, @as(usize, @intCast(size)) - at * page);
+            const map = try std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, @intCast(at * page));
+            defer std.posix.munmap(map);
+            if (mincore(map.ptr, len, vec[at..].ptr) != 0) return error.MincoreFailed;
+            for (vec[at..][0..count]) |*v| v.* &= 1;
+            at += count;
+        }
+        return vec;
+    }
 
     fn open(fd: c_int) !Probe {
         const size = std.c.lseek(fd, 0, std.c.SEEK.END);
@@ -88,7 +109,7 @@ const Probe = struct {
     }
 };
 
-fn loadConfig(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !@import("plugins/deepseek_v41/config.zig").Config {
+pub fn loadConfig(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !@import("plugins/deepseek_v41/config.zig").Config {
     const cfg = @import("plugins/deepseek_v41/config.zig");
     const abi = @import("abi/plugin.zig");
     var fs = try @import("sdk/util/pack_dir.zig").FsPackDir.open(io, path);
@@ -104,7 +125,7 @@ fn loadConfig(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !@import("pl
     return cfg.of(&parsed).*;
 }
 
-fn jsonLine(gpa: std.mem.Allocator, value: anytype) !void {
+pub fn jsonLine(gpa: std.mem.Allocator, value: anytype) !void {
     const bytes = try std.json.Stringify.valueAlloc(gpa, value, .{});
     defer gpa.free(bytes);
     var at: usize = 0;
@@ -228,24 +249,86 @@ fn readWarm(gpa: std.mem.Allocator, table: *const engram.Table, probe: *Probe, i
     return .{ .data = data, .cached_parts = cached_parts, .selected_pages = pages.count(), .cached_pages = cached_pages, .cold_rows = cold_rows, .cold_read_ns = 0, .probe_ns = read_start_ns - probe_start_ns, .read_start_ns = read_start_ns, .read_start_epoch_ns = read_start_epoch_ns, .read_end_ns = nowNs() };
 }
 
+pub const TableLayout = struct {
+    layer: usize,
+    relative_path: []const u8,
+    file_bytes: u64,
+    rows: u64,
+    w_off: u64,
+    w_stride: u64,
+    wlen: usize,
+    s_off: u64,
+    s_stride: u64,
+    slen: usize,
+};
+
+pub const Layout = struct { schema: u32 = 1, config_sha256: []const u8, tables: [2]TableLayout };
+
+pub fn sha256(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+pub fn tokenize(io: std.Io, gpa: std.mem.Allocator, pack: []const u8, corpus: []const u8) !struct { ids: []u32, corpus_sha256: [64]u8, text_bytes: usize } {
+    var tok = try @import("sdk/tokenizer/tokenizer.zig").loadTokenizerAny(io, gpa, pack);
+    defer tok.deinit();
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, corpus, gpa, .limited(16 << 20));
+    defer gpa.free(text);
+    return .{ .ids = try tok.encode(gpa, text), .corpus_sha256 = sha256(text), .text_bytes = text.len };
+}
+
+fn exportLayout(io: std.Io, gpa: std.mem.Allocator, pack: []const u8) !void {
+    const cfg = try loadConfig(io, gpa, pack);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, pack, gpa);
+    defer gpa.free(root);
+    const config_path = try std.fs.path.join(gpa, &.{ root, "config.json" });
+    defer gpa.free(config_path);
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, config_path, gpa, .limited(8 << 20));
+    defer gpa.free(raw);
+    const digest = sha256(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, raw, .{});
+    defer parsed.deinit();
+    const format = parsed.value.object.get("omlx_deepseek_v41") orelse return error.MetadataMissing;
+    const paths = format.object.get("engram_tables") orelse return error.MetadataMissing;
+    var specs: [2]TableLayout = undefined;
+    var count: usize = 0;
+    defer for (specs[0..count]) |spec| gpa.free(spec.relative_path);
+    if (cfg.dsv41_n_engram_layers != 2) return error.LayerMismatch;
+    for (&specs, 0..) |*spec, slot| {
+        const layer = cfg.dsv41_engram_layers[slot];
+        if (layer != (if (slot == 0) @as(usize, 1) else 14)) return error.LayerMismatch;
+        var table = try engram.Table.open(gpa, root, slot, layer, cfg.dsv41_engram_rows[slot], cfg.dsv41_engram_head_dim);
+        defer table.close();
+        if (table.mode != .mxfp8 or table.records() or table.wlen != 256 or table.slen != 8) return error.UnsupportedTableLayout;
+        var key_buf: [96]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "language_model.layers.{d}.engram.embed", .{layer});
+        const entry = paths.object.get(key) orelse return error.MetadataMissing;
+        const filename = entry.object.get("weight_file") orelse return error.MetadataMissing;
+        if (filename != .string) return error.MetadataMissing;
+        const relative = try gpa.dupe(u8, filename.string);
+        spec.* = .{ .layer = layer, .relative_path = relative, .file_bytes = @intCast(std.c.lseek(table.fd, 0, std.c.SEEK.END)), .rows = table.rows, .w_off = table.w_off, .w_stride = table.w_stride, .wlen = table.wlen, .s_off = table.s_off, .s_stride = table.s_stride, .slen = table.slen };
+        count += 1;
+    }
+    try jsonLine(gpa, Layout{ .config_sha256 = &digest, .tables = specs });
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len == 5 and std.mem.eql(u8, args[1], "tokenize")) {
-        var tok = try @import("sdk/tokenizer/tokenizer.zig").loadTokenizerAny(io, gpa, args[2]);
-        defer tok.deinit();
-        const text = try std.Io.Dir.cwd().readFileAlloc(io, args[3], gpa, .limited(16 << 20));
-        defer gpa.free(text);
-        const tokens = try tok.encode(gpa, text);
+        const encoded = try tokenize(io, gpa, args[2], args[3]);
+        const tokens = encoded.ids;
         defer gpa.free(tokens);
         const raw = try gpa.alloc(u8, tokens.len * 4);
         defer gpa.free(raw);
         for (tokens, 0..) |id, i| std.mem.writeInt(u32, raw[i * 4 ..][0..4], id, .little);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = args[4], .data = raw });
-        try jsonLine(gpa, .{ .kind = "pp4_tokens", .count = tokens.len, .text_bytes = text.len });
+        try jsonLine(gpa, .{ .kind = "pp4_tokens", .count = tokens.len, .text_bytes = encoded.text_bytes });
         return;
     }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "layout")) return exportLayout(io, gpa, args[2]);
     const warm = args.len == 8 and std.mem.eql(u8, args[7], "--warm");
     if (args.len != 7 and !warm) return error.Usage_pack_tokens_depth_readers_rank_chunk_optional_warm;
     const depth = try std.fmt.parseInt(usize, args[3], 10);

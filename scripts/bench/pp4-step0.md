@@ -1,5 +1,7 @@
 # PP4 step 0: prepare one-box evidence
 
+Live serving-cache evidence: [read-only residency probe](pp4-residency.md).
+
 Run `bash scripts/bench/pp4-step0.sh --dry-run` to inspect the command. It starts
 nothing. The actual window runs only on studio4 inside studio1's single-box
 borrow. Build, sign, and test before loading the sole private server. Keep the

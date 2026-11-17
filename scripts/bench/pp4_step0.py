@@ -381,12 +381,98 @@ def bound_table(result):
     return text
 
 
+def validate_fraction(value):
+    pages, resident = value['pages'], value['resident_pages']
+    if (type(pages) is not int or type(resident) is not int or
+            not 0 <= resident <= pages or pages <= 0 or
+            not math.isclose(value['resident_fraction'], resident / pages, abs_tol=1e-12)):
+        raise ValueError('invalid live residency page counts')
+
+
+def validate_live(artifact, identity):
+    if (artifact['kind'] != 'pp4_live_residency' or artifact['schema'] != 1 or
+            artifact['table_payload_read'] is not False or artifact['table_header_read'] is not False or
+            not 0 <= artifact['elapsed_s'] < 120 or not 0 < artifact['peak_rss_bytes'] < 512 << 20 or
+            (artifact['corpus_sha256'], artifact['tokens_sha256']) != identity):
+        raise ValueError('live residency identity, safety or duration mismatch')
+    if sorted(t['layer'] for t in artifact['tables']) != [1, 14]:
+        raise ValueError('live residency requires layers 1 and 14')
+    selections = []
+    for table in artifact['tables']:
+        for part in ('whole', 'code', 'scale'):
+            validate_fraction(table[part])
+        samples = table['samples']
+        offsets = {(s['depth'], s['token_offset']) for s in samples}
+        if (len(samples) != 6 or len(offsets) != 6 or
+                any(sum(s['depth'] == depth for s in samples) != 3 for depth in (32768, 131072))):
+            raise ValueError('live residency requires three distinct offsets per depth')
+        selections.append(offsets)
+        for sample in samples:
+            if type(sample['token_offset']) is not int or sample['token_offset'] < 0:
+                raise ValueError('invalid live corpus offset')
+            for part in ('code', 'scale'):
+                validate_fraction(sample[part])
+    if selections[0] != selections[1]:
+        raise ValueError('live tables use different corpus samples')
+
+
+def attach_live_residency(result, paths):
+    warm = result.get('warm', result)
+    rows = warm['depths']
+    if not rows:
+        raise ValueError('live comparison requires a recorded depth')
+    manifests = [json.loads((Path(row['source']) / 'manifest.json').read_text()) for row in rows.values()]
+    identities = {(m['corpus_sha256'], m.get('tokens_sha256')) for m in manifests}
+    if len(identities) != 1 or any(not all(i) for i in identities):
+        raise ValueError('live comparison requires corpus and token SHA256 identity')
+    text = ['', '## Live Engram residency', '',
+            'Live fractions count unique pages per complete sample and part. WARM counts',
+            'unique pages per first-use bucket. Shared pages can recur across buckets.',
+            'These denominators describe different access schedules.', '']
+    evidence = []
+    hosts = set()
+    for path in paths:
+        artifact = json.loads(path.read_text())
+        validate_live(artifact, next(iter(identities)))
+        host = artifact['host']
+        if host in hosts:
+            raise ValueError('duplicate live box')
+        hosts.add(host)
+        text += [f'### {host}', '',
+                 '| Layer | Whole table | Code region | Scale region |',
+                 '|---:|---:|---:|---:|']
+        for table in artifact['tables']:
+            text.append(f"| {table['layer']} | {table['whole']['resident_fraction']:.3%} | "
+                        f"{table['code']['resident_fraction']:.3%} | {table['scale']['resident_fraction']:.3%} |")
+        text += ['', '| Layer | Depth | Token offset | Code pages resident | Scale pages resident |',
+                 '|---:|---:|---:|---:|---:|']
+        for table in artifact['tables']:
+            for sample in table['samples']:
+                text.append(f"| {table['layer']} | {sample['depth']} | {sample['token_offset']} | "
+                            f"{sample['code']['resident_fraction']:.3%} | {sample['scale']['resident_fraction']:.3%} |")
+        text.append('')
+        comparison = {}
+        for depth, row in rows.items():
+            parts = [sample[part] for table in artifact['tables'] for sample in table['samples']
+                     if sample['depth'] == int(depth) for part in ('code', 'scale')]
+            live = sum(p['resident_pages'] for p in parts) / sum(p['pages'] for p in parts)
+            warm_fraction = row['resident_fraction'] if row['cache_mode'] == 'WARM' else None
+            comparison[depth] = dict(live_resident_fraction=live, warm_arm_resident_fraction=warm_fraction)
+            warm_text = f'{warm_fraction:.3%}' if warm_fraction is not None else 'unmeasured'
+            text.append(f'{host}, {depth}: live resident fraction = {live:.3%} vs warm-arm resident fraction = {warm_text}.')
+        evidence.append(dict(source=str(path), probe=artifact, comparison=comparison))
+    result['live_residency'] = evidence
+    return text
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('directories', type=Path, nargs='+')
     ap.add_argument('--out', type=Path, help='write bound files here; evidence can stay read-only')
+    ap.add_argument('--live-residency', type=Path, action='append', default=[], help='JSON snapshot from each live serving box')
     args = ap.parse_args()
     result = summarize(args.directories)
+    live_text = attach_live_residency(result, args.live_residency) if args.live_residency else []
     destination = args.out or args.directories[0]
     destination.mkdir(parents=True, exist_ok=True)
     (destination / 'bound.json').write_text(json.dumps(result, indent=2) + '\n')
@@ -398,6 +484,7 @@ def main():
         for depth, row in result['comparison'].items():
             for cuts, pair in row['cuts'].items():
                 text.append(f"| {depth} | {cuts} | {pair['cold_s']:.3f} | {pair['warm_s']:.3f} | {pair['delivery_bound_ratio']:.3f}x |")
+    text += live_text
     text += ['', *result['prerequisites'], '',
              'Local shard replays share one SSD. Max cumulative delivery is a projection,',
              'not a measurement of four-box cadence. Layer timers synchronize the GPU;',
