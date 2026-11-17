@@ -75,6 +75,59 @@ older concurrent readers remain labeled `concurrent_gpu_prefill` in analysis.
 `memory.jsonl` samples free+inactive, server RSS, and `top`'s footprint. The
 watchdog aborts the owned processes below 16 GiB or on a foreign model process.
 
+## Warm page-cache window
+
+```bash
+PP4_BINARY=EXISTING_RUN/build/zig-out/bin/mlx-serve \
+  bash scripts/bench/pp4-step0.sh --run --warm --depths 32768,131072 --readers 32
+```
+
+Inside the same studio4 borrow, `--warm` replaces the discarded request at each
+server load with four different 32k corpus prefills before **each selected depth
+in each block**. Both depths have 96 inputs: 72 measured requests and 24 warmups.
+Every input uses the same global distinct-first-token/prefix check. Warmups are
+saved with their exact slices and must also report `cached_tokens==0`.
+
+```text
+load control -> 4x32k warm -> 6x32k control -> 4x32k warm -> 6x131k control
+load profile -> 4x32k warm -> 24x32k profile -> 4x32k warm -> 24x131k profile
+load control -> 4x32k warm -> 6x32k control -> 4x32k warm -> 6x131k control
+                              each profile: reader -> measured server request
+```
+
+Warm readers use the **original pack's table inodes**, with buffered I/O and
+no cold-coverage minimum. They run before their matching request with the GPU
+idle and the model loaded (`warm_before_request_idle_gpu`). This measures the
+cache as it stands, including pages from earlier requests and readers. It does
+not establish a fixed or fully resident cache. No purge or pinning is applied.
+
+Each bucket retains integer `cached_parts` (code/scale spans with any resident
+page) and reports `cached_pages`, `selected_pages`, and `resident_fraction`.
+The fraction counts unique OS pages within that bucket, including shared scale
+pages only once, **before** reading. Depth-level residency weights the buckets
+by their selected-page counts. The cold path retains its existing direct reads
+and clone qualification.
+
+The one-second watchdog stays active during all warmups and reads. Warmups also
+check free+inactive immediately before and after each request against the same
+16 GiB floor. The server keeps its 225000 MB GPU ceiling. Reclaimable page cache
+is still included in the free+inactive check; a breach aborts the window.
+
+Warm data produces the same bound table labeled `WARM`, with observed resident
+fraction. The inherited storage floor and transport/import allowances remain
+unchanged. Supply cold and warm directories together to compare them:
+
+```bash
+python3 scripts/bench/pp4_step0.py COLD_RUN WARM_RUN --out ANALYSIS_DIR
+```
+
+The analyzer requires matching server/corpus SHA256 and reader counts at each
+compared depth. It keeps the cold result at the top level of `bound.json` and
+adds `warm` and `comparison`; a warm-only input uses the normal top-level shape.
+`bound.md` displays separate tables and the cold/warm bound ratio. Read the
+reader-load labels beside the results: older cold captures ran concurrently
+with GPU prefill, so their ratio also includes a change in GPU load.
+
 ## Recompute the bound
 
 ```bash

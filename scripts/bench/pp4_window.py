@@ -30,12 +30,17 @@ def read_tokens(path):
     return list(struct.unpack('<' + 'I' * (len(raw) // 4), raw))
 
 
-def sample_schedule(depths=(32768, 131072)):
+def sample_schedule(depths=(32768, 131072), warm=False):
     if not depths or len(set(depths)) != len(depths) or any(d not in (32768, 131072) for d in depths):
         raise ValueError("depths must select 32768 and/or 131072 once")
     for block, arm in enumerate(('control', 'profile', 'control')):
-        yield dict(block=block, arm=arm, depth=depths[0], rep=-1, rank=None, warmup=True)
+        if not warm:
+            yield dict(block=block, arm=arm, depth=depths[0], rep=-1, rank=None, warmup=True)
         for depth in depths:
+            if warm:
+                for rep in range(4):
+                    yield dict(block=block, arm=arm, depth=32768, rep=rep, rank=None,
+                               warmup=True, warm_depth=depth)
             for rep in range(6):
                 ranks = (None,)
                 if arm == 'profile':
@@ -50,10 +55,10 @@ def sample_ids(ids, sample):
     return ids[offset:offset + sample['depth']]
 
 
-def plan_samples(ids, deadline=None, depths=(32768, 131072)):
+def plan_samples(ids, deadline=None, depths=(32768, 131072), warm=False):
     deadline = time.monotonic() + 30 if deadline is None else deadline
     plan, first_tokens = [], set()
-    for ordinal, sample in enumerate(sample_schedule(depths)):
+    for ordinal, sample in enumerate(sample_schedule(depths, warm)):
         span = len(ids) - sample['depth'] + 1
         if span <= 0:
             raise ValueError('real corpus too short')
@@ -142,6 +147,7 @@ def cold_pack(pack, parent):
 class Window:
     def __init__(self, args):
         self.args = args
+        self.warm = getattr(args, 'warm', False)
         self.server = None
         self.reader = None
         self.stop_watch = threading.Event()
@@ -159,8 +165,9 @@ class Window:
         if self.binary_sha is None:
             self.binary_sha = hashlib.sha256(self.args.binary.read_bytes()).hexdigest()
         meta = dict(samples=self.samples, warmups=self.warmups, failure=self.failure, chunk=2048,
-                    depths=self.args.depths, readers=self.args.readers, binary_sha256=self.binary_sha,
-                    prefix_cold=True, selected_rows='reader clones probed before server startup; >=90% fully cold rows; server pages uncontrolled',
+                    depths=self.args.depths, readers=self.args.readers, warm=self.warm, binary_sha256=self.binary_sha,
+                    prefix_cold=True, selected_rows=('original pack, buffered reads after distinct server warmups' if self.warm else
+                        'reader clones probed before server startup; >=90% fully cold rows; server pages uncontrolled'),
                     corpus_sha256=hashlib.sha256(self.args.corpus.read_bytes()).hexdigest(),
                     tokens_sha256=hashlib.sha256((self.base / 'corpus.u32').read_bytes()).hexdigest())
         (self.base / 'manifest.json').write_text(json.dumps(meta, indent=2) + '\n')
@@ -269,6 +276,8 @@ class Window:
         tag = f'{arm}-d{depth}-r{rep}' + (f'-s{rank}' if rank is not None else '')
         if spec['warmup']:
             tag = f'{arm}-b{spec["block"]}-warmup'
+            if self.warm:
+                tag += f'-d{spec["warm_depth"]}-r{rep}'
         dest = self.base / tag
         dest.mkdir(exist_ok=True)
         ids = sample_ids(self.ids, spec)
@@ -285,18 +294,22 @@ class Window:
         depth, rank = spec['depth'], spec['rank']
         clone = None
         try:
-            clone, provenance = cold_pack(self.args.pack, dest)
-            (dest / 'clone.json').write_text(json.dumps(provenance, indent=2) + '\n')
+            pack = self.args.pack
+            if not self.warm:
+                clone, provenance = cold_pack(pack, dest)
+                pack = clone
+                (dest / 'clone.json').write_text(json.dumps(provenance, indent=2) + '\n')
             with (dest / 'reader.jsonl').open('w') as out, (dest / 'reader.err').open('w') as err:
-                self.reader = subprocess.Popen([str(self.args.reader), str(clone),
-                    str(dest / 'tokens.u32'), str(depth), str(self.args.readers), str(rank), '2048'],
+                self.reader = subprocess.Popen([str(self.args.reader), str(pack),
+                    str(dest / 'tokens.u32'), str(depth), str(self.args.readers), str(rank), '2048'] +
+                    (['--warm'] if self.warm else []),
                     stdout=out, stderr=err)
                 rc = self.reader.wait(timeout=120)
                 self.reader = None
             if rc:
                 raise RuntimeError(f'first-use reader exited {rc}')
             from pp4_step0 import records, deliveries
-            deliveries(records(dest / 'reader.jsonl'), depth, rank, self.args.readers)
+            deliveries(records(dest / 'reader.jsonl'), depth, rank, self.args.readers, warm=self.warm)
             self.readers_ready.add(dest.name)
         finally:
             if self.reader and self.reader.poll() is None:
@@ -315,7 +328,11 @@ class Window:
         dest, ids, input_meta = self.sample_input(spec)
         tag = dest.name
         if spec['warmup']:
+            if self.warm:
+                self.check_memory()
             response, begin, end = self.request(ids)
+            if self.warm:
+                self.check_memory()
             (dest / 'response.json').write_text(json.dumps(response, indent=2) + '\n')
             self.warmups.append(dict(input_meta, request_start_epoch_ns=begin,
                                      request_end_epoch_ns=end))
@@ -346,18 +363,23 @@ class Window:
             events = records(dest / 'trace.log')
             chunk_costs(events)
             read = records(dest / 'reader.jsonl')
-            deliveries(read, depth, rank, self.args.readers)
-            sample['reader_mode'] = 'before_request_idle_gpu'
+            deliveries(read, depth, rank, self.args.readers, warm=self.warm)
+            sample['reader_mode'] = 'warm_before_request_idle_gpu' if self.warm else 'before_request_idle_gpu'
         self.samples.append(sample)
         self.save()
         print('PP4-SAMPLE', tag, elapsed, flush=True)
+
+    def check_memory(self):
+        self.check()
+        if free_bytes() < 16 << 30:
+            raise RuntimeError('memory floor16GiB failed at warmup boundary')
 
     def run(self):
         deadline = time.monotonic() + 30
         subprocess.run([str(self.args.reader), 'tokenize', str(self.args.pack),
                         str(self.args.corpus), str(self.base / 'corpus.u32')], check=True, timeout=30)
         self.ids = read_tokens(self.base / 'corpus.u32')
-        plan = plan_samples(self.ids, deadline, self.args.depths)
+        plan = plan_samples(self.ids, deadline, self.args.depths, self.warm)
         (self.base / 'sample-plan.json').write_text(json.dumps(plan, indent=2) + '\n')
         print(f'PP4-OFFLINE-CHECK OK samples={len(plan)} prefix_tokens={PREFIX_TOKENS}', flush=True)
         if model_pids() or free_bytes() < 16 << 30:
@@ -366,10 +388,10 @@ class Window:
         watch.start()
         try:
             for spec in plan:
-                if spec['rank'] is not None:
+                if not self.warm and spec['rank'] is not None:
                     self.read_sample(spec)
             for spec in plan:
-                if spec['warmup']:
+                if spec['warmup'] and (not self.warm or (spec['rep'] == 0 and spec['warm_depth'] == self.args.depths[0])):
                     self.stop_server()
                     self.start_server(spec['arm'])
                 self.sample(spec)
@@ -387,15 +409,21 @@ class Window:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--depths', type=int, nargs='+', choices=(32768, 131072), default=[32768, 131072])
+    ap.add_argument('--depths', nargs='+', default=['32768', '131072'])
+    ap.add_argument('--warm', action='store_true', help='prefill four distinct 32k corpus prompts before each depth')
     ap.add_argument('--readers', type=int, choices=range(1, 33), default=32)
     ap.add_argument('--check-tokens', type=Path, help='check every sample offline within 30 seconds')
     for name in ('binary', 'reader', 'pack', 'corpus', 'out'):
         ap.add_argument('--' + name, type=Path)
     args = ap.parse_args()
+    try:
+        args.depths = [int(d) for value in args.depths for d in value.split(',')]
+        list(sample_schedule(args.depths, args.warm))
+    except ValueError as error:
+        ap.error(str(error))
     if args.check_tokens:
         deadline = time.monotonic() + 30
-        plan = plan_samples(read_tokens(args.check_tokens), deadline, args.depths)
+        plan = plan_samples(read_tokens(args.check_tokens), deadline, args.depths, args.warm)
         print(f'PP4-OFFLINE-CHECK OK samples={len(plan)} prefix_tokens={PREFIX_TOKENS} readers={args.readers}')
         return
     for name in ('binary', 'reader', 'pack', 'corpus', 'out'):

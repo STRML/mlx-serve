@@ -110,7 +110,7 @@ def chunk_costs(events):
     return out
 
 
-def deliveries(events, depth, rank, readers=None):
+def deliveries(events, depth, rank, readers=None, warm=False):
     catalog = [e for e in events if e['kind'] == 'pp4_catalog']
     buckets = [e for e in events if e['kind'] == 'pp4_bucket']
     if len(catalog) != 1:
@@ -119,6 +119,8 @@ def deliveries(events, depth, rank, readers=None):
                             chunk_width=2048, shards=4)
     if any(catalog[0].get(k) != v for k, v in expected_catalog.items()):
         raise ValueError('reader catalog identity mismatch')
+    if catalog[0].get('warm', False) is not warm:
+        raise ValueError('reader cache mode mismatch')
     count_readers = catalog[0].get('readers')
     if (type(count_readers) is not int or not 1 <= count_readers <= 32 or
             (readers is not None and count_readers != readers)):
@@ -154,12 +156,22 @@ def deliveries(events, depth, rank, readers=None):
                 e['width'] != min(2048, depth - 1 - e['p0']) or
                 e['payload_bytes'] != e['rows'] * 264):
             raise ValueError('invalid reader timeline')
+        if e.get('warm', False) is not warm:
+            raise ValueError('bucket cache mode mismatch')
+        if warm:
+            pages, cached = e.get('selected_pages'), e.get('cached_pages')
+            fraction = e.get('resident_fraction')
+            if (type(pages) is not int or type(cached) is not int or not 0 <= cached <= pages or
+                    (e['rows'] > 0 and pages == 0) or
+                    not isinstance(fraction, (int, float)) or not math.isfinite(fraction) or
+                    abs(fraction - (cached / pages if pages else 0)) > 1e-12):
+                raise ValueError('invalid page residency accounting')
         cold = e.get('cold_rows', e['rows'] if not e['cached_parts'] else None)
         if (not isinstance(e['cached_parts'], int) or not 0 <= e['cached_parts'] <= e['rows'] * 2 or
                 not isinstance(cold, int) or not 0 <= cold <= e['rows'] or
                 not e['rows'] - cold <= e['cached_parts'] <= (e['rows'] - cold) * 2):
             raise ValueError('invalid cold row accounting')
-        if 'cold_rows' in e or e['cached_parts']:
+        if not warm and ('cold_rows' in e or e['cached_parts']):
             ns = e.get('cold_read_ns')
             if not isinstance(ns, int) or ns < 0 or (cold > 0 and ns == 0) or ns > e['read_end_ns'] - e['read_start_ns']:
                 raise ValueError('missing or invalid cold timing')
@@ -167,7 +179,7 @@ def deliveries(events, depth, rank, readers=None):
         cold_rows += cold
         found[key] = (e['copy_end_ns'] - origin) / 1e9
         previous_end = e['copy_end_ns']
-    if not selected_rows or cold_rows / selected_rows < .9:
+    if not selected_rows or (not warm and cold_rows / selected_rows < .9):
         raise ValueError('cold coverage below 90%')
     if not isinstance(done['elapsed_ns'], int) or done['elapsed_ns'] < previous_end - origin:
         raise ValueError('reader completion precedes final copy')
@@ -186,7 +198,7 @@ def run_identity(root, manifest):
     return binary, manifest.get('corpus_sha256')
 
 
-def summarize_depth(root, depth, controls, profiles, coverage, readers=None):
+def summarize_depth(root, depth, controls, profiles, coverage, readers=None, warm=False):
     e = SSD[depth]
     # With both blocks, choose the faster median to keep the ratio conservative.
     if any(not math.isfinite(v) or v <= 0 for v in controls):
@@ -200,17 +212,22 @@ def summarize_depth(root, depth, controls, profiles, coverage, readers=None):
         if [(c['p0'], c['rows']) for c in chunks] != expected:
             raise ValueError('wrong prefill depth/chunk width')
         rows = records(root / sample['reader'])
+        ready = deliveries(rows, depth, sample['rank'], readers, warm=warm)
         buckets = [e for e in rows if e['kind'] == 'pp4_bucket']
         selected = sum(e['rows'] for e in buckets)
         cold = sum(e.get('cold_rows', e['rows'] if not e['cached_parts'] else 0) for e in buckets)
+        pages = sum(e.get('selected_pages', 0) for e in buckets)
+        cached_pages = sum(e.get('cached_pages', 0) for e in buckets)
         reader_evidence.append(dict(rank=sample['rank'], rows=selected, cold_rows=cold,
+            selected_pages=pages, cached_pages=cached_pages,
+            resident_fraction=cached_pages / pages if pages else (0 if not any(e['cached_parts'] for e in buckets) else None),
             cached_parts=sum(e['cached_parts'] for e in buckets), cold_fraction=cold / selected if selected else 0,
             cold_read_s=sum(e.get('cold_read_ns', e['read_end_ns'] - e['read_start_ns']) for e in buckets) / 1e9))
         demands = [e for e in records(root / sample['trace']) if e['kind'] == 'pp4_engram']
         if not demands:
             raise ValueError('Engram demand trace missing')
         actual_demands.append(demands)
-        ready_by_rank[sample['rank']].append(deliveries(rows, depth, sample['rank'], readers))
+        ready_by_rank[sample['rank']].append(ready)
         reader_counts.add(next(e['readers'] for e in rows if e['kind'] == 'pp4_catalog'))
         all_chunks.append(chunks)
     if len(reader_counts) != 1:
@@ -226,7 +243,10 @@ def summarize_depth(root, depth, controls, profiles, coverage, readers=None):
     head = statistics.mean(c['head_s'] for run in all_chunks for c in run)
     overhead = statistics.mean(c['overhead_s'] for run in all_chunks for c in run)
     profiled = [s['prefill_s'] for s in profiles if 'prefill_s' in s]
-    row = dict(control_coverage=coverage, source=str(root), control_samples=len(controls),
+    pages = sum(e['selected_pages'] for e in reader_evidence)
+    resident = (sum(e['cached_pages'] for e in reader_evidence) / pages if pages else
+                (0 if all(e['resident_fraction'] == 0 for e in reader_evidence) else None))
+    row = dict(cache_mode='WARM' if warm else 'COLD', resident_fraction=resident, control_coverage=coverage, source=str(root), control_samples=len(controls),
                reader_modes=sorted({s.get('reader_mode', 'concurrent_gpu_prefill') for s in profiles}),
                reader_counts=sorted(reader_counts),
                control_s=control, t_s=control / count, x_s=x,
@@ -257,7 +277,7 @@ def summarize_depth(root, depth, controls, profiles, coverage, readers=None):
     return row
 
 
-def summarize(roots):
+def summarize_runs(roots):
     roots = [roots] if isinstance(roots, Path) else list(roots)
     runs = [(root, json.loads((root / 'manifest.json').read_text())) for root in roots]
     identities = [run_identity(root, manifest) for root, manifest in runs]
@@ -290,16 +310,16 @@ def summarize(roots):
                     coverage = 'following_only'
                 else:
                     raise ValueError('control block split around profiles')
-            candidates.append((root, controls, profiles, coverage, manifest.get('readers')))
+            candidates.append((root, controls, profiles, coverage, manifest.get('readers'), manifest.get('warm', False)))
         if len(candidates) > 1:
             raise ValueError(f'overlapping depth {depth}; supply one evidence set per depth')
         if not candidates:
             output['missing_depths'].append(depth)
             output['missing_reasons'][depth] = f'{depth}: requires six profiles per shard and a six-sample control block'
             continue
-        root, controls, profiles, coverage, readers = candidates[0]
+        root, controls, profiles, coverage, readers, warm = candidates[0]
         try:
-            output['depths'][depth] = summarize_depth(root, depth, controls, profiles, coverage, readers)
+            output['depths'][depth] = summarize_depth(root, depth, controls, profiles, coverage, readers, warm)
         except (ValueError, OSError, KeyError) as error:
             output['missing_depths'].append(depth)
             output['missing_reasons'][depth] = f'{depth}: {error}'
@@ -313,6 +333,54 @@ def summarize(roots):
     return output
 
 
+def summarize(roots):
+    roots = [roots] if isinstance(roots, Path) else list(roots)
+    groups = {False: [], True: []}
+    identities = set()
+    for root in roots:
+        manifest = json.loads((root / 'manifest.json').read_text())
+        warm = manifest.get('warm', False)
+        if type(warm) is not bool:
+            raise ValueError('invalid manifest cache mode')
+        groups[warm].append(root)
+        identities.add(run_identity(root, manifest))
+    if len(roots) > 1 and (len(identities) != 1 or any(not all(i) for i in identities)):
+        raise ValueError('merge identity requires matching binary and corpus SHA256')
+    if not all(groups.values()):
+        return summarize_runs(roots)
+    result = summarize_runs(groups[False])
+    result['warm'] = summarize_runs(groups[True])
+    result['comparison'] = {}
+    for depth in result['depths'].keys() & result['warm']['depths'].keys():
+        cold, warm = result['depths'][depth], result['warm']['depths'][depth]
+        if cold['reader_counts'] != warm['reader_counts']:
+            raise ValueError('cold vs warm reader count mismatch')
+        result['comparison'][depth] = dict(
+            cold_reader_modes=cold['reader_modes'], warm_reader_modes=warm['reader_modes'],
+            cold_resident_fraction=cold['resident_fraction'], warm_resident_fraction=warm['resident_fraction'],
+            cuts={cuts: dict(cold_s=cold['cuts'][cuts]['tp1_with_delivery_s'],
+                             warm_s=warm['cuts'][cuts]['tp1_with_delivery_s'],
+                             delivery_bound_ratio=cold['cuts'][cuts]['tp1_with_delivery_s'] /
+                                                  warm['cuts'][cuts]['tp1_with_delivery_s']) for cuts in CUTS})
+    return result
+
+
+def bound_table(result):
+    text = [result['verdict'], '', f"Missing depths: {result['missing_depths']}", '',
+            '| Mode | Depth | Resident pages | Cuts | X/t | TP1 projected s | Speedup | Ratio gate |',
+            '|---|---|---:|---|---:|---:|---:|---|']
+    for depth, row in result['depths'].items():
+        resident = row['resident_fraction']
+        fraction = f'{resident:.3%}' if resident is not None else 'unrecorded'
+        for cuts, bound in row['cuts'].items():
+            text.append(f"| {row['cache_mode']} | {depth} | {fraction} | {cuts} | {row['x_share']:.3%} | "
+                        f"{bound['tp1_with_delivery_s']:.3f} | {bound['speedup_with_delivery']:.3f}x | {bound['ratio_gate']} |")
+    text += ['', *[f'{d}: {reason}' for d, reason in result['missing_reasons'].items()], '',
+             *[f"{d}: controls={row['control_coverage']}; reader modes={row['reader_modes']}"
+               for d, row in result['depths'].items()]]
+    return text
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('directories', type=Path, nargs='+')
@@ -322,19 +390,20 @@ def main():
     destination = args.out or args.directories[0]
     destination.mkdir(parents=True, exist_ok=True)
     (destination / 'bound.json').write_text(json.dumps(result, indent=2) + '\n')
-    text = ['# PP4 step 0', '', result['verdict'], '', f"Missing depths: {result['missing_depths']}", '',
-            '| Depth | Cuts | X/t | TP1 projected s | Speedup | Ratio gate |',
-            '|---|---|---:|---:|---:|---|']
-    for depth, row in result['depths'].items():
-        for cuts, bound in row['cuts'].items():
-            text.append(f"| {depth} | {cuts} | {row['x_share']:.3%} | "
-                        f"{bound['tp1_with_delivery_s']:.3f} | {bound['speedup_with_delivery']:.3f}x | {bound['ratio_gate']} |")
-    text += ['', *[f'{d}: {reason}' for d, reason in result['missing_reasons'].items()], '',
-             *[f"{d}: controls={row['control_coverage']}; reader modes={row['reader_modes']}"
-               for d, row in result['depths'].items()], '', *result['prerequisites'], '',
+    text = ['# PP4 step 0', '', *bound_table(result)]
+    if 'warm' in result:
+        text += ['', '## WARM', '', *bound_table(result['warm']), '', '## Cold vs warm', '',
+                 '| Depth | Cuts | Cold s | Warm s | Cold/warm bound |',
+                 '|---|---|---:|---:|---:|']
+        for depth, row in result['comparison'].items():
+            for cuts, pair in row['cuts'].items():
+                text.append(f"| {depth} | {cuts} | {pair['cold_s']:.3f} | {pair['warm_s']:.3f} | {pair['delivery_bound_ratio']:.3f}x |")
+    text += ['', *result['prerequisites'], '',
              'Local shard replays share one SSD. Max cumulative delivery is a projection,',
              'not a measurement of four-box cadence. Layer timers synchronize the GPU;',
-             'their perturbation is visible against uninstrumented controls.']
+             'their perturbation is visible against uninstrumented controls.',
+             'Residency is weighted by unique selected pages within each bucket, probed before reads.',
+             'Cold vs warm compares recorded runs; reader-load modes above qualify the comparison.']
     (destination / 'bound.md').write_text('\n'.join(text) + '\n')
     print(json.dumps({'verdict': result['verdict'], 'bound': str(destination / 'bound.md')}))
 

@@ -25,6 +25,15 @@ sorted payload order. Direct reads do not fill those caches. A reader completes
 only with at least 90% fully cold rows across both tables and all chunks; it
 prints every bucket and a coverage record before refusing lower coverage. Clone cleanup belongs to the window.
 
+For the warm window, run `pp4-first-use PACK TOKENS.u32 32768 32 0 2048
+--warm` (one command). Use the original pack after the server's distinct
+real-text prefills. Warm mode opens buffered tables, probes residency, and reads
+each sorted bucket once as-is. It omits the 90% cold-coverage gate. The catalog
+and buckets record `warm=true`; `cached_parts` remains an integer span count.
+`cached_pages / selected_pages` gives `resident_fraction`, deduplicating OS pages
+within the bucket before any reads. Fully cold rows remain reported, while
+`cold_read_ns=0` because warm mode does not time a separate cold subset.
+
 The window passes a sample's offset slice as its own `tokens.u32`, identical to
 the HTTP prompt. The reader uses the first `N-1` exact tokenizer ids, preserving
 full preceding mapped history. Each table deduplicates the whole request and
