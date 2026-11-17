@@ -29,7 +29,7 @@ export PATH="$HOME/opt/zig-0.17.1:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbi
 TPL=${PP4_TEMPLATE:-$HOME/build/integ-61c-runner-2335}
 STAGE=${PP4_MLX_STAGE:-$HOME/opt/mlx-serve-integ-2335/lib/mlx}
 OUT=${PP4_OUT:-$HOME/bench/pp4-step0-$(date +%Y%m%d-%H%M%S)}
-[ -d "$TPL/lib" ] && [ -d "$STAGE" ] && [ ! -e "$OUT" ]
+[ -d "$TPL/lib" ] && [ -d "$STAGE" ] && [ ! -e "$OUT" ] || { echo "PP4-STEP0-REFUSED: missing $TPL/lib or $STAGE, or $OUT exists" >&2; exit 2; }
 mkdir -p "$OUT"
 BUILD="$OUT/build"
 cp -Rc "$TPL/." "$BUILD/"
