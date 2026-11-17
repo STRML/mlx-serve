@@ -36,6 +36,23 @@ pages for the CPU reader are cold APFS clones, tested with `mincore`; the sole
 server's own selected-page cache is uncontrolled and labeled separately. There
 is no global purge or memory-pressure probe.
 
+Before loading a model, the runner checks all 75 inputs (72 measured samples
+and three warm-ups) within a 30-second budget including tokenization. Each input
+gets a deterministic corpus offset, with collisions resolved until its first
+token differs from every other input. The check builds every full slice and
+refuses repeated first-32-token prefixes. Reuse a tokenized corpus to run the
+same check offline on the Mac:
+
+```bash
+python3 scripts/bench/pp4_window.py --check-tokens CORPUS.u32
+```
+
+`sample-plan.json` records the offsets for the full schedule. Every sample and
+warm-up also writes `input.json` and `tokens.u32`; the manifest retains its
+`token_offset` and token SHA256. The HTTP request and CPU reader consume that
+same slice. Disabling prefix caches alone does not clear a slot's live decode
+state, so the zero-cached-token response guard still applies to every request.
+
 `MLX_SERVE_DIAG=prefill-trace` supplies the control's production prefill time.
 The `pp4-step0` diagnostic adds synchronized layer timings, layer-20 compressor,
 decoder, DSpark commit/evaluation, head, and stock Engram read/ready/demand
@@ -60,7 +77,7 @@ python3 scripts/bench/pp4_step0.py ~/bench/pp4-step0-YYYYMMDD-HHMMSS
 
 The analyzer requires six profiles per rank/depth, six controls before and six
 after, complete contiguous chunks and encoder layers, native DSpark/X fields,
-consistent catalogs, ordered cold reader buckets, and a completion marker. A
+sample-specific catalogs, ordered cold reader buckets, and a completion marker. A
 failed window cannot produce a verdict.
 
 For each depth it uses the faster neighboring control median `T1`,
@@ -85,7 +102,9 @@ for layer 1; layer 14 gates stage 3 or stage 2 according to the cuts. The larger
 of this projection and the scalar envelope supplies the reported ratio. The
 output preserves per-chunk demand/late-delivery times and raw TP1 demand clocks.
 
-Sequential quarters on one SSD are a surrogate, not four simultaneous SSDs.
+Sequential quarters on distinct corpus slices and one SSD are a surrogate for
+four simultaneous SSDs. Catalog digests may differ between samples; the bound
+takes the maximum observed delivery across those samples.
 The hop, row wire and final-state/import costs remain allowances. Per-layer
 synchronization perturbs execution; compare profile/control time before relying
 on the projection. This window does not complete #261's hardware ceiling or

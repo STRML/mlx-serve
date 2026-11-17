@@ -12,6 +12,7 @@ Inside borrow: clone matching integ-61c build template, build ReleaseFast,
 run CPU unit tests in ReleaseFast and Debug, sign server with ~/bench/signbin.sh.
 One server at a time, loopback :18754, prefix caches off, chunk=2048.
 Read real ~/bench/engram-corpus.md with pack tokenizer. Depths 32768/131072.
+Before model load: 30s offline check of 75 distinct sample/warm-up prefixes.
 Controls before/after: 6 per depth. Profile: 6 per depth per shard (4 shards).
 CPU-only cold first-use reads overlap sole server GPU; memory floor16GiB.
 No live binary install. Cleanup drains private request, stops owned PIDs.

@@ -175,7 +175,6 @@ def summarize(root):
             raise ValueError('invalid control timing')
         control = min(statistics.median(controls[:6]), statistics.median(controls[-6:]))
         all_chunks, ready_by_rank = [], [[] for _ in range(4)]
-        catalog_identity = None
         actual_demands = []
         for sample in profiles:
             chunks = chunk_costs(records(root / sample['trace']))
@@ -183,11 +182,6 @@ def summarize(root):
             if [(c['p0'], c['rows']) for c in chunks] != expected:
                 raise ValueError('wrong prefill depth/chunk width')
             rows = records(root / sample['reader'])
-            catalog = next(e for e in rows if e['kind'] == 'pp4_catalog')
-            identity = (catalog['token_digest'], catalog['catalog_digest'], catalog['distinct_rows'])
-            if catalog_identity is not None and identity != catalog_identity:
-                raise ValueError('different corpus/row catalogs across shard replays')
-            catalog_identity = identity
             demands = [e for e in records(root / sample['trace']) if e['kind'] == 'pp4_engram']
             if not demands:
                 raise ValueError('Engram demand trace missing')

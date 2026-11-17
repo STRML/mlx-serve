@@ -23,10 +23,11 @@ source config/token map. Before every bucket, all selected code/scale spans must
 have zero resident pages under `mincore`. Direct reads do not fill those caches.
 A warm selected page fails the utility. Clone cleanup belongs to the window.
 
-The reader uses the first `N-1` exact tokenizer ids, preserving full preceding
-mapped history. Each table deduplicates the whole request and retains each row's
-earliest chunk. It assigns contiguous sorted ordinal quarters before ordering
-that quarter by first-use chunk, then row. Buckets execute chunk 0 layer 1,
+The window passes a sample's offset slice as its own `tokens.u32`, identical to
+the HTTP prompt. The reader uses the first `N-1` exact tokenizer ids, preserving
+full preceding mapped history. Each table deduplicates the whole request and
+retains each row's earliest chunk. It assigns contiguous sorted ordinal quarters
+before ordering that quarter by first-use chunk, then row. Buckets execute chunk 0 layer 1,
 chunk 0 layer 14, chunk 1 layer 1, and so on. One pool of at most 32 readers runs
 at a time. All selected shard bytes remain in owner buffers until exit.
 

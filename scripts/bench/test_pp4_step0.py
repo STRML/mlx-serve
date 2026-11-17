@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -82,7 +83,8 @@ class BoundContract(unittest.TestCase):
                         name = f'reader-{depth}-{rank}-{rep}.jsonl'
                         events = [dict(kind='pp4_catalog', depth=depth, rank=rank, start_ns=0, ready_ns=0,
                                        prefill_tokens=depth - 1, chunk_width=2048, readers=32, shards=4,
-                                       token_digest=123, catalog_digest=[456, 789], distinct_rows=[4, 4])]
+                                       token_digest=rep * 4 + rank,
+                                       catalog_digest=[456 + rep, 789 + rank], distinct_rows=[4, 4])]
                         events += [dict(e, rank=rank) for e in reader]
                         events += [dict(kind='pp4_reader_done', depth=depth, rank=rank, elapsed_ns=10**12)]
                         (root / name).write_text(''.join(json.dumps(e) + '\n' for e in events))
@@ -189,25 +191,121 @@ class BoundContract(unittest.TestCase):
                                        0. if fraction is None else fraction)
                 (root / 'profile.log').touch()
                 window = window_module.Window(SimpleNamespace(out=root, pack=root, reader='reader'))
-                window.ids = list(range(depth))
+                window.ids = list(range(469416))
+                (root / 'corpus.u32').write_bytes(struct.pack('<469416I', *window.ids))
                 window.request = Mock(return_value=({}, 0, 1000000))
                 window.log_tail = Mock(return_value=trace)
                 window.save = Mock()
 
-                def run_reader(*args, stdout, **kwargs):
+                reader_ids = []
+                def run_reader(command, stdout, **kwargs):
+                    raw = Path(command[2]).read_bytes()
+                    self.assertEqual(len(raw), depth * 4)
+                    reader_ids.append(list(struct.unpack('<' + 'I' * depth, raw)))
                     stdout.write(''.join(json.dumps(e) + '\n' for e in reader))
                     stdout.flush()
                     return Mock(wait=Mock(return_value=0), poll=Mock(return_value=0))
 
                 with patch.object(window_module, 'cold_pack', return_value=(None, [])), \
                         patch.object(window_module.subprocess, 'Popen', side_effect=run_reader):
+                    def sample(rep):
+                        return window.sample(dict(arm='profile', depth=depth, rep=rep,
+                            rank=0, block=1, warmup=False, token_offset=4093 * (rep + 1)))
                     if fraction is None:
                         with self.assertRaisesRegex(ValueError, 'less than50%'):
-                            window.sample('profile', depth, 0, 0)
+                            sample(0)
                         self.assertEqual(window.samples, [])
                     else:
-                        window.sample('profile', depth, 0, 0)
+                        sample(0)
                         self.assertAlmostEqual(window.samples[0]['compute_overlap_fraction'], fraction)
+                        if name == 'no-waits':
+                            sample(1)
+                            prompts = [call.args[0] for call in window.request.call_args_list]
+                            self.assertNotEqual(prompts[0][0], prompts[1][0])
+                            self.assertEqual(reader_ids, prompts)
+                            for sample, prompt in zip(window.samples, prompts):
+                                offset = sample['token_offset']
+                                self.assertEqual(prompt, window.ids[offset:offset + depth])
+
+    def test_offline_plan_covers_warmups_and_rejects_repeated_prefixes_before_load(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        import pp4_window as window_module
+
+        # Frequent repeated words require collision resolution as well as offset spacing.
+        ids = [i // 4096 for i in range(469416)]
+        plan = window_module.plan_samples(ids)
+        self.assertEqual(plan, window_module.plan_samples(ids))
+        self.assertEqual(len(plan), 75)
+        self.assertEqual(sum(s['warmup'] for s in plan), 3)
+        self.assertEqual(len({ids[s['token_offset']] for s in plan}), 75)
+        for sample in plan:
+            offset, depth = sample['token_offset'], sample['depth']
+            self.assertGreaterEqual(offset, 0)
+            self.assertLessEqual(offset + depth, len(ids))
+        wrapped_ids = [i % 4096 for i in range(140000)]
+        wrapped = window_module.plan_samples(wrapped_ids)
+        self.assertEqual(len({wrapped_ids[s['token_offset']] for s in wrapped}), 75)
+        with tempfile.TemporaryDirectory() as temp:
+            tokens = Path(temp) / 'corpus.u32'
+            tokens.write_bytes(struct.pack('<' + 'I' * len(ids), *ids))
+            result = subprocess.run([sys.executable, window_module.__file__,
+                '--check-tokens', str(tokens)], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('PP4-OFFLINE-CHECK OK samples=75 prefix_tokens=32', result.stdout)
+        for bad in (ids[:131071], [7] * len(ids)):
+            with self.subTest(corpus=len(bad)), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                token_file = root / 'corpus.u32'
+                token_file.write_bytes(struct.pack('<' + 'I' * len(bad), *bad))
+                window = window_module.Window(SimpleNamespace(out=root, reader='reader',
+                    corpus=root / 'corpus.md', pack=root))
+                window.start_server = Mock()
+                with patch.object(window_module.subprocess, 'run'), \
+                        self.assertRaisesRegex(ValueError, 'corpus|distinct'):
+                    window.run()
+                window.start_server.assert_not_called()
+        with patch.object(window_module.time, 'monotonic', side_effect=[0, 31]):
+            with self.assertRaisesRegex(TimeoutError, '30'):
+                window_module.plan_samples(ids)
+
+    def test_warmup_records_and_requests_its_own_exact_slice(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import pp4_window as window_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            window = window_module.Window(SimpleNamespace(out=root))
+            window.ids = list(range(469416))
+            warmup = [s for s in window_module.plan_samples(window.ids) if s['warmup']][1]
+            offset, depth = warmup['token_offset'], warmup['depth']
+            expected = window.ids[offset:offset + depth]
+            window.request = Mock(return_value=({}, 0, 1))
+            window.save = Mock()
+            window.sample(warmup)
+            self.assertTrue(window.request.call_args.args[0] == expected, 'warm-up request slice differs')
+            self.assertEqual(window.samples, [])
+            recorded = window.warmups[0]
+            raw = (root / recorded['tokens']).read_bytes()
+            self.assertTrue(list(struct.unpack('<' + 'I' * depth, raw)) == expected,
+                            'warm-up token artifact differs')
+            meta = json.loads((root / recorded['tokens']).with_name('input.json').read_text())
+            self.assertEqual(meta['token_offset'], offset)
+
+    def test_cached_tokens_guard_still_refuses_a_live_slot_hit(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import pp4_window as window_module
+
+        window = window_module.Window(SimpleNamespace(out=Path('/unused')))
+        for cached in (1, None):
+            response = dict(choices=[{}], usage=dict(prompt_tokens=2,
+                prompt_tokens_details=dict(cached_tokens=cached)))
+            with self.subTest(cached=cached), \
+                    patch.object(window_module, 'http', return_value=response), \
+                    self.assertRaisesRegex(ValueError, 'prefix cache hit'):
+                window.request([11, 22])
 
     def test_dry_run_has_no_effects_and_unborrowed_run_refuses(self):
         script = Path(__file__).with_name('pp4-step0.sh')

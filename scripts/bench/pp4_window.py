@@ -20,6 +20,61 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tests'))
 from lib.server import wait_health
 
 PORT = 18754
+PREFIX_TOKENS = 32
+
+
+def read_tokens(path):
+    raw = path.read_bytes()
+    if len(raw) % 4:
+        raise ValueError('corpus token file is not u32 aligned')
+    return list(struct.unpack('<' + 'I' * (len(raw) // 4), raw))
+
+
+def sample_schedule():
+    for block, arm in enumerate(('control', 'profile', 'control')):
+        yield dict(block=block, arm=arm, depth=32768, rep=-1, rank=None, warmup=True)
+        for depth in (32768, 131072):
+            for rep in range(6):
+                ranks = (None,)
+                if arm == 'profile':
+                    ranks = (0, 1, 2, 3) if rep % 2 == 0 else (3, 2, 1, 0)
+                for rank in ranks:
+                    yield dict(block=block, arm=arm, depth=depth,
+                               rep=rep + (6 if block == 2 else 0), rank=rank, warmup=False)
+
+
+def sample_ids(ids, sample):
+    offset = sample['token_offset']
+    return ids[offset:offset + sample['depth']]
+
+
+def plan_samples(ids, deadline=None):
+    deadline = time.monotonic() + 30 if deadline is None else deadline
+    plan, first_tokens = [], set()
+    for ordinal, sample in enumerate(sample_schedule()):
+        span = len(ids) - sample['depth'] + 1
+        if span <= 0:
+            raise ValueError('real corpus too short')
+        for probe in range(span):
+            if time.monotonic() > deadline:
+                raise TimeoutError('offline sample check exceeded 30 seconds')
+            offset = (ordinal * 4093 + probe) % span
+            if ids[offset] not in first_tokens:
+                break
+        else:
+            raise ValueError('corpus lacks distinct first tokens for all samples')
+        first_tokens.add(ids[offset])
+        plan.append(dict(sample, token_offset=offset))
+    prefixes = set()
+    for sample in plan:
+        if time.monotonic() > deadline:
+            raise TimeoutError('offline sample check exceeded 30 seconds')
+        prompt = sample_ids(ids, sample)
+        prefix = tuple(prompt[:PREFIX_TOKENS])
+        if len(prompt) != sample['depth'] or prefix in prefixes:
+            raise ValueError('sample has a short or repeated corpus prefix')
+        prefixes.add(prefix)
+    return plan
 
 
 def compute_overlap_fraction(events, reads):
@@ -118,13 +173,14 @@ class Window:
         self.stop_watch = threading.Event()
         self.failure = None
         self.samples = []
+        self.warmups = []
         self.active_request = False
         self.stopping = False
         self.base = args.out
         self.log = None
 
     def save(self):
-        meta = dict(samples=self.samples, failure=self.failure, chunk=2048,
+        meta = dict(samples=self.samples, warmups=self.warmups, failure=self.failure, chunk=2048,
                     prefix_cold=True, selected_rows='reader clones cold, server pages uncontrolled',
                     corpus_sha256=hashlib.sha256(self.args.corpus.read_bytes()).hexdigest(),
                     tokens_sha256=hashlib.sha256((self.base / 'corpus.u32').read_bytes()).hexdigest())
@@ -229,11 +285,27 @@ class Window:
             raise ValueError('prefix cache hit')
         return response, begin, end
 
-    def sample(self, arm, depth, rep, rank=None):
+    def sample(self, spec):
+        arm, depth, rep, rank = (spec[k] for k in ('arm', 'depth', 'rep', 'rank'))
         tag = f'{arm}-d{depth}-r{rep}' + (f'-s{rank}' if rank is not None else '')
+        if spec['warmup']:
+            tag = f'{arm}-b{spec["block"]}-warmup'
         dest = self.base / tag
         dest.mkdir()
-        ids = self.ids[:depth]
+        ids = sample_ids(self.ids, spec)
+        token_file = dest / 'tokens.u32'
+        raw = struct.pack('<' + 'I' * len(ids), *ids)
+        token_file.write_bytes(raw)
+        input_meta = dict(spec, tokens=f'{tag}/tokens.u32',
+                          tokens_sha256=hashlib.sha256(raw).hexdigest())
+        (dest / 'input.json').write_text(json.dumps(input_meta, indent=2) + '\n')
+        if spec['warmup']:
+            response, begin, end = self.request(ids)
+            (dest / 'response.json').write_text(json.dumps(response, indent=2) + '\n')
+            self.warmups.append(dict(input_meta, request_start_epoch_ns=begin,
+                                     request_end_epoch_ns=end))
+            self.save()
+            return
         logpath = self.base / f'{arm}.log'
         offset = logpath.stat().st_size
         clone = None
@@ -260,7 +332,7 @@ class Window:
                         raise RuntimeError('no GPU trace before reader start')
                     time.sleep(.01)
                 self.reader = subprocess.Popen([str(self.args.reader), str(clone),
-                    str(self.base / 'corpus.u32'), str(depth), '32', str(rank), '2048'],
+                    str(token_file), str(depth), '32', str(rank), '2048'],
                     stdout=out, stderr=err)
                 rc = self.reader.wait(timeout=120)
                 self.reader = None
@@ -287,7 +359,7 @@ class Window:
             if len(timing) != 1 or int(timing[0][0]) != depth or int(timing[0][1]) <= 0:
                 raise ValueError('missing or mismatched production prefill timing')
             elapsed = (end - begin) / 1e9
-            sample = dict(arm=arm, depth=depth, rep=rep, rank=rank,
+            sample = dict(input_meta,
                           request_start_epoch_ns=begin, request_end_epoch_ns=end,
                           wall_s=elapsed, prefill_s=int(timing[0][1]) / 1000,
                           trace=f'{tag}/trace.log', reader=f'{tag}/reader.jsonl')
@@ -329,28 +401,23 @@ class Window:
                 subprocess.run(['rm', '-rf', str(clone)], check=True)
 
     def run(self):
+        deadline = time.monotonic() + 30
         subprocess.run([str(self.args.reader), 'tokenize', str(self.args.pack),
-                        str(self.args.corpus), str(self.base / 'corpus.u32')], check=True)
-        raw = (self.base / 'corpus.u32').read_bytes()
-        self.ids = list(struct.unpack('<' + 'I' * (len(raw) // 4), raw))
-        if len(self.ids) < 131072:
-            raise ValueError('real corpus too short')
+                        str(self.args.corpus), str(self.base / 'corpus.u32')], check=True, timeout=30)
+        self.ids = read_tokens(self.base / 'corpus.u32')
+        plan = plan_samples(self.ids, deadline)
+        (self.base / 'sample-plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        print(f'PP4-OFFLINE-CHECK OK samples={len(plan)} prefix_tokens={PREFIX_TOKENS}', flush=True)
         if model_pids() or free_bytes() < 16 << 30:
             raise RuntimeError('one-server/memory preflight refused')
         watch = threading.Thread(target=self.watch, daemon=True)
         watch.start()
         try:
-            for block, arm in enumerate(('control', 'profile', 'control')):
-                self.start_server(arm)
-                self.request(self.ids[:32768])  # Discard kernel warm-up, prefix cache remains disabled.
-                for depth in (32768, 131072):
-                    for rep in range(6):
-                        if arm == 'profile':
-                            for rank in ((0, 1, 2, 3) if rep % 2 == 0 else (3, 2, 1, 0)):
-                                self.sample(arm, depth, rep, rank)
-                        else:
-                            self.sample(arm, depth, rep + (6 if block == 2 else 0))
-                self.stop_server()
+            for spec in plan:
+                if spec['warmup']:
+                    self.stop_server()
+                    self.start_server(spec['arm'])
+                self.sample(spec)
         except BaseException as error:
             self.failure = self.failure or repr(error)
             raise
@@ -365,9 +432,18 @@ class Window:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--check-tokens', type=Path, help='check every sample offline within 30 seconds')
     for name in ('binary', 'reader', 'pack', 'corpus', 'out'):
-        ap.add_argument('--' + name, type=Path, required=True)
+        ap.add_argument('--' + name, type=Path)
     args = ap.parse_args()
+    if args.check_tokens:
+        deadline = time.monotonic() + 30
+        plan = plan_samples(read_tokens(args.check_tokens), deadline)
+        print(f'PP4-OFFLINE-CHECK OK samples={len(plan)} prefix_tokens={PREFIX_TOKENS}')
+        return
+    for name in ('binary', 'reader', 'pack', 'corpus', 'out'):
+        if getattr(args, name) is None:
+            ap.error('--' + name + ' is required for a window')
     if os.environ.get('BORROW') != 'S4' or os.environ.get('BORROW_BOXES') != 'studio4' or os.uname().nodename.split('.')[0] != 'studio4':
         ap.error('requires studio4 borrow')
     for name in ('binary', 'reader', 'pack', 'corpus', 'out'):
