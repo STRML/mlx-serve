@@ -567,7 +567,7 @@ pub const Table = struct {
     /// each a contiguous run of them: a row's codes through the blocks that hold them, its scales (and biases) from the
     /// block the run read last when it holds them, so neighbouring rows' scales cost one read. Rows in `ids`'s order.
     /// `cap`: the threads the read may run on (at most `GRID_THREADS`).
-    fn readSorted(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, cap: usize) !Raw {
+    pub fn readSorted(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, cap: usize) !Raw {
         const n = ids.len;
         const w = try gpa.alignedAlloc(u8, .@"4", n * self.wlen);
         errdefer gpa.free(w);
