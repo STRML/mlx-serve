@@ -465,19 +465,94 @@ test "peer transfer session: an export by X-Session-Key imports on another box a
     const exported = exportBySession(model_a, 77);
     try testing.expect(exported == .ok);
     defer testing.allocator.free(exported.ok.bytes);
-    try testing.expectEqual(@as(usize, 24), exported.ok.n);
+    // The decode-end entry: the 25-token prompt and both generated tokens.
+    try testing.expectEqual(@as(usize, 27), exported.ok.n);
 
     const imported = importWire(model_b, exported.ok.bytes);
     try testing.expect(imported == .ok);
-    try testing.expectEqual(@as(usize, 24), imported.ok.n);
-    try testing.expectEqual(@as(usize, 24), model_b.entry.prefix_cache.?.sessionTip(77).?.n);
+    try testing.expectEqual(@as(usize, 27), imported.ok.n);
+    try testing.expectEqual(@as(usize, 27), model_b.entry.prefix_cache.?.sessionTip(77).?.n);
 
-    const warm_a = try model_a.runGreedy(&full_prompt, 6, false);
+    var next = full_prompt;
+    @memcpy(next[25..27], turn1.tokens[0..2]);
+    const warm_a = try model_a.runGreedy(&next, 6, false);
     defer testing.allocator.free(warm_a.tokens);
-    const warm_b = try model_b.runGreedy(&full_prompt, 6, false);
+    const warm_b = try model_b.runGreedy(&next, 6, false);
     defer testing.allocator.free(warm_b.tokens);
-    try testing.expectEqual(@as(u32, 24), warm_b.cached);
+    try testing.expectEqual(@as(u32, 27), warm_b.cached);
     try testing.expectEqual(warm_a.cached, warm_b.cached);
+    try testing.expectEqualSlices(u32, warm_a.tokens, warm_b.tokens);
+}
+
+test "peer transfer session: an export carries the decode-end checkpoint, so the next turn keeps the reply on another box" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const model_a = try PeerHarness.open(files);
+    defer model_a.close();
+    const model_b = try PeerHarness.open(files);
+    defer model_b.close();
+
+    const base = buildPrompt(48);
+    const turn1 = try model_a.runGreedyTagged(base[0..25], 4, true, 77);
+    defer testing.allocator.free(turn1.tokens);
+    // The next turn re-sends the prompt and the reply, then new user text, as an agent session does.
+    var next: [25 + 4 + 8]u32 = undefined;
+    @memcpy(next[0..25], base[0..25]);
+    @memcpy(next[25..29], turn1.tokens[0..4]);
+    @memcpy(next[29..], base[40..48]);
+
+    const exported = exportBySession(model_a, 77);
+    try testing.expect(exported == .ok);
+    defer testing.allocator.free(exported.ok.bytes);
+    try testing.expect(importWire(model_b, exported.ok.bytes) == .ok);
+
+    const warm_a = try model_a.runGreedy(&next, 4, false);
+    defer testing.allocator.free(warm_a.tokens);
+    const warm_b = try model_b.runGreedy(&next, 4, false);
+    defer testing.allocator.free(warm_b.tokens);
+    // The bar is a same-box continuation, which restores past the 24-token prompt boundary.
+    try testing.expect(warm_a.cached > 25);
+    try testing.expectEqual(warm_a.cached, warm_b.cached);
+    try testing.expectEqualSlices(u32, warm_a.tokens, warm_b.tokens);
+}
+
+test "peer transfer session: a next prompt that drops the reply restores from the exported tail by a cut" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const model_a = try PeerHarness.open(files);
+    defer model_a.close();
+    const model_b = try PeerHarness.open(files);
+    defer model_b.close();
+
+    // Past MODULE_CUT_COST, so a cut is worth restoring.
+    const prompt = buildPrompt(720);
+    const turn1 = try model_a.runGreedyTagged(prompt[0..640], 2, true, 77);
+    defer testing.allocator.free(turn1.tokens);
+    const exported = exportBySession(model_a, 77);
+    try testing.expect(exported == .ok);
+    defer testing.allocator.free(exported.ok.bytes);
+    try testing.expect(exported.ok.n > 640);
+    try testing.expect(importWire(model_b, exported.ok.bytes) == .ok);
+
+    // The next prompt continues the user text instead of the reply (a template that drops it, an edited history).
+    const warm_a = try model_a.runGreedy(&prompt, 4, false);
+    defer testing.allocator.free(warm_a.tokens);
+    const warm_b = try model_b.runGreedy(&prompt, 4, false);
+    defer testing.allocator.free(warm_b.tokens);
+    try testing.expectEqual(@as(u32, 639), warm_a.cached);
+    try testing.expect(warm_b.cached >= warm_a.cached);
     try testing.expectEqualSlices(u32, warm_a.tokens, warm_b.tokens);
 }
 
@@ -592,7 +667,7 @@ test "peer transfer session: a newest SSD import that fails with an MLX error le
     try testing.expect(imports_seen >= 2);
 }
 
-test "peer transfer session: two sessions on one conversation each export their own boundary" {
+test "peer transfer session: two sessions on one conversation each export their own entry" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const old_fits = scheduler.prefill_admission_fits;
     defer scheduler.prefill_admission_fits = old_fits;
@@ -613,11 +688,12 @@ test "peer transfer session: two sessions on one conversation each export their 
     const first = exportBySession(model_a, 1);
     try testing.expect(first == .ok);
     defer testing.allocator.free(first.ok.bytes);
+    // The longer commit reached past session 1's prompt and dropped its decode-end entry: its boundary goes.
     try testing.expectEqual(@as(usize, 24), first.ok.n);
     const second = exportBySession(model_a, 2);
     try testing.expect(second == .ok);
     defer testing.allocator.free(second.ok.bytes);
-    try testing.expectEqual(@as(usize, 32), second.ok.n);
+    try testing.expectEqual(@as(usize, 35), second.ok.n);
 }
 
 test "peer transfer session: an import another session's entry already covers still names its session" {
@@ -653,7 +729,9 @@ test "peer transfer session: an import another session's entry already covers st
     const owned = exportBySession(model_b, 78);
     try testing.expect(owned == .ok);
     defer testing.allocator.free(owned.ok.bytes);
-    try testing.expectEqual(@as(usize, 24), owned.ok.n);
+    // Session 78 owns the entry that covered it: 77's decode-end entry, the same prompt and greedy reply.
+    try testing.expectEqual(@as(usize, 27), owned.ok.n);
+    try testing.expectEqualSlices(u32, turn_77.tokens[0..2], turn_78.tokens[0..2]);
 }
 
 fn expectWireIds(wire: []const u8, want: []const u32) !void {
@@ -688,8 +766,14 @@ test "peer transfer session: two sessions on different prompts of one length eac
     const wire_2 = exportBySession(model_a, 2);
     try testing.expect(wire_2 == .ok);
     defer testing.allocator.free(wire_2.ok.bytes);
-    try expectWireIds(wire_1.ok.bytes, first[0..24]);
-    try expectWireIds(wire_2.ok.bytes, second[0..24]);
+    var want_1: [27]u32 = undefined;
+    @memcpy(want_1[0..25], &first);
+    @memcpy(want_1[25..], turn_1.tokens[0..2]);
+    var want_2: [27]u32 = undefined;
+    @memcpy(want_2[0..25], &second);
+    @memcpy(want_2[25..], turn_2.tokens[0..2]);
+    try expectWireIds(wire_1.ok.bytes, &want_1);
+    try expectWireIds(wire_2.ok.bytes, &want_2);
 }
 
 test "peer transfer session: an import a longer boundary covers exports exactly the tokens it carried" {
@@ -721,12 +805,15 @@ test "peer transfer session: an import a longer boundary covers exports exactly 
     const own = exportBySession(holder, 6);
     try testing.expect(own == .ok);
     defer testing.allocator.free(own.ok.bytes);
-    try testing.expectEqual(@as(usize, 24), own.ok.n);
-    try expectWireIds(own.ok.bytes, full_prompt[0..24]);
+    var carried: [27]u32 = undefined;
+    @memcpy(carried[0..25], full_prompt[0..25]);
+    @memcpy(carried[25..], short_turn.tokens[0..2]);
+    try testing.expectEqual(@as(usize, 27), own.ok.n);
+    try expectWireIds(own.ok.bytes, &carried);
     const other = exportBySession(holder, 5);
     try testing.expect(other == .ok);
     defer testing.allocator.free(other.ok.bytes);
-    try testing.expectEqual(@as(usize, 32), other.ok.n);
+    try testing.expectEqual(@as(usize, 35), other.ok.n);
 }
 
 test "dsv41 peer fetch: importWireModule refuses layout key, pack identity, settings, quant config, stale entry and low memory headroom" {

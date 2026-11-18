@@ -163,8 +163,9 @@ const SessionLookup = union(enum) { none, hit: RamModuleHit, refused: requests.C
 
 pub var after_aux_import_for_test: ?*const fn () void = null;
 
-/// The prompt boundary a session's newest tip names, else the next boundary of the session that has a record, in RAM or
-/// on the SSD (`tipHit`). A session whose every tip is gone is `none`: the caller sees `session_not_found`.
+/// The entry a session's newest tip names (its decode-end tail when RAM holds one, `ramExportOfTip`), else the next
+/// boundary of the session that has a record, in RAM or on the SSD (`tipHit`). A session whose every tip is gone is
+/// `none`: the caller sees `session_not_found`.
 fn sessionHit(
     allocator: std.mem.Allocator,
     sch: *const Scheduler,
@@ -200,7 +201,7 @@ fn tipHit(
     max_bytes: usize,
     holder: *DiskSession,
 ) SessionLookup {
-    if (hc.ramHitOfTip(tip, session)) |hit| return .{ .hit = hit };
+    if (hc.ramExportOfTip(tip, session)) |hit| return .{ .hit = hit };
     const d = if (hc.disk) |*dd| dd else return .none;
     const ref = d.moduleByBoundary(tip.id, tip.n) orelse return .none;
     const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, tip.variant) orelse return .none;

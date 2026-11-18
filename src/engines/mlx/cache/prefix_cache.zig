@@ -1499,6 +1499,28 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
+    /// What a session export sends for a tip: the decode-end tail of the request that committed the tip's boundary
+    /// (its prompt is the boundary plus at most the one token the boundary stands short of), the entry a same-box
+    /// continuation restores, so a moved session keeps its last reply; else the boundary itself. A tail of a longer
+    /// prompt belongs to another turn or session and is never sent. On the importer, a next prompt that drops or
+    /// re-renders the reply restores from the tail by a cut (`findBestRestorableMatchWithModule`, `MODULE_CUT_COST`).
+    pub fn ramExportOfTip(self: *const HotPrefixCache, tip: SessionTip, session: u64) ?RamModuleHit {
+        const boundary = self.ramHitOfTip(tip, session) orelse return null;
+        const n = boundary.tokens.len;
+        var best: ?*const Entry = null;
+        for (self.entries.items) |*e| {
+            const m = e.module orelse continue;
+            if (m.tail_from < n or m.tail_from > n + 1 or e.tokens.len <= n or e.checked_out_by != null) continue;
+            if (!ModuleBinding.same(m.binding, boundary.payload.binding) or e.has_tools != boundary.has_tools) continue;
+            if (!std.meta.eql(e.quant_config, boundary.quant_config) or e.media.len != 0 or boundary.media.len != 0) continue;
+            if (!std.mem.eql(u32, e.tokens[0..boundary.tokens.len], boundary.tokens)) continue;
+            if (best == null or e.last_used > best.?.last_used) best = e;
+        }
+        var hit = ramHit(best orelse return boundary) orelse return boundary;
+        hit.session = session;
+        return hit;
+    }
+
     pub fn findRamModule(
         self: *const HotPrefixCache,
         binding: ModuleBinding,
@@ -13317,6 +13339,37 @@ test "HotPrefixCache module: a session's tip is its prompt boundary, not the dec
     const tip = cache.findSessionTip(7).?;
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, tip.tokens);
     try testing.expectEqual(@as(usize, 0), tip.payload.tail_from);
+}
+
+test "HotPrefixCache module: a session export sends the decode-end tail past its tip, else the boundary" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const dense = kv_quant.KVQuantConfig.dense;
+    var other: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 5 }, .key = 11 };
+    var boundary: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var tail: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 6 }, .key = 21 };
+    var stray: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 9, 9, 9 }, .key = 27 };
+    // A longer prompt's tail on the same conversation: another turn's or session's reply.
+    var longer: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, .key = 36 };
+    _ = try other.putSession(&cache, binding, &.{}, 8);
+    _ = try boundary.putSession(&cache, binding, &.{}, 7);
+    _ = try cache.commitModuleTail(binding, &longer, longer.ids, longer.key, &.{}, false, dense, 0, 9, 7);
+    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 7, 5);
+    _ = try cache.commitModuleTail(binding, &stray, stray.ids, stray.key, &.{}, false, dense, 0, 0, 2);
+    try testing.expectEqual(@as(usize, 0), longer.frees);
+
+    // A same-box continuation restores the tail; the export sends it too, so a move loses no reply.
+    const sent = cache.ramExportOfTip(cache.sessionTip(7).?, 7).?;
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6 }, sent.tokens);
+    try testing.expectEqual(@as(u64, 7), sent.session);
+    // The tip itself stays the prompt boundary.
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, cache.findSessionTip(7).?.tokens);
+    // A session with no tail past its boundary sends the boundary.
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5 }, cache.ramExportOfTip(cache.sessionTip(8).?, 8).?.tokens);
 }
 
 test "HotPrefixCache module: another session's longer boundary does not hide a session's own tip" {
