@@ -172,7 +172,8 @@ fn prefillProgressSink(sch: *Scheduler) *std.atomic.Value(u64) {
 }
 
 pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
-    const dist_scope = @import("cluster/distributed.zig").scopeRequest(slot);
+    const collective = [_]*const Slot{slot};
+    const dist_scope = @import("cluster/distributed.zig").scopeRequests(&collective);
     defer dist_scope.restore();
     const previous_req = log.setRequestId(slot.request_id);
     defer _ = log.setRequestId(previous_req);

@@ -147,7 +147,8 @@ fn commitCancelledModule(sch: *Scheduler, slot: *Slot, xfm: *transformer_mod.Tra
 /// `waitNext`). Skipped for pad-only generations, vision-bearing slots
 /// (stale embeddings would be reused), and slots with no generated tokens.
 pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
-    const dist_scope = @import("cluster/distributed.zig").scopeRequest(slot);
+    const collective = [_]*const Slot{slot};
+    const dist_scope = @import("cluster/distributed.zig").scopeRequests(&collective);
     defer dist_scope.restore();
     const previous_req = log.setRequestId(slot.request_id);
     defer _ = log.setRequestId(previous_req);

@@ -582,19 +582,14 @@ pub const Slot = struct {
     }
 
     pub fn markError(self: *Slot, name: []const u8) void {
-        _ = self.markErrorOnce(name);
-    }
-
-    pub fn markErrorOnce(self: *Slot, name: []const u8) bool {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
-        if (self.error_code != null or self.finished) return false;
+        if (self.error_code != null or self.finished) return;
         self.error_code = self.allocator.dupe(u8, name) catch null;
         self.state = .errored;
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
         self.emitFinished(.failed, name);
-        return true;
     }
 
     /// The prefill is done: the prompt's counts and its logprobs go out before its first token.

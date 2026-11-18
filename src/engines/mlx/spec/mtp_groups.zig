@@ -486,6 +486,8 @@ pub fn mtpCrowdThresholdFor(slot: *const Slot) usize {
 }
 
 fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
+    const dist_scope = @import("../cluster/distributed.zig").scopeRequests(group);
+    defer dist_scope.restore();
     const cost_xfm = group[0].model.transformer.?;
     // The forward records its attention and MoE arms on qwen4_exp's trunk.
     const cost_trunk = cost_xfm.qwen4Trunk();
@@ -734,6 +736,8 @@ pub fn mtpSubGroupSize(remaining: usize, row_cap: u32) usize {
 }
 
 fn runBatchedMtpTick(sch: *Scheduler, group: []*Slot) !void {
+    const dist_scope = @import("../cluster/distributed.zig").scopeRequests(group);
+    defer dist_scope.restore();
     var inner_err: ?anyerror = null;
     runBatchedMtpTickInner(sch, group) catch |e| {
         inner_err = e;

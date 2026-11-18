@@ -187,7 +187,8 @@ const LinkState = struct {
     recvs: std.atomic.Value(u32) = .init(0),
     loop_tick_ms: std.atomic.Value(u64) = .init(0),
     watchdog: dist_watchdog.State = .{},
-    request_owner: u64 = 0,
+    request_owners: []const *const Slot = &.{},
+    first_exit: ?ExitEvidence = null,
     watchdog_started: std.atomic.Value(bool) = .init(false),
     watchdog_stop: std.atomic.Value(bool) = .init(false),
     /// The watchdog and (rank 0) heartbeat threads of the open link; `Link.deinit` joins them.
@@ -200,10 +201,6 @@ const LinkState = struct {
     ready_to_go_ms: u32 = 0,
 
     fn exit(self: *LinkState, detected: dist_watchdog.ExitCause, rank: ?u32, waited: ?u64) void {
-        self.exitWithEvidence(detected, rank, waited, null);
-    }
-
-    fn exitWithEvidence(self: *LinkState, detected: dist_watchdog.ExitCause, rank: ?u32, waited: ?u64, saved: ?*const ExitEvidence) void {
         lock(&self.exit_mu);
         defer self.exit_mu.unlock();
         if (detected == .teardown_timeout and self.teardown_done.load(.acquire)) return;
@@ -214,18 +211,15 @@ const LinkState = struct {
             (if (self.rank == 0) .partial_go else .cancelled_after_go)
         else
             detected;
+        const evidence = latchExit(self, null);
         if (comptime builtin.is_test) if (self.test_exits) |counter| {
+            if (counter.emit_record) noteDistExit(cause, rank, waited, evidence);
             _ = counter.causes.fetchOr(@as(u32, 1) << @backingInt(cause), .acq_rel);
             _ = counter.count.fetchAdd(1, .acq_rel);
             return;
         };
         log.err("[dist] attempt={d} cause={s}\n", .{ self.n, @tagName(cause) });
-        if (saved) |evidence| {
-            noteDistExit(cause, rank, waited, evidence);
-        } else {
-            const evidence = captureExit(self);
-            noteDistExit(cause, rank, waited, &evidence);
-        }
+        noteDistExit(cause, rank, waited, evidence);
         std.c._exit(1);
     }
 };
@@ -633,6 +627,7 @@ pub const Link = struct {
         c.state_mu.unlock();
         state.teardown_done.store(true, .release);
         if (state.teardown_timer) |t| t.join();
+        if (state.first_exit) |*evidence| evidence.request_ids.deinit(std.heap.page_allocator);
         std.heap.page_allocator.destroy(state);
         self.state = null;
     }
@@ -1140,6 +1135,7 @@ fn idleTimeoutMs() u32 {
 fn followerExit(state: *LinkState, reason: dist_watchdog.BellFailure) void {
     if (state.aborting.load(.acquire)) return;
     if (state.closing.load(.acquire) or state.releasing.load(.acquire)) return;
+    _ = latchExit(state, null);
     log.err("[dist-watchdog] leader gone: bell {s} (idle timeout {d} ms); this worker exits\n", .{ @tagName(reason), idleTimeoutMs() });
     state.exit(if (reason == .eof) .bell_eof else .bell_timeout, 0, if (reason == .timeout) idleTimeoutMs() else null);
 }
@@ -1157,19 +1153,16 @@ fn noteDistExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64
     log.syncFile();
 }
 
-fn noteWorkerExit() void {
-    var evidence = captureExit(null);
-    defer evidence.deinit();
-    noteDistExit(.worker_error, 0, null, &evidence);
-}
-
 pub fn exitReleaseFailed(rank: u32) noreturn {
     distExit(.release_failed, rank, null);
 }
 
 fn noteSwitchAbort(n: u64) void {
-    var evidence = captureExit(null);
-    defer evidence.deinit();
+    const c = cluster();
+    lock(&c.state_mu);
+    defer c.state_mu.unlock();
+    const idle: ExitEvidence = .{ .step = c.last_liveness.step };
+    const evidence = if (c.active_state) |state| latchExitLocked(c, state, null) else &idle;
     log.err("[dist-exit] epoch_ms={d} cause=switch_abort n={d} peer=- step={d} waited_ms=- req={f}\n", .{ crt.wallMs(), n, evidence.step, evidence.tags() });
     log.syncFile();
 }
@@ -1181,7 +1174,7 @@ pub fn exitSwitchAbort(n: u64) noreturn {
 
 pub fn exitWorker(err: ?anyerror) noreturn {
     if (err) |e| {
-        noteWorkerExit();
+        noteGlobalExit(.worker_error, 0, null);
         log.err("[dist] worker: {s}\n", .{@errorName(e)});
     }
     std.process.exit(if (err != null) 1 else 0);
@@ -1198,9 +1191,17 @@ pub fn switchStallNote(buf: []u8) []const u8 {
 }
 
 fn distExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64) noreturn {
-    const evidence = captureExit(null);
-    noteDistExit(cause, peer_rank, waited_ms, &evidence);
+    noteGlobalExit(cause, peer_rank, waited_ms);
     std.c._exit(1);
+}
+
+fn noteGlobalExit(cause: dist_watchdog.ExitCause, peer_rank: ?u32, waited_ms: ?u64) void {
+    const c = cluster();
+    lock(&c.state_mu);
+    defer c.state_mu.unlock();
+    const idle: ExitEvidence = .{ .step = c.last_liveness.step };
+    const evidence = if (c.active_state) |state| latchExitLocked(c, state, null) else &idle;
+    noteDistExit(cause, peer_rank, waited_ms, evidence);
 }
 
 /// Rank 0's side of the bells while the group forms: files each connection under the rank it names, a
@@ -1766,25 +1767,26 @@ fn activeModelLocked(c: *const ClusterState) ?[]const u8 {
 
 pub const RequestScope = struct {
     link: ?*LinkState = null,
-    previous: u64 = 0,
+    previous: []const *const Slot = &.{},
 
     pub fn restore(self: RequestScope) void {
         const link = self.link orelse return;
         const c = cluster();
         lock(&c.state_mu);
         defer c.state_mu.unlock();
-        if (c.active_state == link) link.request_owner = self.previous;
+        if (c.active_state == link) link.request_owners = self.previous;
     }
 };
 
-pub fn scopeRequest(slot: ?*const Slot) RequestScope {
+/// The caller keeps the slice alive until restore. Exit detectors copy the IDs before releasing any slots.
+pub fn scopeRequests(slots: []const *const Slot) RequestScope {
     const c = cluster();
     lock(&c.state_mu);
     defer c.state_mu.unlock();
     const state = c.active_state orelse return .{};
     if (state.rank != 0) return .{};
-    const previous = state.request_owner;
-    state.request_owner = if (slot) |s| (if (samePath(activeModelLocked(c) orelse "", s.model.path)) s.request_id else 0) else 0;
+    const previous = state.request_owners;
+    state.request_owners = slots;
     return .{ .link = state, .previous = previous };
 }
 
@@ -1793,29 +1795,39 @@ const ExitEvidence = struct {
     request_ids: std.ArrayList(u64) = .empty,
     unavailable: bool = false,
 
-    fn deinit(self: *ExitEvidence) void {
-        self.request_ids.deinit(std.heap.page_allocator);
-    }
-
     fn tags(self: *const ExitEvidence) dist_watchdog.RequestTags {
         return .{ .ids = self.request_ids.items, .unavailable = self.unavailable };
     }
 };
 
-fn captureExit(link: ?*const LinkState) ExitEvidence {
+fn latchExit(state: *LinkState, queue_locked: ?*Scheduler) *const ExitEvidence {
     const c = cluster();
     lock(&c.state_mu);
     defer c.state_mu.unlock();
-    const state = link orelse c.active_state orelse return .{ .step = c.last_liveness.step };
+    return latchExitLocked(c, state, queue_locked);
+}
+
+fn latchExitLocked(c: *ClusterState, state: *LinkState, queue_locked: ?*Scheduler) *const ExitEvidence {
+    if (state.first_exit == null) state.first_exit = snapshotExit(c, state, queue_locked);
+    return &state.first_exit.?;
+}
+
+fn snapshotExit(c: *ClusterState, state: *const LinkState, queue_locked: ?*Scheduler) ExitEvidence {
     var evidence: ExitEvidence = .{ .step = state.watchdog.step.load(.monotonic) };
     if (state.rank != 0 or state != c.active_state) return evidence;
-    if (state.request_owner != 0) {
-        evidence.request_ids.append(std.heap.page_allocator, state.request_owner) catch {
+    const model = activeModelLocked(c) orelse return evidence;
+    for (state.request_owners) |slot| {
+        if (!samePath(model, slot.model.path)) continue;
+        evidence.request_ids.append(std.heap.page_allocator, slot.request_id) catch {
             evidence.unavailable = true;
+            return evidence;
         };
+    }
+    if (evidence.request_ids.items.len > 0) return evidence;
+    if (queue_locked) |sch| {
+        evidence.unavailable = !scheduler_mod.liveRequestIdsLocked(sch, model, &evidence.request_ids);
         return evidence;
     }
-    const model = activeModelLocked(c) orelse return evidence;
     if (!c.request_scheduler_mu.tryLock()) {
         evidence.unavailable = true;
         return evidence;
@@ -1910,10 +1922,12 @@ fn watchdogLoop(c: *LinkState, deadline_ms: u64, leader: bool) void {
         const in_flight = c.watchdog.in_flight.load(.acquire);
         const ready = c.heartbeat_active.load(.acquire);
         if (leader and ready and !dist_watchdog.loopAlive(now_ms, last_tick_ms, in_flight, @as(u64, idleTimeoutMs()))) {
+            _ = latchExit(c, null);
             log.err("[dist-watchdog] leader loop stalled: waited_ms={d}; this rank exits\n", .{now_ms -| last_tick_ms});
             return c.exit(.self_check, null, now_ms -| last_tick_ms);
         }
         const waited = c.watchdog.stalledMs(now_ms, deadline_ms) orelse continue;
+        _ = latchExit(c, null);
         log.err("[dist-watchdog] stall: step={d} waited_ms={d}; this rank exits\n", .{ c.watchdog.step.load(.monotonic), waited });
         return c.exit(.stall, null, waited);
     }
@@ -3568,26 +3582,32 @@ fn watchWorker(link: Link) void {
     const state = link.state.?;
     const lost = watchBells(&link, state);
     if (lost == 0 or state.closing.load(.acquire)) return;
-    var evidence = workerLeftEvidence(&link, lost) orelse return;
-    defer evidence.deinit();
+    _ = workerLeftEvidence(&link, lost) orelse return;
     if (sleepUnlessStopped(state, 2000)) return;
-    state.exitWithEvidence(.worker_left, lost, null, &evidence);
+    state.exit(.worker_left, lost, null);
 }
 
-fn workerLeftEvidence(link: *const Link, lost: u32) ?ExitEvidence {
+fn workerLeftEvidence(link: *const Link, lost: u32) ?*const ExitEvidence {
     const state = link.state.?;
     if (!state.switch_open and link.size == 2) {
         while (state.recvs.load(.acquire) == 0) if (sleepUnlessStopped(state, 100)) return null;
     }
     if (state.closing.load(.acquire) or state.releasing.load(.acquire)) return null;
-    var evidence: ExitEvidence = .{ .step = state.watchdog.step.load(.monotonic) };
-    {
-        const c = cluster();
+    const c = cluster();
+    const evidence = blk: {
         lock(&c.request_scheduler_mu);
-        defer c.request_scheduler_mu.unlock();
-        if (c.request_scheduler) |sch| evidence.unavailable = !scheduler_mod.failInFlight(sch, "DistWorkerLeft", &evidence.request_ids);
-    }
-    noteWorkerLeft(state, lost, &evidence);
+        if (c.request_scheduler) |sch| {
+            defer c.request_scheduler_mu.unlock();
+            sch.queue_mu.lockUncancelable(sch.io);
+            defer sch.queue_mu.unlock(sch.io);
+            const evidence = latchExit(state, sch);
+            scheduler_mod.failInFlightLocked(sch, "DistWorkerLeft");
+            break :blk evidence;
+        }
+        c.request_scheduler_mu.unlock();
+        break :blk latchExit(state, null);
+    };
+    noteWorkerLeft(state, lost, evidence);
     return evidence;
 }
 
@@ -3682,7 +3702,7 @@ fn sameModel(io: std.Io, allocator: std.mem.Allocator, parts: []const []const u8
 /// model folders, `~/.mlx-serve/models` by default), then runs forwards until rank 0 stops it.
 pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     bindInferenceThread();
-    errdefer noteWorkerExit();
+    errdefer noteGlobalExit(.worker_error, 0, null);
     // JACCL (RDMA over Thunderbolt) exists only on macOS.
     if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable;
     preferFastSynch();
@@ -4729,6 +4749,7 @@ test "after the stop message rank 0 sends the worker nothing more" {
 const switcher = @import("switch.zig");
 
 const TestDistExit = struct {
+    emit_record: bool = false,
     count: std.atomic.Value(u32) = .init(0),
     causes: std.atomic.Value(u32) = .init(0),
 };
@@ -6697,7 +6718,7 @@ test "request id: switch-abort exit keeps the request and existing attempt field
     const text = try @import("../../../sdk/testing/log_capture.zig").capture(std.testing.allocator, struct {
         fn run(active: *Slot) void {
             {
-                const scope = scopeRequest(active);
+                const scope = scopeRequests(&.{active});
                 defer scope.restore();
                 noteSwitchAbort(8);
             }
@@ -6706,61 +6727,7 @@ test "request id: switch-abort exit keeps the request and existing attempt field
     }.run, .{&slot});
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "cause=switch_abort n=8 peer=- step=0 waited_ms=- req=chatcmpl-0000000000000000-73\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "cause=switch_abort n=9 peer=- step=0 waited_ms=- req=-\n") != null);
-}
-
-test "dist exit evidence names concurrent requests in slot order after a worker leaves" {
-    const t = std.testing;
-    var queue: ExitTestQueue = undefined;
-    queue.init();
-    defer queue.deinit();
-    var link = try newLink(.{ .rank = 0, .size = 2, .coordinator = "127.0.0.1:46225", .device = "loopback" });
-    defer link.deinit();
-    setSwitchGroup(&link, queue.model.path);
-    const first = try queue.submit();
-    const second = try queue.submit();
-    const state = link.state.?;
-    state.n = 8;
-    state.watchdog.step.store(41, .monotonic);
-    state.recvs.store(1, .release);
-    const output = try @import("../../../sdk/testing/log_capture.zig").capture(t.allocator, struct {
-        fn run(l: *const Link, b: *Slot) void {
-            const s = l.state.?;
-            {
-                const owner = scopeRequest(b);
-                defer owner.restore();
-                var step = captureExit(s);
-                defer step.deinit();
-                noteDistExit(.stall, null, 30001, &step);
-
-                const batch = scopeRequest(null);
-                defer batch.restore();
-                var shared = captureExit(s);
-                defer shared.deinit();
-                noteDistExit(.self_check, null, null, &shared);
-            }
-
-            var lost = workerLeftEvidence(l, 1).?;
-            defer lost.deinit();
-            var idle = captureExit(s);
-            defer idle.deinit();
-            noteWorkerLeft(s, 1, &idle);
-            noteDistExit(.stall, null, null, &idle);
-            noteDistExit(.worker_left, 1, null, &lost);
-        }
-    }.run, .{ &link, second });
-    defer t.allocator.free(output);
-    try t.expect(first.errorNameIs("DistWorkerLeft"));
-    try t.expect(second.errorNameIs("DistWorkerLeft"));
-    const owner_line = try std.fmt.allocPrint(t.allocator, "cause=stall peer=- step=41 waited_ms=30001 req={f}\n", .{log.requestTag(second.request_id)});
-    defer t.allocator.free(owner_line);
-    try t.expect(std.mem.indexOf(u8, output, owner_line) != null);
-    const expected = try std.fmt.allocPrint(t.allocator, " req={f},{f}\n", .{ log.requestTag(first.request_id), log.requestTag(second.request_id) });
-    defer t.allocator.free(expected);
-    try t.expectEqual(@as(usize, 3), std.mem.count(u8, output, expected));
-    try t.expect(std.mem.endsWith(u8, output, expected));
-    try t.expect(std.mem.indexOf(u8, output, "[dist] attempt=8 worker rank 1 left req=-\n") != null);
-    try t.expect(std.mem.indexOf(u8, output, "cause=stall peer=- step=41 waited_ms=- req=-\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cause=switch_abort n=9 peer=- step=0 waited_ms=- req=chatcmpl-0000000000000000-73\n") != null);
 }
 
 const ExitTestQueue = struct {
@@ -6781,7 +6748,7 @@ const ExitTestQueue = struct {
         self.sch.kv_quant_config = .dense;
         self.sch.queue_mu = .init;
         self.sch.queue_cond = .init;
-        self.sch.queue_cap = 2;
+        self.sch.queue_cap = 3;
         self.sch.in_flight = 0;
         self.sch.submit_waiting = 0;
         self.sch.shutdown = .init(false);
@@ -6797,6 +6764,8 @@ const ExitTestQueue = struct {
         setRequestScheduler(null);
         for (self.sch.pending.items) |slot| slot.deinit();
         self.sch.pending.deinit(self.sch.allocator);
+        for (self.sch.decoding.items) |slot| slot.deinit();
+        self.sch.decoding.deinit(self.sch.allocator);
     }
 
     fn submit(self: *ExitTestQueue) !*Slot {
@@ -6826,6 +6795,8 @@ fn expectWorkerLeftRequest(late: bool) !void {
     link.bells[1] = pair.leader.bells[1];
     pair.leader.bells[1] = .{};
     const state = link.state.?;
+    var exits: TestDistExit = .{ .emit_record = true };
+    state.test_exits = &exits;
     state.n = 8;
     state.watchdog.step.store(17, .monotonic);
     var failure: ?anyerror = null;
@@ -6843,9 +6814,8 @@ fn expectWorkerLeftRequest(late: bool) !void {
                     const active = watched.state.?;
                     const rank = watchBells(watched, active);
                     if (rank == 0) return;
-                    var evidence = workerLeftEvidence(watched, rank) orelse return;
-                    defer evidence.deinit();
-                    noteDistExit(.worker_left, rank, null, &evidence);
+                    _ = workerLeftEvidence(watched, rank) orelse return;
+                    active.exit(.worker_left, rank, null);
                 }
             }.run, .{l});
             defer thread.join();
@@ -6872,4 +6842,130 @@ fn expectWorkerLeftRequest(late: bool) !void {
     if (!std.mem.startsWith(u8, output, worker_line)) std.debug.print("{s}", .{output});
     try t.expect(std.mem.startsWith(u8, output, worker_line));
     try t.expect(std.mem.endsWith(u8, output, exit_suffix));
+}
+
+test "request id: batched decode tick excludes the pending request from exit evidence" {
+    const t = std.testing;
+    const Alloc = std.mem.Allocator;
+    const Probe = struct {
+        fn alloc(ctx: *anyopaque, _: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+            const state: *LinkState = @ptrCast(@alignCast(ctx));
+            _ = latchExit(state, null);
+            return null;
+        }
+
+        const vtable: Alloc.VTable = .{ .alloc = &alloc, .resize = &Alloc.noResize, .remap = &Alloc.noRemap, .free = &Alloc.noFree };
+    };
+
+    var queue: ExitTestQueue = undefined;
+    queue.init();
+    defer queue.deinit();
+    var link = try newLink(.{ .rank = 0, .size = 2, .coordinator = "127.0.0.1:46225", .device = "loopback" });
+    defer link.deinit();
+    setSwitchGroup(&link, queue.model.path);
+    const first = try queue.submit();
+    const second = try queue.submit();
+    const pending = try queue.submit();
+    first.request_id = 73;
+    second.request_id = 74;
+    pending.request_id = 75;
+    try queue.sch.decoding.appendSlice(t.allocator, &.{ first, second });
+    _ = queue.sch.pending.orderedRemove(0);
+    _ = queue.sch.pending.orderedRemove(0);
+
+    var xfm: @import("../transformer.zig").Transformer = undefined;
+    xfm.plugin = null;
+    queue.model.transformer = &xfm;
+    defer queue.model.transformer = null;
+    const state = link.state.?;
+    queue.sch.allocator = .{ .ptr = state, .vtable = &Probe.vtable };
+    defer queue.sch.allocator = t.allocator;
+    queue.sch.metrics = null;
+    queue.sch.force_batched = false;
+    queue.sch.inflight_generated_tokens = .init(0);
+    var active = [_]*Slot{ first, second };
+    try t.expectError(error.OutOfMemory, @import("../decode.zig").runDecodeTick(&queue.sch, &active));
+    try t.expectEqualSlices(u64, &.{ 73, 74 }, state.first_exit.?.tags().ids);
+    try t.expectEqual(@as(usize, 0), state.request_owners.len);
+}
+
+test "request id: a watchdog reuses worker-left evidence during the exit grace" {
+    const t = std.testing;
+    var queue: ExitTestQueue = undefined;
+    queue.init();
+    defer queue.deinit();
+    var link = try newLink(.{ .rank = 0, .size = 2, .coordinator = "127.0.0.1:46225", .device = "loopback" });
+    defer link.deinit();
+    setSwitchGroup(&link, queue.model.path);
+    const slot = try queue.submit();
+    slot.request_id = 73;
+    const state = link.state.?;
+    var exits: TestDistExit = .{ .emit_record = true };
+    state.test_exits = &exits;
+    state.recvs.store(1, .release);
+    state.watchdog.step.store(41, .monotonic);
+    const output = try @import("../../../sdk/testing/log_capture.zig").capture(t.allocator, struct {
+        fn run(l: *const Link, q: *ExitTestQueue) void {
+            _ = workerLeftEvidence(l, 1).?;
+            const late = q.submit() catch unreachable;
+            late.request_id = 75;
+            l.state.?.exit(.stall, null, 30001);
+        }
+    }.run, .{ &link, &queue });
+    defer t.allocator.free(output);
+    try t.expect(slot.errorNameIs("DistWorkerLeft"));
+    try t.expect(std.mem.indexOf(u8, output, "worker rank 1 left req=chatcmpl-0000000000000000-73\n") != null);
+    try t.expect(std.mem.indexOf(u8, output, "cause=stall peer=- step=41 waited_ms=30001 req=chatcmpl-0000000000000000-73\n") != null);
+}
+
+test "request id: decode-end commit exit names the finished slot" {
+    const t = std.testing;
+    const abi = @import("../../../abi/plugin.zig");
+    const driver = @import("../plugin/driver.zig");
+    const cache = @import("../cache/prefix_cache.zig");
+    const Probe = struct {
+        fn enabled(ctx: *anyopaque) callconv(.c) bool {
+            const state: *LinkState = @ptrCast(@alignCast(ctx));
+            state.exit(.stall, null, 30001);
+            return false;
+        }
+    };
+
+    var queue: ExitTestQueue = undefined;
+    queue.init();
+    defer queue.deinit();
+    var link = try newLink(.{ .rank = 0, .size = 2, .coordinator = "127.0.0.1:46225", .device = "loopback" });
+    defer link.deinit();
+    setSwitchGroup(&link, queue.model.path);
+    const pending = try queue.submit();
+    pending.request_id = 75;
+
+    var exits: TestDistExit = .{ .emit_record = true };
+    const state = link.state.?;
+    state.test_exits = &exits;
+    state.watchdog.step.store(41, .monotonic);
+    var hooks: abi.AuxHooks = undefined;
+    hooks.size = @sizeOf(abi.AuxHooks);
+    hooks.enabled = &Probe.enabled;
+    const cache_hooks: abi.CacheHooks = .{ .aux = &hooks };
+    var table: abi.ModelTable = undefined;
+    table.cache = &cache_hooks;
+    var bound: driver.Bound = .{ .table = &table, .model = state };
+    var xfm: @import("../transformer.zig").Transformer = undefined;
+    xfm.plugin = &bound;
+    queue.model.transformer = &xfm;
+    defer queue.model.transformer = null;
+    var hot = cache.HotPrefixCache.init(t.allocator, 1);
+    defer hot.deinit();
+    var finished: Slot = undefined;
+    finished.request_id = 73;
+    finished.model = &queue.model;
+    finished.finished = true;
+    finished.error_code = null;
+    finished.prefix_cache = &hot;
+    finished.cache_variant = 1;
+    const output = try @import("../../../sdk/testing/log_capture.zig").capture(t.allocator, @import("../commit.zig").commitSlotIfApplicable, .{ &queue.sch, &finished });
+    defer t.allocator.free(output);
+    try t.expectEqual(@as(u32, 1), exits.count.load(.acquire));
+    try t.expect(std.mem.indexOf(u8, output, "cause=stall peer=- step=41 waited_ms=30001 req=chatcmpl-0000000000000000-73\n") != null);
 }

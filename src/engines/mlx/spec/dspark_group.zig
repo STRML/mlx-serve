@@ -106,6 +106,8 @@ fn runGroupTickInner(sch: *Scheduler, group: []*Slot) !void {
     }
     if (n == 0) return;
     if (n == 1) return runSingleDecodeTick(sch, live[0]);
+    const dist_scope = @import("../cluster/distributed.zig").scopeRequests(live[0..n]);
+    defer dist_scope.restore();
     var results: [MAX_SLOTS]DrafterStepResult = undefined;
     try modules.call("dspark_group_round", .{ gens[0..n], allocs[0..n], results[0..n] });
     for (live[0..n], gens[0..n], results[0..n]) |slot, gen, r| {
