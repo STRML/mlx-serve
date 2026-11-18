@@ -411,6 +411,25 @@ pub fn handleChatCompletions(
         },
     };
 
+    const return_token_ids = if (root.get("return_token_ids")) |v| v == .bool and v.bool else false;
+    const include_usage = if (root.get("stream_options")) |so| blk: {
+        if (so != .object) break :blk false;
+        const iu = so.object.get("include_usage") orelse break :blk false;
+        break :blk iu == .bool and iu.bool;
+    } else false;
+
+    if (return_token_ids and speech_ask != null) {
+        const message = if (is_stream)
+            "return_token_ids is not supported on spoken streams"
+        else
+            "return_token_ids is not supported on spoken replies";
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", message, 400);
+    }
+    if (return_token_ids and is_stream and !include_usage) {
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "return_token_ids on a stream needs stream_options.include_usage", 400);
+    }
+    stream.return_token_ids = return_token_ids;
+
     const sampled = resolveSampling(gen, root, config);
     const temperature = sampled.temperature;
     const top_p = sampled.top_p;
@@ -592,17 +611,6 @@ pub fn handleChatCompletions(
             }
         }
     }
-
-    stream.return_token_ids = if (root.get("return_token_ids")) |v| v == .bool and v.bool else false;
-
-    // Parse stream_options
-    const include_usage = if (root.get("stream_options")) |so| blk: {
-        if (so != .object) break :blk false;
-        if (so.object.get("include_usage")) |iu| {
-            break :blk iu == .bool and iu.bool;
-        }
-        break :blk false;
-    } else false;
 
     // Thinking opt-ins: the OpenAI-standard `reasoning_effort` string and the
     // vendor `enable_thinking` bool (Qwen/vLLM chat_template_kwargs family).
@@ -821,7 +829,7 @@ pub fn handleChatCompletions(
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
-    stream.usage_prompt_ids = prompt_ids;
+    if (return_token_ids) stream.usage_prompt_ids = prompt_ids;
     defer stream.usage_prompt_ids = &.{};
     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 

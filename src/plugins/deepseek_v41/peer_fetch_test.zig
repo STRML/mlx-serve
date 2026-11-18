@@ -1877,12 +1877,69 @@ fn usageOf(a: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Val
     return std.json.parseFromSlice(std.json.Value, a, body, .{});
 }
 
-fn usageReply(io: std.Io, node: *LiveNode, body: []const u8) !std.json.Parsed(std.json.Value) {
+fn postUsageChat(io: std.Io, node: *LiveNode, body: []const u8) !HttpReply {
     const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 50000 } };
-    var reply = try sendHttp(io, node, loopback, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\n", body);
+    return sendHttp(io, node, loopback, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\n", body);
+}
+
+fn usageReply(io: std.Io, node: *LiveNode, body: []const u8) !std.json.Parsed(std.json.Value) {
+    var reply = try postUsageChat(io, node, body);
     defer reply.deinit(testing.allocator);
     try expectStatus(body, 200, reply);
     return usageOf(testing.allocator, reply.body);
+}
+
+fn expectUsageRejection(io: std.Io, node: *LiveNode, body: []const u8, message: []const u8) !void {
+    var reply = try postUsageChat(io, node, body);
+    defer reply.deinit(testing.allocator);
+    try expectStatus(body, 400, reply);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, reply.body, .{});
+    defer parsed.deinit();
+    const err = parsed.value.object.get("error").?.object;
+    try testing.expectEqualStrings("invalid_request_error", err.get("type").?.string);
+    try testing.expectEqualStrings(message, err.get("message").?.string);
+    try testing.expect(std.mem.indexOf(u8, reply.raw, "\r\nx-mlx-request-id:") == null);
+}
+
+test "usage token ids: text stream without usage returns HTTP 400" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const node = try LiveNode.open(io, try fixture.v41ServableFiles(arena.allocator(), 7));
+    defer node.close();
+    const body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":4,\"stream\":true,\"return_token_ids\":true";
+    for ([_][]const u8{ "}", ",\"stream_options\":{\"include_usage\":false}}" }) |options| {
+        const request = try std.mem.concat(arena.allocator(), u8, &.{ body, options });
+        try expectUsageRejection(io, node, request, "return_token_ids on a stream needs stream_options.include_usage");
+    }
+}
+
+fn expectSpokenUsageRejection(body: []const u8, message: []const u8) !void {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const node = try LiveNode.open(io, try fixture.v41ServableFiles(arena.allocator(), 7));
+    defer node.close();
+    const facts = &node.entry.config.?.plugin.?.parsed.speech;
+    const original = facts.*;
+    defer facts.* = original;
+    facts.* = .{ .codebooks = 12, .mixed_start = 1, .sample_rate = 24000 };
+    try expectUsageRejection(io, node, body, message);
+}
+
+test "usage token ids: spoken stream with usage returns HTTP 400" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try expectSpokenUsageRejection(
+        \\{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"modalities":["audio"],"stream":true,"stream_options":{"include_usage":true},"return_token_ids":true}
+    , "return_token_ids is not supported on spoken streams");
+}
+
+test "usage token ids: nonstream spoken reply returns HTTP 400" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try expectSpokenUsageRejection(
+        \\{"messages":[{"role":"user","content":"hi"}],"max_tokens":4,"modalities":["audio"],"audio":{"format":"pcm16"},"return_token_ids":true}
+    , "return_token_ids is not supported on spoken replies");
 }
 
 test "usage token ids: opt-in usage carries the prompt and generated ids, and a default reply is unchanged" {
