@@ -161,11 +161,16 @@ const DiskSession = struct {
 
 const SessionLookup = union(enum) { none, hit: RamModuleHit, refused: requests.CacheExportOutcome };
 
+/// Which entry of a session an export builds: its prompt boundary, or the decode-end entry beside it.
+const Pick = enum { boundary, tail };
+
+const ExportOk = @FieldType(requests.CacheExportOutcome, "ok");
+
 pub var after_aux_import_for_test: ?*const fn () void = null;
 
-/// The entry a session's newest tip names (its decode-end tail when RAM holds one, `ramExportOfTip`), else the next
-/// boundary of the session that has a record, in RAM or on the SSD (`tipHit`). A session whose every tip is gone is
-/// `none`: the caller sees `session_not_found`.
+/// The prompt boundary a session's newest tip names, else the next boundary of the session that has a record, in RAM or
+/// on the SSD (`tipHit`). A session whose every tip is gone is `none`: the caller sees `session_not_found`. With
+/// `.tail`, the decode-end entry the session committed after its newest tip's boundary (`ramTailOfTip`), RAM only.
 fn sessionHit(
     allocator: std.mem.Allocator,
     sch: *const Scheduler,
@@ -175,12 +180,16 @@ fn sessionHit(
     session: u64,
     max_bytes: usize,
     holder: *DiskSession,
-    tails: bool,
+    pick: Pick,
 ) SessionLookup {
     var walk: prefix_cache_mod.HotPrefixCache.TipWalk = .{ .session = session };
+    if (pick == .tail) {
+        const tip = walk.next(hc) orelse return .none;
+        return if (hc.ramTailOfTip(tip, session)) |hit| .{ .hit = hit } else .none;
+    }
     while (walk.next(hc)) |tip| {
         const had_error = mlx.errorPending();
-        const found = tipHit(allocator, sch, cfg, hc, xfm, session, tip, max_bytes, holder, tails);
+        const found = tipHit(allocator, sch, cfg, hc, xfm, session, tip, max_bytes, holder);
         if (found != .none) return found;
         mlx.dropLatchedErrorUnless(had_error);
     }
@@ -201,10 +210,8 @@ fn tipHit(
     tip: prefix_cache_mod.HotPrefixCache.SessionTip,
     max_bytes: usize,
     holder: *DiskSession,
-    tails: bool,
 ) SessionLookup {
-    const ram = if (tails) hc.ramExportOfTip(tip, session) else hc.ramHitOfTip(tip, session);
-    if (ram) |hit| return .{ .hit = hit };
+    if (hc.ramHitOfTip(tip, session)) |hit| return .{ .hit = hit };
     const d = if (hc.disk) |*dd| dd else return .none;
     const ref = d.moduleByBoundary(tip.id, tip.n) orelse return .none;
     const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, tip.variant) orelse return .none;
@@ -250,7 +257,11 @@ fn tipHit(
     } };
 }
 
-/// A session export whose decode-end tail does not fit `max_bytes` sends the session's boundary instead.
+/// A session export sends the session's prompt boundary and, when it has one, the decode-end entry it committed after
+/// it, both in one bundle (`peer_wire.writeBundle`): the receiver keeps both, so a next prompt that extends the reply
+/// restores the tail and one that drops it restores the boundary whole. Anything that keeps the tail out (it is
+/// gone, over `max_bytes` with the boundary, refused by the transfer budget or memory, an export error) sends the
+/// boundary alone.
 fn exportWireModuleWithBudget(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -265,10 +276,33 @@ fn exportWireModuleWithBudget(
     max_bytes: usize,
     admit_transfer_budget: bool,
 ) !requests.CacheExportOutcome {
-    var sent_tail = false;
-    const out = try exportWireModuleOnce(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, session, max_bytes, admit_transfer_budget, true, &sent_tail);
-    if (out != .too_large or !sent_tail) return out;
-    return exportWireModuleOnce(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, session, max_bytes, admit_transfer_budget, false, &sent_tail);
+    var tail_from: usize = 0;
+    const base = try exportWireModuleOnce(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, session, max_bytes, admit_transfer_budget, .boundary, &tail_from);
+    if (session == 0 or base != .ok) return base;
+    const tail = exportWireModuleOnce(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, session, max_bytes, admit_transfer_budget, .tail, &tail_from) catch return base;
+    if (tail != .ok) return base;
+    return .{ .ok = bundleOrBoundary(allocator, base.ok, tail.ok, tail_from, max_bytes, admit_transfer_budget) };
+}
+
+/// The bundle of `base` and `tail` when it fits `max_bytes` and the transfer budget, else `base` alone. Takes both
+/// results' bytes and reservations; the returned bytes carry a reservation of exactly their length.
+fn bundleOrBoundary(allocator: std.mem.Allocator, base: ExportOk, tail: ExportOk, tail_from: usize, max_bytes: usize, admit: bool) ExportOk {
+    const total = peer_wire.bundleSize(&.{ base.bytes.len, tail.bytes.len });
+    const extra: u64 = @intCast(total - base.bytes.len - tail.bytes.len);
+    const reserved = total <= max_bytes and (!admit or http_server.reserveCacheExportBytes(extra));
+    const bytes = (if (reserved) allocator.alloc(u8, total) catch null else null) orelse {
+        if (reserved and admit) http_server.releaseCacheExportBytes(extra);
+        if (admit) http_server.releaseCacheExportBytes(@intCast(tail.bytes.len));
+        allocator.free(tail.bytes);
+        return base;
+    };
+    peer_wire.writeBundle(bytes, &.{ .{ .tail_from = 0, .body = base.bytes }, .{ .tail_from = tail_from, .body = tail.bytes } });
+    // The reservations of the two members and the bundle header add up to `total`, released with the bytes.
+    allocator.free(base.bytes);
+    allocator.free(tail.bytes);
+    const peak = if (admit) @max(base.planned_peak -| base.bytes.len, tail.planned_peak -| tail.bytes.len) +| total else 0;
+    log.info("[hot-cache] peer module export: bundle of {d} + {d} tokens, bytes={d}\n", .{ base.n, tail.n, total });
+    return .{ .bytes = bytes, .n = tail.n, .export_ms = base.export_ms + tail.export_ms, .planned_peak = peak };
 }
 
 fn exportWireModuleOnce(
@@ -284,8 +318,8 @@ fn exportWireModuleOnce(
     session: u64,
     max_bytes: usize,
     admit_transfer_budget: bool,
-    tails: bool,
-    sent_tail: *bool,
+    pick: Pick,
+    tail_from: *usize,
 ) !requests.CacheExportOutcome {
     const t0 = io_util.nowUsMonotonic(io);
     const had_error = mlx.errorPending();
@@ -303,7 +337,7 @@ fn exportWireModuleOnce(
 
     var from_disk: DiskSession = .{};
     defer from_disk.release();
-    const hit = if (session != 0) switch (sessionHit(allocator, sch, cfg, hc, xfm, session, max_bytes, &from_disk, tails)) {
+    const hit = if (session != 0) switch (sessionHit(allocator, sch, cfg, hc, xfm, session, max_bytes, &from_disk, pick)) {
         .hit => |h| h,
         .none => return .not_found,
         .refused => |outcome| return outcome,
@@ -312,7 +346,7 @@ fn exportWireModuleOnce(
         break :blk hc.findRamModule(by_prompt, prompt_ids, has_tools, quant_config) orelse return .not_found;
     };
     const binding = hit.payload.binding;
-    sent_tail.* = hit.payload.tail_from > 0;
+    tail_from.* = hit.payload.tail_from;
 
     var info: plugin_abi.AuxSnapshotInfo = .{};
     if (!plugin_driver.auxDescribe(binding.xfm, hit.payload.snapshot, &info).isOk() or
@@ -423,12 +457,39 @@ fn importArraysRefusal() requests.CacheImportRefusal {
     return if (mlx.latchedErrorIs(mlx.mlxErrorIsMemory)) .no_memory else .import_arrays;
 }
 
+/// One envelope, or a session export's bundle: its boundary first, then its decode-end entry, committed as a tail of
+/// the same session. The tail goes in only when the boundary did or the receiver already holds it (`stale`); the
+/// outcome is the longest member committed, else the boundary's refusal.
 pub fn importWireModule(
     allocator: std.mem.Allocator,
     io: std.Io,
     sch: *Scheduler,
     lm: *LoadedModel,
     body: []const u8,
+) !requests.CacheImportOutcome {
+    if (!peer_wire.isBundle(body)) return importEnvelope(allocator, io, sch, lm, body, 0);
+    var members: [peer_wire.MAX_BUNDLE_MEMBERS]peer_wire.BundleMember = undefined;
+    const list = peer_wire.readBundle(body, &members) catch |err| {
+        const refusal = try mapDecodeError(err);
+        logRefusal(refusal, 0);
+        return .{ .refused = refusal };
+    };
+    var best = try importEnvelope(allocator, io, sch, lm, list[0].body, 0);
+    if (best == .refused and best.refused != .stale) return best;
+    for (list[1..]) |m| {
+        const out = try importEnvelope(allocator, io, sch, lm, m.body, @intCast(m.tail_from));
+        if (out == .ok and (best != .ok or out.ok.n > best.ok.n)) best = out;
+    }
+    return best;
+}
+
+fn importEnvelope(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sch: *Scheduler,
+    lm: *LoadedModel,
+    body: []const u8,
+    tail_from: usize,
 ) !requests.CacheImportOutcome {
     const t0 = io_util.nowUsMonotonic(io);
     const had_error = mlx.errorPending();
@@ -453,6 +514,10 @@ pub fn importWireModule(
     };
     defer env.deinit();
     const t_decode = io_util.nowUsMonotonic(io);
+    if (tail_from >= env.ids.len and tail_from > 0) {
+        logRefusal(.bad_envelope, env.ids.len);
+        return .{ .refused = .bad_envelope };
+    }
 
     const xfm = lm.transformer orelse {
         logRefusal(.unsupported_model, env.ids.len);
@@ -574,7 +639,9 @@ pub fn importWireModule(
         return .{ .refused = .describe_mismatch };
     }
 
-    const committed = hc.commitModule(
+    // An imported tail binds to the session's tip, which the bundle's boundary member just committed or claimed.
+    const boundary_seq: u64 = if (tail_from > 0) (if (hc.sessionTip(env.session)) |tip| tip.seq else 0) else 0;
+    const committed = hc.commitModuleTail(
         binding,
         snapshot,
         env.ids,
@@ -584,6 +651,8 @@ pub fn importWireModule(
         env.quant_config,
         env.cache_key,
         env.session,
+        tail_from,
+        boundary_seq,
     ) catch |err| {
         publishHotCacheResidency(sch);
         return err;

@@ -84,7 +84,7 @@ fn heldTokens(a: std.mem.Allocator, prompt: []const u32, forwarded: []const u32,
 /// A module-owned slot's state where decode stopped, committed beside its prompt boundary so the next turn resumes
 /// after the generated tail. A plugin captures at a prompt's last token: the slot is handed its own tokens and one
 /// more as a prompt it already stands at the end of, and refuses when it stands elsewhere.
-fn commitModuleDecodeEnd(sch: *Scheduler, slot: *Slot, gen: *Generator, binding: prefix_cache_mod.ModuleBinding, hc: *prefix_cache_mod.HotPrefixCache) void {
+fn commitModuleDecodeEnd(sch: *Scheduler, slot: *Slot, gen: *Generator, binding: prefix_cache_mod.ModuleBinding, hc: *prefix_cache_mod.HotPrefixCache, boundary_seq: u64) void {
     const forwarded = gen.generated_ids.items[0 .. gen.generated_ids.items.len - gen.unforwarded_tail];
     if (forwarded.len == 0) return;
     // A plain pipelined step leaves its stop and lookahead forwarded; a draft round leaves neither.
@@ -104,7 +104,7 @@ fn commitModuleDecodeEnd(sch: *Scheduler, slot: *Slot, gen: *Generator, binding:
             plugin_driver.auxFree(binding.xfm, snap);
             return;
         }
-        const st = hc.commitModuleTail(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, slot.session, slot.full_prompt.len) catch |err| {
+        const st = hc.commitModuleTail(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, slot.session, slot.full_prompt.len, boundary_seq) catch |err| {
             log.warn("[hot-cache] module decode-end commit failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -174,7 +174,8 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             log.warn("[hot-cache] module commit failed: {s}\n", .{@errorName(err)});
             return;
         };
-        commitModuleDecodeEnd(sch, slot, gen, binding, hc);
+        // The boundary commit just above set `last_session_seq`; the tail binds to that boundary only.
+        commitModuleDecodeEnd(sch, slot, gen, binding, hc, hc.last_session_seq);
         publishHotCacheResidency(sch);
         return;
     };
