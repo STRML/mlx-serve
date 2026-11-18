@@ -1350,8 +1350,8 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC = wire.MAGIC;
-/// 14: TP capture carries the request and the reserved snapshot id.
-const VERSION: i32 = 14;
+/// 15: TP snapshot import carries the source generation.
+const VERSION: i32 = 15;
 pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
 pub const OP_STOP = wire.OP_STOP;
@@ -2745,8 +2745,12 @@ fn sendAll(link: *const Link, header: Msg, follow: ?Msg) void {
     }
 }
 
-/// Host: the snapshot `id` it read from disk, as its ids and then `dsv41.tpLoadPlan`'s tensors in order.
-fn dsv41TpLoad(id: u64, ids: []const u32, tensors: []const mlx.mlx_array) anyerror!void {
+fn tpLoadHeader(id: u64, source_gen: u64, n: usize, tensors: usize) Msg {
+    return .{ OP_DSV41_TP_LOAD, @intCast(id & 0x7fffffff), @intCast(id >> 31), @intCast(n & 0x7fffffff), @intCast(n >> 31), @intCast(tensors), @intCast(source_gen & 0x7fffffff), @intCast(source_gen >> 31) };
+}
+
+/// Host: the snapshot's ids, then the cache tensors of `dsv41.tpLoadPlan` in order.
+fn dsv41TpLoad(id: u64, source_gen: u64, ids: []const u32, tensors: []const mlx.mlx_array) anyerror!void {
     const link = try tpLeader(true);
     cluster().tp_link.?.state.?.watchdog.progress(@intCast(crt.monotonicMs()));
     const a = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .int32);
@@ -2758,7 +2762,7 @@ fn dsv41TpLoad(id: u64, ids: []const u32, tensors: []const mlx.mlx_array) anyerr
     // One worker after another, each its whole snapshot.
     for (1..link.size) |k| {
         const dst: u32 = @intCast(k);
-        try sendMsg(link, .{ OP_DSV41_TP_LOAD, @intCast(id & 0x7fffffff), @intCast(id >> 31), @intCast(ids.len & 0x7fffffff), @intCast(ids.len >> 31), @intCast(tensors.len), 0, 0 }, dst);
+        try sendMsg(link, tpLoadHeader(id, source_gen, ids.len, tensors.len), dst);
         try sendNow(link, a, dst);
         for (tensors) |t| try sendNow(link, t, dst);
     }
@@ -3109,6 +3113,8 @@ fn dsv41StepLoop(io: std.Io, allocator: std.mem.Allocator, link: *const Link, m:
                 try dsv41_mod.tpWorkerSnap(m, allocator, &parked, &snaps, op, joined(msg[2], msg[3]), joined(msg[4], msg[5]), evidence);
             },
             OP_DSV41_TP_LOAD => {
+                if (msg[6] < 0 or msg[7] < 0) return error.DistBadMessage;
+                const source_gen = joined(msg[6], msg[7]);
                 const n: usize = @intCast(joined(msg[3], msg[4]));
                 const sent = try transport.recvNow(&.{@intCast(n)}, .int32, 0);
                 defer _ = mlx.mlx_array_free(sent);
@@ -3126,7 +3132,7 @@ fn dsv41StepLoop(io: std.Io, allocator: std.mem.Allocator, link: *const Link, m:
                     x.* = try transport.recvNow(shape[0..spec.rank()], spec.dtype, 0);
                     got += 1;
                 }
-                try dsv41_mod.tpWorkerLoad(m, allocator, &snaps, joined(msg[1], msg[2]), ids, xs);
+                try dsv41_mod.tpWorkerLoad(m, allocator, &snaps, joined(msg[1], msg[2]), source_gen, ids, xs);
             },
             OP_DSV41_TP_PREFILL => {
                 for (msg[1..]) |word| if (word < 0) return error.DistBadMessage;
@@ -3685,7 +3691,7 @@ test "dist bell READY matrix 14: bell EOF interrupts cold load promptly" {
 }
 
 test "dist bell READY matrix 15: workers without the current protocol are refused at hello" {
-    for ([_]i32{ 10, 11, 12, 13 }) |old| try std.testing.expectError(error.DistProtocolMismatch, Hello.parse(.{ MAGIC, old, 0, 0, 0, 0, 0, 0 }));
+    for ([_]i32{ 10, 11, 12, 13, 14 }) |old| try std.testing.expectError(error.DistProtocolMismatch, Hello.parse(.{ MAGIC, old, 0, 0, 0, 0, 0, 0 }));
     _ = try Hello.parse(.{ MAGIC, VERSION, 0, 0, 0, 0, 0, 0 });
 }
 
@@ -7255,26 +7261,36 @@ const TestTpCacheEvidence = struct {
         const aux = v41.table.cache.aux.?;
 
         const held: [4079]u32 = @splat(1);
-        try t.expect(aux.begin_prompt(&plugin, 1, .of(&held), .{}, 4078, true).isOk());
-        var checkpoint: @import("../../../abi/plugin.zig").Handle = null;
-        try t.expect(aux.snapshot(&plugin, 1, &checkpoint).isOk());
-        const snap_ptr: *dsv41_mod.Snap = @ptrCast(@alignCast(checkpoint orelse return error.TestMissingSnapshot));
-        defer aux.free(&plugin, checkpoint);
-        try t.expectEqual(@as(u64, 17), snap_ptr.tp_id);
+        var frames: [15]Msg = undefined;
+        for ([_]u64{ 12, 17 }, 0..) |destination, i| {
+            _ = log.setRequestId(73 + 2 * @as(u64, i));
+            leader.dec_state.?.request_id = log.requestId();
+            try t.expect(aux.begin_prompt(&plugin, 1, .of(&held), .{}, 4078, true).isOk());
+            var checkpoint: @import("../../../abi/plugin.zig").Handle = null;
+            try t.expect(aux.snapshot(&plugin, 1, &checkpoint).isOk());
+            const snap_ptr: *dsv41_mod.Snap = @ptrCast(@alignCast(checkpoint orelse return error.TestMissingSnapshot));
+            defer aux.free(&plugin, checkpoint);
+            try t.expectEqual(@as(u64, 17), snap_ptr.tp_id);
+            try t.expectEqual(leader.state_gen, snap_ptr.gen);
 
-        _ = log.setRequestId(74);
-        try t.expect(aux.restore_at(&plugin, 1, checkpoint, 4078).isOk());
-        const restored = produced.restored orelse return error.TestMissingRestore;
-        const captured = produced.captured orelse return error.TestMissingCapture;
-        const frames = [_]Msg{
-            captured[0],
-            captured[1],
-            produced.taken orelse return error.TestMissingTake,
-            produced.freed orelse return error.TestMissingFree,
-            restored[0],
-            restored[1],
-            .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 },
-        };
+            _ = log.setRequestId(74 + 2 * @as(u64, i));
+            leader.gens = destination - 1;
+            try t.expect(aux.restore_at(&plugin, 1, checkpoint, 4078).isOk());
+            const restored = produced.restored orelse return error.TestMissingRestore;
+            const captured = produced.captured orelse return error.TestMissingCapture;
+            frames[i * 7 ..][0..7].* = .{
+                captured[0],
+                captured[1],
+                produced.taken orelse return error.TestMissingTake,
+                produced.freed orelse return error.TestMissingFree,
+                restored[0],
+                restored[1],
+                tpSnapHeader(.free, 17, 0, .{}),
+            };
+            // Force the fixture to reuse its freed ID across two generations.
+            plugin.tp_ids.last = 16;
+        }
+        frames[14] = .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 };
         for (1..4) |rank_usize| {
             const rank: u32 = @intCast(rank_usize);
             var follower = model(rank);
@@ -7362,15 +7378,21 @@ test "request id: each TP rank logs its own free and restore positions" {
     if (failure) |err| return err;
     try t.expectEqualStrings(
         "[hot-cache] rank=0 free req=chatcmpl-0000000000000000-73 gen=9 pos=4078\n" ++
-            "[hot-cache] rank=0 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4078\n" ++
+            "[hot-cache] rank=0 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4078 src_gen=9\n" ++
             "[hot-cache] rank=1 free req=chatcmpl-0000000000000000-73 gen=9 pos=4080\n" ++
-            "[hot-cache] rank=1 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4078\n" ++
+            "[hot-cache] rank=1 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4078 src_gen=9\n" ++
             "[hot-cache] rank=2 free req=chatcmpl-0000000000000000-73 gen=9 pos=4078\n" ++
-            "[hot-cache] rank=2 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4079\n" ++
+            "[hot-cache] rank=2 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4079 src_gen=9\n" ++
             "[hot-cache] rank=3 free req=chatcmpl-0000000000000000-73 gen=9 pos=4078\n" ++
-            "[hot-cache] rank=3 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4078\n",
+            "[hot-cache] rank=3 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4078 src_gen=9\n",
         output,
     );
+}
+
+test "request id: TP snapshot import header preserves both halves of the source generation" {
+    const source_gen: u64 = (1 << 35) + 9;
+    const header = tpLoadHeader(17, source_gen, 4078, 80);
+    try std.testing.expectEqual(source_gen, joined(header[6], header[7]));
 }
 
 test "request id: TP cache metadata preserves the full leader nonce and id" {
@@ -7385,19 +7407,28 @@ test "request id: TP cache metadata preserves the full leader nonce and id" {
     try t.expectEqualStrings("chatcmpl-89abcdef01234567-18364758544493064720", tag);
 }
 
-test "request id: TP checkpoint logs each position before settle and restores the same snapshot" {
+test "request id: TP checkpoint logs each position before settle and pairs reused snapshot IDs with their source generations" {
     const t = std.testing;
     var failure: ?anyerror = null;
     const output = try @import("../../../sdk/testing/log_capture.zig").capture(t.allocator, TestTpCacheEvidence.captureCheckpoint, .{&failure});
     defer t.allocator.free(output);
     if (failure) |err| return err;
-    try t.expectEqual(@as(usize, 4), std.mem.count(u8, output, " capture req="));
+    try t.expectEqual(@as(usize, 8), std.mem.count(u8, output, " capture req="));
     for (0..4) |rank| {
-        var buf: [160]u8 = undefined;
-        const capture_line = try std.fmt.bufPrint(&buf, "[hot-cache] rank={d} capture req=chatcmpl-0000000000000000-73 snap=17 pre_pos={d} snap_pos=4078\n", .{ rank, if (rank == 1) @as(usize, 4080) else 4078 });
-        const after_capture = output[(std.mem.indexOf(u8, output, capture_line) orelse return error.TestMissingCaptureLine) + capture_line.len ..];
-        const restore_line = try std.fmt.bufPrint(&buf, "[hot-cache] rank={d} restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4078\n", .{rank});
-        try t.expect(std.mem.indexOf(u8, after_capture, restore_line) != null);
+        var remaining = output;
+        for ([_]u64{ 9, 12 }, [_]u64{ 12, 17 }, 0..) |source, destination, i| {
+            var buf: [160]u8 = undefined;
+            const pre_pos: usize = if (rank == 1 and i == 0) 4080 else 4078;
+            const capture_line = try std.fmt.bufPrint(&buf, "[hot-cache] rank={d} capture req=chatcmpl-0000000000000000-{d} snap=17 gen={d} pre_pos={d} snap_pos=4078\n", .{ rank, 73 + 2 * i, source, pre_pos });
+            const capture_at = std.mem.indexOf(u8, remaining, capture_line) orelse {
+                std.debug.print("missing {s}in {s}", .{ capture_line, output });
+                return error.TestMissingCaptureLine;
+            };
+            remaining = remaining[capture_at + capture_line.len ..];
+            const restore_line = try std.fmt.bufPrint(&buf, "[hot-cache] rank={d} restore req=chatcmpl-0000000000000000-{d} gen={d} snap=17 snap_pos=4078 src_gen={d}\n", .{ rank, 74 + 2 * i, destination, source });
+            const restore_at = std.mem.indexOf(u8, remaining, restore_line) orelse return error.TestMissingRestoreLine;
+            remaining = remaining[restore_at + restore_line.len ..];
+        }
     }
 }
 

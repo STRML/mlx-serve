@@ -1887,9 +1887,9 @@ const LeaderCacheRig = struct {
         }
     }
 
-    fn load(id: u64, ids: []const u32, xs: []const mlx.mlx_array) anyerror!void {
+    fn load(id: u64, source_gen: u64, ids: []const u32, xs: []const mlx.mlx_array) anyerror!void {
         const self = active;
-        for (self.models, &self.snaps) |m, *s| try dsv41.tpWorkerLoad(m, testing.allocator, s, id, ids, xs);
+        for (self.models, &self.snaps) |m, *s| try dsv41.tpWorkerLoad(m, testing.allocator, s, id, source_gen, ids, xs);
         self.loads += 1;
     }
 

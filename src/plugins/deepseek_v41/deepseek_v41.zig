@@ -1732,8 +1732,8 @@ const ClusterHooksState = struct {
     tp_free: ?*const fn (gen: u64, owner: log.RequestTag) void = null,
     /// Rank zero's wide TP1 chunk: incremental latent state before another tensor step.
     tp_prefill: ?*const fn (gen: u64, p0: usize, n: usize, capture: bool, tensors: []const A, stages: usize) anyerror!void = null,
-    /// Tensor parallel, rank 0: a snapshot read from disk, as the cache tensors of `tpLoadPlan` in order.
-    tp_load: ?*const fn (id: u64, ids: []const u32, tensors: []const A) anyerror!void = null,
+    /// Tensor parallel, rank 0: the cache tensors of `tpLoadPlan` for a snapshot the current group lacks.
+    tp_load: ?*const fn (id: u64, source_gen: u64, ids: []const u32, tensors: []const A) anyerror!void = null,
     /// Tensor parallel, rank 0: a snapshot moved, appeared or went (`SnapOp`).
     tp_snap: ?*const fn (op: SnapOp, a: u64, b: u64, evidence: SnapEvidence) void = null,
     with_slot: ?*const fn (u32, *anyopaque, *const fn (*anyopaque) anyerror!A) anyerror!A = null,
@@ -6189,14 +6189,14 @@ pub fn freeArrays(gpa: std.mem.Allocator, xs: []const A) void {
     gpa.free(xs);
 }
 
-/// Rank 0 read `sn` from disk: the other ranks get its tensors under its id.
+/// The other ranks get the tensors under their new wire id, retaining the local snapshot's generation.
 pub fn tpLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap) !void {
     const t = m.tp orelse return;
     if (t.rank != 0) return;
     const load = clusterHooks().tp_load orelse return error.DsvTpNotJoined;
     const xs = try tpLoadTensors(m, gpa, sn);
     defer freeArrays(gpa, xs);
-    try load(sn.tp_id, sn.ids, xs);
+    try load(sn.tp_id, sn.gen, sn.ids, xs);
 }
 
 /// Makes `sn` known to the other ranks of the current group: one taken before the group formed (TP1, or an earlier
@@ -6210,8 +6210,9 @@ pub fn tpEnsure(m: *const Dsv41Model, gpa: std.mem.Allocator, ids: *TpIds, sn: *
 }
 
 /// Tensor-parallel rank past 0: rank 0's snapshot `id` read from disk, as `tpLoadPlan`'s tensors in order.
-pub fn tpWorkerLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, id: u64, ids: []const u32, tensors: []const A) !void {
-    return importPlan(m, gpa, snaps, id, ids, tensors, try tpLoadPlan(m, ids.len));
+pub fn tpWorkerLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, id: u64, source_gen: u64, ids: []const u32, tensors: []const A) !void {
+    try importPlan(m, gpa, snaps, id, ids, tensors, try tpLoadPlan(m, ids.len));
+    snaps.getPtr(id).?.gen = source_gen;
 }
 
 /// Snapshot `id` rebuilt from `p`'s tensors in order, into `snaps` under that id.
@@ -6249,15 +6250,15 @@ pub fn tpCapture(m: *const Dsv41Model, st: *State, gen: u64, ids: ?*TpIds) void 
         if (request.id != 0) {
             sn.tp_id = counter.next();
             evidence = .{ .request = request, .snapshot_id = sn.tp_id };
-            noteTpCapture(tp.rank, evidence, st.n, sn.n);
+            noteTpCapture(tp.rank, evidence, gen, st.n, sn.n);
         }
     }
     if (clusterHooks().tp_snap) |f| f(.capture, gen, sn.n, evidence);
 }
 
-fn noteTpCapture(rank: u32, evidence: SnapEvidence, pre_pos: usize, snap_pos: u64) void {
+fn noteTpCapture(rank: u32, evidence: SnapEvidence, gen: u64, pre_pos: usize, snap_pos: u64) void {
     if (evidence.request.id == 0) return;
-    log.info("[hot-cache] rank={d} capture req={f} snap={d} pre_pos={d} snap_pos={d}\n", .{ rank, evidence.request, evidence.snapshot_id, pre_pos, snap_pos });
+    log.info("[hot-cache] rank={d} capture req={f} snap={d} gen={d} pre_pos={d} snap_pos={d}\n", .{ rank, evidence.request, evidence.snapshot_id, gen, pre_pos, snap_pos });
 }
 
 pub fn tpRestore(m: *const Dsv41Model, sn: *const Snap, gen: u64, request: log.RequestTag) void {
@@ -6269,7 +6270,7 @@ pub fn tpRestore(m: *const Dsv41Model, sn: *const Snap, gen: u64, request: log.R
 
 fn noteTpRestore(rank: u32, sn: *const Snap, id: u64, gen: u64, request: log.RequestTag) void {
     if (request.id == 0) return;
-    log.info("[hot-cache] rank={d} restore req={f} gen={d} snap={d} snap_pos={d}\n", .{ rank, request, gen, id, sn.n });
+    log.info("[hot-cache] rank={d} restore req={f} gen={d} snap={d} snap_pos={d} src_gen={d}\n", .{ rank, request, gen, id, sn.n, sn.gen });
 }
 
 /// A tensor rank's halves of rank 0's prefix-cache snapshots, by the id rank 0 gave each.
@@ -6286,7 +6287,7 @@ pub fn tpWorkerSnap(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, sna
     switch (op) {
         .capture => {
             const st = try tpStateOf(m, parked, a);
-            if (m.tp) |tp| noteTpCapture(tp.rank, evidence, st.n, b);
+            if (m.tp) |tp| noteTpCapture(tp.rank, evidence, a, st.n, b);
             try followVerifyOf(m, st, b);
             if (st.n != b) return error.DistPeerDiverged;
             st.snap_at = b;

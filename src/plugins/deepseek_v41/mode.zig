@@ -108,7 +108,7 @@ pub const LoneGroup = struct {
     fn step(_: []const u32, _: usize, _: bool, _: bool, _: dsv41.VerifyOpts, _: u64, _: ?mlx.mlx_array) anyerror!void {}
     fn batch(_: []const u64, _: []const usize, _: []const []const u32, _: bool) anyerror!void {}
     fn draft(_: []const u64, _: []const usize, _: []const u32) anyerror!void {}
-    fn load(_: u64, _: []const u32, _: []const mlx.mlx_array) anyerror!void {}
+    fn load(_: u64, _: u64, _: []const u32, _: []const mlx.mlx_array) anyerror!void {}
     fn prefill(_: u64, _: usize, _: usize, _: bool, _: []const mlx.mlx_array, _: usize) anyerror!void {}
     fn free(_: u64, _: log.RequestTag) void {}
     fn snap(_: dsv41.SnapOp, _: u64, _: u64, _: dsv41.SnapEvidence) void {}

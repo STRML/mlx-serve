@@ -817,10 +817,12 @@ test "dsv41 tensor parallel: a snapshot read from disk reaches the worker as its
     var snaps: dsv41.Snaps = .init(gpa);
     defer dsv41.dropSnaps(&snaps, gpa);
     // Rank 0's import from disk, then what it sends the worker and what the worker rebuilds from that.
-    try dsv41.tpWorkerLoad(m, gpa, &snaps, 1, ids, disk);
+    try dsv41.tpWorkerLoad(m, gpa, &snaps, 1, 0, ids, disk);
+    try std.testing.expectEqual(@as(u64, 0), snaps.get(1).?.gen);
     const sent = try dsv41.tpLoadTensors(m, gpa, snaps.getPtr(1).?);
     defer dsv41.freeArrays(gpa, sent);
-    try dsv41.tpWorkerLoad(m, gpa, &snaps, 2, ids, sent);
+    try dsv41.tpWorkerLoad(m, gpa, &snaps, 2, 73, ids, sent);
+    try std.testing.expectEqual(@as(u64, 73), snaps.get(2).?.gen);
     const back = try dsv41.tpLoadTensors(m, gpa, snaps.getPtr(2).?);
     defer dsv41.freeArrays(gpa, back);
     for (disk, sent, back) |a, b, c| {
@@ -828,7 +830,7 @@ test "dsv41 tensor parallel: a snapshot read from disk reaches the worker as its
         try expectSameArray(gpa, a, c);
     }
     try std.testing.expectEqual(@as(usize, n), snaps.get(2).?.n);
-    try std.testing.expectError(error.DistPeerDiverged, dsv41.tpWorkerLoad(m, gpa, &snaps, 3, ids, sent[1..]));
+    try std.testing.expectError(error.DistPeerDiverged, dsv41.tpWorkerLoad(m, gpa, &snaps, 3, 73, ids, sent[1..]));
 }
 
 /// A snapshot as the SSD import builds it, held in `snaps` under `id`; `sc` owns the arrays it was built from.
@@ -845,18 +847,20 @@ fn importedSnap(sc: *dsv41.Scope, m: *dsv41.Dsv41Model, snaps: *dsv41.Snaps, id:
     const ids = try gpa.alloc(u32, n);
     defer gpa.free(ids);
     @memset(ids, 3);
-    try dsv41.tpWorkerLoad(m, gpa, snaps, id, ids, disk);
+    try dsv41.tpWorkerLoad(m, gpa, snaps, id, 0, ids, disk);
     return snaps.getPtr(id).?;
 }
 
 const TpHook = struct {
     var loads: usize = 0;
     var last: u64 = 0;
+    var last_gen: u64 = 0;
     var fail = false;
-    fn load(id: u64, _: []const u32, _: []const A) anyerror!void {
+    fn load(id: u64, source_gen: u64, _: []const u32, _: []const A) anyerror!void {
         if (fail) return error.DistPeerDiverged;
         loads += 1;
         last = id;
+        last_gen = source_gen;
     }
 };
 
@@ -879,9 +883,11 @@ test "dsv41 tensor parallel: a snapshot the current group lacks reaches the othe
 
     // Taken under TP1 (id 0), the group forms afterwards: one load, then the snapshot is the group's own.
     sn.tp_id = 0;
+    sn.gen = 73;
     ids.formed();
     try dsv41.tpEnsure(m, gpa, &ids, sn);
     try std.testing.expectEqual(@as(usize, 1), TpHook.loads);
+    try std.testing.expectEqual(@as(u64, 73), TpHook.last_gen);
     try std.testing.expect(sn.tp_id != 0 and TpHook.last == sn.tp_id and !ids.stale(sn.tp_id));
     try dsv41.tpEnsure(m, gpa, &ids, sn);
     try std.testing.expectEqual(@as(usize, 1), TpHook.loads);
