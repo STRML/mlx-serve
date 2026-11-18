@@ -3782,8 +3782,7 @@ fn attnOutSum(sc: *Scope, m: *Dsv41Model, y: A, prof: ?*Profile) !A {
 
 fn profileCompiledAttnOut(prof: ?*Profile, m: *const Dsv41Model, heads: A, out: A) !void {
     const p = prof orelse return;
-    // The compiled short-width region exposes only wo_b's result.
-    try profileMark(p, .wo_b, &.{out});
+    try profileMark(p, .wo_ab_fused, &.{out});
     const groups = m.cfg.dsv4_o_groups;
     const rank = m.cfg.dsv4_o_lora_rank;
     const rows = dim(out, 0);
@@ -6263,7 +6262,15 @@ fn exchange(m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, p0: usize,
     const xchg = clusterHooks().pair_exchange orelse return error.DsvPairNotJoined;
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    const back = try xchg(try sc.concat(sp.xs, 0), try sc.concat(sp.pres, 0), p0, snap, verify);
+    const x = try sc.concat(sp.xs, 0);
+    const pre = try sc.concat(sp.pres, 0);
+    const start = if (sp.prof != null) blk: {
+        // Finish the local payload graph before timing the round trip.
+        try evalAll(&.{ x, pre });
+        break :blk monoUs();
+    } else 0;
+    const back = try xchg(x, pre, p0, snap, verify);
+    if (sp.prof) |p| p.remoteWait(start, monoUs());
     _ = try sc.keep(back[0]);
     _ = try sc.keep(back[1]);
     for (0..sp.xs.len) |k| {
@@ -12110,6 +12117,72 @@ test "dsv41 pair: a layer split refuses an MLX pack's streamed experts by name b
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.Dsv41PairStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 4, .hi = 8, .worker = false }, .streamed_experts = true }));
+}
+
+fn capturePrefillProfile(m: *Dsv41Model, ids: []const u32) ![]u8 {
+    var failure: ?anyerror = null;
+    m.profile_prefill = true;
+    const text = try @import("../../sdk/testing/log_capture.zig").capture(testing.allocator, struct {
+        fn run(model: *Dsv41Model, prompt: []const u32, err: *?anyerror) void {
+            const out = prefill(model, testing.allocator, prompt, null) catch |e| {
+                err.* = e;
+                return;
+            };
+            _ = mlx.mlx_array_free(out);
+        }
+    }.run, .{ m, ids, &failure });
+    errdefer testing.allocator.free(text);
+    if (failure) |err| return err;
+    return text;
+}
+
+test "dsv41 prefill profile: short compiled prompts report both projections as one stage" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try @import("decode/fixture.zig").Fixture.initWhole(gpa, .{ .layers = 1, .vocab = 16 });
+    defer fx.deinit();
+    fx.m.dec.deinit();
+    const prompt: [region_rows + 1]u32 = @splat(1);
+
+    const compiled = try capturePrefillProfile(fx.m, prompt[0..4]);
+    defer gpa.free(compiled);
+    try testing.expect(std.mem.indexOf(u8, compiled, " wo_ab_fused=") != null);
+    try testing.expect(std.mem.indexOf(u8, compiled, " wo_a=") == null);
+    try testing.expect(std.mem.indexOf(u8, compiled, " wo_b=") == null);
+
+    const unfused = try capturePrefillProfile(fx.m, &prompt);
+    defer gpa.free(unfused);
+    try testing.expect(std.mem.indexOf(u8, unfused, " wo_ab_fused=") == null);
+    try testing.expect(std.mem.indexOf(u8, unfused, " wo_a=") != null);
+    try testing.expect(std.mem.indexOf(u8, unfused, " wo_b=") != null);
+}
+
+test "dsv41 prefill profile: a layer split reports the round trip to its unprofiled worker" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const Fixture = @import("decode/fixture.zig").Fixture;
+    const host = try Fixture.initWhole(gpa, .{ .vocab = 16 });
+    defer host.deinit();
+    const worker = try Fixture.init(gpa, .{ .lo = 0, .hi = 1, .ctx = 0, .experts = 8, .experts_fp4 = true });
+    defer worker.deinit();
+    const Xchg = struct {
+        var w: *Dsv41Model = undefined;
+        fn call(x: A, pre: A, p0: usize, snap: bool, verify: bool) anyerror![2]A {
+            return workerStep(w, testing.allocator, x, pre, p0, snap, verify);
+        }
+    };
+    host.m.pair = .{ .lo = 0, .hi = 1, .worker = false };
+    Xchg.w = worker.m;
+    const hooks = clusterHooks();
+    const previous = hooks.pair_exchange;
+    hooks.pair_exchange = &Xchg.call;
+    defer hooks.pair_exchange = previous;
+
+    const text = try capturePrefillProfile(host.m, &.{ 1, 2, 3, 4 });
+    defer gpa.free(text);
+    try testing.expectEqual(@as(usize, 4), worker.state().n);
+    try testing.expect(std.mem.indexOf(u8, text, " remote_wait=") != null);
+    try testing.expect(std.mem.indexOf(u8, text, " workers=unprofiled") != null);
 }
 
 test "request id: dsv41 CED prefill logs the current request" {

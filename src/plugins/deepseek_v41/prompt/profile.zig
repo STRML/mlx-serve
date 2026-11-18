@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Stage = enum { setup, engram, hc, attn_in, q, compress, indexer, core, attn_out_glue, wo_a, wo_b, shared, routed, expand, fused, head };
+pub const Stage = enum { setup, engram, hc, attn_in, q, compress, indexer, core, attn_out_glue, wo_a, wo_b, wo_ab_fused, shared, routed, expand, fused, remote_wait, head };
 pub const Pass = enum { full, decoder };
 pub const Matmul = enum { wq_b, wo_a, wo_b };
 
@@ -17,7 +17,7 @@ const CountedShape = struct { shape: Shape, calls: usize = 1 };
 pub const Profile = struct {
     started: i64,
     last: i64,
-    us: [std.enums.values(Stage).len]u64 = @splat(0),
+    us: [std.enums.values(Stage).len]?u64 = @splat(null),
     shape_allocator: ?std.mem.Allocator = null,
     shapes: std.ArrayList(CountedShape) = .empty,
 
@@ -32,8 +32,20 @@ pub const Profile = struct {
         const p = self orelse return;
         try @call(.auto, evaluate, args);
         const tick = now();
-        p.us[@backingInt(stage)] += elapsed(p.last, tick);
+        p.add(stage, elapsed(p.last, tick));
         p.last = tick;
+    }
+
+    pub fn remoteWait(self: *Profile, sent_at: i64, received_at: i64) void {
+        const wait_us = elapsed(sent_at, received_at);
+        self.add(.remote_wait, wait_us);
+        // Leave any local work before the exchange for the next local mark.
+        self.last += @intCast(wait_us);
+    }
+
+    fn add(self: *Profile, stage: Stage, us: u64) void {
+        const sum = &self.us[@backingInt(stage)];
+        sum.* = (sum.* orelse 0) + us;
     }
 
     pub fn deinit(self: *Profile) void {
@@ -92,7 +104,12 @@ const Line = struct {
         const tag = if (self.pass == .full) "dsv41-prof" else "dsv41-prof-dec";
         try w.print("[{s}] req={s} pos={d} rows={d} layers={d}", .{ tag, self.req, self.pos, self.rows, self.layers });
         for (std.enums.values(Stage), self.profile.us) |stage, us| {
-            try writeMs(w, @tagName(stage), us);
+            switch (stage) {
+                .wo_a, .wo_b, .wo_ab_fused, .remote_wait => if (us == null) continue,
+                else => {},
+            }
+            try writeMs(w, @tagName(stage), us orelse 0);
+            if (stage == .remote_wait) try w.writeAll(" workers=unprofiled");
         }
         try writeMs(w, "total_ms", self.total);
     }
@@ -102,18 +119,33 @@ fn writeMs(w: *std.Io.Writer, key: []const u8, us: u64) std.Io.Writer.Error!void
     try w.print(" {s}={d}.{d:0>3}", .{ key, us / 1000, us % 1000 });
 }
 
-test "prefill profile formats both passes with their chunk position and zero stages" {
+test "prefill profile formats both passes with their chunk position and omits unused projections" {
     var p: Profile = .{ .started = 100, .last = 100 };
     p.us[@backingInt(Stage.indexer)] = 1234;
     var buf: [512]u8 = undefined;
     const full = p.line(.full, "chatcmpl-0123456789abcdef-7", 8192, 4096, 20, 2100);
     try std.testing.expectEqualStrings(
-        "[dsv41-prof] req=chatcmpl-0123456789abcdef-7 pos=8192 rows=4096 layers=20 setup=0.000 engram=0.000 hc=0.000 attn_in=0.000 q=0.000 compress=0.000 indexer=1.234 core=0.000 attn_out_glue=0.000 wo_a=0.000 wo_b=0.000 shared=0.000 routed=0.000 expand=0.000 fused=0.000 head=0.000 total_ms=2.000",
+        "[dsv41-prof] req=chatcmpl-0123456789abcdef-7 pos=8192 rows=4096 layers=20 setup=0.000 engram=0.000 hc=0.000 attn_in=0.000 q=0.000 compress=0.000 indexer=1.234 core=0.000 attn_out_glue=0.000 shared=0.000 routed=0.000 expand=0.000 fused=0.000 head=0.000 total_ms=2.000",
         try std.fmt.bufPrint(&buf, "{f}", .{full}),
     );
     const tail = p.line(.decoder, "-", 8192, 128, 23, 2100);
     const out = try std.fmt.bufPrint(&buf, "{f}", .{tail});
     try std.testing.expectStringStartsWith(out, "[dsv41-prof-dec] req=- pos=8192 rows=128 layers=23 ");
+}
+
+test "prefill profile excludes the worker round trip from the next local stage" {
+    const Head = struct {
+        fn eval() !void {}
+        fn now() i64 {
+            return 3100;
+        }
+    };
+    var p: Profile = .{ .started = 100, .last = 100 };
+    p.remoteWait(600, 2600);
+    try Profile.mark(&p, .head, Head.eval, .{}, Head.now);
+    var buf: [512]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, "{f}", .{p.line(.full, "-", 0, 4, 1, Head.now())});
+    try std.testing.expectStringEndsWith(out, " remote_wait=2.000 workers=unprofiled head=1.000 total_ms=3.000");
 }
 
 test "prefill shape log counts repeated calls and retains different span widths" {
@@ -161,5 +193,5 @@ test "prefill profile off never reads the clock or evaluates a stage" {
     try Profile.mark(on, .indexer, Calls.eval, .{}, Calls.now);
     try std.testing.expectEqual(@as(usize, 2), Calls.clocks);
     try std.testing.expectEqual(@as(usize, 1), Calls.evals);
-    try std.testing.expectEqual(@as(u64, 1), storage.us[@backingInt(Stage.indexer)]);
+    try std.testing.expectEqual(@as(?u64, 1), storage.us[@backingInt(Stage.indexer)]);
 }
