@@ -25,6 +25,8 @@ const gather_nax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
 const log = @import("../../sdk/util/log.zig");
 const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 const engram = @import("engram.zig");
+const profile = @import("prompt/profile.zig");
+const Profile = profile.Profile;
 const system = @import("../../sdk/util/system.zig");
 const cache_codec = @import("cache_codec.zig");
 const rowcut = @import("rowcut.zig");
@@ -399,9 +401,9 @@ pub const Bank = struct {
 /// format), so one gather reads both; `gate` and `up` are then unset.
 /// `views`: one-expert views of `gu` and `down` that the decode kernels bind
 /// in their place (they address experts from the buffer pointer): MLX bills
+
 /// a command buffer for each bound array's size, and a whole bank forced a
 /// commit at every kernel.
-
 /// `ext`: banks (w1, w3, w2) an outside quant plugin loaded and runs (the DSpark stages'); the MLX banks are then unset.
 pub const Experts = struct { gate: Bank, up: Bank, down: Bank, gu: ?Bank = null, views: ?[2]Bank = null, ext: ?[3]outside.Weight = null };
 pub const Layer = struct {
@@ -549,6 +551,7 @@ pub const Dsv41Model = struct {
     /// `qat` per kind, compiled at init (null: the op chain).
     /// Per trunk layer: its decode-width stretches compiled (`Region`).
     regions: []LayerRegions = &.{},
+    profile_prefill: bool = false,
     /// Arrays made at load (casts, reshapes, stacks); freed in `deinit`.
     owned: std.ArrayList(A) = .empty,
     /// The outside quant plugin that reads the pack's weights (`InitOpts.quant`), while `init` runs.
@@ -3087,6 +3090,7 @@ pub const Shared = struct {
     /// A replaying chunk's last decoder layer on its last span: nothing but the chunk's logits reads its output rows,
     /// so its MoE routes the last row only (`moeLast`).
     last_row: bool = false,
+    prof: ?*Profile = null,
 };
 
 /// `x` normed attention input `[L, dim]` at positions [p0, p0 + L). With `pre` (the rows' projections,
@@ -3105,7 +3109,9 @@ pub fn attention(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: us
         var a: [3]A = undefined;
         try runRegion(sc, m, li, .q_kv, &.{ x, pos }, &a);
         pj = .{ .q = a[0], .kv = a[1], .qr = a[2] };
-    } else pj = try qkvProj(sc, m, ly, ropeFor(m, li).fwd, x, pos);
+        try profileMark(sh.prof, .attn_in, &a);
+        if (sh.prof) |p| try p.noteShape(.{ .matmul = .wq_b, .groups = 1, .m = L, .n = dim(pj.q, 1) * hd, .k = dim(pj.qr, 1) });
+    } else pj = try qkvProjProfile(sc, m, ly, ropeFor(m, li).fwd, x, pos, false, sh.prof);
     var q = pj.q;
     const qr = pj.qr;
     const kv = pj.kv;
@@ -3120,15 +3126,18 @@ pub fn attention(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: us
         keys_w = if (prev.ctx != null) try sc.concat(&.{ prev, kv }, 0) else kv;
         try ls.win.write(kv, p0, sc.s);
     }
+    try profileMark(sh.prof, .attn_in, &.{ keys_w, ls.win.buf });
 
     const comp_rows, const topk = try compressed(sc, m, st, li, x, qr, p0, sh);
 
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     if (compiled) {
         const o = try attnDecode(sc, m, ly, q, ls.win, comp_rows, topk, p0, scale, ropeFor(m, li).inv);
+        try profileMark(sh.prof, .core, &.{o});
         var y: [1]A = undefined;
         try runRegion(sc, m, li, .attn_out, &.{o}, &y);
-        return if (m.tp != null) tpSum(sc, m, y[0]) else y[0];
+        try profileCompiledAttnOut(sh.prof, m, o, y[0]);
+        return attnOutSum(sc, m, y[0], sh.prof);
     }
     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
     const f16_core = m.attn_f16 and (m.act == .bfloat16 or m.act == .float16) and dim(keys_w, 0) + K <= ATTN_SOFTMAX_MAX_COLS and mlx.streamIsGpu(sc.s);
@@ -3143,6 +3152,7 @@ pub fn attention(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: us
         try attnWide(sc, m, ly.sink, q, keys_w, wp, comp_rows, topk, scale, m.act)
     else
         try attnWideF32(sc, ly.sink, q, keys_w, try windowBand(sc, wp, L, window), comp_rows, topk, scale, m.act);
+    try profileMark(sh.prof, .core, &.{o});
     if (m.trace) |t| {
         try t.put("sa_q_{d}", .{li}, q);
         try t.put("sa_kv_{d}", .{li}, keys_w);
@@ -3150,8 +3160,9 @@ pub fn attention(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: us
     }
 
     if (pre != null) return o;
-    const y = try attnOut(sc, m, ly, ropeFor(m, li).inv, o, pos);
-    return if (m.tp != null) tpSum(sc, m, y) else y;
+    const r = try ropeTail(sc, m, o, ropeFor(m, li).inv, pos, 1.0);
+    const y = try attnOutRopedProfile(sc, m, ly, r, sh.prof);
+    return attnOutSum(sc, m, y, sh.prof);
 }
 
 /// The compressed rows the rows at [p0, p0 + L) attend and the indexer's picks among them (none at ratio 0): the
@@ -3160,8 +3171,15 @@ fn compressed(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, qr: A, p0
     const ly = &m.layers[li];
     if (ly.ratio == 0) return .{ none, none };
     const clen = (p0 + dim(x, 0)) / ly.ratio;
-    if (ly.comp) |*cw| if (sh.floor == null and !sh.compressed) try compress(sc, m, st, li, cw, x, p0);
-    if (ly.idx) |*iw| sh.topk = if (clen == 0) none else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
+    if (ly.comp) |*cw| if (sh.floor == null and !sh.compressed) {
+        try compress(sc, m, st, li, cw, x, p0);
+        try profileCompress(sh.prof, &st.layers[li]);
+    };
+    if (ly.idx) |*iw| {
+        sh.topk = if (clen == 0) none else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
+        // The scores stay lazy until the picks (including candidate blocks) are evaluated.
+        if (clen != 0) try profileMark(sh.prof, .indexer, &.{ sh.topk, sh.cand });
+    }
     if (clen == 0 or sh.topk.ctx == null) return .{ none, sh.topk };
     return .{ try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s)), sh.topk };
 }
@@ -3546,7 +3564,7 @@ pub fn indexScoresScalar(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weight
 
 /// `attention`'s scores, softmax and weighted rows for a decode block as one
 /// kernel (`ATTN_DEC_SOURCE`); the ring already holds this step's rows. With
-/// `inv`, the heads leave inverse-roped (`attnOut`'s first step).
+/// `inv`, the heads leave inverse-roped for the output projection.
 pub fn attnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, q: A, win: Ring, comp_rows: A, topk: A, p0: usize, scale: f32, inv: ?A) !A {
     if (m.dec.attn) |k| if (try dkern.attn.partials(sc, k, m, q, win, comp_rows, topk, p0, scale)) |p|
         return attnMerge(sc, m, ly, .{ p.acc, p.m, p.l }, p.splits, try attnMeta(sc, m, q, win, comp_rows, topk, p0), inv);
@@ -3621,6 +3639,7 @@ fn attnMerge(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, parts: [3]A, sp
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(mc, &[_]c_int{ ci(L), ci(H), ci(D) }, 3, m.act));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(mc, ci(D), ci(H), ci(L)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(mc, ci(D), 1, 1));
+
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(mc, "D", ci(D)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(mc, "S", splits));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(mc, "OT", m.act));
@@ -3640,28 +3659,32 @@ pub fn attnSplits(rows: usize) c_int {
     return @intCast(@max(1, @min(8, rows / 160)));
 }
 
-
 /// `qt` (q_tail.zig): the heads' roped last channels [L, H, rope dims]; `q` is then the unroped heads.
 pub const Proj = struct { q: A, kv: A, qr: A, qt: A = none };
 /// Rows at `pos` -> the roped query heads, the window row (roped, fp8
 /// round-trip) and the query latent the indexer reads.
 pub fn qkvProj(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, x: A, pos: A) !Proj {
-    return qkvProjWith(sc, m, ly, periods, x, pos, false);
+    return qkvProjProfile(sc, m, ly, periods, x, pos, false, null);
 }
 /// `qkvProj`; `tail` (q_tail.zig, a wide layer's): the heads left as `wq_b` wrote them and only their last
 /// `dsv4_rope_head_dim` channels roped, apart (`Proj.qt`).
-pub fn qkvProjWith(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, x: A, pos: A, tail: bool) !Proj {
-    const rows = try qkvRows(sc, m, ly, x);
-    if (tail) {
+fn qkvProjProfile(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, x: A, pos: A, tail: bool, prof: ?*Profile) !Proj {
+    const rows = try qkvRowsProfile(sc, m, ly, x, prof);
+    const pj: Proj = if (tail) blk: {
         const qt = try ropeTailOnly(sc, m, rows.q, periods, pos);
         const row = try kvRow(sc, m, ly, periods, rows.kv, pos);
-        return .{ .q = rows.q, .kv = row, .qr = rows.qr, .qt = qt };
-    }
-    return ropeProj(sc, m, ly, periods, rows, pos);
+        break :blk .{ .q = rows.q, .kv = row, .qr = rows.qr, .qt = qt };
+    } else try ropeProj(sc, m, ly, periods, rows, pos);
+    try profileMark(prof, .q, &.{ pj.q, pj.kv, pj.qt });
+    return pj;
 }
 
 /// `qkvProj` before the rope: the query heads `[L, H, hd]`, the window row unnormed, the query latent.
 pub fn qkvRows(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !Proj {
+    return qkvRowsProfile(sc, m, ly, x, null);
+}
+
+fn qkvRowsProfile(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, prof: ?*Profile) !Proj {
     const c = &m.cfg;
     const qa, const kv = if (ly.q_kv) |*f| blk: {
         const y = try f.apply(sc, x);
@@ -3669,7 +3692,9 @@ pub fn qkvRows(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !Proj {
         break :blk .{ try sc.slice(y, -1, 0, n - c.head_dim), try sc.slice(y, -1, n - c.head_dim, n) };
     } else .{ try ly.wq_a.apply(sc, x), try ly.wkv.apply(sc, x) };
     const qr = try sc.rms(qa, ly.q_norm, c.rms_norm_eps);
+    try profileMark(prof, .attn_in, &.{ qr, kv });
     const qb = try ly.wq_b.apply(sc, qr);
+    if (prof) |p| try p.noteShape(.{ .matmul = .wq_b, .groups = 1, .m = dim(qr, 0), .n = dim(qb, 1), .k = dim(qr, 1) });
     return .{ .q = try sc.reshape(qb, &.{ ci(dim(x, 0)), -1, ci(c.head_dim) }), .kv = kv, .qr = qr };
 }
 
@@ -3700,33 +3725,69 @@ pub fn kvRow(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, kv: A, po
     return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
 
-/// Attention heads `o` [L, H, hd] at `pos` back to the stream: the inverse
-/// rope, the grouped `wo_a`, then `wo_b`.
-pub fn attnOut(sc: *Scope, m: *Dsv41Model, ly: *const Layer, inv: A, o: A, pos: A) !A {
-    return attnOutRoped(sc, m, ly, try ropeTail(sc, m, o, inv, pos, 1.0));
+/// Project the inverse-roped attention heads back to the stream.
+pub fn attnOutRoped(sc: *Scope, m: *Dsv41Model, ly: *const Layer, r: A) !A {
+    return attnOutRopedProfile(sc, m, ly, r, null);
 }
 
-/// `attnOut` of heads already inverse-roped.
-pub fn attnOutRoped(sc: *Scope, m: *Dsv41Model, ly: *const Layer, r: A) !A {
+fn attnOutRopedProfile(sc: *Scope, m: *Dsv41Model, ly: *const Layer, r: A, prof: ?*Profile) !A {
     const L = dim(r, 0);
     // A stage's whole groups under a tensor split; an outside plugin's `wo_a` (no `w`) the config's.
     const og = if (ly.wo_a.ext != null) m.cfg.dsv4_o_groups else dim(ly.wo_a.w, 0);
-    return ly.wo_b.apply(sc, try attnOutA(sc, m, ly, try sc.transpose(try sc.reshape(r, &.{ ci(L), ci(og), -1 }), &.{ 1, 0, 2 }), null)); // [og, L, in]
+    const grouped = try sc.transpose(try sc.reshape(r, &.{ ci(L), ci(og), -1 }), &.{ 1, 0, 2 });
+    try profileMark(prof, .attn_out_glue, &.{grouped});
+    return attnOutBProfile(sc, ly, try attnOutAProfile(sc, m, ly, grouped, null, prof), prof);
 }
 
 /// The grouped `wo_a` of heads already grouped and inverse-roped `[og, L, in]`: `[L, og * o_lora]` in `m.act`.
-pub fn attnOutA(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a: ?A) !A {
+fn attnOutAProfile(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a: ?A, prof: ?*Profile) !A {
     const L = dim(ob, 1);
     // An outside plugin's groups: its grouped linear reads `[L, og, in]`.
-    if (ly.wo_a.ext) |*e| return sc.astype(try sc.reshape(try sc.keep(try e.matmul(try sc.transpose(ob, &.{ 1, 0, 2 }), sc.s)), &.{ ci(L), -1 }), m.act);
+    if (ly.wo_a.ext != null) {
+        const rows = try sc.transpose(ob, &.{ 1, 0, 2 });
+        try profileMark(prof, .attn_out_glue, &.{rows});
+        return attnOutARun(sc, m, ly, rows, prof);
+    }
     const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (L >= DENSE_ROWS) try ly.wo_a.dense(sc, mlx.mlx_array_dtype(ob)) else none;
-    const oa = if (wd.ctx != null)
-        try sc.matmul(ob, try sc.transpose(wd, &.{ 0, 2, 1 }))
+    const oa = try groupedMatmul(sc, &ly.wo_a, ob, wd);
+    try profileMark(prof, .wo_a, &.{oa});
+    if (prof) |p| try p.noteShape(.{ .matmul = .wo_a, .groups = dim(ob, 0), .m = L, .n = dim(oa, 2), .k = dim(ob, 2) });
+    const rows = try sc.astype(try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ ci(L), -1 }), m.act);
+    try profileMark(prof, .attn_out_glue, &.{rows});
+    return rows;
+}
+
+fn groupedMatmul(sc: *Scope, w: *const Lin, x: A, dense: A) !A {
+    return if (dense.ctx != null)
+        sc.matmul(x, try sc.transpose(dense, &.{ 0, 2, 1 }))
     else blk: {
         var ro = mlx.mlx_array_new();
-        break :blk try sc.res(mlx.mlx_quantized_matmul(&ro, ob, ly.wo_a.w, ly.wo_a.s, ly.wo_a.b, true, mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.group_size)), mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.bits)), ly.wo_a.qp.mode.cstr(), sc.s), &ro);
+        break :blk sc.res(mlx.mlx_quantized_matmul(&ro, x, w.w, w.s, w.b, true, mlx.mlx_optional_int.some(@intCast(w.qp.group_size)), mlx.mlx_optional_int.some(@intCast(w.qp.bits)), w.qp.mode.cstr(), sc.s), &ro);
     };
-    return sc.astype(try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ ci(L), -1 }), m.act);
+}
+
+fn attnOutBProfile(sc: *Scope, ly: *const Layer, x: A, prof: ?*Profile) !A {
+    const y = try ly.wo_b.apply(sc, x);
+    try profileMark(prof, .wo_b, &.{y});
+    if (prof) |p| try p.noteShape(.{ .matmul = .wo_b, .groups = 1, .m = dim(x, 0), .n = dim(y, 1), .k = dim(x, 1) });
+    return y;
+}
+
+fn attnOutSum(sc: *Scope, m: *Dsv41Model, y: A, prof: ?*Profile) !A {
+    if (m.tp == null) return y;
+    const out = try tpSum(sc, m, y);
+    try profileMark(prof, .attn_out_glue, &.{out});
+    return out;
+}
+
+fn profileCompiledAttnOut(prof: ?*Profile, m: *const Dsv41Model, heads: A, out: A) !void {
+    const p = prof orelse return;
+    try profileMark(p, .wo_ab_fused, &.{out});
+    const groups = m.cfg.dsv4_o_groups;
+    const rank = m.cfg.dsv4_o_lora_rank;
+    const rows = dim(out, 0);
+    try p.noteShape(.{ .matmul = .wo_a, .groups = groups, .m = rows, .n = rank, .k = dim(heads, 1) * dim(heads, 2) / groups });
+    try p.noteShape(.{ .matmul = .wo_b, .groups = 1, .m = rows, .n = dim(out, 1), .k = @as(usize, groups) * rank });
 }
 
 /// `x` [L, K] f32 through the dense linear `l` in f32: decode rows read `l`
@@ -4582,27 +4643,44 @@ pub fn addShared(sc: *Scope, m: *const Dsv41Model, y: A, sy: A) !A {
 }
 
 pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
+    return moeProfile(sc, m, li, x, img, null);
+}
+
+fn moeProfile(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A, prof: ?*Profile) !A {
     const ly = &m.layers[li];
     const r = try route(sc, m, ly, x, img);
     try VerifyPicks.note(m, li, r.idx);
+    try profileMark(prof, .routed, &.{ r.idx, r.wts });
     if (m.row_cut) |rc| if (rc.layer(m, li, @intCast(dim(x, 0)))) |rl| return rc.run(sc, m, rl, x, r.idx, r.wts);
     // The DSpark stages' experts stay resident.
     if (li < m.n_layers) if (m.streamed) |src| {
         // A wide call's routed sum and the shared expert in one combine (the same f32 words).
         if (src.math == .source and dim(r.idx, 0) * dim(r.idx, 1) > src.decode_ids) if (src.source_shared) |f| {
-            const sy = try shared(sc, m, ly, x);
+            const sy = try sharedProfile(sc, m, ly, x, prof);
             const y = try sc.keep(try f(src.ctx, @intCast(li), x, r.idx, r.wts, try sc.astype(sy, .float32)).get());
             return sc.astype(y, m.act);
         };
-        if (src.math == .source) return withShared(sc, m, ly, x, try sc.keep(try src.math.source(src.ctx, @intCast(li), x, r.idx, r.wts).get()));
-        if (dim(r.idx, 0) * dim(r.idx, 1) > src.decode_ids) return slotWide(sc, m, src, li, x, r.idx, r.wts, try shared(sc, m, ly, x));
+        if (src.math == .source) return addSharedProfile(sc, m, ly, x, try sc.keep(try src.math.source(src.ctx, @intCast(li), x, r.idx, r.wts).get()), prof);
+        if (dim(r.idx, 0) * dim(r.idx, 1) > src.decode_ids) return slotWide(sc, m, src, li, x, r.idx, r.wts, try sharedProfile(sc, m, ly, x, prof));
         const sl = try fetchSlots(sc, m, src, li, r.idx);
-        if (dim(x, 0) > region_rows) return slotPrefill(sc, m, &sl, x, r.wts, try shared(sc, m, ly, x));
-        return withShared(sc, m, ly, x, try rowSum(sc, try slotRows(sc, m, &sl, x, r.wts, null)));
+        try profileMark(prof, .routed, &.{});
+        if (dim(x, 0) > region_rows) return slotPrefill(sc, m, &sl, x, r.wts, try sharedProfile(sc, m, ly, x, prof));
+        return addSharedProfile(sc, m, ly, x, try rowSum(sc, try slotRows(sc, m, &sl, x, r.wts, null)), prof);
     };
-    if (ly.experts.ext) |*e| return withShared(sc, m, ly, x, try routedOutside(sc, m, e, x, r.idx, r.wts));
-    const y = try moePartial(sc, m, ly, x, r.idx, r.wts);
+    if (ly.experts.ext) |*e| return addSharedProfile(sc, m, ly, x, try routedOutside(sc, m, e, x, r.idx, r.wts), prof);
+    const y = try moePartialProfile(sc, m, ly, x, r.idx, r.wts, prof);
     return if (li < m.n_layers or m.draft_shard) tpSum(sc, m, y) else sc.astype(y, m.act);
+}
+
+fn sharedProfile(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, prof: ?*Profile) !A {
+    const y = try shared(sc, m, ly, x);
+    try profileMark(prof, .shared, &.{y});
+    return y;
+}
+
+fn addSharedProfile(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, y: A, prof: ?*Profile) !A {
+    try profileMark(prof, .routed, &.{y});
+    return addShared(sc, m, y, try sharedProfile(sc, m, ly, x, prof));
 }
 
 /// `x` summed over the tensor-parallel ranks (itself unsplit), in `m.act`: f32 at decode width, so the sum rounds once.
@@ -4651,8 +4729,14 @@ fn gatherSum(sc: *Scope, m: *const Dsv41Model, x: A) !A {
 /// The routed and shared experts this process holds over routed rows: the whole MoE, or one rank's slice of it. f32
 /// at decode width, so the ranks' sum rounds once; the activation dtype past it.
 fn moePartial(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A) !A {
-    if (dim(x, 0) > region_rows) return moePrefill(sc, m, ly, x, idx, wts, try shared(sc, m, ly, x));
-    return sc.add(try routed(sc, m, ly, x, idx, wts), try sc.astype(try shared(sc, m, ly, x), .float32));
+    return moePartialProfile(sc, m, ly, x, idx, wts, null);
+}
+
+fn moePartialProfile(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A, prof: ?*Profile) !A {
+    if (dim(x, 0) > region_rows) return moePrefill(sc, m, ly, x, idx, wts, try sharedProfile(sc, m, ly, x, prof));
+    const y = try routed(sc, m, ly, x, idx, wts);
+    try profileMark(prof, .routed, &.{y});
+    return sc.add(y, try sc.astype(try sharedProfile(sc, m, ly, x, prof), .float32));
 }
 
 /// Layer `li`'s experts this rank holds over `x` routed by `idx` / `wts` (caller frees).
@@ -4666,14 +4750,15 @@ pub fn moeShare(m: *Dsv41Model, gpa: std.mem.Allocator, li: usize, x: A, idx: A,
 /// nothing but the logits read (the last row): the router and the shared expert over every row as `moe` runs them, the
 /// joinless routed call over the last row only (`source_shared` runs it on a wide call's waves and combine), its row put
 /// back as the last of `moe`'s output (the other rows zero). `moe` itself where its joinless wide call would not run.
-fn moeLast(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
+fn moeLast(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A, prof: ?*Profile) !A {
     const ly = &m.layers[li];
-    const src = m.streamed orelse return moe(sc, m, li, x, img);
-    const f = src.source_shared orelse return moe(sc, m, li, x, img);
+    const src = m.streamed orelse return moeProfile(sc, m, li, x, img, prof);
+    const f = src.source_shared orelse return moeProfile(sc, m, li, x, img, prof);
     const n = dim(x, 0);
-    if (li >= m.n_layers or src.math != .source or n < 2 or n * ly.top_k <= src.decode_ids) return moe(sc, m, li, x, img);
+    if (li >= m.n_layers or src.math != .source or n < 2 or n * ly.top_k <= src.decode_ids) return moeProfile(sc, m, li, x, img, prof);
     const r = try route(sc, m, ly, x, img);
-    const sy = try shared(sc, m, ly, x);
+    try profileMark(prof, .routed, &.{ r.idx, r.wts });
+    const sy = try sharedProfile(sc, m, ly, x, prof);
     const sy32 = try sc.astype(sy, .float32);
     const last = try sc.ints(&.{@intCast(n - 1)}, &.{1});
     const one = try sc.keep(try f(src.ctx, @intCast(li), try sc.take(x, last, 0), try sc.take(r.idx, last, 0), try sc.take(r.wts, last, 0), try sc.take(sy32, last, 0)).get());
@@ -4687,7 +4772,7 @@ fn moeLast(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
 /// attention state, committed behind the call's routes.
 /// `into`: `x1` is the published x1 region over every row of the chunk; the new streams are written over the region in
 /// place (the kernel's write-into twin) and returned as its published alias.
-fn moeExpand(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A, x1: A, sf: *const Split, early: Early, into: bool) !?A {
+fn moeExpand(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A, x1: A, sf: *const Split, early: Early, into: bool, prof: ?*Profile) !?A {
     if (li >= m.n_layers) return null;
     const src = m.streamed orelse return null;
     const f = src.source_expand orelse return null;
@@ -4695,7 +4780,8 @@ fn moeExpand(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A, x1: A, s
     if (src.math != .source or dim(x, 0) * ly.top_k <= src.decode_ids) return null;
     if (mlx.mlx_array_dtype(sf.post) != .float32 or mlx.mlx_array_dtype(sf.comb) != .float32) return null;
     const r = try route(sc, m, ly, x, img);
-    const sy = try shared(sc, m, ly, x);
+    try profileMark(prof, .routed, &.{ r.idx, r.wts });
+    const sy = try sharedProfile(sc, m, ly, x, prof);
     // The routes, the prediction, then the shared expert and the attention state committed before the call (its barrier
     // waits on the routes only).
     const idx = try commitEarly(sc, r.idx, sy, early);
@@ -4858,14 +4944,19 @@ pub const Want = enum { last, all, replay, encode };
 /// mix, which the next layer's attention collapses with.
 pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !A {
     if (sh.floor == null and sh.img.ctx == null and m.streamed == null and li < m.regions.len and dim(x, 0) <= dkern.max_rows and compiledAt(m, dim(x, 0)))
-        if (try blockFused(sc, m, st, li, x, pre, p0, sh)) |y| return y;
+        if (try blockFused(sc, m, st, li, x, pre, p0, sh)) |y| {
+            try profileMark(sh.prof, .fused, &.{ y, pre.* });
+            return y;
+        };
     if (sh.floor == null and sh.img.ctx == null and li < m.regions.len and compiledAt(m, dim(x, 0)) and fetchServes(m, dim(x, 0))) {
         var a: [4]A = undefined; // the attention's pre, post, comb; its input
         try runRegion(sc, m, li, .attn_in, &.{ x, pre.* }, &a);
+        try profileMark(sh.prof, .hc, &a);
         const ao = try attention(sc, m, st, li, a[3], p0, sh, null);
         if (m.streamed) |src| {
             var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
             try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, a[0], a[1], a[2] }, &p);
+            try profileMark(sh.prof, .hc, &p);
             // the shared expert built first (the source commits it behind the routed call's waves), the
             // call's joined rows, the shared rows and the hc expand in TAIL_FUSE's kernel: the new stream, the words of the
             // source's sum and `ffn_post_shared`.
@@ -4874,9 +4965,11 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
             if (src.math == .source and decode_call and mlx.mlx_array_dtype(p[2]) == .float32 and mlx.mlx_array_dtype(p[3]) == .float32) if (src.source_decode_expand) |fx| {
                 var s: [1]A = undefined;
                 try runRegion(sc, m, li, .ffn_shared, &.{p[4]}, &s);
+                try profileMark(sh.prof, .shared, &s);
                 const pc = try sc.concat(&.{ p[2], try sc.reshape(p[3], &.{ ci(dim(p[3], 0)), -1 }) }, 1);
                 const yf = try sc.keep(try fx(src.ctx, @intCast(li), p[4], p[5], p[6], s[0], p[0], pc).get());
                 pre.* = p[1];
+                try profileMark(sh.prof, .routed, &.{yf});
                 return yf;
             };
             const ro = switch (src.math) {
@@ -4886,31 +4979,41 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
                     break :blk try slotRows(sc, m, &sl, p[4], p[6], li);
                 },
             };
+            try profileMark(sh.prof, .routed, &.{ro});
             var y: [1]A = undefined;
             // the shared expert committed now queues behind the hit wave.
             if (src.math == .source) {
                 var s: [1]A = undefined;
                 try runRegion(sc, m, li, .ffn_shared, &.{p[4]}, &s);
+                try profileMark(sh.prof, .shared, &s);
                 const v = mlx.mlx_vector_array_new_data(&s, 1);
                 defer _ = mlx.mlx_vector_array_free(v);
                 try mlx.check(mlx.mlx_async_eval(v));
                 try runRegion(sc, m, li, .ffn_post_shared, &.{ p[0], p[2], p[3], ro, s[0] }, &y);
             } else try runRegion(sc, m, li, .ffn_post, &.{ p[0], p[2], p[3], p[4], ro }, &y);
             pre.* = p[1];
+            try profileMark(sh.prof, .fused, &y);
             return y[0];
         }
-        if (m.tp != null) return tpFfn(sc, m, li, x, ao, &.{ .pre = a[0], .post = a[1], .comb = a[2] }, pre);
+        if (m.tp != null) {
+            const y = try tpFfn(sc, m, li, x, ao, &.{ .pre = a[0], .post = a[1], .comb = a[2] }, pre);
+            try profileMark(sh.prof, .fused, &.{ y, pre.* });
+            return y;
+        }
         var o: [2]A = undefined;
         try runRegion(sc, m, li, .ffn, &.{ x, ao, a[0], a[1], a[2] }, &o);
+        try profileMark(sh.prof, .fused, &o);
         pre.* = o[1];
         return o[0];
     }
     const mid = try blockAttn(sc, m, st, li, x, pre.*, p0, sh);
     // the replaying chunk's last decoder layer routes its last row only.
-    const y = if (sh.last_row and li < m.n_layers) try moeLast(sc, m, li, mid.h, sh.img) else try moe(sc, m, li, mid.h, sh.img);
+    const y = if (sh.last_row and li < m.n_layers) try moeLast(sc, m, li, mid.h, sh.img, sh.prof) else try moeProfile(sc, m, li, mid.h, sh.img, sh.prof);
+    try profileMark(sh.prof, .routed, &.{y});
     if (m.trace) |t| try t.put("ffn_{d}", .{li}, y);
     pre.* = mid.sf.pre;
     const out = try hcExpand(sc, mid.x1, y, &mid.sf);
+    try profileMark(sh.prof, .expand, &.{out});
     return out;
 }
 
@@ -4938,13 +5041,23 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const a = try dkern.in_proj.run(sc, kp, m, ly, try probed(sc, m, li, .in_proj, &.{ x, pre.* }), pre.*) orelse return null;
     const pos = try dkern.wq_b.rowsAt(sc, p0, L);
     const w = try dkern.wq_b.run(sc, m, kq, ly, li, try probed(sc, m, li, .wq_b, &.{ a.qa, a.kv, a.z, pos }), a.kv, a.z, pos) orelse return null;
+    try profileMark(sh.prof, .attn_in, &.{ a.qa, a.kv, a.z, a.iw orelse none, a.comp orelse none });
+    try profileMark(sh.prof, .q, &.{ w.q, w.kv_row, w.q_idx orelse none, w.sa.pre, w.sa.post, w.sa.comb });
+    if (sh.prof) |p| try p.noteShape(.{ .matmul = .wq_b, .groups = 1, .m = L, .n = dim(w.q, 1) * hd, .k = dim(a.qa, 1) });
     try ls.win.write(w.kv_row, p0, sc.s);
+    try profileMark(sh.prof, .attn_in, &.{ls.win.buf});
     var comp_rows = none;
     var topk = none;
     if (ly.ratio > 0) {
         const clen = (p0 + L) / ly.ratio;
-        if (ly.comp) |*cw| if (!try compressFused(sc, m, st, li, a.comp.?, p0)) try compressFrom(sc, m, st, li, cw, a.comp.?, p0);
-        if (ly.idx) |_| sh.topk = if (clen == 0) none else try indexerQ(sc, m, st, li, a.iw.?, w.q_idx.?, p0, sh);
+        if (ly.comp) |*cw| {
+            if (!try compressFused(sc, m, st, li, a.comp.?, p0)) try compressFrom(sc, m, st, li, cw, a.comp.?, p0);
+            try profileCompress(sh.prof, ls);
+        }
+        if (ly.idx) |_| {
+            sh.topk = if (clen == 0) none else try indexerQ(sc, m, st, li, a.iw.?, w.q_idx.?, p0, sh);
+            if (clen != 0) try profileMark(sh.prof, .indexer, &.{ sh.topk, sh.cand });
+        }
         topk = sh.topk;
         if (clen > 0 and topk.ctx != null) comp_rows = try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s));
     }
@@ -4954,14 +5067,30 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, w.q, ls.win, comp_rows, topk, p0, scale)) |p| {
         const meta = try attnMeta(sc, m, w.q, ls.win, comp_rows, topk, p0);
         oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, meta, try probed(sc, m, li, .wo_a, &.{ p.acc, p.m, p.l, meta }), p.m, p.l);
+        if (oa) |v| {
+            try profileMark(sh.prof, .core, &.{ p.acc, p.m, p.l });
+            try profileMark(sh.prof, .wo_a, &.{v});
+            if (sh.prof) |prof| {
+                const groups = m.cfg.dsv4_o_groups;
+                try prof.noteShape(.{ .matmul = .wo_a, .groups = groups, .m = L, .n = dim(v, 1) / groups, .k = dim(w.q, 1) * hd / groups });
+            }
+        }
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &w.sa)) |f| {
+        if (sh.prof) |p| try p.noteShape(.{ .matmul = .wo_b, .groups = 1, .m = L, .n = m.cfg.hidden_size, .k = dim(v, 1) });
         pre.* = f.sf.pre;
         return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
     };
     var ao: [1]A = undefined;
-    if (oa) |v| ao[0] = try ly.wo_b.apply(sc, try probed(sc, m, li, .wo_b, &.{v})) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
+    if (oa) |v| {
+        ao[0] = try attnOutBProfile(sc, ly, try probed(sc, m, li, .wo_b, &.{v}), sh.prof);
+    } else {
+        const o = try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv);
+        try profileMark(sh.prof, .core, &.{o});
+        try runRegion(sc, m, li, .attn_out, &.{o}, &ao);
+        try profileCompiledAttnOut(sh.prof, m, o, ao[0]);
+    }
     if (m.tp != null) return try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, pre);
     var out: [2]A = undefined;
     try runRegion(sc, m, li, .ffn, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &out);
@@ -5040,6 +5169,7 @@ pub fn blockAttn(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: A
     const pa = try hcPreNorm(sc, m, x, pre, &ly.hc_attn, ly.attn_norm);
     const sa = pa.sp;
     var h = pa.h;
+    try profileMark(sh.prof, .hc, &.{ h, sa.pre, sa.post, sa.comb });
     if (m.trace) |t| {
         try t.put("hc_pre_{d}", .{li}, sa.pre);
         try t.put("hc_post_{d}", .{li}, sa.post);
@@ -5049,6 +5179,7 @@ pub fn blockAttn(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: A
     h = try attention(sc, m, st, li, h, p0, sh, null);
     if (m.trace) |t| try t.put("attn_{d}", .{li}, h);
     const pf = try hcExpandPreNorm(sc, m, x, h, &sa, sa.pre, &ly.hc_ffn, ly.ffn_norm);
+    try profileStaged(sh.prof, &pf);
     return .{ .x1 = pf.x1, .sf = pf.sp, .h = pf.h };
 }
 
@@ -5088,6 +5219,34 @@ pub fn evalAll(xs: []const A) !void {
     const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_eval(vec));
+}
+
+inline fn profileMark(prof: ?*Profile, stage: profile.Stage, xs: []const A) !void {
+    try Profile.mark(prof, stage, evalProfile, .{xs}, monoUs);
+}
+
+fn evalProfile(xs: []const A) !void {
+    var present: [7]A = undefined;
+    var n: usize = 0;
+    for (xs) |x| if (x.ctx != null) {
+        present[n] = x;
+        n += 1;
+    };
+    if (n > 0) try evalAll(present[0..n]);
+}
+
+inline fn profileStaged(prof: ?*Profile, pf: *const Staged) !void {
+    try profileMark(prof, .hc, &.{ pf.x1, pf.h, pf.sp.pre, pf.sp.post, pf.sp.comb });
+}
+
+inline fn profileCompress(prof: ?*Profile, ls: *const LState) !void {
+    if (prof == null) return;
+    try profileMark(prof, .compress, &.{
+        if (ls.comp) |r| r.buf else none,
+        if (ls.idx_k) |r| r.buf else none,
+        ls.pend_kv,
+        ls.pend_gate,
+    });
 }
 
 /// `evalAll` committed, not waited for.
@@ -5353,13 +5512,16 @@ fn leaderPrefill(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []cons
     m.tp_drafted = null;
     const prompt = whole.prompt;
     const next_rows = whole.next_rows;
+    const profile_prefill = whole.profile_prefill;
     whole.prompt = m.prompt;
     whole.next_rows = m.next_rows;
+    whole.profile_prefill = m.profile_prefill;
     defer {
         m.ahead = whole.ahead;
         whole.ahead = null;
         whole.prompt = prompt;
         whole.next_rows = next_rows;
+        whole.profile_prefill = profile_prefill;
     }
     var chunk: LeaderChunk = .{ .m = m, .whole = whole, .gpa = gpa, .st = st, .want = want, .vision = vision };
     defer if (chunk.sn) |*sn| sn.deinit(gpa);
@@ -5401,6 +5563,18 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     if (m.prefill_whole != null and given == .host and L > rowcut.max_rows)
         return leaderPrefill(m, gpa, st, given.host, want, vision);
     const p0 = st.n;
+    var full_profile: Profile = undefined;
+    var tail_profile: Profile = undefined;
+    const profiling = m.profile_prefill and want != .replay;
+    if (profiling) try mlx.check(mlx.mlx_synchronize(m.s));
+    const full_prof = Profile.start(profiling, &full_profile, monoUs);
+    if (full_prof) |p| if (log.isDebug()) {
+        p.shape_allocator = gpa;
+    };
+    defer if (full_prof) |p| p.deinit();
+    var tail_prof: ?*Profile = null;
+    defer if (tail_prof) |p| p.deinit();
+    var full_end: ?i64 = null;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
     Laps.begin();
@@ -5479,6 +5653,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     }
     @memset(held, none);
     var sp = spansOf(held, n_spans, targets, span, L, p0);
+    sp.prof = full_prof;
     sp.whole = held[held.len - 4 ..][0..2];
     if (want == .replay) sp.floor = p0;
     sp.eng_ids = eng_ids;
@@ -5508,6 +5683,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
             emb = try spliceImages(&sc, m, emb, id_arr, ids.host, img_rows, &img_mask);
             sp.img = img_mask;
         }
+        try profileMark(sp.prof, .setup, &.{emb});
         for (0..n_spans) |k| {
             const lo, const hi = sp.bounds(k);
             hold(&sp.xs[k], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, lo, hi), 1), &.{ ci(hi - lo), ci(hc), ci(d) }));
@@ -5559,13 +5735,23 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         defer ev.deinit(gpa);
         for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
         try asyncEvalAll(ev.items);
+        try Profile.mark(sp.prof, .head, evalAll, .{ev.items}, monoUs);
+        if (full_prof) |p| {
+            emitPrefillProfile(p, .full, p0, L, enc_hi, monoUs());
+            emitPrefillShapes(p, null, p0);
+        }
         return none;
     }
     if (tail) |tl| {
+        try cedCompress(m, gpa, st, &sp, enc_hi);
+        if (full_prof != null) full_end = monoUs();
         var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
+        tail_prof = Profile.start(full_prof != null, &tail_profile, monoUs);
+        if (tail_prof) |p| p.shape_allocator = full_prof.?.shape_allocator;
+        tsp.prof = tail_prof;
         tsp.whole = held[held.len - 2 ..][0..2];
         tsp.floor = tsp.p0;
-        try cedReplayIn(m, gpa, st, &sp, &tsp, enc_hi);
+        try cedReplayIn(m, gpa, &sp, &tsp);
         m.ced_stats.chunks += 1;
         m.ced_stats.skipped += L - tl;
         logCedPrefill(L - tl, tl);
@@ -5617,10 +5803,31 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_async_eval(vec));
+    try Profile.mark(sp.prof, .head, evalAll, .{ev.items}, monoUs);
     Laps.lap(.submit);
     Laps.end(m);
     try dkern.seg.afterStep(m, L);
+    if (full_prof) |p| {
+        const end = monoUs();
+        const remote_layers = if (m.pair) |pair| pair.hi - pair.lo else 0;
+        emitPrefillProfile(p, .full, p0, L, enc_hi - remote_layers, full_end orelse end);
+        if (tail) |tl| emitPrefillProfile(&tail_profile, .decoder, p0, tl, m.n_layers - enc_hi, end);
+        emitPrefillShapes(p, tail_prof, p0);
+    }
     return sc.out(logits);
+}
+
+fn emitPrefillProfile(prof: *const Profile, pass: profile.Pass, p0: usize, rows: usize, layers: usize, end: i64) void {
+    var buf: [64]u8 = undefined;
+    const req = std.fmt.bufPrint(&buf, "{f}", .{log.requestTag(log.requestId())}) catch unreachable;
+    log.info("{f}\n", .{prof.line(pass, req, p0, rows, layers, end)});
+}
+
+fn emitPrefillShapes(full: *const Profile, decoder: ?*const Profile, pos: usize) void {
+    if (full.shape_allocator == null) return;
+    var buf: [64]u8 = undefined;
+    const req = std.fmt.bufPrint(&buf, "{f}", .{log.requestTag(log.requestId())}) catch unreachable;
+    log.debug("{f}\n", .{profile.ShapeLine{ .req = req, .pos = pos, .full = full, .decoder = decoder }});
 }
 
 /// Diag `engram-laps`: a decode step's host time with its token on the GPU, phase by phase, summed over `every` steps
@@ -6012,7 +6219,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
             defer sc.deinit();
             var x = try spanIn(&sc, m, gpa, sp, li, k);
             const a, const b = sp.bounds(k);
-            var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .img = try sp.imgSlice(&sc, a, b), .last_row = sp.floor != null and li + 1 == m.n_layers and k + 1 == n_spans and m.trace == null };
+            var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .img = try sp.imgSlice(&sc, a, b), .last_row = sp.floor != null and li + 1 == m.n_layers and k + 1 == n_spans and m.trace == null, .prof = sp.prof };
             var pre = sp.pres[k];
             x = try block(&sc, m, st, li, x, &pre, sp.p0 + k * sp.span, &sh);
             if (m.trace) |t| try t.put("stream_{d}", .{li}, x);
@@ -6055,7 +6262,15 @@ fn exchange(m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, p0: usize,
     const xchg = clusterHooks().pair_exchange orelse return error.DsvPairNotJoined;
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    const back = try xchg(try sc.concat(sp.xs, 0), try sc.concat(sp.pres, 0), p0, snap, verify);
+    const x = try sc.concat(sp.xs, 0);
+    const pre = try sc.concat(sp.pres, 0);
+    const start = if (sp.prof != null) blk: {
+        // Finish the local payload graph before timing the round trip.
+        try evalAll(&.{ x, pre });
+        break :blk monoUs();
+    } else 0;
+    const back = try xchg(x, pre, p0, snap, verify);
+    if (sp.prof) |p| p.remoteWait(start, monoUs());
     _ = try sc.keep(back[0]);
     _ = try sc.keep(back[1]);
     for (0..sp.xs.len) |k| {
@@ -6401,6 +6616,7 @@ pub fn tpWorkerStep(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, gen
 /// `next_wide`: layer `li + 1` runs wide over the same spans next (next-layer staging predicts it here); `prev_wide`:
 /// layer `li - 1` ran wide over them just before (and predicted this one).
 fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, li: usize, next_wide: bool, prev_wide: bool) !void {
+    const prof = sp.prof;
     // The kept projection outputs: the last wide layer's kept projection outputs to MLX's cache, for this layer's.
     tkeep.release();
     // scratch_attn.zig: the layer's attention spans on the ring (a streamed wide prompt layer on the GPU).
@@ -6434,14 +6650,18 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         const r = try attnHcWide(&sc, m, x, pres, ly, ly.ffn_norm);
         pa = r.pa;
         hp = r.hp;
+        try profileMark(prof, .hc, &.{ pa.h, pa.sp.pre, pa.sp.post, pa.sp.comb, hp });
     }
     if (ra_own) if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, hp, sp.img, ra, src.ctx);
-    if (!fused) pa = (try attnHcWide(&sc, m, x, pres, ly, null)).pa;
+    if (!fused) {
+        pa = (try attnHcWide(&sc, m, x, pres, ly, null)).pa;
+        try profileMark(prof, .hc, &.{ pa.h, pa.sp.pre, pa.sp.post, pa.sp.comb });
+    }
     const pos = try sc.i(ci(sp.p0));
     // The heads unroped and their roped tail apart, where the gather reads them (a trace keeps the whole roped heads it
     // records).
     const q_tail = m.attn_gather != null and m.trace == null and m.cfg.dsv4_rope_head_dim == 64 and m.cfg.head_dim % 64 == 0;
-    const pj = try qkvProjWith(&sc, m, ly, ropeFor(m, li).fwd, pa.h, pos, q_tail);
+    const pj = try qkvProjProfile(&sc, m, ly, ropeFor(m, li).fwd, pa.h, pos, q_tail, prof);
     const heads = try gpa.alloc(A, n_spans);
     defer gpa.free(heads);
     var n_heads: usize = 0;
@@ -6474,6 +6694,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         defer csc.deinit();
         try compress(&csc, m, st, li, &ly.comp.?, try csc.slice(pa.h, 0, lo, hi), sp.p0 + lo);
     };
+    if (comp_first) try profileCompress(prof, &st.layers[li]);
     // scratch_attn.zig: a full run's grouped heads straight into a run region (`[rows, og, in]`), its `wo_a` reading
     // the region: no join, no transpose (with an EXL3 `wo_a`).
     const heads_b = run > 1 and m.act == .bfloat16 and try sat.headsLayerBegin(ly.wo_a.ext != null, run * sp.span, m.cfg.dsv4_o_groups, @as(usize, m.cfg.num_attention_heads) / m.cfg.dsv4_o_groups * m.cfg.head_dim, m.act);
@@ -6484,7 +6705,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         // A span's core intermediates are dropped once built, as in the per-span path.
         var ssc = Scope.init(gpa, m.s);
         defer ssc.deinit();
-        var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .compressed = comp_first };
+        var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .compressed = comp_first, .prof = prof };
         var span_pj: Proj = .{ .q = try ssc.slice(pj.q, 0, lo, hi), .kv = try ssc.slice(pj.kv, 0, lo, hi), .qr = try ssc.slice(pj.qr, 0, lo, hi) };
         if (pj.qt.ctx != null) span_pj.qt = try ssc.slice(pj.qt, 0, lo, hi);
         // Whether this span's run takes a region (its `run` spans all of `sp.span` rows).
@@ -6497,7 +6718,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         var o_k = try attention(&ssc, m, st, li, try ssc.slice(pa.h, 0, lo, hi), sp.p0 + lo, &sh, span_pj);
         // Each span (or each run of spans) takes its own `wo_a`: the rows the chunk's `wo_b` reads, not the heads, are
         // joined. Heads the core handed back plain are roped and grouped here.
-        if (!sh.grouped) o_k = try ssc.transpose(try ssc.reshape(try ropeTail(&ssc, m, o_k, ropeFor(m, li).inv, try ssc.i(ci(sp.p0 + lo)), 1.0), &.{ ci(hi - lo), og, -1 }), &.{ 1, 0, 2 });
+        if (!sh.grouped) {
+            o_k = try ssc.transpose(try ssc.reshape(try ropeTail(&ssc, m, o_k, ropeFor(m, li).inv, try ssc.i(ci(sp.p0 + lo)), 1.0), &.{ ci(hi - lo), og, -1 }), &.{ 1, 0, 2 });
+            try profileMark(prof, .attn_out_glue, &.{o_k});
+        }
         if (run > 1) {
             if (run_scope == null) run_scope = Scope.init(gpa, m.s);
             run_heads[in_run] = try run_scope.?.keep(ssc.out(o_k));
@@ -6507,10 +6731,9 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
                 // output.
                 const r_region = if (heads_b) try sat.headsRunEnd(sc.s) else null;
                 if (r_region) |rg| _ = try run_scope.?.keep(rg);
-                heads[n_heads] = if (r_region != null)
-                    try sc.keep(try attnOutARun(&run_scope.?, m, ly, r_region.?))
-                else
-                    try sc.keep(try woaRun(&run_scope.?, m, ly, run_heads[0..in_run]));
+                const rs = &run_scope.?;
+                const oa = if (r_region) |rg| try attnOutARun(rs, m, ly, rg, prof) else try woaRun(rs, m, ly, run_heads[0..in_run], prof);
+                heads[n_heads] = try sc.keep(rs.out(oa));
                 if (r_region != null) try sat.headsReleased(heads[n_heads]);
                 n_heads += 1;
                 in_run = 0;
@@ -6519,12 +6742,14 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             }
         } else {
             if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) woa_dense = try ly.wo_a.dense(&sc, m.act);
-            const oa = try attnOutA(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null);
+            const oa = try attnOutAProfile(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null, prof);
             // A tensor split sums each span's wo_b on the CPU stream while the GPU runs the next span's attention.
-            heads[n_heads] = try sc.keep(ssc.out(if (m.tp != null) try tpSum(&ssc, m, try ly.wo_b.apply(&ssc, oa)) else oa));
+            const y = if (m.tp != null) try attnOutSum(&ssc, m, try attnOutBProfile(&ssc, ly, oa, prof), prof) else oa;
+            heads[n_heads] = try sc.keep(ssc.out(y));
             n_heads += 1;
         }
         hold(&sp.topks[k], sh.topk);
+
         hold(&sp.cands[k], sh.cand);
         if (igroup.endsGroup(k, ig_g, n_spans)) {
             var ig_ev: std.ArrayList(A) = .empty;
@@ -6537,11 +6762,14 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             ig_start = k + 1;
         }
     }
-    const y = if (m.tp != null) try sc.concat(heads[0..n_heads], 0) else try ly.wo_b.apply(&sc, try sc.concat(heads[0..n_heads], 0));
+    const joined = try sc.concat(heads[0..n_heads], 0);
+    try profileMark(prof, .attn_out_glue, &.{joined});
+    const y = if (m.tp != null) joined else try attnOutBProfile(&sc, ly, joined, prof);
     // scratch_x1.zig: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE
     // group, so that group's output is the region's last reader's).
     const x1_scratch = m.streamed != null and sp.L >= scratch_rows and mlx.streamIsGpu(m.s);
     const pf = if (x1_scratch) try hcExpandPreNormScratch(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm) else try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
+    try profileStaged(prof, &pf);
     // A streamed bank reads each layer's experts once per call: one MoE over all of its rows.
     const group = if (m.streamed != null) n_spans else @max(1, m.moe_rows / sp.span);
     var k0: usize = 0;
@@ -6569,7 +6797,16 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         // the region. The call's last wide layer keeps the fresh buffer: its
         // streams are read after the call's last eval (the CED replay, the head, the next chunk).
         const into = pf.in_region and k0 == 0 and k1 == n_spans and next_wide and (m.n_mtp == 0 or m.dsparkTarget(li + 1) == null);
-        const xg = if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
+        const xg = if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into, prof)) |v| blk: {
+            try profileMark(prof, .routed, &.{v});
+            break :blk v;
+        } else blk: {
+            const part = try moeProfile(&gsc, m, li, hg, img, prof);
+            try profileMark(prof, .routed, &.{part});
+            const out = try hcExpand(&gsc, x1g, part, &sf);
+            try profileMark(prof, .expand, &.{out});
+            break :blk out;
+        };
         // scratch_x1.zig: the region's next writer waits for this, its last reader.
         if (x1_scratch and k1 == n_spans) try sx1.ps().x1.released(xg);
         for (k0..k1) |k| {
@@ -6594,16 +6831,26 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     tkeep.layerEnd(&.{ pj.q, pa.h, pj.qt }, next_wide);
 }
 /// A full run's `wo_a` over its region `x` (`[rows, og, in]`, published): the plugin's grouped linear reads that
-/// layout as it is (no join, no transpose), `[rows, og * o_lora]` in `m.act`, a new handle the caller frees.
-fn attnOutARun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, x: A) !A {
+/// layout as it is (no join, no transpose), `[rows, og * o_lora]` in `m.act`.
+fn attnOutARun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, x: A, prof: ?*Profile) !A {
     const e = if (ly.wo_a.ext) |*e| e else return error.ScratchHeadsNoOutside;
     const L = dim(x, 0);
-    return sc.out(try sc.astype(try sc.reshape(try sc.keep(try e.matmul(x, sc.s)), &.{ ci(L), -1 }), m.act));
+    const oa = try sc.keep(try e.matmul(x, sc.s));
+    try profileMark(prof, .wo_a, &.{oa});
+    if (prof) |p| {
+        const groups = dim(x, 1);
+        try p.noteShape(.{ .matmul = .wo_a, .groups = groups, .m = L, .n = mlx.mlx_array_size(oa) / (L * groups), .k = dim(x, 2) });
+    }
+    const rows = try sc.astype(try sc.reshape(oa, &.{ ci(L), -1 }), m.act);
+    try profileMark(prof, .attn_out_glue, &.{rows});
+    return rows;
 }
 /// One run's `wo_a` over its spans' grouped heads `parts` (`[og, rows_k, in]` each), their rows joined
-/// (`[og, rows, in]`) through one `attnOutA`: `[rows, og * o_lora]` in `m.act`. A handle the caller frees.
-fn woaRun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, parts: []const A) !A {
-    return sc.out(try attnOutA(sc, m, ly, try sc.concat(parts, 1), null));
+/// (`[og, rows, in]`) through one grouped projection: `[rows, og * o_lora]` in `m.act`.
+fn woaRun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, parts: []const A, prof: ?*Profile) !A {
+    const joined = try sc.concat(parts, 1);
+    try profileMark(prof, .attn_out_glue, &.{joined});
+    return attnOutAProfile(sc, m, ly, joined, null, prof);
 }
 
 /// A streamed prompt call's routes of layer `li` predicted before its attention (the FFN's input taken as the stream
@@ -6646,6 +6893,7 @@ pub const Spans = struct {
     p0: usize,
     eng_ids: []const u32,
     ncols: usize,
+    prof: ?*Profile = null,
     prefetch: ?*engram.Prefetch = null,
     /// A replay tail's first position (`Shared.floor`).
     floor: ?usize = null,
@@ -6682,15 +6930,16 @@ fn cedCompress(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
     defer sc.deinit();
     for (sp.xs, sp.pres, 0..) |x, pre, k| {
         const pa = try hcPreNormWide(&sc, m, x, pre, &ly.hc_attn, ly.attn_norm);
+        try profileMark(sp.prof, .hc, &.{pa.h});
         try compress(&sc, m, st, li, &ly.comp.?, pa.h, sp.p0 + k * sp.span);
+        try profileCompress(sp.prof, &st.layers[li]);
     }
 }
 
-/// CED: `cedCompress`, then `sp`'s last rows become `tsp`'s spans, the decoder's input; `sp`'s streams are released.
+/// CED: `sp`'s last rows become `tsp`'s spans, the decoder's input; `sp`'s streams are released.
 /// The rows before the tail get no decoder window KV, which no tail query reaches: the tail's band stops at its first
 /// row.
-fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, tsp: *const Spans, li: usize) !void {
-    try cedCompress(m, gpa, st, sp, li);
+fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, tsp: *const Spans) !void {
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
     // The tail's rows come from the spans it overlaps.
@@ -6703,6 +6952,7 @@ fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
         const lo, const hi = tsp.bounds(k);
         hold(&tsp.xs[k], try sc.slice(x, 0, off + lo, off + hi));
         hold(&tsp.pres[k], try sc.slice(pre, 0, off + lo, off + hi));
+        try profileMark(tsp.prof, .setup, &.{ tsp.xs[k], tsp.pres[k] });
     }
     for ([_][]A{ sp.xs, sp.pres, sp.topks, sp.cands }) |slots| for (slots) |*s| hold(s, none);
 }
@@ -6733,6 +6983,7 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
         const y = try engramApply(sc, m, e, x, try sc.reshape(rows, &.{ ci(hi - lo), -1 }));
         // An image span's rows get no Engram write (the reference shuts their gate).
         x = if (sp.img.ctx != null) try sc.where(try sc.expand(try sc.expand(try sp.imgSlice(sc, lo, hi), -1), -1), x, y) else y;
+        try profileMark(sp.prof, .engram, &.{x});
         if (m.trace) |t| try t.put("engram_{d}", .{li}, x);
         if (sp.xs.len == 1 and engramReadsAtOnce(sp.L)) {
             try asyncEval(x);
@@ -6751,7 +7002,6 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
 /// rows, and run the stretches around attention's state as compiled graphs, one per layer: what precedes attention, its
 /// projections, and the FFN half of the block.
 pub const region_rows = 16;
-
 
 /// With a streamed bank the FFN stretch runs as three (`ffn_pre`, `ffn_act`, `ffn_post`) around the source's host
 /// barrier, cut where `ffn` has no fusable op across the cut.
@@ -11535,6 +11785,74 @@ fn bfRandom(sc: *Scope, seed: u64, shape: []const c_int, mean: f32, sd: f32) !A 
     return r;
 }
 
+fn benchMxfp8(sc: *Scope, w: A) !Lin {
+    const native = @import("../../sdk/quant/native.zig");
+    const q = try native.quantized(w, "mxfp8", 8, 32, sc.s);
+    const packed_weight = sc.keep(q.w) catch |err| {
+        _ = mlx.mlx_array_free(q.sc);
+        return err;
+    };
+    return .{ .w = packed_weight, .s = try sc.keep(q.sc), .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
+}
+
+test "dsv41 bench: grouped and flat prefill projections (DSV41_BENCH_PREFILL_WO_A)" {
+    if (!env.on(.DSV41_BENCH_PREFILL_WO_A)) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const cfg = try @import("decode/fixture.zig").releaseConfig();
+    const groups = cfg.dsv4_o_groups;
+    const span = SPAN;
+    const rows = groups * span;
+    const q_n = @as(usize, cfg.num_attention_heads) * cfg.head_dim;
+    const q_k = cfg.dsv4_q_lora_rank;
+    const a_n = cfg.dsv4_o_lora_rank;
+    const a_k = q_n / groups;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+
+    const xg = try bfRandom(&sc, 1, &.{ ci(groups), ci(span), ci(a_k) }, 0, 1);
+    const xf = try sc.reshape(xg, &.{ ci(rows), ci(a_k) });
+    const xq = try bfRandom(&sc, 2, &.{ ci(rows), ci(q_k) }, 0, 1);
+    const wa = try bfRandom(&sc, 3, &.{ ci(a_n), ci(a_k) }, 0, 0.01);
+    // Materialize independent copies of the flat weight so both arms do the same dot products.
+    const copies = try sc.broadcast(try sc.expand(wa, 0), &.{ ci(groups), ci(a_n), ci(a_k) });
+    const wg = try benchMxfp8(&sc, copies);
+    const wf = try benchMxfp8(&sc, wa);
+    const wq = try benchMxfp8(&sc, try bfRandom(&sc, 4, &.{ ci(q_n), ci(q_k) }, 0, 0.01));
+    try evalAll(&.{ xf, wg.w, wg.s, wf.w, wf.s, wq.w, wq.s });
+
+    const cases = [_]struct { name: []const u8, x: A, w: Lin, groups: usize, use_serving_linear: bool = false }{
+        .{ .name = "wo_a_grouped", .x = xg, .w = wg, .groups = groups },
+        .{ .name = "wo_a_flat", .x = xf, .w = wf, .groups = 1 },
+        .{ .name = "wq_b", .x = xq, .w = wq, .groups = 1, .use_serving_linear = true },
+    };
+    const reps = 6;
+    var times: [cases.len][reps]i64 = undefined;
+    for (0..reps + 1) |rep| for (cases, 0..) |arm, i| {
+        var run = Scope.init(sc.a, sc.s);
+        defer run.deinit();
+        const t0 = monoUs();
+        // Keep both wo_a arms quantized at equal total rows. wq_b uses the serving linear.
+        const y = if (arm.use_serving_linear) try arm.w.apply(&run, arm.x) else try groupedMatmul(&run, &arm.w, arm.x, none);
+        try mlx.check(mlx.mlx_array_eval(y));
+        const us = monoUs() - t0;
+        if (rep != 0) {
+            times[i][rep - 1] = us;
+        } else {
+            try testing.expectEqual(rows, arm.groups * dim(y, -2));
+            try testing.expectEqual(dim(arm.w.w, -2), dim(y, -1));
+        }
+    };
+    for (cases, &times) |arm, *samples| {
+        std.mem.sort(i64, samples, {}, std.sort.asc(i64));
+        const ms = @as(f64, @floatFromInt(samples[reps / 2 - 1] + samples[reps / 2])) / 2000;
+        const M = dim(arm.x, -2);
+        const N = dim(arm.w.w, -2);
+        const K = dim(arm.x, -1);
+        const flops: f64 = @floatFromInt(2 * arm.groups * M * N * K);
+        std.debug.print("[dsv41-woa-bench] {s} M={d} N={d} K={d} groups={d} reps={d} ms={d:.3} tflops={d:.3}\n", .{ arm.name, M, N, K, arm.groups, reps, ms, flops / (ms * 1e9) });
+    }
+}
+
 test "dsv41 vocab head: every rank's rows of the head, gathered, give the whole head's logits bit for bit, dense and 8-bit" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -11799,6 +12117,72 @@ test "dsv41 pair: a layer split refuses an MLX pack's streamed experts by name b
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.Dsv41PairStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 4, .hi = 8, .worker = false }, .streamed_experts = true }));
+}
+
+fn capturePrefillProfile(m: *Dsv41Model, ids: []const u32) ![]u8 {
+    var failure: ?anyerror = null;
+    m.profile_prefill = true;
+    const text = try @import("../../sdk/testing/log_capture.zig").capture(testing.allocator, struct {
+        fn run(model: *Dsv41Model, prompt: []const u32, err: *?anyerror) void {
+            const out = prefill(model, testing.allocator, prompt, null) catch |e| {
+                err.* = e;
+                return;
+            };
+            _ = mlx.mlx_array_free(out);
+        }
+    }.run, .{ m, ids, &failure });
+    errdefer testing.allocator.free(text);
+    if (failure) |err| return err;
+    return text;
+}
+
+test "dsv41 prefill profile: short compiled prompts report both projections as one stage" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try @import("decode/fixture.zig").Fixture.initWhole(gpa, .{ .layers = 1, .vocab = 16 });
+    defer fx.deinit();
+    fx.m.dec.deinit();
+    const prompt: [region_rows + 1]u32 = @splat(1);
+
+    const compiled = try capturePrefillProfile(fx.m, prompt[0..4]);
+    defer gpa.free(compiled);
+    try testing.expect(std.mem.indexOf(u8, compiled, " wo_ab_fused=") != null);
+    try testing.expect(std.mem.indexOf(u8, compiled, " wo_a=") == null);
+    try testing.expect(std.mem.indexOf(u8, compiled, " wo_b=") == null);
+
+    const unfused = try capturePrefillProfile(fx.m, &prompt);
+    defer gpa.free(unfused);
+    try testing.expect(std.mem.indexOf(u8, unfused, " wo_ab_fused=") == null);
+    try testing.expect(std.mem.indexOf(u8, unfused, " wo_a=") != null);
+    try testing.expect(std.mem.indexOf(u8, unfused, " wo_b=") != null);
+}
+
+test "dsv41 prefill profile: a layer split reports the round trip to its unprofiled worker" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const Fixture = @import("decode/fixture.zig").Fixture;
+    const host = try Fixture.initWhole(gpa, .{ .vocab = 16 });
+    defer host.deinit();
+    const worker = try Fixture.init(gpa, .{ .lo = 0, .hi = 1, .ctx = 0, .experts = 8, .experts_fp4 = true });
+    defer worker.deinit();
+    const Xchg = struct {
+        var w: *Dsv41Model = undefined;
+        fn call(x: A, pre: A, p0: usize, snap: bool, verify: bool) anyerror![2]A {
+            return workerStep(w, testing.allocator, x, pre, p0, snap, verify);
+        }
+    };
+    host.m.pair = .{ .lo = 0, .hi = 1, .worker = false };
+    Xchg.w = worker.m;
+    const hooks = clusterHooks();
+    const previous = hooks.pair_exchange;
+    hooks.pair_exchange = &Xchg.call;
+    defer hooks.pair_exchange = previous;
+
+    const text = try capturePrefillProfile(host.m, &.{ 1, 2, 3, 4 });
+    defer gpa.free(text);
+    try testing.expectEqual(@as(usize, 4), worker.state().n);
+    try testing.expect(std.mem.indexOf(u8, text, " remote_wait=") != null);
+    try testing.expect(std.mem.indexOf(u8, text, " workers=unprofiled") != null);
 }
 
 test "request id: dsv41 CED prefill logs the current request" {
