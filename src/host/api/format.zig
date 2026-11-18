@@ -146,6 +146,36 @@ pub fn formatChatUsage(
     , .{ prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cached_tokens, extra_details });
 }
 
+/// The token ids an opted-in chat usage carries (`"return_token_ids": true`): the prompt the server served and the
+/// tokens it generated.
+pub const TokenIds = struct { prompt: []const u32, generated: []const u32 };
+
+/// `usage` (a JSON object) with `"prompt_ids"` and `"generated_ids"` appended; `usage` unchanged when `ids` is null.
+pub fn chatUsageTokenIds(allocator: std.mem.Allocator, usage: []const u8, ids: ?TokenIds) ![]u8 {
+    const t = ids orelse return allocator.dupe(u8, usage);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, usage[0 .. usage.len - 1]);
+    for ([_]struct { key: []const u8, list: []const u32 }{ .{ .key = "prompt_ids", .list = t.prompt }, .{ .key = "generated_ids", .list = t.generated } }) |field| {
+        try out.print(allocator, ",\"{s}\":[", .{field.key});
+        for (field.list, 0..) |id, i| try out.print(allocator, "{s}{d}", .{ if (i == 0) "" else ",", id });
+        try out.append(allocator, ']');
+    }
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+test "chatUsageTokenIds appends both id lists, and leaves the usage alone when not asked" {
+    const t = std.testing;
+    const usage = "{\"request_id\":\"x\",\"prompt_tokens\":3}";
+    const same = try chatUsageTokenIds(t.allocator, usage, null);
+    defer t.allocator.free(same);
+    try t.expectEqualStrings(usage, same);
+    const with = try chatUsageTokenIds(t.allocator, usage, .{ .prompt = &.{ 1, 2, 3 }, .generated = &.{} });
+    defer t.allocator.free(with);
+    try t.expectEqualStrings("{\"request_id\":\"x\",\"prompt_tokens\":3,\"prompt_ids\":[1,2,3],\"generated_ids\":[]}", with);
+}
+
 pub fn chatUsageRequestId(allocator: std.mem.Allocator, usage: []const u8, request_id: u64) ![]u8 {
     return std.fmt.allocPrint(allocator, "{{\"request_id\":\"{f}\",{s}", .{ log.requestTag(request_id), usage[1..] });
 }

@@ -87,13 +87,18 @@ pub const StreamingTokenStream = struct {
     finish_details: ?[]const u8 = null,
     prefill_ns: u64 = 0,
     decode_ns: u64 = 0,
+    /// The yielded token ids, kept only for a request that asked for them (`return_token_ids`).
+    collect_ids: bool = false,
+    ids: std.ArrayList(u32) = .empty,
 
     /// `mode` is recorded for telemetry: the engine already routed PLD/drafter/MTP.
     pub fn initFromStream(stream: *Stream, mode: StreamMode, eos: []const u32) StreamingTokenStream {
         return .{ .stream = stream, .request_id = stream.request_id, .mode = mode, .eos_token_ids = eos };
     }
 
-    pub fn deinit(_: *StreamingTokenStream, _: std.mem.Allocator) void {}
+    pub fn deinit(self: *StreamingTokenStream, allocator: std.mem.Allocator) void {
+        self.ids.deinit(allocator);
+    }
 
     /// Copies the request's numbers out of the stream; idempotent.
     pub fn finalize(self: *StreamingTokenStream) void {
@@ -131,11 +136,14 @@ pub const StreamingTokenStream = struct {
 
     /// The next token, the end, or `.idle` after `timeout_ms` with no progress so the caller can poll the peer
     /// socket and send SSE keepalives during a long prefill.
-    pub fn nextOrIdle(self: *StreamingTokenStream, _: std.mem.Allocator, timeout_ms: i64) !NextOrIdle {
+    pub fn nextOrIdle(self: *StreamingTokenStream, allocator: std.mem.Allocator, timeout_ms: i64) !NextOrIdle {
         if (self.finished) return .done;
         const nr = self.stream.waitNextTimeout(timeout_ms) orelse return .idle;
         switch (nr) {
-            .token => |t| return .{ .token = t },
+            .token => |t| {
+                if (self.collect_ids) try self.ids.append(allocator, t);
+                return .{ .token = t };
+            },
             .done => {
                 self.finished = true;
                 return .done;
@@ -262,6 +270,7 @@ pub fn handleStreamingGeneration(
         .kv_quant_config = kv_quant_override,
     });
     var ts = StreamingTokenStream.initFromStream(running.?.stream, stream_mode, eos_token_ids);
+    ts.collect_ids = stream.return_token_ids;
     defer ts.deinit(allocator);
 
     // Send SSE headers (no Content-Length — we stream until done)
@@ -1031,7 +1040,8 @@ pub fn handleStreamingGeneration(
         // Usage chunk only if requested via stream_options.include_usage. Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
         const usage: ?StreamUsage = if (include_usage) .{ .prompt = total_prompt, .completion = ts.completion_tokens, .cached = ts.cached_tokens, .reasoning = @intCast(@as(usize, @intCast(think_tokens)) + reasoning_tokens_sent) } else null;
-        try sendStreamTail(allocator, stream, chat_id, model_name, .{ .reason = finish_reason, .details = ts.finish_details }, try lps.take(), usage, if (timings_obj.len > 0) timings_obj else null);
+        const ids: ?@import("format.zig").TokenIds = if (stream.return_token_ids) .{ .prompt = stream.usage_prompt_ids, .generated = ts.ids.items } else null;
+        try sendStreamTail(allocator, stream, chat_id, model_name, .{ .reason = finish_reason, .details = ts.finish_details }, try lps.take(), usage, if (timings_obj.len > 0) timings_obj else null, ids);
     }
 
     // Per-slot timings come from the scheduler (ts.prefill_ns / ts.decode_ns,
@@ -1057,6 +1067,7 @@ fn sendStreamTail(
     logprobs_json: ?[]const u8,
     usage: ?StreamUsage,
     timings: ?[]const u8,
+    ids: ?@import("format.zig").TokenIds,
 ) !void {
     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish.reason, .details = finish.details }, null, if (usage == null) timings else null, .{ .logprobs_json = logprobs_json });
     // OpenAI ships the usage chunk with an EMPTY choices array — restating
@@ -1066,7 +1077,9 @@ fn sendStreamTail(
     if (usage) |u| {
         const usage_json = try formatChatUsageWithReasoning(allocator, u.prompt, u.completion, u.cached, u.reasoning);
         defer allocator.free(usage_json);
-        const request_usage = try @import("format.zig").chatUsageRequestId(allocator, usage_json, chat_id);
+        const tagged_usage = try @import("format.zig").chatUsageRequestId(allocator, usage_json, chat_id);
+        defer allocator.free(tagged_usage);
+        const request_usage = try @import("format.zig").chatUsageTokenIds(allocator, tagged_usage, ids);
         defer allocator.free(request_usage);
         try sendSSEUsageChunk(allocator, stream, chat_id, model_name, request_usage, timings);
     }
@@ -1091,7 +1104,7 @@ test "a streamed turn's result keeps the prompt-cache hit and timings the slot m
 fn testStreamTail(a: std.mem.Allocator, usage: ?StreamUsage, timings: ?[]const u8) ![]std.json.Value {
     const raw = try capture(a, struct {
         fn run(conn: *Conn, al: std.mem.Allocator, u: ?StreamUsage, t: ?[]const u8) !void {
-            try sendStreamTail(al, conn, 1, "m", .{ .reason = "stop", .details = null }, null, u, t);
+            try sendStreamTail(al, conn, 1, "m", .{ .reason = "stop", .details = null }, null, u, t, null);
         }
     }.run, .{ a, usage, timings });
     var events = std.ArrayList(std.json.Value).empty;
@@ -1141,7 +1154,7 @@ test "request id: streaming chat header and final usage match every chunk" {
             fn run(conn: *Conn, al: std.mem.Allocator, with_usage: bool) !void {
                 const id = try sendChatSseHeaders(conn, 73);
                 const usage: ?StreamUsage = if (with_usage) .{ .prompt = 10, .completion = 2, .cached = 3, .reasoning = 0 } else null;
-                try sendStreamTail(al, conn, id, "m", .{ .reason = "stop", .details = null }, null, usage, null);
+                try sendStreamTail(al, conn, id, "m", .{ .reason = "stop", .details = null }, null, usage, null, null);
             }
         }.run, .{ a, include_usage });
         try testing.expect(std.mem.indexOf(u8, raw, "x-mlx-request-id: chatcmpl-0000000000000000-73\r\n") != null);

@@ -1866,6 +1866,62 @@ test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 medi
     try testing.expectEqualStrings(a_reason, b_reason);
 }
 
+/// The usage object of a reply: the JSON body, or the SSE event that carries `"usage":{`.
+fn usageOf(a: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (!std.mem.startsWith(u8, line, "data: {") or std.mem.indexOf(u8, line, "\"usage\":{") == null) continue;
+        return std.json.parseFromSlice(std.json.Value, a, line["data: ".len..], .{});
+    }
+    return std.json.parseFromSlice(std.json.Value, a, body, .{});
+}
+
+fn usageReply(io: std.Io, node: *LiveNode, body: []const u8) !std.json.Parsed(std.json.Value) {
+    const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 50000 } };
+    var reply = try sendHttp(io, node, loopback, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\n", body);
+    defer reply.deinit(testing.allocator);
+    try expectStatus(body, 200, reply);
+    return usageOf(testing.allocator, reply.body);
+}
+
+test "usage token ids: opt-in usage carries the prompt and generated ids, and a default reply is unchanged" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const node = try LiveNode.open(io, try fixture.v41ServableFiles(arena.allocator(), 7));
+    defer node.close();
+    const msgs = "{\"messages\":[{\"role\":\"user\",\"content\":\"Explain cache locality in systems programming.\"}],\"temperature\":0,\"max_tokens\":4";
+    for ([_][]const u8{ ",\"stream\":false", ",\"stream\":true,\"stream_options\":{\"include_usage\":true}" }) |mode| {
+        var plain = try usageReply(io, node, try std.mem.concat(arena.allocator(), u8, &.{ msgs, mode, "}" }));
+        defer plain.deinit();
+        var off = try usageReply(io, node, try std.mem.concat(arena.allocator(), u8, &.{ msgs, mode, ",\"return_token_ids\":false}" }));
+        defer off.deinit();
+        var on = try usageReply(io, node, try std.mem.concat(arena.allocator(), u8, &.{ msgs, mode, ",\"return_token_ids\":true}" }));
+        defer on.deinit();
+        const plain_usage = plain.value.object.get("usage").?.object;
+        const off_usage = off.value.object.get("usage").?.object;
+        const usage = on.value.object.get("usage").?.object;
+        // Off, or not asked: the usage object has exactly the keys it always had, and no ids.
+        try testing.expect(!plain_usage.contains("prompt_ids") and !plain_usage.contains("generated_ids"));
+        try testing.expectEqual(plain_usage.count(), off_usage.count());
+        for (plain_usage.keys()) |key| try testing.expect(off_usage.contains(key));
+        // On: the same keys plus the two id lists, whose lengths are the token counts.
+        try testing.expectEqual(plain_usage.count() + 2, usage.count());
+        for (plain_usage.keys()) |key| try testing.expect(usage.contains(key));
+        const prompt_ids = usage.get("prompt_ids").?.array.items;
+        const generated_ids = usage.get("generated_ids").?.array.items;
+        try testing.expectEqual(usage.get("prompt_tokens").?.integer, @as(i64, @intCast(prompt_ids.len)));
+        try testing.expectEqual(usage.get("completion_tokens").?.integer, @as(i64, @intCast(generated_ids.len)));
+        try testing.expect(generated_ids.len > 0);
+        for (prompt_ids) |id| try testing.expect(id == .integer and id.integer >= 0);
+        for (generated_ids) |id| try testing.expect(id == .integer and id.integer >= 0);
+    }
+}
+
 test "dsv41 peer fetch: HTTP cache import accepts a body above 512 MiB when slow gate is enabled" {
     if (!env.on(.CACHE_TRANSFER_SLOW_E2E)) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
