@@ -3809,9 +3809,12 @@ fn chainProbe(io: std.Io, link: *const Link, s: mlx.mlx_stream) !void {
 /// (one decode row of a hyper-connection stream, a prefill chunk) and all_sum.
 pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     if (args.len == 1 and std.mem.eql(u8, args[0], "--cycle-end-format")) {
-        log.info("[dist-probe] cycle_end_ms v1\n", .{});
+        log.info("[dist-probe] cycle_end_ms v2\n", .{});
         return;
     }
+    // Declared first so it runs last, after every teardown below: the judge counts a gap sample only between a
+    // cycle's end and this line, both on this rank's clock.
+    defer log.info("[dist-probe] exit_ms {d}\n", .{crt.wallMs()});
     log.info("[dist-probe] jaccl formation deadline: {s}\n", .{if (mlx.jacclFormationDeadlineAvailable()) "available" else "missing"});
     // `--soak N`: N header + one-row-stream round trips, the shape of a pipeline decode hop.
     var soak: u64 = 0;
