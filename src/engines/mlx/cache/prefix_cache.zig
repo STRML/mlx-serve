@@ -1499,26 +1499,36 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
-    /// What a session export sends for a tip: the decode-end tail of the request that committed the tip's boundary
-    /// (its prompt is the boundary plus at most the one token the boundary stands short of), the entry a same-box
-    /// continuation restores, so a moved session keeps its last reply; else the boundary itself. A tail of a longer
-    /// prompt belongs to another turn or session and is never sent. On the importer, a next prompt that drops or
-    /// re-renders the reply restores from the tail by a cut (`findBestRestorableMatchWithModule`, `MODULE_CUT_COST`).
+    /// What a session export sends for a tip: the decode-end entry the same request committed after the tip's
+    /// boundary (`SessionTip.tail_id`, bound in `bindSessionTail`), the entry a same-box continuation restores, so a
+    /// moved session keeps its last reply; else the boundary itself. Another session's or an untagged request's tail is
+    /// never sent, whatever tokens it shares. On the importer, a next prompt that drops or re-renders the reply
+    /// restores from the tail by a cut (`findBestRestorableMatchWithModule`, `MODULE_CUT_COST`).
     pub fn ramExportOfTip(self: *const HotPrefixCache, tip: SessionTip, session: u64) ?RamModuleHit {
         const boundary = self.ramHitOfTip(tip, session) orelse return null;
+        if (tip.tail_id == 0) return boundary;
         const n = boundary.tokens.len;
-        var best: ?*const Entry = null;
         for (self.entries.items) |*e| {
-            const m = e.module orelse continue;
-            if (m.tail_from < n or m.tail_from > n + 1 or e.tokens.len <= n or e.checked_out_by != null) continue;
-            if (!ModuleBinding.same(m.binding, boundary.payload.binding) or e.has_tools != boundary.has_tools) continue;
-            if (!std.meta.eql(e.quant_config, boundary.quant_config) or e.media.len != 0 or boundary.media.len != 0) continue;
-            if (!std.mem.eql(u32, e.tokens[0..boundary.tokens.len], boundary.tokens)) continue;
-            if (best == null or e.last_used > best.?.last_used) best = e;
+            if (e.id != tip.tail_id) continue;
+            const m = e.module orelse return boundary;
+            if (m.tail_from == 0 or e.tokens.len <= n or e.checked_out_by != null or e.media.len != 0) return boundary;
+            if (!std.mem.eql(u32, e.tokens[0..n], boundary.tokens)) return boundary;
+            var hit = ramHit(e) orelse return boundary;
+            hit.session = session;
+            return hit;
         }
-        var hit = ramHit(best orelse return boundary) orelse return boundary;
-        hit.session = session;
-        return hit;
+        return boundary;
+    }
+
+    /// The decode-end entry `id` a tagged request just committed is its session's tail when the session's tip is that
+    /// request's boundary: the tail starts with the boundary's tokens and its prompt is the boundary or one past it.
+    fn bindSessionTail(self: *HotPrefixCache, session: u64, ids: []const u32, tail_from: usize, id: u64) void {
+        if (session == 0) return;
+        const tip = self.session_tips.getPtr(session) orelse return;
+        if (tail_from < tip.n or tail_from > tip.n + 1 or ids.len <= tip.n) return;
+        const boundary = self.ramHitOfTip(tip.*, session) orelse return;
+        if (!std.mem.eql(u32, ids[0..tip.n], boundary.tokens)) return;
+        tip.tail_id = id;
     }
 
     pub fn findRamModule(
@@ -1543,6 +1553,8 @@ pub const HotPrefixCache = struct {
         seq: u64,
         /// In the persisted index: a tip goes there only once its record is committed on the SSD (`persistDurableTips`).
         persisted: bool = false,
+        /// The RAM id of the decode-end entry the boundary's own request committed (`bindSessionTail`); 0 is none.
+        tail_id: u64 = 0,
     };
 
     pub const MAX_SESSION_TIPS: usize = 4096;
@@ -2443,6 +2455,7 @@ pub const HotPrefixCache = struct {
             });
         }
         if (seq != 0) self.noteSessionTip(session, .{ .id = boundary_key, .n = ids.len, .variant = binding.variant, .seq = seq }, true);
+        if (tail_from > 0) self.bindSessionTail(session, ids, tail_from, self.entries.items[last].id);
         self.logResident();
         return .{ .ok = ids.len };
     }
@@ -13370,6 +13383,40 @@ test "HotPrefixCache module: a session export sends the decode-end tail past its
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, cache.findSessionTip(7).?.tokens);
     // A session with no tail past its boundary sends the boundary.
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 5 }, cache.ramExportOfTip(cache.sessionTip(8).?, 8).?.tokens);
+}
+
+test "HotPrefixCache module: two sessions that share a boundary and diverge after it each export their own tail" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const dense = kv_quant.KVQuantConfig.dense;
+    // Session 7 sends 1 2 3 4 5 and gets 6; session 8 sends 1 2 3 4 9 and gets 7. Both boundaries are 1 2 3 4.
+    var boundary_7: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var tail_7: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 6 }, .key = 21 };
+    var boundary_8: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var tail_8: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 9, 7 }, .key = 26 };
+    // An untagged request on the same boundary, newest of all.
+    var boundary_0: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var tail_0: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 8, 8 }, .key = 26 };
+    _ = try boundary_7.putSession(&cache, binding, &.{}, 7);
+    _ = try cache.commitModuleTail(binding, &tail_7, tail_7.ids, tail_7.key, &.{}, false, dense, 0, 7, 5);
+    _ = try boundary_8.putSession(&cache, binding, &.{}, 8);
+    _ = try cache.commitModuleTail(binding, &tail_8, tail_8.ids, tail_8.key, &.{}, false, dense, 0, 8, 5);
+    _ = try boundary_0.put(&cache, binding, &.{});
+    _ = try cache.commitModuleTail(binding, &tail_0, tail_0.ids, tail_0.key, &.{}, false, dense, 0, 0, 5);
+
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6 }, cache.ramExportOfTip(cache.sessionTip(7).?, 7).?.tokens);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 9, 7 }, cache.ramExportOfTip(cache.sessionTip(8).?, 8).?.tokens);
+
+    // Once a session's own tail is gone, it sends its boundary, never another request's tail.
+    for (cache.entries.items, 0..) |e, i| if (std.mem.eql(u32, e.tokens, tail_7.ids)) {
+        cache.evictAt(i, "test");
+        break;
+    };
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, cache.ramExportOfTip(cache.sessionTip(7).?, 7).?.tokens);
 }
 
 test "HotPrefixCache module: another session's longer boundary does not hide a session's own tip" {

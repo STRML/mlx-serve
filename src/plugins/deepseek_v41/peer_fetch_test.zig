@@ -511,6 +511,11 @@ test "peer transfer session: an export carries the decode-end checkpoint, so the
     try testing.expect(exported == .ok);
     defer testing.allocator.free(exported.ok.bytes);
     try testing.expect(importWire(model_b, exported.ok.bytes) == .ok);
+    // A cap the decode-end entry does not fit sends the prompt boundary instead of refusing the export.
+    const capped = exportBySessionCapped(model_a, 77, exported.ok.bytes.len - 1);
+    try testing.expect(capped == .ok);
+    defer testing.allocator.free(capped.ok.bytes);
+    try testing.expectEqual(@as(usize, 24), capped.ok.n);
 
     const warm_a = try model_a.runGreedy(&next, 4, false);
     defer testing.allocator.free(warm_a.tokens);
@@ -790,11 +795,14 @@ test "peer transfer session: an import a longer boundary covers exports exactly 
     const sender = try PeerHarness.open(files);
     defer sender.close();
 
-    const full_prompt = buildPrompt(33);
-    const long_turn = try holder.runGreedyTagged(&full_prompt, 2, true, 5);
-    defer testing.allocator.free(long_turn.tokens);
+    var full_prompt = buildPrompt(33);
     const short_turn = try sender.runGreedyTagged(full_prompt[0..25], 2, true, 6);
     defer testing.allocator.free(short_turn.tokens);
+    // The holder's longer prompt continues the sender's reply, so its boundary covers the sender's decode-end entry.
+    @memcpy(full_prompt[25..27], short_turn.tokens[0..2]);
+    const long_turn = try holder.runGreedyTagged(&full_prompt, 2, true, 5);
+    defer testing.allocator.free(long_turn.tokens);
+    try testing.expect(holder.entry.prefix_cache.?.hasModuleCovering(prefix_cache.ModuleBinding.init(&holder.xfm).?, full_prompt[0..27], &.{}, false, KVQuantConfig.dense));
     const short_wire = exportBySession(sender, 6);
     try testing.expect(short_wire == .ok);
     defer testing.allocator.free(short_wire.ok.bytes);

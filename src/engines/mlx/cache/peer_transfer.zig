@@ -175,11 +175,12 @@ fn sessionHit(
     session: u64,
     max_bytes: usize,
     holder: *DiskSession,
+    tails: bool,
 ) SessionLookup {
     var walk: prefix_cache_mod.HotPrefixCache.TipWalk = .{ .session = session };
     while (walk.next(hc)) |tip| {
         const had_error = mlx.errorPending();
-        const found = tipHit(allocator, sch, cfg, hc, xfm, session, tip, max_bytes, holder);
+        const found = tipHit(allocator, sch, cfg, hc, xfm, session, tip, max_bytes, holder, tails);
         if (found != .none) return found;
         mlx.dropLatchedErrorUnless(had_error);
     }
@@ -200,8 +201,10 @@ fn tipHit(
     tip: prefix_cache_mod.HotPrefixCache.SessionTip,
     max_bytes: usize,
     holder: *DiskSession,
+    tails: bool,
 ) SessionLookup {
-    if (hc.ramExportOfTip(tip, session)) |hit| return .{ .hit = hit };
+    const ram = if (tails) hc.ramExportOfTip(tip, session) else hc.ramHitOfTip(tip, session);
+    if (ram) |hit| return .{ .hit = hit };
     const d = if (hc.disk) |*dd| dd else return .none;
     const ref = d.moduleByBoundary(tip.id, tip.n) orelse return .none;
     const binding = prefix_cache_mod.ModuleBinding.forVariant(xfm, tip.variant) orelse return .none;
@@ -247,6 +250,7 @@ fn tipHit(
     } };
 }
 
+/// A session export whose decode-end tail does not fit `max_bytes` sends the session's boundary instead.
 fn exportWireModuleWithBudget(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -260,6 +264,28 @@ fn exportWireModuleWithBudget(
     session: u64,
     max_bytes: usize,
     admit_transfer_budget: bool,
+) !requests.CacheExportOutcome {
+    var sent_tail = false;
+    const out = try exportWireModuleOnce(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, session, max_bytes, admit_transfer_budget, true, &sent_tail);
+    if (out != .too_large or !sent_tail) return out;
+    return exportWireModuleOnce(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, session, max_bytes, admit_transfer_budget, false, &sent_tail);
+}
+
+fn exportWireModuleOnce(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    sch: *const Scheduler,
+    lm: *LoadedModel,
+    prompt_ids: []const u32,
+    has_tools: bool,
+    kv_quant_override: ?kv_quant.KVQuantConfig,
+    variant: u64,
+    cache_key: u64,
+    session: u64,
+    max_bytes: usize,
+    admit_transfer_budget: bool,
+    tails: bool,
+    sent_tail: *bool,
 ) !requests.CacheExportOutcome {
     const t0 = io_util.nowUsMonotonic(io);
     const had_error = mlx.errorPending();
@@ -277,7 +303,7 @@ fn exportWireModuleWithBudget(
 
     var from_disk: DiskSession = .{};
     defer from_disk.release();
-    const hit = if (session != 0) switch (sessionHit(allocator, sch, cfg, hc, xfm, session, max_bytes, &from_disk)) {
+    const hit = if (session != 0) switch (sessionHit(allocator, sch, cfg, hc, xfm, session, max_bytes, &from_disk, tails)) {
         .hit => |h| h,
         .none => return .not_found,
         .refused => |outcome| return outcome,
@@ -286,6 +312,7 @@ fn exportWireModuleWithBudget(
         break :blk hc.findRamModule(by_prompt, prompt_ids, has_tools, quant_config) orelse return .not_found;
     };
     const binding = hit.payload.binding;
+    sent_tail.* = hit.payload.tail_from > 0;
 
     var info: plugin_abi.AuxSnapshotInfo = .{};
     if (!plugin_driver.auxDescribe(binding.xfm, hit.payload.snapshot, &info).isOk() or
