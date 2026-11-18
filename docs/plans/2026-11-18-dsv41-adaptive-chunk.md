@@ -1,75 +1,85 @@
 # DeepSeek V4.1 per-request prefill width
 
-Choose the widest resident dsv41 prefill width the request can afford, up to 8192 rows. On the g14 budget in issue #50, a cold 1M prompt should admit at 4096 and a 32k prompt with room should use 8192. Keep `--prefill-chunk N` as a pin. Choose once on the inference thread after restore and eviction. Keep 8192 as a hard limit on every served dsv41 path. Wider forwards have hung or crashed Macs. [Issue #50](https://github.com/STRML/mlx-serve/issues/50)
-
-The source citations refer to `943a0c6b` on `integ/61c`.
+For resident dsv41, choose the widest legal prefill rung that fits the full
+request bill. With `--prefill-chunk` omitted, the candidates are 8192 and
+4096. A cold 1M prompt should admit at 4096 at the g14 budget. A 32k prompt
+with room should use 8192. An explicit width remains a pin, subject to the
+model's row limit. [Issue #50](https://github.com/STRML/mlx-serve/issues/50)
 
 ```text
-connection bill -> queue -> restore -> evict if needed -> final live bill
-                                                              |
-                                           admitted width -> generator slices
-                                                              |
-                                              CED / TP send / plugin forward
+connection bill ─▶ queue ─▶ restore / evict ─▶ inference-thread re-ask
+                                                     │
+                                                     ▼
+                                              generator slices
+                                                     │
+                                              plugin row guard
 ```
 
-## Current path
+## Build order
 
-`--prefill-chunk` parses a positive `usize` into `engine_flags.prefill_chunk`. `main` passes the flags to the MLX API. Its `configure` entry calls `configure.apply`, which writes `prefillCli().override` and sets `prefillCli().explicit`. The default is 8192 with `explicit = false`. `explicitPrefillChunk` reads that bit and clamps the raw flag to `u32`. (`src/main.zig:1058`, `src/main.zig:1303`, `src/engines/mlx/api.zig:66`, `src/engines/mlx/configure.zig:85`, `src/engines/mlx/generate.zig:104`, `src/engines/mlx/admission/prefill_chunk.zig:151`.)
-
-`resolvePrefillChunk` prices the load-time ladder against the machine budget. It skips the 16384 WIDE rung for models with a score tensor and skips any rung past the model limit. `billedPrefillChunk` returns a positive override directly, or the resolved rung capped for CUDA. `pinPrefillChunk` stores the load result. On this base, the limit called `prefillChunkMax` in the issue is `prefillWidths().max`. `cappedPrefillChunk` applies it. dsv41 has a max of 8192, a beside-decode cap of 4096, and a score head dimension of zero. (`src/engines/mlx/admission/prefill_chunk.zig:73`, `src/engines/mlx/admission/prefill_chunk.zig:129`, `src/engines/mlx/admission/prefill_chunk.zig:159`, `src/engines/mlx/admission/prefill_chunk.zig:193`, `src/sdk/config/model.zig:1029`, `src/sdk/config/model.zig:1034`, `src/sdk/config/model.zig:1508`.)
-
-`perRequestPrefillChunkEnabled` checks `ModelConfig.perRequestPrefillChunk` and a test override. The model method delegates to `longCtxGated`, which reads `caps().long_ctx`. `caps()` reads the parsed plugin caps or the legacy caps. Qwen4 sets the bit in both forms. The DeepSeek parser leaves it at its false default. As a result, `chooseRequestPrefillChunk` returns the load-time pin for dsv41. On an opted-in model it walks the raw ladder. `rungWidth` calls the generator's `effectivePrefillChunk` and clips to `u32`. That generator function gives an explicit flag precedence. Otherwise it takes the minimum of the launch width, the machine cap, and a nonzero pin. With no score tensor and no explicit flag, its launch width is WIDE. The score cap runs last. The chooser's extra 22% applies only to an effective width that grows under the long-context gate. (`src/sdk/config/model.zig:1010`, `src/sdk/config/model.zig:1271`, `src/sdk/config/model.zig:1338`, `src/abi/plugin.zig:104`, `src/plugins/qwen4_exp/config.zig:719`, `src/plugins/qwen4_exp/model_config.zig:30`, `src/plugins/deepseek_v4/config.zig:402`, `src/engines/mlx/admission/prefill_chunk.zig:278`, `src/engines/mlx/admission/prefill_chunk.zig:287`, `src/engines/mlx/admission/prefill_chunk.zig:314`, `src/engines/mlx/generate/prefill_chunk.zig:164`.)
-
-`prefillAdmissionBill` reads live headroom, calls the chooser, then resolves and caps the width again before billing it. `admitPrompt` starts cold and adds media bytes. It can pass on reclaimable cache credit, defer to a warm check, or retry after unloading an idle model. On the inference thread `runPrefill` restores a module prefix and slices off the matched tokens. It checks the live bill and retries after eviction. If the restored state pins too much memory, it can release the restore and retry cold. The scheduler then calls `requestPrefillChunkNow` with the post-eviction headroom. That hook already clamps an explicit override, and the live re-ask wins in either direction. The resident dsv41 estimator currently bills the full sequence even after a restore and ignores `WarmPrefix`. (`src/engines/mlx/admission/admit.zig:39`, `src/engines/mlx/admission/admit.zig:162`, `src/engines/mlx/admission/admit.zig:222`, `src/engines/mlx/prefill.zig:297`, `src/engines/mlx/prefill.zig:415`, `src/engines/mlx/prefill.zig:467`, `src/engines/mlx/prefill.zig:514`, `src/engines/mlx/scheduler/params.zig:49`, `src/engines/mlx/admission/prefill_chunk.zig:247`, `src/engines/mlx/admission/prefill_chunk.zig:332`.)
-
-Resident dsv41 uses the generator's chunk loop. `runPrefill` puts the request width in `InitOptions.pinned_prefill_chunk` after the company cap. `initWithOptions` resolves the effective width with the full context, including the restored offset. It forwards each slice through the plugin driver, which passes the actual row count and IDs. `plugin.forward` calls `run`, then `runPrompt` for ordinary prompt rows. `extendResumable` can split the input at a snapshot. `extendCold` computes an encoder-only lead from `ids.len` when Engram read-ahead and CED permit it. `cedTail` uses the actual row count for the last-window replay. CED and the encoder-only pass inherit the request width from the ID slice. They read no separate launch-time width. (`src/engines/mlx/prefill.zig:615`, `src/engines/mlx/generate/init.zig:206`, `src/engines/mlx/generate/init.zig:348`, `src/engines/mlx/generate/init.zig:451`, `src/engines/mlx/dispatch.zig:125`, `src/engines/mlx/plugin/driver.zig:1225`, `src/plugins/deepseek_v41/plugin.zig:521`, `src/plugins/deepseek_v41/plugin.zig:637`, `src/plugins/deepseek_v41/plugin.zig:675`, `src/plugins/deepseek_v41/deepseek_v41.zig:887`, `src/plugins/deepseek_v41/deepseek_v41.zig:7820`, `src/plugins/deepseek_v41/deepseek_v41.zig:7845`.)
-
-Streamed dsv41 declares `whole_prompt_prefill` and owns its call splits. The driver supplies `prompt_spans`, but dsv41's `forward` ignores them. The external bank can run 16384 rows per call. It budgets at that width. The MLX pack bank uses its route ID limit divided by experts per token. This path bypasses the host's chunk cap. (`src/plugins/deepseek_v4/config.zig:413`, `src/engines/mlx/dispatch.zig:88`, `src/engines/mlx/generate/init.zig:761`, `src/engines/mlx/plugin/driver.zig:1255`, `src/plugins/deepseek_v41/plugin.zig:521`, `src/plugins/deepseek_v41/plugin.zig:664`, `src/plugins/deepseek_v41/bill.zig:29`, `src/plugins/deepseek_v41/bill.zig:57`.)
-
-## Proposed behavior
-
-1. Share the raw rung filter across `resolvePrefillChunk`, `chooseRequestPrefillChunk`, and both passes in `adaptivePrefillWidth`. Reject WIDE if `prefillScoreHeadDim()` is nonzero. Reject any rung over a nonzero `prefillWidths().max` before pricing. Bound mapped widths, explicit overrides, stale pins, and floor fallbacks by the same max. Clamp adaptive `current` and `cap` before the first cost probe or early return. Carry the same bound into direct bill calls, the adaptive widen confirmation, and the unpinned WIDE seed in `sizerCtxKvBytes`. A legal floor that still fails the fit check goes through the existing eviction, hold, or refusal path. Keep the CUDA auto cap and the score cap. For qwen4's shipped config, WIDE maps to a width already covered by the 8192 candidate and effective caps. Prove that equivalence. (`src/engines/mlx/admission/prefill_chunk.zig:181`, `src/engines/mlx/admission/prefill_chunk.zig:398`, `src/engines/mlx/admission/prefill_chunk.zig:464`, `src/engines/mlx/generate/prefill_chunk.zig:121`.)
-
-2. Add resident dsv41 to `perRequestPrefillChunk`. Keep `rungWidth` on the real `longCtxGated()` bit. Leave `caps().long_ctx` false for dsv41. Keep its load-time pin for startup sizing and keep the existing hot-cache reserve rule for dsv41. `clampReserveWidth` also reads the per-request predicate and would otherwise switch dsv41's load-time hot-cache reserve to 512. Keep the other effects tied to their existing gates. They include context and cache sizing, the pending memory hold, KV and generation reservation, SSD and RAM checkpoint retention, batch padding, the OS memory floor, GDN prefill, and spec round-cost policy. (`src/engines/mlx/admission/hot_cache_plan.zig:130`, `src/engines/mlx/admission/context.zig:221`, `src/engines/mlx/admission/pending.zig:17`, `src/engines/mlx/generate/prefill_chunk.zig:375`, `src/engines/mlx/load.zig:862`, `src/engines/mlx/load.zig:904`, `src/engines/mlx/batching/verdict.zig:138`, `src/host/registry/memory_ceiling.zig:145`, `src/engines/mlx/methods/gated_delta_net.zig:393`, `src/engines/mlx/spec/round_cost.zig:58`.)
-
-3. Keep explicit resident widths as pins. This preserves the 4096 rollback and makes 4096 and 8192 reproducible controls. With the flag omitted, the chooser can go above the startup pin when the request fits. With an explicit 8192, the g14 cold 1M request can still be refused. A safe pin above the live budget is a refusal, with the existing warm deferral and eviction paths still available. A value above 8192 resolves to at most 8192 for dsv41. Existing scheduler and logprobs caps can shorten actual forwards. A positive pin can be off the ladder. Carry the same resolved width from pricing to execution. In particular, make `effectivePrefillChunk` and its caller honor a dsv41 request width already narrowed by scheduling. The raw explicit flag currently takes precedence over `companyPrefillChunk` in that case. Preserve CLI precedence for the other families. (`src/engines/mlx/prefill_interleave.zig:97`, `src/engines/mlx/prefill_interleave.zig:130`, `src/engines/mlx/generate/prefill_chunk.zig:164`.)
-
-4. Use the same dsv41 bill for the preliminary choice, the eviction probes, and the final width. On the inference thread, use actual freed bytes and the actual matched prefix. Keep full-context state, keys, and margin in the estimate. Where the verified uncached tail is shorter than the rung, limit width-dependent working buffers to the rows that can forward. Keep enough state to cover a copy on append. Avoid using matched tokens as a credit against the full compressed state without evidence for that credit. Recompute from a cold prompt on restore failure or a cold retry. If a tighter final reading fits only a narrower rung, run the narrower rung. If it cannot fit even the floor, refuse or hold through the existing path. When other work already has a memory promise or media reserve, check the final bill against that same constraint before widening. Apply the company cap to the chosen width. Bound actual slices by that width, including a merged tail. Today `nextChunkEnd` can merge a small tail past the priced rung and the caller caps only at the model max. (`src/plugins/deepseek_v41/deepseek_v41.zig:2149`, `src/engines/mlx/prefill.zig:483`, `src/engines/mlx/admission/pending.zig:23`, `src/engines/mlx/batching/verdict.zig:220`, `src/engines/mlx/generate/prefill_chunk.zig:229`, `src/engines/mlx/generate/init.zig:451`.)
-
-5. Keep dsv41 out of per-chunk repricing. `adaptivePrefillChunkEnabled` currently follows the per-request opt-in and rejects explicit widths. Give it a separate gate that preserves the existing long-context behavior. `adaptivePrefillWidth` probes at each boundary, steps down immediately, and can widen after two probes. dsv41's admission pays for full-context state plus its working width already. Existing decode and boundary admission still run at the ordinary chunk boundaries. The whole-prompt streamed arm cannot use that hook. Keep its load-budget and context-refusal contract. In the plugin, use the same 8192 maximum for the streamed-bank budget and the actual bank call, combined with its route ID limit. Keep one definition of the dsv41 maximum usable by both the host and plugin. Reject an oversized direct resident forward before mutating state, including the all-logits arm. Use a fake backend for the oversized test. (`src/engines/mlx/admission/prefill_chunk.zig:367`, `src/engines/mlx/admission/prefill_chunk.zig:398`, `src/engines/mlx/admission/prefill_chunk.zig:486`, `src/engines/mlx/generate/init.zig:604`, `src/plugins/deepseek_v41/plugin.zig:529`, `src/plugins/deepseek_v41/plugin.zig:646`.)
-
-## TP4 width agreement
-
-Rank 0 chooses and slices. For collective prefill, `tpLead` hands the actual ID slice to `dsv41TpStep`, which sends the row count, position, and IDs to each worker. `tpWorkerStep` forwards those exact rows. `extendCold` disables the encoder-only lead split on a sharded model. The regular CED replay decision uses the shared input row count. For leader-only prefill, rank 0 runs the whole-model slice and sends the resulting position and row count with `OP_DSV41_TP_PREFILL`. Workers apply the state update for that span. Reuse these two message paths. A worker must never make a second width choice from its own headroom. A row count mismatch can hang collectives. Rank agreement and worker memory fit are separate release checks. (`src/plugins/deepseek_v41/deepseek_v41.zig:5410`, `src/plugins/deepseek_v41/deepseek_v41.zig:5488`, `src/plugins/deepseek_v41/deepseek_v41.zig:5505`, `src/plugins/deepseek_v41/deepseek_v41.zig:5537`, `src/plugins/deepseek_v41/deepseek_v41.zig:5631`, `src/plugins/deepseek_v41/deepseek_v41.zig:6591`, `src/plugins/deepseek_v41/deepseek_v41.zig:7820`, `src/engines/mlx/cluster/distributed.zig:2549`, `src/engines/mlx/cluster/distributed.zig:2772`, `src/engines/mlx/cluster/distributed.zig:3021`, `src/engines/mlx/cluster/distributed.zig:3137`.)
+1. In `src/plugins/deepseek_v41/plugin.zig`, test and reject single-slot
+   forwards over 8192 before activating slot state. Use the model's shared
+   prefill maximum. The guard covers prefill, verify, and all-logits forwards.
+   `forwardBatched` already requires one decode row per slot and caps the
+   number of slots at 16.
+2. Share the rung filter between the load, request, and per-chunk ladders.
+   Keep the score and CUDA limits. Reuse `ModelConfig.cappedPrefillChunk`
+   for the width cap and update the stale `prefillChunkMax` references.
+3. Opt resident dsv41 into request sizing. Floor its ladder at 4096 because
+   the Engram encoder lead split has a 4096-row minimum on TP1. Keep
+   per-chunk repricing and the hot-cache reserve clamp on `longCtxGated`.
+   The omitted-flag startup still sizes the hot cache from the load pin.
+4. Include media bytes, pending promises and reserve, and the omitted-flag
+   cap beside decoders when pricing candidates for resident dsv41. Apply
+   these constraints in the relevant prefill bill and re-ask. Admission
+   still owns eviction, warm deferral and refusal. If the final re-ask
+   measures less headroom than the floor needs, it returns the floor and
+   execution proceeds, as with qwen4.
+5. Pass the final choice through the existing generator width path. Keep
+   explicit flag precedence and bound a merged dsv41 tail by its billed
+   width. Keep the full-context dsv41 estimate, including on restore.
+   Handle the streamed bank's internal call width and matching load bill
+   in a follow-up issue. The plugin row guard rejects oversized inputs
+   at the ABI boundary.
 
 ## Failure matrix
 
-| Case | Today | Under the plan | Test that proves it |
-| --- | --- | --- | --- |
-| Cold 1M | g14 refused all four at explicit 8192. Issue #50 records about 13309 MiB needed against 13062 MiB available. The 4096 control admitted. | With the flag omitted, admit at 4096 at the recorded budget. Refuse with the normal error if even 512 fails after recovery. | Fake the g14 headroom with the production estimator and parsed iQ shape. Assert 8192 fails, 4096 fits, and the admitted and forwarded width is 4096. Run the live 1M gate. |
-| Warm 1M with a restored prefix | Connection admission can defer. The scheduler restores the tail but the dsv41 estimator still prices full state and a full chunk. | Rebill after restore. Keep full-state coverage. Use only actual remaining rows for the width-dependent term. If restore drops, rebill and slice cold. | Seed a module snapshot and extend to 1M. Check the matched position, live bill, first forwarded position, maximum width, and completion. Add a short-tail and a restore-failure arm. |
-| 32k | The request inherits the effective load pin or CLI pin. | With headroom and no decode company, choose and forward at 8192 even from a 4096 startup pin. | Run through scheduler and plugin dispatch with a recorded forward shape. Exercise CED and encoder-only split on TP1. Check a near-width tail stays within the bill. |
-| Request arrives during prefill | The scheduler considers eligible tails up to 1024 at a boundary under a positive decode share. The pending memory hold counts the outer request. Long or ineligible tails wait. | Use the current boundary and memory gates. Protect the outer request's memory promise. Keep dsv41 at most 4096 when it starts beside live decoders. | Extend `tests/test_boundary_admission.sh` coverage with a small eligible request, a larger tail, and a short-tail request that exceeds net headroom. Check first-token and forward ordering. |
-| Hot cache must free memory | Admission can credit reclaimable bytes. Live LRU eviction rechecks the pinned-width bill. | Admit immediately if a smaller rung fits. If even the floor needs eviction, protect the restored entry and choose from actual post-eviction headroom. Refuse if reclaim falls short. | Script memory readings before and after eviction. Check the no-eviction arm, a successful re-ask, and a shortfall. Assert which entry survives and which width reaches the forward. |
-| Explicit 4096 and 8192 | Both are pins. 8192 can refuse a cold 1M request. | Both remain pins subject to row safety and scheduler caps. Omitting the flag permits a step down. | Run a CLI matrix with the flag omitted, 4096, 8192, and a synthetic 16384. Compare the bill with recorded forward rows. Use fakes for the oversized case. |
-| TP4 | Workers follow rank 0's rows or its leader-only state handoff. | Workers still follow rank 0. One request may choose 4096 and the next 8192. | Verify sent and received positions and row counts for each chunk and rank. Include a restored tail and final short chunk. Run both TP4 modes on the cluster with a progress timeout. |
-| qwen4_exp | Per-request choice and per-chunk adaptation are long-context gated. | Existing choices, explicit precedence, wide-width margin and boundary adaptation carry through the shared filter. | Characterize the existing cold, warm, tight-headroom, CLI and CUDA-cap cases. Compare effective widths, bills, and adaptive transitions. |
-| Other architectures | They use their current load pins or explicit widths. Score-free models can use WIDE. | Preserve those results and keep their existing ability to use WIDE where allowed. | Cover one dense model with scores and one score-free uncapped model. Compare load and request bills, CLI overrides, and actual forwarded rows. |
-| Streamed dsv41 | A whole-prompt forward can bypass the 8192 cap. | Each bank call stays within the shared model max and its bank limit. The bank still owns context admission. | Give a fake bank more than 8192 input rows and verify split sizes and the same width in the bank budget. Cover both bank kinds and the context refusal. |
+| Case | Expected behavior | Verification |
+| --- | --- | --- |
+| Single-slot plugin forward | 8192 reaches forward and 8193 is refused before slot activation, including all-row logits. | Exercise the plugin ABI with fake or tiny-model state. |
+| Cold 1M at g14 | Reported budget is about 13062 MiB against about 13309 MiB needed at 8192. The omitted-flag request admits at 4096. | Use the production estimator and the release config. Check the fit boundary and the bill. Run the live omitted-flag gate before rollout. |
+| 32k with room | From a 4096 load pin, the request chooses 8192. | Check the chooser and bill. Verify forwarded slice sizes on TP1 during rollout. |
+| Image request under pressure | The image claim pushes the 8192 bill over budget. The full 4096 bill fits and admits. | Exercise the admission path with a media claim between the two fit boundaries. |
+| Pending prefill beside decoders | Price the 4096 company cap and include other promises and reserve. | Exercise the pending hold. Check the width against the scheduler cap and test a shortfall with existing claims. |
+| Restored prefix and cold retry | Price the full context after restore. Re-evaluate the remaining tail after eviction or a cold retry. | Cover warm and cold fit inputs and the re-ask. Check restored position and completion in the live gate. |
+| Cache eviction and late headroom drop | Sizing steps down when possible. Admission can reclaim or refuse. An already-admitted request gets the 4096 floor on a late shortfall. | Vary headroom around both rungs and verify the floor fallback and normal admission refusal. |
+| Short final tail | A merged tail remains within the selected dsv41 width. | Exercise a merge candidate just above the selected rung. |
+| Explicit pin and stale width | Explicit 4096 pins. Explicit 8192 preserves its normal fit check. Oversized pins cannot produce a chooser result, bill, or plugin forward above 8192. | Exercise omitted, 4096, 8192 and 16384 width inputs. |
+| First launch with flag omitted | The load pin sizes the hot-cache reserve. The admitted request can widen independently. | Exercise real reserve sizing with explicit and omitted flag inputs. Include a flag-omitted launch in the rollout gate. |
+| qwen4 and a second architecture | Existing per-request selections, explicit precedence, and long-context policy hold. | Compare old and new decisions over a grid of headroom, prompt, warm-prefix and pin inputs. |
+| TP4 collective and leader-only prefill | Rank 0 determines the slice. Collective workers forward the IDs sent by rank 0. In leader-only mode, workers apply the position and row-count update. | Verify position and row agreement on 4096, 8192, restored and final-short slices with a progress timeout. |
+| TP4 worker capacity | Rank 0 can widen using its own headroom. Every worker must fit the resulting 8192-row collective. All ranks need matching `MLX_SERVE_DSV41_CED` behavior. | Gate rollout on per-rank headroom and forward progress at 8192. |
 
-The pending gate and the post-restore tail check are in `src/engines/mlx/prefill_interleave.zig:193`, `src/engines/mlx/prefill_interleave.zig:292`, `src/engines/mlx/admission/pending.zig:17`, and `src/engines/mlx/prefill.zig:391`.
+## Validation
 
-## Red tests first
+Run red tests before each behavior change. On the Mac, run the Debug
+admission, prefill, chunk, dsv41, deepseek, peer and qwen4 filters, plus
+`zig build check` and strict lint. Use fake or fixture paths for scheduler and
+plugin coverage.
 
-1. Start with a scheduler-to-forward regression using fixed headroom and a recording plugin. Show the cold 1M and 32k widths differ under the same startup pin. Confirm the failing assertions concern choice or forwarded shape. Use the release-config fixtures in `src/engines/mlx/plugin/deepseek_test.zig:35` as a starting point. Record the exact g14 configuration, prompt length and byte inputs. The issue's MiB values are rounded. Use the real estimator and a separate fit-boundary assertion instead of hardcoding a model bill.
-2. Add the failing warm, eviction, tail-merge and concurrent-admission scenarios from the matrix. Assert the final forward width, as well as the admission verdict. Keep explicit 4096 and explicit 8192 as characterization controls.
-3. Exercise each ladder consumer with a permissive budget. Prove no dsv41 candidate can be priced above 8192. Include the adaptive entry with an oversized initial width and cap, and the direct override paths. Assert the per-request gate is on while the long-context bit and per-chunk hook are off. Add the streamed-bank and TP message tests before changing those paths. Qwen4 and other-family characterizations should start green. Verify the new regressions are red on revert.
+Before rollout, run the iQ 3.0bpw 1M gate with `--prefill-chunk` omitted.
+`local-llm/bench/studio-cluster/gate1m.sh:56-58` always supplies the flag, so
+the omitted-flag run needs a separate launch arm. Check the load pin and
+hot-cache reserve on that first launch, then record selected and forwarded
+widths for four cold prompts and a restored-prefix session. Repeat on target
+TP4 modes. The collective header carries `ids.len` and workers forward that
+slice (`distributed.zig:2803,3021-3041` on the plan base). CED reads each
+process's environment (`deepseek_v41.zig:879-890`). TP disables the encoder
+lead split.
 
-After the focused tests turn green, run `zig build check`, `zig build test -Dslow-tests`, and the relevant boundary and interleave scripts. Run the dsv41 plugin tests on real Metal before the live gates. Refresh the test server with a `ReleaseFast` build.
-
-## Measurements before rollout
-
-- Run the iQ 3.0bpw 1M gate on real Apple Silicon with `--prefill-chunk` omitted. Use `local-llm/bench/studio-cluster/gate1m.sh`, which currently always passes a flag at line 58. Add an omitted-flag arm to the harness when implementing. It currently checks a startup log at lines 174 to 181. Check actual per-request and forwarded widths too. Use a fresh cache for the four cold sessions, then exercise the restored-prefix case. Require successful completion, headroom within the gate's existing bounds, and no hangs or memory kills. Record a matching 4096 control and repeat on the target TP4 modes with per-rank headroom and progress.
-- Measure concurrent-decode stalls with a 32k or longer cold prefill. Capture the longest and p95 inter-token gaps per decode stream, the prefill chunk wall times, and time to first token for a newly arriving small request. Compare logged 8192 rows against 4096 with the same model, binary settings, prompt and arrival schedule. Test the shipping decode share and verify the 4096 company cap when decoders are already live. To measure an actual 8192 chunk, include an idle-start prefill followed by a small request that begins decoding at a boundary. Check the log for engagement. If that case cannot run at 8192, use a controlled benchmark arm and record the cap separately. Use `--warmup-full` where supported, a clean Studio measurement window, and the existing Latch protocol.
-
-Open gates are the exact g14 fixture inputs, the acceptable p95 and worst decode gap, and worker headroom on the deployed TP4 modes. Keep the 4096 pin as the rollout fallback until those checks pass.
+For the decode stall gate, hold the model, prompt and arrival schedule
+constant while comparing 4096 and 8192. Record maximum and p95 inter-token
+gaps, prefill chunk wall time, and time to first token for a small request
+arriving during prefill. Confirm the 4096 cap when decode is already active.
+Use a clean Studio window and the existing Latch protocol. Keep explicit
+4096 as the rollout fallback until the live gates pass.
