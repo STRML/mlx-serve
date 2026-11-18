@@ -719,9 +719,9 @@ test "dsv41 tensor parallel: a worker keeps rank 0's states by gen, the one it s
     try std.testing.expectEqual(@as(usize, 50), m.dec_state.?.n);
     try std.testing.expectEqual(@as(u64, 5), m.state_gen);
     try std.testing.expectEqual(@as(usize, 60), parked.get(6).?.n);
-    dsv41.tpWorkerFree(m, &parked, 6);
+    dsv41.tpWorkerFree(m, &parked, 6, .{});
     try std.testing.expectEqual(@as(usize, 0), parked.count());
-    dsv41.tpWorkerFree(m, &parked, 5);
+    dsv41.tpWorkerFree(m, &parked, 5, .{});
     try std.testing.expect(m.dec_state == null);
 }
 
@@ -743,21 +743,21 @@ test "dsv41 tensor parallel: a worker keeps its copy of rank 0's snapshots by id
     st.n = 50;
     st.snap_at = 50;
     try dsv41.snapshotStateIfDue(st, 5);
-    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .take, 5, 1);
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .take, 5, 1, .{});
     try std.testing.expect(st.snap == null and snaps.get(1).?.n == 50);
-    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .clone, 1, 2);
-    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .restore, 2, 7);
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .clone, 1, 2, .{});
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .restore, 2, 7, .{});
     try std.testing.expectEqual(@as(u64, 7), m.state_gen);
     try std.testing.expectEqual(@as(usize, 50), m.dec_state.?.n);
     try std.testing.expect(parked.contains(5));
-    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .capture, 7, 50);
-    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .take, 7, 3);
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .capture, 7, 50, .{});
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .take, 7, 3, .{});
     try std.testing.expectEqual(@as(usize, 50), snaps.get(3).?.n);
-    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .free, 3, 0);
-    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .free, 1, 0);
-    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .free, 2, 0);
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .free, 3, 0, .{});
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .free, 1, 0, .{});
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .free, 2, 0, .{});
     try std.testing.expectEqual(@as(usize, 0), snaps.count());
-    try std.testing.expectError(error.DistPeerDiverged, dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .restore, 1, 8));
+    try std.testing.expectError(error.DistPeerDiverged, dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .restore, 1, 8, .{}));
 }
 
 test "dsv41 tensor parallel: a chunk's image rows, sent alone, splice as the request's rows at their offset" {

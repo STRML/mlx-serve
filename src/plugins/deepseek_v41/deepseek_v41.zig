@@ -1729,13 +1729,13 @@ const ClusterHooksState = struct {
     /// Tensor parallel, rank 0: one batched step over the states `gens`, each from `p0s[k]` with `chunks[k]`.
     tp_batch: ?*const fn (gens: []const u64, p0s: []const usize, chunks: []const []const u32, verify: bool) anyerror!void = null,
     /// Tensor parallel, rank 0: the state `gen` is gone.
-    tp_free: ?*const fn (gen: u64) void = null,
+    tp_free: ?*const fn (gen: u64, owner: log.RequestTag) void = null,
     /// Rank zero's wide TP1 chunk: incremental latent state before another tensor step.
     tp_prefill: ?*const fn (gen: u64, p0: usize, n: usize, capture: bool, tensors: []const A, stages: usize) anyerror!void = null,
     /// Tensor parallel, rank 0: a snapshot read from disk, as the cache tensors of `tpLoadPlan` in order.
     tp_load: ?*const fn (id: u64, ids: []const u32, tensors: []const A) anyerror!void = null,
     /// Tensor parallel, rank 0: a snapshot moved, appeared or went (`SnapOp`).
-    tp_snap: ?*const fn (op: SnapOp, a: u64, b: u64) void = null,
+    tp_snap: ?*const fn (op: SnapOp, a: u64, b: u64, request: log.RequestTag) void = null,
 };
 
 /// What rank 0 did with a snapshot, for the other ranks to do with their copy: `take` (state `a`'s snapshot kept as
@@ -2459,6 +2459,7 @@ pub const State = struct {
     gpa: std.mem.Allocator,
     n: usize = 0,
     tp_synced: bool = true,
+    request_id: u64 = 0,
     layers: []LState,
     /// The request's compressed token ids (Engram look-back).
     hist: std.ArrayList(u32) = .empty,
@@ -6131,9 +6132,18 @@ fn followVerifyOf(m: *Dsv41Model, st: *State, p0: usize) !void {
     try finishVerify(m, st.gpa, st, p0 - v.n0);
 }
 
-/// Rank 0 tells the other ranks a state is gone (`ClusterHooksState.tp_free`).
-pub fn tpFree(m: *const Dsv41Model, gen: u64) void {
-    if (m.tp) |t| if (t.rank == 0) if (clusterHooks().tp_free) |free| free(gen);
+/// The generation owns its id even when the next request causes its cleanup.
+pub fn freeState(m: *const Dsv41Model, st: *State, gen: u64) void {
+    const tp = m.tp orelse return st.deinit();
+    if (tp.rank != 0) return st.deinit();
+    const owner = log.requestTag(st.request_id);
+    noteTpFree(tp.rank, gen, st.n, owner);
+    st.deinit();
+    if (clusterHooks().tp_free) |free| free(gen, owner);
+}
+
+fn noteTpFree(rank: u32, gen: u64, pos: usize, owner: log.RequestTag) void {
+    log.info("[hot-cache] rank={d} free req={f} gen={d} pos={d}\n", .{ rank, owner, gen, pos });
 }
 
 /// What a snapshot read from disk sends the other ranks: its layers' caches and Engram history. The ranks build them
@@ -6221,7 +6231,19 @@ pub fn importPlan(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, i
 
 /// Rank 0 tells the other ranks what it did with a snapshot (`ClusterHooksState.tp_snap`).
 pub fn tpSnap(m: *const Dsv41Model, op: SnapOp, a: u64, b: u64) void {
-    if (m.tp) |t| if (t.rank == 0) if (clusterHooks().tp_snap) |f| f(op, a, b);
+    if (m.tp) |t| if (t.rank == 0) if (clusterHooks().tp_snap) |f| f(op, a, b, .{});
+}
+
+pub fn tpRestore(m: *const Dsv41Model, sn: *const Snap, gen: u64, request: log.RequestTag) void {
+    const tp = m.tp orelse return;
+    if (tp.rank != 0) return;
+    noteTpRestore(tp.rank, sn, sn.tp_id, gen, request);
+    if (clusterHooks().tp_snap) |f| f(.restore, sn.tp_id, gen, request);
+}
+
+fn noteTpRestore(rank: u32, sn: *const Snap, id: u64, gen: u64, request: log.RequestTag) void {
+    if (request.id == 0) return;
+    log.info("[hot-cache] rank={d} restore req={f} gen={d} snap={d} snap_pos={d}\n", .{ rank, request, gen, id, sn.n });
 }
 
 /// A tensor rank's halves of rank 0's prefix-cache snapshots, by the id rank 0 gave each.
@@ -6234,7 +6256,7 @@ pub fn dropSnaps(s: *Snaps, gpa: std.mem.Allocator) void {
 }
 
 /// Tensor-parallel rank past 0: does with its copy of a snapshot what rank 0 did (`SnapOp`).
-pub fn tpWorkerSnap(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, snaps: *Snaps, op: SnapOp, a: u64, b: u64) !void {
+pub fn tpWorkerSnap(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, snaps: *Snaps, op: SnapOp, a: u64, b: u64, request: log.RequestTag) !void {
     switch (op) {
         .capture => {
             const st = try tpStateOf(m, parked, a);
@@ -6251,6 +6273,7 @@ pub fn tpWorkerSnap(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, sna
         },
         .restore => {
             const sn = snaps.getPtr(a) orelse return error.DistPeerDiverged;
+            if (m.tp) |tp| noteTpRestore(tp.rank, sn, a, b, request);
             var fresh = try stateFromSnapshot(m, gpa, sn);
             errdefer fresh.deinit();
             try tpActivate(m, parked, b);
@@ -6296,14 +6319,11 @@ pub fn tpActivate(m: *Dsv41Model, parked: *Parked, gen: u64) !void {
 }
 
 /// Tensor-parallel rank past 0: rank 0 dropped the state `gen`.
-pub fn tpWorkerFree(m: *Dsv41Model, parked: *Parked, gen: u64) void {
-    if (m.dec_state != null and m.state_gen == gen) {
-        m.dec_state.?.deinit();
-        m.dec_state = null;
-    } else if (parked.fetchRemove(gen)) |kv| {
-        var st = kv.value;
-        st.deinit();
-    }
+pub fn tpWorkerFree(m: *Dsv41Model, parked: *Parked, gen: u64, owner: log.RequestTag) void {
+    const st = tpStateOf(m, parked, gen) catch return;
+    if (m.tp) |tp| noteTpFree(tp.rank, gen, st.n, owner);
+    st.deinit();
+    if (m.state_gen == gen and m.dec_state != null) m.dec_state = null else _ = parked.remove(gen);
 }
 
 /// Tensor-parallel rank past 0: one batched step rank 0 handed over (`ClusterHooksState.tp_batch`) over its states
@@ -6880,13 +6900,13 @@ pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision:
 /// A fresh request's empty state.
 pub fn reset(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
     var fresh = try initState(m, gpa);
+    fresh.request_id = log.requestId();
     if (m.dec_state) |*st| {
         fresh.snap_at = st.snap_at;
         fresh.snap_ids = st.snap_ids;
         fresh.snap_vision_key = st.snap_vision_key;
         st.snap_ids = &.{};
-        st.deinit();
-        tpFree(m, m.state_gen);
+        freeState(m, st, m.state_gen);
     }
     newGen(m);
     m.dec_state = fresh;

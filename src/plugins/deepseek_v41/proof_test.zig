@@ -3,6 +3,7 @@
 //! in `fixtures/` (`../deepseek_v4/proof_test.zig`).
 
 const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
 const env = @import("../../env.zig");
 const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -1892,18 +1893,18 @@ const LeaderCacheRig = struct {
         self.loads += 1;
     }
 
-    fn snap(op: dsv41.SnapOp, a: u64, b: u64) void {
+    fn snap(op: dsv41.SnapOp, a: u64, b: u64, request: log.RequestTag) void {
         const self = active;
         for (self.models, &self.parked, &self.snaps) |m, *p, *s|
-            dsv41.tpWorkerSnap(m, testing.allocator, p, s, op, a, b) catch |err| {
+            dsv41.tpWorkerSnap(m, testing.allocator, p, s, op, a, b, request) catch |err| {
                 self.failure = err;
                 return;
             };
     }
 
-    fn free(gen: u64) void {
+    fn free(gen: u64, owner: log.RequestTag) void {
         const self = active;
-        for (self.models, &self.parked) |m, *p| dsv41.tpWorkerFree(m, p, gen);
+        for (self.models, &self.parked) |m, *p| dsv41.tpWorkerFree(m, p, gen, owner);
     }
 };
 
@@ -2034,13 +2035,13 @@ const WarmRestore = struct {
         try events.append(testing.allocator, .{ .chunk = index });
     }
 
-    fn snap(op: dsv41.SnapOp, a: u64, b: u64) void {
+    fn snap(op: dsv41.SnapOp, a: u64, b: u64, _: log.RequestTag) void {
         events.append(testing.allocator, .{ .snap = .{ .op = op, .a = a, .b = b } }) catch {
             failed = true;
         };
     }
 
-    fn free(gen: u64) void {
+    fn free(gen: u64, _: log.RequestTag) void {
         events.append(testing.allocator, .{ .free = gen }) catch {
             failed = true;
         };
@@ -2097,10 +2098,10 @@ const WarmRestore = struct {
                 try dsv41.tpWorkerPrefill(m, testing.allocator, &parked, c.gen, c.p0, c.n, c.capture, c.xs, c.stages);
             },
             .snap => |s| {
-                try dsv41.tpWorkerSnap(m, testing.allocator, &parked, &snaps, s.op, s.a, s.b);
+                try dsv41.tpWorkerSnap(m, testing.allocator, &parked, &snaps, s.op, s.a, s.b, .{});
                 if (s.op == .restore) restored = m.dec_state.?.n;
             },
-            .free => |gen| dsv41.tpWorkerFree(m, &parked, gen),
+            .free => |gen| dsv41.tpWorkerFree(m, &parked, gen, .{}),
         };
         try testing.expectEqual(33 + keep, restored);
     }

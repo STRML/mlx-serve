@@ -2,6 +2,7 @@
 //! built by `init` at load and resident together. A switch moves no live slot state across them (`plugin.swapMode`).
 
 const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const dsv41 = @import("deepseek_v41.zig");
 const Config = @import("config.zig").Config;
@@ -109,8 +110,8 @@ pub const LoneGroup = struct {
     fn draft(_: []const u64, _: []const usize, _: []const u32) anyerror!void {}
     fn load(_: u64, _: []const u32, _: []const mlx.mlx_array) anyerror!void {}
     fn prefill(_: u64, _: usize, _: usize, _: bool, _: []const mlx.mlx_array, _: usize) anyerror!void {}
-    fn free(_: u64) void {}
-    fn snap(_: dsv41.SnapOp, _: u64, _: u64) void {}
+    fn free(_: u64, _: log.RequestTag) void {}
+    fn snap(_: dsv41.SnapOp, _: u64, _: u64, _: log.RequestTag) void {}
 
     pub fn arm(n: usize) void {
         size = n;

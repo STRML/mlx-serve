@@ -88,14 +88,16 @@ pub fn initRequestIds(io: std.Io) void {
 }
 
 pub fn requestTag(id: u64) RequestTag {
-    return .{ .id = id };
+    return .{ .id = id, .boot_nonce = sinks().request_nonce.load(.acquire) };
 }
 
 pub const RequestTag = struct {
-    id: u64,
+    id: u64 = 0,
+    boot_nonce: u64 = 0,
+
     pub fn format(self: RequestTag, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.id == 0) return w.writeAll("-");
-        try w.print("chatcmpl-{x:0>16}-{d}", .{ sinks().request_nonce.load(.acquire), self.id });
+        try w.print("chatcmpl-{x:0>16}-{d}", .{ self.boot_nonce, self.id });
     }
 };
 

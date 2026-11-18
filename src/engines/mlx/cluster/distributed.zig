@@ -1312,8 +1312,8 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC = wire.MAGIC;
-/// 12: incremental state from a leader-only TP prefill chunk.
-const VERSION: i32 = 12;
+/// 13: TP restore carries the leader's request tag.
+const VERSION: i32 = 13;
 pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
 pub const OP_STOP = wire.OP_STOP;
@@ -1338,6 +1338,7 @@ const OP_DSV41_TP_PIPE: i32 = 15;
 const OP_DSV41_TP_DRAFT_PIPE: i32 = 16;
 const OP_DSV41_TP_VERIFY_PIPE: i32 = 17;
 const OP_DSV41_TP_PREFILL: i32 = 18;
+const OP_DSV41_TP_RESTORE_TAG: i32 = 19;
 pub const OP_RELEASE = wire.OP_RELEASE;
 
 /// `link` as a plugin's split job talks over it (`sdk/util/wire.zig`).
@@ -2603,16 +2604,35 @@ fn dsv41TpDraft(gens: []const u64, p0s: []const usize, t1s: []const u32) anyerro
     if (gens.len == 1) cluster().tp_spec = .{ .drafted = .{ .gen = gens[0], .n = p0s[0] } };
 }
 
-/// Host: the state `gen` is gone; the workers drop their copies.
-fn dsv41TpFree(gen: u64) void {
-    const link = tpLeader(false) catch return;
-    sendAll(link, .{ OP_DSV41_TP_FREE, @intCast(gen & 0x7fffffff), @intCast(gen >> 31), 0, 0, 0, 0, 0 });
+fn tpRequestWords(request: log.RequestTag) [4]i32 {
+    return @bitCast([2]u64{ request.id, request.boot_nonce });
 }
 
-/// A control message with no payload to every worker. Best effort, like the pair's: a worker it misses has left,
-/// and the bell's watcher ends the group.
-fn sendAll(link: *const Link, m: Msg) void {
-    for (1..link.size) |k| sendMsg(link, m, @intCast(k)) catch |err| log.warn("[dist] op {d} did not reach worker rank {d} ({s})\n", .{ m[0], k, @errorName(err) });
+fn tpRequestTag(words: [4]i32) log.RequestTag {
+    const fields: [2]u64 = @bitCast(words);
+    return .{ .id = fields[0], .boot_nonce = fields[1] };
+}
+
+fn tpFreeHeader(gen: u64, owner: log.RequestTag) Msg {
+    const words = tpRequestWords(owner);
+    return .{ OP_DSV41_TP_FREE, @intCast(gen & 0x7fffffff), @intCast(gen >> 31), words[0], words[1], words[2], words[3], 0 };
+}
+
+/// Host: the state `gen` is gone; the workers drop their copies.
+fn dsv41TpFree(gen: u64, owner: log.RequestTag) void {
+    const link = tpLeader(false) catch return;
+    sendAll(link, tpFreeHeader(gen, owner), null);
+}
+
+fn sendAll(link: *const Link, header: Msg, follow: ?Msg) void {
+    for (1..link.size) |k| {
+        const dst: u32 = @intCast(k);
+        sendMsg(link, header, dst) catch |err| {
+            log.warn("[dist] op {d} did not reach worker rank {d} ({s})\n", .{ header[0], k, @errorName(err) });
+            continue;
+        };
+        if (follow) |msg| sendMsg(link, msg, dst) catch |err| log.warn("[dist] op {d} did not reach worker rank {d} ({s})\n", .{ msg[0], k, @errorName(err) });
+    }
 }
 
 /// Host: the snapshot `id` it read from disk, as its ids and then `dsv41.tpLoadPlan`'s tensors in order.
@@ -2648,10 +2668,19 @@ fn dsv41TpPrefill(gen: u64, p0: usize, n: usize, capture: bool, tensors: []const
     }
 }
 
+fn tpSnapHeader(op: dsv41_mod.SnapOp, a: u64, b: u64, request: log.RequestTag) Msg {
+    return .{ OP_DSV41_TP_SNAP, @backingInt(op), @intCast(a & 0x7fffffff), @intCast(a >> 31), @intCast(b & 0x7fffffff), @intCast(b >> 31), @intFromBool(request.id != 0), 0 };
+}
+
+fn tpRestoreTagHeader(request: log.RequestTag) Msg {
+    const words = tpRequestWords(request);
+    return .{ OP_DSV41_TP_RESTORE_TAG, words[0], words[1], words[2], words[3], 0, 0, 0 };
+}
+
 /// Host: what it did with a snapshot (`dsv41.SnapOp`); the worker does the same with its copy.
-fn dsv41TpSnap(op: dsv41_mod.SnapOp, a: u64, b: u64) void {
+fn dsv41TpSnap(op: dsv41_mod.SnapOp, a: u64, b: u64, request: log.RequestTag) void {
     const link = tpLeader(false) catch return;
-    sendAll(link, .{ OP_DSV41_TP_SNAP, @backingInt(op), @intCast(a & 0x7fffffff), @intCast(a >> 31), @intCast(b & 0x7fffffff), @intCast(b >> 31), 0, 0 });
+    sendAll(link, tpSnapHeader(op, a, b, request), if (request.id != 0) tpRestoreTagHeader(request) else null);
 }
 
 /// A tensor step's header: its rows, position, flags, the state it advances and, for one row, the id itself.
@@ -2951,10 +2980,20 @@ fn dsv41StepLoop(io: std.Io, allocator: std.mem.Allocator, link: *const Link, m:
                 noteTpStep(p0s[0], 0);
                 try dsv41_mod.tpWorkerDraft(m, allocator, &parked, gens[0..n], p0s[0..n], t1s[0..n]);
             },
-            OP_DSV41_TP_FREE => dsv41_mod.tpWorkerFree(m, &parked, joined(msg[1], msg[2])),
+            OP_DSV41_TP_FREE => dsv41_mod.tpWorkerFree(m, &parked, joined(msg[1], msg[2]), tpRequestTag(msg[3..7].*)),
             OP_DSV41_TP_SNAP => {
                 const op = std.enums.fromInt(dsv41_mod.SnapOp, msg[1]) orelse return error.DistBadMessage;
-                try dsv41_mod.tpWorkerSnap(m, allocator, &parked, &snaps, op, joined(msg[2], msg[3]), joined(msg[4], msg[5]));
+                const request: log.RequestTag = switch (msg[6]) {
+                    0 => .{},
+                    1 => blk: {
+                        if (op != .restore) return error.DistBadMessage;
+                        const tag = try transport.recvOp();
+                        if (tag[0] != OP_DSV41_TP_RESTORE_TAG) return error.DistBadMessage;
+                        break :blk tpRequestTag(tag[1..5].*);
+                    },
+                    else => return error.DistBadMessage,
+                };
+                try dsv41_mod.tpWorkerSnap(m, allocator, &parked, &snaps, op, joined(msg[2], msg[3]), joined(msg[4], msg[5]), request);
             },
             OP_DSV41_TP_LOAD => {
                 const n: usize = @intCast(joined(msg[3], msg[4]));
@@ -3531,7 +3570,7 @@ test "dist bell READY matrix 14: bell EOF interrupts cold load promptly" {
 }
 
 test "dist bell READY matrix 15: workers without the current protocol are refused at hello" {
-    for ([_]i32{ 10, 11 }) |old| try std.testing.expectError(error.DistProtocolMismatch, Hello.parse(.{ MAGIC, old, 0, 0, 0, 0, 0, 0 }));
+    for ([_]i32{ 10, 11, 12 }) |old| try std.testing.expectError(error.DistProtocolMismatch, Hello.parse(.{ MAGIC, old, 0, 0, 0, 0, 0, 0 }));
     _ = try Hello.parse(.{ MAGIC, VERSION, 0, 0, 0, 0, 0, 0 });
 }
 
@@ -6968,4 +7007,145 @@ test "request id: decode-end commit exit names the finished slot" {
     defer t.allocator.free(output);
     try t.expectEqual(@as(u32, 1), exits.count.load(.acquire));
     try t.expect(std.mem.indexOf(u8, output, "cause=stall peer=- step=41 waited_ms=30001 req=chatcmpl-0000000000000000-73\n") != null);
+}
+
+const TestTpCacheEvidence = struct {
+    const Producer = struct {
+        var active: ?*@This() = null;
+        freed: ?Msg = null,
+        restored: ?[2]Msg = null,
+
+        fn free(gen: u64, owner: log.RequestTag) void {
+            active.?.freed = tpFreeHeader(gen, owner);
+        }
+
+        fn snapshot(op: dsv41_mod.SnapOp, snap_id: u64, gen: u64, request: log.RequestTag) void {
+            if (op == .restore) active.?.restored = .{ tpSnapHeader(op, snap_id, gen, request), tpRestoreTagHeader(request) };
+        }
+    };
+
+    const v41 = @import("../../../plugins/deepseek_v41/plugin.zig");
+    const t = std.testing;
+    messages: []const Msg,
+    at: usize = 0,
+
+    fn receive(ctx: *const anyopaque) !Msg {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(ctx)));
+        if (self.at == self.messages.len) return error.TestUnexpectedMessage;
+        defer self.at += 1;
+        return self.messages[self.at];
+    }
+
+    const vt = blk: {
+        var v = WireOps.vt;
+        v.recv_op = receive;
+        break :blk v;
+    };
+
+    fn model(rank: u32) dsv41_mod.Dsv41Model {
+        var m: dsv41_mod.Dsv41Model = undefined;
+        m.cfg = .{ .hidden_size = 4 };
+        m.gpa = t.allocator;
+        m.n_layers = 0;
+        m.n_mtp = 0;
+        m.tp = .{ .rank = rank, .size = 4 };
+        m.pair = null;
+        m.state_gen = 0;
+        m.gens = 8;
+        m.dec_state = null;
+        return m;
+    }
+
+    fn snap(n: usize, ids: []u32) dsv41_mod.Snap {
+        return .{ .tp_id = 17, .gen = 9, .vision_key = 0, .n = n, .ids = ids, .layers = &.{}, .ds = &.{}, .mh = .{ .ctx = null }, .hist = &.{} };
+    }
+
+    fn capture(failure: *?anyerror) void {
+        run() catch |err| {
+            failure.* = err;
+        };
+    }
+
+    fn run() !void {
+        const previous = log.setRequestId(73);
+        defer _ = log.setRequestId(previous);
+        var leader = model(0);
+        defer if (leader.dec_state) |*st| st.deinit();
+        try dsv41_mod.reset(&leader, t.allocator);
+        leader.dec_state.?.n = 4078;
+        var plugin: v41.Model = undefined;
+        plugin.mdl = &leader;
+        plugin.owner = 1;
+        plugin.bank_streams = false;
+        plugin.tp_ids = .{ .last = 17 };
+        var ids: [4078]u32 = @splat(1);
+        var cached = snap(ids.len, &ids);
+        var produced: Producer = .{};
+        Producer.active = &produced;
+        defer Producer.active = null;
+        const hooks = dsv41_mod.clusterHooks();
+        const saved = hooks.*;
+        defer hooks.* = saved;
+        hooks.tp_free = &Producer.free;
+        hooks.tp_snap = &Producer.snapshot;
+
+        _ = log.setRequestId(74);
+        const restore = v41.table.cache.aux.?.restore_at(&plugin, 1, &cached, cached.n);
+        try t.expect(restore.isOk());
+        try t.expectEqual(@as(u64, 10), leader.state_gen);
+
+        const restored = produced.restored orelse return error.TestMissingRestore;
+        const frames = [_]Msg{
+            tpSnapHeader(.take, 9, 17, .{}),
+            produced.freed orelse return error.TestMissingFree,
+            restored[0],
+            restored[1],
+            .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        for (1..4) |rank_usize| {
+            const rank: u32 = @intCast(rank_usize);
+            const snapshot_pos: usize = if (rank == 2) 4079 else 4078;
+            var follower = model(rank);
+            defer if (follower.dec_state) |*st| st.deinit();
+            follower.state_gen = 9;
+            follower.dec_state = .{ .gpa = t.allocator, .layers = &.{}, .n = if (rank == 1) 4080 else 4078, .snap = snap(snapshot_pos, &.{}) };
+            var state: LinkState = .{};
+            const link: Link = .{ .state = &state, .group = .{}, .rank = rank, .size = 4 };
+            var wire_fixture: TestTpCacheEvidence = .{ .messages = &frames };
+            try t.expect(try dsv41StepLoop(t.io, t.allocator, &link, &follower, .{ .ctx = &wire_fixture, .vt = &vt }));
+            try t.expectEqual(@as(u64, 10), follower.state_gen);
+            try t.expectEqual(snapshot_pos, follower.dec_state.?.n);
+        }
+    }
+};
+
+test "request id: each TP rank logs its own free and restore positions" {
+    const t = std.testing;
+    var failure: ?anyerror = null;
+    const output = try @import("../../../sdk/testing/log_capture.zig").capture(t.allocator, TestTpCacheEvidence.capture, .{&failure});
+    defer t.allocator.free(output);
+    if (failure) |err| return err;
+    try t.expectEqualStrings(
+        "[hot-cache] rank=0 free req=chatcmpl-0000000000000000-73 gen=9 pos=4078\n" ++
+            "[hot-cache] rank=0 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4078\n" ++
+            "[hot-cache] rank=1 free req=chatcmpl-0000000000000000-73 gen=9 pos=4080\n" ++
+            "[hot-cache] rank=1 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4078\n" ++
+            "[hot-cache] rank=2 free req=chatcmpl-0000000000000000-73 gen=9 pos=4078\n" ++
+            "[hot-cache] rank=2 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4079\n" ++
+            "[hot-cache] rank=3 free req=chatcmpl-0000000000000000-73 gen=9 pos=4078\n" ++
+            "[hot-cache] rank=3 restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4078\n",
+        output,
+    );
+}
+
+test "request id: TP cache metadata preserves the full leader nonce and id" {
+    const t = std.testing;
+    const request: log.RequestTag = .{ .id = 0xfedcba9876543210, .boot_nonce = 0x89abcdef01234567 };
+    const freed = tpFreeHeader(9, request);
+    const restored = tpRestoreTagHeader(request);
+    try t.expectEqual(request, tpRequestTag(freed[3..7].*));
+    try t.expectEqual(request, tpRequestTag(restored[1..5].*));
+    var buf: [64]u8 = undefined;
+    const tag = try std.fmt.bufPrint(&buf, "{f}", .{tpRequestTag(restored[1..5].*)});
+    try t.expectEqualStrings("chatcmpl-89abcdef01234567-18364758544493064720", tag);
 }

@@ -5,6 +5,7 @@
 //! a plain MLX pack's own shards (`sdk/weights/streamed.zig`).
 
 const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -134,8 +135,7 @@ fn park(m: *Model) !void {
     const k: Kept = .{ .st = st, .gen = m.mdl.state_gen };
     if (m.owner != 0) try m.parked.put(gpa, m.owner, k) else if (!auxEnabled(m)) keepIdle(m, k) else {
         var orphan = k;
-        orphan.deinit();
-        dsv41.tpFree(m.mdl, k.gen);
+        dsv41.freeState(m.mdl, &orphan.st, k.gen);
     }
     m.mdl.dec_state = null;
     m.owner = 0;
@@ -143,8 +143,7 @@ fn park(m: *Model) !void {
 
 fn keepIdle(m: *Model, k: Kept) void {
     if (m.idle) |*old| {
-        old.deinit();
-        dsv41.tpFree(m.mdl, old.gen);
+        dsv41.freeState(m.mdl, &old.st, old.gen);
     }
     m.idle = k;
 }
@@ -214,14 +213,12 @@ fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
     if (slot == m.owner) {
         m.owner = 0;
         if (m.mdl.dec_state) |*st| {
-            st.deinit();
-            dsv41.tpFree(m.mdl, m.mdl.state_gen);
+            dsv41.freeState(m.mdl, st, m.mdl.state_gen);
         }
         m.mdl.dec_state = null;
     } else if (m.parked.fetchRemove(slot)) |kv| {
         var k = kv.value;
-        k.deinit();
-        dsv41.tpFree(m.mdl, k.gen);
+        dsv41.freeState(m.mdl, &k.st, k.gen);
     }
 }
 
@@ -827,14 +824,13 @@ fn auxRestoreAt(mp: *anyopaque, slot: u32, handle: abi.Handle, pos: u64) callcon
         fresh.deinit();
         return Verdict.named(.failed, @errorName(e));
     };
-    if (m.mdl.dec_state) |*old| {
-        old.deinit();
-        dsv41.tpFree(m.mdl, m.mdl.state_gen);
-    }
+    if (m.mdl.dec_state) |*old| dsv41.freeState(m.mdl, old, m.mdl.state_gen);
+    const request = log.requestTag(log.requestId());
+    fresh.request_id = request.id;
     m.mdl.dec_state = fresh;
     m.mdl.gens += 1;
     m.mdl.state_gen = m.mdl.gens;
-    dsv41.tpSnap(m.mdl, .restore, sn.tp_id, m.mdl.state_gen);
+    dsv41.tpRestore(m.mdl, sn, m.mdl.state_gen, request);
     return .ok;
 }
 
