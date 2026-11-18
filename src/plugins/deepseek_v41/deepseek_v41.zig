@@ -5698,7 +5698,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         tsp.prof = Profile.start(full_prof != null, &tail_profile, monoUs);
         tsp.whole = held[held.len - 2 ..][0..2];
         tsp.floor = tsp.p0;
-        try cedReplayIn(m, gpa, st, &sp, &tsp);
+        try cedReplayIn(m, gpa, &sp, &tsp);
         m.ced_stats.chunks += 1;
         m.ced_stats.skipped += L - tl;
         logCedPrefill(L - tl, tl);
