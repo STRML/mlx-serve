@@ -41,8 +41,6 @@ var kv_skew_split_logged: bool = false; // one-shot log guard
 pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     const dist_scope = @import("cluster/distributed.zig").scopeRequests(active);
     defer dist_scope.restore();
-    const previous_req = log.setRequestId(if (active.len == 1) active[0].request_id else 0);
-    defer _ = log.setRequestId(previous_req);
     if (active.len == 0) return;
 
     // Publish the in-flight generated-token aggregate for the gauge sampler.
@@ -239,8 +237,6 @@ pub fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     const collective = [_]*const Slot{slot};
     const dist_scope = @import("cluster/distributed.zig").scopeRequests(&collective);
     defer dist_scope.restore();
-    const previous_req = log.setRequestId(slot.request_id);
-    defer _ = log.setRequestId(previous_req);
     var inner_err: ?anyerror = null;
     runSingleDecodeTickInner(sch, slot) catch |e| switch (e) {
         // A reasoning-protocol dead end is this request's failure; the tick

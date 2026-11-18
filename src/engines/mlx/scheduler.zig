@@ -761,27 +761,24 @@ pub fn failInFlightLocked(self: *Scheduler, name: []const u8) void {
 pub fn liveRequestIds(self: *Scheduler, model: []const u8, ids: *std.ArrayList(u64)) bool {
     if (!self.queue_mu.tryLock()) return false;
     defer self.queue_mu.unlock(self.io);
-    return liveRequestIdsLocked(self, model, ids);
+    return liveRequestIdsLocked(self, model, ids, .try_lock);
 }
 
-pub fn liveRequestIdsLocked(self: *Scheduler, model: []const u8, ids: *std.ArrayList(u64)) bool {
-    var recorded_all = true;
+pub fn liveRequestIdsLocked(self: *Scheduler, model: []const u8, ids: *std.ArrayList(u64), mode: enum { try_lock, wait }) bool {
     for (inFlightSlotsLocked(self)) |slots| {
         for (slots) |slot| {
             if (!distributed.samePath(model, slot.model.path)) continue;
-            if (!slot.out_mu.tryLock()) {
-                recorded_all = false;
-                continue;
+            switch (mode) {
+                .try_lock => if (!slot.out_mu.tryLock()) return false,
+                .wait => slot.out_mu.lockUncancelable(slot.io),
             }
             const ended = slot.finished or slot.error_code != null;
             slot.out_mu.unlock(slot.io);
             if (ended or std.mem.indexOfScalar(u64, ids.items, slot.request_id) != null) continue;
-            ids.append(std.heap.page_allocator, slot.request_id) catch {
-                recorded_all = false;
-            };
+            ids.append(std.heap.page_allocator, slot.request_id) catch return false;
         }
     }
-    return recorded_all;
+    return true;
 }
 
 fn inFlightSlotsLocked(self: *Scheduler) [4][]const *Slot {

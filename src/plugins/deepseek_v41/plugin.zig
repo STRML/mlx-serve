@@ -601,10 +601,26 @@ fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {
     defer for (rows[0..done]) |r| {
         _ = mlx.mlx_array_free(r);
     };
+    const Row = struct {
+        model: *Model,
+        slot: u32,
+        token: u32,
+        position: ?usize,
+
+        fn step(ctx: *anyopaque) anyerror!mlx.mlx_array {
+            const row: *@This() = @ptrCast(@alignCast(ctx));
+            const m0 = row.model;
+            try activate(m0, row.slot);
+            const pos = row.position orelse if (m0.mdl.dec_state) |st| st.n else 0;
+            return run(m0, &.{row.token}, pos, false, null, .{ .ctx = null });
+        }
+    };
     for (f.slots.slice(), f.tokens.slice(), 0..) |slot, t, k| {
-        try activate(m, slot);
-        const pos = if (f.positions.len == f.slots.len) f.positions.slice()[k] else if (m.mdl.dec_state) |st| st.n else 0;
-        rows[done] = try run(m, &.{t}, pos, false, null, .{ .ctx = null });
+        var row: Row = .{ .model = m, .slot = slot, .token = t, .position = if (f.positions.len == f.slots.len) f.positions.slice()[k] else null };
+        rows[done] = if (dsv41.clusterHooks().with_slot) |withSlot|
+            try withSlot(slot, &row, &Row.step)
+        else
+            try Row.step(&row);
         done += 1;
     }
     var o = mlx.mlx_array_new();
@@ -684,11 +700,13 @@ pub fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows
         m.mdl.state_gen = k.gen;
         m.idle = null;
     };
-    return dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch blk: {
+    const restored = dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch blk: {
         // The forward at position 0 establishes the cold state even if this reset fails.
         dsv41.reset(m.mdl, gpa) catch {};
         break :blk 0;
     };
+    if (restored > 0) m.mdl.dec_state.?.request_id = log.requestId();
+    return restored;
 }
 
 /// `CacheHooks.state_bytes`: the bytes the request's state holds on the GPU, for the engine's cache budget.

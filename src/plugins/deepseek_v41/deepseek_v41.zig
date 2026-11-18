@@ -1736,6 +1736,7 @@ const ClusterHooksState = struct {
     tp_load: ?*const fn (id: u64, ids: []const u32, tensors: []const A) anyerror!void = null,
     /// Tensor parallel, rank 0: a snapshot moved, appeared or went (`SnapOp`).
     tp_snap: ?*const fn (op: SnapOp, a: u64, b: u64, evidence: SnapEvidence) void = null,
+    with_slot: ?*const fn (u32, *anyopaque, *const fn (*anyopaque) anyerror!A) anyerror!A = null,
 };
 
 /// What rank 0 did with a snapshot, for the other ranks to do with their copy: `take` (state `a`'s snapshot kept as

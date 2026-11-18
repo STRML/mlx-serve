@@ -87,6 +87,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             continue;
         };
         if (gen.has_pending_logits or gen.has_pending_token) {
+            const scope = @import("../cluster/distributed.zig").scopeRequests(&.{slot});
+            defer scope.restore();
             const emitted = gen.drainPipelineForBatch(slot.allocator) catch |err| {
                 slot.markError(@errorName(err));
                 continue;

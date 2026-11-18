@@ -113,6 +113,7 @@ pub fn start(ctx: Context, role: Role, n: u64, deadline_epoch_ms: i64) error{ Bu
     a.req.cfg.formation_deadline_ms = a.deadline_ms;
     a.req.cfg.ready_in_open = true;
     a.req.cfg.open_control = &a.control;
+    a.req.cfg.switch_model = model_dir;
     a.thread = std.Thread.spawn(.{ .stack_size = 1 << 20 }, Attempt.run, .{a}) catch return error.InvalidArgs;
     current = a;
 }

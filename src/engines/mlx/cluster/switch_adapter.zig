@@ -87,7 +87,7 @@ fn poll(_: *anyopaque, n: u64) ?controller.FormOutcome {
 fn activate(ctx: *anyopaque, n: u64, link: *anyopaque) ?[]const u8 {
     var work: Work = .{ .owner = adapter(ctx), .n = n, .link = @ptrCast(@alignCast(link)), .op = .activate };
     dispatch(&work);
-    if (work.failure) |name| if (std.mem.eql(u8, name, "Unavailable")) distributed.exitSwitchAbort(n);
+    if (work.failure) |name| if (std.mem.eql(u8, name, "Unavailable")) distributed.exitSwitchAbort(n, work.owner.context.model_dir);
     return work.failure;
 }
 
@@ -105,15 +105,15 @@ fn release(ctx: *anyopaque, n: u64, link: *anyopaque, rank: *?u32) ?[]const u8 {
 fn fall(ctx: *anyopaque, n: u64, link: *anyopaque) void {
     var work: Work = .{ .owner = adapter(ctx), .n = n, .link = @ptrCast(@alignCast(link)), .op = .fall };
     dispatch(&work);
-    if (work.failure != null) distributed.exitSwitchAbort(n);
+    if (work.failure != null) distributed.exitSwitchAbort(n, work.owner.context.model_dir);
 }
 
 fn quarantined(_: *anyopaque) bool {
     return switcher.quarantined();
 }
 
-fn exitProcess(_: *anyopaque, n: u64) void {
-    distributed.exitSwitchAbort(n);
+fn exitProcess(ctx: *anyopaque, n: u64) void {
+    distributed.exitSwitchAbort(n, adapter(ctx).context.model_dir);
 }
 
 fn peers(ctx: *anyopaque) u8 {
@@ -125,10 +125,10 @@ fn stallNote(_: *anyopaque, buf: []u8) []const u8 {
 }
 
 pub fn followerFell(n: u64, link: *distributed.Link) void {
-    const self = installed orelse distributed.exitSwitchAbort(n);
+    const self = installed orelse distributed.exitSwitchAbort(n, null);
     var work: Work = .{ .owner = self, .n = n, .link = link, .op = .follower_fell };
     dispatch(&work);
-    if (work.failure != null) distributed.exitSwitchAbort(n);
+    if (work.failure != null) distributed.exitSwitchAbort(n, self.context.model_dir);
 }
 
 const Work = struct {
@@ -153,13 +153,13 @@ const Work = struct {
         switch (self.op) {
             .activate => {
                 self.swap() catch {
-                    self.leave() catch distributed.exitSwitchAbort(self.n);
+                    self.leave() catch distributed.exitSwitchAbort(self.n, self.owner.context.model_dir);
                     return error.SwapFailed;
                 };
                 active_mode = .{ .n = self.n, .link = self.link };
                 switcher.activate(self.n) catch {
-                    self.restore() catch distributed.exitSwitchAbort(self.n);
-                    self.leave() catch distributed.exitSwitchAbort(self.n);
+                    self.restore() catch distributed.exitSwitchAbort(self.n, self.owner.context.model_dir);
+                    self.leave() catch distributed.exitSwitchAbort(self.n, self.owner.context.model_dir);
                     return error.SwapFailed;
                 };
             },
@@ -257,7 +257,7 @@ pub fn serveFollower() bool {
     if (!follower_pending.load(.acquire)) return false;
     var work = follower;
     const snap = work.owner.sw.snapshot();
-    if (snap.quarantined) distributed.exitSwitchAbort(work.n);
+    if (snap.quarantined) distributed.exitSwitchAbort(work.n, work.owner.context.model_dir);
     if (snap.mode != .tp4) return false;
     if (!follower_pending.swap(false, .acq_rel)) return false;
     distributed.parkInferenceLoop();
@@ -271,7 +271,7 @@ pub fn serveFollower() bool {
     };
     if (!released) distributed.exitWorker(null);
     work.run();
-    if (work.failure != null) distributed.exitSwitchAbort(work.n);
+    if (work.failure != null) distributed.exitSwitchAbort(work.n, work.owner.context.model_dir);
     return true;
 }
 

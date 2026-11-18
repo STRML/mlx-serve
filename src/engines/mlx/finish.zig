@@ -18,6 +18,8 @@ const plugin_settle = @import("plugin/settle.zig");
 pub fn releasePluginSlot(slot: *Slot) void {
     const xfm = slot.model.transformer orelse return;
     if (!xfm.ownsModuleDecodeState()) return;
+    const scope = @import("cluster/distributed.zig").scopeRequests(&.{slot});
+    defer scope.restore();
     if (slot.legacy_gen) |*g| {
         xfm.discardDeferredPle(&g.ctx);
         const id = g.ctx.plugin_slot;
@@ -179,6 +181,8 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         }
         g.persistRoundCost();
         // The cache commit below snapshots the n-gram history: settle the pipelined step's owed advance first.
+        const scope = @import("cluster/distributed.zig").scopeRequests(&.{slot});
+        defer scope.restore();
         g.xfm.flushDeferredPle(&g.ctx) catch g.xfm.discardDeferredPle(&g.ctx);
     }
     const latched: ?[]const u8 = mlx.peekErrorName();

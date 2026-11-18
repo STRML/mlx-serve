@@ -87,6 +87,8 @@ fn runGroupTickInner(sch: *Scheduler, group: []*Slot) !void {
     var allocs: [MAX_SLOTS]std.mem.Allocator = undefined;
     var n: usize = 0;
     for (group) |slot| {
+        const scope = @import("../cluster/distributed.zig").scopeRequests(&.{slot});
+        defer scope.restore();
         const gen = &slot.legacy_gen.?;
         if (try loopGuardTick(sch, slot, gen)) continue;
         const entry = enter(gen, slot.allocator) catch |e| {

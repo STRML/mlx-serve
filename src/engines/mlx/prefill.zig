@@ -175,8 +175,6 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const collective = [_]*const Slot{slot};
     const dist_scope = @import("cluster/distributed.zig").scopeRequests(&collective);
     defer dist_scope.restore();
-    const previous_req = log.setRequestId(slot.request_id);
-    defer _ = log.setRequestId(previous_req);
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
     // so the panel isn't blind until the first chunk lands; the chunk loop in

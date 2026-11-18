@@ -150,8 +150,6 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     const collective = [_]*const Slot{slot};
     const dist_scope = @import("cluster/distributed.zig").scopeRequests(&collective);
     defer dist_scope.restore();
-    const previous_req = log.setRequestId(slot.request_id);
-    defer _ = log.setRequestId(previous_req);
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.prefix_cache) |p| p else return;
     if (slot.error_code != null) return;
