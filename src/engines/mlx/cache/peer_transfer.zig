@@ -279,27 +279,28 @@ fn exportWireModuleWithBudget(
     var tail_from: usize = 0;
     const base = try exportWireModuleOnce(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, session, max_bytes, admit_transfer_budget, .boundary, &tail_from);
     if (session == 0 or base != .ok) return base;
-    const tail = exportWireModuleOnce(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, session, max_bytes, admit_transfer_budget, .tail, &tail_from) catch return base;
+    const remaining = max_bytes -| peer_wire.bundleSize(&.{ base.ok.bytes.len, 0 });
+    if (remaining == 0) return base;
+    const tail = exportWireModuleOnce(allocator, io, sch, lm, prompt_ids, has_tools, kv_quant_override, variant, cache_key, session, remaining, admit_transfer_budget, .tail, &tail_from) catch return base;
     if (tail != .ok) return base;
-    return .{ .ok = bundleOrBoundary(allocator, base.ok, tail.ok, tail_from, max_bytes, admit_transfer_budget) };
+    return .{ .ok = bundleOrBoundary(allocator, base.ok, tail.ok, tail_from, admit_transfer_budget) };
 }
 
-/// The bundle of `base` and `tail` when it fits `max_bytes` and the transfer budget, else `base` alone. Takes both
-/// results' bytes and reservations; the returned bytes carry a reservation of exactly their length.
-fn bundleOrBoundary(allocator: std.mem.Allocator, base: ExportOk, tail: ExportOk, tail_from: usize, max_bytes: usize, admit: bool) ExportOk {
+/// Both members stay reserved until the bundle copy is complete.
+fn bundleOrBoundary(allocator: std.mem.Allocator, base: ExportOk, tail: ExportOk, tail_from: usize, admit: bool) ExportOk {
     const total = peer_wire.bundleSize(&.{ base.bytes.len, tail.bytes.len });
-    const extra: u64 = @intCast(total - base.bytes.len - tail.bytes.len);
-    const reserved = total <= max_bytes and (!admit or http_server.reserveCacheExportBytes(extra));
-    const bytes = (if (reserved) allocator.alloc(u8, total) catch null else null) orelse {
-        if (reserved and admit) http_server.releaseCacheExportBytes(extra);
-        if (admit) http_server.releaseCacheExportBytes(@intCast(tail.bytes.len));
+    defer {
         allocator.free(tail.bytes);
+        if (admit) http_server.releaseCacheExportBytes(@intCast(tail.bytes.len));
+    }
+    if (admit and !http_server.reserveCacheExportBytes(total)) return base;
+    const bytes = allocator.alloc(u8, total) catch {
+        if (admit) http_server.releaseCacheExportBytes(total);
         return base;
     };
     peer_wire.writeBundle(bytes, &.{ .{ .tail_from = 0, .body = base.bytes }, .{ .tail_from = tail_from, .body = tail.bytes } });
-    // The reservations of the two members and the bundle header add up to `total`, released with the bytes.
     allocator.free(base.bytes);
-    allocator.free(tail.bytes);
+    if (admit) http_server.releaseCacheExportBytes(@intCast(base.bytes.len));
     const peak = if (admit) @max(base.planned_peak -| base.bytes.len, tail.planned_peak -| tail.bytes.len) +| total else 0;
     log.info("[hot-cache] peer module export: bundle of {d} + {d} tokens, bytes={d}\n", .{ base.n, tail.n, total });
     return .{ .bytes = bytes, .n = tail.n, .export_ms = base.export_ms + tail.export_ms, .planned_peak = peak };
@@ -457,9 +458,27 @@ fn importArraysRefusal() requests.CacheImportRefusal {
     return if (mlx.latchedErrorIs(mlx.mlxErrorIsMemory)) .no_memory else .import_arrays;
 }
 
-/// One envelope, or a session export's bundle: its boundary first, then its decode-end entry, committed as a tail of
-/// the same session. The tail goes in only when the boundary did or the receiver already holds it (`stale`); the
-/// outcome is the longest member committed, else the boundary's refusal.
+const ImportedBoundary = struct {
+    env: peer_wire.DecodedEnvelope,
+    commit: prefix_cache_mod.ModuleCommit,
+};
+
+const TailImport = struct {
+    boundary: *const ImportedBoundary,
+    from: usize,
+
+    fn matches(self: TailImport, env: peer_wire.DecodedEnvelope) bool {
+        const base = self.boundary.env;
+        return env.session == base.session and env.variant == base.variant and env.has_tools == base.has_tools and
+            std.meta.eql(env.quant_config, base.quant_config) and env.media.len == 0 and base.media.len == 0 and
+            self.from >= base.ids.len and self.from <= base.ids.len + 1 and self.from < env.ids.len and
+            std.mem.startsWith(u32, env.ids, base.ids);
+    }
+};
+
+const ImportMember = union(enum) { single, boundary: *?ImportedBoundary, tail: TailImport };
+
+/// A bundle may add a reply only to the prompt boundary this import committed or claimed.
 pub fn importWireModule(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -467,20 +486,32 @@ pub fn importWireModule(
     lm: *LoadedModel,
     body: []const u8,
 ) !requests.CacheImportOutcome {
-    if (!peer_wire.isBundle(body)) return importEnvelope(allocator, io, sch, lm, body, 0);
+    if (!peer_wire.isBundle(body)) return importEnvelope(allocator, io, sch, lm, body, .single);
     var members: [peer_wire.MAX_BUNDLE_MEMBERS]peer_wire.BundleMember = undefined;
     const list = peer_wire.readBundle(body, &members) catch |err| {
         const refusal = try mapDecodeError(err);
         logRefusal(refusal, 0);
         return .{ .refused = refusal };
     };
-    var best = try importEnvelope(allocator, io, sch, lm, list[0].body, 0);
-    if (best == .refused and best.refused != .stale) return best;
-    for (list[1..]) |m| {
-        const out = try importEnvelope(allocator, io, sch, lm, m.body, @intCast(m.tail_from));
-        if (out == .ok and (best != .ok or out.ok.n > best.ok.n)) best = out;
+    if (list.len == 1) return importEnvelope(allocator, io, sch, lm, list[0].body, .single);
+    var boundary: ?ImportedBoundary = null;
+    const base = try importEnvelope(allocator, io, sch, lm, list[0].body, .{ .boundary = &boundary });
+    const imported = if (boundary) |*b| b else return base;
+    defer imported.env.deinit();
+
+    const hc = lm.prefix_cache.?;
+    if (!hc.pinPeerBoundary(imported.commit.entry_id)) return base;
+    defer {
+        hc.unpinPeerBoundary();
+        publishHotCacheResidency(sch);
     }
-    return best;
+
+    const tail: ImportMember = .{ .tail = .{ .boundary = imported, .from = @intCast(list[1].tail_from) } };
+    const out = importEnvelope(allocator, io, sch, lm, list[1].body, tail) catch |err| {
+        log.warn("[hot-cache] optional peer tail import failed: {s}\n", .{@errorName(err)});
+        return base;
+    };
+    return if (out == .ok or out.refused == .bad_envelope) out else base;
 }
 
 fn importEnvelope(
@@ -489,7 +520,7 @@ fn importEnvelope(
     sch: *Scheduler,
     lm: *LoadedModel,
     body: []const u8,
-    tail_from: usize,
+    member: ImportMember,
 ) !requests.CacheImportOutcome {
     const t0 = io_util.nowUsMonotonic(io);
     const had_error = mlx.errorPending();
@@ -512,9 +543,20 @@ fn importEnvelope(
         logRefusal(r, 0);
         return .{ .refused = r };
     };
-    defer env.deinit();
+    var boundary_commit: ?prefix_cache_mod.ModuleCommit = null;
+    defer if (boundary_commit) |c| {
+        member.boundary.* = .{ .env = env, .commit = c };
+    } else env.deinit();
     const t_decode = io_util.nowUsMonotonic(io);
-    if (tail_from >= env.ids.len and tail_from > 0) {
+    var stats: requests.CacheImportStats = .{
+        .n = env.ids.len,
+        .bytes = body.len,
+        .decode_ms = @intCast(@max(@divTrunc(t_decode - t0, 1000), 0)),
+        .admit_ms = 0,
+        .import_ms = 0,
+        .commit_ms = 0,
+    };
+    if (member == .tail and !member.tail.matches(env)) {
         logRefusal(.bad_envelope, env.ids.len);
         return .{ .refused = .bad_envelope };
     }
@@ -554,9 +596,19 @@ fn importEnvelope(
         return .{ .refused = .quant_config };
     }
 
-    if (hc.claimCovering(binding, env.ids, env.media, env.has_tools, env.quant_config, env.session)) {
-        logRefusal(.stale, env.ids.len);
-        return .{ .refused = .stale };
+    if (member == .tail) {
+        if (hc.exactModuleBoundary(binding, env.ids, env.media, env.has_tools, env.quant_config) != null) {
+            logRefusal(.stale, env.ids.len);
+            return .{ .refused = .stale };
+        }
+    } else if (hc.claimCovering(binding, env.ids, env.media, env.has_tools, env.quant_config, env.session)) |claim| {
+        if (member == .boundary and claim.seq != 0) {
+            boundary_commit = claim;
+            return .{ .ok = stats };
+        }
+        const refusal: requests.CacheImportRefusal = if (member == .boundary and env.session == 0) .bad_envelope else .stale;
+        logRefusal(refusal, env.ids.len);
+        return .{ .refused = refusal };
     }
 
     var plan: plugin_abi.AuxImportPlan = .{};
@@ -576,14 +628,14 @@ fn importEnvelope(
     var peak = try prefill_mod.moduleImportPeak(plan.peak, env.tensors);
     const body_bytes: u64 = @intCast(body.len);
     peak = try std.math.add(u64, peak, body_bytes);
-    const staged = stagedHostBytes(sch) -| body_bytes;
-    if (peak > prefillHeadroomNow(cfg, staged) +| hc.residentBytes()) {
-        logRefusal(.no_memory, env.ids.len);
-        return .{ .refused = .no_memory };
-    }
     var probe: prefill_mod.ModuleImportProbe = .{ .sch = sch, .cfg = cfg, .peak = peak, .body_bytes = body_bytes };
-    const admitted = hc.evictLruToAdmit(@intCast(env.ids.len), &probe, prefill_mod.ModuleImportProbe.fits, false).admitted;
-    publishHotCacheResidency(sch);
+    const admitted = if (member == .tail) prefill_mod.ModuleImportProbe.fits(&probe) else blk: {
+        const staged = stagedHostBytes(sch) -| body_bytes;
+        if (peak > prefillHeadroomNow(cfg, staged) +| hc.residentBytes()) break :blk false;
+        const report = hc.evictLruToAdmit(@intCast(env.ids.len), &probe, prefill_mod.ModuleImportProbe.fits, false);
+        publishHotCacheResidency(sch);
+        break :blk report.admitted;
+    };
     if (!admitted) {
         logRefusal(.no_memory, env.ids.len);
         return .{ .refused = .no_memory };
@@ -639,8 +691,6 @@ fn importEnvelope(
         return .{ .refused = .describe_mismatch };
     }
 
-    // An imported tail binds to the session's tip, which the bundle's boundary member just committed or claimed.
-    const boundary_seq: u64 = if (tail_from > 0) (if (hc.sessionTip(env.session)) |tip| tip.seq else 0) else 0;
     const committed = hc.commitModuleTail(
         binding,
         snapshot,
@@ -651,25 +701,28 @@ fn importEnvelope(
         env.quant_config,
         env.cache_key,
         env.session,
-        tail_from,
-        boundary_seq,
+        if (member == .tail) member.tail.from else 0,
+        if (member == .tail) member.tail.boundary.commit.seq else 0,
     ) catch |err| {
-        publishHotCacheResidency(sch);
+        if (member != .tail) publishHotCacheResidency(sch);
         return err;
     };
-    publishHotCacheResidency(sch);
+    if (member != .tail) publishHotCacheResidency(sch);
     const t_commit = io_util.nowUsMonotonic(io);
 
     switch (committed) {
-        .ok => |n| {
-            const stats: requests.CacheImportStats = .{
-                .n = n,
-                .bytes = body.len,
-                .decode_ms = @intCast(@max(@divTrunc(t_decode - t0, 1000), 0)),
-                .admit_ms = @intCast(@max(@divTrunc(t_admit - t_decode, 1000), 0)),
-                .import_ms = @intCast(@max(@divTrunc(t_import - t_admit, 1000), 0)),
-                .commit_ms = @intCast(@max(@divTrunc(t_commit - t_import, 1000), 0)),
-            };
+        .ok => |c| {
+            if (member == .boundary) {
+                if (env.session == 0) {
+                    logRefusal(.bad_envelope, env.ids.len);
+                    return .{ .refused = .bad_envelope };
+                }
+                if (c.seq != 0) boundary_commit = c;
+            }
+            stats.n = c.n;
+            stats.admit_ms = @intCast(@max(@divTrunc(t_admit - t_decode, 1000), 0));
+            stats.import_ms = @intCast(@max(@divTrunc(t_import - t_admit, 1000), 0));
+            stats.commit_ms = @intCast(@max(@divTrunc(t_commit - t_import, 1000), 0));
             log.info("[hot-cache] peer module import: n={d} bytes={d} (decode={d}ms admit={d}ms import={d}ms commit={d}ms)\n", .{
                 stats.n, stats.bytes, stats.decode_ms, stats.admit_ms, stats.import_ms, stats.commit_ms,
             });

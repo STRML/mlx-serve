@@ -170,12 +170,11 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             return;
         }
         // The snapshot describes its own forwarded prompt boundary, excluding the generated tail.
-        _ = hc.commitModule(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, slot.session) catch |err| {
+        const boundary = hc.commitModule(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, slot.session) catch |err| {
             log.warn("[hot-cache] module commit failed: {s}\n", .{@errorName(err)});
             return;
         };
-        // The boundary commit just above set `last_session_seq`; the tail binds to that boundary only.
-        commitModuleDecodeEnd(sch, slot, gen, binding, hc, hc.last_session_seq);
+        commitModuleDecodeEnd(sch, slot, gen, binding, hc, if (boundary == .ok) boundary.ok.seq else 0);
         publishHotCacheResidency(sch);
         return;
     };

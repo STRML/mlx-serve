@@ -509,14 +509,19 @@ test "peer transfer session: an export carries the decode-end checkpoint, so the
     try testing.expect(exported == .ok);
     defer testing.allocator.free(exported.ok.bytes);
     try testing.expect(importWire(model_b, exported.ok.bytes) == .ok);
+    try testing.expectEqual(@as(u64, 0), model_b.sch.hot_cache_checked_out_bytes.load(.monotonic));
     // A cap the decode-end entry does not fit sends the prompt boundary instead of refusing the export.
     const capped = exportBySessionCapped(model_a, 77, exported.ok.bytes.len - 1);
     try testing.expect(capped == .ok);
     defer testing.allocator.free(capped.ok.bytes);
     try testing.expectEqual(@as(usize, 24), capped.ok.n);
-    // So does a transfer budget the decode-end entry does not fit.
-    {
-        const held = http_server.CACHE_TRANSFER_BUDGET_BYTES - capped.ok.bytes.len - 16;
+    // Both members and the copy must fit at once. Only the returned body stays reserved.
+    for ([_]struct { room: usize, n: usize }{
+        .{ .room = capped.ok.bytes.len + 16, .n = 24 },
+        .{ .room = exported.ok.bytes.len, .n = 24 },
+        .{ .room = 2 * exported.ok.bytes.len, .n = exported.ok.n },
+    }) |budget| {
+        const held = http_server.CACHE_TRANSFER_BUDGET_BYTES - budget.room;
         try testing.expect(http_server.reserveCacheExportBytes(held));
         defer http_server.releaseCacheExportBytes(held);
         var req: @import("../../host/gpu_thread/requests.zig").CacheExportRequest = .{
@@ -532,7 +537,8 @@ test "peer transfer session: an export carries the decode-end checkpoint, so the
         try testing.expect(req.outcome == .ok);
         defer http_server.releaseCacheExportBytes(@intCast(req.outcome.ok.bytes.len));
         defer testing.allocator.free(req.outcome.ok.bytes);
-        try testing.expectEqual(@as(usize, 24), req.outcome.ok.n);
+        try testing.expectEqual(budget.n, req.outcome.ok.n);
+        try testing.expectEqual(held + req.outcome.ok.bytes.len, http_server.cacheTransferReservedBytes());
     }
 
     const warm_a = try model_a.runGreedy(&next, 4, false);
@@ -806,6 +812,213 @@ fn expectWireIds(wire: []const u8, wants: []const []const u32) !void {
         defer decoded.deinit();
         try testing.expectEqualSlices(u32, want, decoded.ids);
     }
+}
+
+const SessionBundleFixture = struct {
+    sender: *PeerHarness,
+    receiver: *PeerHarness,
+    wire: []u8,
+    members: [peer_wire.MAX_BUNDLE_MEMBERS]peer_wire.BundleMember,
+
+    const session = 77;
+    const prompt = buildPrompt(25);
+    const boundary = prompt[0..24];
+
+    fn open() !SessionBundleFixture {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const files = try fixture.v41Files(arena.allocator(), 7);
+        const sender = try PeerHarness.open(files);
+        errdefer sender.close();
+        const receiver = try PeerHarness.open(files);
+        errdefer receiver.close();
+        const turn = try sender.runGreedyTagged(&prompt, 2, true, session);
+        defer testing.allocator.free(turn.tokens);
+        const exported = exportBySession(sender, session);
+        try testing.expect(exported == .ok);
+        errdefer testing.allocator.free(exported.ok.bytes);
+        var members: [peer_wire.MAX_BUNDLE_MEMBERS]peer_wire.BundleMember = undefined;
+        try testing.expectEqual(@as(usize, 2), (try peer_wire.readBundle(exported.ok.bytes, &members)).len);
+        return .{ .sender = sender, .receiver = receiver, .wire = exported.ok.bytes, .members = members };
+    }
+
+    fn close(f: SessionBundleFixture) void {
+        testing.allocator.free(f.wire);
+        f.receiver.close();
+        f.sender.close();
+    }
+
+    fn expectBoundaryOnly(f: SessionBundleFixture) !void {
+        const exported = exportBySession(f.receiver, session);
+        try testing.expect(exported == .ok);
+        defer testing.allocator.free(exported.ok.bytes);
+        try expectWireIds(exported.ok.bytes, &.{boundary});
+    }
+};
+
+test "peer transfer session: a covering prompt from another session cannot claim the imported reply as a tip" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+    const f = try SessionBundleFixture.open();
+    defer f.close();
+
+    var tail = try peer_wire.decode(testing.allocator, f.members[1].body);
+    defer tail.deinit();
+    var other_prompt: [28]u32 = undefined;
+    try testing.expectEqual(other_prompt.len - 1, tail.ids.len);
+    @memcpy(other_prompt[0..tail.ids.len], tail.ids);
+    other_prompt[tail.ids.len] = 42;
+    const other = try f.receiver.runGreedyTagged(&other_prompt, 1, true, 88);
+    defer testing.allocator.free(other.tokens);
+    const hc = f.receiver.entry.prefix_cache.?;
+    try expectPromptEntries(hc, &.{tail.ids});
+
+    const out = importWire(f.receiver, f.wire);
+    try testing.expect(out == .ok);
+    try testing.expectEqual(SessionBundleFixture.boundary.len, hc.sessionTip(SessionBundleFixture.session).?.n);
+    try expectPromptEntries(hc, &.{ tail.ids, SessionBundleFixture.boundary });
+    try f.expectBoundaryOnly();
+}
+
+test "peer transfer session: a retried bundle preserves the receiver's newer reply" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+    const f = try SessionBundleFixture.open();
+    defer f.close();
+
+    try testing.expect(importWire(f.receiver, f.wire) == .ok);
+    const newer = try f.receiver.runGreedyTagged(&SessionBundleFixture.prompt, 4, true, SessionBundleFixture.session);
+    defer testing.allocator.free(newer.tokens);
+    const before = exportBySession(f.receiver, SessionBundleFixture.session);
+    try testing.expect(before == .ok);
+    defer testing.allocator.free(before.ok.bytes);
+    try testing.expectEqual(@as(usize, 29), before.ok.n);
+
+    const retry = importWire(f.receiver, f.wire);
+    const after = exportBySession(f.receiver, SessionBundleFixture.session);
+    try testing.expect(after == .ok);
+    defer testing.allocator.free(after.ok.bytes);
+    try testing.expectEqual(before.ok.n, after.ok.n);
+    try testing.expectEqualSlices(u8, before.ok.bytes, after.ok.bytes);
+    try testing.expectEqual(@as(@TypeOf(retry), .{ .refused = .stale }), retry);
+}
+
+test "peer transfer session: a mismatched bundle refuses the tail and retains the boundary" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+    const f = try SessionBundleFixture.open();
+    defer f.close();
+
+    const other = try f.sender.runGreedyTagged(&SessionBundleFixture.prompt, 2, true, 88);
+    defer testing.allocator.free(other.tokens);
+    const exported = exportBySession(f.sender, 88);
+    try testing.expect(exported == .ok);
+    defer testing.allocator.free(exported.ok.bytes);
+    var other_members: [peer_wire.MAX_BUNDLE_MEMBERS]peer_wire.BundleMember = undefined;
+    try testing.expectEqual(@as(usize, 2), (try peer_wire.readBundle(exported.ok.bytes, &other_members)).len);
+    const wire = try testing.allocator.alloc(u8, peer_wire.bundleSize(&.{ f.members[0].body.len, other_members[1].body.len }));
+    defer testing.allocator.free(wire);
+    peer_wire.writeBundle(wire, &.{ f.members[0], other_members[1] });
+
+    const out = importWire(f.receiver, wire);
+    try expectPromptEntries(f.receiver.entry.prefix_cache.?, &.{SessionBundleFixture.boundary});
+    try f.expectBoundaryOnly();
+    try testing.expectEqual(@as(@TypeOf(out), .{ .refused = .bad_envelope }), out);
+    try testing.expectEqual(@as(usize, 1), f.receiver.entry.prefix_cache.?.entries.items.len);
+}
+
+fn restrictHeadroomForTail(f: SessionBundleFixture) !void {
+    var tail = try peer_wire.decode(testing.allocator, f.members[1].body);
+    defer tail.deinit();
+    var plan: abi.AuxImportPlan = .{};
+    try testing.expect(driver.auxImportPlanDetails(&f.receiver.xfm, tail.plugin_header, &plan).isOk());
+    const peak = try prefill_request.moduleImportPeak(plan.peak, tail.tensors) + f.members[1].body.len;
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    memory_ceiling.overrides().* = .{ .static_ceiling = active + peak - 1, .wired_limit_mb = 0 };
+}
+
+test "peer transfer session: a bundle with room for one entry keeps its boundary" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+    const f = try SessionBundleFixture.open();
+    defer f.close();
+    const limits = memory_ceiling.overrides();
+    const prev = limits.*;
+    defer limits.* = prev;
+
+    const hc = f.receiver.entry.prefix_cache.?;
+    hc.max_entries = 1;
+    // Seed the exact boundary without a session so this bundle can claim it.
+    const seed = try f.receiver.runGreedy(&SessionBundleFixture.prompt, 1, true);
+    defer testing.allocator.free(seed.tokens);
+    try expectPromptEntries(hc, &.{SessionBundleFixture.boundary});
+    try restrictHeadroomForTail(f);
+
+    const out = importWire(f.receiver, f.wire);
+    try expectPromptEntries(hc, &.{SessionBundleFixture.boundary});
+    try testing.expect(out == .ok);
+    try testing.expectEqual(SessionBundleFixture.boundary.len, out.ok.n);
+    try f.expectBoundaryOnly();
+}
+
+test "peer transfer session: an allocation failure in the tail leaves a successful boundary import" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+    const f = try SessionBundleFixture.open();
+    defer f.close();
+
+    const h = f.receiver;
+    var counting = testing.FailingAllocator.init(testing.allocator, .{});
+    const base = try peer_transfer.importWireModule(counting.allocator(), h.sch.io, &h.sch, h.entry, f.members[0].body);
+    try testing.expect(base == .ok);
+    try testing.expect(counting.alloc_index > 0);
+    h.entry.prefix_cache.?.invalidateAll("replay with a failing allocator");
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = counting.alloc_index });
+    const out = try peer_transfer.importWireModule(failing.allocator(), h.sch.io, &h.sch, h.entry, f.wire);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expect(out == .ok);
+    try testing.expectEqual(SessionBundleFixture.boundary.len, out.ok.n);
+    try f.expectBoundaryOnly();
+}
+
+test "peer transfer session: tail admission under memory pressure preserves other sessions' boundaries" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+    const f = try SessionBundleFixture.open();
+    defer f.close();
+    const limits = memory_ceiling.overrides();
+    const prev = limits.*;
+    defer limits.* = prev;
+
+    var other_prompt = buildPrompt(17);
+    other_prompt[0] = 90;
+    const other = try f.receiver.runGreedyTagged(&other_prompt, 1, true, 88);
+    defer testing.allocator.free(other.tokens);
+    const seed = try f.receiver.runGreedy(&SessionBundleFixture.prompt, 1, true);
+    defer testing.allocator.free(seed.tokens);
+    const hc = f.receiver.entry.prefix_cache.?;
+    try expectPromptEntries(hc, &.{ other_prompt[0..16], SessionBundleFixture.boundary });
+    try restrictHeadroomForTail(f);
+
+    const out = importWire(f.receiver, f.wire);
+    try expectPromptEntries(hc, &.{ other_prompt[0..16], SessionBundleFixture.boundary });
+    try testing.expect(out == .ok);
+    try testing.expectEqual(SessionBundleFixture.boundary.len, out.ok.n);
+    try f.expectBoundaryOnly();
 }
 
 test "peer transfer session: two sessions on different prompts of one length each export their own tokens" {
