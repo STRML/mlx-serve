@@ -3808,6 +3808,10 @@ fn chainProbe(io: std.Io, link: *const Link, s: mlx.mlx_stream) !void {
 /// joins the group and measures round trips at the sizes inference moves
 /// (one decode row of a hyper-connection stream, a prefill chunk) and all_sum.
 pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "--cycle-end-format")) {
+        log.info("[dist-probe] cycle_end_ms v1\n", .{});
+        return;
+    }
     log.info("[dist-probe] jaccl formation deadline: {s}\n", .{if (mlx.jacclFormationDeadlineAvailable()) "available" else "missing"});
     // `--soak N`: N header + one-row-stream round trips, the shape of a pipeline decode hop.
     var soak: u64 = 0;
@@ -4178,6 +4182,7 @@ const SwitchProbeRunner = struct {
             };
             log.info("[dist-probe] switch {d}: epoch_ms {d} {s} open_ms {d} ready_to_go_ms {d} release_ms {d} teardown_ms {d}\n", .{ k, crt.wallMs(), label, r.open_ms, r.ready_to_go_ms, r.release_ms, r.teardown_ms });
             if (fatal) break;
+            log.info("[dist-probe] cycle_end_ms switch {d} {d}\n", .{ k, crt.wallMs() });
         }
         log.info("[dist-probe] switch {d} cycles: formed {d} failed {d} cancelled {d} fell {d} mismatches {d}\n", .{ o.cycles.n, counts[0], counts[1], counts[2], counts[3], mismatches });
         if (mismatches > 0) return error.SwitchProbeMismatch;
@@ -4213,6 +4218,7 @@ fn relinkProbe(io: std.Io, cfg: Config, o: RelinkOpts) !void {
         }
         if (o.sit_out and o.failing(k)) {
             log.info("[dist-probe] relink {d}: sat out\n", .{k});
+            log.info("[dist-probe] cycle_end_ms fail-relink {d} {d}\n", .{ k, crt.wallMs() });
             continue;
         }
         var sw_open = io_util.Stopwatch.init(io);
@@ -4223,7 +4229,8 @@ fn relinkProbe(io: std.Io, cfg: Config, o: RelinkOpts) !void {
         var link = Link.open(io, c) catch |e| {
             log.err("[dist-probe] relink {d}: epoch_ms {d} open failed after {d} ms: {s}{s}\n", .{ k, crt.wallMs(), sw_open.read() / std.time.ns_per_ms, @errorName(e), if (o.failing(k)) " (expected)" else "" });
             if (o.slot_ms == 0) return e;
-            mlx.check(mlx.mlx_distributed_clear_backends()) catch {};
+            try mlx.check(mlx.mlx_distributed_clear_backends());
+            log.info("[dist-probe] cycle_end_ms fail-relink {d} {d}\n", .{ k, crt.wallMs() });
             failed += 1;
             if (!o.failing(k)) mismatches += 1;
             continue;
@@ -4269,6 +4276,7 @@ fn relinkProbe(io: std.Io, cfg: Config, o: RelinkOpts) !void {
         var sw_free = io_util.Stopwatch.init(io);
         try relinkProbeTeardown(&link);
         const free_us = sw_free.read() / std.time.ns_per_us;
+        if (o.slot_ms != 0) log.info("[dist-probe] cycle_end_ms fail-relink {d} {d}\n", .{ k, crt.wallMs() });
         log.info("[dist-probe] relink {d}: epoch_ms {d} open {d} us, first all_sum {d} us (check {d} == {d}), free {d} us\n", .{ k, crt.wallMs(), open_us, sum_us, v, 10240 * cfg.size, free_us });
     }
     if (o.slot_ms == 0) {
