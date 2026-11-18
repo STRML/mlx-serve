@@ -535,6 +535,8 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     if (m.bank != null and in.host.len > 1 and f.logits != .all_rows and pos + in.host.len > m.bank_context)
         return Verdict.refuse(.failed, "deepseek_v41: the prompt is longer than the streamed bank's billed context (ctx_size)");
     const rows: ?dsv41.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
+    m.mdl.profile_prefill = f.mode == .prefill and env.on(.DSV41_PREFILL_PROFILE);
+    defer m.mdl.profile_prefill = false;
     const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch |e| {
         std.log.err("deepseek_v41: the forward failed: {s}", .{if (e == error.EngineFailed) @import("../../sdk/util/err_name.zig").last() else @errorName(e)});
         return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
