@@ -3110,6 +3110,7 @@ pub fn attention(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: us
         try runRegion(sc, m, li, .q_kv, &.{ x, pos }, &a);
         pj = .{ .q = a[0], .kv = a[1], .qr = a[2] };
         try profileMark(sh.prof, .attn_in, &a);
+        if (sh.prof) |p| try p.noteShape(.{ .matmul = .wq_b, .groups = 1, .m = L, .n = dim(pj.q, 1) * hd, .k = dim(pj.qr, 1) });
     } else pj = try qkvProjProfile(sc, m, ly, ropeFor(m, li).fwd, x, pos, false, sh.prof);
     var q = pj.q;
     const qr = pj.qr;
@@ -3135,9 +3136,8 @@ pub fn attention(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: us
         try profileMark(sh.prof, .core, &.{o});
         var y: [1]A = undefined;
         try runRegion(sc, m, li, .attn_out, &.{o}, &y);
-        const out = if (m.tp != null) try tpSum(sc, m, y[0]) else y[0];
-        try profileMark(sh.prof, .attn_out, &.{out});
-        return out;
+        try profileCompiledAttnOut(sh.prof, m, o, y[0]);
+        return attnOutSum(sc, m, y[0], sh.prof);
     }
     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
     const f16_core = m.attn_f16 and (m.act == .bfloat16 or m.act == .float16) and dim(keys_w, 0) + K <= ATTN_SOFTMAX_MAX_COLS and mlx.streamIsGpu(sc.s);
@@ -3160,10 +3160,9 @@ pub fn attention(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: us
     }
 
     if (pre != null) return o;
-    const y = try attnOut(sc, m, ly, ropeFor(m, li).inv, o, pos);
-    const out = if (m.tp != null) try tpSum(sc, m, y) else y;
-    try profileMark(sh.prof, .attn_out, &.{out});
-    return out;
+    const r = try ropeTail(sc, m, o, ropeFor(m, li).inv, pos, 1.0);
+    const y = try attnOutRopedProfile(sc, m, ly, r, sh.prof);
+    return attnOutSum(sc, m, y, sh.prof);
 }
 
 /// The compressed rows the rows at [p0, p0 + L) attend and the indexer's picks among them (none at ratio 0): the
@@ -3565,7 +3564,7 @@ pub fn indexScoresScalar(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weight
 
 /// `attention`'s scores, softmax and weighted rows for a decode block as one
 /// kernel (`ATTN_DEC_SOURCE`); the ring already holds this step's rows. With
-/// `inv`, the heads leave inverse-roped (`attnOut`'s first step).
+/// `inv`, the heads leave inverse-roped for the output projection.
 pub fn attnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, q: A, win: Ring, comp_rows: A, topk: A, p0: usize, scale: f32, inv: ?A) !A {
     if (m.dec.attn) |k| if (try dkern.attn.partials(sc, k, m, q, win, comp_rows, topk, p0, scale)) |p|
         return attnMerge(sc, m, ly, .{ p.acc, p.m, p.l }, p.splits, try attnMeta(sc, m, q, win, comp_rows, topk, p0), inv);
@@ -3695,6 +3694,7 @@ fn qkvRowsProfile(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, prof
     const qr = try sc.rms(qa, ly.q_norm, c.rms_norm_eps);
     try profileMark(prof, .attn_in, &.{ qr, kv });
     const qb = try ly.wq_b.apply(sc, qr);
+    if (prof) |p| try p.noteShape(.{ .matmul = .wq_b, .groups = 1, .m = dim(qr, 0), .n = dim(qb, 1), .k = dim(qr, 1) });
     return .{ .q = try sc.reshape(qb, &.{ ci(dim(x, 0)), -1, ci(c.head_dim) }), .kv = kv, .qr = qr };
 }
 
@@ -3725,33 +3725,70 @@ pub fn kvRow(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, kv: A, po
     return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
 
-/// Attention heads `o` [L, H, hd] at `pos` back to the stream: the inverse
-/// rope, the grouped `wo_a`, then `wo_b`.
-pub fn attnOut(sc: *Scope, m: *Dsv41Model, ly: *const Layer, inv: A, o: A, pos: A) !A {
-    return attnOutRoped(sc, m, ly, try ropeTail(sc, m, o, inv, pos, 1.0));
+/// Project the inverse-roped attention heads back to the stream.
+pub fn attnOutRoped(sc: *Scope, m: *Dsv41Model, ly: *const Layer, r: A) !A {
+    return attnOutRopedProfile(sc, m, ly, r, null);
 }
 
-/// `attnOut` of heads already inverse-roped.
-pub fn attnOutRoped(sc: *Scope, m: *Dsv41Model, ly: *const Layer, r: A) !A {
+fn attnOutRopedProfile(sc: *Scope, m: *Dsv41Model, ly: *const Layer, r: A, prof: ?*Profile) !A {
     const L = dim(r, 0);
     // A stage's whole groups under a tensor split; an outside plugin's `wo_a` (no `w`) the config's.
     const og = if (ly.wo_a.ext != null) m.cfg.dsv4_o_groups else dim(ly.wo_a.w, 0);
-    return ly.wo_b.apply(sc, try attnOutA(sc, m, ly, try sc.transpose(try sc.reshape(r, &.{ ci(L), ci(og), -1 }), &.{ 1, 0, 2 }), null)); // [og, L, in]
+    const grouped = try sc.transpose(try sc.reshape(r, &.{ ci(L), ci(og), -1 }), &.{ 1, 0, 2 });
+    try profileMark(prof, .attn_out_glue, &.{grouped});
+    return attnOutBProfile(sc, ly, try attnOutAProfile(sc, m, ly, grouped, null, prof), prof);
 }
 
 /// The grouped `wo_a` of heads already grouped and inverse-roped `[og, L, in]`: `[L, og * o_lora]` in `m.act`.
-pub fn attnOutA(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a: ?A) !A {
+fn attnOutAProfile(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a: ?A, prof: ?*Profile) !A {
     const L = dim(ob, 1);
     // An outside plugin's groups: its grouped linear reads `[L, og, in]`.
-    if (ly.wo_a.ext) |*e| return sc.astype(try sc.reshape(try sc.keep(try e.matmul(try sc.transpose(ob, &.{ 1, 0, 2 }), sc.s)), &.{ ci(L), -1 }), m.act);
+    if (ly.wo_a.ext != null) {
+        const rows = try sc.transpose(ob, &.{ 1, 0, 2 });
+        try profileMark(prof, .attn_out_glue, &.{rows});
+        return attnOutARun(sc, m, ly, rows, prof);
+    }
     const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (L >= DENSE_ROWS) try ly.wo_a.dense(sc, mlx.mlx_array_dtype(ob)) else none;
-    const oa = if (wd.ctx != null)
-        try sc.matmul(ob, try sc.transpose(wd, &.{ 0, 2, 1 }))
+    const oa = try groupedMatmul(sc, &ly.wo_a, ob, wd);
+    try profileMark(prof, .wo_a, &.{oa});
+    if (prof) |p| try p.noteShape(.{ .matmul = .wo_a, .groups = dim(ob, 0), .m = L, .n = dim(oa, 2), .k = dim(ob, 2) });
+    const rows = try sc.astype(try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ ci(L), -1 }), m.act);
+    try profileMark(prof, .attn_out_glue, &.{rows});
+    return rows;
+}
+
+fn groupedMatmul(sc: *Scope, w: *const Lin, x: A, dense: A) !A {
+    return if (dense.ctx != null)
+        sc.matmul(x, try sc.transpose(dense, &.{ 0, 2, 1 }))
     else blk: {
         var ro = mlx.mlx_array_new();
-        break :blk try sc.res(mlx.mlx_quantized_matmul(&ro, ob, ly.wo_a.w, ly.wo_a.s, ly.wo_a.b, true, mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.group_size)), mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.bits)), ly.wo_a.qp.mode.cstr(), sc.s), &ro);
+        break :blk sc.res(mlx.mlx_quantized_matmul(&ro, x, w.w, w.s, w.b, true, mlx.mlx_optional_int.some(@intCast(w.qp.group_size)), mlx.mlx_optional_int.some(@intCast(w.qp.bits)), w.qp.mode.cstr(), sc.s), &ro);
     };
-    return sc.astype(try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ ci(L), -1 }), m.act);
+}
+
+fn attnOutBProfile(sc: *Scope, ly: *const Layer, x: A, prof: ?*Profile) !A {
+    const y = try ly.wo_b.apply(sc, x);
+    try profileMark(prof, .wo_b, &.{y});
+    if (prof) |p| try p.noteShape(.{ .matmul = .wo_b, .groups = 1, .m = dim(x, 0), .n = dim(y, 1), .k = dim(x, 1) });
+    return y;
+}
+
+fn attnOutSum(sc: *Scope, m: *Dsv41Model, y: A, prof: ?*Profile) !A {
+    if (m.tp == null) return y;
+    const out = try tpSum(sc, m, y);
+    try profileMark(prof, .attn_out_glue, &.{out});
+    return out;
+}
+
+fn profileCompiledAttnOut(prof: ?*Profile, m: *const Dsv41Model, heads: A, out: A) !void {
+    const p = prof orelse return;
+    // The compiled short-width region exposes only wo_b's result.
+    try profileMark(p, .wo_b, &.{out});
+    const groups = m.cfg.dsv4_o_groups;
+    const rank = m.cfg.dsv4_o_lora_rank;
+    const rows = dim(out, 0);
+    try p.noteShape(.{ .matmul = .wo_a, .groups = groups, .m = rows, .n = rank, .k = dim(heads, 1) * dim(heads, 2) / groups });
+    try p.noteShape(.{ .matmul = .wo_b, .groups = 1, .m = rows, .n = dim(out, 1), .k = @as(usize, groups) * rank });
 }
 
 /// `x` [L, K] f32 through the dense linear `l` in f32: decode rows read `l`
@@ -5007,6 +5044,7 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const w = try dkern.wq_b.run(sc, m, kq, ly, li, try probed(sc, m, li, .wq_b, &.{ a.qa, a.kv, a.z, pos }), a.kv, a.z, pos) orelse return null;
     try profileMark(sh.prof, .attn_in, &.{ a.qa, a.kv, a.z, a.iw orelse none, a.comp orelse none });
     try profileMark(sh.prof, .q, &.{ w.q, w.kv_row, w.q_idx orelse none, w.sa.pre, w.sa.post, w.sa.comb });
+    if (sh.prof) |p| try p.noteShape(.{ .matmul = .wq_b, .groups = 1, .m = L, .n = dim(w.q, 1) * hd, .k = dim(a.qa, 1) });
     try ls.win.write(w.kv_row, p0, sc.s);
     try profileMark(sh.prof, .attn_in, &.{ls.win.buf});
     var comp_rows = none;
@@ -5032,23 +5070,28 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
         oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, meta, try probed(sc, m, li, .wo_a, &.{ p.acc, p.m, p.l, meta }), p.m, p.l);
         if (oa) |v| {
             try profileMark(sh.prof, .core, &.{ p.acc, p.m, p.l });
-            try profileMark(sh.prof, .attn_out, &.{v});
+            try profileMark(sh.prof, .wo_a, &.{v});
+            if (sh.prof) |prof| {
+                const groups = m.cfg.dsv4_o_groups;
+                try prof.noteShape(.{ .matmul = .wo_a, .groups = groups, .m = L, .n = dim(v, 1) / groups, .k = dim(w.q, 1) * hd / groups });
+            }
         }
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &w.sa)) |f| {
+        if (sh.prof) |p| try p.noteShape(.{ .matmul = .wo_b, .groups = 1, .m = L, .n = m.cfg.hidden_size, .k = dim(v, 1) });
         pre.* = f.sf.pre;
         return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
     };
     var ao: [1]A = undefined;
     if (oa) |v| {
-        ao[0] = try ly.wo_b.apply(sc, try probed(sc, m, li, .wo_b, &.{v}));
+        ao[0] = try attnOutBProfile(sc, ly, try probed(sc, m, li, .wo_b, &.{v}), sh.prof);
     } else {
         const o = try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv);
         try profileMark(sh.prof, .core, &.{o});
         try runRegion(sc, m, li, .attn_out, &.{o}, &ao);
+        try profileCompiledAttnOut(sh.prof, m, o, ao[0]);
     }
-    try profileMark(sh.prof, .attn_out, &ao);
     if (m.tp != null) return try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, pre);
     var out: [2]A = undefined;
     try runRegion(sc, m, li, .ffn, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &out);
@@ -5526,6 +5569,12 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     const profiling = m.profile_prefill and want != .replay;
     if (profiling) try mlx.check(mlx.mlx_synchronize(m.s));
     const full_prof = Profile.start(profiling, &full_profile, monoUs);
+    if (full_prof) |p| if (log.isDebug()) {
+        p.shape_allocator = gpa;
+    };
+    defer if (full_prof) |p| p.deinit();
+    var tail_prof: ?*Profile = null;
+    defer if (tail_prof) |p| p.deinit();
     var full_end: ?i64 = null;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
@@ -5688,14 +5737,19 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
         try asyncEvalAll(ev.items);
         try Profile.mark(sp.prof, .head, evalAll, .{ev.items}, monoUs);
-        if (full_prof) |p| emitPrefillProfile(p, .full, p0, L, enc_hi, monoUs());
+        if (full_prof) |p| {
+            emitPrefillProfile(p, .full, p0, L, enc_hi, monoUs());
+            emitPrefillShapes(p, null, p0);
+        }
         return none;
     }
     if (tail) |tl| {
         try cedCompress(m, gpa, st, &sp, enc_hi);
         if (full_prof != null) full_end = monoUs();
         var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
-        tsp.prof = Profile.start(full_prof != null, &tail_profile, monoUs);
+        tail_prof = Profile.start(full_prof != null, &tail_profile, monoUs);
+        if (tail_prof) |p| p.shape_allocator = full_prof.?.shape_allocator;
+        tsp.prof = tail_prof;
         tsp.whole = held[held.len - 2 ..][0..2];
         tsp.floor = tsp.p0;
         try cedReplayIn(m, gpa, &sp, &tsp);
@@ -5759,6 +5813,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         const remote_layers = if (m.pair) |pair| pair.hi - pair.lo else 0;
         emitPrefillProfile(p, .full, p0, L, enc_hi - remote_layers, full_end orelse end);
         if (tail) |tl| emitPrefillProfile(&tail_profile, .decoder, p0, tl, m.n_layers - enc_hi, end);
+        emitPrefillShapes(p, tail_prof, p0);
     }
     return sc.out(logits);
 }
@@ -5767,6 +5822,13 @@ fn emitPrefillProfile(prof: *const Profile, pass: profile.Pass, p0: usize, rows:
     var buf: [64]u8 = undefined;
     const req = std.fmt.bufPrint(&buf, "{f}", .{log.requestTag(log.requestId())}) catch unreachable;
     log.info("{f}\n", .{prof.line(pass, req, p0, rows, layers, end)});
+}
+
+fn emitPrefillShapes(full: *const Profile, decoder: ?*const Profile, pos: usize) void {
+    if (full.shape_allocator == null) return;
+    var buf: [64]u8 = undefined;
+    const req = std.fmt.bufPrint(&buf, "{f}", .{log.requestTag(log.requestId())}) catch unreachable;
+    log.debug("{f}\n", .{profile.ShapeLine{ .req = req, .pos = pos, .full = full, .decoder = decoder }});
 }
 
 /// Diag `engram-laps`: a decode step's host time with its token on the GPU, phase by phase, summed over `every` steps
@@ -6649,7 +6711,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         var o_k = try attention(&ssc, m, st, li, try ssc.slice(pa.h, 0, lo, hi), sp.p0 + lo, &sh, span_pj);
         // Each span (or each run of spans) takes its own `wo_a`: the rows the chunk's `wo_b` reads, not the heads, are
         // joined. Heads the core handed back plain are roped and grouped here.
-        if (!sh.grouped) o_k = try ssc.transpose(try ssc.reshape(try ropeTail(&ssc, m, o_k, ropeFor(m, li).inv, try ssc.i(ci(sp.p0 + lo)), 1.0), &.{ ci(hi - lo), og, -1 }), &.{ 1, 0, 2 });
+        if (!sh.grouped) {
+            o_k = try ssc.transpose(try ssc.reshape(try ropeTail(&ssc, m, o_k, ropeFor(m, li).inv, try ssc.i(ci(sp.p0 + lo)), 1.0), &.{ ci(hi - lo), og, -1 }), &.{ 1, 0, 2 });
+            try profileMark(prof, .attn_out_glue, &.{o_k});
+        }
         if (run > 1) {
             if (run_scope == null) run_scope = Scope.init(gpa, m.s);
             run_heads[in_run] = try run_scope.?.keep(ssc.out(o_k));
@@ -6659,12 +6724,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
                 // output.
                 const r_region = if (heads_b) try sat.headsRunEnd(sc.s) else null;
                 if (r_region) |rg| _ = try run_scope.?.keep(rg);
-                heads[n_heads] = if (r_region != null)
-                    try sc.keep(try attnOutARun(&run_scope.?, m, ly, r_region.?))
-                else
-                    try sc.keep(try woaRun(&run_scope.?, m, ly, run_heads[0..in_run]));
+                const rs = &run_scope.?;
+                const oa = if (r_region) |rg| try attnOutARun(rs, m, ly, rg, prof) else try woaRun(rs, m, ly, run_heads[0..in_run], prof);
+                heads[n_heads] = try sc.keep(rs.out(oa));
                 if (r_region != null) try sat.headsReleased(heads[n_heads]);
-                try profileMark(prof, .attn_out, &.{heads[n_heads]});
                 n_heads += 1;
                 in_run = 0;
                 run_scope.?.deinit();
@@ -6672,13 +6735,14 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             }
         } else {
             if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) woa_dense = try ly.wo_a.dense(&sc, m.act);
-            const oa = try attnOutA(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null);
+            const oa = try attnOutAProfile(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null, prof);
             // A tensor split sums each span's wo_b on the CPU stream while the GPU runs the next span's attention.
-            heads[n_heads] = try sc.keep(ssc.out(if (m.tp != null) try tpSum(&ssc, m, try ly.wo_b.apply(&ssc, oa)) else oa));
-            try profileMark(prof, .attn_out, &.{heads[n_heads]});
+            const y = if (m.tp != null) try attnOutSum(&ssc, m, try attnOutBProfile(&ssc, ly, oa, prof), prof) else oa;
+            heads[n_heads] = try sc.keep(ssc.out(y));
             n_heads += 1;
         }
         hold(&sp.topks[k], sh.topk);
+
         hold(&sp.cands[k], sh.cand);
         if (igroup.endsGroup(k, ig_g, n_spans)) {
             var ig_ev: std.ArrayList(A) = .empty;
@@ -6691,8 +6755,9 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             ig_start = k + 1;
         }
     }
-    const y = if (m.tp != null) try sc.concat(heads[0..n_heads], 0) else try ly.wo_b.apply(&sc, try sc.concat(heads[0..n_heads], 0));
-    try profileMark(prof, .attn_out, &.{y});
+    const joined = try sc.concat(heads[0..n_heads], 0);
+    try profileMark(prof, .attn_out_glue, &.{joined});
+    const y = if (m.tp != null) joined else try attnOutBProfile(&sc, ly, joined, prof);
     // scratch_x1.zig: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE
     // group, so that group's output is the region's last reader's).
     const x1_scratch = m.streamed != null and sp.L >= scratch_rows and mlx.streamIsGpu(m.s);
@@ -6752,7 +6817,6 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         // teardown and the layer's last eval (runLayers) finds them under way. The holds above have just freed the
         // previous streams, so the new ones take their place in the live set.
         if (k1 == n_spans) try asyncEvalAll(&.{xg});
-
     }
     // The kept projection outputs: the attention projections' large outputs (evaluated by the routed call) kept past
     // the teardown for the next wide layer of the pass: `wq_b`'s heads first, the attention norm's rows, the roped
@@ -6760,16 +6824,26 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     tkeep.layerEnd(&.{ pj.q, pa.h, pj.qt }, next_wide);
 }
 /// A full run's `wo_a` over its region `x` (`[rows, og, in]`, published): the plugin's grouped linear reads that
-/// layout as it is (no join, no transpose), `[rows, og * o_lora]` in `m.act`, a new handle the caller frees.
-fn attnOutARun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, x: A) !A {
+/// layout as it is (no join, no transpose), `[rows, og * o_lora]` in `m.act`.
+fn attnOutARun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, x: A, prof: ?*Profile) !A {
     const e = if (ly.wo_a.ext) |*e| e else return error.ScratchHeadsNoOutside;
     const L = dim(x, 0);
-    return sc.out(try sc.astype(try sc.reshape(try sc.keep(try e.matmul(x, sc.s)), &.{ ci(L), -1 }), m.act));
+    const oa = try sc.keep(try e.matmul(x, sc.s));
+    try profileMark(prof, .wo_a, &.{oa});
+    if (prof) |p| {
+        const groups = dim(x, 1);
+        try p.noteShape(.{ .matmul = .wo_a, .groups = groups, .m = L, .n = mlx.mlx_array_size(oa) / (L * groups), .k = dim(x, 2) });
+    }
+    const rows = try sc.astype(try sc.reshape(oa, &.{ ci(L), -1 }), m.act);
+    try profileMark(prof, .attn_out_glue, &.{rows});
+    return rows;
 }
 /// One run's `wo_a` over its spans' grouped heads `parts` (`[og, rows_k, in]` each), their rows joined
-/// (`[og, rows, in]`) through one `attnOutA`: `[rows, og * o_lora]` in `m.act`. A handle the caller frees.
-fn woaRun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, parts: []const A) !A {
-    return sc.out(try attnOutA(sc, m, ly, try sc.concat(parts, 1), null));
+/// (`[og, rows, in]`) through one grouped projection: `[rows, og * o_lora]` in `m.act`.
+fn woaRun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, parts: []const A, prof: ?*Profile) !A {
+    const joined = try sc.concat(parts, 1);
+    try profileMark(prof, .attn_out_glue, &.{joined});
+    return attnOutAProfile(sc, m, ly, joined, null, prof);
 }
 
 /// A streamed prompt call's routes of layer `li` predicted before its attention (the FFN's input taken as the stream
@@ -11702,6 +11776,74 @@ fn bfRandom(sc: *Scope, seed: u64, shape: []const c_int, mean: f32, sd: f32) !A 
     const r = try sc.res(mlx.mlx_random_normal(&o, shape.ptr, shape.len, .bfloat16, mean, sd, k, sc.s), &o);
     try mlx.check(mlx.mlx_array_eval(r));
     return r;
+}
+
+fn benchMxfp8(sc: *Scope, w: A) !Lin {
+    const native = @import("../../sdk/quant/native.zig");
+    const q = try native.quantized(w, "mxfp8", 8, 32, sc.s);
+    const packed_weight = sc.keep(q.w) catch |err| {
+        _ = mlx.mlx_array_free(q.sc);
+        return err;
+    };
+    return .{ .w = packed_weight, .s = try sc.keep(q.sc), .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
+}
+
+test "dsv41 bench: grouped and flat prefill projections (DSV41_BENCH_PREFILL_WO_A)" {
+    if (!env.on(.DSV41_BENCH_PREFILL_WO_A)) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const cfg = try @import("decode/fixture.zig").releaseConfig();
+    const groups = cfg.dsv4_o_groups;
+    const span = SPAN;
+    const rows = groups * span;
+    const q_n = @as(usize, cfg.num_attention_heads) * cfg.head_dim;
+    const q_k = cfg.dsv4_q_lora_rank;
+    const a_n = cfg.dsv4_o_lora_rank;
+    const a_k = q_n / groups;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+
+    const xg = try bfRandom(&sc, 1, &.{ ci(groups), ci(span), ci(a_k) }, 0, 1);
+    const xf = try sc.reshape(xg, &.{ ci(rows), ci(a_k) });
+    const xq = try bfRandom(&sc, 2, &.{ ci(rows), ci(q_k) }, 0, 1);
+    const wa = try bfRandom(&sc, 3, &.{ ci(a_n), ci(a_k) }, 0, 0.01);
+    // Materialize independent copies of the flat weight so both arms do the same dot products.
+    const copies = try sc.broadcast(try sc.expand(wa, 0), &.{ ci(groups), ci(a_n), ci(a_k) });
+    const wg = try benchMxfp8(&sc, copies);
+    const wf = try benchMxfp8(&sc, wa);
+    const wq = try benchMxfp8(&sc, try bfRandom(&sc, 4, &.{ ci(q_n), ci(q_k) }, 0, 0.01));
+    try evalAll(&.{ xf, wg.w, wg.s, wf.w, wf.s, wq.w, wq.s });
+
+    const cases = [_]struct { name: []const u8, x: A, w: Lin, groups: usize, use_serving_linear: bool = false }{
+        .{ .name = "wo_a_grouped", .x = xg, .w = wg, .groups = groups },
+        .{ .name = "wo_a_flat", .x = xf, .w = wf, .groups = 1 },
+        .{ .name = "wq_b", .x = xq, .w = wq, .groups = 1, .use_serving_linear = true },
+    };
+    const reps = 6;
+    var times: [cases.len][reps]i64 = undefined;
+    for (0..reps + 1) |rep| for (cases, 0..) |arm, i| {
+        var run = Scope.init(sc.a, sc.s);
+        defer run.deinit();
+        const t0 = monoUs();
+        // Keep both wo_a arms quantized at equal total rows. wq_b uses the serving linear.
+        const y = if (arm.use_serving_linear) try arm.w.apply(&run, arm.x) else try groupedMatmul(&run, &arm.w, arm.x, none);
+        try mlx.check(mlx.mlx_array_eval(y));
+        const us = monoUs() - t0;
+        if (rep != 0) {
+            times[i][rep - 1] = us;
+        } else {
+            try testing.expectEqual(rows, arm.groups * dim(y, -2));
+            try testing.expectEqual(dim(arm.w.w, -2), dim(y, -1));
+        }
+    };
+    for (cases, &times) |arm, *samples| {
+        std.mem.sort(i64, samples, {}, std.sort.asc(i64));
+        const ms = @as(f64, @floatFromInt(samples[reps / 2 - 1] + samples[reps / 2])) / 2000;
+        const M = dim(arm.x, -2);
+        const N = dim(arm.w.w, -2);
+        const K = dim(arm.x, -1);
+        const flops: f64 = @floatFromInt(2 * arm.groups * M * N * K);
+        std.debug.print("[dsv41-woa-bench] {s} M={d} N={d} K={d} groups={d} reps={d} ms={d:.3} tflops={d:.3}\n", .{ arm.name, M, N, K, arm.groups, reps, ms, flops / (ms * 1e9) });
+    }
 }
 
 test "dsv41 vocab head: every rank's rows of the head, gathered, give the whole head's logits bit for bit, dense and 8-bit" {
