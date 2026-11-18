@@ -66,6 +66,7 @@ pub fn nonStreamingViaScheduler(
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
     conn: ?*Conn,
+    chat_request_id: ?*u64,
 ) !request_mod.GenerationResult {
     const running = try mlx_engine.Running.submit(sch, .{
         .model = lm,
@@ -110,36 +111,7 @@ pub fn nonStreamingViaScheduler(
     var output_ids = std.ArrayList(u32).empty;
     defer output_ids.deinit(allocator);
 
-    var client_gone = false;
-    wait: while (true) {
-        const nr = slot.waitNextTimeout(Conn.STREAM_KEEPALIVE_MS) orelse {
-            // Idle (long prefill). If the client is gone, cancel and serve
-            // whatever accumulated — the response write will fail upstream,
-            // which is fine; the win is freeing the GPU.
-            if (conn) |c| {
-                if (c.peerClosed()) {
-                    log.info("  [cancel] client disconnected while waiting (non-stream) — cancelling slot\n", .{});
-                    slot.cancel();
-                    client_gone = true;
-                    break :wait;
-                }
-            }
-            continue :wait;
-        };
-        switch (nr) {
-            .token => |t| try output_ids.append(allocator, t),
-            .done => break :wait,
-            .err => return slotFailure(slot),
-        }
-        if (conn) |c| {
-            if (c.peerClosed()) {
-                log.info("  [cancel] client disconnected while decoding (non-stream) — cancelling slot\n", .{});
-                slot.cancel();
-                client_gone = true;
-                break :wait;
-            }
-        }
-    }
+    const client_gone = try collectOutput(allocator, slot, conn, &output_ids, chat_request_id);
 
     // The scheduler measures prefill_ns / decode_ns per-slot directly. Pull
     // those instead of the old single-wall-clock approximation, which
@@ -201,6 +173,7 @@ pub fn nonStreamingViaScheduler(
     const audio_codes: ?[]u32 = if (slot.audio_codes.items.len > 0) slot.audio_codes.toOwnedSlice(slot.allocator) catch null else null;
 
     return .{
+        .request_id = slot.request_id,
         .text = text,
         .audio_samples = audio_samples,
         .audio_codes = audio_codes,
@@ -219,4 +192,67 @@ pub fn nonStreamingViaScheduler(
         .finish_details = slot.finish_details,
         .constraint_payload_byte = constraint_payload_byte,
     };
+}
+
+fn collectOutput(allocator: std.mem.Allocator, slot: *@import("../engines/stream.zig").Stream, conn: ?*Conn, output_ids: *std.ArrayList(u32), request_id: ?*u64) !bool {
+    if (request_id) |out| out.* = slot.request_id;
+    var client_gone = false;
+    wait: while (true) {
+        const nr = slot.waitNextTimeout(Conn.STREAM_KEEPALIVE_MS) orelse {
+            // Idle (long prefill). If the client is gone, cancel and serve
+            // whatever accumulated — the response write will fail upstream,
+            // which is fine; the win is freeing the GPU.
+            if (conn) |c| {
+                if (c.peerClosed()) {
+                    log.info("  [cancel] client disconnected while waiting (non-stream) — cancelling slot\n", .{});
+                    slot.cancel();
+                    client_gone = true;
+                    break :wait;
+                }
+            }
+            continue :wait;
+        };
+        switch (nr) {
+            .token => |t| try output_ids.append(allocator, t),
+            .done => break :wait,
+            .err => return slotFailure(slot),
+        }
+        if (conn) |c| {
+            if (c.peerClosed()) {
+                log.info("  [cancel] client disconnected while decoding (non-stream) — cancelling slot\n", .{});
+                slot.cancel();
+                client_gone = true;
+                break :wait;
+            }
+        }
+    }
+
+    return client_gone;
+}
+
+test "request id: nonstream slot failure returns a correlated HTTP error" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = try @import("../engines/stream.zig").Stream.create(t.allocator, t.io);
+    defer source.release();
+    source.request_id = 73;
+    source.markError("DistWorkerLeft");
+    const raw = try @import("../media_jobs/plugin/test_conn.zig").capture(a, struct {
+        fn run(conn: *Conn, alloc: std.mem.Allocator, slot: *@import("../engines/stream.zig").Stream) !void {
+            var ids: std.ArrayList(u32) = .empty;
+            defer ids.deinit(alloc);
+            _ = collectOutput(alloc, slot, conn, &ids, &conn.chat_request_id) catch |err| {
+                return @import("../http/errors.zig").sendGenerationError(alloc, conn, err, .openai);
+            };
+            return error.ExpectedGenerationFailure;
+        }
+    }.run, .{ a, source });
+    try t.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 503 "));
+    const split = std.mem.indexOf(u8, raw, "\r\n\r\n").?;
+    const expected = try std.fmt.allocPrint(a, "\r\nx-mlx-request-id: {f}\r\n", .{log.requestTag(73)});
+    try t.expect(std.mem.indexOf(u8, raw[0 .. split + 2], expected) != null);
+    const body = (try std.json.parseFromSliceLeaky(std.json.Value, a, raw[split + 4 ..], .{})).object;
+    try t.expectEqual(@as(i64, 503), body.get("error").?.object.get("code").?.integer);
 }

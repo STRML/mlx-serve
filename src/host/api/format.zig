@@ -146,6 +146,10 @@ pub fn formatChatUsage(
     , .{ prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cached_tokens, extra_details });
 }
 
+pub fn chatUsageRequestId(allocator: std.mem.Allocator, usage: []const u8, request_id: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"request_id\":\"{f}\",{s}", .{ log.requestTag(request_id), usage[1..] });
+}
+
 /// `thinking_tokens` is Anthropic's share of `output_tokens` spent thinking; a re-encoded count can overshoot the
 /// generated one, so it is capped there.
 pub fn formatAnthropicUsage(allocator: std.mem.Allocator, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32, thinking_tokens: u32) ![]u8 {

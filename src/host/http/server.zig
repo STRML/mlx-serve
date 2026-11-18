@@ -425,6 +425,7 @@ pub fn serve(
     port: u16,
     cfg: ServerConfig,
 ) !void {
+    log.initRequestIds(io);
     serverState().server_config = cfg;
     // Before `Scheduler.init`: that call is the model load and every load-time bill inside it
     // asks for the KV width.

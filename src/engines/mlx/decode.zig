@@ -39,6 +39,8 @@ const loopGuardTick = @import("loop_stop.zig").loopGuardTick;
 var kv_skew_split_logged: bool = false; // one-shot log guard
 
 pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+    const dist_scope = @import("cluster/distributed.zig").scopeRequests(active);
+    defer dist_scope.restore();
     if (active.len == 0) return;
 
     // Publish the in-flight generated-token aggregate for the gauge sampler.
@@ -232,6 +234,9 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
 }
 
 pub fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
+    const collective = [_]*const Slot{slot};
+    const dist_scope = @import("cluster/distributed.zig").scopeRequests(&collective);
+    defer dist_scope.restore();
     var inner_err: ?anyerror = null;
     runSingleDecodeTickInner(sch, slot) catch |e| switch (e) {
         // A reasoning-protocol dead end is this request's failure; the tick
@@ -379,7 +384,9 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 
 // ── tests ──
 
-test "single MTP slot reaches the round entry through runDecodeTick" {
+test "request id: single MTP slot reaches the round entry and restores its request scope" {
+    const outer_request = log.setRequestId(91);
+    defer _ = log.setRequestId(outer_request);
     var xfm: @import("../../plugins/qwen4_exp/trunk.zig").Trunk = undefined;
     xfm.outside = null;
     var model: model_registry_mod.LoadedModel = undefined;
@@ -401,6 +408,7 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     gen.logprobs_n = 1;
     var slot: Slot = undefined;
     slot.allocator = testing.allocator;
+    slot.request_id = 73;
     slot.model = &model;
     slot.legacy_gen = gen;
     slot.enable_mtp = true;
@@ -415,6 +423,7 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     sch.inflight_generated_tokens = std.atomic.Value(u64).init(0);
     var active = [_]*Slot{&slot};
     try testing.expectError(error.SpecDecodeUnsupported, runDecodeTick(&sch, &active));
+    try testing.expectEqual(@as(u64, 91), log.requestId());
     try testing.expect(slot.legacy_gen.?.spec_cost_solo);
     try testing.expectEqual(@as(u32, 0), slot.legacy_gen.?.mtp_group_cap);
     try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));

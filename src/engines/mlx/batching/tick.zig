@@ -87,6 +87,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             continue;
         };
         if (gen.has_pending_logits or gen.has_pending_token) {
+            const scope = @import("../cluster/distributed.zig").scopeRequests(&.{slot});
+            defer scope.restore();
             const emitted = gen.drainPipelineForBatch(slot.allocator) catch |err| {
                 slot.markError(@errorName(err));
                 continue;
@@ -120,6 +122,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     }
     if (live_n == 0) return;
     const batch = live[0..live_n];
+    const dist_scope = @import("../cluster/distributed.zig").scopeRequests(batch);
+    defer dist_scope.restore();
 
     // Build inputs.
     const next_tokens = try allocator.alloc(u32, live_n);

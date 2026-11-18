@@ -61,6 +61,8 @@ pub fn inferenceLoop(ctx: ThreadCtx) void {
     switch_adapter.installSwapHook();
     switch_adapter.bindInferenceThread(sch);
     defer switch_adapter.unbindInferenceThread();
+    distributed.setRequestScheduler(sch);
+    defer distributed.setRequestScheduler(null);
     const params = ctx.params;
     defer sch.inference_done.store(true, .release);
     // Covers shutdown and startup-load failure.

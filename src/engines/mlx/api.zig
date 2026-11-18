@@ -27,6 +27,7 @@ pub const table: host.Api = .{
     .cancel_all = scheduler.cancelAllInFlight,
     .has_company = scheduler.hasCompany,
     .submit = submit,
+    .request_id = requestId,
     .complete = complete,
     .cancel = cancel,
     .ensure_loaded = ensureLoaded,
@@ -106,6 +107,10 @@ fn start(gpa: std.mem.Allocator, io: std.Io, p: *const params.LoadParams, max_co
 fn submit(sch: *Scheduler, p: *const params.SubmitParams, out: *?*Slot) ?[]const u8 {
     out.* = scheduler.submit(sch, p.*) catch |e| return @errorName(e);
     return null;
+}
+
+fn requestId(slot: *const Slot) u64 {
+    return slot.request_id;
 }
 
 fn complete(sch: *Scheduler, slot: *Slot) void {
@@ -244,4 +249,52 @@ test "RADIO video availability follows loaded embedder weights" {
     try testing.expect(!supportsVideo(&entry));
     entry.vision_encoder = null;
     try testing.expect(!supportsVideo(&entry));
+}
+
+test "request id: fake-engine submissions expose each allocated slot id to the host" {
+    const t = std.testing;
+    const served = @import("../../host/engines/served.zig");
+    var progress: @import("../../host/registry/load_progress.zig").Progress = .{};
+    var gauges: served.Gauges = .{};
+    const engine = try served.Served.openTable(t.allocator, .plugin, &@import("../../testing/fake_engine.zig").own_thread, .{ .model_dir = "/fake" }, &progress, &gauges, null);
+    defer engine.close();
+    var cfg: ModelConfig = .{};
+    cfg.num_hidden_layers = 0;
+    var lm: LoadedModel = undefined;
+    lm.config = &cfg;
+    lm.engine = engine;
+    lm.transformer = null;
+    lm.prefix_cache = null;
+    lm.session_claims = 0;
+    var sch: Scheduler = undefined;
+    sch.allocator = t.allocator;
+    sch.io = t.io;
+    sch.kv_quant_config = .dense;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.session_cond = .init;
+    sch.shutdown = .init(false);
+    sch.queue_cap = 2;
+    sch.in_flight = 0;
+    sch.submit_waiting = 0;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.offloaded = .empty;
+    sch.cleanup_queue = .empty;
+    defer {
+        for (sch.cleanup_queue.items) |slot| slot.deinit();
+        sch.cleanup_queue.deinit(t.allocator);
+        sch.offloaded.deinit(t.allocator);
+    }
+    var previous: u64 = 0;
+    for (0..2) |_| {
+        const running = try host.Running.submit(&sch, .{ .model = &lm, .prompt_ids = &.{ 5, 6 }, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = 1 });
+        defer running.done();
+        const slot: *Slot = @ptrCast(@alignCast(running.slot));
+        while (running.stream.waitNext() == .token) {}
+        try t.expectEqual(slot.request_id, running.stream.request_id);
+        try t.expect(running.stream.request_id > previous);
+        previous = running.stream.request_id;
+    }
 }

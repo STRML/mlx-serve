@@ -3,6 +3,7 @@
 //! in `fixtures/` (`../deepseek_v4/proof_test.zig`).
 
 const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
 const env = @import("../../env.zig");
 const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -1157,7 +1158,7 @@ test "codec preserves compressed Engram history including dead sentinels through
     const m = pm.mdl;
     const ids = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
     try dsv41.reset(m, gpa);
-    try dsv41.armPrompt(m, &ids, null, true);
+    try dsv41.armPrompt(m, &ids, null, true, null);
     _ = mlx.mlx_array_free(try dsv41.extendResumable(m, gpa, &ids, null));
     const sn = &m.dec_state.?.snap.?;
     const history = [_]u32{ 9, engram.Hash.DEAD, 2, 4, engram.Hash.DEAD, 7, 1 };
@@ -1886,24 +1887,24 @@ const LeaderCacheRig = struct {
         }
     }
 
-    fn load(id: u64, ids: []const u32, xs: []const mlx.mlx_array) anyerror!void {
+    fn load(id: u64, source_gen: u64, ids: []const u32, xs: []const mlx.mlx_array) anyerror!void {
         const self = active;
-        for (self.models, &self.snaps) |m, *s| try dsv41.tpWorkerLoad(m, testing.allocator, s, id, ids, xs);
+        for (self.models, &self.snaps) |m, *s| try dsv41.tpWorkerLoad(m, testing.allocator, s, id, source_gen, ids, xs);
         self.loads += 1;
     }
 
-    fn snap(op: dsv41.SnapOp, a: u64, b: u64) void {
+    fn snap(op: dsv41.SnapOp, a: u64, b: u64, evidence: dsv41.SnapEvidence) void {
         const self = active;
         for (self.models, &self.parked, &self.snaps) |m, *p, *s|
-            dsv41.tpWorkerSnap(m, testing.allocator, p, s, op, a, b) catch |err| {
+            dsv41.tpWorkerSnap(m, testing.allocator, p, s, op, a, b, evidence) catch |err| {
                 self.failure = err;
                 return;
             };
     }
 
-    fn free(gen: u64) void {
+    fn free(gen: u64, owner: log.RequestTag) void {
         const self = active;
-        for (self.models, &self.parked) |m, *p| dsv41.tpWorkerFree(m, p, gen);
+        for (self.models, &self.parked) |m, *p| dsv41.tpWorkerFree(m, p, gen, owner);
     }
 };
 
@@ -1989,7 +1990,7 @@ test "deepseek_v41 leader prefill: Engram read-ahead stays with the active TP st
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast((i * 13 + 3) % 1024);
     try dsv41.reset(tp, gpa);
-    try dsv41.armPrompt(tp, &prompt, null, true);
+    try dsv41.armPrompt(tp, &prompt, null, true, null);
     for ([_]usize{ 0, 32 }) |p0| {
         _ = mlx.mlx_array_free(try dsv41.extendResumable(tp, gpa, prompt[p0..][0..32], null));
         const ahead = tp.ahead orelse return error.LeaderPrefillDroppedEngramReadAhead;
@@ -2034,13 +2035,13 @@ const WarmRestore = struct {
         try events.append(testing.allocator, .{ .chunk = index });
     }
 
-    fn snap(op: dsv41.SnapOp, a: u64, b: u64) void {
+    fn snap(op: dsv41.SnapOp, a: u64, b: u64, _: dsv41.SnapEvidence) void {
         events.append(testing.allocator, .{ .snap = .{ .op = op, .a = a, .b = b } }) catch {
             failed = true;
         };
     }
 
-    fn free(gen: u64) void {
+    fn free(gen: u64, _: log.RequestTag) void {
         events.append(testing.allocator, .{ .free = gen }) catch {
             failed = true;
         };
@@ -2097,10 +2098,10 @@ const WarmRestore = struct {
                 try dsv41.tpWorkerPrefill(m, testing.allocator, &parked, c.gen, c.p0, c.n, c.capture, c.xs, c.stages);
             },
             .snap => |s| {
-                try dsv41.tpWorkerSnap(m, testing.allocator, &parked, &snaps, s.op, s.a, s.b);
+                try dsv41.tpWorkerSnap(m, testing.allocator, &parked, &snaps, s.op, s.a, s.b, .{});
                 if (s.op == .restore) restored = m.dec_state.?.n;
             },
-            .free => |gen| dsv41.tpWorkerFree(m, &parked, gen),
+            .free => |gen| dsv41.tpWorkerFree(m, &parked, gen, .{}),
         };
         try testing.expectEqual(33 + keep, restored);
     }

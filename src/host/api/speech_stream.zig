@@ -44,7 +44,6 @@ pub fn handle(
     tokenize_ns: u64,
 ) !void {
     const f = lm.config.?.speech().?;
-    const id = io_util.nowMs(stream.io);
     // The id a later history turn names this reply by (`speech.store`).
     const audio_id = speech_api.Store.newId(stream.io);
     const created = io_util.nowSecs(stream.io);
@@ -84,7 +83,7 @@ pub fn handle(
     defer running.done();
     const s = running.stream;
 
-    try respond.sendSseHeaders(stream, "chat.completions", respond.SSE_ALLOW_HEADERS_DEFAULT);
+    const id = try respond.sendChatSseHeaders(stream, s.request_id);
     try chunk(allocator, stream, id, created, model_name, "{\"role\":\"assistant\",\"content\":null}");
 
     // The reply's text, decoded a token at a time as it arrives (the main stream's way: never the whole reply again).
@@ -154,26 +153,30 @@ pub fn handle(
         if (!spoke) _ = try sendTranscript(allocator, stream, id, audio_id, created, model_name, text.items, sent_text, true);
         try speech_api.store.put(stream.io, audio_id, created, transcript);
     }
-    const fin = try std.fmt.allocPrint(allocator, "{{\"id\":\"chatcmpl-{d}\",\"object\":\"chat.completion.chunk\",\"created\":{d},\"model\":\"{s}\",\"system_fingerprint\":\"mlx-serve\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}", .{ id, created, model_name, reason });
+    const fin = try std.fmt.allocPrint(allocator, "{{\"id\":\"{f}\",\"object\":\"chat.completion.chunk\",\"created\":{d},\"model\":\"{s}\",\"system_fingerprint\":\"mlx-serve\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}", .{ log.requestTag(id), created, model_name, reason });
     defer allocator.free(fin);
     try sendData(stream, fin);
-    if (include_usage) {
-        const details = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"audio_tokens\":{d}}}", .{s.audio_codes.items.len / f.codebooks});
-        defer allocator.free(details);
-        const usage = try format.formatChatUsage(allocator, s.prompt_tokens, s.completion_tokens, s.cached_tokens, details);
-        defer allocator.free(usage);
-        const timings = try format.formatTimingsObject(allocator, s.prompt_tokens, s.cached_tokens, s.completion_tokens, s.prefill_ns, s.decode_ns, tokenize_ns);
-        defer allocator.free(timings);
-        try sendSSEUsageChunk(allocator, stream, id, model_name, usage, if (timings.len > 0) timings else null);
-    }
+    if (include_usage) try sendUsage(allocator, stream, s, id, model_name, f.codebooks, tokenize_ns);
     respond.logHttpSseData("[DONE]");
     try stream.writeAll("data: [DONE]\n\n");
     var perf_buf: [160]u8 = undefined;
     log.info("  <- {d}+{d} tokens streamed, {d} frames [{s}] [{s}]\n", .{ s.prompt_tokens, s.completion_tokens, s.audio_codes.items.len / f.codebooks, format.formatPerfBracket(&perf_buf, s.prompt_tokens, s.cached_tokens, s.completion_tokens, s.prefill_ns, s.decode_ns), reason });
 }
 
+fn sendUsage(allocator: std.mem.Allocator, stream: *Conn, s: *@import("../engines/stream.zig").Stream, id: u64, model_name: []const u8, codebooks: u32, tokenize_ns: u64) !void {
+    const details = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"audio_tokens\":{d}}}", .{s.audio_codes.items.len / codebooks});
+    defer allocator.free(details);
+    const usage = try format.formatChatUsage(allocator, s.prompt_tokens, s.completion_tokens, s.cached_tokens, details);
+    defer allocator.free(usage);
+    const timings = try format.formatTimingsObject(allocator, s.prompt_tokens, s.cached_tokens, s.completion_tokens, s.prefill_ns, s.decode_ns, tokenize_ns);
+    defer allocator.free(timings);
+    const request_usage = try format.chatUsageRequestId(allocator, usage, s.request_id);
+    defer allocator.free(request_usage);
+    try sendSSEUsageChunk(allocator, stream, id, model_name, request_usage, if (timings.len > 0) timings else null);
+}
+
 /// The transcript past `sent` bytes, held back while its tail is an incomplete UTF-8 sequence (`final` sends all).
-fn sendTranscript(a: std.mem.Allocator, stream: *Conn, id: i64, audio_id: speech_api.Id, created: i64, model: []const u8, text: []const u8, sent: usize, final: bool) !usize {
+fn sendTranscript(a: std.mem.Allocator, stream: *Conn, id: u64, audio_id: speech_api.Id, created: i64, model: []const u8, text: []const u8, sent: usize, final: bool) !usize {
     if (text.len == 0) return sent;
     const end = if (final) text.len else text.len - format.utf8TrailingIncomplete(text);
     if (end <= sent) return sent;
@@ -186,7 +189,7 @@ fn sendTranscript(a: std.mem.Allocator, stream: *Conn, id: i64, audio_id: speech
 }
 
 /// The samples the codec made final past `sent`, as one base64 16-bit PCM delta.
-fn sendAudio(a: std.mem.Allocator, stream: *Conn, s: anytype, id: i64, audio_id: speech_api.Id, created: i64, model: []const u8, sent: usize) !usize {
+fn sendAudio(a: std.mem.Allocator, stream: *Conn, s: anytype, id: u64, audio_id: speech_api.Id, created: i64, model: []const u8, sent: usize) !usize {
     s.out_mu.lockUncancelable(s.io);
     const fresh = a.dupe(f32, s.audio_samples.items[@min(sent, s.audio_samples.items.len)..]) catch |e| {
         s.out_mu.unlock(s.io);
@@ -203,8 +206,8 @@ fn sendAudio(a: std.mem.Allocator, stream: *Conn, s: anytype, id: i64, audio_id:
     return sent + fresh.len;
 }
 
-fn chunk(a: std.mem.Allocator, stream: *Conn, id: i64, created: i64, model: []const u8, delta: []const u8) !void {
-    const body = try std.fmt.allocPrint(a, "{{\"id\":\"chatcmpl-{d}\",\"object\":\"chat.completion.chunk\",\"created\":{d},\"model\":\"{s}\",\"system_fingerprint\":\"mlx-serve\",\"choices\":[{{\"index\":0,\"delta\":{s},\"finish_reason\":null}}]}}", .{ id, created, model, delta });
+fn chunk(a: std.mem.Allocator, stream: *Conn, id: u64, created: i64, model: []const u8, delta: []const u8) !void {
+    const body = try std.fmt.allocPrint(a, "{{\"id\":\"{f}\",\"object\":\"chat.completion.chunk\",\"created\":{d},\"model\":\"{s}\",\"system_fingerprint\":\"mlx-serve\",\"choices\":[{{\"index\":0,\"delta\":{s},\"finish_reason\":null}}]}}", .{ log.requestTag(id), created, model, delta });
     defer a.free(body);
     try sendData(stream, body);
 }
@@ -215,4 +218,33 @@ fn sendData(stream: *Conn, body: []const u8) !void {
     try stream.writeAllNoFlush(body);
     try stream.writeAllNoFlush("\n\n");
     try stream.flush();
+}
+
+test "request id: speech stream usage keeps the response id and audio counts" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try @import("../engines/stream.zig").Stream.create(a, t.io);
+    defer s.release();
+    s.request_id = 73;
+    s.prompt_tokens = 10;
+    s.completion_tokens = 2;
+    s.cached_tokens = 3;
+    try s.audio_codes.appendSlice(a, &.{ 1, 2, 3, 4 });
+    const raw = try @import("../media_jobs/plugin/test_conn.zig").capture(a, struct {
+        fn run(conn: *Conn, al: std.mem.Allocator, source: *@import("../engines/stream.zig").Stream) !void {
+            const id = try respond.sendChatSseHeaders(conn, source.request_id);
+            try sendUsage(al, conn, source, id, "m", 2, 0);
+        }
+    }.run, .{ a, s });
+    try t.expect(std.mem.indexOf(u8, raw, "x-mlx-request-id: chatcmpl-0000000000000000-73\r\n") != null);
+    const body = raw[std.mem.indexOf(u8, raw, "\r\n\r\n").? + 4 ..];
+    const data = std.mem.trim(u8, body["data: ".len..], "\n");
+    const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{})).object;
+    const usage = root.get("usage").?.object;
+    try t.expect(usage.get("request_id") != null);
+    try t.expectEqualStrings("chatcmpl-0000000000000000-73", root.get("id").?.string);
+    try t.expectEqualStrings("chatcmpl-0000000000000000-73", usage.get("request_id").?.string);
+    try t.expectEqual(@as(i64, 2), usage.get("completion_tokens_details").?.object.get("audio_tokens").?.integer);
 }

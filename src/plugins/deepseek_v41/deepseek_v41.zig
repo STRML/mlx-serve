@@ -1729,19 +1729,24 @@ const ClusterHooksState = struct {
     /// Tensor parallel, rank 0: one batched step over the states `gens`, each from `p0s[k]` with `chunks[k]`.
     tp_batch: ?*const fn (gens: []const u64, p0s: []const usize, chunks: []const []const u32, verify: bool) anyerror!void = null,
     /// Tensor parallel, rank 0: the state `gen` is gone.
-    tp_free: ?*const fn (gen: u64) void = null,
+    tp_free: ?*const fn (gen: u64, owner: log.RequestTag) void = null,
     /// Rank zero's wide TP1 chunk: incremental latent state before another tensor step.
     tp_prefill: ?*const fn (gen: u64, p0: usize, n: usize, capture: bool, tensors: []const A, stages: usize) anyerror!void = null,
-    /// Tensor parallel, rank 0: a snapshot read from disk, as the cache tensors of `tpLoadPlan` in order.
-    tp_load: ?*const fn (id: u64, ids: []const u32, tensors: []const A) anyerror!void = null,
+    /// Tensor parallel, rank 0: the cache tensors of `tpLoadPlan` for a snapshot the current group lacks.
+    tp_load: ?*const fn (id: u64, source_gen: u64, ids: []const u32, tensors: []const A) anyerror!void = null,
     /// Tensor parallel, rank 0: a snapshot moved, appeared or went (`SnapOp`).
-    tp_snap: ?*const fn (op: SnapOp, a: u64, b: u64) void = null,
+    tp_snap: ?*const fn (op: SnapOp, a: u64, b: u64, evidence: SnapEvidence) void = null,
+    with_slot: ?*const fn (u32, *anyopaque, *const fn (*anyopaque) anyerror!A) anyerror!A = null,
 };
 
 /// What rank 0 did with a snapshot, for the other ranks to do with their copy: `take` (state `a`'s snapshot kept as
 /// id `b`), `restore` (id `a` made state `b`), `clone` (id `a` copied to id `b`), `free` (id `a`),
 /// `capture` (state `a` settled and captured at position `b`).
 pub const SnapOp = enum(i32) { take, restore, clone, free, capture };
+pub const SnapEvidence = struct {
+    request: log.RequestTag = .{},
+    snapshot_id: u64 = 0,
+};
 pub const clusterHooks_shared = @import("../../sdk/util/shared.zig").Shared(ClusterHooksState, "dsv41_cluster", .{});
 pub inline fn clusterHooks() *ClusterHooksState {
     return clusterHooks_shared.get();
@@ -2459,6 +2464,7 @@ pub const State = struct {
     gpa: std.mem.Allocator,
     n: usize = 0,
     tp_synced: bool = true,
+    request_id: u64 = 0,
     layers: []LState,
     /// The request's compressed token ids (Engram look-back).
     hist: std.ArrayList(u32) = .empty,
@@ -5562,7 +5568,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         try cedReplayIn(m, gpa, st, &sp, &tsp, enc_hi);
         m.ced_stats.chunks += 1;
         m.ced_stats.skipped += L - tl;
-        log.info("[dsv41] CED prefill: {d} rows encoder-only, replay {d} rows\n", .{ L - tl, tl });
+        logCedPrefill(L - tl, tl);
         if (prefetch) |pf| log.debug("[dsv41] the chunk waited {d} ms on its Engram rows{s}\n", .{ pf.waited_ms, if (m.engrams[0].table.past_cache.load(.acquire)) ", codes past the page cache" else "" });
         try runLayers(m, gpa, st, &tsp, held, enc_hi, m.n_layers);
         sp = tsp;
@@ -6131,9 +6137,18 @@ fn followVerifyOf(m: *Dsv41Model, st: *State, p0: usize) !void {
     try finishVerify(m, st.gpa, st, p0 - v.n0);
 }
 
-/// Rank 0 tells the other ranks a state is gone (`ClusterHooksState.tp_free`).
-pub fn tpFree(m: *const Dsv41Model, gen: u64) void {
-    if (m.tp) |t| if (t.rank == 0) if (clusterHooks().tp_free) |free| free(gen);
+/// The generation owns its id even when the next request causes its cleanup.
+pub fn freeState(m: *const Dsv41Model, st: *State, gen: u64) void {
+    const tp = m.tp orelse return st.deinit();
+    if (tp.rank != 0) return st.deinit();
+    const owner = log.requestTag(st.request_id);
+    noteTpFree(tp.rank, gen, st.n, owner);
+    st.deinit();
+    if (clusterHooks().tp_free) |free| free(gen, owner);
+}
+
+fn noteTpFree(rank: u32, gen: u64, pos: usize, owner: log.RequestTag) void {
+    log.info("[hot-cache] rank={d} free req={f} gen={d} pos={d}\n", .{ rank, owner, gen, pos });
 }
 
 /// What a snapshot read from disk sends the other ranks: its layers' caches and Engram history. The ranks build them
@@ -6174,14 +6189,14 @@ pub fn freeArrays(gpa: std.mem.Allocator, xs: []const A) void {
     gpa.free(xs);
 }
 
-/// Rank 0 read `sn` from disk: the other ranks get its tensors under its id.
+/// The other ranks get the tensors under their new wire id, retaining the local snapshot's generation.
 pub fn tpLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap) !void {
     const t = m.tp orelse return;
     if (t.rank != 0) return;
     const load = clusterHooks().tp_load orelse return error.DsvTpNotJoined;
     const xs = try tpLoadTensors(m, gpa, sn);
     defer freeArrays(gpa, xs);
-    try load(sn.tp_id, sn.ids, xs);
+    try load(sn.tp_id, sn.gen, sn.ids, xs);
 }
 
 /// Makes `sn` known to the other ranks of the current group: one taken before the group formed (TP1, or an earlier
@@ -6195,8 +6210,9 @@ pub fn tpEnsure(m: *const Dsv41Model, gpa: std.mem.Allocator, ids: *TpIds, sn: *
 }
 
 /// Tensor-parallel rank past 0: rank 0's snapshot `id` read from disk, as `tpLoadPlan`'s tensors in order.
-pub fn tpWorkerLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, id: u64, ids: []const u32, tensors: []const A) !void {
-    return importPlan(m, gpa, snaps, id, ids, tensors, try tpLoadPlan(m, ids.len));
+pub fn tpWorkerLoad(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, id: u64, source_gen: u64, ids: []const u32, tensors: []const A) !void {
+    try importPlan(m, gpa, snaps, id, ids, tensors, try tpLoadPlan(m, ids.len));
+    snaps.getPtr(id).?.gen = source_gen;
 }
 
 /// Snapshot `id` rebuilt from `p`'s tensors in order, into `snaps` under that id.
@@ -6221,7 +6237,40 @@ pub fn importPlan(m: *const Dsv41Model, gpa: std.mem.Allocator, snaps: *Snaps, i
 
 /// Rank 0 tells the other ranks what it did with a snapshot (`ClusterHooksState.tp_snap`).
 pub fn tpSnap(m: *const Dsv41Model, op: SnapOp, a: u64, b: u64) void {
-    if (m.tp) |t| if (t.rank == 0) if (clusterHooks().tp_snap) |f| f(op, a, b);
+    if (m.tp) |t| if (t.rank == 0) if (clusterHooks().tp_snap) |f| f(op, a, b, .{});
+}
+
+pub fn tpCapture(m: *const Dsv41Model, st: *State, gen: u64, ids: ?*TpIds) void {
+    const tp = m.tp orelse return;
+    if (tp.rank != 0) return;
+    const sn = &st.snap.?;
+    var evidence: SnapEvidence = .{};
+    if (ids) |counter| {
+        const request = log.requestTag(st.request_id);
+        if (request.id != 0) {
+            sn.tp_id = counter.next();
+            evidence = .{ .request = request, .snapshot_id = sn.tp_id };
+            noteTpCapture(tp.rank, evidence, gen, st.n, sn.n);
+        }
+    }
+    if (clusterHooks().tp_snap) |f| f(.capture, gen, sn.n, evidence);
+}
+
+fn noteTpCapture(rank: u32, evidence: SnapEvidence, gen: u64, pre_pos: usize, snap_pos: u64) void {
+    if (evidence.request.id == 0) return;
+    log.info("[hot-cache] rank={d} capture req={f} snap={d} gen={d} pre_pos={d} snap_pos={d}\n", .{ rank, evidence.request, evidence.snapshot_id, gen, pre_pos, snap_pos });
+}
+
+pub fn tpRestore(m: *const Dsv41Model, sn: *const Snap, gen: u64, request: log.RequestTag) void {
+    const tp = m.tp orelse return;
+    if (tp.rank != 0) return;
+    noteTpRestore(tp.rank, sn, sn.tp_id, gen, request);
+    if (clusterHooks().tp_snap) |f| f(.restore, sn.tp_id, gen, .{ .request = request });
+}
+
+fn noteTpRestore(rank: u32, sn: *const Snap, id: u64, gen: u64, request: log.RequestTag) void {
+    if (request.id == 0) return;
+    log.info("[hot-cache] rank={d} restore req={f} gen={d} snap={d} snap_pos={d} src_gen={d}\n", .{ rank, request, gen, id, sn.n, sn.gen });
 }
 
 /// A tensor rank's halves of rank 0's prefix-cache snapshots, by the id rank 0 gave each.
@@ -6234,23 +6283,27 @@ pub fn dropSnaps(s: *Snaps, gpa: std.mem.Allocator) void {
 }
 
 /// Tensor-parallel rank past 0: does with its copy of a snapshot what rank 0 did (`SnapOp`).
-pub fn tpWorkerSnap(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, snaps: *Snaps, op: SnapOp, a: u64, b: u64) !void {
+pub fn tpWorkerSnap(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, snaps: *Snaps, op: SnapOp, a: u64, b: u64, evidence: SnapEvidence) !void {
     switch (op) {
         .capture => {
             const st = try tpStateOf(m, parked, a);
+            if (m.tp) |tp| noteTpCapture(tp.rank, evidence, a, st.n, b);
             try followVerifyOf(m, st, b);
             if (st.n != b) return error.DistPeerDiverged;
             st.snap_at = b;
             try snapshotStateIfDue(st, a);
+            if (st.snap) |*sn| sn.tp_id = evidence.snapshot_id;
         },
         .take => {
             const st = try tpStateOf(m, parked, a);
             const sn = st.snap orelse return error.DistPeerDiverged;
+            if (sn.tp_id != 0 and sn.tp_id != b) return error.DistPeerDiverged;
             try snaps.put(b, sn);
             st.snap = null;
         },
         .restore => {
             const sn = snaps.getPtr(a) orelse return error.DistPeerDiverged;
+            if (m.tp) |tp| noteTpRestore(tp.rank, sn, a, b, evidence.request);
             var fresh = try stateFromSnapshot(m, gpa, sn);
             errdefer fresh.deinit();
             try tpActivate(m, parked, b);
@@ -6296,14 +6349,11 @@ pub fn tpActivate(m: *Dsv41Model, parked: *Parked, gen: u64) !void {
 }
 
 /// Tensor-parallel rank past 0: rank 0 dropped the state `gen`.
-pub fn tpWorkerFree(m: *Dsv41Model, parked: *Parked, gen: u64) void {
-    if (m.dec_state != null and m.state_gen == gen) {
-        m.dec_state.?.deinit();
-        m.dec_state = null;
-    } else if (parked.fetchRemove(gen)) |kv| {
-        var st = kv.value;
-        st.deinit();
-    }
+pub fn tpWorkerFree(m: *Dsv41Model, parked: *Parked, gen: u64, owner: log.RequestTag) void {
+    const st = tpStateOf(m, parked, gen) catch return;
+    if (m.tp) |tp| noteTpFree(tp.rank, gen, st.n, owner);
+    st.deinit();
+    if (m.state_gen == gen and m.dec_state != null) m.dec_state = null else _ = parked.remove(gen);
 }
 
 /// Tensor-parallel rank past 0: one batched step rank 0 handed over (`ClusterHooksState.tp_batch`) over its states
@@ -6880,13 +6930,13 @@ pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision:
 /// A fresh request's empty state.
 pub fn reset(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
     var fresh = try initState(m, gpa);
+    fresh.request_id = log.requestId();
     if (m.dec_state) |*st| {
         fresh.snap_at = st.snap_at;
         fresh.snap_ids = st.snap_ids;
         fresh.snap_vision_key = st.snap_vision_key;
         st.snap_ids = &.{};
-        st.deinit();
-        tpFree(m, m.state_gen);
+        freeState(m, st, m.state_gen);
     }
     newGen(m);
     m.dec_state = fresh;
@@ -7209,6 +7259,10 @@ fn failedCacheGroups(status: []const u32) usize {
     return count;
 }
 
+fn logCedPrefill(encoded: usize, replayed: usize) void {
+    log.info("[dsv41] CED prefill: {d} rows encoder-only, replay {d} rows req={f}\n", .{ encoded, replayed, log.requestTag(log.requestId()) });
+}
+
 test "failedCacheGroups counts every non-zero group status" {
     try std.testing.expectEqual(@as(usize, 0), failedCacheGroups(&.{ 0, 0, 0 }));
     try std.testing.expectEqual(@as(usize, 2), failedCacheGroups(&.{ 0, 1, 0, 7 }));
@@ -7344,12 +7398,12 @@ fn ref(x: A) A {
 pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {
     const n = try restore(m, prompt, vision_rows);
     if (n == 0) try reset(m, m.gpa);
-    try armPrompt(m, prompt, vision_rows, true);
+    try armPrompt(m, prompt, vision_rows, true, null);
     return n;
 }
 
 /// Arms only this live State; candidate identity covers the boundary's ids and image rows.
-pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: bool) !void {
+pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: bool, tp_ids: ?*TpIds) !void {
     m.dropAhead();
     m.gpa.free(m.prompt);
     m.prompt = &.{};
@@ -7369,7 +7423,7 @@ pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: 
     st.snap_vision_key = key;
     try snapshotIfDue(m);
     // A restored prompt can stand at its boundary already: no step will carry the snapshot to the other ranks.
-    if (st.snap != null) tpSnap(m, .capture, m.state_gen, st.n);
+    if (st.snap != null) tpCapture(m, st, m.state_gen, tp_ids);
 }
 
 pub fn prefixKey(m: *const Dsv41Model, ids: []const u32, rows: ?A) !u64 {
@@ -10423,7 +10477,7 @@ test "dsv41 prefill: chunk time against depth (DSV41_PREFILL)" {
     const served = std.c.getenv("DSV41_PREFILL_SERVED") != null;
     if (served) {
         try reset(m, gpa);
-        try armPrompt(m, prompt, null, true);
+        try armPrompt(m, prompt, null, true, null);
     } else m.prompt = try m.gpa.dupe(u32, prompt);
     var st = try initState(m, gpa);
     defer st.deinit();
@@ -11745,4 +11799,12 @@ test "dsv41 pair: a layer split refuses an MLX pack's streamed experts by name b
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.Dsv41PairStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 4, .hi = 8, .worker = false }, .streamed_experts = true }));
+}
+
+test "request id: dsv41 CED prefill logs the current request" {
+    const prev = log.setRequestId(73);
+    defer _ = log.setRequestId(prev);
+    const text = try @import("../../sdk/testing/log_capture.zig").capture(testing.allocator, logCedPrefill, .{ @as(usize, 100), @as(usize, 16) });
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "[dsv41] CED prefill: 100 rows encoder-only, replay 16 rows req=chatcmpl-0000000000000000-73\n") != null);
 }

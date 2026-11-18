@@ -750,20 +750,41 @@ pub fn cancelAllInFlight(self: *Scheduler) void {
 /// Ends every request in flight with the error `name`, from any thread: for an inference thread that will never
 /// return from its step (a cluster worker left mid-exchange), so the readers are told before the process exits.
 /// The stuck pass never drops its slots' `in_pass`; it is dropped here, or each reader's `complete` waits forever.
-pub fn failInFlight(self: *Scheduler, name: []const u8) void {
-    self.queue_mu.lockUncancelable(self.io);
-    defer self.queue_mu.unlock(self.io);
-    for (self.pending.items) |slot| failSlot(slot, name);
-    if (self.boundary_slot) |slot| failSlot(slot, name);
-    if (self.prefilling_from < self.n_prefilling) {
-        for (self.prefilling[self.prefilling_from..self.n_prefilling]) |slot| failSlot(slot, name);
-    }
-    for (self.decoding.items) |slot| failSlot(slot, name);
+pub fn failInFlightLocked(self: *Scheduler, name: []const u8) void {
+    for (inFlightSlotsLocked(self)) |slots| for (slots) |slot| {
+        slot.markError(name);
+        slot.in_pass.store(0, .release);
+    };
 }
 
-fn failSlot(slot: *Slot, name: []const u8) void {
-    slot.markError(name);
-    slot.in_pass.store(0, .release);
+/// A watchdog must still exit if the inference thread wedged inside a queue operation.
+pub fn liveRequestIds(self: *Scheduler, model: []const u8, ids: *std.ArrayList(u64)) bool {
+    if (!self.queue_mu.tryLock()) return false;
+    defer self.queue_mu.unlock(self.io);
+    return liveRequestIdsLocked(self, model, ids, .try_lock);
+}
+
+pub fn liveRequestIdsLocked(self: *Scheduler, model: []const u8, ids: *std.ArrayList(u64), mode: enum { try_lock, wait }) bool {
+    for (inFlightSlotsLocked(self)) |slots| {
+        for (slots) |slot| {
+            if (!distributed.samePath(model, slot.model.path)) continue;
+            switch (mode) {
+                .try_lock => if (!slot.out_mu.tryLock()) return false,
+                .wait => slot.out_mu.lockUncancelable(slot.io),
+            }
+            const ended = slot.finished or slot.error_code != null;
+            slot.out_mu.unlock(slot.io);
+            if (ended or std.mem.indexOfScalar(u64, ids.items, slot.request_id) != null) continue;
+            ids.append(std.heap.page_allocator, slot.request_id) catch return false;
+        }
+    }
+    return true;
+}
+
+fn inFlightSlotsLocked(self: *Scheduler) [4][]const *Slot {
+    const boundary = if (self.boundary_slot) |*slot| @as([]*Slot, slot[0..1]) else &.{};
+    const prefilling = self.prefilling[@min(self.prefilling_from, self.n_prefilling)..self.n_prefilling];
+    return .{ self.pending.items, boundary, prefilling, self.decoding.items };
 }
 
 /// The media residency bill for an entry, or 0 when it is not a media
@@ -1418,7 +1439,9 @@ test "failInFlight: a decoding request ends with the error by name, its stuck pa
     slot.in_pass = .init(1);
     try sch.decoding.append(testing.allocator, &slot);
     defer sch.decoding.deinit(testing.allocator);
-    failInFlight(&sch, "DistWorkerLeft");
+    sch.queue_mu.lockUncancelable(sch.io);
+    failInFlightLocked(&sch, "DistWorkerLeft");
+    sch.queue_mu.unlock(sch.io);
     defer testing.allocator.free(slot.error_code.?);
     try testing.expectEqualStrings("DistWorkerLeft", slot.error_code.?);
     // The stuck pass's hold is dropped, so the reader's `complete` returns.

@@ -181,6 +181,7 @@ test {
     _ = @import("plugins/nemotron_diarization/diarization.zig");
     _ = @import("host/api/audio/transcription.zig");
     _ = @import("host/api/speech.zig");
+    _ = @import("host/api/speech_stream.zig");
     _ = @import("sdk/vision/mrope.zig");
     _ = @import("engines/ane/engine.zig");
     _ = @import("sdk/quant/hadamard/rht.zig");

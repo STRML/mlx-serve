@@ -76,9 +76,13 @@ fn restoreModulePrompt(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.M
         try beginModulePrompt(slot, binding, 0);
     };
     if (n > 0) if (selected) |match| {
-        log.info("[hot-cache] module restored source={s} id={d} position={d}{s}\n", .{ @tagName(match.source), if (match.source == .ram) match.entry_id else match.disk_id, n, if (match.cut > 0) " (cut from a longer entry)" else "" });
+        logModuleRestore(slot, match, n);
     };
     return n;
+}
+
+fn logModuleRestore(slot: *const Slot, match: prefix_cache_mod.ModuleMatch, n: usize) void {
+    log.info("[hot-cache] module restored source={s} id={d} position={d}{s} req={f}\n", .{ @tagName(match.source), if (match.source == .ram) match.entry_id else match.disk_id, n, if (match.cut > 0) " (cut from a longer entry)" else "", log.requestTag(slot.request_id) });
 }
 
 fn modulePromptMatch(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, cuts: bool) ?prefix_cache_mod.ModuleMatch {
@@ -168,6 +172,9 @@ fn prefillProgressSink(sch: *Scheduler) *std.atomic.Value(u64) {
 }
 
 pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+    const collective = [_]*const Slot{slot};
+    const dist_scope = @import("cluster/distributed.zig").scopeRequests(&collective);
+    defer dist_scope.restore();
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
     // so the panel isn't blind until the first chunk lands; the chunk loop in
@@ -740,4 +747,20 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     a.finished = true;
     b.finished = true;
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
+}
+
+test "request id: RAM restore logs the restoring slot, including a cut" {
+    const capture = @import("../../sdk/testing/log_capture.zig").capture;
+    const text = try capture(testing.allocator, struct {
+        fn run() void {
+            var slot: Slot = undefined;
+            slot.request_id = 73;
+            logModuleRestore(&slot, .{ .entry_id = 9, .n = 100, .prefix_key = 0 }, 100);
+            slot.request_id = 74;
+            logModuleRestore(&slot, .{ .entry_id = 9, .n = 80, .cut = 80, .prefix_key = 0 }, 80);
+        }
+    }.run, .{});
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "[hot-cache] module restored source=ram id=9 position=100 req=chatcmpl-0000000000000000-73\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[hot-cache] module restored source=ram id=9 position=80 (cut from a longer entry) req=chatcmpl-0000000000000000-74\n") != null);
 }

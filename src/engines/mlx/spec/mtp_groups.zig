@@ -486,6 +486,8 @@ pub fn mtpCrowdThresholdFor(slot: *const Slot) usize {
 }
 
 fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
+    const dist_scope = @import("../cluster/distributed.zig").scopeRequests(group);
+    defer dist_scope.restore();
     const cost_xfm = group[0].model.transformer.?;
     // The forward records its attention and MoE arms on qwen4_exp's trunk.
     const cost_trunk = cost_xfm.qwen4Trunk();
@@ -514,6 +516,8 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     defer for (chains[0..n_chain]) |*c| c.deinit(live[0].allocator);
 
     for (group) |slot| {
+        const solo_scope = @import("../cluster/distributed.zig").scopeRequests(&.{slot});
+        defer solo_scope.restore();
         const gen = &slot.legacy_gen.?;
         if (try loopGuardTick(sch, slot, gen)) continue;
         gen.mtp_batch_head = true;
@@ -542,6 +546,8 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
         }
     }
     if (n == 0) return;
+    const live_scope = @import("../cluster/distributed.zig").scopeRequests(live[0..n]);
+    defer live_scope.restore();
 
     var depth: u32 = 1;
     for (opens[0..n], 0..) |*o, i| {
@@ -591,6 +597,9 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     };
     for (0..taken) |i| {
         opens[i].chain = chains[i];
+        const slot = live[i];
+        const solo_scope = @import("../cluster/distributed.zig").scopeRequests(&.{slot});
+        defer solo_scope.restore();
         states[vn] = gens[i].mtpRoundContinue(live[i].allocator, opens[i]) catch |e| {
             live[i].markError(@errorName(e));
             continue;
@@ -600,6 +609,8 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
         vn += 1;
     }
     if (vn == 0) return;
+    const verify_scope = @import("../cluster/distributed.zig").scopeRequests(vlive[0..vn]);
+    defer verify_scope.restore();
 
     var sts: [MAX_BATCH_GROUP]*generate_mod.Generator.MtpRoundState = undefined;
     for (states[0..vn], 0..) |*st, i| sts[i] = st;
@@ -734,6 +745,8 @@ pub fn mtpSubGroupSize(remaining: usize, row_cap: u32) usize {
 }
 
 fn runBatchedMtpTick(sch: *Scheduler, group: []*Slot) !void {
+    const dist_scope = @import("../cluster/distributed.zig").scopeRequests(group);
+    defer dist_scope.restore();
     var inner_err: ?anyerror = null;
     runBatchedMtpTickInner(sch, group) catch |e| {
         inner_err = e;
@@ -771,6 +784,8 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
     };
 
     for (group) |slot| {
+        const solo_scope = @import("../cluster/distributed.zig").scopeRequests(&.{slot});
+        defer solo_scope.restore();
         const gen = &slot.legacy_gen.?;
         if (try loopGuardTick(sch, slot, gen)) continue;
         gen.mtp_batch_head = true;
@@ -793,6 +808,8 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
         }
     }
     if (open_n > 0) {
+        const open_scope = @import("../cluster/distributed.zig").scopeRequests(open_slots[0..open_n]);
+        defer open_scope.restore();
         var gens: [MAX_BATCH_GROUP]*Generator = undefined;
         var chains: [MAX_BATCH_GROUP]Generator.MtpPreDraft = undefined;
         var depth: u32 = 0;
@@ -813,6 +830,8 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
         };
         if (taken > 0) open_n = 0;
         for (opens[0..taken], open_slots[0..taken], 0..) |o, slot, i| {
+            const solo_scope = @import("../cluster/distributed.zig").scopeRequests(&.{slot});
+            defer solo_scope.restore();
             // `mtpRoundContinue` owns the chain from here, on success and on error.
             states[n] = gens[i].mtpRoundContinue(slot.allocator, o) catch |e| {
                 slot.markError(@errorName(e));
@@ -823,12 +842,17 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
         }
     }
     if (n == 0) return;
+    const live_scope = @import("../cluster/distributed.zig").scopeRequests(live[0..n]);
+    defer live_scope.restore();
 
     var results: [MAX_BATCH_GROUP]?Generator.DrafterStepResult = @splat(null);
     const merged = n > 1 and try verifyGroupMerged(sch, states[0..n], live[0..n]);
     var gens: [MAX_BATCH_GROUP]*Generator = undefined;
     var running: usize = 0;
+    var running_slots: [MAX_BATCH_GROUP]*Slot = undefined;
     for (states[0..n], live[0..n], 0..) |*st, slot, i| {
+        const solo_scope = @import("../cluster/distributed.zig").scopeRequests(&.{slot});
+        defer solo_scope.restore();
         const gen = &slot.legacy_gen.?;
         if (!merged) gen.mtpRoundVerify(st) catch |e| {
             slot.markError(@errorName(e));
@@ -840,12 +864,17 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
         };
         if (results[i] != null) {
             gens[running] = gen;
+            running_slots[running] = slot;
             running += 1;
         }
     }
-    if (running > 0) Generator.mtpGroupPreDraft(gens[0..running], allocator) catch |e| {
-        for (live[0..n]) |slot| slot.markError(@errorName(e));
-    };
+    if (running > 0) {
+        const predraft_scope = @import("../cluster/distributed.zig").scopeRequests(running_slots[0..running]);
+        defer predraft_scope.restore();
+        Generator.mtpGroupPreDraft(gens[0..running], allocator) catch |e| {
+            for (live[0..n]) |slot| slot.markError(@errorName(e));
+        };
+    }
     for (live[0..n], results[0..n]) |slot, r| {
         if (slot.state == .errored) {
             if (r) |res| slot.allocator.free(res.tokens);

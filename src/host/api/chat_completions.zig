@@ -82,11 +82,11 @@ const requestSpecModes = @import("request_options.zig").requestSpecModes;
 const handleStreamingGeneration = @import("chat_stream.zig").handleStreamingGeneration;
 const StreamLogprobs = @import("logprobs.zig").StreamLogprobs;
 const sendSSEChunk = @import("../http/sse.zig").sendSSEChunk;
-const sendResponse = @import("../http/respond.zig").sendResponse;
 const extractJsonField = @import("../http/errors.zig").extractJsonField;
 const countRejected = @import("../http/errors.zig").countRejected;
 const contextOverflowMessage = @import("../http/errors.zig").contextOverflowMessage;
 const sendErrorResponse = @import("../http/errors.zig").sendErrorResponse;
+const sendResponse = @import("../http/respond.zig").sendResponse;
 const cachedFormatChat = @import("format.zig").cachedFormatChat;
 const speech_stream = @import("speech_stream.zig");
 const speech_api = @import("speech.zig");
@@ -982,7 +982,7 @@ pub fn handleChatCompletions(
 /// UNREParsed. A standalone re-scan of the payload would read marker text
 /// inside JSON string data ("the close delimiter") as protocol structure and
 /// truncate valid JSON. Without a boundary the existing parser applies.
-pub fn emitConstrainedChat(a: std.mem.Allocator, stream: *Conn, id: i64, model: []const u8, lps: *StreamLogprobs, d: *rp_mod.Delivery) !void {
+pub fn emitConstrainedChat(a: std.mem.Allocator, stream: *Conn, id: u64, model: []const u8, lps: *StreamLogprobs, d: *rp_mod.Delivery) !void {
     if (d.reasoning.items.len > 0) {
         try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = null, .reasoning_content = d.reasoning.items }, null, null, null, .{});
     }
@@ -1123,7 +1123,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, logprobs_n, false, kv_quant_override, kv_attn_explicit, if (speech != null) .{} else null, stream);
+    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, logprobs_n, false, kv_quant_override, kv_attn_explicit, if (speech != null) .{} else null, stream, &stream.chat_request_id);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -1363,9 +1363,11 @@ fn formatChatReply(
     else
         try formatChatUsageWithReasoning(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, details.reasoning_tokens);
     defer allocator.free(usage);
+    const request_usage = try @import("format.zig").chatUsageRequestId(allocator, usage, result.request_id);
+    defer allocator.free(request_usage);
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
-    , .{ nowMs(io), nowSecs(io), model_name, message.content, message.reasoning, message.audio, logprobs_json, finish_reason, finishDetailsField(finish_reason, result.finish_details), usage, timings_field });
+        \\{{"id":"{f}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+    , .{ log.requestTag(result.request_id), nowSecs(io), model_name, message.content, message.reasoning, message.audio, logprobs_json, finish_reason, finishDetailsField(finish_reason, result.finish_details), request_usage, timings_field });
 }
 
 /// The non-stream reply that called tools. `message` is encoded already: the content value, the `reasoning_content`
@@ -1382,10 +1384,12 @@ fn formatToolCallReply(
 ) ![]u8 {
     const usage = try formatChatUsageWithReasoning(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, reasoning_tokens);
     defer allocator.free(usage);
+    const request_usage = try @import("format.zig").chatUsageRequestId(allocator, usage, result.request_id);
+    defer allocator.free(request_usage);
     const finish = toolCallFinishReason(finish_reason);
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
-    , .{ nowMs(io), nowSecs(io), model_name, message.content, message.reasoning, message.tool_calls, finish, finishDetailsField(finish, result.finish_details), usage, timings_field });
+        \\{{"id":"{f}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+    , .{ log.requestTag(result.request_id), nowSecs(io), model_name, message.content, message.reasoning, message.tool_calls, finish, finishDetailsField(finish, result.finish_details), request_usage, timings_field });
 }
 
 // ── tests ──
@@ -1410,4 +1414,46 @@ test "a reply's usage caps its re-encoded reasoning tokens at completion_tokens"
     const json = try formatChatReply(a, testing.io, "m", .{ .content = "\"ok\"", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 51, .audio = "" }, "");
     const usage = (try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{})).object.get("usage").?.object;
     try testing.expectEqual(@as(?i64, 50), if (usage.get("completion_tokens_details")) |d| d.object.get("reasoning_tokens").?.integer else null);
+}
+
+test "request id: nonstream chat header and usage match the response id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = try @import("../media_jobs/plugin/test_conn.zig").capture(a, struct {
+        fn run(conn: *Conn, al: std.mem.Allocator) !void {
+            const result: request_mod.GenerationResult = .{ .request_id = 73, .text = &.{}, .token_ids = &.{}, .prompt_tokens = 10, .completion_tokens = 2, .finish_reason = "stop", .prefill_tps = 0, .decode_tps = 0 };
+            const reply = try formatChatReply(al, std.testing.io, "m", .{ .content = "\"ok\"", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 0, .audio = "" }, "");
+            conn.chat_request_id = result.request_id;
+            try sendResponse(conn, "200 OK", "application/json", reply);
+        }
+    }.run, .{a});
+    const split = std.mem.indexOf(u8, raw, "\r\n\r\n").?;
+    const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, raw[split + 4 ..], .{})).object;
+    const id = root.get("id").?.string;
+    try std.testing.expectEqualStrings("chatcmpl-0000000000000000-73", id);
+    const expected = try std.fmt.allocPrint(a, "x-mlx-request-id: {s}\r\n", .{id});
+    try std.testing.expect(std.mem.indexOf(u8, raw[0 .. split + 2], expected) != null);
+    const usage = root.get("usage").?.object;
+    try std.testing.expect(usage.get("request_id") != null);
+    try std.testing.expectEqualStrings(id, usage.get("request_id").?.string);
+}
+
+test "request id: text tool and audio usage carry the response id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const result: request_mod.GenerationResult = .{ .request_id = 73, .text = &.{}, .token_ids = &.{}, .prompt_tokens = 10, .completion_tokens = 2, .finish_reason = "stop", .prefill_tps = 0, .decode_tps = 0 };
+    const replies = [_][]const u8{
+        try formatChatReply(a, std.testing.io, "m", .{ .content = "\"ok\"", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 1, .audio = "" }, ""),
+        try formatToolCallReply(a, std.testing.io, "m", .{ .content = "null", .reasoning = "", .tool_calls = "[]" }, "stop", result, 1, ""),
+        try formatChatReply(a, std.testing.io, "m", .{ .content = "null", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 0, .audio = ",\"completion_tokens_details\":{\"audio_tokens\":2}" }, ""),
+    };
+    for (replies) |reply| {
+        const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, reply, .{})).object;
+        try std.testing.expectEqualStrings("chatcmpl-0000000000000000-73", root.get("id").?.string);
+        const usage = root.get("usage").?.object;
+        try std.testing.expect(usage.get("request_id") != null);
+        try std.testing.expectEqualStrings(root.get("id").?.string, usage.get("request_id").?.string);
+    }
 }

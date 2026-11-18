@@ -8,6 +8,7 @@ const io_util = @import("../../sdk/util/io_util.zig");
 const ollama_mod = @import("../api/ollama/translate.zig");
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const testing = std.testing;
+const log = @import("../../sdk/util/log.zig");
 const http_server = @import("server.zig");
 
 const WsBridge = @import("../api/responses/ws.zig").WsBridge;
@@ -89,6 +90,7 @@ pub const Conn = struct {
     ablation: ?AblationRequest = null,
     ablation_header: [192]u8 = undefined,
     ablation_header_len: usize = 0,
+    chat_request_id: u64 = 0,
     cache_export: bool = false,
     /// The current request's `X-Session-Key`, hashed by `sessionTag` (0 = none).
     session_key: u64 = 0,
@@ -99,6 +101,7 @@ pub const Conn = struct {
         c.stream = stream;
         c.io = io;
         c.client = .other;
+        c.chat_request_id = 0;
         c.clearAblation();
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
@@ -113,6 +116,11 @@ pub const Conn = struct {
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 
+    pub fn requestIdHeader(c: *const Conn, buf: []u8) []const u8 {
+        if (c.chat_request_id == 0) return "";
+        return std.fmt.bufPrint(buf, "x-mlx-request-id: {f}\r\n", .{log.requestTag(c.chat_request_id)}) catch "";
+    }
+
     /// Replaces the previous request's client, so a request without a User-Agent never inherits it.
     pub fn noteRequestHeaders(c: *Conn, headers: []const u8) void {
         c.noteRequestHeadersAt(headers, nowMsMonotonic(c.io));
@@ -120,6 +128,7 @@ pub const Conn = struct {
 
     pub fn noteRequestHeadersAt(c: *Conn, headers: []const u8, head_read_ms: i64) void {
         c.client = instr.Client.fromUserAgent(findHeaderValue(headers, "user-agent"));
+        c.chat_request_id = 0;
         c.clearAblation();
         c.ablation_key = findHeaderValue(headers, "x-ablation-key");
         c.cache_export = if (findHeaderValue(headers, "x-cache-export")) |v| std.mem.eql(u8, v, "1") else false;
@@ -502,6 +511,7 @@ test "Conn: a request's X-Ablation line rides both response heads, and the next 
         const line = "X-Ablation: profile=p; strength=1.000; hash=00000000000000aa\r\n";
         @memcpy(conn.ablation_header[0..line.len], line);
         conn.ablation_header_len = line.len;
+        conn.chat_request_id = 73;
         if (sse) try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_DEFAULT) else try sendResponseFramed(&conn, "200 OK", "application/json", "{}");
         var buf: [1024]u8 = undefined;
         const n = std.c.recv(sv[1], &buf, buf.len, 0);
@@ -511,10 +521,13 @@ test "Conn: a request's X-Ablation line rides both response heads, and the next 
         try testing.expect(std.mem.indexOf(u8, head, "\r\n" ++ line) != null);
         // A browser may send the key cross-origin and read the X-Ablation line back.
         try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Ablation-Key\r\n") != null);
-        try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Expose-Headers: X-Ablation\r\n") != null);
+        try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Expose-Headers: X-Ablation, x-mlx-request-id\r\n") != null);
+        try testing.expect(std.mem.indexOf(u8, head, "\r\nx-mlx-request-id: chatcmpl-0000000000000000-73\r\n") != null);
         try testing.expect(std.mem.indexOf(u8, got, "secret-value") == null);
         conn.noteRequestHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n");
         try testing.expect(conn.ablation_key == null and conn.ablation == null and conn.ablationHeader().len == 0);
+        var request_buf: [80]u8 = undefined;
+        try testing.expectEqualStrings("", conn.requestIdHeader(&request_buf));
     }
 }
 

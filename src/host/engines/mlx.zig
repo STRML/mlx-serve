@@ -30,6 +30,7 @@ pub const Api = struct {
     has_company: *const fn (*Scheduler) bool,
     // ── requests
     submit: *const fn (*Scheduler, *const params.SubmitParams, *?*Slot) Err,
+    request_id: *const fn (*const Slot) u64,
     complete: *const fn (*Scheduler, *Slot) void,
     cancel: *const fn (*Slot) void,
     // ── models
@@ -290,6 +291,7 @@ pub const Running = struct {
             if (out == null and stream.refs.load(.acquire) == 2) stream.release();
             return err_name.toError(name);
         }
+        stream.request_id = api().request_id(out.?);
         stream.canceller = .{ .ctx = out.?, .cancel = cancelSlot };
         return .{ .sch = sch, .slot = out.?, .stream = stream };
     }

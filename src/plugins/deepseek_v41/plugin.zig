@@ -5,6 +5,7 @@
 //! a plain MLX pack's own shards (`sdk/weights/streamed.zig`).
 
 const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -134,8 +135,7 @@ fn park(m: *Model) !void {
     const k: Kept = .{ .st = st, .gen = m.mdl.state_gen };
     if (m.owner != 0) try m.parked.put(gpa, m.owner, k) else if (!auxEnabled(m)) keepIdle(m, k) else {
         var orphan = k;
-        orphan.deinit();
-        dsv41.tpFree(m.mdl, k.gen);
+        dsv41.freeState(m.mdl, &orphan.st, k.gen);
     }
     m.mdl.dec_state = null;
     m.owner = 0;
@@ -143,8 +143,7 @@ fn park(m: *Model) !void {
 
 fn keepIdle(m: *Model, k: Kept) void {
     if (m.idle) |*old| {
-        old.deinit();
-        dsv41.tpFree(m.mdl, old.gen);
+        dsv41.freeState(m.mdl, &old.st, old.gen);
     }
     m.idle = k;
 }
@@ -214,14 +213,12 @@ fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
     if (slot == m.owner) {
         m.owner = 0;
         if (m.mdl.dec_state) |*st| {
-            st.deinit();
-            dsv41.tpFree(m.mdl, m.mdl.state_gen);
+            dsv41.freeState(m.mdl, st, m.mdl.state_gen);
         }
         m.mdl.dec_state = null;
     } else if (m.parked.fetchRemove(slot)) |kv| {
         var k = kv.value;
-        k.deinit();
-        dsv41.tpFree(m.mdl, k.gen);
+        dsv41.freeState(m.mdl, &k.st, k.gen);
     }
 }
 
@@ -604,10 +601,26 @@ fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {
     defer for (rows[0..done]) |r| {
         _ = mlx.mlx_array_free(r);
     };
+    const Row = struct {
+        model: *Model,
+        slot: u32,
+        token: u32,
+        position: ?usize,
+
+        fn step(ctx: *anyopaque) anyerror!mlx.mlx_array {
+            const row: *@This() = @ptrCast(@alignCast(ctx));
+            const m0 = row.model;
+            try activate(m0, row.slot);
+            const pos = row.position orelse if (m0.mdl.dec_state) |st| st.n else 0;
+            return run(m0, &.{row.token}, pos, false, null, .{ .ctx = null });
+        }
+    };
     for (f.slots.slice(), f.tokens.slice(), 0..) |slot, t, k| {
-        try activate(m, slot);
-        const pos = if (f.positions.len == f.slots.len) f.positions.slice()[k] else if (m.mdl.dec_state) |st| st.n else 0;
-        rows[done] = try run(m, &.{t}, pos, false, null, .{ .ctx = null });
+        var row: Row = .{ .model = m, .slot = slot, .token = t, .position = if (f.positions.len == f.slots.len) f.positions.slice()[k] else null };
+        rows[done] = if (dsv41.clusterHooks().with_slot) |withSlot|
+            try withSlot(slot, &row, &Row.step)
+        else
+            try Row.step(&row);
         done += 1;
     }
     var o = mlx.mlx_array_new();
@@ -687,11 +700,13 @@ pub fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows
         m.mdl.state_gen = k.gen;
         m.idle = null;
     };
-    return dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch blk: {
+    const restored = dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch blk: {
         // The forward at position 0 establishes the cold state even if this reset fails.
         dsv41.reset(m.mdl, gpa) catch {};
         break :blk 0;
     };
+    if (restored > 0) m.mdl.dec_state.?.request_id = log.requestId();
+    return restored;
 }
 
 /// `CacheHooks.state_bytes`: the bytes the request's state holds on the GPU, for the engine's cache budget.
@@ -773,7 +788,7 @@ fn auxBeginPrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), rows: abi.Ar
     if (restored_at == 0) {
         dsv41.reset(m.mdl, gpa) catch |e| return Verdict.named(.failed, @errorName(e));
     }
-    dsv41.armPrompt(m.mdl, prompt.slice(), if (rows.ctx != null) .{ .ctx = rows.ctx } else null, capture) catch |e| return Verdict.named(.failed, @errorName(e));
+    dsv41.armPrompt(m.mdl, prompt.slice(), if (rows.ctx != null) .{ .ctx = rows.ctx } else null, capture, &m.tp_ids) catch |e| return Verdict.named(.failed, @errorName(e));
     return .ok;
 }
 
@@ -797,7 +812,7 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
     if (!live.st.tp_synced) return Verdict.refuse(.failed, "deepseek_v41: tensor state import did not complete");
     if (live.st.snap == null and (m.mdl.tp == null or m.mdl.prefill_whole != null)) {
         dsv41.snapshotStateAtChunk(m.mdl, live.st, live.gen) catch |e| return Verdict.named(.failed, @errorName(e));
-        if (live.st.snap != null) dsv41.tpSnap(m.mdl, .capture, live.gen, live.st.n);
+        if (live.st.snap != null) dsv41.tpCapture(m.mdl, live.st, live.gen, &m.tp_ids);
     }
     const sn = live.st.snap orelse return .ok;
     if (sn.n != sn.ids.len) return Verdict.refuse(.failed, "deepseek_v41: snapshot boundary differs from its ids");
@@ -805,7 +820,7 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
     owned.* = sn;
     live.st.snap = null;
     if (m.mdl.tp != null) {
-        owned.tp_id = m.tp_ids.next();
+        if (owned.tp_id == 0) owned.tp_id = m.tp_ids.next();
         dsv41.tpSnap(m.mdl, .take, live.gen, owned.tp_id);
     }
     out.* = owned;
@@ -827,14 +842,13 @@ fn auxRestoreAt(mp: *anyopaque, slot: u32, handle: abi.Handle, pos: u64) callcon
         fresh.deinit();
         return Verdict.named(.failed, @errorName(e));
     };
-    if (m.mdl.dec_state) |*old| {
-        old.deinit();
-        dsv41.tpFree(m.mdl, m.mdl.state_gen);
-    }
+    if (m.mdl.dec_state) |*old| dsv41.freeState(m.mdl, old, m.mdl.state_gen);
+    const request = log.requestTag(log.requestId());
+    fresh.request_id = request.id;
     m.mdl.dec_state = fresh;
     m.mdl.gens += 1;
     m.mdl.state_gen = m.mdl.gens;
-    dsv41.tpSnap(m.mdl, .restore, sn.tp_id, m.mdl.state_gen);
+    dsv41.tpRestore(m.mdl, sn, m.mdl.state_gen, request);
     return .ok;
 }
 

@@ -1339,6 +1339,7 @@ const LatchState = struct {
     /// pthread mutex: mlx-c calls the handler from whatever thread raised, none carry an `Io`.
     mlx_error_mtx: os_mutex.Mutex = .{},
     gpu_context_lost: std.atomic.Value(bool) = .init(false),
+    distributed_error: std.atomic.Value(?*const fn () void) = .init(null),
 };
 pub const latch_shared = @import("../sdk/util/shared.zig").Shared(LatchState, "mlx_error_latch", .{});
 inline fn latch() *LatchState {
@@ -1423,6 +1424,9 @@ pub fn resetGpuContextLostForTest() void {
 fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
     _ = data;
     const span = std.mem.span(msg);
+    if (std.mem.startsWith(u8, span, "[jaccl]") or std.mem.startsWith(u8, span, "[ring]")) {
+        if (latch().distributed_error.load(.acquire)) |handler| handler();
+    }
     lockErrBuf();
     defer unlockErrBuf();
     if (!latch().gpu_context_lost.load(.acquire) and mlxErrorIsContextLost(span)) {
@@ -1439,6 +1443,10 @@ fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
     log.err("[mlx] {s}\n", .{span});
     // Test builds keep the log off stderr; a failed op must still name its cause beside the test.
     if (comptime builtin.is_test) std.debug.print("[mlx] {s}\n", .{span});
+}
+
+pub fn setDistributedErrorHandler(handler: *const fn () void) void {
+    latch().distributed_error.store(handler, .release);
 }
 
 /// Install the latching handler. Called once from `main()`.
