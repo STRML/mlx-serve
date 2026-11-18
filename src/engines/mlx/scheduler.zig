@@ -604,7 +604,6 @@ fn submitWaiting(self: *Scheduler, params: SubmitParams, wait: bool) !*Slot {
         if (slot.holds_session) releaseSessionLocked(self, slot);
         return err;
     };
-    distributed.trackRequest(slot);
     self.in_flight += 1;
     self.queue_cond.broadcast(self.io);
     return slot;
@@ -711,7 +710,6 @@ pub fn complete(self: *Scheduler, slot: *Slot) void {
         unlistLocked(self, slot);
     }
 
-    distributed.untrackRequest(slot);
     self.cleanup_queue.append(self.allocator, slot) catch {
         // OOM on the cleanup list — fall back to inline deinit. This
         // races on mlx but is strictly better than the leak; the slot
@@ -752,20 +750,48 @@ pub fn cancelAllInFlight(self: *Scheduler) void {
 /// Ends every request in flight with the error `name`, from any thread: for an inference thread that will never
 /// return from its step (a cluster worker left mid-exchange), so the readers are told before the process exits.
 /// The stuck pass never drops its slots' `in_pass`; it is dropped here, or each reader's `complete` waits forever.
-pub fn failInFlight(self: *Scheduler, name: []const u8) void {
+pub fn failInFlight(self: *Scheduler, name: []const u8, ids: *std.ArrayList(u64)) bool {
     self.queue_mu.lockUncancelable(self.io);
     defer self.queue_mu.unlock(self.io);
-    for (self.pending.items) |slot| failSlot(slot, name);
-    if (self.boundary_slot) |slot| failSlot(slot, name);
-    if (self.prefilling_from < self.n_prefilling) {
-        for (self.prefilling[self.prefilling_from..self.n_prefilling]) |slot| failSlot(slot, name);
-    }
-    for (self.decoding.items) |slot| failSlot(slot, name);
+    return exitRequestIdsLocked(self, .{ .fail = name }, ids);
 }
 
-fn failSlot(slot: *Slot, name: []const u8) void {
-    slot.markError(name);
-    slot.in_pass.store(0, .release);
+/// A watchdog must still exit if the inference thread wedged inside a queue operation.
+pub fn liveRequestIds(self: *Scheduler, model: []const u8, ids: *std.ArrayList(u64)) bool {
+    if (!self.queue_mu.tryLock()) return false;
+    defer self.queue_mu.unlock(self.io);
+    return exitRequestIdsLocked(self, .{ .model = model }, ids);
+}
+
+fn exitRequestIdsLocked(self: *Scheduler, action: union(enum) { fail: []const u8, model: []const u8 }, ids: *std.ArrayList(u64)) bool {
+    const boundary = if (self.boundary_slot) |*slot| @as([]*Slot, slot[0..1]) else &.{};
+    const prefilling = self.prefilling[@min(self.prefilling_from, self.n_prefilling)..self.n_prefilling];
+    var recorded_all = true;
+    for ([_][]const *Slot{ self.pending.items, boundary, prefilling, self.decoding.items }) |slots| {
+        for (slots) |slot| {
+            switch (action) {
+                .fail => |name| {
+                    const failed = slot.markErrorOnce(name);
+                    slot.in_pass.store(0, .release);
+                    if (!failed) continue;
+                },
+                .model => |model| {
+                    if (!distributed.samePath(model, slot.model.path)) continue;
+                    if (!slot.out_mu.tryLock()) {
+                        recorded_all = false;
+                        continue;
+                    }
+                    const ended = slot.finished or slot.error_code != null;
+                    slot.out_mu.unlock(slot.io);
+                    if (ended or std.mem.indexOfScalar(u64, ids.items, slot.request_id) != null) continue;
+                },
+            }
+            ids.append(std.heap.page_allocator, slot.request_id) catch {
+                recorded_all = false;
+            };
+        }
+    }
+    return recorded_all;
 }
 
 /// The media residency bill for an entry, or 0 when it is not a media
@@ -1420,8 +1446,12 @@ test "failInFlight: a decoding request ends with the error by name, its stuck pa
     slot.in_pass = .init(1);
     try sch.decoding.append(testing.allocator, &slot);
     defer sch.decoding.deinit(testing.allocator);
-    failInFlight(&sch, "DistWorkerLeft");
+    slot.request_id = 73;
+    var ids: std.ArrayList(u64) = .empty;
+    defer ids.deinit(std.heap.page_allocator);
+    try testing.expect(failInFlight(&sch, "DistWorkerLeft", &ids));
     defer testing.allocator.free(slot.error_code.?);
+    try testing.expectEqualSlices(u64, &.{73}, ids.items);
     try testing.expectEqualStrings("DistWorkerLeft", slot.error_code.?);
     // The stuck pass's hold is dropped, so the reader's `complete` returns.
     try testing.expectEqual(@as(u32, 0), slot.in_pass.load(.acquire));

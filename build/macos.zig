@@ -282,6 +282,10 @@ pub fn addUnitTests(g: *const Graph) Tests {
     // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig);
     // a filtered run defaults to one process.
     const shards: u32 = b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse (if (test_filter != null) 1 else defaultShards());
+    if (shards == 0) {
+        std.debug.print("[mlx-serve] -Dtest-shards must be at least 1\n", .{});
+        std.process.exit(1);
+    }
     const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
     // A Run step given an env var copies the WHOLE configure-time environment into the cached configuration, so the

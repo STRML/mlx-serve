@@ -11756,5 +11756,5 @@ test "request id: dsv41 CED prefill logs the current request" {
     defer _ = log.setRequestId(prev);
     const text = try @import("../../sdk/testing/log_capture.zig").capture(testing.allocator, logCedPrefill, .{ @as(usize, 100), @as(usize, 16) });
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "[dsv41] CED prefill: 100 rows encoder-only, replay 16 rows req=chatcmpl-73\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[dsv41] CED prefill: 100 rows encoder-only, replay 16 rows req=chatcmpl-0000000000000000-73\n") != null);
 }

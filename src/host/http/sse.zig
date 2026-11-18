@@ -1,6 +1,7 @@
 //! DeltaFields, ChunkExtras; sendSSEChunk, usage chunk; keepalive
 
 const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const nowSecs = io_util.nowSecs;
 const nowMsMonotonic = io_util.nowMsMonotonic;
@@ -37,7 +38,7 @@ const Finish = struct {
 pub fn sendSSEChunk(
     allocator: std.mem.Allocator,
     stream: *Conn,
-    chat_id: i64,
+    chat_id: u64,
     model_name: []const u8,
     delta: DeltaFields,
     /// `null` on every mid-stream delta; the two FINAL chunks pass the reason
@@ -120,8 +121,8 @@ pub fn sendSSEChunk(
 
     // Build the full SSE chunk
     const chunk = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"delta":{s},"finish_reason":{s}{s}{s}}}],"usage":{s}{s}}}
-    , .{ chat_id, nowSecs(stream.io), model_name, delta_buf.items, fr_str, fd_str, lp_buf.items, usage_str, timings_tail_buf.items });
+        \\{{"id":"{f}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"delta":{s},"finish_reason":{s}{s}{s}}}],"usage":{s}{s}}}
+    , .{ log.requestTag(chat_id), nowSecs(stream.io), model_name, delta_buf.items, fr_str, fd_str, lp_buf.items, usage_str, timings_tail_buf.items });
     defer allocator.free(chunk);
 
     // Write as SSE event
@@ -138,7 +139,7 @@ pub fn sendSSEChunk(
 pub fn sendSSEUsageChunk(
     allocator: std.mem.Allocator,
     stream: *Conn,
-    chat_id: i64,
+    chat_id: u64,
     model_name: []const u8,
     usage_json: []const u8,
     timings_json: ?[]const u8,
@@ -150,8 +151,8 @@ pub fn sendSSEUsageChunk(
         try timings_tail_buf.appendSlice(allocator, t);
     }
     const chunk = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[],"usage":{s}{s}}}
-    , .{ chat_id, nowSecs(stream.io), model_name, usage_json, timings_tail_buf.items });
+        \\{{"id":"{f}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[],"usage":{s}{s}}}
+    , .{ log.requestTag(chat_id), nowSecs(stream.io), model_name, usage_json, timings_tail_buf.items });
     defer allocator.free(chunk);
 
     logHttpSseData(chunk);

@@ -8,6 +8,7 @@ const io_util = @import("../../sdk/util/io_util.zig");
 const ollama_mod = @import("../api/ollama/translate.zig");
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const testing = std.testing;
+const log = @import("../../sdk/util/log.zig");
 const http_server = @import("server.zig");
 
 const WsBridge = @import("../api/responses/ws.zig").WsBridge;
@@ -117,7 +118,7 @@ pub const Conn = struct {
 
     pub fn requestIdHeader(c: *const Conn, buf: []u8) []const u8 {
         if (c.chat_request_id == 0) return "";
-        return std.fmt.bufPrint(buf, "x-mlx-request-id: chatcmpl-{d}\r\n", .{c.chat_request_id}) catch "";
+        return std.fmt.bufPrint(buf, "x-mlx-request-id: {f}\r\n", .{log.requestTag(c.chat_request_id)}) catch "";
     }
 
     /// Replaces the previous request's client, so a request without a User-Agent never inherits it.
@@ -521,11 +522,11 @@ test "Conn: a request's X-Ablation line rides both response heads, and the next 
         // A browser may send the key cross-origin and read the X-Ablation line back.
         try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Ablation-Key\r\n") != null);
         try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Expose-Headers: X-Ablation, x-mlx-request-id\r\n") != null);
-        try testing.expect(std.mem.indexOf(u8, head, "\r\nx-mlx-request-id: chatcmpl-73\r\n") != null);
+        try testing.expect(std.mem.indexOf(u8, head, "\r\nx-mlx-request-id: chatcmpl-0000000000000000-73\r\n") != null);
         try testing.expect(std.mem.indexOf(u8, got, "secret-value") == null);
         conn.noteRequestHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n");
         try testing.expect(conn.ablation_key == null and conn.ablation == null and conn.ablationHeader().len == 0);
-        var request_buf: [64]u8 = undefined;
+        var request_buf: [80]u8 = undefined;
         try testing.expectEqualStrings("", conn.requestIdHeader(&request_buf));
     }
 }

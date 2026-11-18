@@ -226,6 +226,6 @@ test "a TCP peer that closed reads as gone even with its last bytes unread" {
 
 test "request id: dist-exit preserves every field with an active or idle request" {
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=1794778000123 cause=worker_left peer=2 step=41 waited_ms=- req=chatcmpl-73\n", try std.fmt.bufPrint(&buf, "{f}", .{ExitRecord{ .epoch_ms = 1794778000123, .cause = .worker_left, .peer = 2, .step = 41, .requests = .{ .ids = &.{73} } }}));
+    try std.testing.expectEqualStrings("[dist-exit] epoch_ms=1794778000123 cause=worker_left peer=2 step=41 waited_ms=- req=chatcmpl-0000000000000000-73\n", try std.fmt.bufPrint(&buf, "{f}", .{ExitRecord{ .epoch_ms = 1794778000123, .cause = .worker_left, .peer = 2, .step = 41, .requests = .{ .ids = &.{73} } }}));
     try std.testing.expectEqualStrings("[dist-exit] epoch_ms=5 cause=stall peer=- step=0 waited_ms=30001 req=-\n", try std.fmt.bufPrint(&buf, "{f}", .{ExitRecord{ .epoch_ms = 5, .cause = .stall, .waited_ms = 30001 }}));
 }

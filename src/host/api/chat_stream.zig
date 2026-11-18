@@ -1051,7 +1051,7 @@ const StreamUsage = struct { prompt: u32, completion: u32, cached: u32, reasonin
 fn sendStreamTail(
     allocator: std.mem.Allocator,
     stream: *Conn,
-    chat_id: i64,
+    chat_id: u64,
     model_name: []const u8,
     finish: struct { reason: []const u8, details: ?[]const u8 },
     logprobs_json: ?[]const u8,
@@ -1066,7 +1066,7 @@ fn sendStreamTail(
     if (usage) |u| {
         const usage_json = try formatChatUsageWithReasoning(allocator, u.prompt, u.completion, u.cached, u.reasoning);
         defer allocator.free(usage_json);
-        const request_usage = try @import("format.zig").chatUsageRequestId(allocator, usage_json, @intCast(chat_id));
+        const request_usage = try @import("format.zig").chatUsageRequestId(allocator, usage_json, chat_id);
         defer allocator.free(request_usage);
         try sendSSEUsageChunk(allocator, stream, chat_id, model_name, request_usage, timings);
     }
@@ -1144,7 +1144,7 @@ test "request id: streaming chat header and final usage match every chunk" {
                 try sendStreamTail(al, conn, id, "m", .{ .reason = "stop", .details = null }, null, usage, null);
             }
         }.run, .{ a, include_usage });
-        try testing.expect(std.mem.indexOf(u8, raw, "x-mlx-request-id: chatcmpl-73\r\n") != null);
+        try testing.expect(std.mem.indexOf(u8, raw, "x-mlx-request-id: chatcmpl-0000000000000000-73\r\n") != null);
         var it = std.mem.tokenizeSequence(u8, raw[std.mem.indexOf(u8, raw, "\r\n\r\n").? + 4 ..], "\n\n");
         var chunks: usize = 0;
         var usage_chunks: usize = 0;
@@ -1152,12 +1152,12 @@ test "request id: streaming chat header and final usage match every chunk" {
             const data = ev["data: ".len..];
             if (std.mem.eql(u8, data, "[DONE]")) continue;
             const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{})).object;
-            try testing.expectEqualStrings("chatcmpl-73", root.get("id").?.string);
+            try testing.expectEqualStrings("chatcmpl-0000000000000000-73", root.get("id").?.string);
             if (root.get("usage").? == .object) {
                 usage_chunks += 1;
                 const usage = root.get("usage").?.object;
                 try testing.expect(usage.get("request_id") != null);
-                try testing.expectEqualStrings("chatcmpl-73", usage.get("request_id").?.string);
+                try testing.expectEqualStrings("chatcmpl-0000000000000000-73", usage.get("request_id").?.string);
                 try testing.expectEqual(@as(i64, 3), usage.get("prompt_tokens_details").?.object.get("cached_tokens").?.integer);
             }
             chunks += 1;

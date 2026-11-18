@@ -35,6 +35,7 @@ pub const Level = enum {
 /// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
 const SinksState = struct {
     current_level: Level = .info,
+    request_nonce: std.atomic.Value(u64) = .init(0),
     inference_request: std.atomic.Value(u64) = .init(0),
     /// Read outside the mutex on every log call, so keep it atomic. When false the
     /// sink costs one relaxed load and nothing else.
@@ -67,13 +68,23 @@ inline fn sinks() *SinksState {
     return sinks_shared.get();
 }
 
-/// The inference thread nests request work at prefill boundaries; exit watchers read the published id atomically.
+/// Inference work can nest at prefill boundaries.
 pub fn setRequestId(id: u64) u64 {
     return sinks().inference_request.swap(id, .acq_rel);
 }
 
 pub fn requestId() u64 {
     return sinks().inference_request.load(.acquire);
+}
+
+pub fn initRequestIds(io: std.Io) void {
+    if (sinks().request_nonce.load(.acquire) != 0) return;
+    var random: u64 = undefined;
+    io.random(std.mem.asBytes(&random));
+    const nonce = @max(1, random);
+    if (sinks().request_nonce.cmpxchgStrong(0, nonce, .acq_rel, .acquire) == null) {
+        emit("[request-id] boot_nonce={x:0>16}\n", .{nonce});
+    }
 }
 
 pub fn requestTag(id: u64) RequestTag {
@@ -84,7 +95,7 @@ pub const RequestTag = struct {
     id: u64,
     pub fn format(self: RequestTag, w: *std.Io.Writer) std.Io.Writer.Error!void {
         if (self.id == 0) return w.writeAll("-");
-        try w.print("chatcmpl-{d}", .{self.id});
+        try w.print("chatcmpl-{x:0>16}-{d}", .{ sinks().request_nonce.load(.acquire), self.id });
     }
 };
 
@@ -495,4 +506,30 @@ test "request id: nested inference work restores the outer request on error and 
     try std.testing.expectEqual(@as(u64, 73), requestId());
     _ = setRequestId(outer);
     try std.testing.expectEqual(@as(u64, 0), requestId());
+}
+
+test "request id: a per-process nonce namespaces the slot counter and is logged once" {
+    const previous = sinks().request_nonce.swap(0, .acq_rel);
+    defer sinks().request_nonce.store(previous, .release);
+    const startup = try @import("../testing/log_capture.zig").capture(testing.allocator, struct {
+        fn run() void {
+            initRequestIds(testing.io);
+            initRequestIds(testing.io);
+        }
+    }.run, .{});
+    defer testing.allocator.free(startup);
+    var first_buf: [64]u8 = undefined;
+    var next_buf: [64]u8 = undefined;
+    const first = try std.fmt.bufPrint(&first_buf, "{f}", .{requestTag(1)});
+    const next = try std.fmt.bufPrint(&next_buf, "{f}", .{requestTag(2)});
+    try testing.expectEqual(@as(usize, 27), first.len);
+    try testing.expect(std.mem.startsWith(u8, first, "chatcmpl-"));
+    const nonce = first[9..25];
+    try testing.expect(!std.mem.eql(u8, nonce, "0000000000000000"));
+    var line_buf: [64]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&line_buf, "[request-id] boot_nonce={s}\n", .{nonce}), startup);
+    for (nonce) |c| try testing.expect(std.mem.indexOfScalar(u8, "0123456789abcdef", c) != null);
+    try testing.expectEqualStrings("-1", first[25..]);
+    try testing.expectEqualStrings(first[0..25], next[0..25]);
+    try testing.expectEqualStrings("-2", next[25..]);
 }

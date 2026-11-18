@@ -433,6 +433,6 @@ test "request id: SSM and module decode-end checkpoints log their slot" {
         }
     }.run, .{});
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "  [hot-cache] decode-end checkpoint at 5 (3 prompt + 2 generated) req=chatcmpl-73\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "  [hot-cache] decode-end checkpoint at 7 (3 prompt + 4 generated) req=chatcmpl-74\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "  [hot-cache] decode-end checkpoint at 5 (3 prompt + 2 generated) req=chatcmpl-0000000000000000-73\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "  [hot-cache] decode-end checkpoint at 7 (3 prompt + 4 generated) req=chatcmpl-0000000000000000-74\n") != null);
 }

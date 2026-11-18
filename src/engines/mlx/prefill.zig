@@ -762,6 +762,6 @@ test "request id: RAM restore logs the restoring slot, including a cut" {
         }
     }.run, .{});
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "[hot-cache] module restored source=ram id=9 position=100 req=chatcmpl-73\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "[hot-cache] module restored source=ram id=9 position=80 (cut from a longer entry) req=chatcmpl-74\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[hot-cache] module restored source=ram id=9 position=100 req=chatcmpl-0000000000000000-73\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[hot-cache] module restored source=ram id=9 position=80 (cut from a longer entry) req=chatcmpl-0000000000000000-74\n") != null);
 }

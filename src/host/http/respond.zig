@@ -11,15 +11,10 @@ const queryParamValue = @import("auth.zig").queryParamValue;
 const loginFormKey = @import("auth.zig").loginFormKey;
 const readRequestOver = @import("request.zig").readRequestOver;
 
-pub fn sendChatResponse(stream: *Conn, request_id: u64, body: []const u8) !void {
-    stream.chat_request_id = request_id;
-    try sendResponse(stream, "200 OK", "application/json", body);
-}
-
-pub fn sendChatSseHeaders(stream: *Conn, request_id: u64) !i64 {
+pub fn sendChatSseHeaders(stream: *Conn, request_id: u64) !u64 {
     stream.chat_request_id = request_id;
     try sendSseHeaders(stream, "chat.completions", SSE_ALLOW_HEADERS_DEFAULT);
-    return @intCast(request_id);
+    return request_id;
 }
 
 pub fn sendResponse(stream: *Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
@@ -44,7 +39,7 @@ pub fn sendResponseFramed(stream: *Conn, status: []const u8, content_type: []con
         return;
     }
 
-    var request_buf: [64]u8 = undefined;
+    var request_buf: [80]u8 = undefined;
     var hdr_buf: [832]u8 = undefined;
     const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: " ++ SSE_ALLOW_HEADERS_DEFAULT ++ "\r\nAccess-Control-Expose-Headers: X-Ablation, x-mlx-request-id\r\n{s}{s}\r\n", .{
         status,
@@ -106,7 +101,7 @@ pub fn sendSseHeaders(stream: *Conn, kind: []const u8, allow_headers: []const u8
         "Access-Control-Allow-Headers: ");
     try stream.writeAllNoFlush(allow_headers);
     try stream.writeAllNoFlush("\r\nAccess-Control-Expose-Headers: X-Ablation, x-mlx-request-id\r\n");
-    var request_buf: [64]u8 = undefined;
+    var request_buf: [80]u8 = undefined;
     try stream.writeAllNoFlush(stream.requestIdHeader(&request_buf));
     try stream.writeAllNoFlush(stream.ablationHeader());
     try stream.writeAll("\r\n");

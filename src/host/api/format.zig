@@ -147,7 +147,7 @@ pub fn formatChatUsage(
 }
 
 pub fn chatUsageRequestId(allocator: std.mem.Allocator, usage: []const u8, request_id: u64) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{{\"request_id\":\"chatcmpl-{d}\",{s}", .{ request_id, usage[1..] });
+    return std.fmt.allocPrint(allocator, "{{\"request_id\":\"{f}\",{s}", .{ log.requestTag(request_id), usage[1..] });
 }
 
 /// `thinking_tokens` is Anthropic's share of `output_tokens` spent thinking; a re-encoded count can overshoot the
