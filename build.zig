@@ -39,6 +39,8 @@ pub fn build(b: *std.Build) void {
         } else .{},
     });
     const optimize = b.standardOptimizeOption(.{});
+    const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
+    const build_id = readBuildId(b, git_sha);
 
     // `-Dunits` (the macOS default): the host, the MLX engine and every plugin group compile as their own objects, in
     // parallel, none of them needing the whole tree's compiler memory. `-Dunits=false` builds one unit.
@@ -57,10 +59,10 @@ pub fn build(b: *std.Build) void {
 
     // `install`, `run`, `test` for Linux and Windows, gated on the TARGET so the Linux exe can be built on any host
     // zig can target; the host gate below still guards the macOS graph.
-    if (target.result.os.tag == .linux or target.result.os.tag == .windows) return linux.add(b, target, optimize);
+    if (target.result.os.tag == .linux or target.result.os.tag == .windows) return linux.add(b, target, optimize, build_id);
     if (builtin.os.tag != .macos) return;
 
-    const graph: macos.Graph = .init(b, target, optimize, host, units);
+    const graph: macos.Graph = .init(b, target, optimize, host, units, git_sha, build_id);
     // `install`, `units`, `units-check`, `run`.
     macos.addServer(&graph, plugin_names);
     // `test-build`, `test`.
@@ -74,5 +76,28 @@ pub fn build(b: *std.Build) void {
     // `vz-agent`, `vz-agent-host`; its host-side tests join `test`.
     standalone.addVzAgent(b, target, optimize, tests.step);
     // `ios-lib`, `ios-lib-sim`.
-    ios.add(b, graph.version, host.brew_prefix);
+    ios.add(b, graph.version, host.brew_prefix, build_id);
+}
+
+fn readBuildId(b: *std.Build, git_sha: []const u8) []const u8 {
+    b.graph.poisonCache();
+    const root = config.buildRootHandle(b);
+    root.access(b.graph.io, ".git", .{}) catch return "unknown";
+    const git: std.Build.RunOptions = .{ .cwd = .{ .dir = root }, .stderr_behavior = .ignore };
+    const sha = if (isGitSha(git_sha)) git_sha else switch (b.runFallible(&.{ "git", "rev-parse", "--verify", "HEAD" }, git)) {
+        .success => |stdout| std.mem.trim(u8, stdout, " \t\r\n"),
+        else => return "unknown",
+    };
+    if (!isGitSha(sha)) return "unknown";
+    const status = switch (b.runFallible(&.{ "git", "--no-optional-locks", "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none" }, git)) {
+        .success => |stdout| stdout,
+        else => return "unknown",
+    };
+    return if (status.len == 0) sha else b.fmt("{s}-dirty", .{sha});
+}
+
+fn isGitSha(sha: []const u8) bool {
+    if (sha.len != 40 and sha.len != 64) return false;
+    for (sha) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
 }

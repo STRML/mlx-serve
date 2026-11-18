@@ -12,15 +12,15 @@ const std = @import("std");
 const libs = @import("libs.zig");
 
 /// `ios-lib`, `ios-lib-sim`.
-pub fn add(b: *std.Build, version: []const u8, brew_prefix: []const u8) void {
+pub fn add(b: *std.Build, version: []const u8, brew_prefix: []const u8, build_id: []const u8) void {
     const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse b.fmt("{s}/include", .{brew_prefix});
-    addLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
-    addLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
+    addLib(b, version, ios_include, build_id, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
+    addLib(b, version, ios_include, build_id, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
 }
 
 const Slice = struct { step: []const u8, abi: std.Target.Abi, sdk: []const u8 };
 
-fn addLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice: Slice) void {
+fn addLib(b: *std.Build, version: []const u8, ios_include: []const u8, build_id: []const u8, slice: Slice) void {
     // Min 18.0 to match the MLX metallib (Metal 3.2). abi=.none → device,
     // abi=.simulator → iOS Simulator slice.
     const ios_target = b.resolveTargetQuery(.{
@@ -46,6 +46,7 @@ fn addLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice: Sl
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
     ios_options.addOption([]const u8, "git_sha", "");
+    ios_options.addOption([]const u8, "build_id", build_id);
 
     const embedded: libs.Embedded = .init(b, ios_target, .ReleaseFast);
     const mod = b.createModule(.{

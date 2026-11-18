@@ -1006,3 +1006,80 @@ test "cache import route allows bounded headers around a 4 GiB body" {
     try std.testing.expectEqual(max_cache_transfer_body_bytes + 16 * 1024, maxRequestBytesFor("/v1/cache/import"));
     try std.testing.expectEqual(max_cache_transfer_body_bytes, max_cache_export_bytes);
 }
+
+fn buildIdHttpBody(request: []const u8, out: []u8) ![]const u8 {
+    const t = std.testing;
+    var sockets: [2]std.posix.fd_t = undefined;
+    try t.expectEqual(@as(c_int, 0), std.c.socketpair(1, 1, 0, &sockets));
+    defer _ = std.c.close(sockets[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sockets[0], .address = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) } } }, t.io);
+    defer conn.close();
+    try t.expectEqual(@as(isize, @intCast(request.len)), std.c.send(sockets[1], request.ptr, request.len, 0));
+    try handleConnection(t.allocator, &conn);
+    try conn.flush();
+    try t.expectEqual(@as(c_int, 0), std.c.shutdown(sockets[0], 1));
+    const len = std.c.recv(sockets[1], out.ptr, out.len, std.c.MSG.WAITALL);
+    try t.expect(len > 0);
+    const response = out[0..@intCast(len)];
+    try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+    return (std.mem.cut(u8, response, "\r\n\r\n") orelse return error.MissingHttpBody)[1];
+}
+
+test "HTTP build_id: internal mode preserves the legacy poll body" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const t = std.testing;
+    const reg = try ModelRegistry.init(t.allocator, t.io, null, 1, 0, null);
+    defer reg.deinit();
+    const old_registry = http_server.global_registry;
+    const old_internal = http_server.g_internal;
+    defer http_server.global_registry = old_registry;
+    defer http_server.g_internal = old_internal;
+    http_server.global_registry = reg;
+    var sw = @import("../internal/switch.zig").Switch.init(t.io);
+    var key: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("test-key", &key, .{});
+    http_server.g_internal = .{ .sw = &sw, .key = key };
+
+    var out: [4096]u8 = undefined;
+    const body = try buildIdHttpBody("GET /v1/internal/mode HTTP/1.1\r\nAuthorization: Bearer test-key\r\n\r\n", &out);
+    const parsed = try std.json.parseFromSlice(struct { clock_ms: i64, room_mib: ?u64 }, t.allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const expected_id = @import("build_options").build_id;
+    try t.expect(expected_id.len > 0);
+    const expected = try std.fmt.allocPrint(t.allocator,
+        \\{{"ok":true,"reason":"","mode":"tp1","n":0,"high_water":0,"role":"none","state":"idle","failure":"none","failure_rank":null,"peers":0,"in_flight":0,"admitting":true,"quarantined":false,"progress":null,"stalled_ms":0,"clock_ms":{d},"room_mib":{?d},"build_id":"{s}"}}
+    , .{ parsed.value.clock_ms, parsed.value.room_mib, expected_id });
+    defer t.allocator.free(expected);
+    try t.expectEqualStrings(expected, body);
+}
+
+test "HTTP build_id: headless props preserves the legacy status body" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const t = std.testing;
+    const reg = try ModelRegistry.init(t.allocator, t.io, null, 1, 0, null);
+    defer reg.deinit();
+    const old_registry = http_server.global_registry;
+    const old_scheduler = http_server.launch().global_scheduler;
+    defer http_server.global_registry = old_registry;
+    defer http_server.launch().global_scheduler = old_scheduler;
+    var scheduler: @import("../gpu_thread/scheduler.zig").Scheduler = undefined;
+    scheduler.registry = reg;
+    http_server.global_registry = reg;
+    http_server.launch().global_scheduler = &scheduler;
+
+    var out: [4096]u8 = undefined;
+    const body = try buildIdHttpBody("GET /props HTTP/1.1\r\n\r\n", &out);
+    const parsed = try std.json.parseFromSlice(struct {
+        memory: struct { active_bytes: u64, peak_bytes: u64, available_bytes: u64 },
+    }, t.allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const m = parsed.value.memory;
+    const expected_id = @import("build_options").build_id;
+    try t.expect(expected_id.len > 0);
+    const expected = try std.fmt.allocPrint(t.allocator,
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":0}},"batching":{{"supported":false,"reason":"no_model","max_group":32}},"plugins":[],"registry_generation":0,"build_id":"{s}"}}
+    , .{ m.active_bytes, m.peak_bytes, m.available_bytes, expected_id });
+    defer t.allocator.free(expected);
+    try t.expectEqualStrings(expected, body);
+}
