@@ -1312,8 +1312,8 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC = wire.MAGIC;
-/// 13: TP restore carries the leader's request tag.
-const VERSION: i32 = 13;
+/// 14: TP capture carries the request and the reserved snapshot id.
+const VERSION: i32 = 14;
 pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
 pub const OP_STOP = wire.OP_STOP;
@@ -1338,7 +1338,7 @@ const OP_DSV41_TP_PIPE: i32 = 15;
 const OP_DSV41_TP_DRAFT_PIPE: i32 = 16;
 const OP_DSV41_TP_VERIFY_PIPE: i32 = 17;
 const OP_DSV41_TP_PREFILL: i32 = 18;
-const OP_DSV41_TP_RESTORE_TAG: i32 = 19;
+const OP_DSV41_TP_SNAP_EVIDENCE: i32 = 19;
 pub const OP_RELEASE = wire.OP_RELEASE;
 
 /// `link` as a plugin's split job talks over it (`sdk/util/wire.zig`).
@@ -2672,15 +2672,16 @@ fn tpSnapHeader(op: dsv41_mod.SnapOp, a: u64, b: u64, request: log.RequestTag) M
     return .{ OP_DSV41_TP_SNAP, @backingInt(op), @intCast(a & 0x7fffffff), @intCast(a >> 31), @intCast(b & 0x7fffffff), @intCast(b >> 31), @intFromBool(request.id != 0), 0 };
 }
 
-fn tpRestoreTagHeader(request: log.RequestTag) Msg {
-    const words = tpRequestWords(request);
-    return .{ OP_DSV41_TP_RESTORE_TAG, words[0], words[1], words[2], words[3], 0, 0, 0 };
+fn tpSnapEvidenceHeader(evidence: dsv41_mod.SnapEvidence) Msg {
+    const words = tpRequestWords(evidence.request);
+    const id = evidence.snapshot_id;
+    return .{ OP_DSV41_TP_SNAP_EVIDENCE, words[0], words[1], words[2], words[3], @intCast(id & 0x7fffffff), @intCast(id >> 31), 0 };
 }
 
 /// Host: what it did with a snapshot (`dsv41.SnapOp`); the worker does the same with its copy.
-fn dsv41TpSnap(op: dsv41_mod.SnapOp, a: u64, b: u64, request: log.RequestTag) void {
+fn dsv41TpSnap(op: dsv41_mod.SnapOp, a: u64, b: u64, evidence: dsv41_mod.SnapEvidence) void {
     const link = tpLeader(false) catch return;
-    sendAll(link, tpSnapHeader(op, a, b, request), if (request.id != 0) tpRestoreTagHeader(request) else null);
+    sendAll(link, tpSnapHeader(op, a, b, evidence.request), if (evidence.request.id != 0) tpSnapEvidenceHeader(evidence) else null);
 }
 
 /// A tensor step's header: its rows, position, flags, the state it advances and, for one row, the id itself.
@@ -2983,17 +2984,19 @@ fn dsv41StepLoop(io: std.Io, allocator: std.mem.Allocator, link: *const Link, m:
             OP_DSV41_TP_FREE => dsv41_mod.tpWorkerFree(m, &parked, joined(msg[1], msg[2]), tpRequestTag(msg[3..7].*)),
             OP_DSV41_TP_SNAP => {
                 const op = std.enums.fromInt(dsv41_mod.SnapOp, msg[1]) orelse return error.DistBadMessage;
-                const request: log.RequestTag = switch (msg[6]) {
+                const evidence: dsv41_mod.SnapEvidence = switch (msg[6]) {
                     0 => .{},
                     1 => blk: {
-                        if (op != .restore) return error.DistBadMessage;
+                        if (op != .restore and op != .capture) return error.DistBadMessage;
                         const tag = try transport.recvOp();
-                        if (tag[0] != OP_DSV41_TP_RESTORE_TAG) return error.DistBadMessage;
-                        break :blk tpRequestTag(tag[1..5].*);
+                        if (tag[0] != OP_DSV41_TP_SNAP_EVIDENCE or tag[5] < 0 or tag[6] < 0) return error.DistBadMessage;
+                        const id = joined(tag[5], tag[6]);
+                        if ((op == .capture) != (id != 0)) return error.DistBadMessage;
+                        break :blk .{ .request = tpRequestTag(tag[1..5].*), .snapshot_id = id };
                     },
                     else => return error.DistBadMessage,
                 };
-                try dsv41_mod.tpWorkerSnap(m, allocator, &parked, &snaps, op, joined(msg[2], msg[3]), joined(msg[4], msg[5]), request);
+                try dsv41_mod.tpWorkerSnap(m, allocator, &parked, &snaps, op, joined(msg[2], msg[3]), joined(msg[4], msg[5]), evidence);
             },
             OP_DSV41_TP_LOAD => {
                 const n: usize = @intCast(joined(msg[3], msg[4]));
@@ -3570,7 +3573,7 @@ test "dist bell READY matrix 14: bell EOF interrupts cold load promptly" {
 }
 
 test "dist bell READY matrix 15: workers without the current protocol are refused at hello" {
-    for ([_]i32{ 10, 11, 12 }) |old| try std.testing.expectError(error.DistProtocolMismatch, Hello.parse(.{ MAGIC, old, 0, 0, 0, 0, 0, 0 }));
+    for ([_]i32{ 10, 11, 12, 13 }) |old| try std.testing.expectError(error.DistProtocolMismatch, Hello.parse(.{ MAGIC, old, 0, 0, 0, 0, 0, 0 }));
     _ = try Hello.parse(.{ MAGIC, VERSION, 0, 0, 0, 0, 0, 0 });
 }
 
@@ -7013,14 +7016,22 @@ const TestTpCacheEvidence = struct {
     const Producer = struct {
         var active: ?*@This() = null;
         freed: ?Msg = null,
+        captured: ?[2]Msg = null,
+        taken: ?Msg = null,
         restored: ?[2]Msg = null,
 
         fn free(gen: u64, owner: log.RequestTag) void {
             active.?.freed = tpFreeHeader(gen, owner);
         }
 
-        fn snapshot(op: dsv41_mod.SnapOp, snap_id: u64, gen: u64, request: log.RequestTag) void {
-            if (op == .restore) active.?.restored = .{ tpSnapHeader(op, snap_id, gen, request), tpRestoreTagHeader(request) };
+        fn snapshot(op: dsv41_mod.SnapOp, a: u64, b: u64, evidence: dsv41_mod.SnapEvidence) void {
+            const header = tpSnapHeader(op, a, b, evidence.request);
+            switch (op) {
+                .capture => active.?.captured = .{ header, tpSnapEvidenceHeader(evidence) },
+                .take => active.?.taken = header,
+                .restore => active.?.restored = .{ header, tpSnapEvidenceHeader(evidence) },
+                else => {},
+            }
         }
     };
 
@@ -7058,6 +7069,79 @@ const TestTpCacheEvidence = struct {
 
     fn snap(n: usize, ids: []u32) dsv41_mod.Snap {
         return .{ .tp_id = 17, .gen = 9, .vision_key = 0, .n = n, .ids = ids, .layers = &.{}, .ds = &.{}, .mh = .{ .ctx = null }, .hist = &.{} };
+    }
+
+    fn captureCheckpoint(failure: *?anyerror) void {
+        runCheckpoint() catch |err| {
+            failure.* = err;
+        };
+    }
+
+    fn runCheckpoint() !void {
+        const previous = log.setRequestId(73);
+        defer _ = log.setRequestId(previous);
+        var leader = model(0);
+        leader.ahead = null;
+        leader.prompt = &.{};
+        defer t.allocator.free(leader.prompt);
+        defer if (leader.dec_state) |*st| st.deinit();
+        try dsv41_mod.reset(&leader, std.heap.c_allocator);
+        leader.dec_state.?.n = 4078;
+        var plugin: v41.Model = undefined;
+        plugin.mdl = &leader;
+        plugin.owner = 1;
+        plugin.bank_streams = false;
+        plugin.tp_ids = .{ .last = 16 };
+
+        var produced: Producer = .{};
+        Producer.active = &produced;
+        defer Producer.active = null;
+        const hooks = dsv41_mod.clusterHooks();
+        const saved = hooks.*;
+        defer hooks.* = saved;
+        hooks.tp_free = &Producer.free;
+        hooks.tp_snap = &Producer.snapshot;
+        const aux = v41.table.cache.aux.?;
+
+        const held: [4079]u32 = @splat(1);
+        try t.expect(aux.begin_prompt(&plugin, 1, .of(&held), .{}, 4078, true).isOk());
+        var checkpoint: @import("../../../abi/plugin.zig").Handle = null;
+        try t.expect(aux.snapshot(&plugin, 1, &checkpoint).isOk());
+        const snap_ptr: *dsv41_mod.Snap = @ptrCast(@alignCast(checkpoint orelse return error.TestMissingSnapshot));
+        defer aux.free(&plugin, checkpoint);
+        try t.expectEqual(@as(u64, 17), snap_ptr.tp_id);
+
+        _ = log.setRequestId(74);
+        try t.expect(aux.restore_at(&plugin, 1, checkpoint, 4078).isOk());
+        const restored = produced.restored orelse return error.TestMissingRestore;
+        const captured = produced.captured orelse return error.TestMissingCapture;
+        const frames = [_]Msg{
+            captured[0],
+            captured[1],
+            produced.taken orelse return error.TestMissingTake,
+            produced.freed orelse return error.TestMissingFree,
+            restored[0],
+            restored[1],
+            .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        for (1..4) |rank_usize| {
+            const rank: u32 = @intCast(rank_usize);
+            var follower = model(rank);
+            follower.s = .{};
+            defer if (follower.dec_state) |*st| st.deinit();
+            follower.state_gen = 9;
+            follower.dec_state = .{ .gpa = t.allocator, .layers = &.{}, .n = 4078 };
+            if (rank == 1) {
+                follower.dec_state.?.n = 4077;
+                try dsv41_mod.armVerify(&follower.dec_state.?, 0);
+                follower.dec_state.?.n = 4080;
+            }
+            var state: LinkState = .{};
+            const link: Link = .{ .state = &state, .group = .{}, .rank = rank, .size = 4 };
+            var wire_fixture: TestTpCacheEvidence = .{ .messages = &frames };
+            try t.expect(try dsv41StepLoop(t.io, t.allocator, &link, &follower, .{ .ctx = &wire_fixture, .vt = &vt }));
+            try t.expectEqual(@as(usize, 4078), follower.dec_state.?.n);
+        }
     }
 
     fn capture(failure: *?anyerror) void {
@@ -7142,10 +7226,26 @@ test "request id: TP cache metadata preserves the full leader nonce and id" {
     const t = std.testing;
     const request: log.RequestTag = .{ .id = 0xfedcba9876543210, .boot_nonce = 0x89abcdef01234567 };
     const freed = tpFreeHeader(9, request);
-    const restored = tpRestoreTagHeader(request);
+    const restored = tpSnapEvidenceHeader(.{ .request = request });
     try t.expectEqual(request, tpRequestTag(freed[3..7].*));
     try t.expectEqual(request, tpRequestTag(restored[1..5].*));
     var buf: [64]u8 = undefined;
     const tag = try std.fmt.bufPrint(&buf, "{f}", .{tpRequestTag(restored[1..5].*)});
     try t.expectEqualStrings("chatcmpl-89abcdef01234567-18364758544493064720", tag);
+}
+
+test "request id: TP checkpoint logs each position before settle and restores the same snapshot" {
+    const t = std.testing;
+    var failure: ?anyerror = null;
+    const output = try @import("../../../sdk/testing/log_capture.zig").capture(t.allocator, TestTpCacheEvidence.captureCheckpoint, .{&failure});
+    defer t.allocator.free(output);
+    if (failure) |err| return err;
+    try t.expectEqual(@as(usize, 4), std.mem.count(u8, output, " capture req="));
+    for (0..4) |rank| {
+        var buf: [160]u8 = undefined;
+        const capture_line = try std.fmt.bufPrint(&buf, "[hot-cache] rank={d} capture req=chatcmpl-0000000000000000-73 snap=17 pre_pos={d} snap_pos=4078\n", .{ rank, if (rank == 1) @as(usize, 4080) else 4078 });
+        const after_capture = output[(std.mem.indexOf(u8, output, capture_line) orelse return error.TestMissingCaptureLine) + capture_line.len ..];
+        const restore_line = try std.fmt.bufPrint(&buf, "[hot-cache] rank={d} restore req=chatcmpl-0000000000000000-74 gen=10 snap=17 snap_pos=4078\n", .{rank});
+        try t.expect(std.mem.indexOf(u8, after_capture, restore_line) != null);
+    }
 }

@@ -111,7 +111,7 @@ pub const LoneGroup = struct {
     fn load(_: u64, _: []const u32, _: []const mlx.mlx_array) anyerror!void {}
     fn prefill(_: u64, _: usize, _: usize, _: bool, _: []const mlx.mlx_array, _: usize) anyerror!void {}
     fn free(_: u64, _: log.RequestTag) void {}
-    fn snap(_: dsv41.SnapOp, _: u64, _: u64, _: log.RequestTag) void {}
+    fn snap(_: dsv41.SnapOp, _: u64, _: u64, _: dsv41.SnapEvidence) void {}
 
     pub fn arm(n: usize) void {
         size = n;

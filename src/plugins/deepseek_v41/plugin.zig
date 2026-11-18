@@ -770,7 +770,7 @@ fn auxBeginPrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), rows: abi.Ar
     if (restored_at == 0) {
         dsv41.reset(m.mdl, gpa) catch |e| return Verdict.named(.failed, @errorName(e));
     }
-    dsv41.armPrompt(m.mdl, prompt.slice(), if (rows.ctx != null) .{ .ctx = rows.ctx } else null, capture) catch |e| return Verdict.named(.failed, @errorName(e));
+    dsv41.armPrompt(m.mdl, prompt.slice(), if (rows.ctx != null) .{ .ctx = rows.ctx } else null, capture, &m.tp_ids) catch |e| return Verdict.named(.failed, @errorName(e));
     return .ok;
 }
 
@@ -794,7 +794,7 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
     if (!live.st.tp_synced) return Verdict.refuse(.failed, "deepseek_v41: tensor state import did not complete");
     if (live.st.snap == null and (m.mdl.tp == null or m.mdl.prefill_whole != null)) {
         dsv41.snapshotStateAtChunk(m.mdl, live.st, live.gen) catch |e| return Verdict.named(.failed, @errorName(e));
-        if (live.st.snap != null) dsv41.tpSnap(m.mdl, .capture, live.gen, live.st.n);
+        if (live.st.snap != null) dsv41.tpCapture(m.mdl, live.st, live.gen, &m.tp_ids);
     }
     const sn = live.st.snap orelse return .ok;
     if (sn.n != sn.ids.len) return Verdict.refuse(.failed, "deepseek_v41: snapshot boundary differs from its ids");
@@ -802,7 +802,7 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
     owned.* = sn;
     live.st.snap = null;
     if (m.mdl.tp != null) {
-        owned.tp_id = m.tp_ids.next();
+        if (owned.tp_id == 0) owned.tp_id = m.tp_ids.next();
         dsv41.tpSnap(m.mdl, .take, live.gen, owned.tp_id);
     }
     out.* = owned;

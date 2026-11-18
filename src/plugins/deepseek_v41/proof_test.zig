@@ -1158,7 +1158,7 @@ test "codec preserves compressed Engram history including dead sentinels through
     const m = pm.mdl;
     const ids = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
     try dsv41.reset(m, gpa);
-    try dsv41.armPrompt(m, &ids, null, true);
+    try dsv41.armPrompt(m, &ids, null, true, null);
     _ = mlx.mlx_array_free(try dsv41.extendResumable(m, gpa, &ids, null));
     const sn = &m.dec_state.?.snap.?;
     const history = [_]u32{ 9, engram.Hash.DEAD, 2, 4, engram.Hash.DEAD, 7, 1 };
@@ -1893,10 +1893,10 @@ const LeaderCacheRig = struct {
         self.loads += 1;
     }
 
-    fn snap(op: dsv41.SnapOp, a: u64, b: u64, request: log.RequestTag) void {
+    fn snap(op: dsv41.SnapOp, a: u64, b: u64, evidence: dsv41.SnapEvidence) void {
         const self = active;
         for (self.models, &self.parked, &self.snaps) |m, *p, *s|
-            dsv41.tpWorkerSnap(m, testing.allocator, p, s, op, a, b, request) catch |err| {
+            dsv41.tpWorkerSnap(m, testing.allocator, p, s, op, a, b, evidence) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -1990,7 +1990,7 @@ test "deepseek_v41 leader prefill: Engram read-ahead stays with the active TP st
     var prompt: [96]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast((i * 13 + 3) % 1024);
     try dsv41.reset(tp, gpa);
-    try dsv41.armPrompt(tp, &prompt, null, true);
+    try dsv41.armPrompt(tp, &prompt, null, true, null);
     for ([_]usize{ 0, 32 }) |p0| {
         _ = mlx.mlx_array_free(try dsv41.extendResumable(tp, gpa, prompt[p0..][0..32], null));
         const ahead = tp.ahead orelse return error.LeaderPrefillDroppedEngramReadAhead;
@@ -2035,7 +2035,7 @@ const WarmRestore = struct {
         try events.append(testing.allocator, .{ .chunk = index });
     }
 
-    fn snap(op: dsv41.SnapOp, a: u64, b: u64, _: log.RequestTag) void {
+    fn snap(op: dsv41.SnapOp, a: u64, b: u64, _: dsv41.SnapEvidence) void {
         events.append(testing.allocator, .{ .snap = .{ .op = op, .a = a, .b = b } }) catch {
             failed = true;
         };

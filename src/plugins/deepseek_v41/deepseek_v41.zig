@@ -1735,13 +1735,17 @@ const ClusterHooksState = struct {
     /// Tensor parallel, rank 0: a snapshot read from disk, as the cache tensors of `tpLoadPlan` in order.
     tp_load: ?*const fn (id: u64, ids: []const u32, tensors: []const A) anyerror!void = null,
     /// Tensor parallel, rank 0: a snapshot moved, appeared or went (`SnapOp`).
-    tp_snap: ?*const fn (op: SnapOp, a: u64, b: u64, request: log.RequestTag) void = null,
+    tp_snap: ?*const fn (op: SnapOp, a: u64, b: u64, evidence: SnapEvidence) void = null,
 };
 
 /// What rank 0 did with a snapshot, for the other ranks to do with their copy: `take` (state `a`'s snapshot kept as
 /// id `b`), `restore` (id `a` made state `b`), `clone` (id `a` copied to id `b`), `free` (id `a`),
 /// `capture` (state `a` settled and captured at position `b`).
 pub const SnapOp = enum(i32) { take, restore, clone, free, capture };
+pub const SnapEvidence = struct {
+    request: log.RequestTag = .{},
+    snapshot_id: u64 = 0,
+};
 pub const clusterHooks_shared = @import("../../sdk/util/shared.zig").Shared(ClusterHooksState, "dsv41_cluster", .{});
 pub inline fn clusterHooks() *ClusterHooksState {
     return clusterHooks_shared.get();
@@ -6234,11 +6238,32 @@ pub fn tpSnap(m: *const Dsv41Model, op: SnapOp, a: u64, b: u64) void {
     if (m.tp) |t| if (t.rank == 0) if (clusterHooks().tp_snap) |f| f(op, a, b, .{});
 }
 
+pub fn tpCapture(m: *const Dsv41Model, st: *State, gen: u64, ids: ?*TpIds) void {
+    const tp = m.tp orelse return;
+    if (tp.rank != 0) return;
+    const sn = &st.snap.?;
+    var evidence: SnapEvidence = .{};
+    if (ids) |counter| {
+        const request = log.requestTag(st.request_id);
+        if (request.id != 0) {
+            sn.tp_id = counter.next();
+            evidence = .{ .request = request, .snapshot_id = sn.tp_id };
+            noteTpCapture(tp.rank, evidence, st.n, sn.n);
+        }
+    }
+    if (clusterHooks().tp_snap) |f| f(.capture, gen, sn.n, evidence);
+}
+
+fn noteTpCapture(rank: u32, evidence: SnapEvidence, pre_pos: usize, snap_pos: u64) void {
+    if (evidence.request.id == 0) return;
+    log.info("[hot-cache] rank={d} capture req={f} snap={d} pre_pos={d} snap_pos={d}\n", .{ rank, evidence.request, evidence.snapshot_id, pre_pos, snap_pos });
+}
+
 pub fn tpRestore(m: *const Dsv41Model, sn: *const Snap, gen: u64, request: log.RequestTag) void {
     const tp = m.tp orelse return;
     if (tp.rank != 0) return;
     noteTpRestore(tp.rank, sn, sn.tp_id, gen, request);
-    if (clusterHooks().tp_snap) |f| f(.restore, sn.tp_id, gen, request);
+    if (clusterHooks().tp_snap) |f| f(.restore, sn.tp_id, gen, .{ .request = request });
 }
 
 fn noteTpRestore(rank: u32, sn: *const Snap, id: u64, gen: u64, request: log.RequestTag) void {
@@ -6256,24 +6281,27 @@ pub fn dropSnaps(s: *Snaps, gpa: std.mem.Allocator) void {
 }
 
 /// Tensor-parallel rank past 0: does with its copy of a snapshot what rank 0 did (`SnapOp`).
-pub fn tpWorkerSnap(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, snaps: *Snaps, op: SnapOp, a: u64, b: u64, request: log.RequestTag) !void {
+pub fn tpWorkerSnap(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, snaps: *Snaps, op: SnapOp, a: u64, b: u64, evidence: SnapEvidence) !void {
     switch (op) {
         .capture => {
             const st = try tpStateOf(m, parked, a);
+            if (m.tp) |tp| noteTpCapture(tp.rank, evidence, st.n, b);
             try followVerifyOf(m, st, b);
             if (st.n != b) return error.DistPeerDiverged;
             st.snap_at = b;
             try snapshotStateIfDue(st, a);
+            if (st.snap) |*sn| sn.tp_id = evidence.snapshot_id;
         },
         .take => {
             const st = try tpStateOf(m, parked, a);
             const sn = st.snap orelse return error.DistPeerDiverged;
+            if (sn.tp_id != 0 and sn.tp_id != b) return error.DistPeerDiverged;
             try snaps.put(b, sn);
             st.snap = null;
         },
         .restore => {
             const sn = snaps.getPtr(a) orelse return error.DistPeerDiverged;
-            if (m.tp) |tp| noteTpRestore(tp.rank, sn, a, b, request);
+            if (m.tp) |tp| noteTpRestore(tp.rank, sn, a, b, evidence.request);
             var fresh = try stateFromSnapshot(m, gpa, sn);
             errdefer fresh.deinit();
             try tpActivate(m, parked, b);
@@ -7368,12 +7396,12 @@ fn ref(x: A) A {
 pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {
     const n = try restore(m, prompt, vision_rows);
     if (n == 0) try reset(m, m.gpa);
-    try armPrompt(m, prompt, vision_rows, true);
+    try armPrompt(m, prompt, vision_rows, true, null);
     return n;
 }
 
 /// Arms only this live State; candidate identity covers the boundary's ids and image rows.
-pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: bool) !void {
+pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: bool, tp_ids: ?*TpIds) !void {
     m.dropAhead();
     m.gpa.free(m.prompt);
     m.prompt = &.{};
@@ -7393,7 +7421,7 @@ pub fn armPrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A, capture: 
     st.snap_vision_key = key;
     try snapshotIfDue(m);
     // A restored prompt can stand at its boundary already: no step will carry the snapshot to the other ranks.
-    if (st.snap != null) tpSnap(m, .capture, m.state_gen, st.n);
+    if (st.snap != null) tpCapture(m, st, m.state_gen, tp_ids);
 }
 
 pub fn prefixKey(m: *const Dsv41Model, ids: []const u32, rows: ?A) !u64 {
@@ -10447,7 +10475,7 @@ test "dsv41 prefill: chunk time against depth (DSV41_PREFILL)" {
     const served = std.c.getenv("DSV41_PREFILL_SERVED") != null;
     if (served) {
         try reset(m, gpa);
-        try armPrompt(m, prompt, null, true);
+        try armPrompt(m, prompt, null, true, null);
     } else m.prompt = try m.gpa.dupe(u32, prompt);
     var st = try initState(m, gpa);
     defer st.deinit();
