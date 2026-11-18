@@ -1,7 +1,6 @@
-//! A wide prompt layer's grouped `wo_a` (an EXL3 pack's, turboexl3's `linearGrouped`) over runs of its attention spans'
-//! rows, not span by span.
+//! A wide prompt layer's grouped `wo_a` over runs of its attention spans.
 //!
-//! Span by span, the model's `wideLayer` would run `wo_a` on each 256-row span's grouped heads as the span's
+//! On an EXL3 pack, the model's `wideLayer` would run `wo_a` on each 256-row span's grouped heads as the span's
 //! attention ends. At prefill rows turboexl3's grouped linear runs `linear` on each of the 8 slices, and `linear` decodes the slice's whole
 //! trellis to W_hat and multiplies at M = the span's rows. A 16K-row layer so decodes every slice 64 times and runs 512
 //! GEMMs at M = 256, each slice's prepare and finish on its own launches.
@@ -12,8 +11,8 @@
 //! order: on the full pack every layer's runs differ from the span-by-span words in about 2% of them, by at most one bf16
 //! ulp (7.8e-3; w-pio-20261101-0624), a reorder-level change.
 //!
-//! A run holds its spans' grouped heads, their join and the grouped linear's copy of them (about 0.8 GB at 4096 rows),
-//! within the prompt bill's term for the chunk's grouped heads (`prefillBytes`: the heads for every row of the chunk).
+//! On native BF16 NAX prefill, the grouped GEMM uses the same dense weight for every run. The prompt bill covers
+//! the original grouped heads and their join. The native iQ fixture tests the projection bit for bit.
 
 const std = @import("std");
 

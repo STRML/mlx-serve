@@ -42,7 +42,7 @@ const device = @import("../../mlx/device.zig");
 const outside = @import("../../sdk/quant/outside.zig");
 /// the embed_pread.zig (the embedding pread): the embedding table read from the pack per lookup.
 const ep = @import("prompt/embed_pread.zig");
-/// the woa_rows.zig: a wide layer's EXL3 `wo_a` over runs of its spans' rows.
+/// A wide layer's grouped `wo_a` over runs of its spans' rows.
 const woa = @import("prompt/woa_rows.zig");
 /// What a wide call's MoE does not read, committed behind its routes before the routing barrier waits on them
 /// .
@@ -2166,7 +2166,9 @@ pub fn prefillBytes(config: anytype, kv_per_token: u64, seq: u64, chunk: u64, fl
     const idx_bytes = span * seq * 4 * 3;
     // A pair's gate/up rows, its activation and its down row, in the activation dtype (bf16).
     const moe_bytes = @min(c, MOE_ROWS) * config.num_experts_per_tok * (3 * config.moe_intermediate_size + d) * 2;
-    return (state + held + attn + idx_bytes + moe_bytes + wideEarlyBytes(config, c) + woaJoinBytes(config, c) + floor) * 5 / 4;
+    // Native runs copy the held BF16 attention heads into group-major projection inputs.
+    const woa_heads = if (nax and c >= DENSE_ROWS) c * config.num_attention_heads * hd * 2 else 0;
+    return (state + held + attn + idx_bytes + moe_bytes + wideEarlyBytes(config, c) + woaJoinBytes(config, c) + woa_heads + floor) * 5 / 4;
 }
 /// a streamed bank's wide call of `rows` rows holds its early shared expert's evaluation through the MoE
 /// stage (`wide_early.bytes`); 0 with no streamed bank or a call no wider than a span (the decode phase's bill: only wide
@@ -6659,11 +6661,9 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     defer gpa.free(heads);
     var n_heads: usize = 0;
     const og: c_int = @intCast(m.cfg.dsv4_o_groups);
-    // The chunk's spans share one dequantized `wo_a` (`DENSE_ROWS`).
-    var woa_dense = none;
-    // woa_rows.zig: an EXL3 `wo_a` over runs of `woa.spansPer` spans' grouped heads, one grouped linear a run
-    // (`woaRun`); a run of one span is the span-by-span path.
-    const run: usize = if (ly.wo_a.ext != null) @min(n_spans, woa.spansPer(sp.span)) else 1;
+    // Native projections share one dequantized weight across the chunk.
+    const woa_dense = if (ly.wo_a.ext == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) try ly.wo_a.dense(&sc, m.act) else null;
+    const run = woaSpansPerRun(m, ly, sp);
     const run_heads = try gpa.alloc(A, run);
     defer gpa.free(run_heads);
     var in_run: usize = 0;
@@ -6725,7 +6725,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
                 const r_region = if (heads_b) try sat.headsRunEnd(sc.s) else null;
                 if (r_region) |rg| _ = try run_scope.?.keep(rg);
                 const rs = &run_scope.?;
-                const oa = if (r_region) |rg| try attnOutARun(rs, m, ly, rg, prof) else try woaRun(rs, m, ly, run_heads[0..in_run], prof);
+                const oa = if (r_region) |rg| try attnOutARun(rs, m, ly, rg, prof) else try woaRun(rs, m, ly, run_heads[0..in_run], woa_dense, prof);
                 heads[n_heads] = try sc.keep(rs.out(oa));
                 if (r_region != null) try sat.headsReleased(heads[n_heads]);
                 n_heads += 1;
@@ -6734,8 +6734,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
                 run_scope = null;
             }
         } else {
-            if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) woa_dense = try ly.wo_a.dense(&sc, m.act);
-            const oa = try attnOutAProfile(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null, prof);
+            const oa = try attnOutAProfile(&ssc, m, ly, o_k, woa_dense, prof);
             // A tensor split sums each span's wo_b on the CPU stream while the GPU runs the next span's attention.
             const y = if (m.tp != null) try attnOutSum(&ssc, m, try attnOutBProfile(&ssc, ly, oa, prof), prof) else oa;
             heads[n_heads] = try sc.keep(ssc.out(y));
@@ -6840,10 +6839,21 @@ fn attnOutARun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, x: A, prof: ?*Profi
 }
 /// One run's `wo_a` over its spans' grouped heads `parts` (`[og, rows_k, in]` each), their rows joined
 /// (`[og, rows, in]`) through one grouped projection: `[rows, og * o_lora]` in `m.act`.
-fn woaRun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, parts: []const A, prof: ?*Profile) !A {
+fn woaRun(sc: *Scope, m: *Dsv41Model, ly: *const Layer, parts: []const A, dense_wo_a: ?A, prof: ?*Profile) !A {
     const joined = try sc.concat(parts, 1);
     try profileMark(prof, .attn_out_glue, &.{joined});
-    return attnOutAProfile(sc, m, ly, joined, null, prof);
+    return attnOutAProfile(sc, m, ly, joined, dense_wo_a, prof);
+}
+
+fn woaSpansPerRun(m: *const Dsv41Model, ly: *const Layer, sp: *const Spans) usize {
+    if (ly.wo_a.ext == null) {
+        // Keep per-span tensor sums and the native kernels for short or partial spans.
+        if (m.tp != null or m.act != .bfloat16 or !device.naxAvailable() or !mlx.streamIsGpu(m.s)) return 1;
+        if (sp.span != SPAN or sp.L < DENSE_ROWS or sp.L % sp.span != 0) return 1;
+        const bf16_weight = if (ly.wo_a.s.ctx == null) mlx.mlx_array_dtype(ly.wo_a.w) == .bfloat16 else ly.wo_a.qp.mode == .mxfp8;
+        if (!bf16_weight) return 1;
+    }
+    return @min(sp.xs.len, woa.spansPer(sp.span));
 }
 
 /// A streamed prompt call's routes of layer `li` predicted before its attention (the FFN's input taken as the stream
@@ -11788,6 +11798,48 @@ fn benchMxfp8(sc: *Scope, w: A) !Lin {
     return .{ .w = packed_weight, .s = try sc.keep(q.sc), .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
 }
 
+test "dsv41 wo_a: native prefill runs match span projections at iQ geometry" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const cfg = try @import("decode/fixture.zig").releaseConfig();
+    const groups = cfg.dsv4_o_groups;
+    const n = cfg.dsv4_o_lora_rank;
+    const k = @as(usize, cfg.num_attention_heads) * cfg.head_dim / groups;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    m.act = .bfloat16;
+    m.tp = null;
+    m.s = sc.s;
+    var ly: Layer = undefined;
+    ly.wo_a = try benchMxfp8(&sc, try bfRandom(&sc, 31, &.{ ci(groups), ci(n), ci(k) }, 0, 0.01));
+    const dense = try ly.wo_a.dense(&sc, m.act);
+    const rows = woa.rows;
+    var parts: [rows / SPAN]A = undefined;
+    var projected: [parts.len]A = undefined;
+    for (&parts, &projected, 0..) |*part, *out, i| {
+        part.* = try bfRandom(&sc, i + 71, &.{ ci(groups), SPAN, ci(k) }, 0, 1);
+        out.* = try attnOutAProfile(&sc, &m, &ly, part.*, dense, null);
+    }
+    const want = try sc.concat(&projected, 0);
+    const sp: Spans = .{ .xs = &parts, .pres = &.{}, .topks = &.{}, .cands = &.{}, .mh = &.{}, .span = SPAN, .L = rows, .p0 = 4096, .eng_ids = &.{}, .ncols = 0 };
+    var storage: Profile = undefined;
+    const prof = Profile.start(true, &storage, monoUs).?;
+    prof.shape_allocator = testing.allocator;
+    defer prof.deinit();
+    const run = woaSpansPerRun(&m, &ly, &sp);
+    const got = try woaRun(&sc, &m, &ly, parts[0..run], dense, prof);
+    try testing.expectEqual(@as(usize, 1), prof.shapes.items.len);
+    try testing.expectEqual(@as(usize, 1), prof.shapes.items[0].calls);
+    try testing.expectEqual(rows, prof.shapes.items[0].shape.m);
+    try evalAll(&.{ want, got });
+    const len = rows * groups * n;
+    try testing.expectEqualSlices(
+        u16,
+        @as([*]const u16, @ptrCast(mlx.mlx_array_data_bfloat16(want).?))[0..len],
+        @as([*]const u16, @ptrCast(mlx.mlx_array_data_bfloat16(got).?))[0..len],
+    );
+}
+
 test "dsv41 bench: grouped and flat prefill projections (DSV41_BENCH_PREFILL_WO_A)" {
     if (!env.on(.DSV41_BENCH_PREFILL_WO_A)) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
@@ -11817,6 +11869,9 @@ test "dsv41 bench: grouped and flat prefill projections (DSV41_BENCH_PREFILL_WO_
         .{ .name = "wo_a_grouped", .x = xg, .w = wg, .groups = groups },
         .{ .name = "wo_a_flat", .x = xf, .w = wf, .groups = 1 },
         .{ .name = "wq_b", .x = xq, .w = wq, .groups = 1, .use_serving_linear = true },
+        .{ .name = "wo_a_grouped", .x = try bfRandom(&sc, 5, &.{ ci(groups), 1024, ci(a_k) }, 0, 1), .w = wg, .groups = groups },
+        .{ .name = "wo_a_grouped", .x = try bfRandom(&sc, 6, &.{ ci(groups), 2048, ci(a_k) }, 0, 1), .w = wg, .groups = groups },
+        .{ .name = "wo_a_grouped", .x = try bfRandom(&sc, 7, &.{ ci(groups), 4096, ci(a_k) }, 0, 1), .w = wg, .groups = groups },
     };
     const reps = 6;
     var times: [cases.len][reps]i64 = undefined;
@@ -11824,14 +11879,14 @@ test "dsv41 bench: grouped and flat prefill projections (DSV41_BENCH_PREFILL_WO_
         var run = Scope.init(sc.a, sc.s);
         defer run.deinit();
         const t0 = monoUs();
-        // Keep both wo_a arms quantized at equal total rows. wq_b uses the serving linear.
+        // The wo_a sweep measures packed matmul. wq_b uses the serving linear.
         const y = if (arm.use_serving_linear) try arm.w.apply(&run, arm.x) else try groupedMatmul(&run, &arm.w, arm.x, none);
         try mlx.check(mlx.mlx_array_eval(y));
         const us = monoUs() - t0;
         if (rep != 0) {
             times[i][rep - 1] = us;
         } else {
-            try testing.expectEqual(rows, arm.groups * dim(y, -2));
+            try testing.expectEqual(dim(arm.x, -2), dim(y, -2));
             try testing.expectEqual(dim(arm.w.w, -2), dim(y, -1));
         }
     };
