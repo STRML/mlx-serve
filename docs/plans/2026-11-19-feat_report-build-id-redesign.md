@@ -75,7 +75,7 @@ Rounds 1–5 surfaced recurring loopholes because `git status`, `git diff --name
 | 2 | Explicit valid `git_sha` override on clean tree | `<override_sha>` | `isGitSha(git_sha)` honored after cleanliness checks |
 | 3 | Missing `.git` or invalid/missing `HEAD` | `"unknown"` | Initial `root.access(".git")` / `rev-parse HEAD` fails |
 | 4 | Post-HEAD query failure (buffer > limit, unreadable dir, failed temp index) | `<sha>-dirty` | Fail-closed `dirtyId(allocator, sha)` after `HEAD` SHA is known |
-| 5 | Root CI/build artifacts (`cuda-keyring_*.deb`, root `dist/`, root `.work-mlx-windows/`, `.zig-cache/`, `src/plugins/registry.zig`) | `<sha>` | Root-anchored exact allowlist in `isAllowedSuperprojectUntracked` |
+| 5 | Root/app CI/build artifacts (`cuda-keyring_*.deb`, root `dist/`, root `.work-mlx-windows/`, `app/.build/`, `.zig-cache/`, `src/plugins/registry.zig`) | `<sha>` | Root-anchored exact allowlist in `isAllowedSuperprojectUntrackedPath` |
 | 6 | Unanchored path collision (`src/plugins/dist/plugin.zig` or `sub/cuda-keyring_1.deb`) | `<sha>-dirty` | Allowlist matches ONLY root `dist/` and root `cuda-keyring_*.deb` |
 | 7 | Untracked plugin `src/plugins/new_plugin/plugin.zig` under `showUntrackedFiles=no`, `.git/info/exclude`, or `core.excludesFile` | `<sha>-dirty` | Direct `Dir` recursion vs `ls-tree -r -z HEAD` ignores all exclude files & status config |
 | 8 | Tracked edit marked `--assume-unchanged` or `--skip-worktree` in superproject or any submodule | `<sha>-dirty` | Fresh `GIT_INDEX_FILE` (`read-tree HEAD` + `update-index --refresh` + `diff-index`) ignores `.git/index` flags |
