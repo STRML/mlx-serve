@@ -19,7 +19,7 @@ const config = @import("config.zig");
 const libs = @import("libs.zig");
 
 /// `install`, `run`, `test`.
-pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_id: []const u8) void {
     const windows = target.result.os.tag == .windows;
     if (!windows) verifyMlxStageLinux(b);
 
@@ -33,6 +33,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     build_options.addOption([]const u8, "ds4_commit", b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse config.readDs4Commit(b) orelse "unknown");
     build_options.addOption([]const u8, "llama_tag", config.readLlamaTag(b) orelse "unknown");
     build_options.addOption([]const u8, "git_sha", "");
+    build_options.addOption([]const u8, "build_id", build_id);
     build_options.addOption(bool, "ios", false);
     build_options.addOption(bool, "units", false);
     build_options.addOption(bool, "ds4_engine", !windows);
@@ -139,6 +140,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     // Rerun every time when filtered, as on macOS (env-gated tests).
     if (test_filter != null) run_unit_tests.has_side_effects = true;
     test_step.dependOn(&run_unit_tests.step);
+    config.addTests(b, test_step, test_filter);
 }
 
 /// Linux counterpart of verifyMlxStage: fail loudly when scripts/

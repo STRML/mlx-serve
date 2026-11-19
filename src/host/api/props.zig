@@ -65,7 +65,7 @@ fn renderPropsBody(
     // was invisible: the panel read 19.6 GB of `active_bytes` while the process
     // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"weights_bytes":{d},"kv_cache_bytes":{d}}}{s}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"weights_bytes":{d},"kv_cache_bytes":{d}}}{s},"build_id":"{s}"}}
     , .{
         config.model_type,              ctx_str,
         config.vocab_size,              config.hidden_size,
@@ -76,7 +76,7 @@ fn renderPropsBody(
         peak_mem,                       available_mem,
         safe_ctx,                       cache_mem,
         weights_mem,                    kv_cache_mem,
-        extra_json,
+        extra_json,                     build_options.build_id,
     });
 }
 
@@ -331,8 +331,8 @@ pub fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     const plugins_json = try plugin_loader.processStatusJson(allocator, auth.peerIsLoopback(stream));
     defer allocator.free(plugins_json);
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s},"plugins":{s},"registry_generation":{d}}}
-    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP, cluster_json, plugins_json, registryGeneration() });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s},"plugins":{s},"registry_generation":{d},"build_id":"{s}"}}
+    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP, cluster_json, plugins_json, registryGeneration(), build_options.build_id });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -589,4 +589,5 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     // The tray splits active_bytes into loaded weights, the prefix KV cache and the rest.
     try testing.expect(std.mem.indexOf(u8, body, "\"weights_bytes\":7777") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"kv_cache_bytes\":8888") != null);
+    try testing.expect(std.mem.endsWith(u8, body, ",\"build_id\":\"" ++ build_options.build_id ++ "\"}"));
 }

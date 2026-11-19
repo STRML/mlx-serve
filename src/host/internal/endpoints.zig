@@ -3,6 +3,7 @@
 //! Pure over a `Switch`: the connection glue is in `http/router.zig`.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const attempt = @import("attempt.zig");
 const sw_mod = @import("switch.zig");
 
@@ -134,13 +135,13 @@ fn plain(buf: []u8, status: u16, msg: []const u8) Response {
     return .{ .status = status, .body = std.fmt.bufPrint(buf, "{{\"ok\":false,\"error\":\"{s}\"}}", .{msg}) catch "{}" };
 }
 
-fn render(io: std.Io, buf: []u8, status: u16, reason: []const u8, drained: ?bool, snap: sw_mod.Snapshot) Response {
+fn render(io: std.Io, buf: []u8, status: u16, reason: []const u8, drained: ?bool, snap: sw_mod.Snapshot, extra_json: []const u8) Response {
     var tmp: [512]u8 = undefined;
     const body = sw_mod.renderSnapshot(io, &tmp, snap);
     var dr: [24]u8 = undefined;
     const drained_field = if (drained) |d| std.fmt.bufPrint(&dr, ",\"drained\":{}", .{d}) catch "" else "";
     const error_field = if (status == 501) ",\"error\":\"no formation backend: the switch adapter is not installed\"" else "";
-    return .{ .status = status, .body = std.fmt.bufPrint(buf, "{{\"ok\":{},\"reason\":\"{s}\"{s}{s},{s}", .{ status == 200, reason, error_field, drained_field, body[1..] }) catch "{}" };
+    return .{ .status = status, .body = std.fmt.bufPrint(buf, "{{\"ok\":{},\"reason\":\"{s}\"{s}{s},{s}{s}}}", .{ status == 200, reason, error_field, drained_field, body[1 .. body.len - 1], extra_json }) catch "{}" };
 }
 
 /// The router's deadline is wall-clock and shared by every rank; it is refused when past or absurdly far.
@@ -156,7 +157,7 @@ pub fn handle(sw: *sw_mod.Switch, internal_key: ?[32]u8, req: Request, wall_now_
     const is_get = std.mem.eql(u8, req.method, "GET");
     if (std.mem.eql(u8, route, "mode")) {
         if (!is_get) return plain(buf, 405, "method not allowed");
-        return render(sw.io, buf, 200, "", null, sw.snapshot());
+        return render(sw.io, buf, 200, "", null, sw.snapshot(), ",\"build_id\":\"" ++ build_options.build_id ++ "\"");
     }
     const cmd = commandOf(route) orelse return plain(buf, 404, "not found");
     if (!std.mem.eql(u8, req.method, "POST")) return plain(buf, 405, "method not allowed");
@@ -173,7 +174,7 @@ pub fn handle(sw: *sw_mod.Switch, internal_key: ?[32]u8, req: Request, wall_now_
         drained = sw.waitDrained(p.n, p.wait_ms);
         snap = sw.snapshot();
     }
-    return render(sw.io, buf, reply.status, reply.reason, drained, snap);
+    return render(sw.io, buf, reply.status, reply.reason, drained, snap, "");
 }
 
 /// `/health`: 200 `ok` with the mode fields, 503 naming quarantine, an abort in progress, or a stall.

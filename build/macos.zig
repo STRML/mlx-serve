@@ -18,7 +18,7 @@ pub const Graph = struct {
     exe_mod: *std.Build.Module,
     test_mod: *std.Build.Module,
 
-    pub fn init(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host: config.Host, units: bool) Graph {
+    pub fn init(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host: config.Host, units: bool, git_sha: []const u8, build_id: []const u8) Graph {
         // App version. Release builds pass it explicitly (app/build.sh computes the
         // next CalVer from the GitHub releases and stamps it into app/Info.plist;
         // the release workflow passes the tag). A plain `zig build` used to fall
@@ -51,8 +51,8 @@ pub const Graph = struct {
         build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
         build_options.addOption([]const u8, "ds4_commit", ds4_commit);
         build_options.addOption([]const u8, "llama_tag", llama_tag);
-        const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
         build_options.addOption([]const u8, "git_sha", git_sha);
+        build_options.addOption([]const u8, "build_id", build_id);
         // false for the macOS exe/tests; the iOS static-lib step (`zig build ios-lib`)
         // builds its own options with ios=true so the engine swaps the embedded
         // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
@@ -309,7 +309,7 @@ pub fn addUnitTests(g: *const Graph) Tests {
         test_step.dependOn(&run.*.step);
     }
     plugins.addTests(b, test_step);
-    config.addTests(b, test_step);
+    config.addTests(b, test_step, test_filter);
     test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
     test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
     return .{ .step = test_step, .build = test_build, .runs = test_runs, .filter = test_filter };
