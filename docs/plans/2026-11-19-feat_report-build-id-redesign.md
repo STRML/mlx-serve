@@ -4,105 +4,66 @@
 
 `build_options.build_id` (computed by `readBuildId` / `resolveBuildId` in `build/config.zig` and exposed on `/v1/internal/mode` and `/props`) must uniquely identify the exact source code compiled into `mlx-serve`:
 
-- `<40/64-char HEAD SHA>` when the checkout and all embedded/staged submodules match committed `HEAD` plus at most the expected release/CI build artifacts (`cuda-keyring_*.deb`, `dist/`, `.work-mlx-windows/`) and the exact platform MLX/mlx-c patch set (`scripts/build-mlx.sh`, `scripts/build-mlx-linux.sh`, `scripts/build-mlx-windows.ps1`).
-- `<HEAD SHA>-dirty` on any uncommitted superproject edit, staged change (including staged submodule gitlinks), untracked source/plugin file, moved/conflicted submodule HEAD, dirty non-MLX submodule (`lib/ds4`, `lib/opencode2-mlx-serve`), or unapproved/partial/extra edit, mode change, deletion, or untracked file inside `lib/mlx-src` or `lib/mlxc-src`.
-- `"unknown"` only when `.git` / git metadata is genuinely unavailable.
+- `<40/64-char HEAD SHA>` when the checkout and all embedded/staged submodules match committed `HEAD` plus at most the expected root-anchored build/CI artifacts (`cuda-keyring_*.deb`, `dist/`, `.work-mlx-windows/`, `.zig-cache/`, `zig-out/`, etc.) and a complete, matched platform MLX/mlx-c patch pair (`scripts/build-mlx.sh`, `scripts/build-mlx-linux.sh`, `scripts/build-mlx-windows.ps1`).
+- `<HEAD SHA>-dirty` on any uncommitted superproject edit, staged change (including staged submodule gitlinks), untracked source/plugin file (even under `status.showUntrackedFiles=no`, `core.excludesFile`, `.git/info/exclude`, or `src/plugins/dist/`), index-flagged edit (`assume-unchanged` / `skip-worktree`), moved/conflicted submodule HEAD, populated submodule directory missing `.git`, dirty non-MLX submodule (`lib/ds4`, `lib/opencode2-mlx-serve`), or unapproved/partial/mixed/extra edit, mode change, deletion, or untracked file inside `lib/mlx-src` or `lib/mlxc-src`, as well as any post-HEAD query/stat failure.
+- `"unknown"` only when `.git` / `HEAD` metadata itself is unavailable.
 
-Rounds 1–4 surfaced recurring regressions because earlier incremental patches tweaked `git status` flags/pathspecs ad hoc and later reimplemented Git's path traversal and content comparison manually in Zig. This redesign eliminates those defect classes structurally.
+Rounds 1–5 surfaced recurring loopholes because `git status`, `git diff --name-only`, and `git ls-files --others` honor `.git/index` skip flags (`assume-unchanged`, `skip-worktree`), ignore files (`core.excludesFile`, `.git/info/exclude`, `.gitignore`), and unanchored pathspecs, while validating `lib/mlx-src` and `lib/mlxc-src` independently allowed partial/mixed patch sets. This redesign eliminates those defect classes structurally.
 
 ---
 
-## Findings Inventory (Rounds 1–4) & Root-Cause Grouping
+## Findings Inventory (Rounds 1–5) & Root-Cause Grouping
 
-### Group A — Ad-hoc `git status` / submodule flag exclusions
-1. **Round 1 `[P1]` — Linux release builds report clean source as dirty (`cuda-keyring_*.deb`, `dist/`, `.work-mlx-windows/`)**:
-   `.github/workflows/linux.yml` downloads `cuda-keyring_1.1-1_all.deb`, `scripts/build-windows.ps1` creates `dist/`, and `scripts/build-mlx-windows.ps1` creates `.work-mlx-windows/` (which was also missing from `.gitignore`); bare `--untracked-files=normal` flagged them `-dirty`.
+### Group A — Relying on `git status` / `.git/index` / ignore rules / unanchored exclusions
+1. **Round 1 `[P1]` — Linux/Windows release builds report clean source as dirty (`cuda-keyring_*.deb`, `dist/`, `.work-mlx-windows/`)** + **Round 5 `[P1]` — Overbroad `:(exclude)dist` hides `src/plugins/dist/plugin.zig`**:
+   Unanchored `:(exclude)dist` matched `src/plugins/dist/` as well as root `dist/`.
 2. **Round 1 `[P1]` — Modified embedded submodule code reports a clean build (`lib/ds4`, `lib/opencode2-mlx-serve`)**:
-   `--ignore-submodules=dirty` hid working-tree edits inside embedded C/Zig submodules (`build/libs.zig`, `lib/opencode2_plugin.zig`).
+   `--ignore-submodules=dirty` hid working-tree edits inside embedded submodules.
 3. **Round 2 `[P1]` — Modified embedded MLX submodule code reports a clean build (`nax.h`)**:
-   Switching to `--ignore-submodules=none` + pathspec exclusion hid all edits inside `lib/mlx-src` and `lib/mlxc-src`, including `nax.h` embedded via `lib/mlx_steel_sources.zig`.
+   Pathspec exclusions hid `lib/mlx-src` edits (`lib/mlx_steel_sources.zig`).
 4. **Round 2 `[P1]` — Staged MLX submodule updates report a clean build**:
-   Excluding MLX submodules from superproject status caused staged gitlink updates (`git add lib/mlx-src`) to match `git submodule status` (which compares working HEAD to index) and miss the staged pointer change vs `HEAD`.
-5. **Round 2 `[P1]` — Untracked plugin source reports a clean build**:
-   Using `--untracked-files=no` hid untracked plugins under `src/plugins/`, which `build/plugins.zig` discovers automatically.
-6. **Round 3 `[P1]` — Untracked plugin source reports a clean build under `status.showUntrackedFiles=no`**:
-   User/global Git config `status.showUntrackedFiles=no` caused bare `git status --porcelain` in both superproject and non-MLX submodules to omit untracked files.
+   Excluding MLX submodules missed staged gitlink changes vs `HEAD`.
+5. **Round 2 `[P1]` / Round 3 `[P1]` / Round 5 `[P1]` — Untracked plugin/source hidden by `--untracked-files=no`, `status.showUntrackedFiles=no`, `.gitignore`, `.git/info/exclude`, or global `core.excludesFile`**:
+   `git status` and `git ls-files --others --exclude-standard` both obey ignore rules and user config, hiding `src/plugins/new_plugin/` and `lib/mlx-src/rogue.cpp`.
+6. **Round 5 `[P1]` — `assume-unchanged` / `skip-worktree` index flags hide edits to compiled files**:
+   `.git/index` flags cause `git status` and `git diff` to skip modified tracked files in the superproject and submodules.
+7. **Round 5 `[P1]` — Populated uninitialized submodules skipped (`git submodule status` `-`)**:
+   An extracted archive directory in `lib/ds4/` or `lib/mlx-src/` without `.git` reports `-` in `git submodule status`, yet `build/libs.zig` and `lib/mlx_steel_sources.zig` still compile/embed it.
 
 **Design change eliminating Group A**:
-- Always pass `-c status.showUntrackedFiles=normal -c core.quotePath=false status --porcelain=v1` in both superproject (`--ignore-submodules` with explicit `:(exclude)cuda-keyring_*.deb`, `:(exclude)dist`, and `:(exclude).work-mlx-windows` pathspecs, plus `/.work-mlx-windows/` in `.gitignore`) and non-MLX submodules.
-- Explicitly check staged changes (including staged gitlink changes) via `git --no-optional-locks diff-index --cached --quiet HEAD --`.
-- Inspect every initialized entry from `git --no-optional-locks submodule status` directly: fail on `+` (moved HEAD) or `U` (conflict); validate non-MLX submodules cleanly; validate MLX submodules (`lib/mlx-src`, `lib/mlxc-src`) via canonical Git verification below.
+- **Zero `git status`, zero `git diff --name-only`, zero `git ls-files --others`, zero `:(exclude)` pathspecs.**
+- **Staged changes**: checked directly via `git --no-optional-locks diff-index --cached --quiet HEAD --` in superproject and initialized submodules.
+- **Tracked working-tree changes, deletions, and mode changes**: checked against a **fresh temporary `GIT_INDEX_FILE`** populated via `git read-tree HEAD` + `git update-index -q --refresh` + `git diff-index --name-only` / `--summary HEAD --`. Completely ignores `.git/index` (`assume-unchanged` / `skip-worktree`), honors `HEAD` CRLF (`legacy_http.golden`), `core.autocrlf`, `.gitattributes`, symlinks, and `core.filemode`, and never mutates the repo's `.git/`.
+- **Untracked files**: checked directly on disk via root-relative directory recursion (`Dir.iterate`) compared against `git ls-tree -r -z HEAD` (`head_paths` + `head_submodules`):
+  - Superproject skips only top-level `.git`, `head_submodules`, and an exact **root-anchored** list of build/CI/tooling paths (root `dist`, root `.work-mlx-windows`, root `.work-mlx-linux*`, root `cuda-keyring_*.deb`, `.zig-cache`, `zig-out`, `lib/mlx`, `lib/llama`, `src/plugins/registry.zig`, `src/unit_*.zig`, etc.) — `src/plugins/dist/` and `core.excludesFile` / `.git/info/exclude` entries NEVER bypass it.
+  - MLX submodules allow NO untracked files outside verified patch outputs (`rogue.cpp` under `core.excludesFile` is always caught). Non-MLX submodules allow only `*.o` inside `lib/ds4` (for `scripts/build-ds4-linux.sh`).
+- **Submodules**: iterate `head_submodules` + `git submodule status`; fail on `+` / `U`; if a submodule directory exists without `.git`, allow ONLY if completely empty (`iter.next == null`); otherwise validate `.git` submodules normally even if `submodule status` marked `-`.
 
-### Group B — Incomplete platform patch manifest coverage
-7. **Round 3 `[P1]` — Linux CUDA builds report expected patches as dirty**:
-   Only `scripts/build-mlx-patches.txt` (macOS) was checked, rejecting `scripts/build-mlx-linux.sh` patches (`8` `mlx-cuda-*.patch` + `3` `mlxc-*.patch`, including `new file mode` untracked files `row_dot.cuh` and `row_dot_ops.cuh` created by `mlx-cuda-row-dot-matvec.patch`) and `scripts/build-mlx-windows.ps1` (`patches/mlx*.patch` with `--ignore-whitespace --exclude=tests/* --exclude=docs/*`).
+### Group B — Incomplete / uncoupled platform patch verification
+8. **Round 3 `[P1]` — Linux CUDA builds report expected patches as dirty**:
+   Supported only `scripts/build-mlx-patches.txt`, omitting `scripts/build-mlx-linux.sh` and `scripts/build-mlx-windows.ps1` + newly created `row_dot.cuh` / `row_dot_ops.cuh`.
+9. **Round 5 `[P1]` — Partial and mixed platform patch sets report clean**:
+   Validating `lib/mlx-src` and `lib/mlxc-src` independently allowed macOS MLX + untouched `lib/mlxc-src` or macOS MLX + Linux `lib/mlxc-src` to pass clean.
 
 **Design change eliminating Group B**:
-- Collect all three official platform patch sets cleanly in `matchesExpectedMlxPatches`:
-  1. **macOS**: exact manifest from `scripts/build-mlx-patches.txt` (`git apply -p1`).
-  2. **Linux**: exact `build-mlx-linux.sh` ordered arrays (`linux_mlx_cuda_patches` for `lib/mlx-src`, `linux_mlxc_patches` for `lib/mlxc-src`, applied with `git apply -p1`), active when those patch files exist in `root`.
-  3. **Windows**: sorted `patches/mlx*.patch` split by `mlxc-` prefix (`collectWindowsPatchSet`), applied with `git apply -p1 --ignore-whitespace --exclude=tests/* --exclude=docs/*` (honoring `build-mlx-windows.ps1`'s `--check` / `--reverse --check` skip-if-already-applied semantics; assumes all listed patches remain un-upstreamed against pinned `HEAD`, which is true for every patch in `patches/`).
-- Inspect BOTH `diff --name-only` (tracked edits/deletions) AND `ls-files --others --exclude-standard` (patch-created untracked files vs rogue untracked files), and reject any mode-only changes (`git diff --summary` containing `mode change `) since none of the official patches modify file permissions.
+- Validate `(lib/mlx-src, lib/mlxc-src)` **jointly** against whole-platform candidates:
+  1. **Both clean** (0 changed, 0 untracked in both).
+  2. **macOS** (`scripts/build-mlx-patches.txt`): every submodule listed in the manifest must be present and match its listed patches (no short-circuit if a listed submodule has 0 changes), and any unlisted MLX submodule must be clean.
+  3. **Linux CUDA** (`scripts/build-mlx-linux.sh`): BOTH `lib/mlx-src` (`8` `mlx-cuda-*.patch`) AND `lib/mlxc-src` (`3` `mlxc-*.patch`) must be present and match.
+  4. **Linux CPU** (`MLX_BACKEND=cpu ./scripts/build-mlx-linux.sh`): `lib/mlx-src` must be clean AND `lib/mlxc-src` must match all `3` `mlxc-*.patch`.
+  5. **Windows** (`scripts/build-mlx-windows.ps1`): BOTH `lib/mlx-src` (sorted non-`mlxc` `mlx*.patch`) AND `lib/mlxc-src` (sorted `mlxc-*.patch`) must match with `--ignore-whitespace --exclude=tests/* --exclude=docs/*` (assumes patches remain un-upstreamed against pinned `HEAD`).
 
 ### Group C — Manual filesystem traversal & raw-byte comparison fighting OS separators and CRLF
-8. **Round 4 `[P1]` — Windows patch verification walks the temporary Git directory**:
-   `std.Io.Dir.walk` returns `.git\config` on Windows, bypassing `startsWith(entry.path, ".git/")` and attempting to open `sub_dir/.git\config`.
-9. **Round 4 `[P1]` — Windows line endings make expected patches appear dirty**:
-   `std.mem.eql(u8, want, have)` compared raw LF `git show HEAD:<rel>` / LF-patched bytes against CRLF working-tree files produced when `core.autocrlf=true`.
+10. **Round 4 `[P1]` — Windows patch verification walks temporary `.git\`** & **CRLF mismatch under `core.autocrlf=true`**:
+    - Inside `cand_dir`, configure `sub_dir`'s `core.autocrlf` + `.git/info/attributes` (`.gitattributes`), seed `HEAD:<rel>`, apply candidate patches, run `git -c core.safecrlf=false add -A`, and compare `git -c core.quotePath=false ls-files -s` (forward `/`, no `.git`) against read-only `git -c core.quotePath=false -c core.safecrlf=false hash-object --` on `sub_dir` (partitioning `dirty_files` into `existing` vs `deleted` via `statFile` before chunked hashing).
 
-**Design change eliminating Group C**:
-- **Delete `Dir.walk` and delete raw-byte file comparisons (`std.mem.eql(u8, want, have)`) completely.** Delegate canonical path enumeration and canonical line-ending normalization to **Git itself**:
-  1. In the temporary candidate repo (`cand_dir`), query `sub_dir`'s `core.autocrlf` (`git -C sub_dir config --get core.autocrlf`, defaulting to `false`) and apply that exact setting to `cand_dir`; if `sub_dir/.gitattributes` exists, copy it to `cand_dir/.git/info/attributes` (never polluting `cand_dir`'s working tree or index).
-  2. Seed `HEAD:<rel>` blobs for `changed_files` into `cand_dir`, apply the candidate's patches, run `git -C cand_dir -c core.safecrlf=false add -A`, and query `git -C cand_dir -c core.quotePath=false ls-files -s`.
-     - `-c core.safecrlf=false` prevents global `core.safecrlf=true` from aborting `git add -A` when LF `HEAD:<rel>` blobs mix with CRLF patch lines under `core.autocrlf=true`.
-     - Git **never** lists `.git/` or `.git\`.
-     - Git **always** emits normalized forward-slash (`/`) paths on macOS, Linux, and Windows.
-     - Git computes the canonical Git blob SHA-1 for every file in `cand_dir` under `sub_dir`'s exact line-ending rules.
-  3. Partition `dirty_files` (`changed ∪ untracked`) *before* hashing using `sub_dir.statFile(io, rel, .{})`:
-     - `error.FileNotFound` -> record in `deleted_files`.
-     - Non-regular file (e.g., `stat.kind == .directory` for an untracked directory / nested repo entry `foo/`, or other error) -> fail closed (`return false`, reporting `<sha>-dirty`, never `"unknown"`).
-     - Regular `.file` -> record in `existing_files`.
-  4. Batch-hash `existing_files` in `sub_dir` (100% read-only, without `-w`) in chunks of 32 paths via `git -C sub_dir -c core.quotePath=false -c core.safecrlf=false hash-object -- <chunk...>`:
-     - Avoids passing deleted paths to `hash-object` (which would fail the entire batch) and stays well under Windows `CreateProcess` command-line limits.
-     - `-c core.safecrlf=false` allows hashing mixed endings cleanly under global `core.safecrlf=true`.
-     - Git runs `sub_dir`'s `core.autocrlf` / `.gitattributes` clean filters, hashing CRLF Windows checkouts and LF checkouts to the exact same canonical blob SHA-1 when content matches, while any real content change produces a different SHA-1.
-  5. Verify bidirectional exact match:
-     - Every `rel` in `existing_files` must appear in `cand_dir`'s `ls-files -s` output with identical blob SHA-1.
-     - Every `rel` in `deleted_files` must be absent from `cand_dir`'s `ls-files -s` output.
-     - Every `(path, sha)` in `cand_dir`'s `ls-files -s` output must appear in `dirty_files` (so a file created/kept by a patch cannot be missing from `sub_dir`).
-
-### Group D — Test config leakage & concurrent build directory races
-10. **Round 1 `[P2]` — Test fixture inherits global `commit.gpgsign=true`**:
-    All test commits explicitly pass `-c commit.gpgsign=false`.
-11. **Round 3 `[P2]` — Concurrent builds collide on deterministic `msv-bid-<hash>-0`**:
-    `openUniqueStageDir` generates a random hex suffix via `io.random` and creates the directory atomically via `parent_dir.createDir` with `PathAlreadyExists` retry, cleaned up via `defer deleteTree`.
-
----
-
-## Architecture & Control Flow
-
-```
-readBuildId(b, git_sha)
-  ├─ b.graph.poisonCache()
-  └─ resolveBuildId(allocator, io, root, git_sha)
-       ├─ check .git exists (else "unknown")
-       ├─ resolve HEAD SHA (use valid 40/64 hex git_sha override or `git rev-parse --verify HEAD`)
-       ├─ superproject working tree + untracked (-c status.showUntrackedFiles=normal -c core.quotePath=false
-       │  status --porcelain=v1 --ignore-submodules -- . :(exclude)cuda-keyring_*.deb :(exclude)dist
-       │  :(exclude).work-mlx-windows) -> non-empty => "<sha>-dirty"
-       ├─ superproject staged index (`diff-index --cached --quiet HEAD --`) -> non-zero => "<sha>-dirty"
-       └─ submodulesClean(allocator, io, root)
-            ├─ `git submodule status`: `+` or `U` => dirty; `-` => skip uninitialized
-            ├─ non-MLX submodule (`lib/ds4`, `lib/opencode2-mlx-serve`, ...):
-            │    `git -c status.showUntrackedFiles=normal -c core.quotePath=false status --porcelain=v1` -> non-empty => dirty
-            └─ MLX submodule (`lib/mlx-src`, `lib/mlxc-src`):
-                 ├─ `git diff --cached --name-only` -> non-empty => dirty
-                 ├─ `git diff --summary` containing `mode change ` -> dirty
-                 ├─ `changed = git -c core.quotePath=false diff --name-only`
-                 ├─ `untracked = git -c core.quotePath=false ls-files --others --exclude-standard`
-                 └─ if (changed != empty or untracked != empty):
-                      matchesExpectedMlxPatches(...) -> false => dirty
-```
+### Group D — Test coverage, config isolation, fail-closed errors & concurrent build races
+11. **Round 1 `[P2]` — `commit.gpgsign=true`** -> test fixtures pass `-c commit.gpgsign=false`.
+12. **Round 3 `[P2]` — Shared temp dir** -> `openUniqueStageDir` via `io.random` + exclusive `createDir` retry.
+13. **Round 5 `[P1]` — Build-ID tests absent from Linux/Windows `zig build test`**:
+    Wire `config.addTests(b, test_step, test_filter)` into BOTH `build/macos.zig` and `build/linux.zig` (which builds both Linux and Windows) and use `build_id` test names so `zig build test -Dtest-filter="build_id"` executes them on every platform.
+14. **Round 5 `[P2]` — Status/query errors returned `"unknown"` after `HEAD` was read**:
+    Once `HEAD` SHA is resolved, ALL subsequent command, IO, buffer-limit, or stat failures fail closed as `<sha>-dirty`.
 
 ---
 
@@ -110,35 +71,27 @@ readBuildId(b, git_sha)
 
 | # | Scenario | Expected `build_id` | Mechanism enforcing expectation |
 |---|---|---|---|
-| 1 | Clean checkout matching `HEAD` | `<sha>` | Superproject status empty, staged empty, submodules clean |
-| 2 | Explicit valid `git_sha` override (`-Dgit-sha=...`) on clean tree | `<override_sha>` | `isGitSha(git_sha)` honored after cleanliness checks |
-| 3 | Missing `.git` metadata (tarball / non-git export) | `"unknown"` | `root.access(io, ".git", .{})` fails |
-| 4 | CI / Windows artifacts `cuda-keyring_*.deb`, `dist/...`, or `.work-mlx-windows/...` present | `<sha>` | Pathspecs `:(exclude)cuda-keyring_*.deb`, `:(exclude)dist`, `:(exclude).work-mlx-windows` (+ `.gitignore`) |
-| 5 | Superproject tracked edit or staged change | `<sha>-dirty` | `status --porcelain=v1` and `diff-index --cached --quiet HEAD --` |
-| 6 | Untracked plugin `src/plugins/new_plugin/plugin.zig` with `status.showUntrackedFiles=no` | `<sha>-dirty` | `-c status.showUntrackedFiles=normal` overrides repo/global config |
-| 7 | Non-MLX submodule (`lib/ds4`) tracked edit or untracked file with `status.showUntrackedFiles=no` | `<sha>-dirty` | Per-submodule `-c status.showUntrackedFiles=normal status --porcelain=v1` |
-| 8 | Moved submodule HEAD (`+`) or conflict (`U`) | `<sha>-dirty` | `git submodule status` prefix check (`+`, `U`) |
-| 9 | Staged MLX submodule gitlink update (`git add lib/mlx-src`) | `<sha>-dirty` | `git diff-index --cached --quiet HEAD --` |
-| 10 | Official macOS patches (`scripts/build-mlx-patches.txt`) applied to `lib/mlx-src` + `lib/mlxc-src` | `<sha>` | `collectMacosPatchSet` -> `verifyPatchCandidate` |
-| 11 | Official Linux CUDA patches (`scripts/build-mlx-linux.sh`), incl. newly created `row_dot.cuh` / `row_dot_ops.cuh` | `<sha>` | `collectLinuxPatchSet` + `untracked` included in `dirty_files` & `cand_dir` `ls-files -s` |
-| 12 | Official Windows patches (`scripts/build-mlx-windows.ps1`, `--ignore-whitespace --exclude=tests/* --exclude=docs/*`) | `<sha>` | `collectWindowsPatchSet` + `.windows` mode |
-| 13 | Windows `core.autocrlf=true` + `core.safecrlf=true` CRLF checkout + CRLF patches + `\` path separators | `<sha>` | No `Dir.walk`, no raw byte `mem.eql`; `-c core.safecrlf=false`, Git `ls-files -s` (forward `/`, no `.git\`) + `hash-object` clean filters |
-| 14 | Unrelated edit inside `lib/mlx-src` (`nax.h`) alone or alongside official patches | `<sha>-dirty` | `nax.h` `hash-object` != `HEAD:nax.h` blob SHA in `cand_dir` |
-| 15 | Extra untracked file (`rogue.cpp`) or untracked nested repo/dir (`foo/`) inside `lib/mlx-src` | `<sha>-dirty` | `rogue.cpp` absent from `cand_dir` `ls-files -s`; non-file `statFile` fails closed as `-dirty` |
-| 16 | Partial patch set, hand-modified patched line (under `autocrlf=true`), or mode-only `chmod +x` change | `<sha>-dirty` | Candidate patch set fails `git apply`, `hash-object` SHA mismatches, or `diff --summary` detects `mode change ` |
-| 17 | Deleted tracked file in `lib/mlx-src` (alone or alongside edited files) | `<sha>-dirty` | Partitioned into `deleted_files` before `hash-object` and found still present in `cand_dir` `ls-files -s` |
-| 18 | Concurrent `zig build` invocations checking MLX patches | `<sha>` (no race) | `openUniqueStageDir` (`io.random` + exclusive `createDir`) |
-| 19 | Global `commit.gpgsign=true` when running `zig build test` | All tests pass | Fixture commits use `-c commit.gpgsign=false` |
+| 1 | Clean checkout matching `HEAD` (incl. CRLF `legacy_http.golden` under `autocrlf=input`) | `<sha>` | Temp `GIT_INDEX_FILE` `diff-index` empty, root walk clean, submodules clean |
+| 2 | Explicit valid `git_sha` override on clean tree | `<override_sha>` | `isGitSha(git_sha)` honored after cleanliness checks |
+| 3 | Missing `.git` or invalid/missing `HEAD` | `"unknown"` | Initial `root.access(".git")` / `rev-parse HEAD` fails |
+| 4 | Post-HEAD query failure (buffer > limit, unreadable dir, failed temp index) | `<sha>-dirty` | Fail-closed `dirtyId(allocator, sha)` after `HEAD` SHA is known |
+| 5 | Root CI/build artifacts (`cuda-keyring_*.deb`, root `dist/`, root `.work-mlx-windows/`, `.zig-cache/`, `src/plugins/registry.zig`) | `<sha>` | Root-anchored exact allowlist in `isAllowedSuperprojectUntracked` |
+| 6 | Unanchored path collision (`src/plugins/dist/plugin.zig` or `sub/cuda-keyring_1.deb`) | `<sha>-dirty` | Allowlist matches ONLY root `dist/` and root `cuda-keyring_*.deb` |
+| 7 | Untracked plugin `src/plugins/new_plugin/plugin.zig` under `showUntrackedFiles=no`, `.git/info/exclude`, or `core.excludesFile` | `<sha>-dirty` | Direct `Dir` recursion vs `ls-tree -r -z HEAD` ignores all exclude files & status config |
+| 8 | Tracked edit marked `--assume-unchanged` or `--skip-worktree` in superproject or any submodule | `<sha>-dirty` | Fresh `GIT_INDEX_FILE` (`read-tree HEAD` + `update-index --refresh` + `diff-index`) ignores `.git/index` flags |
+| 9 | Staged edit or staged MLX submodule gitlink (`git add lib/mlx-src`) | `<sha>-dirty` | `git diff-index --cached --quiet HEAD --` |
+| 10 | Moved submodule HEAD (`+`), conflict (`U`), or populated submodule dir missing `.git` | `<sha>-dirty` | `submodule status` check + non-empty check when `.git` is absent |
+| 11 | Non-MLX submodule (`lib/ds4`) tracked edit or untracked `.c` under `showUntrackedFiles=no` / `core.excludesFile` (while allowing `build-ds4-linux.sh` `*.o`) | `<sha>-dirty` | Submodule fresh `GIT_INDEX_FILE` + `Dir` walk |
+| 12 | Complete matched platform patches: macOS (`build-mlx-patches.txt`), Linux CUDA (`8` + `3` incl. `row_dot.cuh`), Linux CPU (`clean` + `3`), Windows (`core.autocrlf=true`, `safecrlf=true`, CRLF patches, `--exclude=tests/* --exclude=docs/*`) | `<sha>` | Joint `(lib/mlx-src, lib/mlxc-src)` candidate validation + Git `ls-files -s` / `hash-object` |
+| 13 | Partial or mixed MLX patch sets (e.g., macOS `lib/mlx-src` + untouched or Linux `lib/mlxc-src`) | `<sha>-dirty` | Joint platform-pair validator requires full platform agreement |
+| 14 | Unrelated edit (`nax.h`), `rogue.cpp` (even in `core.excludesFile`), partial edit under `autocrlf=true`, mode-only `chmod +x`, deleted tracked file, or nested `.git` in `lib/mlx-src` | `<sha>-dirty` | Fresh `GIT_INDEX_FILE` `diff-index`, `Dir` walk, `statFile` partitioning, `ls-files -s` vs `hash-object` |
+| 15 | Concurrent `zig build` invocations & `commit.gpgsign=true` | `<sha>` / pass | `io.random` + `createDir` retry; `-c commit.gpgsign=false` in test commits |
+| 16 | Running `zig build test -Dtest-filter=build_id` on macOS, Linux, or Windows | Runs & passes | `config.addTests(b, test_step, test_filter)` wired in BOTH `build/macos.zig` and `build/linux.zig` |
 
 ---
 
 ## Verification Plan
 
-1. Unit tests in `build/config.zig` (run via `zig test build/config.zig` and `zig build test -Dtest-filter="resolveBuildId"` / `build_id` under `/private/tmp/claude/zig-build.lock`):
-   - Existing assertions: clean HEAD, override SHA, `cuda-keyring_*.deb` + `dist/`, macOS patches, `nax.h` edit, `lib/ds4` edit, moved & staged submodule gitlinks, `status.showUntrackedFiles=no` (superproject plugin + `lib/ds4` untracked), Linux CUDA patch set + `new file mode` (`row_dot.cuh`) + `nax.h` + `rogue.cpp`.
-   - New assertions for the redesign:
-     - `.work-mlx-windows/prefix/foo.obj` stays clean (`<head_sha>`).
-     - **Windows `core.autocrlf=true` + `core.safecrlf=true` + CRLF patches + `--exclude=tests/* --exclude=docs/*`**: force CRLF checkout on `lib/mlx-src` & `lib/mlxc-src` (`assert` `
-` bytes exist on disk), apply CRLF-encoded `patches/mlx-*.patch` & `patches/mlxc-*.patch` containing `tests/` and `docs/` hunks (leaving `tests/` and `docs/` untouched on disk), verify `resolveBuildId` returns `<head_sha>`, verify hand-modifying a patched line with CRLF returns `<head_sha>-dirty` (matrix #16), and verify editing `nax.h` with CRLF returns `<head_sha>-dirty`.
-     - **Deleted tracked file inside `lib/mlx-src`** (both alone and alongside a patched file): deleting a tracked file flags `<head_sha>-dirty` cleanly (matrix #17).
-2. `python3 scripts/lint.py --strict` exits 0.
+1. Run `zig test build/config.zig` and `zig build test -Dtest-filter="build_id" --summary all` (under `/private/tmp/claude/zig-build.lock`), verifying `build-config-test` runs on both `macos` and `linux`/`windows` build graphs and passes all cases covering matrix rows 1–16.
+2. Run `python3 scripts/lint.py --strict` -> exit 0.
+3. Verify all Sweeps from rounds 1–5 return 0 matches on `build/config.zig`.

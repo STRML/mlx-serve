@@ -140,6 +140,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     // Rerun every time when filtered, as on macOS (env-gated tests).
     if (test_filter != null) run_unit_tests.has_side_effects = true;
     test_step.dependOn(&run_unit_tests.step);
+    config.addTests(b, test_step, test_filter);
 }
 
 /// Linux counterpart of verifyMlxStage: fail loudly when scripts/
