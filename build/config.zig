@@ -335,6 +335,7 @@ fn isAllowedSuperprojectUntrackedPath(rel: []const u8, entry_name: []const u8) b
         ".serena",
         ".cursor",
         ".vscode",
+        ".build",
         "app/.build",
         "app/MLXCore-MAS.pkg",
         "app/.swiftpm",
@@ -1496,6 +1497,8 @@ test "build config: build_id allows joint MLX patch pairs and root artifacts whi
     try repo.writeFile(t.io, .{ .sub_path = "cuda-keyring_1.1-1_all.deb", .data = "deb\n" });
     try repo.createDirPath(t.io, "dist");
     try repo.writeFile(t.io, .{ .sub_path = "dist/out.zip", .data = "zip\n" });
+    try repo.createDirPath(t.io, ".build");
+    try repo.writeFile(t.io, .{ .sub_path = ".build/build.db", .data = "db\n" });
     try repo.createDirPath(t.io, "app/.build");
     try repo.writeFile(t.io, .{ .sub_path = "app/.build/zig-build.log", .data = "log\n" });
     var sub_mlx = try repo.openDir(t.io, "lib/mlx-src", .{});
