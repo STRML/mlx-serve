@@ -43,7 +43,8 @@ fn macosFrameworks(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 
 /// repo changes, staged changes (including staged submodule pointers), dirty non-MLX submodules, moved
 /// submodule HEAD pointers, or unpatched/extra edits inside `lib/mlx-src` / `lib/mlxc-src`; or `"unknown"`
 /// when git metadata is unavailable. Excludes known checkout build artifacts (`cuda-keyring_*.deb`, `dist/`)
-/// and exact working-tree patches applied by `scripts/build-mlx.sh` (`scripts/build-mlx-patches.txt`).
+/// and exact working-tree patch sets applied by `scripts/build-mlx.sh`, `scripts/build-mlx-linux.sh`, or
+/// `scripts/build-mlx-windows.ps1`.
 pub fn readBuildId(b: *std.Build, git_sha: []const u8) []const u8 {
     b.graph.poisonCache();
     return resolveBuildId(b.allocator, b.graph.io, buildRootHandle(b), git_sha) catch "unknown";
@@ -89,78 +90,306 @@ fn isMlxSubmodule(path: []const u8) bool {
     return std.mem.eql(u8, path, "lib/mlx-src") or std.mem.eql(u8, path, "lib/mlxc-src");
 }
 
-fn mlxSubmoduleMatchesPatches(
+const HeadFile = struct {
+    rel: []const u8,
+    bytes: []const u8,
+};
+
+const PatchMode = enum {
+    exact,
+    windows,
+};
+
+const linux_mlx_cuda_patches = [_][]const u8{
+    "patches/mlx-cuda-sdpa-head-dim-256-512.patch",
+    "patches/mlx-cuda-qmm-read-weights-once.patch",
+    "patches/mlx-cuda-qmv-rows.patch",
+    "patches/mlx-cuda-row-dot-matvec.patch",
+    "patches/mlx-cuda-sorted-gather-experts.patch",
+    "patches/mlx-cuda-graphs-switch.patch",
+    "patches/mlx-cuda-sorted-gather-matvec.patch",
+    "patches/mlx-cuda-custom-kernel-disk-cache.patch",
+};
+
+const linux_mlxc_patches = [_][]const u8{
+    "patches/mlxc-gather-qmm-global-scale.patch",
+    "patches/mlxc-x86-f16-data-alias.patch",
+    "patches/mlxc-clear-backends.patch",
+};
+
+fn parseNameLines(allocator: std.mem.Allocator, raw_names: []const u8, out: *std.ArrayList([]const u8)) bool {
+    var lines = std.mem.tokenizeScalar(u8, raw_names, '\n');
+    while (lines.next()) |raw| {
+        const rel = std.mem.trim(u8, raw, " \t\r");
+        if (rel.len == 0) continue;
+        out.append(allocator, rel) catch return false;
+    }
+    return true;
+}
+
+fn collectMacosPatchSet(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    subpath: []const u8,
+    out: *std.ArrayList([]const u8),
+) bool {
+    const list_bytes = root.readFileAlloc(io, "scripts/build-mlx-patches.txt", allocator, .limited(64 * 1024)) catch return false;
+    defer allocator.free(list_bytes);
+
+    var lines = std.mem.tokenizeScalar(u8, list_bytes, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+        const sub_col = fields.next() orelse continue;
+        if (sub_col[0] == '#') continue;
+        const patch_rel = fields.next() orelse return false;
+        if (std.mem.eql(u8, sub_col, subpath)) {
+            const duped = allocator.dupe(u8, patch_rel) catch return false;
+            out.append(allocator, duped) catch {
+                allocator.free(duped);
+                return false;
+            };
+        }
+    }
+    return out.items.len != 0;
+}
+
+fn collectLinuxPatchSet(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    subpath: []const u8,
+    out: *std.ArrayList([]const u8),
+) bool {
+    const list: []const []const u8 = if (std.mem.eql(u8, subpath, "lib/mlx-src"))
+        &linux_mlx_cuda_patches
+    else if (std.mem.eql(u8, subpath, "lib/mlxc-src"))
+        &linux_mlxc_patches
+    else
+        return false;
+
+    for (list) |patch_rel| {
+        root.access(io, patch_rel, .{}) catch return false;
+        const duped = allocator.dupe(u8, patch_rel) catch return false;
+        out.append(allocator, duped) catch {
+            allocator.free(duped);
+            return false;
+        };
+    }
+    return out.items.len != 0;
+}
+
+fn collectWindowsPatchSet(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    subpath: []const u8,
+    out: *std.ArrayList([]const u8),
+) bool {
+    const want_mlxc = std.mem.eql(u8, subpath, "lib/mlxc-src");
+    if (!want_mlxc and !std.mem.eql(u8, subpath, "lib/mlx-src")) return false;
+
+    var patch_dir = root.openDir(io, "patches", .{ .iterate = true }) catch return false;
+    defer patch_dir.close(io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+
+    var iter = patch_dir.iterate();
+    while (iter.next(io) catch return false) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "mlx")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".patch")) continue;
+        const is_mlxc = std.mem.startsWith(u8, entry.name, "mlxc-");
+        if (want_mlxc != is_mlxc) continue;
+        const duped = allocator.dupe(u8, entry.name) catch return false;
+        names.append(allocator, duped) catch {
+            allocator.free(duped);
+            return false;
+        };
+    }
+    if (names.items.len == 0) return false;
+
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    for (names.items) |name| {
+        const patch_rel = std.fmt.allocPrint(allocator, "patches/{s}", .{name}) catch return false;
+        out.append(allocator, patch_rel) catch {
+            allocator.free(patch_rel);
+            return false;
+        };
+    }
+    return true;
+}
+
+fn freePatchList(allocator: std.mem.Allocator, patches: *std.ArrayList([]const u8)) void {
+    for (patches.items) |p| allocator.free(p);
+    patches.deinit(allocator);
+}
+
+fn verifyPatchCandidate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_abs: []const u8,
+    stage_handle: std.Io.Dir,
+    cand_name: []const u8,
+    sub_dir: std.Io.Dir,
+    head_files: []const HeadFile,
+    dirty_files: []const []const u8,
+    patches: []const []const u8,
+    mode: PatchMode,
+) bool {
+    stage_handle.createDir(io, cand_name, .default_dir) catch return false;
+    var cand_dir = stage_handle.openDir(io, cand_name, .{ .iterate = true }) catch return false;
+    defer cand_dir.close(io);
+
+    if (!runGitOk(allocator, io, cand_dir, &.{ "git", "init" })) return false;
+
+    for (head_files) |hf| {
+        if (std.fs.path.dirname(hf.rel)) |dir_part| cand_dir.createDirPath(io, dir_part) catch return false;
+        cand_dir.writeFile(io, .{ .sub_path = hf.rel, .data = hf.bytes }) catch return false;
+    }
+
+    for (patches) |patch_rel| {
+        const patch_abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_abs, patch_rel }) catch return false;
+        defer allocator.free(patch_abs);
+        switch (mode) {
+            .exact => {
+                if (!runGitOk(allocator, io, cand_dir, &.{ "git", "apply", "-p1", patch_abs })) return false;
+            },
+            .windows => {
+                const check_args = &.{ "git", "apply", "-p1", "--ignore-whitespace", "--exclude=tests/*", "--exclude=docs/*", "--check", patch_abs };
+                if (runGitOk(allocator, io, cand_dir, check_args)) {
+                    if (!runGitOk(allocator, io, cand_dir, &.{ "git", "apply", "-p1", "--ignore-whitespace", "--exclude=tests/*", "--exclude=docs/*", patch_abs })) return false;
+                } else {
+                    const rev_args = &.{ "git", "apply", "-p1", "--ignore-whitespace", "--exclude=tests/*", "--exclude=docs/*", "--reverse", "--check", patch_abs };
+                    if (!runGitOk(allocator, io, cand_dir, rev_args)) return false;
+                }
+            },
+        }
+    }
+
+    for (dirty_files) |rel| {
+        const want = cand_dir.readFileAlloc(io, rel, allocator, .limited(16 * 1024 * 1024)) catch return false;
+        defer allocator.free(want);
+        const have = sub_dir.readFileAlloc(io, rel, allocator, .limited(16 * 1024 * 1024)) catch return false;
+        defer allocator.free(have);
+        if (!std.mem.eql(u8, want, have)) return false;
+    }
+
+    var walker = cand_dir.walk(allocator) catch return false;
+    defer walker.deinit();
+    while (walker.next(io) catch return false) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.startsWith(u8, entry.path, ".git/") or std.mem.eql(u8, entry.path, ".git")) continue;
+        const want = cand_dir.readFileAlloc(io, entry.path, allocator, .limited(16 * 1024 * 1024)) catch return false;
+        defer allocator.free(want);
+        const have = sub_dir.readFileAlloc(io, entry.path, allocator, .limited(16 * 1024 * 1024)) catch return false;
+        defer allocator.free(have);
+        if (!std.mem.eql(u8, want, have)) return false;
+    }
+    return true;
+}
+
+fn openUniqueStageDir(allocator: std.mem.Allocator, io: std.Io, parent_dir: std.Io.Dir) ?[]u8 {
+    var attempt: usize = 0;
+    while (attempt < 8) : (attempt += 1) {
+        var rnd: [8]u8 = undefined;
+        io.random(&rnd);
+        const dir_name = std.fmt.allocPrint(allocator, "mlx-patch-verify-{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return null;
+        parent_dir.createDir(io, dir_name, .default_dir) catch |err| {
+            allocator.free(dir_name);
+            if (err == error.PathAlreadyExists) continue;
+            return null;
+        };
+        return dir_name;
+    }
+    return null;
+}
+
+fn tempParentPath() []const u8 {
+    for ([_][*:0]const u8{ "TMPDIR", "TEMP", "TMP" }) |env_name| {
+        if (std.c.getenv(env_name)) |ptr| {
+            const trimmed = std.mem.trimEnd(u8, std.mem.span(ptr), "/\\");
+            if (trimmed.len != 0) return trimmed;
+        }
+    }
+    return "/tmp";
+}
+
+fn matchesExpectedMlxPatches(
     allocator: std.mem.Allocator,
     io: std.Io,
     root: std.Io.Dir,
     sub_dir: std.Io.Dir,
     subpath: []const u8,
     changed_names: []const u8,
+    untracked_names: []const u8,
 ) bool {
-    const list_bytes = root.readFileAlloc(io, "scripts/build-mlx-patches.txt", allocator, .limited(64 * 1024)) catch return false;
-    defer allocator.free(list_bytes);
+    var changed_files: std.ArrayList([]const u8) = .empty;
+    defer changed_files.deinit(allocator);
+    if (!parseNameLines(allocator, changed_names, &changed_files)) return false;
 
-    var patches: std.ArrayList([]const u8) = .empty;
-    defer patches.deinit(allocator);
-    var lines = std.mem.tokenizeScalar(u8, list_bytes, '\n');
-    while (lines.next()) |line| {
-        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
-        const target_sub = fields.next() orelse continue;
-        if (target_sub[0] == '#') continue;
-        const patch_rel = fields.next() orelse return false;
-        if (std.mem.eql(u8, target_sub, subpath)) patches.append(allocator, patch_rel) catch return false;
+    var dirty_files: std.ArrayList([]const u8) = .empty;
+    defer dirty_files.deinit(allocator);
+    for (changed_files.items) |rel| dirty_files.append(allocator, rel) catch return false;
+    if (!parseNameLines(allocator, untracked_names, &dirty_files)) return false;
+    if (dirty_files.items.len == 0) return true;
+
+    var head_files: std.ArrayList(HeadFile) = .empty;
+    defer {
+        for (head_files.items) |hf| allocator.free(hf.bytes);
+        head_files.deinit(allocator);
     }
-    if (patches.items.len == 0) return false;
-
-    const S = struct {
-        var seq: std.atomic.Value(u64) = .init(0);
-    };
-    const id = S.seq.fetchAdd(1, .monotonic);
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root_abs = root_buf[0 .. root.realPath(io, &root_buf) catch return false];
-    const tmp_name = std.fmt.allocPrint(allocator, "msv-bid-{x}-{d}", .{ std.hash.Wyhash.hash(0, root_abs), id }) catch return false;
-    defer allocator.free(tmp_name);
-    const tmp_base = std.c.getenv("TMPDIR");
-    const tmp_parent = if (tmp_base) |ptr| std.mem.trimEnd(u8, std.mem.span(ptr), "/") else "/tmp";
-
-    var parent_dir = std.Io.Dir.openDirAbsolute(io, tmp_parent, .{}) catch return false;
-    defer parent_dir.close(io);
-    parent_dir.createDirPath(io, tmp_name) catch return false;
-    defer parent_dir.deleteTree(io, tmp_name) catch {};
-    var tmp_dir = parent_dir.openDir(io, tmp_name, .{}) catch return false;
-    defer tmp_dir.close(io);
-
-    if (!runGitOk(allocator, io, tmp_dir, &.{ "git", "init" })) return false;
-
-    var files: std.ArrayList([]const u8) = .empty;
-    defer files.deinit(allocator);
-    var file_lines = std.mem.tokenizeScalar(u8, changed_names, '\n');
-    while (file_lines.next()) |raw| {
-        const rel = std.mem.trim(u8, raw, " \t\r");
-        if (rel.len == 0) continue;
-        files.append(allocator, rel) catch return false;
+    for (changed_files.items) |rel| {
         const spec = std.fmt.allocPrint(allocator, "HEAD:{s}", .{rel}) catch return false;
         defer allocator.free(spec);
         const orig = runGitQuery(allocator, io, sub_dir, &.{ "git", "--no-optional-locks", "show", spec }, 16 * 1024 * 1024) orelse return false;
-        defer allocator.free(orig);
-        if (std.fs.path.dirname(rel)) |dir_part| tmp_dir.createDirPath(io, dir_part) catch return false;
-        tmp_dir.writeFile(io, .{ .sub_path = rel, .data = orig }) catch return false;
+        head_files.append(allocator, .{ .rel = rel, .bytes = orig }) catch {
+            allocator.free(orig);
+            return false;
+        };
     }
 
-    for (patches.items) |patch_rel| {
-        const patch_abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_abs, patch_rel }) catch return false;
-        defer allocator.free(patch_abs);
-        if (!runGitOk(allocator, io, tmp_dir, &.{ "git", "apply", "-p1", patch_abs })) return false;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_abs = root_buf[0 .. root.realPath(io, &root_buf) catch return false];
+
+    var parent_dir = std.Io.Dir.openDirAbsolute(io, tempParentPath(), .{}) catch return false;
+    defer parent_dir.close(io);
+    const stage_dir = openUniqueStageDir(allocator, io, parent_dir) orelse return false;
+    defer {
+        parent_dir.deleteTree(io, stage_dir) catch {};
+        allocator.free(stage_dir);
+    }
+    var stage_handle = parent_dir.openDir(io, stage_dir, .{}) catch return false;
+    defer stage_handle.close(io);
+
+    var macos_patches: std.ArrayList([]const u8) = .empty;
+    defer freePatchList(allocator, &macos_patches);
+    if (collectMacosPatchSet(allocator, io, root, subpath, &macos_patches)) {
+        if (verifyPatchCandidate(allocator, io, root_abs, stage_handle, "mac", sub_dir, head_files.items, dirty_files.items, macos_patches.items, .exact)) return true;
     }
 
-    for (files.items) |rel| {
-        const want = tmp_dir.readFileAlloc(io, rel, allocator, .limited(16 * 1024 * 1024)) catch return false;
-        defer allocator.free(want);
-        const have = sub_dir.readFileAlloc(io, rel, allocator, .limited(16 * 1024 * 1024)) catch return false;
-        defer allocator.free(have);
-        if (!std.mem.eql(u8, want, have)) return false;
+    var linux_patches: std.ArrayList([]const u8) = .empty;
+    defer freePatchList(allocator, &linux_patches);
+    if (collectLinuxPatchSet(allocator, io, root, subpath, &linux_patches)) {
+        if (verifyPatchCandidate(allocator, io, root_abs, stage_handle, "linux", sub_dir, head_files.items, dirty_files.items, linux_patches.items, .exact)) return true;
     }
-    return true;
+
+    var win_patches: std.ArrayList([]const u8) = .empty;
+    defer freePatchList(allocator, &win_patches);
+    if (collectWindowsPatchSet(allocator, io, root, subpath, &win_patches)) {
+        if (verifyPatchCandidate(allocator, io, root_abs, stage_handle, "win", sub_dir, head_files.items, dirty_files.items, win_patches.items, .windows)) return true;
+    }
+
+    return false;
 }
 
 fn submodulesClean(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir) bool {
@@ -183,15 +412,13 @@ fn submodulesClean(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir) b
         defer sub_dir.close(io);
 
         if (!isMlxSubmodule(subpath)) {
-            const st = runGitQuery(allocator, io, sub_dir, &.{ "git", "--no-optional-locks", "status", "--porcelain" }, 64 * 1024) orelse return false;
+            const st = runGitQuery(allocator, io, sub_dir, &.{
+                "git", "--no-optional-locks", "-c", "status.showUntrackedFiles=normal", "status", "--porcelain=v1",
+            }, 64 * 1024) orelse return false;
             defer allocator.free(st);
             if (st.len != 0) return false;
             continue;
         }
-
-        const untracked = runGitQuery(allocator, io, sub_dir, &.{ "git", "--no-optional-locks", "ls-files", "--others", "--exclude-standard" }, 64 * 1024) orelse return false;
-        defer allocator.free(untracked);
-        if (untracked.len != 0) return false;
 
         const staged = runGitQuery(allocator, io, sub_dir, &.{ "git", "--no-optional-locks", "diff", "--cached", "--name-only" }, 64 * 1024) orelse return false;
         defer allocator.free(staged);
@@ -199,7 +426,13 @@ fn submodulesClean(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir) b
 
         const changed = runGitQuery(allocator, io, sub_dir, &.{ "git", "--no-optional-locks", "diff", "--name-only" }, 64 * 1024) orelse return false;
         defer allocator.free(changed);
-        if (changed.len != 0 and !mlxSubmoduleMatchesPatches(allocator, io, root, sub_dir, subpath, changed)) return false;
+
+        const untracked = runGitQuery(allocator, io, sub_dir, &.{ "git", "--no-optional-locks", "ls-files", "--others", "--exclude-standard" }, 64 * 1024) orelse return false;
+        defer allocator.free(untracked);
+
+        if ((changed.len != 0 or untracked.len != 0) and !matchesExpectedMlxPatches(allocator, io, root, sub_dir, subpath, changed, untracked)) {
+            return false;
+        }
     }
     return true;
 }
@@ -217,7 +450,7 @@ fn resolveBuildId(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, gi
     if (!isGitSha(sha)) return allocator.dupe(u8, "unknown");
 
     const status = runGitQuery(allocator, io, root, &.{
-        "git", "--no-optional-locks", "status", "--porcelain", "--ignore-submodules", "--", ".", ":(exclude)cuda-keyring_*.deb", ":(exclude)dist",
+        "git", "--no-optional-locks", "-c", "status.showUntrackedFiles=normal", "status", "--porcelain=v1", "--ignore-submodules", "--", ".", ":(exclude)cuda-keyring_*.deb", ":(exclude)dist",
     }, 1024 * 1024) orelse return allocator.dupe(u8, "unknown");
     defer allocator.free(status);
     if (status.len != 0) return std.fmt.allocPrint(allocator, "{s}-dirty", .{sha});
@@ -675,10 +908,172 @@ test "build config: resolveBuildId allows exact MLX patch diffs and build artifa
     defer t.allocator.free(restored);
     try t.expectEqualStrings(head_sha, restored);
 
-    // Untracked plugin/source file MUST flag -dirty.
+    // Untracked plugin/source file MUST flag -dirty even if status.showUntrackedFiles=no is configured.
+    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "config", "status.showUntrackedFiles", "no" }));
+    const clean_with_cfg = try resolveBuildId(t.allocator, t.io, repo, "");
+    defer t.allocator.free(clean_with_cfg);
+    try t.expectEqualStrings(head_sha, clean_with_cfg);
+
     try repo.createDirPath(t.io, "src/plugins/new_plugin");
     try repo.writeFile(t.io, .{ .sub_path = "src/plugins/new_plugin/plugin.zig", .data = "//! new\n" });
     const dirty_untracked = try resolveBuildId(t.allocator, t.io, repo, "");
     defer t.allocator.free(dirty_untracked);
     try t.expectEqualStrings(expected_dirty, dirty_untracked);
+
+    try repo.deleteTree(t.io, "src/plugins");
+    const clean_after_rm = try resolveBuildId(t.allocator, t.io, repo, "");
+    defer t.allocator.free(clean_after_rm);
+    try t.expectEqualStrings(head_sha, clean_after_rm);
+
+    // Non-MLX submodule untracked file MUST flag -dirty even with status.showUntrackedFiles=no in the submodule.
+    t.allocator.free(try runGit(t.allocator, t.io, sub_ds4, &.{ "git", "config", "status.showUntrackedFiles", "no" }));
+    try sub_ds4.writeFile(t.io, .{ .sub_path = "untracked_ds4.c", .data = "// untracked\n" });
+    const dirty_sub_untracked = try resolveBuildId(t.allocator, t.io, repo, "");
+    defer t.allocator.free(dirty_sub_untracked);
+    try t.expectEqualStrings(expected_dirty, dirty_sub_untracked);
+    try sub_ds4.deleteFile(t.io, "untracked_ds4.c");
+}
+
+test "resolveBuildId accepts Linux CUDA patch set including new files and still rejects nax.h" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(t.io, "sub_mlx_origin", .default_dir);
+    var sub_mlx_orig = try tmp.dir.openDir(t.io, "sub_mlx_origin", .{});
+    defer sub_mlx_orig.close(t.io);
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlx_orig, &.{ "git", "init" }));
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlx_orig, &.{ "git", "config", "user.name", "Test" }));
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlx_orig, &.{ "git", "config", "user.email", "test@example.com" }));
+    const mlx_targets = [_][]const u8{
+        "mlx/backend/cuda/scaled_dot_product_attention.cpp",
+        "mlx/backend/cuda/quantized/quantized.cpp",
+        "mlx/backend/cuda/quantized/qmm/qmv.cu",
+        "mlx/backend/cuda/device_info.cpp",
+        "mlx/backend/cuda/device/qmm_sm80.cuh",
+        "mlx/backend/cuda/device.cpp",
+        "mlx/backend/cuda/quantized/qmm/qmm.h",
+        "mlx/backend/cuda/custom_kernel.cpp",
+        "nax.h",
+    };
+    for (mlx_targets) |rel| {
+        if (std.fs.path.dirname(rel)) |dir_part| try sub_mlx_orig.createDirPath(t.io, dir_part);
+        try sub_mlx_orig.writeFile(t.io, .{ .sub_path = rel, .data = "orig\n" });
+    }
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlx_orig, &.{ "git", "add", "." }));
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlx_orig, &.{ "git", "-c", "commit.gpgsign=false", "commit", "-m", "init" }));
+
+    try tmp.dir.createDir(t.io, "sub_mlxc_origin", .default_dir);
+    var sub_mlxc_orig = try tmp.dir.openDir(t.io, "sub_mlxc_origin", .{});
+    defer sub_mlxc_orig.close(t.io);
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlxc_orig, &.{ "git", "init" }));
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlxc_orig, &.{ "git", "config", "user.name", "Test" }));
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlxc_orig, &.{ "git", "config", "user.email", "test@example.com" }));
+    for ([_][]const u8{ "mlx/c/ops.cpp", "mlx/c/half.h", "mlx/c/distributed_group.h" }) |rel| {
+        if (std.fs.path.dirname(rel)) |dir_part| try sub_mlxc_orig.createDirPath(t.io, dir_part);
+        try sub_mlxc_orig.writeFile(t.io, .{ .sub_path = rel, .data = "orig\n" });
+    }
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlxc_orig, &.{ "git", "add", "." }));
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlxc_orig, &.{ "git", "-c", "commit.gpgsign=false", "commit", "-m", "init" }));
+
+    try tmp.dir.createDir(t.io, "repo", .default_dir);
+    var repo = try tmp.dir.openDir(t.io, "repo", .{});
+    defer repo.close(t.io);
+    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "init" }));
+    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "config", "user.name", "Test" }));
+    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "config", "user.email", "test@example.com" }));
+    try repo.createDirPath(t.io, "scripts");
+    try repo.writeFile(t.io, .{ .sub_path = "scripts/build-mlx-patches.txt", .data = "# macos only\n" });
+    try repo.createDirPath(t.io, "patches");
+
+    const cuda_patch_specs = [_]struct { patch: []const u8, file: []const u8, new_file: bool }{
+        .{ .patch = "patches/mlx-cuda-sdpa-head-dim-256-512.patch", .file = "mlx/backend/cuda/scaled_dot_product_attention.cpp", .new_file = false },
+        .{ .patch = "patches/mlx-cuda-qmm-read-weights-once.patch", .file = "mlx/backend/cuda/quantized/quantized.cpp", .new_file = false },
+        .{ .patch = "patches/mlx-cuda-qmv-rows.patch", .file = "mlx/backend/cuda/quantized/qmm/qmv.cu", .new_file = false },
+        .{ .patch = "patches/mlx-cuda-row-dot-matvec.patch", .file = "mlx/backend/cuda/gemms/row_dot.cuh", .new_file = true },
+        .{ .patch = "patches/mlx-cuda-sorted-gather-experts.patch", .file = "mlx/backend/cuda/device/qmm_sm80.cuh", .new_file = false },
+        .{ .patch = "patches/mlx-cuda-graphs-switch.patch", .file = "mlx/backend/cuda/device.cpp", .new_file = false },
+        .{ .patch = "patches/mlx-cuda-sorted-gather-matvec.patch", .file = "mlx/backend/cuda/quantized/qmm/qmm.h", .new_file = false },
+        .{ .patch = "patches/mlx-cuda-custom-kernel-disk-cache.patch", .file = "mlx/backend/cuda/custom_kernel.cpp", .new_file = false },
+    };
+    for (cuda_patch_specs) |spec| {
+        const diff = if (spec.new_file)
+            try std.fmt.allocPrint(
+                t.allocator,
+                "diff --git a/{0s} b/{0s}\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/{0s}\n@@ -0,0 +1 @@\n+created\n",
+                .{spec.file},
+            )
+        else
+            try std.fmt.allocPrint(
+                t.allocator,
+                "--- a/{0s}\n+++ b/{0s}\n@@ -1 +1 @@\n-orig\n+patched\n",
+                .{spec.file},
+            );
+        defer t.allocator.free(diff);
+        try repo.writeFile(t.io, .{ .sub_path = spec.patch, .data = diff });
+    }
+    const mlxc_patch_specs = [_]struct { patch: []const u8, file: []const u8 }{
+        .{ .patch = "patches/mlxc-gather-qmm-global-scale.patch", .file = "mlx/c/ops.cpp" },
+        .{ .patch = "patches/mlxc-x86-f16-data-alias.patch", .file = "mlx/c/half.h" },
+        .{ .patch = "patches/mlxc-clear-backends.patch", .file = "mlx/c/distributed_group.h" },
+    };
+    for (mlxc_patch_specs) |spec| {
+        const diff = try std.fmt.allocPrint(t.allocator, "--- a/{0s}\n+++ b/{0s}\n@@ -1 +1 @@\n-orig\n+patched\n", .{spec.file});
+        defer t.allocator.free(diff);
+        try repo.writeFile(t.io, .{ .sub_path = spec.patch, .data = diff });
+    }
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_abs = root_buf[0..try tmp.dir.realPath(t.io, &root_buf)];
+    const mlx_url = try std.fmt.allocPrint(t.allocator, "{s}/sub_mlx_origin", .{root_abs});
+    defer t.allocator.free(mlx_url);
+    const mlxc_url = try std.fmt.allocPrint(t.allocator, "{s}/sub_mlxc_origin", .{root_abs});
+    defer t.allocator.free(mlxc_url);
+
+    try repo.createDirPath(t.io, "lib");
+    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", mlx_url, "lib/mlx-src" }));
+    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", mlxc_url, "lib/mlxc-src" }));
+    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "add", "." }));
+    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "-c", "commit.gpgsign=false", "commit", "-m", "init" }));
+
+    const head_raw = try runGit(t.allocator, t.io, repo, &.{ "git", "rev-parse", "--verify", "HEAD" });
+    defer t.allocator.free(head_raw);
+    const head_sha = std.mem.trim(u8, head_raw, " \t\r\n");
+    const expected_dirty = try std.fmt.allocPrint(t.allocator, "{s}-dirty", .{head_sha});
+    defer t.allocator.free(expected_dirty);
+
+    var sub_mlx = try repo.openDir(t.io, "lib/mlx-src", .{});
+    defer sub_mlx.close(t.io);
+    var sub_mlxc = try repo.openDir(t.io, "lib/mlxc-src", .{});
+    defer sub_mlxc.close(t.io);
+
+    var repo_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const repo_abs = repo_buf[0..try repo.realPath(t.io, &repo_buf)];
+    for (cuda_patch_specs) |spec| {
+        const p_abs = try std.fmt.allocPrint(t.allocator, "{s}/{s}", .{ repo_abs, spec.patch });
+        defer t.allocator.free(p_abs);
+        t.allocator.free(try runGit(t.allocator, t.io, sub_mlx, &.{ "git", "apply", "-p1", p_abs }));
+    }
+    for (mlxc_patch_specs) |spec| {
+        const p_abs = try std.fmt.allocPrint(t.allocator, "{s}/{s}", .{ repo_abs, spec.patch });
+        defer t.allocator.free(p_abs);
+        t.allocator.free(try runGit(t.allocator, t.io, sub_mlxc, &.{ "git", "apply", "-p1", p_abs }));
+    }
+
+    const clean_linux = try resolveBuildId(t.allocator, t.io, repo, "");
+    defer t.allocator.free(clean_linux);
+    try t.expectEqualStrings(head_sha, clean_linux);
+
+    // Extra tracked edit inside lib/mlx-src MUST still report -dirty.
+    try sub_mlx.writeFile(t.io, .{ .sub_path = "nax.h", .data = "// edited\n" });
+    const dirty_nax = try resolveBuildId(t.allocator, t.io, repo, "");
+    defer t.allocator.free(dirty_nax);
+    try t.expectEqualStrings(expected_dirty, dirty_nax);
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlx, &.{ "git", "checkout", "--", "nax.h" }));
+
+    // Extra untracked file inside lib/mlx-src MUST still report -dirty.
+    try sub_mlx.writeFile(t.io, .{ .sub_path = "rogue.cpp", .data = "// rogue\n" });
+    const dirty_rogue = try resolveBuildId(t.allocator, t.io, repo, "");
+    defer t.allocator.free(dirty_rogue);
+    try t.expectEqualStrings(expected_dirty, dirty_rogue);
 }
