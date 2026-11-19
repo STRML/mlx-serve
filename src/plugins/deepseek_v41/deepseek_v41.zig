@@ -7813,7 +7813,7 @@ pub fn snapshotStateAtChunk(m: *const Dsv41Model, st: *State, gen: u64) !void {
 pub fn leadRows(L: usize, read_ahead: bool) usize {
     return if (read_ahead or L < LEAD_MIN) 0 else L / 2 / SPAN * SPAN;
 }
-const LEAD_MIN: usize = 4096;
+const LEAD_MIN = @import("config.zig").prefill_lead_min_rows;
 
 /// `extendIds` of a prompt chunk for its last row's logits, its lead (`leadRows`) run first without the decoder's
 /// replay, which the rest of the chunk makes at its own end.

@@ -7,6 +7,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const sparse_score = @import("../../../sdk/blocks/attention/sparse_block/score.zig");
 const generate_mod = @import("../generate.zig");
+const decodeShareCapped = @import("../generate/prefill_chunk.zig").decodeShareCapped;
 const model_mod = @import("../../../sdk/config/model.zig");
 const dsv4_mod = @import("../../../plugins/deepseek_v4/deepseek_v4.zig");
 const log = @import("../../../sdk/util/log.zig");
@@ -50,7 +51,7 @@ const PREFILL_RUNTIME_FLOOR_BYTES = @import("bills.zig").PREFILL_RUNTIME_FLOOR_B
 
 /// DeepSeek-V4.1's prompt pass (`deepseek_v41.prefillBytes`) over the engine's config.
 pub fn dsv41PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
-    return dsv41_mod.prefillBytes(config, config.kvBytesPerToken(), seq, chunk, PREFILL_RUNTIME_FLOOR_BYTES);
+    return dsv41_mod.prefillBytes(config, config.kvBytesPerToken(), seq, config.cappedPrefillChunk(chunk), PREFILL_RUNTIME_FLOOR_BYTES);
 }
 const prefillStreamBytesPerToken = @import("bills.zig").prefillStreamBytesPerToken;
 const prefillDequantWeightBytes = @import("bills.zig").prefillDequantWeightBytes;
@@ -71,6 +72,15 @@ const qwen4ExpLive364kConfig = @import("bills_test.zig").qwen4ExpLive364kConfig;
 /// go either, and a 256-token forward stops amortizing the per-chunk sweeps.
 /// The top rung is `WIDE_PREFILL_CHUNK`, pinned only by an arch with no prefill score tensor.
 pub const PREFILL_CHUNK_LADDER = [_]u32{ @intCast(generate_mod.WIDE_PREFILL_CHUNK), 8192, 4096, 2048, 1024, 512 };
+
+fn prefillLadderFloor(config: *const model_mod.ModelConfig) u32 {
+    return @max(config.prefillWidths().min, @as(u32, generate_mod.PREFILL_CHUNK_FLOOR));
+}
+
+fn prefillRungAllowed(config: *const model_mod.ModelConfig, width: u32) bool {
+    if (width == generate_mod.WIDE_PREFILL_CHUNK and config.prefillScoreHeadDim() != 0) return false;
+    return width >= prefillLadderFloor(config) and width == config.cappedPrefillChunk(width);
+}
 
 /// How much of the post-weights serving budget a ONE-OFF prefill transient may
 /// claim before the chunk steps down. A quarter: past that the machine is
@@ -136,14 +146,13 @@ pub fn resolvePrefillChunk(
 ) u32 {
     const cap: u64 = prefillChunkCap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
     for (PREFILL_CHUNK_LADDER) |chunk| {
-        if (chunk == generate_mod.WIDE_PREFILL_CHUNK and config.prefillScoreHeadDim() != 0) continue;
-        if (config.prefillWidths().max != 0 and chunk > config.prefillWidths().max) continue;
+        if (!prefillRungAllowed(config, chunk)) continue;
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
     }
     // Nothing fits the share — the model barely fits at all. Take the narrowest
     // rung: it is the smallest bill this box can be asked for, and returning 0
     // would read as "not pinned" and hand the forward the launch width.
-    return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+    return prefillLadderFloor(config);
 }
 
 /// The width `--prefill-chunk` asked for, or 0. The bill must let it outrank the pin as the
@@ -165,7 +174,7 @@ pub fn billedPrefillChunk(
     hot_cache_ask: u64,
     chunk_override: u32,
 ) u32 {
-    if (chunk_override > 0) return chunk_override;
+    if (chunk_override > 0) return @intCast(config.cappedPrefillChunk(chunk_override));
     return @min(resolvePrefillChunk(config, kv_bits, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask), autoPrefillChunkCap(mlx.cudaAvailable()));
 }
 
@@ -198,9 +207,9 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         // Which ask: the gated arch reads the resolved budget; every other arch reads the raw
         // ask as before (the accessor would pin a second model against the first's budget).
         const hot_cache_ask = if (config.longCtxGated()) resolvedPrefixCacheMem() else legacyPrefixCacheAsk();
-        // The override's precedence is the second gated input: ungated, `--prefill-chunk`
-        // still outranks the pin only at forward time, as before (a known inconsistency).
-        const pin_override: u32 = if (config.longCtxGated()) explicitPrefillChunk() else 0;
+        // Archs with per-request prefill chunking honor an explicit `--prefill-chunk`
+        // at load time too so the hot-cache reserve and load pin agree with the forward.
+        const pin_override: u32 = if (config.perRequestPrefillChunk()) explicitPrefillChunk() else 0;
         config.pinned_prefill_chunk = billedPrefillChunk(
             config,
             kv_bits,
@@ -280,6 +289,11 @@ pub fn perRequestPrefillChunkEnabled(config: *const model_mod.ModelConfig) bool 
     return per_request_chunk_override orelse true;
 }
 
+pub const PrefillLimits = struct {
+    extra_bytes: u64 = 0,
+    width_cap: u32 = 0,
+};
+
 /// The widest ladder rung this request can afford, priced by the same estimator that admits
 /// it against post-eviction memory. Candidates are priced at the width the forward will run
 /// (`effectivePrefillChunk` caps by arch), and the width is returned, not the rung. An explicit
@@ -293,20 +307,23 @@ pub fn chooseRequestPrefillChunk(
     load_time_pin: u32,
     chunk_override: u32,
     warm: WarmPrefix,
+    limits: PrefillLimits,
 ) u32 {
-    // The arch gate first: an ungated arch's answer is the load-time pin, as before.
-    if (!perRequestPrefillChunkEnabled(config)) return load_time_pin;
-    if (chunk_override > 0) return chunk_override;
+    if (!perRequestPrefillChunkEnabled(config)) return @intCast(config.cappedPrefillChunk(load_time_pin));
+    if (chunk_override > 0) return @intCast(config.cappedPrefillChunk(decodeShareCapped(chunk_override, limits.width_cap)));
+    const gated = config.longCtxGated();
+    const available_for_prompt = available -| limits.extra_bytes;
     for (PREFILL_CHUNK_LADDER) |rung| {
-        const width: u64 = rungWidth(config, seq, rung, config.longCtxGated());
+        if (!prefillRungAllowed(config, rung)) continue;
+        const width: u64 = decodeShareCapped(rungWidth(config, seq, rung, gated), limits.width_cap);
         const bill = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width, warm);
         const needed = if (width > rungWidth(config, seq, rung, false))
             bill *| (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100
         else
             bill;
-        if (needed <= available) return @intCast(width);
+        if (needed <= available_for_prompt) return @intCast(width);
     }
-    return @intCast(rungWidth(config, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], config.longCtxGated()));
+    return @intCast(decodeShareCapped(rungWidth(config, seq, prefillLadderFloor(config), gated), limits.width_cap));
 }
 
 /// The width one ladder rung forwards at. `long_ctx_gated = false` asks what the rung would be
@@ -314,7 +331,7 @@ pub fn chooseRequestPrefillChunk(
 fn rungWidth(config: *const model_mod.ModelConfig, seq: u64, rung: u32, long_ctx_gated: bool) u64 {
     // `effectivePrefillChunk` can return an explicit `--prefill-chunk` verbatim; clamp before narrowing.
     return @min(
-        @as(u64, generate_mod.effectivePrefillChunk(
+        @as(u64, config.cappedPrefillChunk(generate_mod.effectivePrefillChunk(
             config.prefillScoreHeadDim(),
             config.num_attention_heads,
             @intCast(seq),
@@ -322,7 +339,7 @@ fn rungWidth(config: *const model_mod.ModelConfig, seq: u64, rung: u32, long_ctx
             config.isMoe(),
             long_ctx_gated,
             rung,
-        )),
+        ))),
         @as(u64, std.math.maxInt(u32)),
     );
 }
@@ -334,23 +351,20 @@ pub fn requestPrefillChunkNow(
     prompt_len: usize,
     max_tokens: u32,
     kv_cfg: transformer_mod.KVQuantConfig,
-    warm_matched: u64,
-    warm_capacity: u64,
-    warm_will_donate: bool,
-    enable_mtp: bool,
+    warm: WarmPrefix,
+    limits: PrefillLimits,
 ) u32 {
     const pin: u32 = config.pinned_prefill_chunk;
     const explicit: u32 = explicitPrefillChunk();
-    if (explicit > 0) return @intCast(config.cappedPrefillChunk(explicit));
-    if (!perRequestPrefillChunkEnabled(config)) return pin;
+    if (explicit > 0) return @intCast(config.cappedPrefillChunk(decodeShareCapped(explicit, limits.width_cap)));
+    if (!perRequestPrefillChunkEnabled(config)) return @intCast(config.cappedPrefillChunk(pin));
 
     const seq: u64 = @intCast(prompt_len);
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const available: u64 = currentGpuMemoryCeiling(config, active_mem) -| active_mem;
-    const warm = WarmPrefix{ .matched_tokens = warm_matched, .capacity_tokens = warm_capacity, .will_donate = warm_will_donate, .mtp_on = enable_mtp };
-    const chosen = chooseRequestPrefillChunk(config, seq, max_tokens, kv_bits, available, pin, 0, warm);
+    const chosen = chooseRequestPrefillChunk(config, seq, max_tokens, kv_bits, available, pin, 0, warm, limits);
     if (chosen != pin) {
         const width: u64 = chosen;
         const terms = prefillRequestTerms(config, seq, max_tokens, kv_bits, width, warm);
@@ -363,10 +377,8 @@ pub fn requestPrefillChunkNow(
 /// Test hook for `adaptivePrefillChunkEnabled`'s kill switch.
 pub var adaptive_chunk_override: ?bool = null;
 
-/// The per-chunk adaptive width: subordinate to the per-request gate, plus "no operator pinned a width".
 pub fn adaptivePrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
-    // Arch first: the cheapest and most selective, and this runs once per chunk boundary.
-    if (!config.perRequestPrefillChunk()) return false;
+    if (!config.longCtxGated()) return false;
     if (explicitPrefillChunk() > 0) return false;
     if (!perRequestPrefillChunkEnabled(config)) return false;
     return adaptive_chunk_override orelse true;
@@ -405,14 +417,16 @@ pub fn adaptivePrefillWidth(
     st: *generate_mod.AdaptiveWidthState,
 ) u32 {
     if (cap == 0 or current == 0) return current;
-    const floor: u32 = @min(cap, @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+    const bounded_cap: u32 = @intCast(config.cappedPrefillChunk(cap));
+    const floor: u32 = @min(bounded_cap, prefillLadderFloor(config));
 
     if (prefillChunkCost(config, kv_bits, current, kv_len) > headroom) {
         st.supporting = 0;
         st.ratcheted = true;
         var best: u32 = floor;
         for (PREFILL_CHUNK_LADDER) |rung| {
-            const w: u32 = @min(rung, cap);
+            if (!prefillRungAllowed(config, rung)) continue;
+            const w: u32 = @min(rung, bounded_cap);
             if (w >= current) continue;
             if (prefillChunkCost(config, kv_bits, w, kv_len) <= headroom) {
                 best = w;
@@ -424,7 +438,8 @@ pub fn adaptivePrefillWidth(
 
     var next: u32 = 0;
     for (PREFILL_CHUNK_LADDER) |rung| {
-        const w: u32 = @min(rung, cap);
+        if (!prefillRungAllowed(config, rung)) continue;
+        const w: u32 = @min(rung, bounded_cap);
         if (w > current and (next == 0 or w < next)) next = w;
     }
     if (next == 0 or st.ratcheted) {
@@ -983,8 +998,8 @@ test "chooseRequestPrefillChunk: the machine's chunk cap bounds the per-request 
     generate_mod.prefillCli().machine_cap = autoPrefillChunkCap(true);
     const cfg = qwen4RequestTestConfig();
     const available: u64 = 28_909 << 20;
-    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 10_406, 2048, 8, available, cfg.pinned_prefill_chunk, 0, .{}));
-    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 10_406, 2048, 8, available, cfg.pinned_prefill_chunk, 8192, .{}));
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 10_406, 2048, 8, available, cfg.pinned_prefill_chunk, 0, .{}, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 10_406, 2048, 8, available, cfg.pinned_prefill_chunk, 8192, .{}, .{}));
 }
 
 test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M session cannot" {
@@ -999,13 +1014,13 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     const available: u64 = 28_909 * MiB;
     const pin = cfg.pinned_prefill_chunk;
 
-    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0, .{}, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0, .{}, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0, .{}, .{}));
     try t.expect(4096 > pin);
 
     // The full 1M context fits at 4096 on this box under the one-copy history bill.
-    const full = chooseRequestPrefillChunk(&cfg, 1_048_576, 2048, kv_bits, available, pin, 0, .{});
+    const full = chooseRequestPrefillChunk(&cfg, 1_048_576, 2048, kv_bits, available, pin, 0, .{}, .{});
     try t.expectEqual(@as(u32, 4096), full);
     try t.expect(prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 2048, .{}) <= available);
     try t.expect(prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 4096, .{}) <= available);
@@ -1015,7 +1030,7 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     var i: usize = 0;
     const seqs = [_]u64{ 1_048_576, 384_000, 300_000, 60_000, 4096 };
     while (i < seqs.len) : (i += 1) {
-        const w = chooseRequestPrefillChunk(&cfg, seqs[i], 2048, kv_bits, available, pin, 0, .{});
+        const w = chooseRequestPrefillChunk(&cfg, seqs[i], 2048, kv_bits, available, pin, 0, .{}, .{});
         try t.expect(w >= prev);
         prev = w;
     }
@@ -1046,8 +1061,8 @@ test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
             bill * (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100
         else
             bill;
-        try t.expectEqual(width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed, pin, 0, .{}));
-        const under = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed - 1, pin, 0, .{});
+        try t.expectEqual(width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed, pin, 0, .{}, .{}));
+        const under = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed - 1, pin, 0, .{}, .{});
         if (width == floor_width) {
             try t.expectEqual(floor_width, under);
         } else {
@@ -1057,7 +1072,7 @@ test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
     try t.expect(distinct >= 4);
 
     // Nothing fits: the ladder floor, never 0 and never the load-time pin.
-    try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{}));
+    try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{}, .{}));
 }
 
 test "chooseRequestPrefillChunk: the rung the gate widened clears its bill by the estimator's margin" {
@@ -1077,11 +1092,11 @@ test "chooseRequestPrefillChunk: the rung the gate widened clears its bill by th
     try t.expectEqual(@as(u64, 4096), rungWidth(&cfg, seq, 8192, false));
 
     const with_margin = wide_bill * (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100;
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin - 1, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill, pin, 0, .{}, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin - 1, pin, 0, .{}, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, 0, .{}, .{}));
     // The rungs the gate did not widen are still taken at their plain bill.
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, narrow_bill, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, narrow_bill, pin, 0, .{}, .{}));
 }
 
 test "prefillMemoryNeeded: the wider chunk bills every chunk-scaled term at the wider width" {
@@ -1131,13 +1146,13 @@ test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it"
     const pin = cfg.pinned_prefill_chunk;
 
     // An explicit `--prefill-chunk` wins outright and is billed as-is.
-    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 2048, .{}));
-    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, 0, pin, 2048, .{}));
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 2048, .{}, .{}));
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, 0, pin, 2048, .{}, .{}));
 
     // Kill switch: the load-time pin for every request.
     per_request_chunk_override = false;
     defer per_request_chunk_override = null;
-    try t.expectEqual(pin, chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
+    try t.expectEqual(pin, chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 0, .{}, .{}));
     per_request_chunk_override = null;
 
     // Another arch keeps the load-time pin exactly.
@@ -1145,7 +1160,7 @@ test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it"
     other.model_type = "qwen3_5";
     other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     try t.expect(!other.perRequestPrefillChunk());
-    try t.expectEqual(pin, chooseRequestPrefillChunk(&other, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
+    try t.expectEqual(pin, chooseRequestPrefillChunk(&other, 300_000, 2048, kv_bits, roomy, pin, 0, .{}, .{}));
     try t.expect(cfg.perRequestPrefillChunk());
 }
 
@@ -1170,13 +1185,13 @@ test "admission tries the ladder DOWN before refusing: a prompt that fits only a
     // Exactly enough for the floor width and not a byte more.
     const available = at_floor;
 
-    try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0, .{}, .{}));
     try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, floor_width, .{}) <= available);
 
     // Gate off: the load-time pin does not fit.
     per_request_chunk_override = false;
     defer per_request_chunk_override = null;
-    try t.expectEqual(pin, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(pin, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0, .{}, .{}));
     try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, pin_width, .{}) > available);
     per_request_chunk_override = null;
 
@@ -1187,7 +1202,7 @@ test "admission tries the ladder DOWN before refusing: a prompt that fits only a
         generate_mod.prefillCli().override = 8192;
         generate_mod.prefillCli().explicit = false;
     }
-    const forced = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, explicitPrefillChunk(), .{});
+    const forced = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, explicitPrefillChunk(), .{}, .{});
     try t.expectEqual(@as(u32, 4096), forced);
     try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, forced, .{}) > available);
 }
@@ -1205,12 +1220,12 @@ test "the post-eviction re-ask never exceeds what live memory affords, and never
     const floor_width = widthForRung(&cfg, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
 
     // Pre-eviction: nothing on the ladder fits, the chooser hands back the floor.
-    const admitted = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{});
+    const admitted = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{}, .{});
     try t.expectEqual(floor_width, admitted);
 
     // Post-eviction, with the cache's bytes returned: a wider rung fits.
     const roomy: u64 = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, widthForRung(&cfg, seq, 4096), .{});
-    const reasked = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    const reasked = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{}, .{});
     try t.expect(reasked > admitted);
     try t.expectEqual(reasked, scheduler_mod.postEvictionPrefillChunk(admitted, reasked).width);
 
@@ -1223,16 +1238,16 @@ test "the post-eviction re-ask never exceeds what live memory affords, and never
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5";
     other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
-    const other_pre = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, 0, pin, 0, .{});
-    const other_post = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    const other_pre = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, 0, pin, 0, .{}, .{});
+    const other_post = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0, .{}, .{});
     try t.expectEqual(pin, other_pre);
     try t.expectEqual(pin, other_post);
     try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(other_pre, other_post).width);
 
     per_request_chunk_override = false;
     defer per_request_chunk_override = null;
-    const off_pre = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{});
-    const off_post = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    const off_pre = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{}, .{});
+    const off_post = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{}, .{});
     try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(off_pre, off_post).width);
 }
 
@@ -1787,4 +1802,152 @@ test "the live 364k session's admission numbers reproduce, to the megabyte" {
         @as(u64, 10_774),
         prefillNeededAtChunk(&cfg, 368_208, 418_224, kv_bits, 512, .{}) / mb,
     );
+}
+
+test "dsv41 admission: pick 8192 at 32k, cap every width, and honor the request floor and pin" {
+    const t = std.testing;
+    var cfg = try model_mod.parseConfigFromJson(t.allocator, model_mod.dsv41_release_config);
+    defer cfg.deinit(t.allocator);
+    const cli = generate_mod.prefillCli();
+    const saved = cli.*;
+    defer cli.* = saved;
+    cli.* = .{};
+    const roomy = std.math.maxInt(u64);
+    const seq = 32_768;
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 256, 16, roomy, 4096, 0, .{}, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 256, 16, roomy, 16_384, 0, .{}, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 256, 16, roomy, 8192, 16_384, .{}, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 256, 16, roomy, 8192, 4096, .{}, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 256, 16, roomy, 8192, 16_384, .{}, .{ .width_cap = 4096 }));
+    // dsv41 bills 8192 flat (without PREFILL_WIDE_RUNG_MARGIN_PCT) since dsv41.prefillBytes carries its own 5/4.
+    const flat8k = prefillNeededAtChunk(&cfg, seq, 256, 16, 8192, .{});
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 256, 16, flat8k, 4096, 0, .{}, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 256, 16, flat8k - 1, 8192, 0, .{}, .{}));
+    const warm: WarmPrefix = .{ .matched_tokens = 30_000, .capacity_tokens = 30_720, .will_donate = true };
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 256, 16, 0, 8192, 0, warm, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 256, 16, roomy, 4096, 0, warm, .{}));
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 256, 16, 8192, warm) == prefillNeededAtChunk(&cfg, seq, 256, 16, 8192, .{}));
+    try t.expectEqual(prefillNeededAtChunk(&cfg, seq, 256, 16, 8192, .{}), prefillNeededAtChunk(&cfg, seq, 256, 16, 16_384, .{}));
+    try t.expectEqual(@as(u32, 8192), billedPrefillChunk(&cfg, 16, roomy, 0, 0, 0, 16_384));
+    try t.expectEqual(@as(u32, 4096), resolvePrefillChunk(&cfg, 16, 0, 0, 0, 0));
+    var adapt_st: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 4096), adaptivePrefillWidth(&cfg, 16, seq, 0, 8192, 16_384, &adapt_st));
+    cli.* = .{ .override = 16_384, .explicit = true };
+    try t.expectEqual(@as(u32, 8192), requestPrefillChunkNow(&cfg, seq, 256, .dense, .{}, .{}));
+    cli.* = .{};
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 256, 16, roomy, 16_384, 0, .{}, .{}));
+}
+
+test "dsv41 admission: hot-cache load path reserves at the load pin and honors explicit --prefill-chunk" {
+    const t = std.testing;
+    var cfg = try model_mod.parseConfigFromJson(t.allocator, model_mod.dsv41_release_config);
+    defer cfg.deinit(t.allocator);
+    const cli = generate_mod.prefillCli();
+    const saved_cli = cli.*;
+    defer cli.* = saved_cli;
+    const saved_mem = memory_ceiling.overrides().*;
+    defer memory_ceiling.overrides().* = saved_mem;
+    const orig_ctx = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = orig_ctx;
+    const orig_cap = http_server.launch().prefix_cache_capacity;
+    const orig_ask = http_server.launch().prefix_cache_mem_bytes;
+    const orig_explicit = http_server.launch().prefix_cache_mem_explicit;
+    defer {
+        http_server.launch().prefix_cache_capacity = orig_cap;
+        http_server.launch().prefix_cache_mem_bytes = orig_ask;
+        http_server.launch().prefix_cache_mem_explicit = orig_explicit;
+        clearResolvedPrefixCacheMem();
+    }
+    cli.* = .{};
+    http_server.serverState().server_config.max_context_size = 1 << 20;
+    http_server.launch().prefix_cache_capacity = 32;
+    http_server.launch().prefix_cache_mem_bytes = 0;
+    http_server.launch().prefix_cache_mem_explicit = false;
+    try t.expect(perRequestPrefillChunkEnabled(&cfg));
+    try t.expect(!cfg.longCtxGated());
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+
+    const gb: u64 = 1 << 30;
+    memory_ceiling.overrides().static_ceiling = 240 * gb;
+    memory_ceiling.overrides().machine_free = .{ .idle = 100 * gb, .request = 100 * gb };
+    var idle: u64 = 0;
+
+    // Omitted flag on a roomy box: pins and reserves at 8192 through `hot_cache_plan.zig`.
+    cfg.pinned_prefill_chunk = 0;
+    const omitted = prefixCacheMemForLoad(&cfg, 0, .{ .quiet = true }, &idle);
+    try t.expectEqual(@as(u32, 8192), cfg.pinned_prefill_chunk);
+
+    // Explicit --prefill-chunk 4096: pins and reserves at 4096, freeing the reserve delta for cache.
+    cli.* = .{ .override = 4096, .explicit = true };
+    cfg.pinned_prefill_chunk = 0;
+    const pinned_4k = prefixCacheMemForLoad(&cfg, 0, .{ .quiet = true }, &idle);
+    try t.expectEqual(@as(u32, 4096), cfg.pinned_prefill_chunk);
+    const reserve_8k = prefillTransientReserve(&cfg, 16, 8192);
+    const reserve_4k = prefillTransientReserve(&cfg, 16, 4096);
+    try t.expect(reserve_8k > reserve_4k);
+    try t.expectEqual(omitted + (reserve_8k - reserve_4k), pinned_4k);
+
+    // Explicit --prefill-chunk 16384: capped at 8192 and matches the 8192 reserve.
+    cli.* = .{ .override = 16_384, .explicit = true };
+    cfg.pinned_prefill_chunk = 0;
+    const capped_16k = prefixCacheMemForLoad(&cfg, 0, .{ .quiet = true }, &idle);
+    try t.expectEqual(@as(u32, 8192), cfg.pinned_prefill_chunk);
+    try t.expectEqual(omitted, capped_16k);
+
+    // Constrained load where the share bar pins 4096: load reserves at 4096, while a 32k request widens to 8192.
+    cli.* = .{};
+    cfg.pinned_prefill_chunk = 0;
+    memory_ceiling.overrides().machine_free = .{ .idle = 12 * gb, .request = 12 * gb };
+    _ = prefixCacheMemForLoad(&cfg, 0, .{ .quiet = true }, &idle);
+    try t.expectEqual(@as(u32, 4096), cfg.pinned_prefill_chunk);
+    try t.expectEqual(@as(u32, 8192), requestPrefillChunkNow(&cfg, 32_768, 256, .dense, .{}, .{}));
+}
+
+test "dsv41 admission: qwen4 and mimo match the previous chooser across budgets and pins" {
+    const t = std.testing;
+    const Previous = struct {
+        fn width(cfg: *const model_mod.ModelConfig, len: u64, rung: u32, gated: bool) u64 {
+            const effective = generate_mod.effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, @intCast(len), cfg.has_sliding_window, cfg.isMoe(), gated, rung);
+            return @min(effective, std.math.maxInt(u32));
+        }
+
+        fn choose(cfg: *const model_mod.ModelConfig, len: u64, available: u64, pin: u32, explicit: u32, warm: WarmPrefix) u32 {
+            if (!cfg.longCtxGated()) return pin;
+            if (explicit > 0) return explicit;
+            for (PREFILL_CHUNK_LADDER) |rung| {
+                const rows = width(cfg, len, rung, true);
+                const bill = prefillNeededAtChunk(cfg, len, 256, 16, rows, warm);
+                const needed = if (rows > width(cfg, len, rung, false)) bill *| 122 / 100 else bill;
+                if (needed <= available) return @intCast(rows);
+            }
+            return @intCast(width(cfg, len, 512, true));
+        }
+    };
+    const cli = generate_mod.prefillCli();
+    const old = cli.*;
+    defer cli.* = old;
+    const qwen = qwen4RequestTestConfig();
+    var mimo = qwen;
+    mimo.model_type = "mimo_v2";
+    mimo.legacy.caps.long_ctx = false;
+    for ([_]*const model_mod.ModelConfig{ &qwen, &mimo }) |cfg| {
+        for ([_]usize{ std.math.maxInt(usize), 2048 }) |machine_cap| {
+            for ([_]u32{ 0, 4096, 16_384 }) |pin| {
+                for ([_]u32{ 0, 4096, 16_384 }) |explicit| {
+                    cli.* = .{ .override = if (explicit == 0) 8192 else explicit, .explicit = explicit > 0, .machine_cap = machine_cap };
+                    for ([_]u64{ 32_768, 200_000, 1 << 20 }) |len| {
+                        for ([_]WarmPrefix{ .{}, .{ .matched_tokens = len - 64, .capacity_tokens = len, .will_donate = true } }) |warm| {
+                            const step = prefillNeededAtChunk(cfg, len, 256, 16, 4096, warm);
+                            for ([_]u64{ 0, step -| 1, step, step +| 1, std.math.maxInt(u64) }) |available| {
+                                const expected = Previous.choose(cfg, len, available, pin, explicit, warm);
+                                try t.expectEqual(expected, chooseRequestPrefillChunk(cfg, len, 256, 16, available, pin, explicit, warm, .{}));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

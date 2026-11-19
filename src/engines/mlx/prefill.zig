@@ -43,6 +43,8 @@ const specInitWiring = @import("spec/wiring.zig").specInitWiring;
 const publishLiveKvResidency = @import("step.zig").publishLiveKvResidency;
 const scheduler_mod = @import("scheduler.zig");
 const intree = @import("plugin/intree.zig");
+const WarmPrefix = @import("admission/bills.zig").WarmPrefix;
+const slotPrefillLimits = @import("admission/pending.zig").slotPrefillLimits;
 
 fn beginModulePrompt(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, n: usize) !void {
     const id = plugin_settle.slotId(slot.model.transformer.?.plugin.?, &slot.ctx);
@@ -294,6 +296,8 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         @import("finish.zig").releasePluginSlot(slot);
         publishHotCacheResidency(sch);
     };
+    var prefill_base_active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&prefill_base_active);
     if (module_binding) |binding| {
         hot_matched = @intCast(try restoreModulePrompt(sch, slot, binding));
         prefill_tokens = slot.full_prompt[hot_matched..];
@@ -416,32 +420,29 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         if (slot.model.config) |cfg| {
             // Bills the request's own kv-quant scheme and vision chunking, not the process defaults.
             const Probe = struct {
+                sch: *Scheduler,
+                slot: *Slot,
                 cfg: *const model_mod.ModelConfig,
-                seq: usize,
-                max_tokens: u32,
-                kv_cfg: transformer_mod.KVQuantConfig,
-                /// The prefix the hot cache restored and the capacity its buffers hold: already
-                /// inside active memory, so billing them again invents a copy.
-                warm_matched: u64,
-                warm_capacity: u64,
-                /// Only a checked-out restore is credited: a refcount share is copied by the first append.
-                warm_will_donate: bool,
-                enable_mtp: bool,
-                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, u64, u64, bool, bool) bool,
+                base_active: u64,
+                warm: WarmPrefix,
+                fits: scheduler_mod.PrefillFit,
                 fn call(ctx: ?*anyopaque) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
-                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp);
+                    const s = self.slot;
+                    return self.fits(self.cfg, s.full_prompt.len, s.max_tokens, s.cache.config, self.warm, slotPrefillLimits(self.sch, s, self.cfg, self.base_active));
                 }
             };
             var probe = Probe{
+                .sch = sch,
+                .slot = slot,
                 .cfg = cfg,
-                .seq = slot.full_prompt.len,
-                .max_tokens = slot.max_tokens,
-                .kv_cfg = slot.cache.config,
-                .warm_matched = hot_matched,
-                .warm_capacity = slot.cache.residentCapacityTokens(),
-                .warm_will_donate = hot_checked_out,
-                .enable_mtp = slot.enable_mtp,
+                .base_active = @intCast(prefill_base_active),
+                .warm = .{
+                    .matched_tokens = hot_matched,
+                    .capacity_tokens = slot.cache.residentCapacityTokens(),
+                    .will_donate = hot_checked_out,
+                    .mtp_on = slot.enable_mtp,
+                },
                 .fits = fits_fn,
             };
             var fits = Probe.call(&probe);
@@ -460,14 +461,14 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             if (!fits and !hot_checked_out and hot_matched > 0) if (slot.prefix_cache) |hc| {
                 if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len)) {
                     hot_checked_out = true;
-                    probe.warm_will_donate = true;
+                    probe.warm.will_donate = true;
                     fits = Probe.call(&probe);
                 }
             };
             if (!fits) {
                 // The width admission was billed at, read before anything is evicted.
                 if (scheduler_mod.prefill_request_chunk) |pick_pre| {
-                    admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
+                    admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.warm, slotPrefillLimits(sch, slot, cfg, @intCast(prefill_base_active)));
                 }
                 // Per-model, off the slot: `sch.hot_prefix_cache` is whichever model loaded last.
                 // Captured by pointer: a `|hc|` capture would evict from a stack copy.
@@ -486,9 +487,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                     hot_matched = 0;
                     prefill_tokens = slot.full_prompt;
                     slot.restored_entry = 0;
-                    probe.warm_matched = 0;
-                    probe.warm_capacity = 0;
-                    probe.warm_will_donate = false;
+                    probe.warm = .{ .mtp_on = slot.enable_mtp };
                     publishHotCacheResidency(sch);
                     // Dropping the restore can also unpin buffers shared with remaining entries.
                     const cold_report = slot.prefix_cache.?.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, false);
@@ -499,7 +498,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 if (!fits) {
                     log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
                     if (scheduler_mod.prefill_admission_refused_log) |report_fn| {
-                        slot.refused_bill = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
+                        slot.refused_bill = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.warm, slotPrefillLimits(sch, slot, cfg, @intCast(prefill_base_active)));
                     }
                     // Not `error.OutOfMemory` (the MLX latch's name, a 503): this is a request the
                     // machine cannot hold, a named 400.
@@ -519,10 +518,13 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             slot.full_prompt.len,
             slot.max_tokens,
             slot.cache.config,
-            hot_matched,
-            slot.cache.residentCapacityTokens(),
-            hot_checked_out,
-            slot.enable_mtp,
+            .{
+                .matched_tokens = hot_matched,
+                .capacity_tokens = slot.cache.residentCapacityTokens(),
+                .will_donate = hot_checked_out,
+                .mtp_on = slot.enable_mtp,
+            },
+            slotPrefillLimits(sch, slot, cfg, @intCast(prefill_base_active)),
         );
         const decision = postEvictionPrefillChunk(admitted_prefill_chunk, reasked);
         if (decision.widened) {

@@ -80,7 +80,7 @@ test "dsv41 prefill chunk: an explicit --prefill-chunk past 8192 is billed and r
         generate_mod.prefillCli().override = 8192;
         generate_mod.prefillCli().explicit = false;
     }
-    try t.expectEqual(@as(u64, 8192), prefillAdmissionBill(&cfg, 65536, 256, null, null, .{}).chunk);
+    try t.expectEqual(@as(u64, 8192), prefillAdmissionBill(&cfg, 65536, 256, null, null, .{}, .{}).chunk);
 }
 
 test "dsv41 prefill chunk: pinned at 8192 on a big machine, and kept there however long the prompt" {

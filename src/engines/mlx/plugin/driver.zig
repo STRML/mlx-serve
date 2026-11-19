@@ -235,7 +235,7 @@ fn streamRoomDecodeAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64
 }
 
 /// The chunk the engine runs for a `seq`-token prompt (generate/init.zig's, at the prompt's final KV length): an explicit
-/// `--prefill-chunk`, else the default, never past `prefillChunkMax`, narrowed so one layer's score sheet stays within
+/// `--prefill-chunk`, else the default, never past `cappedPrefillChunk`, narrowed so one layer's score sheet stays within
 /// `PREFILL_SCORES_BUDGET_BYTES` (`boundedPrefillChunk`). A model that forms no score sheet keeps the base chunk.
 fn promptChunkAt(config: *const ModelConfig, seq: u64) u32 {
     return @intCast(config.cappedPrefillChunk(@import("../generate/prefill_chunk.zig").effectivePrefillChunk(
@@ -422,7 +422,7 @@ test "driver: a streamed plugin's room bills the widest chunk the engine runs: a
     cfg.head_dim = 0;
     gen.prefillCli().* = .{};
     try t.expectEqual((64 << 30) - (@as(u64, gen.WIDE_PREFILL_CHUNK) << 20) - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
-    // DeepSeek-V4.1 runs at most 8192 rows (`prefillChunkMax`), an explicit 16384 included.
+    // DeepSeek-V4.1 runs at most 8192 rows (`cappedPrefillChunk`), an explicit 16384 included.
     var ds = try model.parseConfigFromJson(t.allocator, model.dsv41_release_config);
     const own = ds.plugin;
     defer {

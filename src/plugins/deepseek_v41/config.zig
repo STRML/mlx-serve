@@ -18,6 +18,8 @@ pub const model_types = [_][]const u8{"deepseek_v41"};
 pub const claims = sdk.claimsByType(&model_types);
 
 pub const Config = v4.Config;
+pub const max_prefill_rows: u32 = 8192;
+pub const prefill_lead_min_rows: u32 = 4096;
 
 /// Whether a `size`-rank tensor split leaves every rank a whole, non-empty share of each width the split divides:
 /// the attention heads, the output groups (whole groups a rank) and the expert widths.
