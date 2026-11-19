@@ -573,7 +573,6 @@ fn handleStreamingCompletion(
         .legacy = true,
     };
     defer lps.deinit();
-    defer ts.deinit(allocator);
 
     // SSE headers
     try sendSseHeaders(stream, "completions", SSE_ALLOW_HEADERS_DEFAULT);
@@ -590,7 +589,7 @@ fn handleStreamingCompletion(
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
         if (stopped or stop_stream.flushed) break;
-        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        const next_id: ?u32 = switch (try ts.nextOrIdle(Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
             .done => if (stop_stream.holding()) null else break,
             .idle => {

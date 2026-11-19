@@ -121,6 +121,11 @@ pub const Stream = struct {
         return .{ .token_index = at, .byte_offset = self.constraint_payload_offset.load(.acquire) };
     }
 
+    /// Authoritative tokens emitted by the engine; call only after `.done` (engine finished).
+    pub fn emittedIds(self: *const Stream) []const u32 {
+        return self.out_buf.items;
+    }
+
     pub fn pushToken(self: *Stream, t: u32) void {
         self.pushTokenWithLogprob(t, null);
     }

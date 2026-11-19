@@ -64,9 +64,6 @@ const beatStreamKeepalive = @import("../http/sse.zig").beatStreamKeepalive;
 /// terminates. This keeps tokens leaking past EOS impossible regardless of
 /// where in an N-token batch the EOS lands.
 ///
-/// `pld_drop_buf` is a heap-owned pending buffer (PLD can yield up to
-/// `1+max_draft_len`=16 tokens per step; drafter yields up to `block_size`).
-/// Caller must `deinit`.
 pub const StreamMode = enum { regular, pld, drafter, mtp };
 
 /// The streamed tokens of one request, read from its `Stream` one at a time. Post-generation stats are copied in by
@@ -87,17 +84,10 @@ pub const StreamingTokenStream = struct {
     finish_details: ?[]const u8 = null,
     prefill_ns: u64 = 0,
     decode_ns: u64 = 0,
-    /// The yielded token ids, kept only for a request that asked for them (`return_token_ids`).
-    collect_ids: bool = false,
-    ids: std.ArrayList(u32) = .empty,
 
     /// `mode` is recorded for telemetry: the engine already routed PLD/drafter/MTP.
     pub fn initFromStream(stream: *Stream, mode: StreamMode, eos: []const u32) StreamingTokenStream {
         return .{ .stream = stream, .request_id = stream.request_id, .mode = mode, .eos_token_ids = eos };
-    }
-
-    pub fn deinit(self: *StreamingTokenStream, allocator: std.mem.Allocator) void {
-        self.ids.deinit(allocator);
     }
 
     /// Copies the request's numbers out of the stream; idempotent.
@@ -136,14 +126,11 @@ pub const StreamingTokenStream = struct {
 
     /// The next token, the end, or `.idle` after `timeout_ms` with no progress so the caller can poll the peer
     /// socket and send SSE keepalives during a long prefill.
-    pub fn nextOrIdle(self: *StreamingTokenStream, allocator: std.mem.Allocator, timeout_ms: i64) !NextOrIdle {
+    pub fn nextOrIdle(self: *StreamingTokenStream, timeout_ms: i64) !NextOrIdle {
         if (self.finished) return .done;
         const nr = self.stream.waitNextTimeout(timeout_ms) orelse return .idle;
         switch (nr) {
-            .token => |t| {
-                if (self.collect_ids) try self.ids.append(allocator, t);
-                return .{ .token = t };
-            },
+            .token => |t| return .{ .token = t },
             .done => {
                 self.finished = true;
                 return .done;
@@ -270,8 +257,6 @@ pub fn handleStreamingGeneration(
         .kv_quant_config = kv_quant_override,
     });
     var ts = StreamingTokenStream.initFromStream(running.?.stream, stream_mode, eos_token_ids);
-    ts.collect_ids = stream.return_token_ids;
-    defer ts.deinit(allocator);
 
     // Send SSE headers (no Content-Length — we stream until done)
     const chat_id = try sendChatSseHeaders(stream, running.?.stream.request_id);
@@ -371,7 +356,7 @@ pub fn handleStreamingGeneration(
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
         if (stopped or stop_stream.flushed) break;
-        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        const next_id: ?u32 = switch (try ts.nextOrIdle(Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
             .done => if (stop_stream.holding()) null else break,
             .idle => {
@@ -446,7 +431,10 @@ pub fn handleStreamingGeneration(
             const fed = try stop_stream.feed(allocator, &text_buf, token_text, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed);
             allocator.free(token_text);
             token_text = fed.send;
-            if (fed.stop != null) stopped = true;
+            if (fed.stop != null) {
+                stopped = true;
+                running.?.requestStop();
+            }
             if (token_text.len == 0) {
                 allocator.free(token_text);
                 continue;
@@ -878,6 +866,8 @@ pub fn handleStreamingGeneration(
         };
     }
 
+    if (stopped and !client_gone) client_gone = !try @import("submit.zig").waitForDone(running.?.stream, stream);
+
     if (!client_gone) {
         if (delivery) |*d| {
             d.clearOutput();
@@ -911,6 +901,7 @@ pub fn handleStreamingGeneration(
     // After generation: capture stats from whichever source was active
     // (Generator on legacy, Slot on scheduler).
     ts.finalize();
+    const generated_ids = if (stream.return_token_ids and !client_gone) running.?.emittedIds() else null;
 
     // Check for tool calls in accumulated text
     var finish_reason: []const u8 = if (client_gone) "client_disconnect" else if (stopped) "stop" else ts.finish_reason;
@@ -1040,7 +1031,10 @@ pub fn handleStreamingGeneration(
         // Usage chunk only if requested via stream_options.include_usage. Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
         const usage: ?StreamUsage = if (include_usage) .{ .prompt = total_prompt, .completion = ts.completion_tokens, .cached = ts.cached_tokens, .reasoning = @intCast(@as(usize, @intCast(think_tokens)) + reasoning_tokens_sent) } else null;
-        const ids: ?@import("format.zig").TokenIds = if (stream.return_token_ids) .{ .prompt = stream.usage_prompt_ids, .generated = ts.ids.items } else null;
+        const ids: ?@import("format.zig").TokenIds = if (generated_ids) |generated| .{
+            .prompt = stream.usage_prompt_ids[0..@min(total_prompt, stream.usage_prompt_ids.len)],
+            .generated = generated,
+        } else null;
         try sendStreamTail(allocator, stream, chat_id, model_name, .{ .reason = finish_reason, .details = ts.finish_details }, try lps.take(), usage, if (timings_obj.len > 0) timings_obj else null, ids);
     }
 

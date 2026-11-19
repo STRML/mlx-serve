@@ -1496,13 +1496,15 @@ fn expectStatus(name: []const u8, want: u16, reply: HttpReply) !void {
     try testing.expectEqual(want, reply.status);
 }
 
+const HttpClientAction = enum { read_reply, half_close, cancel_after_content };
+
 fn sendHttpRaw(
     io: std.Io,
     node: *LiveNode,
     peer_addr: std.Io.net.IpAddress,
     head_bytes: []const u8,
     body: []const u8,
-    shutdown_write_early: bool,
+    action: HttpClientAction,
 ) !HttpReply {
     const a = testing.allocator;
     const prev_reg = http_server.global_registry;
@@ -1533,18 +1535,23 @@ fn sendHttpRaw(
 
     try sendAllFd(sv[1], head_bytes);
     if (body.len > 0) try sendAllFd(sv[1], body);
-    if (shutdown_write_early) _ = std.c.shutdown(sv[1], 1);
+    if (action == .half_close) _ = std.c.shutdown(sv[1], 1);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     var buf: [16 * 1024]u8 = undefined;
+    var cancel_pending = action == .cancel_after_content;
     while (true) {
         const got = std.c.recv(sv[1], &buf, buf.len, 0);
         if (got < 0 and std.posix.errno(got) == .INTR) continue;
         if (got <= 0) break;
         try out.appendSlice(a, buf[0..@intCast(got)]);
+        if (cancel_pending and std.mem.indexOf(u8, out.items, "\"delta\":{\"content\":") != null) {
+            mlx_engine.api().cancel_all(node.sch);
+            cancel_pending = false;
+        }
     }
-    if (!shutdown_write_early) _ = std.c.shutdown(sv[1], 1);
+    if (action != .half_close) _ = std.c.shutdown(sv[1], 1);
     worker.join();
 
     const raw = try out.toOwnedSlice(a);
@@ -1570,7 +1577,7 @@ fn sendHttp(
 ) !HttpReply {
     const req_bytes = try std.fmt.allocPrint(testing.allocator, "{s}Content-Length: {d}\r\n\r\n", .{ head, body.len });
     defer testing.allocator.free(req_bytes);
-    return sendHttpRaw(io, node, peer_addr, req_bytes, body, false);
+    return sendHttpRaw(io, node, peer_addr, req_bytes, body, .read_reply);
 }
 
 fn sendAllFd(fd: std.posix.fd_t, data: []const u8) !void {
@@ -1810,7 +1817,7 @@ test "dsv41 peer fetch: HTTP export and import enforce peer/auth gates, 422 medi
                 .{router.max_cache_transfer_body_bytes + 1},
             );
             defer testing.allocator.free(oversize_head);
-            var r2 = try sendHttpRaw(io, node_b, tb5_peer, oversize_head, "", true);
+            var r2 = try sendHttpRaw(io, node_b, tb5_peer, oversize_head, "", .half_close);
             defer r2.deinit(testing.allocator);
             try expectStatus("import_over_cap_413", 413, r2);
             try testing.expect(std.mem.indexOf(u8, r2.raw, "cache_transfer_too_large") != null);
@@ -1942,6 +1949,270 @@ test "usage token ids: nonstream spoken reply returns HTTP 400" {
     , "return_token_ids is not supported on spoken replies");
 }
 
+fn usagePldFiles(a: std.mem.Allocator) ![]const sdk.fixture.File {
+    const width = 32;
+    var embed: [256 * width]f32 = @splat(0);
+    var head: [256 * width]f32 = @splat(0);
+    for (0..256) |id| embed[id * width] = 1;
+    embed['x' * width] = 0;
+    embed['x' * width + 1] = 1;
+    for ([_]u8{ 'a', 'b' }) |id| {
+        const row = @as(usize, id) * width;
+        embed[row] = 0;
+        embed[row + 2] = 1;
+    }
+    head['x' * width] = 1;
+    head['a' * width + 1] = 1;
+    head['b' * width + 2] = 1;
+    const zeros: [width * width]f32 = @splat(0);
+    const norm: [width]f32 = @splat(1);
+    const matrix = &.{ width, width };
+    const weights = try sdk.fixture.safetensors(a, &.{
+        .{ .name = "model.embed_tokens.weight", .shape = &.{ 256, width }, .data = &embed },
+        .{ .name = "lm_head.weight", .shape = &.{ 256, width }, .data = &head },
+        .{ .name = "model.norm.weight", .shape = &.{width}, .data = &norm },
+        .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{width}, .data = &norm },
+        .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{width}, .data = &norm },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = matrix, .data = &zeros },
+    });
+    return a.dupe(sdk.fixture.File, &.{
+        .{ .name = "config.json", .bytes =
+        \\{"model_type":"llama","hidden_size":32,"intermediate_size":32,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"vocab_size":256,"max_position_embeddings":512,"bos_token_id":1,"eos_token_id":2,"tie_word_embeddings":false,"rms_norm_eps":1e-6,"rope_theta":10000.0}
+        },
+        .{ .name = "tokenizer.json", .bytes = try sdk.byte_tokenizer.json(a, &.{}) },
+        .{ .name = "tokenizer_config.json", .bytes =
+        \\{"chat_template":"{{ messages[0]['content'] }}"}
+        },
+        .{ .name = "model.safetensors", .bytes = weights },
+    });
+}
+
+test "usage token ids: a stop inside a committed PLD block retains its tail" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const node = try LiveNode.openHashing(io, try usagePldFiles(a));
+    defer node.close();
+    const log = @import("../../sdk/util/log.zig");
+    const log_path = try std.fmt.allocPrint(a, "{s}/usage.log", .{node.path_buf[0..node.path_len]});
+    try log.openFile(log_path, 0);
+    defer log.closeFile();
+    const cfg = &http_server.serverState().server_config;
+    const old_key_len = cfg.default_pld_key_len;
+    const old_draft_len = cfg.default_pld_draft_len;
+    defer {
+        cfg.default_pld_key_len = old_key_len;
+        cfg.default_pld_draft_len = old_draft_len;
+    }
+    cfg.default_pld_key_len = 1;
+    cfg.default_pld_draft_len = 1;
+    const request =
+        \\{"messages":[{"role":"user","content":"?abb?"}],"temperature":0,"enable_pld":true,"return_token_ids":true,"stop":["a"],
+    ;
+    const cases = [_]struct { limit: u32, mode: []const u8 }{
+        .{ .limit = 3, .mode = ",\"stream\":true,\"stream_options\":{\"include_usage\":true}}" },
+        .{ .limit = 3, .mode = "}" },
+        .{ .limit = 128, .mode = ",\"stream\":true,\"stream_options\":{\"include_usage\":true}}" },
+    };
+    for (cases) |case| {
+        const body = try std.fmt.allocPrint(a, "{s}\"max_tokens\":{d}{s}", .{ request, case.limit, case.mode });
+        var reply = try postUsageChat(io, node, body);
+        defer reply.deinit(testing.allocator);
+        try expectStatus("PLD stop", 200, reply);
+        try testing.expect(std.mem.indexOf(u8, reply.body, "\"content\":\"x\"") != null);
+        try testing.expect(std.mem.indexOf(u8, reply.body, "\"content\":\"b\"") == null);
+        try testing.expect(std.mem.indexOf(u8, reply.body, "\"finish_reason\":\"stop\"") != null);
+        const parsed = try usageOf(a, reply.body);
+        const usage = parsed.value.object.get("usage").?.object;
+        const generated = usage.get("generated_ids").?.array.items;
+        if (generated.len < 3) std.debug.print("PLD stop reply: {s}\n", .{reply.body});
+        try testing.expectEqual(usage.get("completion_tokens").?.integer, @as(i64, @intCast(generated.len)));
+        try testing.expect(generated.len >= 3);
+        try testing.expect(generated.len <= @min(case.limit, 127));
+        for (generated[0..3], "xab") |got, want| try testing.expectEqual(@as(i64, want), got.integer);
+        try testing.expectEqual(usage.get("prompt_tokens").?.integer, @as(i64, @intCast(usage.get("prompt_ids").?.array.items.len)));
+    }
+    const records = try node.tmp.dir.readFileAlloc(io, "usage.log", a, .limited(64 * 1024));
+    try testing.expect(std.mem.count(u8, records, "[spec-stats] mode=pld attempts=1 accepts=1") >= 2);
+}
+
+test "usage token ids: an engine-cancelled stream reports the committed prefix" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const node = try LiveNode.openHashing(io, try usagePldFiles(a));
+    defer node.close();
+    const body =
+        \\{"messages":[{"role":"user","content":"?abb?"}],"temperature":0,"max_tokens":128,"return_token_ids":true,"stream":true,"stream_options":{"include_usage":true}}
+    ;
+    const head = try std.fmt.allocPrint(a, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{body.len});
+    const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 50000 } };
+    var reply = try sendHttpRaw(io, node, loopback, head, body, .cancel_after_content);
+    defer reply.deinit(testing.allocator);
+    try expectStatus("cancelled chat", 200, reply);
+    try testing.expect(std.mem.indexOf(u8, reply.body, "\"finish_reason\":\"abort\"") != null);
+    const parsed = try usageOf(a, reply.body);
+    const usage = parsed.value.object.get("usage").?.object;
+    const generated = usage.get("generated_ids").?.array.items;
+    try testing.expect(generated.len < 128);
+    try testing.expectEqual(usage.get("completion_tokens").?.integer, @as(i64, @intCast(generated.len)));
+    try testing.expectEqual(usage.get("prompt_tokens").?.integer, @as(i64, @intCast(usage.get("prompt_ids").?.array.items.len)));
+}
+
+fn usageEosFiles(a: std.mem.Allocator) ![]const sdk.fixture.File {
+    const width = 32;
+    var embed: [256 * width]f32 = @splat(0);
+    var head: [256 * width]f32 = @splat(0);
+    for (0..256) |id| embed[id * width] = 1;
+    embed['x' * width] = 0;
+    embed['x' * width + 1] = 1;
+    embed['a' * width] = 0;
+    embed['a' * width + 2] = 1;
+    head['x' * width] = 1;
+    head['a' * width + 1] = 1;
+    head['e' * width + 2] = 1;
+    const zeros: [width * width]f32 = @splat(0);
+    const norm: [width]f32 = @splat(1);
+    const matrix = &.{ width, width };
+    const weights = try sdk.fixture.safetensors(a, &.{
+        .{ .name = "model.embed_tokens.weight", .shape = &.{ 256, width }, .data = &embed },
+        .{ .name = "lm_head.weight", .shape = &.{ 256, width }, .data = &head },
+        .{ .name = "model.norm.weight", .shape = &.{width}, .data = &norm },
+        .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{width}, .data = &norm },
+        .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{width}, .data = &norm },
+        .{ .name = "model.layers.0.self_attn.q_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.self_attn.k_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.self_attn.v_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.self_attn.o_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = matrix, .data = &zeros },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = matrix, .data = &zeros },
+    });
+    return a.dupe(sdk.fixture.File, &.{
+        .{ .name = "config.json", .bytes =
+        \\{"model_type":"llama","hidden_size":32,"intermediate_size":32,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"vocab_size":256,"max_position_embeddings":512,"bos_token_id":1,"eos_token_id":101,"tie_word_embeddings":false,"rms_norm_eps":1e-6,"rope_theta":10000.0}
+        },
+        .{ .name = "tokenizer.json", .bytes = try sdk.byte_tokenizer.json(a, &.{}) },
+        .{ .name = "tokenizer_config.json", .bytes =
+        \\{"chat_template":"{{ messages[0]['content'] }}"}
+        },
+        .{ .name = "model.safetensors", .bytes = weights },
+    });
+}
+
+test "usage token ids: EOS stop excludes unemitted EOS and lookahead across regular and speculative paths" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const node = try LiveNode.openHashing(io, try usageEosFiles(a));
+    defer node.close();
+    const cfg = &http_server.serverState().server_config;
+    const old_key_len = cfg.default_pld_key_len;
+    const old_draft_len = cfg.default_pld_draft_len;
+    defer {
+        cfg.default_pld_key_len = old_key_len;
+        cfg.default_pld_draft_len = old_draft_len;
+    }
+    cfg.default_pld_key_len = 1;
+    cfg.default_pld_draft_len = 1;
+    for ([_]bool{ false, true }) |use_pld| {
+        for ([_][]const u8{ "}", ",\"stream\":true,\"stream_options\":{\"include_usage\":true}}" }) |mode| {
+            const baseline_body = try std.fmt.allocPrint(a,
+                \\{{"messages":[{{"role":"user","content":"?ae?"}}],"temperature":0,"max_tokens":16,"enable_pld":{s}{s}
+            , .{ if (use_pld) "true" else "false", mode });
+            var baseline = try usageReply(io, node, baseline_body);
+            defer baseline.deinit();
+            const base_completion = baseline.value.object.get("usage").?.object.get("completion_tokens").?.integer;
+
+            const body = try std.fmt.allocPrint(a,
+                \\{{"messages":[{{"role":"user","content":"?ae?"}}],"temperature":0,"max_tokens":16,"enable_pld":{s},"return_token_ids":true{s}
+            , .{ if (use_pld) "true" else "false", mode });
+            var reply = try postUsageChat(io, node, body);
+            defer reply.deinit(testing.allocator);
+            try expectStatus("EOS stop", 200, reply);
+            try testing.expect(std.mem.indexOf(u8, reply.body, "\"finish_reason\":\"stop\"") != null);
+            const parsed = try usageOf(a, reply.body);
+            defer parsed.deinit();
+            const usage = parsed.value.object.get("usage").?.object;
+            const generated = usage.get("generated_ids").?.array.items;
+            try testing.expectEqual(base_completion, usage.get("completion_tokens").?.integer);
+            try testing.expectEqual(@as(i64, 2), usage.get("completion_tokens").?.integer);
+            try testing.expectEqual(@as(usize, 2), generated.len);
+            for (generated, "xa") |got, want| try testing.expectEqual(@as(i64, want), got.integer);
+            try testing.expectEqual(usage.get("prompt_tokens").?.integer, @as(i64, @intCast(usage.get("prompt_ids").?.array.items.len)));
+        }
+    }
+}
+
+test "usage token ids: regular stop sequence keeps generated_ids aligned with completion_tokens" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const node = try LiveNode.openHashing(io, try usagePldFiles(a));
+    defer node.close();
+    for ([_][]const u8{ "}", ",\"stream\":true,\"stream_options\":{\"include_usage\":true}}" }) |mode| {
+        const body = try std.fmt.allocPrint(a,
+            \\{{"messages":[{{"role":"user","content":"?abb?"}}],"temperature":0,"max_tokens":32,"enable_pld":false,"return_token_ids":true,"stop":["a"]{s}
+        , .{mode});
+        var reply = try postUsageChat(io, node, body);
+        defer reply.deinit(testing.allocator);
+        try expectStatus("regular stop", 200, reply);
+        try testing.expect(std.mem.indexOf(u8, reply.body, "\"content\":\"x\"") != null);
+        try testing.expect(std.mem.indexOf(u8, reply.body, "\"content\":\"b\"") == null);
+        try testing.expect(std.mem.indexOf(u8, reply.body, "\"finish_reason\":\"stop\"") != null);
+        const parsed = try usageOf(a, reply.body);
+        defer parsed.deinit();
+        const usage = parsed.value.object.get("usage").?.object;
+        const generated = usage.get("generated_ids").?.array.items;
+        try testing.expectEqual(usage.get("completion_tokens").?.integer, @as(i64, @intCast(generated.len)));
+        try testing.expect(generated.len >= 2);
+        for (generated[0..2], "xa") |got, want| try testing.expectEqual(@as(i64, want), got.integer);
+        try testing.expectEqual(usage.get("prompt_tokens").?.integer, @as(i64, @intCast(usage.get("prompt_ids").?.array.items.len)));
+    }
+}
+
+test "usage token ids: non-streaming loop_trim_start trims text while keeping generated_ids equal to completion_tokens" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const node = try LiveNode.openHashing(io, try usagePldFiles(a));
+    defer node.close();
+    const body =
+        \\{"messages":[{"role":"user","content":"?abb?"}],"temperature":0,"max_tokens":200,"enable_pld":false,"return_token_ids":true}
+    ;
+    var reply = try postUsageChat(io, node, body);
+    defer reply.deinit(testing.allocator);
+    try expectStatus("loop trim", 200, reply);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, reply.body, .{});
+    defer parsed.deinit();
+    const choice = parsed.value.object.get("choices").?.array.items[0].object;
+    const content = choice.get("message").?.object.get("content").?.string;
+    const usage = parsed.value.object.get("usage").?.object;
+    const generated = usage.get("generated_ids").?.array.items;
+    const completion = usage.get("completion_tokens").?.integer;
+    try testing.expectEqual(completion, @as(i64, @intCast(generated.len)));
+    try testing.expect(completion > 128 and completion < 200);
+    try testing.expect(content.len < @as(usize, @intCast(completion)));
+    for (generated[0..3], "xab") |got, want| try testing.expectEqual(@as(i64, want), got.integer);
+    try testing.expectEqual(usage.get("prompt_tokens").?.integer, @as(i64, @intCast(usage.get("prompt_ids").?.array.items.len)));
+}
+
 test "usage token ids: opt-in usage carries the prompt and generated ids, and a default reply is unchanged" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
@@ -1973,7 +2244,7 @@ test "usage token ids: opt-in usage carries the prompt and generated ids, and a 
         const generated_ids = usage.get("generated_ids").?.array.items;
         try testing.expectEqual(usage.get("prompt_tokens").?.integer, @as(i64, @intCast(prompt_ids.len)));
         try testing.expectEqual(usage.get("completion_tokens").?.integer, @as(i64, @intCast(generated_ids.len)));
-        try testing.expect(generated_ids.len > 0);
+        try testing.expectEqual(@as(usize, 4), generated_ids.len);
         for (prompt_ids) |id| try testing.expect(id == .integer and id.integer >= 0);
         for (generated_ids) |id| try testing.expect(id == .integer and id.integer >= 0);
     }

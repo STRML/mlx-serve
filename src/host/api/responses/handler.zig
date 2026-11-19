@@ -954,7 +954,6 @@ fn handleResponsesInner(
             .kv_quant_config = kv_quant_override,
         });
         var ts = StreamingTokenStream.initFromStream(running.?.stream, stream_mode, eos_slice);
-        defer ts.deinit(allocator);
 
         var raw_buf = std.ArrayList(u8).empty;
         var stop_stream: StopStream = .{};
@@ -989,7 +988,7 @@ fn handleResponsesInner(
         while (true) {
             // A stop cut resolved on the previous token ends the turn here.
             if (stopped or stop_stream.flushed) break;
-            const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+            const next_id: ?u32 = switch (try ts.nextOrIdle(Conn.STREAM_KEEPALIVE_MS)) {
                 .token => |t| t,
                 .done => if (stop_stream.holding()) null else break,
                 .idle => {

@@ -175,6 +175,7 @@ pub const Slot = struct {
     /// Generated tokens the loop guard has already seen.
     loop_guard_seen: usize = 0,
     cancelled: std.atomic.Value(bool),
+    stop_requested: std.atomic.Value(bool) = .init(false),
     /// Inference thread only: the request's outcome has been counted in `Metrics`.
     metrics_recorded: bool = false,
     /// A kernel warm-up the server serves itself (`warm_requests`): its stats are no client's, so they stay out of the log.

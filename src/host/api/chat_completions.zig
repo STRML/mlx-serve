@@ -1360,7 +1360,7 @@ fn handleNonStreamingGeneration(
 /// The ids an opted-in reply's usage carries: the prompt the handler served and what this result generated.
 fn usageTokenIds(stream: *const Conn, result: request_mod.GenerationResult) ?@import("format.zig").TokenIds {
     if (!stream.return_token_ids) return null;
-    return .{ .prompt = stream.usage_prompt_ids, .generated = result.token_ids };
+    return .{ .prompt = stream.usage_prompt_ids[0..@min(result.prompt_tokens, stream.usage_prompt_ids.len)], .generated = result.token_ids };
 }
 
 /// The non-stream reply. `message` is encoded already: the content value, the `reasoning_content` and audio fields or
