@@ -94,6 +94,10 @@ pub const Conn = struct {
     cache_export: bool = false,
     /// The current request's `X-Session-Key`, hashed by `sessionTag` (0 = none).
     session_key: u64 = 0,
+    /// The request asked for `"return_token_ids": true`: its chat usage carries `prompt_ids` and `generated_ids`.
+    return_token_ids: bool = false,
+    /// The prompt the request was served with, set by the chat handler for the usage it builds while it runs.
+    usage_prompt_ids: []const u32 = &.{},
     cache_deadline_ms: ?u64 = null,
     cache_deadline_invalid: bool = false,
 
@@ -111,6 +115,8 @@ pub const Conn = struct {
         c.length_framed = false;
         c.cache_export = false;
         c.session_key = 0;
+        c.return_token_ids = false;
+        c.usage_prompt_ids = &.{};
         c.cache_deadline_ms = null;
         c.cache_deadline_invalid = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
@@ -133,6 +139,8 @@ pub const Conn = struct {
         c.ablation_key = findHeaderValue(headers, "x-ablation-key");
         c.cache_export = if (findHeaderValue(headers, "x-cache-export")) |v| std.mem.eql(u8, v, "1") else false;
         c.session_key = if (findHeaderValue(headers, "x-session-key")) |v| sessionTag(v) else 0;
+        c.return_token_ids = false;
+        c.usage_prompt_ids = &.{};
         c.cache_deadline_ms = null;
         c.cache_deadline_invalid = false;
         if (findHeaderValue(headers, "x-cache-deadline-ms")) |v| {

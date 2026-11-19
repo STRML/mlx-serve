@@ -411,6 +411,25 @@ pub fn handleChatCompletions(
         },
     };
 
+    const return_token_ids = if (root.get("return_token_ids")) |v| v == .bool and v.bool else false;
+    const include_usage = if (root.get("stream_options")) |so| blk: {
+        if (so != .object) break :blk false;
+        const iu = so.object.get("include_usage") orelse break :blk false;
+        break :blk iu == .bool and iu.bool;
+    } else false;
+
+    if (return_token_ids and speech_ask != null) {
+        const message = if (is_stream)
+            "return_token_ids is not supported on spoken streams"
+        else
+            "return_token_ids is not supported on spoken replies";
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", message, 400);
+    }
+    if (return_token_ids and is_stream and !include_usage) {
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "return_token_ids on a stream needs stream_options.include_usage", 400);
+    }
+    stream.return_token_ids = return_token_ids;
+
     const sampled = resolveSampling(gen, root, config);
     const temperature = sampled.temperature;
     const top_p = sampled.top_p;
@@ -592,15 +611,6 @@ pub fn handleChatCompletions(
             }
         }
     }
-
-    // Parse stream_options
-    const include_usage = if (root.get("stream_options")) |so| blk: {
-        if (so != .object) break :blk false;
-        if (so.object.get("include_usage")) |iu| {
-            break :blk iu == .bool and iu.bool;
-        }
-        break :blk false;
-    } else false;
 
     // Thinking opt-ins: the OpenAI-standard `reasoning_effort` string and the
     // vendor `enable_thinking` bool (Qwen/vLLM chat_template_kwargs family).
@@ -819,6 +829,8 @@ pub fn handleChatCompletions(
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
+    if (return_token_ids) stream.usage_prompt_ids = prompt_ids;
+    defer stream.usage_prompt_ids = &.{};
     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Enforce context size limit
@@ -1254,7 +1266,7 @@ fn handleNonStreamingGeneration(
             defer allocator.free(tc_timings_field);
 
             const tc_reasoning_tokens = if (tc_think_split.reasoning_content) |reasoning| countTextTokens(allocator, lm, tok, reasoning) else 0;
-            const response = try formatToolCallReply(allocator, stream.io, model_name, .{ .content = tc_content_json, .reasoning = tc_reasoning_json, .tool_calls = tc_buf.items }, finish_reason, result, tc_reasoning_tokens, tc_timings_field);
+            const response = try formatToolCallReply(allocator, stream.io, model_name, .{ .content = tc_content_json, .reasoning = tc_reasoning_json, .tool_calls = tc_buf.items }, finish_reason, result, tc_reasoning_tokens, tc_timings_field, usageTokenIds(stream, result));
             defer allocator.free(response);
             try sendResponse(stream, "200 OK", "application/json", response);
             return;
@@ -1339,10 +1351,16 @@ fn handleNonStreamingGeneration(
         audio_field = try std.fmt.allocPrint(allocator, ",\"audio\":{{\"id\":\"{s}\",\"data\":\"{s}\",\"expires_at\":{d},\"transcript\":{s}}}", .{ &audio_id, data, nowSecs(stream.io) + speech_api.Store.TTL_SECS, escaped_text });
     }
 
-    const response = try formatChatReply(allocator, stream.io, model_name, .{ .content = if (speech != null) "null" else escaped_text, .reasoning = reasoning_json, .audio = audio_field }, logprobs_json, finish_reason, result, .{ .reasoning_tokens = reasoning_tokens, .audio = audio_details }, timings_field);
+    const response = try formatChatReply(allocator, stream.io, model_name, .{ .content = if (speech != null) "null" else escaped_text, .reasoning = reasoning_json, .audio = audio_field }, logprobs_json, finish_reason, result, .{ .reasoning_tokens = reasoning_tokens, .audio = audio_details }, timings_field, usageTokenIds(stream, result));
     defer allocator.free(response);
 
     try sendResponse(stream, "200 OK", "application/json", response);
+}
+
+/// The ids an opted-in reply's usage carries: the prompt the handler served and what this result generated.
+fn usageTokenIds(stream: *const Conn, result: request_mod.GenerationResult) ?@import("format.zig").TokenIds {
+    if (!stream.return_token_ids) return null;
+    return .{ .prompt = stream.usage_prompt_ids[0..@min(result.prompt_tokens, stream.usage_prompt_ids.len)], .generated = result.token_ids };
 }
 
 /// The non-stream reply. `message` is encoded already: the content value, the `reasoning_content` and audio fields or
@@ -1357,13 +1375,16 @@ fn formatChatReply(
     result: request_mod.GenerationResult,
     details: struct { reasoning_tokens: u32, audio: []const u8 },
     timings_field: []const u8,
+    ids: ?@import("format.zig").TokenIds,
 ) ![]u8 {
     const usage = if (details.audio.len > 0)
         try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, details.audio)
     else
         try formatChatUsageWithReasoning(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, details.reasoning_tokens);
     defer allocator.free(usage);
-    const request_usage = try @import("format.zig").chatUsageRequestId(allocator, usage, result.request_id);
+    const tagged_usage = try @import("format.zig").chatUsageRequestId(allocator, usage, result.request_id);
+    defer allocator.free(tagged_usage);
+    const request_usage = try @import("format.zig").chatUsageTokenIds(allocator, tagged_usage, ids);
     defer allocator.free(request_usage);
     return std.fmt.allocPrint(allocator,
         \\{{"id":"{f}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
@@ -1381,10 +1402,13 @@ fn formatToolCallReply(
     result: request_mod.GenerationResult,
     reasoning_tokens: u32,
     timings_field: []const u8,
+    ids: ?@import("format.zig").TokenIds,
 ) ![]u8 {
     const usage = try formatChatUsageWithReasoning(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, reasoning_tokens);
     defer allocator.free(usage);
-    const request_usage = try @import("format.zig").chatUsageRequestId(allocator, usage, result.request_id);
+    const tagged_usage = try @import("format.zig").chatUsageRequestId(allocator, usage, result.request_id);
+    defer allocator.free(tagged_usage);
+    const request_usage = try @import("format.zig").chatUsageTokenIds(allocator, tagged_usage, ids);
     defer allocator.free(request_usage);
     const finish = toolCallFinishReason(finish_reason);
     return std.fmt.allocPrint(allocator,
@@ -1400,7 +1424,7 @@ test "a tool-call reply's usage reports its reasoning tokens" {
     defer arena.deinit();
     const a = arena.allocator();
     const result: request_mod.GenerationResult = .{ .text = &.{}, .token_ids = &.{}, .prompt_tokens = 1000, .completion_tokens = 50, .finish_reason = "stop", .prefill_tps = 0, .decode_tps = 0 };
-    const json = try formatToolCallReply(a, testing.io, "m", .{ .content = "null", .reasoning = "", .tool_calls = "[]" }, "stop", result, 40, "");
+    const json = try formatToolCallReply(a, testing.io, "m", .{ .content = "null", .reasoning = "", .tool_calls = "[]" }, "stop", result, 40, "", null);
     const usage = (try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{})).object.get("usage").?.object;
     try testing.expectEqual(@as(?i64, 40), if (usage.get("completion_tokens_details")) |d| d.object.get("reasoning_tokens").?.integer else null);
 }
@@ -1411,7 +1435,7 @@ test "a reply's usage caps its re-encoded reasoning tokens at completion_tokens"
     defer arena.deinit();
     const a = arena.allocator();
     const result: request_mod.GenerationResult = .{ .text = &.{}, .token_ids = &.{}, .prompt_tokens = 1000, .completion_tokens = 50, .finish_reason = "stop", .prefill_tps = 0, .decode_tps = 0 };
-    const json = try formatChatReply(a, testing.io, "m", .{ .content = "\"ok\"", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 51, .audio = "" }, "");
+    const json = try formatChatReply(a, testing.io, "m", .{ .content = "\"ok\"", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 51, .audio = "" }, "", null);
     const usage = (try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{})).object.get("usage").?.object;
     try testing.expectEqual(@as(?i64, 50), if (usage.get("completion_tokens_details")) |d| d.object.get("reasoning_tokens").?.integer else null);
 }
@@ -1423,7 +1447,7 @@ test "request id: nonstream chat header and usage match the response id" {
     const raw = try @import("../media_jobs/plugin/test_conn.zig").capture(a, struct {
         fn run(conn: *Conn, al: std.mem.Allocator) !void {
             const result: request_mod.GenerationResult = .{ .request_id = 73, .text = &.{}, .token_ids = &.{}, .prompt_tokens = 10, .completion_tokens = 2, .finish_reason = "stop", .prefill_tps = 0, .decode_tps = 0 };
-            const reply = try formatChatReply(al, std.testing.io, "m", .{ .content = "\"ok\"", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 0, .audio = "" }, "");
+            const reply = try formatChatReply(al, std.testing.io, "m", .{ .content = "\"ok\"", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 0, .audio = "" }, "", null);
             conn.chat_request_id = result.request_id;
             try sendResponse(conn, "200 OK", "application/json", reply);
         }
@@ -1445,9 +1469,9 @@ test "request id: text tool and audio usage carry the response id" {
     const a = arena.allocator();
     const result: request_mod.GenerationResult = .{ .request_id = 73, .text = &.{}, .token_ids = &.{}, .prompt_tokens = 10, .completion_tokens = 2, .finish_reason = "stop", .prefill_tps = 0, .decode_tps = 0 };
     const replies = [_][]const u8{
-        try formatChatReply(a, std.testing.io, "m", .{ .content = "\"ok\"", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 1, .audio = "" }, ""),
-        try formatToolCallReply(a, std.testing.io, "m", .{ .content = "null", .reasoning = "", .tool_calls = "[]" }, "stop", result, 1, ""),
-        try formatChatReply(a, std.testing.io, "m", .{ .content = "null", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 0, .audio = ",\"completion_tokens_details\":{\"audio_tokens\":2}" }, ""),
+        try formatChatReply(a, std.testing.io, "m", .{ .content = "\"ok\"", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 1, .audio = "" }, "", null),
+        try formatToolCallReply(a, std.testing.io, "m", .{ .content = "null", .reasoning = "", .tool_calls = "[]" }, "stop", result, 1, "", null),
+        try formatChatReply(a, std.testing.io, "m", .{ .content = "null", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 0, .audio = ",\"completion_tokens_details\":{\"audio_tokens\":2}" }, "", null),
     };
     for (replies) |reply| {
         const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, reply, .{})).object;

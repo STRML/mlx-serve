@@ -33,6 +33,7 @@ pub const Api = struct {
     request_id: *const fn (*const Slot) u64,
     complete: *const fn (*Scheduler, *Slot) void,
     cancel: *const fn (*Slot) void,
+    request_stop: *const fn (*Slot) void,
     // ── models
     ensure_loaded: *const fn (*Scheduler, []const u8, *?*LoadedModel) Err,
     release: *const fn (*Scheduler, *LoadedModel) void,
@@ -300,6 +301,15 @@ pub const Running = struct {
     pub fn done(self: Running) void {
         api().complete(self.sch, self.slot);
         self.stream.release();
+    }
+
+    pub fn requestStop(self: Running) void {
+        api().request_stop(self.slot);
+    }
+
+    /// Authoritative tokens emitted by the engine; borrow after `.done` and before `done()`.
+    pub fn emittedIds(self: Running) []const u32 {
+        return self.stream.emittedIds();
     }
 };
 

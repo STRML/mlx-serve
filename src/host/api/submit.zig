@@ -15,12 +15,14 @@ const LoadedModel = model_registry_mod.LoadedModel;
 const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
+const Stream = @import("../engines/stream.zig").Stream;
 const resolveKvAttnFused = @import("request_options.zig").resolveKvAttnFused;
 const mtpCapable = @import("request_options.zig").mtpCapable;
 const decodeTokens = @import("tokenize.zig").decodeTokens;
 const loopTrimmedIds = @import("../chat/tools/pipeline.zig").loopTrimmedIds;
 const slotFailure = @import("../http/errors.zig").slotFailure;
 const nonStreamFinishReason = @import("../chat/stops.zig").nonStreamFinishReason;
+const sendStreamKeepalive = @import("../http/sse.zig").sendStreamKeepalive;
 const MropeData = @import("../media/encode.zig").MropeData;
 const SpeechRequest = @import("../../sdk/request/speech.zig").Request;
 
@@ -194,14 +196,11 @@ pub fn nonStreamingViaScheduler(
     };
 }
 
-fn collectOutput(allocator: std.mem.Allocator, slot: *@import("../engines/stream.zig").Stream, conn: ?*Conn, output_ids: *std.ArrayList(u32), request_id: ?*u64) !bool {
+fn collectOutput(allocator: std.mem.Allocator, slot: *Stream, conn: ?*Conn, output_ids: *std.ArrayList(u32), request_id: ?*u64) !bool {
     if (request_id) |out| out.* = slot.request_id;
     var client_gone = false;
     wait: while (true) {
         const nr = slot.waitNextTimeout(Conn.STREAM_KEEPALIVE_MS) orelse {
-            // Idle (long prefill). If the client is gone, cancel and serve
-            // whatever accumulated — the response write will fail upstream,
-            // which is fine; the win is freeing the GPU.
             if (conn) |c| {
                 if (c.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting (non-stream) — cancelling slot\n", .{});
@@ -226,8 +225,29 @@ fn collectOutput(allocator: std.mem.Allocator, slot: *@import("../engines/stream
             }
         }
     }
-
     return client_gone;
+}
+
+/// Drains a stopped stream until the engine sends `.done` (sending SSE keepalives on idle).
+pub fn waitForDone(slot: *Stream, conn: ?*Conn) !bool {
+    while (true) {
+        const next = slot.waitNextTimeout(Conn.STREAM_KEEPALIVE_MS);
+        if (next) |nr| switch (nr) {
+            .token => {},
+            .done => return true,
+            .err => return slotFailure(slot),
+        };
+        const c = conn orelse continue;
+        if (c.peerClosed()) {
+            log.info("  [cancel] client disconnected while waiting for stop\n", .{});
+            slot.cancel();
+            return false;
+        }
+        if (next == null and c.sse_headers_sent) sendStreamKeepalive(c) catch {
+            slot.cancel();
+            return false;
+        };
+    }
 }
 
 test "request id: nonstream slot failure returns a correlated HTTP error" {
@@ -240,7 +260,7 @@ test "request id: nonstream slot failure returns a correlated HTTP error" {
     source.request_id = 73;
     source.markError("DistWorkerLeft");
     const raw = try @import("../media_jobs/plugin/test_conn.zig").capture(a, struct {
-        fn run(conn: *Conn, alloc: std.mem.Allocator, slot: *@import("../engines/stream.zig").Stream) !void {
+        fn run(conn: *Conn, alloc: std.mem.Allocator, slot: *Stream) !void {
             var ids: std.ArrayList(u32) = .empty;
             defer ids.deinit(alloc);
             _ = collectOutput(alloc, slot, conn, &ids, &conn.chat_request_id) catch |err| {

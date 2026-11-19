@@ -38,10 +38,27 @@ const loopGuardTick = @import("loop_stop.zig").loopGuardTick;
 
 var kv_skew_split_logged: bool = false; // one-shot log guard
 
-pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+fn finishRequestedStops(sch: *Scheduler, slots: []*Slot) []*Slot {
+    var active = slots;
+    var i: usize = 0;
+    while (i < active.len) {
+        const slot = active[i];
+        // An early prefill token still needs its first decode round to commit.
+        if (!slot.stop_requested.load(.acquire) or slot.early_first != null) {
+            i += 1;
+            continue;
+        }
+        finishSlot(sch, slot, "stop");
+        std.mem.swap(*Slot, &active[i], &active[active.len - 1]);
+        active = active[0 .. active.len - 1];
+    }
+    return active;
+}
+
+pub fn runDecodeTick(sch: *Scheduler, slots: []*Slot) !void {
+    const active = finishRequestedStops(sch, slots);
     const dist_scope = @import("cluster/distributed.zig").scopeRequests(active);
     defer dist_scope.restore();
-    if (active.len == 0) return;
 
     // Publish the in-flight generated-token aggregate for the gauge sampler.
     // Runs after the whole tick (all decode work + any finishSlot calls) on
@@ -49,6 +66,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // and O(active), never per token. Finished slots are excluded, so the last
     // slot's completion drives this to 0 (live == total at rest).
     defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
+    if (active.len == 0) return;
 
     // Contention discipline for the spec cost model's kv term: it learns
     // from realized round times, and contention only ever ADDS time. Rather
@@ -417,6 +435,7 @@ test "request id: single MTP slot reaches the round entry and restores its reque
     slot.finished = false;
     slot.error_code = null;
     slot.cancelled = std.atomic.Value(bool).init(false);
+    slot.stop_requested = .init(false);
     slot.completion_tokens = 0;
     var sch: Scheduler = undefined;
     sch.force_batched = false;

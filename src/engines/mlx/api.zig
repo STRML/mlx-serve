@@ -30,6 +30,7 @@ pub const table: host.Api = .{
     .request_id = requestId,
     .complete = complete,
     .cancel = cancel,
+    .request_stop = requestStop,
     .ensure_loaded = ensureLoaded,
     .release = scheduler.release,
     .release_status = scheduler.releaseStatus,
@@ -120,6 +121,12 @@ fn complete(sch: *Scheduler, slot: *Slot) void {
 fn cancel(slot: *Slot) void {
     slot.cancel();
 }
+
+fn requestStop(slot: *Slot) void {
+    if (slot.model.engine != null) return @import("runtime/offload.zig").cancel(slot);
+    slot.stop_requested.store(true, .release);
+}
+
 
 fn ensureLoaded(sch: *Scheduler, id: []const u8, out: *?*LoadedModel) ?[]const u8 {
     out.* = scheduler.ensureLoaded(sch, id) catch |e| return @errorName(e);
