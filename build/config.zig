@@ -39,13 +39,42 @@ fn macosFrameworks(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 
     return b.fmt("{s}/System/Library/Frameworks", .{sdk});
 }
 
-/// Build identity (`build_options.build_id`): HEAD SHA, `<sha>-dirty` on uncommitted superproject or
-/// submodule-pointer changes, or `"unknown"` when git metadata is unavailable.
-/// Ignores dirty submodule working-tree files (`--ignore-submodules=dirty`) so `scripts/build-mlx.sh`
-/// patching `lib/mlx-src` / `lib/mlxc-src` on a cache miss does not mark an identical commit `-dirty`.
+/// Build identity (`build_options.build_id`): HEAD SHA, `<sha>-dirty` on uncommitted tracked repo
+/// changes, dirty non-MLX submodules, or moved submodule HEAD pointers, or `"unknown"` when git
+/// metadata is unavailable. Excludes untracked build artifacts (e.g. `cuda-keyring_*.deb`, `dist/`)
+/// and working-tree patches applied by `scripts/build-mlx.sh` inside `lib/mlx-src` and `lib/mlxc-src`.
 pub fn readBuildId(b: *std.Build, git_sha: []const u8) []const u8 {
     b.graph.poisonCache();
     return resolveBuildId(b.allocator, b.graph.io, buildRootHandle(b), git_sha) catch "unknown";
+}
+
+fn runGitQuery(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, argv: []const []const u8, stdout_limit: usize) ?[]u8 {
+    const res = std.process.run(allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .dir = root },
+        .stdout_limit = .limited(stdout_limit),
+        .stderr_limit = .limited(4096),
+    }) catch return null;
+    allocator.free(res.stderr);
+    switch (res.term) {
+        .exited => |code| if (code != 0) {
+            allocator.free(res.stdout);
+            return null;
+        },
+        else => {
+            allocator.free(res.stdout);
+            return null;
+        },
+    }
+    return res.stdout;
+}
+
+fn submoduleHeadMoved(stdout: []const u8) bool {
+    var lines = std.mem.tokenizeScalar(u8, stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0 and (line[0] == '+' or line[0] == 'U')) return true;
+    }
+    return false;
 }
 
 fn resolveBuildId(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, git_sha: []const u8) ![]u8 {
@@ -53,36 +82,24 @@ fn resolveBuildId(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir, gi
     const sha: []const u8 = if (isGitSha(git_sha))
         try allocator.dupe(u8, git_sha)
     else blk: {
-        const res = std.process.run(allocator, io, .{
-            .argv = &.{ "git", "rev-parse", "--verify", "HEAD" },
-            .cwd = .{ .dir = root },
-            .stdout_limit = .limited(256),
-            .stderr_limit = .limited(4096),
-        }) catch return allocator.dupe(u8, "unknown");
-        defer allocator.free(res.stderr);
-        defer allocator.free(res.stdout);
-        switch (res.term) {
-            .exited => |code| if (code != 0) return allocator.dupe(u8, "unknown"),
-            else => return allocator.dupe(u8, "unknown"),
-        }
-        break :blk try allocator.dupe(u8, std.mem.trim(u8, res.stdout, " \t\r\n"));
+        const out = runGitQuery(allocator, io, root, &.{ "git", "rev-parse", "--verify", "HEAD" }, 256) orelse return allocator.dupe(u8, "unknown");
+        defer allocator.free(out);
+        break :blk try allocator.dupe(u8, std.mem.trim(u8, out, " \t\r\n"));
     };
     defer allocator.free(sha);
     if (!isGitSha(sha)) return allocator.dupe(u8, "unknown");
 
-    const status = std.process.run(allocator, io, .{
-        .argv = &.{ "git", "--no-optional-locks", "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=dirty" },
-        .cwd = .{ .dir = root },
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(4096),
-    }) catch return allocator.dupe(u8, "unknown");
-    defer allocator.free(status.stderr);
-    defer allocator.free(status.stdout);
-    switch (status.term) {
-        .exited => |code| if (code != 0) return allocator.dupe(u8, "unknown"),
-        else => return allocator.dupe(u8, "unknown"),
-    }
-    return if (status.stdout.len == 0) allocator.dupe(u8, sha) else std.fmt.allocPrint(allocator, "{s}-dirty", .{sha});
+    const status = runGitQuery(allocator, io, root, &.{
+        "git", "--no-optional-locks", "status", "--porcelain", "--untracked-files=no", "--ignore-submodules=none", "--", ".", ":(exclude)lib/mlx-src", ":(exclude)lib/mlxc-src",
+    }, 1024 * 1024) orelse return allocator.dupe(u8, "unknown");
+    defer allocator.free(status);
+    if (status.len != 0) return std.fmt.allocPrint(allocator, "{s}-dirty", .{sha});
+
+    const sub_status = runGitQuery(allocator, io, root, &.{
+        "git", "--no-optional-locks", "submodule", "status",
+    }, 64 * 1024) orelse return allocator.dupe(u8, "unknown");
+    defer allocator.free(sub_status);
+    return if (submoduleHeadMoved(sub_status)) std.fmt.allocPrint(allocator, "{s}-dirty", .{sha}) else allocator.dupe(u8, sha);
 }
 
 fn isGitSha(sha: []const u8) bool {
@@ -419,7 +436,16 @@ fn runGit(allocator: std.mem.Allocator, io: std.Io, cwd: std.Io.Dir, argv: []con
     return res.stdout;
 }
 
-test "build config: resolveBuildId ignores patched submodule working trees while flagging real repo and submodule pointer changes" {
+fn initTestRepo(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, file: []const u8, msg: []const u8) !void {
+    allocator.free(try runGit(allocator, io, dir, &.{ "git", "init" }));
+    allocator.free(try runGit(allocator, io, dir, &.{ "git", "config", "user.name", "Test" }));
+    allocator.free(try runGit(allocator, io, dir, &.{ "git", "config", "user.email", "test@example.com" }));
+    try dir.writeFile(io, .{ .sub_path = file, .data = "base\n" });
+    allocator.free(try runGit(allocator, io, dir, &.{ "git", "add", file }));
+    allocator.free(try runGit(allocator, io, dir, &.{ "git", "-c", "commit.gpgsign=false", "commit", "-m", msg }));
+}
+
+test "build config: resolveBuildId ignores MLX patches and untracked artifacts while flagging repo, embedded-submodule, and pointer edits" {
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -428,31 +454,29 @@ test "build config: resolveBuildId ignores patched submodule working trees while
     defer t.allocator.free(no_git);
     try t.expectEqualStrings("unknown", no_git);
 
-    try tmp.dir.createDir(t.io, "sub_origin", .default_dir);
-    var sub_origin = try tmp.dir.openDir(t.io, "sub_origin", .{});
-    defer sub_origin.close(t.io);
-    t.allocator.free(try runGit(t.allocator, t.io, sub_origin, &.{ "git", "init" }));
-    t.allocator.free(try runGit(t.allocator, t.io, sub_origin, &.{ "git", "config", "user.name", "Test" }));
-    t.allocator.free(try runGit(t.allocator, t.io, sub_origin, &.{ "git", "config", "user.email", "test@example.com" }));
-    try sub_origin.writeFile(t.io, .{ .sub_path = "patch_target.txt", .data = "base\n" });
-    t.allocator.free(try runGit(t.allocator, t.io, sub_origin, &.{ "git", "add", "patch_target.txt" }));
-    t.allocator.free(try runGit(t.allocator, t.io, sub_origin, &.{ "git", "commit", "-m", "sub init" }));
+    try tmp.dir.createDir(t.io, "sub_mlx_origin", .default_dir);
+    var sub_mlx_origin = try tmp.dir.openDir(t.io, "sub_mlx_origin", .{});
+    defer sub_mlx_origin.close(t.io);
+    try initTestRepo(t.allocator, t.io, sub_mlx_origin, "patch_target.txt", "mlx init");
+
+    try tmp.dir.createDir(t.io, "sub_ds4_origin", .default_dir);
+    var sub_ds4_origin = try tmp.dir.openDir(t.io, "sub_ds4_origin", .{});
+    defer sub_ds4_origin.close(t.io);
+    try initTestRepo(t.allocator, t.io, sub_ds4_origin, "ds4.c", "ds4 init");
 
     try tmp.dir.createDir(t.io, "repo", .default_dir);
     var repo = try tmp.dir.openDir(t.io, "repo", .{});
     defer repo.close(t.io);
-    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "init" }));
-    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "config", "user.name", "Test" }));
-    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "config", "user.email", "test@example.com" }));
-    try repo.writeFile(t.io, .{ .sub_path = "main.zig", .data = "// base\n" });
-    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "add", "main.zig" }));
-    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "commit", "-m", "init" }));
-    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", "../sub_origin", "lib/mlx-src" }));
-    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "commit", "-m", "add sub" }));
+    try initTestRepo(t.allocator, t.io, repo, "main.zig", "init");
+    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", "../sub_mlx_origin", "lib/mlx-src" }));
+    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "-c", "protocol.file.allow=always", "submodule", "add", "../sub_ds4_origin", "lib/ds4" }));
+    t.allocator.free(try runGit(t.allocator, t.io, repo, &.{ "git", "-c", "commit.gpgsign=false", "commit", "-m", "add submodules" }));
 
     const head_raw = try runGit(t.allocator, t.io, repo, &.{ "git", "rev-parse", "--verify", "HEAD" });
     defer t.allocator.free(head_raw);
     const head_sha = std.mem.trim(u8, head_raw, " \t\r\n");
+    const expected_dirty = try std.fmt.allocPrint(t.allocator, "{s}-dirty", .{head_sha});
+    defer t.allocator.free(expected_dirty);
 
     const clean = try resolveBuildId(t.allocator, t.io, repo, "");
     defer t.allocator.free(clean);
@@ -463,33 +487,39 @@ test "build config: resolveBuildId ignores patched submodule working trees while
     defer t.allocator.free(overridden);
     try t.expectEqualStrings(override_sha, overridden);
 
-    // Submodule working-tree patches (e.g. build-mlx.sh) must not mark the build -dirty.
-    var sub = try repo.openDir(t.io, "lib/mlx-src", .{});
-    defer sub.close(t.io);
-    try sub.writeFile(t.io, .{ .sub_path = "patch_target.txt", .data = "patched\n" });
-    try sub.writeFile(t.io, .{ .sub_path = "untracked_patch_artifact.txt", .data = "tmp\n" });
-    const patched_sub = try resolveBuildId(t.allocator, t.io, repo, "");
-    defer t.allocator.free(patched_sub);
-    try t.expectEqualStrings(head_sha, patched_sub);
+    // Untracked release-script artifacts (e.g. cuda-keyring_*.deb, dist/) and MLX submodule patches stay clean.
+    try repo.writeFile(t.io, .{ .sub_path = "cuda-keyring_1.1-1_all.deb", .data = "deb\n" });
+    var sub_mlx = try repo.openDir(t.io, "lib/mlx-src", .{});
+    defer sub_mlx.close(t.io);
+    try sub_mlx.writeFile(t.io, .{ .sub_path = "patch_target.txt", .data = "patched\n" });
+    const patched_mlx = try resolveBuildId(t.allocator, t.io, repo, "");
+    defer t.allocator.free(patched_mlx);
+    try t.expectEqualStrings(head_sha, patched_mlx);
 
-    // Moving the submodule HEAD without committing the pointer in the superproject IS -dirty.
-    t.allocator.free(try runGit(t.allocator, t.io, sub, &.{ "git", "config", "user.name", "Test" }));
-    t.allocator.free(try runGit(t.allocator, t.io, sub, &.{ "git", "config", "user.email", "test@example.com" }));
-    t.allocator.free(try runGit(t.allocator, t.io, sub, &.{ "git", "add", "patch_target.txt" }));
-    t.allocator.free(try runGit(t.allocator, t.io, sub, &.{ "git", "commit", "-m", "move sub head" }));
+    // Dirty embedded submodule code (lib/ds4) must still flag -dirty.
+    var sub_ds4 = try repo.openDir(t.io, "lib/ds4", .{});
+    defer sub_ds4.close(t.io);
+    try sub_ds4.writeFile(t.io, .{ .sub_path = "ds4.c", .data = "edited\n" });
+    const dirty_ds4 = try resolveBuildId(t.allocator, t.io, repo, "");
+    defer t.allocator.free(dirty_ds4);
+    try t.expectEqualStrings(expected_dirty, dirty_ds4);
+    t.allocator.free(try runGit(t.allocator, t.io, sub_ds4, &.{ "git", "checkout", "--", "ds4.c" }));
+
+    // Moving lib/mlx-src HEAD without committing the pointer in the superproject IS -dirty.
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlx, &.{ "git", "config", "user.name", "Test" }));
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlx, &.{ "git", "config", "user.email", "test@example.com" }));
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlx, &.{ "git", "add", "patch_target.txt" }));
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlx, &.{ "git", "-c", "commit.gpgsign=false", "commit", "-m", "move sub head" }));
     const dirty_ptr = try resolveBuildId(t.allocator, t.io, repo, "");
     defer t.allocator.free(dirty_ptr);
-    const expected_dirty = try std.fmt.allocPrint(t.allocator, "{s}-dirty", .{head_sha});
-    defer t.allocator.free(expected_dirty);
     try t.expectEqualStrings(expected_dirty, dirty_ptr);
 
-    // Restore submodule HEAD and dirty the superproject itself -> -dirty.
-    t.allocator.free(try runGit(t.allocator, t.io, sub, &.{ "git", "reset", "--hard", "HEAD~1" }));
-    try sub.deleteFile(t.io, "untracked_patch_artifact.txt");
+    t.allocator.free(try runGit(t.allocator, t.io, sub_mlx, &.{ "git", "reset", "--hard", "HEAD~1" }));
     const restored = try resolveBuildId(t.allocator, t.io, repo, "");
     defer t.allocator.free(restored);
     try t.expectEqualStrings(head_sha, restored);
 
+    // Tracked superproject edit IS -dirty.
     try repo.writeFile(t.io, .{ .sub_path = "main.zig", .data = "// edited\n" });
     const dirty_repo = try resolveBuildId(t.allocator, t.io, repo, "");
     defer t.allocator.free(dirty_repo);
