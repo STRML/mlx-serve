@@ -525,6 +525,8 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     // Before any forward: a position-0 run would reset the live state for rows nobody reads.
     if (f.want_hidden) return Verdict.refuse(.unsupported, "deepseek_v41: no hidden-state output (embeddings)");
     if (f.mode == .batched_rows) return forwardBatched(m, f, out);
+    if (f.rows > config.max_prefill_rows)
+        return Verdict.refuse(.too_large, std.fmt.comptimePrint("deepseek_v41: a forward may use at most {d} rows", .{config.max_prefill_rows}));
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "deepseek_v41: one slot's rows at a time");
     if (f.slots.len == 1) activate(m, f.slots.slice()[0]) catch return Verdict.refuse(.failed, "deepseek_v41: out of memory parking a slot's state");
     const in = v4plugin.Ids.of(f) catch return Verdict.refuse(.failed, "deepseek_v41: the token ids do not read back");

@@ -15,6 +15,39 @@ const sdk = @import("../../sdk/root.zig");
 
 const testing = std.testing;
 const Twin = proof.Twin(v41);
+
+test "dsv41 plugin: 8192 prefill rows run and 8193 are refused before slot activation" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    const ids: [8193]u32 = @splat(3);
+    testing.allocator.free(try slotForward(t, .prefill, &.{1}, ids[0..8192], &.{0}));
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    try testing.expectEqual(@as(usize, 8192), m.mdl.dec_state.?.n);
+    const Cases = [_]struct { mode: abi.Mode, logits: abi.Logits }{
+        .{ .mode = .prefill, .logits = .last_row },
+        .{ .mode = .prefill, .logits = .all_rows },
+        .{ .mode = .verify, .logits = .all_rows },
+    };
+    for (Cases) |c| {
+        var out: abi.ForwardOut = .{};
+        const verdict = v41.table.forward(t.m, &.{
+            .mode = c.mode,
+            .rows = ids.len,
+            .tokens = .of(&ids),
+            .slots = .of(&.{2}),
+            .positions = .of(&.{1}),
+            .logits = c.logits,
+        }, &out);
+        try testing.expectEqual(abi.Verdict.Code.too_large, verdict.code);
+        try testing.expect(std.mem.indexOf(u8, verdict.why.slice(), "8192") != null);
+        try testing.expectEqual(@as(u32, 1), m.owner);
+        try testing.expectEqual(@as(usize, 8192), m.mdl.dec_state.?.n);
+    }
+}
+
 test "deepseek_v41 plugin: prefill, GPU decode, a verify block and a later chunk equal the legacy seam bit for bit" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;

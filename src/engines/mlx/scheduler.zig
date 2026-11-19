@@ -177,18 +177,19 @@ test {
     _ = @import("runtime/preflight.zig");
 }
 
-/// Set by `server.installPrefillAdmission`: does a request of this shape fit in GPU memory
-/// right now? Null (unit tests, no HTTP server) disables evict-to-admit. The trailing warm
-/// arguments are the restored rows, their capacity, and whether the restore checked the
-/// entry out (the only restore whose rows the request will not allocate).
-/// {needed, available} of the same cold bill, for the sibling ledger.
-pub var prefill_admission_numbers: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) [2]u64 = null;
+const WarmPrefix = @import("admission/bills.zig").WarmPrefix;
+const PrefillLimits = @import("admission/prefill_chunk.zig").PrefillLimits;
+pub const PrefillFit = *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, WarmPrefix, PrefillLimits) bool;
 
-pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, u64, u64, bool, bool) bool = null;
+/// {needed, available} of the same cold bill, for the sibling ledger.
+pub var prefill_admission_numbers: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, PrefillLimits) [2]u64 = null;
+
+/// A null hook disables evict-to-admit.
+pub var prefill_admission_fits: ?PrefillFit = null;
 
 /// The prefill width this request should run at, chosen against live post-eviction memory
 /// (`server.requestPrefillChunkNow`). Null keeps the model's load-time pin.
-pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, u64, u64, bool, bool) u32 = null;
+pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, WarmPrefix, PrefillLimits) u32 = null;
 
 /// Asked by the prefill loop: the width of the next chunk, re-priced at every chunk boundary
 /// (`server.adaptivePrefillWidthNow`). Null keeps the admitted width.
@@ -216,7 +217,7 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 ) bool = null;
 
 /// Logs the numbers the estimator compared on a refusal and returns them, {needed, available} bytes.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, u64, u64, bool, bool) [2]u64 = null;
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, WarmPrefix, PrefillLimits) [2]u64 = null;
 
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;

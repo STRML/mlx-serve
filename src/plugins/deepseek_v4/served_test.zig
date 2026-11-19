@@ -334,6 +334,8 @@ const Requests = struct {
         h.sch.max_concurrent = 4;
         h.sch.boundary_depth = 0;
         h.sch.boundary_outer = null;
+        h.sch.promise_ledger = .{};
+        h.sch.gen_reserve_bytes = 0;
         h.sch.hot_prefix_cache = h.entry.prefix_cache;
         h.sch.digest_mu = .init;
         h.sch.hot_cache_digests = &.{};
@@ -435,6 +437,40 @@ fn diskPrompt() [513]u32 {
     var prompt: [513]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast(3 + i % 80);
     return prompt;
+}
+
+test "dsv41 admission: a small merged tail stays within the forward's 4096-row bill" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const cli = @import("../../engines/mlx/generate.zig").prefillCli();
+    const saved = cli.*;
+    defer cli.* = saved;
+    cli.* = .{ .override = 4096, .explicit = true };
+    const v41 = @import("../deepseek_v41/plugin.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&v41.table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    const Recorder = struct {
+        var max_rows: u32 = 0;
+        fn forward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            max_rows = @max(max_rows, f.rows);
+            return v41.forward(m, f, out);
+        }
+    };
+    var table = v41.table;
+    table.forward = &Recorder.forward;
+    const bound = p.xfm.plugin.?;
+    bound.table = &table;
+    defer bound.table = &v41.table;
+    Recorder.max_rows = 0;
+    const prompt: [4097 + 100]u32 = @splat(3);
+    const slot = try h.prefill(&prompt);
+    defer slot.deinit();
+    defer finish_request.releasePluginSlot(slot);
+    try testing.expectEqual(@as(u32, 4096), Recorder.max_rows);
+    try testing.expectEqual(prompt.len, slot.cache.step);
 }
 
 test "deepseek_v41 served: disk import restores exact counters and cold-reference logits" {
@@ -869,9 +905,9 @@ test "deepseek_v41 served: restored state is discarded once when only cold prefi
         var refuse_cold = false;
         var mdl: *@import("../deepseek_v41/deepseek_v41.zig").Dsv41Model = undefined;
         var cache: *prefix_cache.HotPrefixCache = undefined;
-        fn fits(_: *const model.ModelConfig, _: usize, _: u32, _: KVQuantConfig, n: u64, _: u64, _: bool, _: bool) bool {
+        fn fits(_: *const model.ModelConfig, _: usize, _: u32, _: KVQuantConfig, warm: @import("../../engines/mlx/admission/bills.zig").WarmPrefix, _: @import("../../engines/mlx/admission/prefill_chunk.zig").PrefillLimits) bool {
             calls += 1;
-            return n == 0 and mdl.dec_state.?.n == 0 and cache.entries.items.len == 0 and !refuse_cold;
+            return warm.matched_tokens == 0 and mdl.dec_state.?.n == 0 and cache.entries.items.len == 0 and !refuse_cold;
         }
     };
     const old = scheduler.prefill_admission_fits;

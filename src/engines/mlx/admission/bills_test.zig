@@ -1549,7 +1549,7 @@ test "prefillAdmissionBill: every arch carries the evict-to-admit credits (#492)
         var cfg = qwen4ExpOomConfig();
         cfg.model_type = mt;
         cfg.legacy.caps.long_ctx = std.mem.eql(u8, cfg.model_type, "qwen4_exp");
-        const bill = prefillAdmissionBill(&cfg, 100_000, 2048, null, null, .{});
+        const bill = prefillAdmissionBill(&cfg, 100_000, 2048, null, null, .{}, .{});
         try t.expectEqual(9000 * MB, bill.evictable);
         try t.expectEqual(8000 * MB, bill.reclaimable);
     }

@@ -190,6 +190,13 @@ pub fn cappedEnd(pos: usize, end: usize, max_rows: usize) usize {
     return if (max_rows == 0) end else @min(end, pos + max_rows);
 }
 
+/// Row cap for a merged tail when an arch declares a maximum prefill width (`ModelConfig.prefillWidths().max`):
+/// never wider than the chunk admission billed (`chunk`), nor wider than `arch_max`. `0` (no arch limit) keeps
+/// the unmerged-tail behavior of other models untouched.
+pub fn billedTailCap(chunk: usize, arch_max: usize) usize {
+    return if (arch_max == 0) 0 else @min(chunk, arch_max);
+}
+
 /// A prefill width under the decode share's cap (0 = no cap).
 pub fn decodeShareCapped(width: usize, cap: usize) usize {
     return if (cap == 0) width else @min(width, cap);
@@ -546,6 +553,12 @@ test "cappedEnd: a merged tail never carries a DeepSeek-V4.1 chunk past 8192 row
     try testing.expectEqual(@as(usize, 8192), cappedEnd(0, end, max));
     try testing.expectEqual(@as(usize, 8192 + 100), cappedEnd(0, end, 0));
     try testing.expectEqual(@as(usize, 4096 + 8192), cappedEnd(4096, 4096 + 8192 + 100, max));
+    // A 4096-billed dsv41 chunk must also bound its merged tail at 4096, while models without an arch limit stay uncapped.
+    const cap4k = billedTailCap(4096, max);
+    try testing.expectEqual(@as(usize, 4096), cap4k);
+    try testing.expectEqual(@as(usize, 8192), billedTailCap(16_384, max));
+    try testing.expectEqual(@as(usize, 0), billedTailCap(4096, 0));
+    try testing.expectEqual(@as(usize, 4096), cappedEnd(0, nextChunkEnd(0, 4096 + 100, 4096, false, 0, 0, false, false), cap4k));
     var p = try wholePromptPlan(testing.allocator, 8192 + 101, 8192, max, false, 0, 0, false, false, .{});
     defer p.deinit(testing.allocator);
     var prev: u64 = 0;

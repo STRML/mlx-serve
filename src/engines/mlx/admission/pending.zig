@@ -8,7 +8,11 @@ const testing = std.testing;
 
 const holdsForMemory = @import("../batching/verdict.zig").holdsForMemory;
 const admissionFits = @import("../batching/verdict.zig").admissionFits;
+const admissionClaims = @import("../batching/verdict.zig").admissionClaims;
 const liveDecodingCount = @import("../batching/verdict.zig").liveDecodingCount;
+const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
+const PrefillLimits = @import("prefill_chunk.zig").PrefillLimits;
+const interleave = @import("../prefill_interleave.zig");
 const Scheduler = @import("../scheduler.zig").Scheduler;
 const Slot = @import("../slot.zig").Slot;
 const scheduler_mod = @import("../scheduler.zig");
@@ -20,12 +24,15 @@ pub fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     if (slot.model.transformer == null) return false;
     const numbers_fn = scheduler_mod.prefill_admission_numbers orelse return false;
     // A prefill hosting a nested admission holds memory but is in no list: it is company too.
-    const live = liveDecodingCount(sch) + @intFromBool(sch.boundary_outer != null);
+    const decoders = liveDecodingCount(sch);
+    const live = decoders + @intFromBool(sch.boundary_outer != null);
     if (live == 0) sch.promise_ledger = .{};
-    const bill = numbers_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, slot.enable_mtp);
     var active_now: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_now);
-    const fits = admissionFits(bill[0], bill[1], sch.promise_ledger.outstanding(active_now), sch.gen_reserve_bytes, live);
+    const promised = sch.promise_ledger.outstanding(active_now);
+    const limits = if (cfg.residentDsv41()) dsv41Limits(sch, slot, cfg, decoders, promised) else PrefillLimits{};
+    const bill = numbers_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, slot.enable_mtp, limits);
+    const fits = admissionFits(bill[0], bill[1], promised, sch.gen_reserve_bytes, live);
     if (!holdsForMemory(fits, live > 0 or sch.gen_reserve_bytes > 0)) {
         if (slot.memory_promised == 0) {
             slot.memory_promised = bill[0];
@@ -38,6 +45,25 @@ pub fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
         log.info("[admission] held: {d} tokens do not fit beside {d} live request(s) and {d} MB of media job; waiting for one to finish\n", .{ slot.full_prompt.len, live, sch.gen_reserve_bytes >> 20 });
     }
     return true;
+}
+
+pub fn slotPrefillLimits(sch: *Scheduler, slot: *const Slot, cfg: *const ModelConfig) PrefillLimits {
+    if (!cfg.residentDsv41()) return .{};
+    var active_now: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_now);
+    var ledger = sch.promise_ledger;
+    ledger.release(slot.memory_promised);
+    return dsv41Limits(sch, slot, cfg, liveDecodingCount(sch), ledger.outstanding(active_now));
+}
+
+fn dsv41Limits(sch: *Scheduler, slot: *const Slot, cfg: *const ModelConfig, decoders: usize, promised: u64) PrefillLimits {
+    const beside = cfg.prefillWidths().beside_decode;
+    var cap = interleave.decodeShareAdmissionCap(decoders, interleave.prefillDecodeShare(), beside);
+    if (!generate_mod.prefillCli().explicit and scheduler_mod.decodingCount(sch) > 0) cap = beside;
+    return .{
+        .extra_bytes = admissionClaims(promised, sch.gen_reserve_bytes, decoders + @intFromBool(sch.boundary_outer != null)),
+        .width_cap = interleave.promptLogprobsWidthCap(slot.prompt_logprobs, cap),
+    };
 }
 
 /// One pending-drain candidate (or live decoding slot), reduced to what

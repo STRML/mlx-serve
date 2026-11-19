@@ -33,6 +33,7 @@ const commitAdaptiveWidth = @import("prefill_chunk.zig").commitAdaptiveWidth;
 const countSpliceRows = @import("prefill_chunk.zig").countSpliceRows;
 const decodeShareCapped = @import("prefill_chunk.zig").decodeShareCapped;
 const archCapped = @import("prefill_chunk.zig").archCapped;
+const billedTailCap = @import("prefill_chunk.zig").billedTailCap;
 const cappedEnd = @import("prefill_chunk.zig").cappedEnd;
 const dsparkArmFor = @import("../spec/dspark.zig").dsparkArmFor;
 const dsparkEnabled = @import("../spec/dspark.zig").dsparkEnabled;
@@ -448,7 +449,7 @@ pub fn initWithOptions(
             // chunk-locally. Boundary alignment is in ABSOLUTE position
             // (pos + offset), so the saved snapshot list is correct for
             // the full prompt, not the truncated tail.
-            const end = cappedEnd(pos, nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid), xfm.config.prefillWidths().max);
+            const end = cappedEnd(pos, nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid), billedTailCap(cur_chunk, xfm.config.prefillWidths().max));
             if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
             const chunk_len: c_int = @intCast(end - pos);
             const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -759,7 +760,7 @@ pub fn initWithOptions(
     var prompt_cps: PromptCheckpoints = undefined;
     var prompt_cp_sink: CheckpointSink = undefined;
     if (final_start == 0 and tail_len > 1) {
-        whole_plan = try wholePromptPlan(allocator, prompt_ids.len, PREFILL_CHUNK, xfm.config.prefillWidths().max, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, options.adaptive_chunk_width, dense_low_grid, .{
+        whole_plan = try wholePromptPlan(allocator, prompt_ids.len, PREFILL_CHUNK, billedTailCap(PREFILL_CHUNK, xfm.config.prefillWidths().max), want_ssm_cp, ssm_cp_stride, ssm_cp_offset, options.adaptive_chunk_width, dense_low_grid, .{
             .max = options.ssm_checkpoint_max,
             .thin = cp_thin,
             .low_anchors = options.ssm_low_anchors,

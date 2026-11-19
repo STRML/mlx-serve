@@ -1004,11 +1004,12 @@ pub const ModelConfig = struct {
         return n;
     }
 
-    /// Whether the prefill chunk is resolved per request (by the admission bill) instead of
-    /// once at load. qwen4_exp only: a 1M session's load-time reserve pins every ordinary
-    /// prompt to a narrow rung.
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
-        return self.longCtxGated();
+        return self.longCtxGated() or self.residentDsv41();
+    }
+
+    pub fn residentDsv41(self: *const ModelConfig) bool {
+        return self.isDsv41() and !self.caps().streamed_weights;
     }
 
     /// V4.1's layers split with a worker Mac: the worker keeps ONE decode state and its exchange names no slot, so the
@@ -1024,10 +1025,12 @@ pub const ModelConfig = struct {
     /// The prompt chunk widths the arch's prompt pass wants (0 = the engine's): `max` the widest it gains from,
     /// `beside_decode` the narrowest it runs while others decode. DeepSeek-V4.1's chunk replays a window through its
     /// decoder layers and reads their whole expert banks, so it peaks at 8192 and a narrow chunk pays that read again.
-    pub const PrefillWidths = struct { max: u32 = 0, beside_decode: u32 = 0 };
+    pub const PrefillWidths = struct { min: u32 = 0, max: u32 = 0, beside_decode: u32 = 0 };
 
     pub fn prefillWidths(self: *const ModelConfig) PrefillWidths {
-        return if (self.isDsv41()) .{ .max = 8192, .beside_decode = 4096 } else .{};
+        if (!self.isDsv41()) return .{};
+        const dsv41 = @import("../../plugins/deepseek_v41/config.zig");
+        return .{ .min = dsv41.prefill_lead_min_rows, .max = dsv41.max_prefill_rows, .beside_decode = 4096 };
     }
 
     /// `width` no wider than the arch's maximum prefill width, an explicit `--prefill-chunk` included.

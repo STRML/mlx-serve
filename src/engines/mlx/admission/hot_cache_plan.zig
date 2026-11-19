@@ -129,7 +129,7 @@ pub const HotCachePlan = struct {
 /// `--prefill-chunk` is billed as-is; ungated archs keep the sizer's rung.
 pub fn clampReserveWidth(config: *const model_mod.ModelConfig, pinned_width: u32) u32 {
     if (explicitPrefillChunk() > 0) return pinned_width;
-    if (!perRequestPrefillChunkEnabled(config)) return pinned_width;
+    if (!config.longCtxGated() or !perRequestPrefillChunkEnabled(config)) return pinned_width;
     return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
 }
 
