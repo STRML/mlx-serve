@@ -32,6 +32,85 @@ pub const DecodeError = error{
     BadChecksum,
 };
 
+/// A session export that carries a decode-end entry beside its prompt boundary sends both in one body: this header,
+/// then per member its `tail_from` (u64, 0 for the boundary) and its length (u64), then the member envelopes in order.
+/// The boundary comes first. A body that does not start with BUNDLE_MAGIC is one plain envelope.
+pub const BUNDLE_MAGIC: [8]u8 = "MSVPFB\x00\x00".*;
+pub const BUNDLE_VERSION: u32 = 1;
+pub const MAX_BUNDLE_MEMBERS: usize = 2;
+const BUNDLE_HEADER_BYTES: usize = 16;
+const BUNDLE_MEMBER_BYTES: usize = 16;
+
+pub const BundleMember = struct { tail_from: u64, body: []const u8 };
+
+pub fn isBundle(body: []const u8) bool {
+    return body.len >= BUNDLE_MAGIC.len and std.mem.eql(u8, body[0..BUNDLE_MAGIC.len], &BUNDLE_MAGIC);
+}
+
+pub fn bundleSize(member_lens: []const usize) usize {
+    var total: usize = BUNDLE_HEADER_BYTES + member_lens.len * BUNDLE_MEMBER_BYTES;
+    for (member_lens) |n| total += n;
+    return total;
+}
+
+/// Writes `members` into `out`, which is exactly `bundleSize` of their lengths.
+pub fn writeBundle(out: []u8, members: []const BundleMember) void {
+    @memcpy(out[0..8], &BUNDLE_MAGIC);
+    std.mem.writeInt(u32, out[8..12], BUNDLE_VERSION, .little);
+    std.mem.writeInt(u32, out[12..16], @intCast(members.len), .little);
+    var at: usize = BUNDLE_HEADER_BYTES;
+    for (members) |m| {
+        std.mem.writeInt(u64, out[at..][0..8], m.tail_from, .little);
+        std.mem.writeInt(u64, out[at + 8 ..][0..8], m.body.len, .little);
+        at += BUNDLE_MEMBER_BYTES;
+    }
+    for (members) |m| {
+        @memcpy(out[at..][0..m.body.len], m.body);
+        at += m.body.len;
+    }
+}
+
+/// The members of a bundle body, slices into `body`. Each member is an envelope its own `decode` checks.
+pub fn readBundle(body: []const u8, out: *[MAX_BUNDLE_MEMBERS]BundleMember) DecodeError![]BundleMember {
+    if (!isBundle(body)) return error.BadEnvelope;
+    if (body.len < BUNDLE_HEADER_BYTES) return error.TruncatedEnvelope;
+    if (std.mem.readInt(u32, body[8..12], .little) != BUNDLE_VERSION) return error.UnsupportedEnvelopeVersion;
+    const count: usize = std.mem.readInt(u32, body[12..16], .little);
+    if (count == 0 or count > MAX_BUNDLE_MEMBERS) return error.BadEnvelope;
+    if (body.len < BUNDLE_HEADER_BYTES + count * BUNDLE_MEMBER_BYTES) return error.TruncatedEnvelope;
+    var at: usize = BUNDLE_HEADER_BYTES + count * BUNDLE_MEMBER_BYTES;
+    for (out[0..count], 0..) |*m, i| {
+        const meta = BUNDLE_HEADER_BYTES + i * BUNDLE_MEMBER_BYTES;
+        const len = std.mem.readInt(u64, body[meta + 8 ..][0..8], .little);
+        if (len > body.len - at) return error.TruncatedEnvelope;
+        m.* = .{ .tail_from = std.mem.readInt(u64, body[meta..][0..8], .little), .body = body[at..][0..@intCast(len)] };
+        at += @intCast(len);
+    }
+    if (at != body.len) return error.BadEnvelope;
+    if (out[0].tail_from != 0 or (count == 2 and out[1].tail_from == 0)) return error.BadEnvelope;
+    return out[0..count];
+}
+
+test "peer wire bundle: two members round-trip and a malformed bundle is refused" {
+    const a = "boundary-envelope";
+    const b = "tail-envelope-bytes";
+    const members = [_]BundleMember{ .{ .tail_from = 0, .body = a }, .{ .tail_from = 25, .body = b } };
+    var buf: [128]u8 = undefined;
+    const n = bundleSize(&.{ a.len, b.len });
+    writeBundle(buf[0..n], &members);
+    try std.testing.expect(isBundle(buf[0..n]));
+    var got: [MAX_BUNDLE_MEMBERS]BundleMember = undefined;
+    const read = try readBundle(buf[0..n], &got);
+    try std.testing.expectEqual(@as(usize, 2), read.len);
+    try std.testing.expectEqualStrings(a, read[0].body);
+    try std.testing.expectEqual(@as(u64, 25), read[1].tail_from);
+    try std.testing.expectEqualStrings(b, read[1].body);
+    try std.testing.expectError(error.TruncatedEnvelope, readBundle(buf[0 .. n - 1], &got));
+    var swapped: [128]u8 = undefined;
+    writeBundle(swapped[0..n], &.{ members[1], members[0] });
+    try std.testing.expectError(error.BadEnvelope, readBundle(swapped[0..n], &got));
+}
+
 pub const WireDescriptor = struct {
     name: []const u8,
     dtype: []const u8,

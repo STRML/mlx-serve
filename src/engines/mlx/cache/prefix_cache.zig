@@ -134,6 +134,18 @@ pub const CommitStatus = union(enum) {
     declined,
 };
 
+pub const ModuleCommit = struct {
+    n: usize,
+    entry_id: u64,
+    /// Sequence published for a tagged prompt boundary. Zero means no tip was published.
+    seq: u64 = 0,
+};
+
+pub const ModuleCommitStatus = union(enum) {
+    ok: ModuleCommit,
+    declined,
+};
+
 /// Result of a cache lookup. Tells the caller how many tokens of `prompt_ids`
 /// are already in the live cache after a successful restore — the caller
 /// then prefills only the trailing diverged tokens (`prompt_ids[matched..]`).
@@ -228,6 +240,12 @@ pub const ModulePayload = struct {
     /// Past 0, a decode-end entry: the length of the prompt its generated tail follows. RAM only: the SSD keeps a
     /// conversation's prompt boundary, which every later turn extends whatever its template makes of the tail.
     tail_from: usize = 0,
+    /// A decode-end entry's session: the X-Session-Key of the request that committed it, 0 when untagged. A session
+    /// export sends only its own session's tail (`ramTailOfTip`).
+    session: u64 = 0,
+    /// The session seq returned by this request's boundary commit, or 0 when it published no tip.
+    /// Only the tip with this seq exports the tail.
+    boundary_seq: u64 = 0,
 };
 
 const ModuleRequest = struct { binding: ModuleBinding, media_rows: ?Array, cuts: bool = true };
@@ -733,9 +751,8 @@ pub const HotPrefixCache = struct {
     module_export_losses_total: u64 = 0,
     /// Byte floor for `restoreWouldPinEntry`; a field so a test can reproduce the live shape.
     restore_pin_min_bytes: u64 = RESTORE_PIN_MIN_BYTES,
-    /// Each tagged session's newest prompt boundary. Prefix entries are shared between sessions, so a session's
-    /// ownership lives here and never on the entry; `session_seq` is the last commit order handed out, seeded above
-    /// every record the SSD tier holds (`seedSessionTips`).
+    /// Each tagged session's newest shared prompt boundary. Decode-end entries carry their own session and seq.
+    /// `session_seq` starts above every order in the SSD index (`seedSessionTips`).
     session_tips: std.AutoHashMapUnmanaged(u64, SessionTip) = .empty,
     session_seq: u64 = 0,
     session_tips_seeded: bool = false,
@@ -1499,6 +1516,32 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
+    /// The decode-end entry a session export sends beside the tip's boundary. Identity rule: the entry was committed by
+    /// this session's request right after this very boundary commit (its session, and its `boundary_seq` is the tip's
+    /// seq, so a cancelled request's late tail never replaces its retry's), in the boundary's context (binding with its
+    /// variant, tools, quant config, no media), its tokens extend the boundary and its prompt is the boundary or one past
+    /// it. Checked here at every export. Null when there is none. The identity lives on the entry and the tip's seq is
+    /// in the index, so a tip read back from the index finds it as well.
+    pub fn ramTailOfTip(self: *const HotPrefixCache, tip: SessionTip, session: u64) ?RamModuleHit {
+        if (session == 0 or tip.seq == 0) return null;
+        const boundary = self.ramHitOfTip(tip, session) orelse return null;
+        const n = boundary.tokens.len;
+        var best: ?*const Entry = null;
+        for (self.entries.items) |*e| {
+            const m = e.module orelse continue;
+            if (m.tail_from == 0 or m.session != session or m.boundary_seq != tip.seq) continue;
+            if (m.tail_from < n or m.tail_from > n + 1) continue;
+            if (e.tokens.len <= n or e.checked_out_by != null or e.media.len != 0 or boundary.media.len != 0) continue;
+            if (!ModuleBinding.same(m.binding, boundary.payload.binding) or m.binding.variant != tip.variant) continue;
+            if (e.has_tools != boundary.has_tools or !std.meta.eql(e.quant_config, boundary.quant_config)) continue;
+            if (!std.mem.eql(u32, e.tokens[0..n], boundary.tokens)) continue;
+            if (best == null or e.last_used > best.?.last_used) best = e;
+        }
+        var hit = ramHit(best orelse return null) orelse return null;
+        hit.session = session;
+        return hit;
+    }
+
     pub fn findRamModule(
         self: *const HotPrefixCache,
         binding: ModuleBinding,
@@ -1532,7 +1575,7 @@ pub const HotPrefixCache = struct {
         if (self.session_tips.get(session)) |tip| return tip;
         const record = (self.tipIndex() orelse return null).find(session) orelse return null;
         const tip = tipOf(record);
-        self.noteSessionTip(session, tip, false);
+        _ = self.noteSessionTip(session, tip, false);
         return tip;
     }
 
@@ -1584,7 +1627,7 @@ pub const HotPrefixCache = struct {
         index.load(&records) catch return;
         if (records.items.len == 0) return;
         self.session_seq = @max(self.session_seq, records.items[records.items.len - 1].seq);
-        for (records.items[records.items.len -| self.session_tip_cap..]) |record| self.noteSessionTip(record.session, tipOf(record), false);
+        for (records.items[records.items.len -| self.session_tip_cap..]) |record| _ = self.noteSessionTip(record.session, tipOf(record), false);
     }
 
     fn nextSessionSeq(self: *HotPrefixCache) u64 {
@@ -1595,16 +1638,25 @@ pub const HotPrefixCache = struct {
 
     /// A newer commit of a session replaces its tip; an older one never does. A `fresh` tip (a commit, not a read of the
     /// index) serves RAM exports at once and reaches the persisted index when its record is durable.
-    fn noteSessionTip(self: *HotPrefixCache, session: u64, tip: SessionTip, fresh: bool) void {
-        if (session == 0) return;
-        if (self.session_tips.get(session)) |old| if (old.seq > tip.seq) return;
+    fn noteSessionTip(self: *HotPrefixCache, session: u64, tip: SessionTip, fresh: bool) bool {
+        if (session == 0) return false;
+        if (self.session_tips.get(session)) |old| if (old.seq > tip.seq) return false;
         if (self.session_tips.count() >= self.session_tip_cap and !self.session_tips.contains(session)) self.makeRoomForSessionTip();
         var held = tip;
         held.persisted = !fresh;
-        self.session_tips.put(self.allocator, session, held) catch return;
-        if (!fresh) return;
-        self.tips_unpersisted = true;
-        self.persistDurableTips();
+        self.session_tips.put(self.allocator, session, held) catch return false;
+        if (fresh) {
+            self.tips_unpersisted = true;
+            self.persistDurableTips();
+        }
+        return true;
+    }
+
+    fn publishSessionBoundary(self: *HotPrefixCache, session: u64, e: *const Entry) u64 {
+        if (session == 0) return 0;
+        const seq = self.nextSessionSeq();
+        const tip: SessionTip = .{ .id = e.boundary, .n = e.tokens.len, .variant = e.module.?.binding.variant, .seq = seq };
+        return if (self.noteSessionTip(session, tip, true)) seq else 0;
     }
 
     /// Memory gives up a tip nothing needs: one the file holds, else one no entry resolves. A live tip that has no
@@ -1703,9 +1755,7 @@ pub const HotPrefixCache = struct {
         return std.mem.eql(u32, e.tokens[0..ids.len], ids);
     }
 
-    /// The refusal of an import as stale. A tagged import is stale only when an entry holds exactly its boundary, which
-    /// then becomes the session's tip: a longer entry or a decode-end tail that merely covers it is another boundary,
-    /// and the session's own is committed beside it. Untagged, any covering entry makes it stale.
+    /// A covered import has a result. Its sequence is nonzero only when this call gave the session a new tip.
     pub fn claimCovering(
         self: *HotPrefixCache,
         binding: ModuleBinding,
@@ -1714,14 +1764,56 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         quant_config: kv_quant.KVQuantConfig,
         session: u64,
-    ) bool {
-        if (session == 0) return self.hasModuleCovering(binding, ids, media, has_tools, quant_config);
+    ) ?ModuleCommit {
+        if (session == 0) return if (self.hasModuleCovering(binding, ids, media, has_tools, quant_config))
+            .{ .n = ids.len, .entry_id = 0 }
+        else
+            null;
+        const e = self.exactModuleBoundary(binding, ids, media, has_tools, quant_config) orelse return null;
+        const seq = if (self.sessionCoversBoundary(session, e)) 0 else self.publishSessionBoundary(session, e);
+        return .{ .n = ids.len, .entry_id = e.id, .seq = seq };
+    }
+
+    fn sessionCoversBoundary(self: *HotPrefixCache, session: u64, e: *const Entry) bool {
+        const tip = self.sessionTip(session) orelse return false;
+        if (tip.id == e.boundary) return true;
+        if (tip.n <= e.tokens.len or tip.variant != e.module.?.binding.variant) return false;
+        if (self.ramHitOfTip(tip, session)) |newer| {
+            return moduleRungOf(e, newer.payload.binding, newer.tokens, newer.media, newer.has_tools, newer.quant_config);
+        }
+        const disk = if (self.disk) |*d| d else return false;
+        const newer = disk.moduleByBoundaryNow(tip.id, tip.n) orelse return false;
+        return moduleRungOf(e, e.module.?.binding, newer.tokens, newer.media, newer.has_tools, newer.quant);
+    }
+
+    pub fn exactModuleBoundary(
+        self: *const HotPrefixCache,
+        binding: ModuleBinding,
+        ids: []const u32,
+        media: []const MediaSpan,
+        has_tools: bool,
+        quant_config: kv_quant.KVQuantConfig,
+    ) ?*const Entry {
         for (self.entries.items) |*e| {
             if (e.tokens.len != ids.len or !covers(e, binding, ids, media, has_tools, quant_config) or e.module.?.tail_from != 0) continue;
-            self.noteSessionTip(session, .{ .id = e.boundary, .n = e.tokens.len, .variant = e.module.?.binding.variant, .seq = self.nextSessionSeq() }, true);
+            return e;
+        }
+        return null;
+    }
+
+    const peer_boundary_checkout = std.math.maxInt(usize);
+
+    pub fn pinPeerBoundary(self: *HotPrefixCache, entry_id: u64) bool {
+        for (self.entries.items) |*e| {
+            if (e.id != entry_id or e.checked_out_by != null) continue;
+            e.checked_out_by = peer_boundary_checkout;
             return true;
         }
         return false;
+    }
+
+    pub fn unpinPeerBoundary(self: *HotPrefixCache) void {
+        self.releaseCheckout(peer_boundary_checkout, "peer bundle");
     }
 
     pub fn hasModuleCovering(
@@ -2330,8 +2422,8 @@ pub const HotPrefixCache = struct {
         quant_config: kv_quant.KVQuantConfig,
         cache_key: u64,
         session: u64,
-    ) !CommitStatus {
-        return self.commitModuleTail(binding, snapshot, ids, prefix_key, media, has_tools, quant_config, cache_key, session, 0);
+    ) !ModuleCommitStatus {
+        return self.commitModuleTail(binding, snapshot, ids, prefix_key, media, has_tools, quant_config, cache_key, session, 0, 0);
     }
 
     /// `commitModule` of the state where a request's decode stopped, `tail_from` prompt tokens then what it
@@ -2348,7 +2440,8 @@ pub const HotPrefixCache = struct {
         cache_key: u64,
         session: u64,
         tail_from: usize,
-    ) !CommitStatus {
+        boundary_seq: u64,
+    ) !ModuleCommitStatus {
         var retained = false;
         defer if (!retained) plugin_driver.auxFree(binding.xfm, snapshot);
         if (!self.ram_enabled or self.max_entries == 0) return .declined;
@@ -2385,8 +2478,6 @@ pub const HotPrefixCache = struct {
             self.logModuleDecline(ids.len, aux_bytes, if (tail_from > 0) "a decode-end checkpoint takes no prompt boundary's room" else "no entry could be evicted for it");
             return .declined;
         }
-        // Only a prompt boundary a session tagged moves that session's tip.
-        const seq: u64 = if (tail_from == 0 and session != 0) self.nextSessionSeq() else 0;
         const boundary_key = boundary_mod.id(variantKey(prefix_key, binding.variant), ids, eff_media, has_tools, quant_config);
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
@@ -2400,7 +2491,7 @@ pub const HotPrefixCache = struct {
             .last_used = self.bumpCounter(),
             .touched_ms = crt.monotonicMs(),
             .snapshot = .{ .entries = &.{}, .step = 0, .allocator = self.allocator, .config = quant_config },
-            .module = .{ .binding = binding, .snapshot = snapshot, .n = ids.len, .prefix_key = variantKey(prefix_key, binding.variant), .aux_bytes = aux_bytes, .tail_from = tail_from },
+            .module = .{ .binding = binding, .snapshot = snapshot, .n = ids.len, .prefix_key = variantKey(prefix_key, binding.variant), .aux_bytes = aux_bytes, .tail_from = tail_from, .session = if (tail_from > 0) session else 0, .boundary_seq = if (tail_from > 0) boundary_seq else 0 },
             .kv_bytes = aux_bytes,
         });
         retained = true;
@@ -2420,9 +2511,10 @@ pub const HotPrefixCache = struct {
                 @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
             });
         }
-        if (seq != 0) self.noteSessionTip(session, .{ .id = boundary_key, .n = ids.len, .variant = binding.variant, .seq = seq }, true);
+        const entry = &self.entries.items[last];
+        const seq = if (tail_from == 0) self.publishSessionBoundary(session, entry) else 0;
         self.logResident();
-        return .{ .ok = ids.len };
+        return .{ .ok = .{ .n = ids.len, .entry_id = entry.id, .seq = seq } };
     }
 
     /// Whether the SSD tier writes a module state of `tokens` tokens.
@@ -4162,7 +4254,7 @@ pub const HotPrefixCache = struct {
         self.evicted_billed_bytes +|= billed;
         self.evicted_live_bytes +|= freed_live;
         log.debug("  [hot-cache] eviction ({s}) returned {d} MB live of {d} MB billed, {d} MB parked for the SSD tier; since load {d} of {d} MB\n", .{
-            reason,                                  freed_live >> 20,                 billed >> 20,
+            reason,                                      freed_live >> 20,              billed >> 20,
             (self.parkedBytes() -| parked_before) >> 20, self.evicted_live_bytes >> 20, self.evicted_billed_bytes >> 20,
         });
         if (had_ssm) {
@@ -11720,15 +11812,15 @@ const ModuleFake = struct {
         bytes: u64 = 40,
         frees: usize = 0,
 
-        fn put(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan) !CommitStatus {
+        fn put(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan) !ModuleCommitStatus {
             return self.putSession(cache, binding, media, 0);
         }
 
-        fn putSession(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan, session: u64) !CommitStatus {
+        fn putSession(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan, session: u64) !ModuleCommitStatus {
             return self.putAs(cache, binding, media, session, false, kv_quant.KVQuantConfig.dense);
         }
 
-        fn putAs(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan, session: u64, has_tools: bool, quant: kv_quant.KVQuantConfig) !CommitStatus {
+        fn putAs(self: *Snap, cache: *HotPrefixCache, binding: ModuleBinding, media: []const MediaSpan, session: u64, has_tools: bool, quant: kv_quant.KVQuantConfig) !ModuleCommitStatus {
             return cache.commitModule(binding, self, self.ids, self.key, media, has_tools, quant, 0, session);
         }
     };
@@ -11883,7 +11975,7 @@ test "HotPrefixCache module: longest exact checkpoint wins and KV lookup cannot 
     try testing.expectEqual(@as(usize, 0), cache.restoreModule(binding, 42, 0));
     var long: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
     var short: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
-    try testing.expectEqual(CommitStatus{ .ok = 4 }, try long.put(&cache, binding, &.{}));
+    try testing.expectEqual(@as(usize, 4), (try long.put(&cache, binding, &.{})).ok.n);
     _ = try short.put(&cache, binding, &.{});
     const hit = cache.findModuleMatch(binding, &.{ 1, 2, 3, 4, 5 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(@as(usize, 4), hit.n);
@@ -11965,7 +12057,7 @@ test "HotPrefixCache module: a decode-end entry lasts until its conversation com
     var boundary: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3 }, .key = 6 };
     var tail: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 6 }, .key = 21 };
     _ = try boundary.put(&cache, binding, &.{});
-    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 0, 4);
+    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 0, 4, 0);
     try testing.expectEqual(@as(usize, 2), cache.entries.items.len);
     try testing.expectEqual(@as(usize, 6), cache.findModuleMatch(binding, &.{ 1, 2, 3, 4, 5, 6, 7 }, false, &.{}, null, dense).?.n);
     // The same prompt again (a regenerate): its boundary leaves the old tail alone, its own tail replaces it.
@@ -11973,7 +12065,7 @@ test "HotPrefixCache module: a decode-end entry lasts until its conversation com
     _ = try again.put(&cache, binding, &.{});
     try testing.expectEqual(@as(usize, 0), tail.frees);
     var other: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 9 }, .key = 19 };
-    _ = try cache.commitModuleTail(binding, &other, other.ids, other.key, &.{}, false, dense, 0, 0, 4);
+    _ = try cache.commitModuleTail(binding, &other, other.ids, other.key, &.{}, false, dense, 0, 0, 4, 0);
     try testing.expectEqual(@as(usize, 1), tail.frees);
     // The next turn's boundary reaches past the prompt: the tail it rendered differently is dropped.
     var next: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 8, 8 }, .key = 26 };
@@ -11984,14 +12076,14 @@ test "HotPrefixCache module: a decode-end entry lasts until its conversation com
     // Room: a tail is the first to go for any commit, and takes no prompt boundary's place itself.
     cache.max_kv_bytes = 120;
     var tail2: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 8, 8, 8, 5 }, .key = 39 };
-    _ = try cache.commitModuleTail(binding, &tail2, tail2.ids, tail2.key, &.{}, false, dense, 0, 0, 7);
+    _ = try cache.commitModuleTail(binding, &tail2, tail2.ids, tail2.key, &.{}, false, dense, 0, 0, 7, 0);
     try testing.expectEqual(@as(u64, 120), cache.current_kv_bytes);
     var far: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 70, 71 }, .key = 141 };
     _ = try far.put(&cache, binding, &.{});
     try testing.expectEqual(@as(usize, 1), tail2.frees);
     try testing.expectEqual(@as(usize, 0), next.frees + again.frees);
     var tail3: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 70, 71, 72, 73 }, .key = 286 };
-    try testing.expectEqual(CommitStatus.declined, try cache.commitModuleTail(binding, &tail3, tail3.ids, tail3.key, &.{}, false, dense, 0, 0, 3));
+    try testing.expectEqual(ModuleCommitStatus.declined, try cache.commitModuleTail(binding, &tail3, tail3.ids, tail3.key, &.{}, false, dense, 0, 0, 3, 0));
     try testing.expectEqual(@as(usize, 1), tail3.frees);
     try testing.expectEqual(@as(usize, 0), far.frees + next.frees);
 }
@@ -12268,17 +12360,17 @@ test "HotPrefixCache module: oversized disabled and malformed commits free the w
     var kept: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
     _ = try kept.put(&cache, binding, &.{});
     var huge: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17, .bytes = 61 };
-    try testing.expectEqual(@as(CommitStatus, .declined), try huge.put(&cache, binding, &.{}));
+    try testing.expectEqual(ModuleCommitStatus.declined, try huge.put(&cache, binding, &.{}));
     try testing.expectEqual(@as(usize, 1), huge.frees);
     try testing.expectEqual(@as(usize, 0), kept.frees);
     try testing.expectEqual(@as(u64, 40), cache.current_kv_bytes);
     var bad: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17 };
-    try testing.expectEqual(@as(CommitStatus, .declined), try cache.commitModule(binding, &bad, &.{ 8, 10 }, 17, &.{}, false, kv_quant.KVQuantConfig.dense, 0, 0));
+    try testing.expectEqual(ModuleCommitStatus.declined, try cache.commitModule(binding, &bad, &.{ 8, 10 }, 17, &.{}, false, kv_quant.KVQuantConfig.dense, 0, 0));
     try testing.expectEqual(@as(usize, 1), bad.frees);
     var disabled = HotPrefixCache.init(testing.allocator, 0);
     defer disabled.deinit();
     var declined: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17 };
-    try testing.expectEqual(@as(CommitStatus, .declined), try declined.put(&disabled, binding, &.{}));
+    try testing.expectEqual(ModuleCommitStatus.declined, try declined.put(&disabled, binding, &.{}));
     try testing.expectEqual(@as(usize, 1), declined.frees);
     try testing.expect(cache.findModuleMatch(binding, &.{}, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
     try testing.expect(cache.findModuleMatch(binding, &.{1}, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
@@ -12303,7 +12395,7 @@ test "HotPrefixCache module: a snapshot over the byte budget is declined with a 
     var cache = HotPrefixCache.initWithMem(testing.allocator, 2, 3 << 20);
     defer cache.deinit();
     var huge: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17, .bytes = 4 << 20 };
-    try testing.expectEqual(@as(CommitStatus, .declined), try huge.put(&cache, binding, &.{}));
+    try testing.expectEqual(ModuleCommitStatus.declined, try huge.put(&cache, binding, &.{}));
     const text = try tmp.dir.readFileAlloc(testing.io, "s.log", testing.allocator, .limited(4096));
     defer testing.allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "skipped module snapshot (2 tokens, 4.00 MB; 3.00 MB budget)") != null);
@@ -12469,7 +12561,7 @@ test "HotPrefixCache module: count or byte pressure with only checked-out surviv
         defer cache.deinit();
         try pcAppendCheckedOut(&cache, &.{ 8, 9 }, 40, 1);
         var snap: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
-        try testing.expectEqual(@as(CommitStatus, .declined), try snap.put(&cache, binding, &.{}));
+        try testing.expectEqual(ModuleCommitStatus.declined, try snap.put(&cache, binding, &.{}));
         try testing.expectEqual(@as(usize, 1), snap.frees);
         try testing.expectEqual(@as(usize, 1), cache.entryCount());
         try testing.expectEqual(@as(u64, 40), cache.current_kv_bytes);
@@ -12624,7 +12716,7 @@ test "a module snapshot over the byte budget is held for the SSD tier: served fr
     // Over the budget: it takes the cache whole, is billed (admission sees it) and the next turn restores it.
     var huge = ModuleDiskTest.snap(&fake, &ids);
     huge.bytes = 4 << 20;
-    try testing.expectEqual(CommitStatus{ .ok = 513 }, try huge.put(&hc, binding, &.{}));
+    try testing.expectEqual(@as(usize, 513), (try huge.put(&hc, binding, &.{})).ok.n);
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
     try testing.expectEqual(@as(u64, 4 << 20), hc.residentBytes());
     var longer: [520]u32 = undefined;
@@ -12646,7 +12738,7 @@ test "a module snapshot over the byte budget is held for the SSD tier: served fr
     // Under the tier's persist floor there is nowhere to hold it for: declined, as without a tier.
     var stub = ModuleDiskTest.snap(&fake, ids[0..8]);
     stub.bytes = 4 << 20;
-    try testing.expectEqual(@as(CommitStatus, .declined), try stub.put(&hc, binding, &.{}));
+    try testing.expectEqual(ModuleCommitStatus.declined, try stub.put(&hc, binding, &.{}));
     try testing.expectEqual(@as(usize, 0), hc.entryCount());
 }
 
@@ -12659,9 +12751,9 @@ test "under-floor module commits remain RAM-only" {
     const binding = fake.bind(&bound, &xfm);
     var hc = try ModuleDiskTest.init(&tmp, 2);
     defer hc.deinit();
-    try testing.expectEqual(@as(CommitStatus, .declined), try hc.commitModule(binding, null, &.{ 1, 2 }, 3, &.{}, false, kv_quant.KVQuantConfig.dense, 0, 0));
+    try testing.expectEqual(ModuleCommitStatus.declined, try hc.commitModule(binding, null, &.{ 1, 2 }, 3, &.{}, false, kv_quant.KVQuantConfig.dense, 0, 0));
     var snap = ModuleDiskTest.snap(&fake, &.{ 1, 2 });
-    try testing.expectEqual(@as(CommitStatus, .{ .ok = 2 }), try snap.put(&hc, binding, &.{}));
+    try testing.expectEqual(@as(usize, 2), (try snap.put(&hc, binding, &.{})).ok.n);
     try testing.expectEqual(@as(usize, 0), fake.exports);
     try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
     const hit = hc.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
@@ -12685,7 +12777,7 @@ test "module registration OOM preserves RAM" {
     var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
     const result = try snap.put(&hc, binding, &.{});
     hc.disk.?.allocator = testing.allocator;
-    try testing.expectEqual(@as(CommitStatus, .{ .ok = 512 }), result);
+    try testing.expectEqual(@as(usize, 512), result.ok.n);
     try testing.expect(failing.has_induced_failure);
     try testing.expectEqual(@as(usize, 0), snap.frees);
     try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
@@ -13312,11 +13404,117 @@ test "HotPrefixCache module: a session's tip is its prompt boundary, not the dec
     var tail: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 6 }, .key = 21 };
     _ = try rung.putSession(&cache, binding, &.{}, 7);
     _ = try boundary.putSession(&cache, binding, &.{}, 7);
-    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 7, 4);
+    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 7, 4, 0);
 
     const tip = cache.findSessionTip(7).?;
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, tip.tokens);
     try testing.expectEqual(@as(usize, 0), tip.payload.tail_from);
+}
+
+test "HotPrefixCache module: a session export's tail is its own decode-end entry past its tip, else none" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const dense = kv_quant.KVQuantConfig.dense;
+    var other: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 5 }, .key = 11 };
+    var boundary: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var tail: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 6 }, .key = 21 };
+    var stray: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 9, 9, 9 }, .key = 27 };
+    // A longer prompt's tail on the same conversation: another turn's or session's reply.
+    var longer: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, .key = 36 };
+    _ = try other.putSession(&cache, binding, &.{}, 8);
+    const seq_7 = (try boundary.putSession(&cache, binding, &.{}, 7)).ok.seq;
+    _ = try cache.commitModuleTail(binding, &longer, longer.ids, longer.key, &.{}, false, dense, 0, 9, 7, 0);
+    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 7, 5, seq_7);
+    _ = try cache.commitModuleTail(binding, &stray, stray.ids, stray.key, &.{}, false, dense, 0, 0, 2, 0);
+    try testing.expectEqual(@as(usize, 0), longer.frees);
+
+    // A same-box continuation restores the tail; the export sends it too, so a move loses no reply.
+    const sent = cache.ramTailOfTip(cache.sessionTip(7).?, 7).?;
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6 }, sent.tokens);
+    try testing.expectEqual(@as(u64, 7), sent.session);
+    // The tip itself stays the prompt boundary.
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, cache.findSessionTip(7).?.tokens);
+    // A session with no tail past its boundary has none.
+    try testing.expectEqual(@as(?HotPrefixCache.RamModuleHit, null), cache.ramTailOfTip(cache.sessionTip(8).?, 8));
+}
+
+test "HotPrefixCache module: a session's tail must match its boundary's context and its request's boundary commit" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const dense = kv_quant.KVQuantConfig.dense;
+    var boundary: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    const seq_1 = (try boundary.putSession(&cache, binding, &.{}, 7)).ok.seq;
+    try testing.expect(seq_1 != 0);
+    // Another tools setting, quant config or variant on the same tokens is another context: never the tail.
+    var tools: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 6 }, .key = 21 };
+    _ = try cache.commitModuleTail(binding, &tools, tools.ids, tools.key, &.{}, true, dense, 0, 7, 5, seq_1);
+    try testing.expectEqual(@as(?HotPrefixCache.RamModuleHit, null), cache.ramTailOfTip(cache.sessionTip(7).?, 7));
+    var quant: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 7 }, .key = 22 };
+    _ = try cache.commitModuleTail(binding, &quant, quant.ids, quant.key, &.{}, false, kv_quant.KVQuantConfig.affine(4), 0, 7, 5, seq_1);
+    try testing.expectEqual(@as(?HotPrefixCache.RamModuleHit, null), cache.ramTailOfTip(cache.sessionTip(7).?, 7));
+    var other_variant = binding;
+    other_variant.variant = 99;
+    var variant: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 8 }, .key = 23 };
+    _ = try cache.commitModuleTail(other_variant, &variant, variant.ids, variant.key, &.{}, false, dense, 0, 7, 5, seq_1);
+    try testing.expectEqual(@as(?HotPrefixCache.RamModuleHit, null), cache.ramTailOfTip(cache.sessionTip(7).?, 7));
+
+    // A retry commits the boundary again (seq 2) and its tail; the cancelled first request's tail lands later.
+    var again: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    const seq_2 = (try again.putSession(&cache, binding, &.{}, 7)).ok.seq;
+    try testing.expect(seq_2 > seq_1);
+    var retry_tail: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 9, 9 }, .key = 28 };
+    _ = try cache.commitModuleTail(binding, &retry_tail, retry_tail.ids, retry_tail.key, &.{}, false, dense, 0, 7, 5, seq_2);
+    var late_tail: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 5 }, .key = 20 };
+    _ = try cache.commitModuleTail(binding, &late_tail, late_tail.ids, late_tail.key, &.{}, false, dense, 0, 7, 5, seq_1);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 9, 9 }, cache.ramTailOfTip(cache.sessionTip(7).?, 7).?.tokens);
+}
+
+test "HotPrefixCache module: two sessions that share a boundary and diverge after it each export their own tail" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    const dense = kv_quant.KVQuantConfig.dense;
+    // Session 7 sends 1 2 3 4 5 and gets 6; session 8 sends 1 2 3 4 9 and gets 7. Both boundaries are 1 2 3 4.
+    var boundary_7: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var tail_7: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 5, 6 }, .key = 21 };
+    var boundary_8: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var tail_8: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 9, 7 }, .key = 26 };
+    // An untagged request on the same boundary, newest of all.
+    var boundary_0: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
+    var tail_0: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4, 8, 8 }, .key = 26 };
+    const seq_7 = (try boundary_7.putSession(&cache, binding, &.{}, 7)).ok.seq;
+    _ = try cache.commitModuleTail(binding, &tail_7, tail_7.ids, tail_7.key, &.{}, false, dense, 0, 7, 5, seq_7);
+    const seq_8 = (try boundary_8.putSession(&cache, binding, &.{}, 8)).ok.seq;
+    _ = try cache.commitModuleTail(binding, &tail_8, tail_8.ids, tail_8.key, &.{}, false, dense, 0, 8, 5, seq_8);
+    _ = try boundary_0.put(&cache, binding, &.{});
+    _ = try cache.commitModuleTail(binding, &tail_0, tail_0.ids, tail_0.key, &.{}, false, dense, 0, 0, 5, 0);
+
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6 }, cache.ramTailOfTip(cache.sessionTip(7).?, 7).?.tokens);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 9, 7 }, cache.ramTailOfTip(cache.sessionTip(8).?, 8).?.tokens);
+
+    // A tip forgotten from memory and read back from the index still finds its resident tail.
+    const tip_8 = cache.sessionTip(8).?;
+    _ = cache.session_tips.remove(8);
+    _ = cache.noteSessionTip(8, .{ .id = tip_8.id, .n = tip_8.n, .variant = tip_8.variant, .seq = tip_8.seq }, false);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 9, 7 }, cache.ramTailOfTip(cache.sessionTip(8).?, 8).?.tokens);
+
+    // Once a session's own tail is gone, it has none, never another request's tail.
+    for (cache.entries.items, 0..) |e, i| if (std.mem.eql(u32, e.tokens, tail_7.ids)) {
+        cache.evictAt(i, "test");
+        break;
+    };
+    try testing.expectEqual(@as(?HotPrefixCache.RamModuleHit, null), cache.ramTailOfTip(cache.sessionTip(7).?, 7));
 }
 
 test "HotPrefixCache module: another session's longer boundary does not hide a session's own tip" {
@@ -13378,7 +13576,7 @@ test "HotPrefixCache module: a tip keeps the variant it was committed under, and
 
     var mismatched: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
     const declined = try cache.commitModule(ablated, &mismatched, &.{ 1, 2, 3 }, mismatched.key, &.{}, false, kv_quant.KVQuantConfig.dense, 0, 7);
-    try testing.expectEqual(CommitStatus.declined, declined);
+    try testing.expectEqual(ModuleCommitStatus.declined, declined);
     try testing.expectEqualSlices(u32, &.{ 1, 2 }, cache.findSessionTip(7).?.tokens);
 }
 
@@ -13411,13 +13609,13 @@ test "HotPrefixCache module: an import of a boundary an entry holds exactly clai
     var owner: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
     _ = try owner.putSession(&cache, binding, &.{}, 7);
 
-    try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3, 4 }, &.{}, false, dense, 8));
+    try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3, 4 }, &.{}, false, dense, 8) != null);
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, cache.findSessionTip(8).?.tokens);
-    try testing.expect(!cache.claimCovering(binding, &.{ 1, 2 }, &.{}, false, dense, 9));
+    try testing.expect(cache.claimCovering(binding, &.{ 1, 2 }, &.{}, false, dense, 9) == null);
     try testing.expect(cache.findSessionTip(9) == null);
-    try testing.expect(!cache.claimCovering(binding, &.{ 9, 9 }, &.{}, false, dense, 10));
+    try testing.expect(cache.claimCovering(binding, &.{ 9, 9 }, &.{}, false, dense, 10) == null);
     try testing.expect(cache.findSessionTip(10) == null);
-    try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3, 4 }, &.{}, false, dense, 0));
+    try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3, 4 }, &.{}, false, dense, 0) != null);
     try testing.expect(cache.findSessionTip(0) == null);
 }
 
@@ -13506,13 +13704,13 @@ test "HotPrefixCache module: a tagged import a longer boundary covers is no impo
     var long: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
     _ = try long.putSession(&cache, binding, &.{}, 7);
 
-    try testing.expect(!cache.claimCovering(binding, &.{ 1, 2 }, &.{}, false, dense, 8));
+    try testing.expect(cache.claimCovering(binding, &.{ 1, 2 }, &.{}, false, dense, 8) == null);
     var own: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
     _ = try own.putSession(&cache, binding, &.{}, 8);
     const exported = cache.findSessionTip(8) orelse return error.TestExpectedTip;
     try testing.expectEqualSlices(u32, &.{ 1, 2 }, exported.tokens);
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, (cache.findSessionTip(7) orelse return error.TestExpectedTip).tokens);
-    try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3 }, &.{}, false, dense, 0));
+    try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3 }, &.{}, false, dense, 0) != null);
 }
 
 test "HotPrefixCache module: a tagged import only a decode-end tail covers still commits its own boundary" {
@@ -13526,9 +13724,9 @@ test "HotPrefixCache module: a tagged import only a decode-end tail covers still
     var boundary: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
     var tail: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
     _ = try boundary.putSession(&cache, binding, &.{}, 7);
-    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 7, 2);
+    _ = try cache.commitModuleTail(binding, &tail, tail.ids, tail.key, &.{}, false, dense, 0, 7, 2, 0);
 
-    try testing.expect(!cache.claimCovering(binding, &.{ 1, 2, 3 }, &.{}, false, dense, 8));
+    try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3 }, &.{}, false, dense, 8) == null);
     var own: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3 }, .key = 6 };
     _ = try own.putSession(&cache, binding, &.{}, 8);
     try testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, (cache.findSessionTip(8) orelse return error.TestExpectedTip).tokens);
@@ -13719,7 +13917,7 @@ test "HotPrefixCache module: claiming one checkpoint again and again never costs
         _ = try b.putSession(&hc, binding, &.{}, 9);
         try ModuleDiskTest.finish(&hc, cpu);
         _ = hc.flushOwedSlice(cpu);
-        for (0..3) |_| try testing.expect(hc.claimCovering(binding, ids[0..513], &.{}, false, dense, 7));
+        for (0..3) |_| try testing.expect(hc.claimCovering(binding, ids[0..513], &.{}, false, dense, 7) != null);
 
         const newest = hc.sessionTip(7) orelse return error.TestExpectedTip;
         try testing.expectEqual(@as(usize, 513), newest.n);
@@ -13943,7 +14141,7 @@ test "HotPrefixCache module: a claim whose index append fails leaves the cache o
     const index = hc.tipIndex() orelse return error.TestExpectedIndex;
     try std.Io.Dir.cwd().deleteFile(testing.io, index.path);
     try std.Io.Dir.cwd().createDirPath(testing.io, index.path);
-    try testing.expect(hc.claimCovering(binding, ids[0..512], &.{}, false, kv_quant.KVQuantConfig.dense, 8));
+    try testing.expect(hc.claimCovering(binding, ids[0..512], &.{}, false, kv_quant.KVQuantConfig.dense, 8) != null);
     try testing.expect(!hc.session_tips.get(8).?.persisted);
     try testing.expect(hc.disk_dirty);
 }
@@ -13959,6 +14157,6 @@ test "HotPrefixCache module: sessions that claim one resident checkpoint below t
     const dense = kv_quant.KVQuantConfig.dense;
     var owner: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
     _ = try owner.putSession(&cache, binding, &.{}, 7);
-    for (8..20) |session| try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3, 4 }, &.{}, false, dense, session));
+    for (8..20) |session| try testing.expect(cache.claimCovering(binding, &.{ 1, 2, 3, 4 }, &.{}, false, dense, session) != null);
     for (7..20) |session| try testing.expect(cache.findSessionTip(session) != null);
 }
