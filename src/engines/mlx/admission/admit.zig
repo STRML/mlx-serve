@@ -543,6 +543,41 @@ test "dsv41 admission: pending prefill prices decoder company and outstanding cl
     try t.expect(pending.slotHoldsForMemory(&sch, &slot));
 }
 
+test "dsv41 admission: slotPrefillLimits preserves sibling promises after current slot restores" {
+    const t = std.testing;
+    const Slot = @import("../slot.zig").Slot;
+    const pending = @import("pending.zig");
+    var cfg = try model_mod.parseConfigFromJson(t.allocator, model_mod.dsv41_release_config);
+    defer cfg.deinit(t.allocator);
+    const gib: u64 = 1 << 30;
+    const sib_promise: u64 = 10 * gib;
+    const self_promise: u64 = 10 * gib;
+    const margin = @import("../scheduler/params.zig").SIBLING_MARGIN_BYTES;
+    var slot: Slot = undefined;
+    slot.prompt_logprobs = false;
+    slot.memory_promised = self_promise;
+    var sibling: Slot = undefined;
+    var sch: scheduler_mod.Scheduler = undefined;
+    sch.io = std.Io.Threaded.global_single_threaded.io();
+    sch.queue_mu = .init;
+    sch.decoding = .empty;
+    sch.boundary_outer = &sibling;
+    sch.gen_reserve_bytes = 0;
+
+    // 10 GiB promised to each of two slots at base_active = 100 GiB; current slot restored 10 GiB
+    // before the re-ask (ref_active = 100 GiB, active_now = 110 GiB): sibling's 10 GiB stays intact.
+    const ref_active: u64 = 100 * gib;
+    sch.promise_ledger = .{ .promised = sib_promise + self_promise, .base_active = ref_active };
+    const limits = pending.slotPrefillLimits(&sch, &slot, &cfg, ref_active);
+    try t.expectEqual(sib_promise + margin, limits.extra_bytes);
+
+    // With sibling's 10 GiB + margin accounted for, re-ask steps down to 4096 when 8192 would exceed remaining headroom.
+    const prompt: [32_768]u32 = @splat(3);
+    const wide = prefillNeededAtChunk(&cfg, prompt.len, 256, 16, 8192, .{});
+    const avail = wide + sib_promise + margin - 1;
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, prompt.len, 256, 16, avail, 8192, 0, .{}, limits));
+}
+
 const Dsv41AdmissionTestLimits = struct {
     const mem = @import("../../../host/registry/memory_ceiling.zig");
     memory: mem.Overrides,

@@ -257,6 +257,12 @@ pub const PromiseLedger = struct {
         return self.promised -| (active_now -| self.base_active);
     }
 
+    /// Siblings' unallocated promises at `ref_active` (active memory before the current slot's
+    /// own prefill allocations/evictions), excluding `self_promised`.
+    pub fn otherOutstanding(self: PromiseLedger, self_promised: u64, ref_active: u64) u64 {
+        return (self.promised -| self_promised) -| (ref_active -| self.base_active);
+    }
+
     pub fn admit(self: *PromiseLedger, needed: u64, active_now: u64) void {
         if (self.promised == 0) self.base_active = active_now;
         self.promised +|= needed;
@@ -299,4 +305,20 @@ test "PromiseLedger: a sibling is billed against what earlier admits have not al
     l.release(3 * gb);
     l.admit(1 * gb, 30 * gb); // an empty ledger re-bases
     try testing.expectEqual(1 * gb, l.outstanding(30 * gb));
+}
+
+test "PromiseLedger.otherOutstanding: current slot's own restore does not erase sibling promises" {
+    var l: PromiseLedger = .{};
+    const gb: u64 = 1 << 30;
+    const base = 100 * gb;
+    l.admit(10 * gb, base); // sibling
+    l.admit(10 * gb, base); // current slot
+    // Current slot allocates 10 GiB (active_now = 110 GiB), while ref_active before its restore was 100 GiB.
+    try testing.expectEqual(10 * gb, l.otherOutstanding(10 * gb, base));
+    // If the sibling already materialized 4 GiB before this slot started (ref_active = 104 GiB), 6 GiB remain.
+    try testing.expectEqual(6 * gb, l.otherOutstanding(10 * gb, 104 * gb));
+    // An unpromised third slot (self_promised == 0) still sees both 10 GiB promises at base.
+    try testing.expectEqual(20 * gb, l.otherOutstanding(0, base));
+    // Active memory dipping below base (e.g. after cache eviction) saturates to 0 growth rather than underflowing.
+    try testing.expectEqual(10 * gb, l.otherOutstanding(10 * gb, base - 5 * gb));
 }

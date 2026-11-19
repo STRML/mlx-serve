@@ -207,9 +207,9 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         // Which ask: the gated arch reads the resolved budget; every other arch reads the raw
         // ask as before (the accessor would pin a second model against the first's budget).
         const hot_cache_ask = if (config.longCtxGated()) resolvedPrefixCacheMem() else legacyPrefixCacheAsk();
-        // The override's precedence is the second gated input: ungated, `--prefill-chunk`
-        // still outranks the pin only at forward time, as before (a known inconsistency).
-        const pin_override: u32 = if (config.longCtxGated()) explicitPrefillChunk() else 0;
+        // Archs with per-request prefill chunking honor an explicit `--prefill-chunk`
+        // at load time too so the hot-cache reserve and load pin agree with the forward.
+        const pin_override: u32 = if (config.perRequestPrefillChunk()) explicitPrefillChunk() else 0;
         config.pinned_prefill_chunk = billedPrefillChunk(
             config,
             kv_bits,
@@ -1840,26 +1840,69 @@ test "dsv41 admission: pick 8192 at 32k, cap every width, and honor the request 
     try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 256, 16, roomy, 16_384, 0, .{}, .{}));
 }
 
-test "dsv41 admission: request opt-in leaves adaptation and the omitted-flag hot-cache reserve on their old policy" {
+test "dsv41 admission: hot-cache load path reserves at the load pin and honors explicit --prefill-chunk" {
     const t = std.testing;
     var cfg = try model_mod.parseConfigFromJson(t.allocator, model_mod.dsv41_release_config);
     defer cfg.deinit(t.allocator);
     const cli = generate_mod.prefillCli();
-    const saved = cli.*;
-    defer cli.* = saved;
+    const saved_cli = cli.*;
+    defer cli.* = saved_cli;
+    const saved_mem = memory_ceiling.overrides().*;
+    defer memory_ceiling.overrides().* = saved_mem;
+    const orig_ctx = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = orig_ctx;
+    const orig_cap = http_server.launch().prefix_cache_capacity;
+    const orig_ask = http_server.launch().prefix_cache_mem_bytes;
+    const orig_explicit = http_server.launch().prefix_cache_mem_explicit;
+    defer {
+        http_server.launch().prefix_cache_capacity = orig_cap;
+        http_server.launch().prefix_cache_mem_bytes = orig_ask;
+        http_server.launch().prefix_cache_mem_explicit = orig_explicit;
+        clearResolvedPrefixCacheMem();
+    }
     cli.* = .{};
+    http_server.serverState().server_config.max_context_size = 1 << 20;
+    http_server.launch().prefix_cache_capacity = 32;
+    http_server.launch().prefix_cache_mem_bytes = 0;
+    http_server.launch().prefix_cache_mem_explicit = false;
     try t.expect(perRequestPrefillChunkEnabled(&cfg));
     try t.expect(!cfg.longCtxGated());
     try t.expect(!adaptivePrefillChunkEnabled(&cfg));
-    const gb = 1 << 30;
-    const omitted = planHotCache(&cfg, 16, 240 * gb, 140 * gb, 1 << 20, 0, 8 * gb, 0);
-    try t.expectEqual(@as(u32, 8192), omitted.chunk);
-    try t.expectEqual(omitted.chunk, omitted.reserve_chunk);
-    try t.expectEqual(prefillTransientReserve(&cfg, 16, 8192), omitted.reserve);
-    cli.override = 4096;
-    cli.explicit = true;
-    const pinned = planHotCache(&cfg, 16, 240 * gb, 140 * gb, 1 << 20, 0, 8 * gb, explicitPrefillChunk());
-    try t.expectEqual(@as(u32, 4096), pinned.reserve_chunk);
+
+    const gb: u64 = 1 << 30;
+    memory_ceiling.overrides().static_ceiling = 240 * gb;
+    memory_ceiling.overrides().machine_free = .{ .idle = 100 * gb, .request = 100 * gb };
+    var idle: u64 = 0;
+
+    // Omitted flag on a roomy box: pins and reserves at 8192 through `hot_cache_plan.zig`.
+    cfg.pinned_prefill_chunk = 0;
+    const omitted = prefixCacheMemForLoad(&cfg, 0, .{ .quiet = true }, &idle);
+    try t.expectEqual(@as(u32, 8192), cfg.pinned_prefill_chunk);
+
+    // Explicit --prefill-chunk 4096: pins and reserves at 4096, freeing the reserve delta for cache.
+    cli.* = .{ .override = 4096, .explicit = true };
+    cfg.pinned_prefill_chunk = 0;
+    const pinned_4k = prefixCacheMemForLoad(&cfg, 0, .{ .quiet = true }, &idle);
+    try t.expectEqual(@as(u32, 4096), cfg.pinned_prefill_chunk);
+    const reserve_8k = prefillTransientReserve(&cfg, 16, 8192);
+    const reserve_4k = prefillTransientReserve(&cfg, 16, 4096);
+    try t.expect(reserve_8k > reserve_4k);
+    try t.expectEqual(omitted + (reserve_8k - reserve_4k), pinned_4k);
+
+    // Explicit --prefill-chunk 16384: capped at 8192 and matches the 8192 reserve.
+    cli.* = .{ .override = 16_384, .explicit = true };
+    cfg.pinned_prefill_chunk = 0;
+    const capped_16k = prefixCacheMemForLoad(&cfg, 0, .{ .quiet = true }, &idle);
+    try t.expectEqual(@as(u32, 8192), cfg.pinned_prefill_chunk);
+    try t.expectEqual(omitted, capped_16k);
+
+    // Constrained load where the share bar pins 4096: load reserves at 4096, while a 32k request widens to 8192.
+    cli.* = .{};
+    cfg.pinned_prefill_chunk = 0;
+    memory_ceiling.overrides().machine_free = .{ .idle = 12 * gb, .request = 12 * gb };
+    _ = prefixCacheMemForLoad(&cfg, 0, .{ .quiet = true }, &idle);
+    try t.expectEqual(@as(u32, 4096), cfg.pinned_prefill_chunk);
+    try t.expectEqual(@as(u32, 8192), requestPrefillChunkNow(&cfg, 32_768, 256, .dense, .{}, .{}));
 }
 
 test "dsv41 admission: qwen4 and mimo match the previous chooser across budgets and pins" {

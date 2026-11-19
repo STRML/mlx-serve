@@ -47,13 +47,9 @@ pub fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     return true;
 }
 
-pub fn slotPrefillLimits(sch: *Scheduler, slot: *const Slot, cfg: *const ModelConfig) PrefillLimits {
+pub fn slotPrefillLimits(sch: *Scheduler, slot: *const Slot, cfg: *const ModelConfig, ref_active: u64) PrefillLimits {
     if (!cfg.residentDsv41()) return .{};
-    var active_now: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active_now);
-    var ledger = sch.promise_ledger;
-    ledger.release(slot.memory_promised);
-    return dsv41Limits(sch, slot, cfg, liveDecodingCount(sch), ledger.outstanding(active_now));
+    return dsv41Limits(sch, slot, cfg, liveDecodingCount(sch), sch.promise_ledger.otherOutstanding(slot.memory_promised, ref_active));
 }
 
 fn dsv41Limits(sch: *Scheduler, slot: *const Slot, cfg: *const ModelConfig, decoders: usize, promised: u64) PrefillLimits {
