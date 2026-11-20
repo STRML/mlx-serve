@@ -596,11 +596,13 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const rows: ?dsv41.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
     m.mdl.profile_prefill = f.mode == .prefill and env.on(.DSV41_PREFILL_PROFILE);
     defer m.mdl.profile_prefill = false;
-    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev, spec, ablation.prefillPhase(f)) catch |e| {
+    const logits = run(m, in.host, pos, f.logits, rows, in.dev, spec, ablation.prefillPhase(f)) catch |e| {
         std.log.err("deepseek_v41: the forward failed: {s}", .{if (e == error.EngineFailed) @import("../../sdk/util/err_name.zig").last() else @errorName(e)});
         return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
     };
-    if (f.logits == .none) _ = mlx.mlx_array_free(logits) else out.logits = .{ .ctx = logits.ctx };
+    if (f.logits == .none) {
+        if (logits.ctx != null) _ = mlx.mlx_array_free(logits);
+    } else out.logits = .{ .ctx = logits.ctx };
     return .ok;
 }
 
@@ -702,7 +704,7 @@ fn eachAlone(m: *Model, f: *const abi.Forward, specs: []const ?ablation.Spec) !m
             const m0 = row.model;
             try activate(m0, row.slot);
             const pos = row.position orelse if (m0.mdl.dec_state) |st| st.n else 0;
-            return run(m0, &.{row.token}, pos, false, null, .{ .ctx = null }, row.spec, false);
+            return run(m0, &.{row.token}, pos, .last_row, null, .{ .ctx = null }, row.spec, false);
         }
     };
     for (f.slots.slice(), f.tokens.slice(), 0..) |slot, t, k| {
@@ -721,11 +723,13 @@ fn eachAlone(m: *Model, f: *const abi.Forward, specs: []const ?ablation.Spec) !m
 }
 
 /// The legacy seam's arms: position 0 starts a request (a resumed one arrives past 0); a decode token stays on the
-/// GPU (`dev`, or the host id uploaded); everything else extends the state. `all` returns every row's logits. The
-/// slot's ablation `spec` is armed on the state the forward runs (`ablation.stateArm`): the DSpark rounds the engine
+/// GPU (`dev`, or the host id uploaded); everything else extends the state. `want_logits` selects `.all_rows`,
+/// `.last_row`, or `.none` (non-final prefill chunks eligible for decoder-skipping `Want.encode`). The slot's
+/// ablation `spec` is armed on the state the forward runs (`ablation.stateArm`): the DSpark rounds the engine
 /// runs on the module between forwards ablate under it too.
-fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.VisionRows, dev: mlx.mlx_array, spec: ?ablation.Spec, capture: bool) !mlx.mlx_array {
+fn run(m: *Model, host_ids: []const u32, pos: usize, want_logits: abi.Logits, rows: ?dsv41.VisionRows, dev: mlx.mlx_array, spec: ?ablation.Spec, capture: bool) !mlx.mlx_array {
     const mdl = m.mdl;
+    const all = want_logits == .all_rows;
     var one: [1]u32 = undefined;
     const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and (mdl.tp == null or dsv41.tpPipeOn());
     const ids = if (dev.ctx != null and !gpu_decode) blk: {
@@ -757,8 +761,10 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
         };
         defer _ = mlx.mlx_array_free(tok);
         break :blk try dsv41.extendResumableGpu(mdl, gpa, tok);
-    } else try runPrompt(m, ids, rows);
-    defer _ = mlx.mlx_array_free(logits);
+    } else try runPrompt(m, ids, rows, want_logits == .none and tap == null);
+    defer if (logits.ctx != null) {
+        _ = mlx.mlx_array_free(logits);
+    };
     if (tap) |t| {
         // The split prefill's final-token span is one row, so `Ids.of` leaves its id on the device (`host_ids` empty):
         // read it back, or the sidecar names the prompt one position short and its `tail_ids` empty.
@@ -773,6 +779,7 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
             break :blk false;
         };
     }
+    if (want_logits == .none) return .{ .ctx = null };
     var o = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(o);
     try mlx.check(mlx.mlx_reshape(&o, logits, &[_]c_int{ -1, @intCast(mdl.vocab) }, 2, m.s));
@@ -791,17 +798,22 @@ fn callRows(m: *const Model, n: usize) usize {
 }
 
 /// A prompt from the state's position (a new request's reset first, in `run`), in calls of at most `callRows`.
-fn runPrompt(m: *Model, ids: []const u32, rows: ?dsv41.VisionRows) !mlx.mlx_array {
+fn runPrompt(m: *Model, ids: []const u32, rows: ?dsv41.VisionRows, no_logits: bool) !mlx.mlx_array {
     const mdl = m.mdl;
     const call = callRows(m, ids.len);
     var vr = rows;
     var at: usize = 0;
     while (true) {
         const piece = ids[at..][0..@min(call, ids.len - at)];
-        const out = try dsv41.extendResumable(mdl, gpa, piece, vr);
+        const rem = ids.len - (at + piece.len);
+        const encode_piece = (no_logits and rem == 0) or (rem > 0 and @min(call, rem) >= mdl.cfg.sliding_window + mdl.ced_min_skip);
+        const out = if (encode_piece)
+            try dsv41.extendEncodeResumable(mdl, gpa, piece, vr, if (rem > 0) @min(call, rem) else null)
+        else
+            try dsv41.extendResumable(mdl, gpa, piece, vr);
         at += piece.len;
         if (at == ids.len) return out;
-        _ = mlx.mlx_array_free(out);
+        if (out.ctx != null) _ = mlx.mlx_array_free(out);
         if (vr) |*v| v.offset += std.mem.count(u32, piece, &.{m.cfg.image_token_id});
     }
 }
