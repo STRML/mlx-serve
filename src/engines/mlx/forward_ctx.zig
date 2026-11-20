@@ -103,6 +103,9 @@ pub const ForwardCtx = struct {
     /// A prompt forward read at most at its last row's logits (no prompt logprobs): a model declaring
     /// `Caps.prompt_last_row` is asked for that row alone.
     last_row_logits: bool = false,
+    /// An interior prefill chunk whose logits and hidden rows are discarded: `owns_decode_state` plugins receive
+    /// `abi.Logits.none` with `want_hidden = false`.
+    no_logits: bool = false,
     /// Hand the graph built so far to the GPU every this many layers (0 =
     /// build it whole): a spec round's verify waits on the host otherwise.
     pipeline_build: u32 = 0,
