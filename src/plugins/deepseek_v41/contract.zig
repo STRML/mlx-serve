@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
+const device = @import("../../mlx/device.zig");
 const kit = @import("../deepseek_v4/contract_kit.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const v41 = @import("deepseek_v41.zig");
@@ -896,6 +897,39 @@ const IdxTile = struct {
 
     pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
         // The wrapper casts q to the keys' dtype (exact: the rope kernel rounded it there).
+        try idxFill(k, f, rng, act, act);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        try idxCompute(k, out, mag, sum);
+    }
+};
+
+const IdxNax = struct {
+    pub const Params = struct { ih: usize = IH };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or p.ih == 0 or p.ih > 128 or s.k % 16 != 0 or s.k > 128) return null;
+        const bm = v41.idxNaxBm(s.rows);
+        const bn = v41.idx_nax_bn;
+        const tgn = v41.idxNaxTgn(bm, bn);
+        const dk = v41.idxNaxDk(s.k);
+        var g = metal.Geometry{ .grid = .{ ci((s.rows + bm - 1) / bm * tgn), ci((s.n + bn - 1) / bn), 1 }, .tg = .{ ci(tgn), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n) }, .float32);
+        g.int("IH", p.ih);
+        g.int("IHD", s.k);
+        g.int("BM", bm);
+        g.int("BN", bn);
+        g.int("DK", dk);
+        g.dtype("T", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
         try idxFill(k, f, rng, act, act);
     }
 
@@ -4120,6 +4154,7 @@ const stage_l = launch("dsv41_hc_stage", hc_stage_ins, &.{ "h_out", "z" }, v41.H
 const stage_x_l = launch("dsv41_hc_stage_x", hc_stage_x_ins, &.{ "h_out", "z", "x1" }, v41.HC_STAGE_X_SOURCE, "", 2 * 4 * 32, 1024, true);
 const idx_l = launch("dsv41_index_scores", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_SCORE_SOURCE, "", 4 * IH * IHD, 416, false);
 const tile_l = launch("dsv41_index_tile", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_TILE_SOURCE, "", 2 * IdxTile.KT * IHD + 4 * IH + 4 * 4 * 64, 1024, false);
+const idx_nax_l = metal.Launch{ .name = "dsv41_index_nax", .inputs = &.{ "q", "keys", "w", "meta", "wsc" }, .outputs = &.{"scores"}, .source = v41.IDX_NAX_SOURCE, .header = v41.MPP_OPS_HEADER, .tg_bytes = v41.idx_nax_bn * IHD * 2, .offline = false, .min_gen = 17 };
 pub const rope_l = launch("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, v41.ROPE_TAIL_SOURCE, v41.FP8_HEADER, 0, 1024, false);
 const expand_into_l = launch("dsv41_hc_expand_into", &.{ "x", "res", "post", "comb", "dst", "after" }, &.{"carrier"}, sx1.expand_into_source, "", 0, 704, false);
 const expand_norm_l = launch("dsv41_hc_expand_norm", &.{ "y", "res", "post", "comb", "cpre", "w", "eps" }, &.{ "h_out", "x1" }, hcf.expand_norm_source, hcf.expand_norm_fresh_header, 4 * 32, 1024, true);
@@ -4271,6 +4306,15 @@ pub fn register(set: *kc.Set) !void {
         .tiles = .{ .{}, .{ .size = IdxTile.KT }, .{} },
         .served = &.{ .{ .rows = 17, .n = 300, .k = IHD }, .{ .rows = 24, .n = 200, .k = IHD } },
         .known = relu_nan,
+    });
+    try kit.add(set, IdxNax, &idx_nax_l, .{}, .{
+        .name = "dsv41 idx_nax (wide indexer, NAX matmul2d)",
+        .accum = .f32,
+        .depth = depthIdx,
+        .out = .f32,
+        .tiles = .{ .{ .size = 32, .step = 1, .min = 7 }, .{ .size = v41.idx_nax_bn }, .{} },
+        .served = &.{ .{ .rows = 17, .n = 300, .k = IHD }, .{ .rows = 33, .n = 200, .k = IHD }, .{ .rows = 18, .n = 128, .k = 64 } },
+        .nax = true,
     });
     const rope_served: []const Shape = &.{ .{ .rows = 1, .n = 8, .k = HD }, .{ .rows = REGION, .n = 8, .k = HD } };
     try kit.add(set, RopeTail, &rope_l, .{ .qk = .none, .off = 3001 }, .{
@@ -4531,6 +4575,7 @@ const Shell = struct {
         m.attn_merge_kernel = try b("dsv41_attn_merge", &v41.ATTN_MERGE_INS, &.{"out"}, v41.ATTN_MERGE_SOURCE, v41.UNROPE_HEADER);
         m.idx_score_kernel = try v41.buildIdxScoreKernel();
         m.idx_tile_kernel = try b("dsv41_index_tile", &v41.IDX_INS, &.{"scores"}, v41.IDX_TILE_SOURCE, "");
+        m.idx_nax_kernel = if (device.naxAvailable()) try b("dsv41_index_nax", &v41.IDX_INS, &.{"scores"}, v41.IDX_NAX_SOURCE, v41.MPP_OPS_HEADER) else null;
         m.gate_kernel = try b("dsv41_gate", &.{ "x", "w" }, &.{"logits"}, v41.GATE_SOURCE, "");
         m.topk_kernel = try b("dsv41_topk", &.{"x"}, &.{"out"}, v41.TOPK_SOURCE, v41.TOPK_HEADER);
         m.topk_tg = 1024;
@@ -4554,6 +4599,7 @@ const Shell = struct {
 
     fn deinit(self: *Shell) void {
         const m = &self.m;
+        if (m.idx_nax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         for ([_]mlx.mlx_fast_metal_kernel{ m.attn_dec_kernel, m.attn_split_kernel, m.attn_merge_kernel, m.idx_score_kernel, m.idx_tile_kernel, m.gate_kernel, m.topk_kernel, m.dense_f32x_kernel, m.route_kernel, m.hc_mix_kernel, m.hc_norm_kernel, m.hc_stage_kernel, m.hc_stage_x_kernel, m.hc_split_kernel, m.rope_kernel, m.rope_tail_only_kernel, m.kv_row_kernel, m.engram_kernel, m.moe_gu_kernel, m.moe_dn_kernel, m.moe_act_kernel, m.moe_combine_kernel }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
     }
 };
@@ -4974,6 +5020,10 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(IdxTile, a, &tile_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
         try Expect.same(r.c, r.bytes, &.{try v41.indexScoresTiled(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2], @floatCast(r.c.in(4)[0]), @intFromFloat(r.c.in(3)[0]), @intFromFloat(r.c.in(3)[1]))});
     }
+    if (m.idx_nax_kernel != null) {
+        const r = try ours(IdxNax, a, &idx_nax_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
+        try Expect.same(r.c, r.bytes, &.{try v41.indexScoresNax(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2], @floatCast(r.c.in(4)[0]), @intFromFloat(r.c.in(3)[0]), @intFromFloat(r.c.in(3)[1]))});
+    }
     {
         const r = try ours(Engram, a, &engram_l, .{}, .{ .rows = 2, .n = HC, .k = DIM });
         try Expect.same(r.c, r.bytes, &.{try v41.engramGate(&sc, m, r.c.args[2], r.c.args[0], r.c.args[1])});
@@ -5041,4 +5091,26 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(MoeCombine, a, &combine_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
         try Expect.same(r.c, r.bytes, &.{try v41.flatKernel(&sc, m.moe_combine_kernel, r.c.args[0..3], &.{ 3, 256 }, act, 3 * 256, &.{ .{ .name = "D", .v = 256 }, .{ .name = "K", .v = TOPK } })});
     }
+}
+
+test "kernel contract dsv41 idx_nax: passes gates 1-4 and planted controls fail" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var set = kc.Set.init(a);
+    defer set.deinit();
+    try @import("../../sdk/testing/kernel_contract/controls.zig").register(&set);
+    try kit.add(&set, IdxNax, &idx_nax_l, .{}, .{
+        .name = "dsv41 idx_nax (wide indexer, NAX matmul2d)",
+        .accum = .f32,
+        .depth = depthIdx,
+        .out = .f32,
+        .tiles = .{ .{ .size = 32, .step = 1, .min = 7 }, .{ .size = v41.idx_nax_bn }, .{} },
+        .served = &.{ .{ .rows = 17, .n = 300, .k = IHD }, .{ .rows = 33, .n = 200, .k = IHD }, .{ .rows = 18, .n = 128, .k = 64 } },
+        .nax = true,
+    });
+    var t: kc.gates.Tally = .{};
+    try kc.gates.runAll(a, set.kernels.items, 0xc0de, &t);
+    try std.testing.expectEqual(@as(usize, 1), t.passed);
+    try std.testing.expect(t.caught >= 7);
+    try std.testing.expectEqual(@as(usize, 0), t.problems());
 }
