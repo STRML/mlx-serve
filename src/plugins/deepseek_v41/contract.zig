@@ -4593,9 +4593,8 @@ const Shell = struct {
         m.moe_dn_kernel = try b("dsv41_moe_dn", &v41.MOE_DN_INS, &.{"out"}, v41.MOE_DN_SOURCE, v41.MOE_HEADER);
         m.moe_act_kernel = try b("dsv41_moe_act", &v41.MOE_ACT_INS, &.{"out"}, v41.MOE_ACT_SOURCE, "");
         m.moe_combine_kernel = try b("dsv41_moe_combine", &v41.MOE_COMBINE_INS, &.{"out"}, v41.MOE_COMBINE_SOURCE, "");
-        if (device.naxAvailable()) {
-            m.idx_nax_kernel = try b("dsv41_index_nax", &v41.IDX_INS, &.{"scores"}, v41.IDX_NAX_SOURCE, v41.MPP_OPS_HEADER);
-        }
+        const use_nax = device.naxAvailable();
+        m.idx_nax_kernel = if (use_nax) try v41.buildIdxNaxKernel() else null;
         return .{ .m = m };
     }
 

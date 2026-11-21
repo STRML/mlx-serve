@@ -1695,6 +1695,10 @@ pub fn buildIdxScoreKernel() !mlx.mlx_fast_metal_kernel {
     return buildKernel("dsv41_index_scores", &IDX_INS, &.{"scores"}, IDX_SCORE_SOURCE, "");
 }
 
+pub fn buildIdxNaxKernel() !mlx.mlx_fast_metal_kernel {
+    return buildKernel("dsv41_index_nax", &IDX_INS, &.{"scores"}, IDX_NAX_SOURCE, MPP_OPS_HEADER);
+}
+
 pub const ATTN_INS = [_][*:0]const u8{ "q", "ring", "comp", "topk", "sink", "meta", "scal" };
 pub const ATTN_SOFTMAX_INS = [_][*:0]const u8{ "lw", "lc", "topk", "sink", "meta", "scal" };
 pub const ATTN_DEC_INS = ATTN_INS ++ [_][*:0]const u8{"periods"};
@@ -1981,7 +1985,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
     }
     if (device.naxAvailable() and mlx.metalKernelsAvailable()) {
-        m.idx_nax_kernel = try buildKernel("dsv41_index_nax", &IDX_INS, &.{"scores"}, IDX_NAX_SOURCE, MPP_OPS_HEADER);
+        m.idx_nax_kernel = try buildIdxNaxKernel();
     }
     if (worker) {
         m.embed = .{ .w = none };
@@ -10226,7 +10230,7 @@ test "dsv41 index_nax: NAX multi-row scorer matches idx_tile scores and top-K pi
     defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_score_kernel);
     m.idx_tile_kernel = try buildKernel("dsv41_index_tile", &IDX_INS, &.{"scores"}, IDX_TILE_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_tile_kernel);
-    m.idx_nax_kernel = try buildKernel("dsv41_index_nax", &IDX_INS, &.{"scores"}, IDX_NAX_SOURCE, MPP_OPS_HEADER);
+    m.idx_nax_kernel = try buildIdxNaxKernel();
     defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_nax_kernel.?);
     m.topk_kernel = try buildKernel("dsv41_topk", &.{"x"}, &.{"out"}, TOPK_SOURCE, TOPK_HEADER);
     m.topk_tg = 1024;
@@ -10349,7 +10353,7 @@ test "dsv41 index_nax: ubench" {
     var m: Dsv41Model = undefined;
     m.idx_tile_kernel = try buildKernel("dsv41_index_tile", &IDX_INS, &.{"scores"}, IDX_TILE_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_tile_kernel);
-    m.idx_nax_kernel = try buildKernel("dsv41_index_nax", &IDX_INS, &.{"scores"}, IDX_NAX_SOURCE, MPP_OPS_HEADER);
+    m.idx_nax_kernel = try buildIdxNaxKernel();
     defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_nax_kernel.?);
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
