@@ -589,7 +589,7 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     defer in.deinit();
     const pos: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
     if (pos != 0 and (m.mdl.dec_state == null or m.mdl.dec_state.?.n != pos)) return Verdict.refuse(.failed, "deepseek_v41: the position does not follow the model's state");
-    if (pos != 0 and !ablation.fits(pos, m.mdl.dec_state.?.variant, spec)) return variantRefused();
+    if (pos != 0) if (continuationRefused(pos, m.mdl.dec_state.?.variant, spec)) |refused| return refused;
     for (in.host) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "deepseek_v41: token id past the vocabulary");
     if (m.bank != null and in.host.len > 1 and f.logits != .all_rows and pos + in.host.len > m.bank_context)
         return Verdict.refuse(.failed, "deepseek_v41: the prompt is longer than the streamed bank's billed context (ctx_size)");
@@ -618,8 +618,12 @@ fn slotAblation(m: *const Model, f: *const abi.Forward, k: usize, out: *?ablatio
     return null;
 }
 
-/// A forward under another ablation (or none) than the one its slot's state was computed under (`ablation.fits`).
-fn variantRefused() Verdict {
+/// The refusal of a forward that continues `n` rows computed under `variant` under `spec` (`ablation.fits`), or null:
+/// an unkeyed ablation continues nothing (a one-shot forward from position 0 is allowed), and any other mismatch is a
+/// state computed under another ablation (or none).
+fn continuationRefused(n: usize, variant: ?ablation.Variant, spec: ?ablation.Spec) ?Verdict {
+    if (ablation.fits(n, variant, spec)) return null;
+    if (ablation.variantOf(spec) == .unkeyed) return Verdict.refuse(.unsupported, "deepseek_v41: an unkeyed ablation cannot continue rows (the host must give it a nonzero key)");
     return Verdict.refuse(.unsupported, "deepseek_v41: the slot's state was computed under another ablation (or none)");
 }
 
@@ -644,7 +648,7 @@ fn forwardBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdic
         states[k] = live.st;
         gens[k] = live.gen;
         if (f.positions.len == n and f.positions.slice()[k] != states[k].n) return Verdict.refuse(.failed, "deepseek_v41: the position does not follow the slot's state");
-        if (!ablation.fits(states[k].n, states[k].variant, specs[k])) return variantRefused();
+        if (continuationRefused(states[k].n, states[k].variant, specs[k])) |refused| return refused;
         if (states[k].verify != null) alone = true;
     }
     for (f.tokens.slice()) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "deepseek_v41: token id past the vocabulary");

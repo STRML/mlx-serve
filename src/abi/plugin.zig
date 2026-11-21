@@ -547,7 +547,9 @@ pub const Ablation = extern struct {
     directions: Array = .{},
     /// One per slot, in [0, 1]; 0 = that slot is not ablated.
     strengths: Span(f32) = .{},
-    /// One per slot: the profile's identity with the strength folded in (equal keys ablate identically); 0 = none.
+    /// One per slot: the profile's identity with the strength folded in (equal keys ablate identically); 0 = unkeyed. A
+    /// module may run one forward from position 0 under an unkeyed ablation and refuse any continuation of its rows; a
+    /// host that continues rows gives each distinct direction and strength a nonzero key.
     keys: Span(u64) = .{},
 };
 

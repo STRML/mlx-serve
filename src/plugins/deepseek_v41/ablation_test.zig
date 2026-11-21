@@ -1184,3 +1184,27 @@ test "deepseek_v41 ablation forward: a mixed tick of one ablated slot and two pl
     try testing.expectEqualSlices(f32, want2, got[want2.len .. 2 * want2.len]);
     try testing.expectEqualSlices(f32, want3, got[2 * want2.len ..]);
 }
+
+test "deepseek_v41 ablation forward: an unkeyed ablation runs one forward from position 0 and refuses every continuation by its own name" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    const unkeyed = try Table.init(&.{1}, &.{0}, m.cfg.hidden_size);
+    defer unkeyed.deinit();
+    const batch = try Table.init(&.{ 1, 0 }, &.{ 0, 0 }, m.cfg.hidden_size);
+    defer batch.deinit();
+    const keyed = try Table.init(&.{1}, &.{key}, m.cfg.hidden_size);
+    defer keyed.deinit();
+    const pos: u32 = @intCast(short_prompt.len);
+    const says = "unkeyed ablation cannot continue rows";
+    testing.allocator.free(try forwardUnder(t, .prefill, &.{1}, &short_prompt, &.{0}, &unkeyed.abl));
+    try expectRefused(t, .decode, &.{1}, &.{44}, &.{pos}, &unkeyed.abl, says);
+    // A batched tick with the unkeyed slot among plain ones names the same cause.
+    testing.allocator.free(try forwardUnder(t, .prefill, &.{2}, &short_prompt, &.{0}, null));
+    try expectRefused(t, .batched_rows, &.{ 1, 2 }, &.{ 44, 9 }, &.{ pos, pos }, &batch.abl, says);
+    // A mismatch is another cause and keeps its own text: a keyed step on rows the unkeyed ablation wrote.
+    try expectRefused(t, .decode, &.{1}, &.{44}, &.{pos}, &keyed.abl, "another ablation");
+}
