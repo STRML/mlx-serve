@@ -1368,9 +1368,10 @@ pub const HotPrefixCache = struct {
                 const request = module_request orelse continue;
                 if (!ModuleBinding.same(m.binding, request.binding) or m.n == 0) continue;
                 // An entry that ends inside the prompt restores whole. One that outruns the prompt or leaves it is
-                // worth what the plugin can cut it to, text only: its key covers image rows a cut cannot re-derive.
+                // worth what the plugin can cut it to, text only: its key covers image rows a cut cannot re-derive. A keyed
+                // request takes none: an imported entry holds no direction, so a cut would replay its window plain.
                 const whole = shared == m.n and m.n < prompt_ids.len;
-                const cut = if (whole or !request.cuts or e.media.len > 0 or spansBelow(media, shared).len > 0) 0 else @min(shared, prompt_ids.len -| 1);
+                const cut = if (whole or !request.cuts or request.binding.variant != 0 or e.media.len > 0 or spansBelow(media, shared).len > 0) 0 else @min(shared, prompt_ids.len -| 1);
                 const worth = if (whole) m.n else cut -| MODULE_CUT_COST;
                 if (worth <= best_effective) continue;
                 var key: u64 = 0;
@@ -11951,6 +11952,46 @@ test "HotPrefixCache module: an entry that outruns the prompt or leaves it is re
     try testing.expectEqual(@as(usize, 0), cache.restoreModuleCut(binding, cut.entry_id, 7, cut.cut));
     try testing.expectEqual(@as(usize, 2), cache.entries.items.len);
     try testing.expectEqual(@as(usize, 1200), cache.findWholeModuleMatch(binding, &far, false, &.{}, null, dense).?.n);
+}
+
+test "HotPrefixCache module: a keyed request is never restored through a cut, a plain one with the same shape still is" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const plain = fake.bind(&bound, &xfm);
+    var keyed = plain;
+    keyed.variant = 5;
+    const dense = kv_quant.KVQuantConfig.dense;
+    var ids: [2000]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(i % 251 + 1);
+    const keyOf = struct {
+        fn f(xs: []const u32) u64 {
+            var k: u64 = 0;
+            for (xs) |x| k += x;
+            return k;
+        }
+    }.f;
+    var prompt: [1600]u32 = @splat(300);
+    @memcpy(prompt[0..1501], ids[0..1501]);
+    // An imported entry holds no direction arrays, so a cut would replay its window plain under a keyed request.
+    for ([_]ModuleBinding{ plain, keyed }) |binding| {
+        var cache = HotPrefixCache.init(testing.allocator, 4);
+        defer cache.deinit();
+        var long: ModuleFake.Snap = .{ .owner = &fake, .ids = &ids, .key = keyOf(&ids) };
+        _ = try long.put(&cache, binding, &.{});
+        const hit = cache.findModuleMatch(binding, &prompt, false, &.{}, null, dense);
+        if (binding.variant == 0) {
+            try testing.expectEqual(@as(usize, 1501), hit.?.cut);
+            continue;
+        }
+        try testing.expect(hit == null);
+        // A whole entry still serves it.
+        var mid: ModuleFake.Snap = .{ .owner = &fake, .ids = ids[0..1200], .key = keyOf(ids[0..1200]) };
+        _ = try mid.put(&cache, binding, &.{});
+        const whole = cache.findModuleMatch(binding, &prompt, false, &.{}, null, dense).?;
+        try testing.expectEqual(@as(usize, 0), whole.cut);
+        try testing.expectEqual(@as(usize, 1200), whole.n);
+    }
 }
 
 test "HotPrefixCache module: a decode-end entry lasts until its conversation commits past its prompt" {
