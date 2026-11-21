@@ -28,6 +28,13 @@ The model plugin table (`ModelTable`) and every struct that crosses it. Extern l
 | `stream_room_cell` | `u64 = 16_384 + 1_024` | The request the stream rooms are billed at (16K prompt + 1K reply): a bank calibration's evidence cell. |
 | `max_round_tokens` | `32` | The most tokens a native drafter's round commits (`Round.tokens`). |
 
+### `ServingMode` (enum(u8))
+
+| Member | Value | |
+|---|---|---|
+| `tp1` | |  |
+| `tp` | |  |
+
 ### `AuxImportPlan` (extern struct)
 
 | Field | Type | Default | |
@@ -553,6 +560,7 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `ablation` | `?*const Ablation` | `null` | Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged. |
 | `prompt_spans` | `Span(u64)` | `.{}` | A prompt forward the engine does not chunk: a whole-prompt prefill (`Caps.whole_prompt_prefill`), or a hybrid's restored tail inside the snapshot backoff. The absolute positions where the engine's chunk loop would end its spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only when `size` reaches it: an older host's `Forward` ends before it. |
 | `ssm_checkpoints` | `Span(u64)` | `.{}` | The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending, each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it. |
+| `prefill` | `bool` | `false` | The engine's prompt forwarding, whatever `mode` says: the split prefill's final-token span is one row and so arrives as `Mode.decode`. False on decode steps and verify blocks. Read it only when `size` reaches it: an older host's `Forward` ends before it. |
 
 ### `Ablation` (extern struct)
 
@@ -563,7 +571,7 @@ Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i
 | `size` | `u32` | `@sizeOf(Ablation)` |  |
 | `directions` | `Array` | `.{}` | Unit directions `[slots, hidden]` f32, one row per `Forward.slots` entry. |
 | `strengths` | `Span(f32)` | `.{}` | One per slot, in [0, 1]; 0 = that slot is not ablated. |
-| `keys` | `Span(u64)` | `.{}` | One per slot: the profile's identity with the strength folded in (equal keys ablate identically); 0 = none. |
+| `keys` | `Span(u64)` | `.{}` | One per slot: the profile's identity with the strength folded in (equal keys ablate identically); 0 = unkeyed. A module may run one forward from position 0 under an unkeyed ablation and refuse any continuation of its rows; a host that continues rows gives each distinct direction and strength a nonzero key. |
 
 ### `Offload` (extern struct)
 
@@ -1001,6 +1009,7 @@ A model plugin's table, exported as `exportName(name, version)`. `claims` and `p
 | `weights` | `*const WeightHooks` |  |  |
 | `meters` | `?*const fn (m: *anyopaque, slot: u32, out: *Str) callconv(.c) void` | `null` | `slot`'s arm counters for its request's summary lines (each a full log line), in memory the plugin owns until the next call on `m`; the counters reset. |
 | `speech` | `?*const SpeechHooks` | `null` |  |
+| `swap_mode` | `?*const fn (m: *anyopaque, to: ServingMode) callconv(.c) Verdict` | `null` |  |
 
 ### `declaresMode(caps: Caps, mode: Mode) bool`
 

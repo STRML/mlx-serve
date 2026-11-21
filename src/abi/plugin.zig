@@ -532,6 +532,10 @@ pub const Forward = extern struct {
     /// The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending,
     /// each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it.
     ssm_checkpoints: Span(u64) = .{},
+    /// The engine's prompt forwarding, whatever `mode` says: the split prefill's final-token span is one row and so
+    /// arrives as `Mode.decode`. False on decode steps and verify blocks. Read it only when `size` reaches it: an older
+    /// host's `Forward` ends before it.
+    prefill: bool = false,
 };
 
 /// Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its
@@ -543,7 +547,9 @@ pub const Ablation = extern struct {
     directions: Array = .{},
     /// One per slot, in [0, 1]; 0 = that slot is not ablated.
     strengths: Span(f32) = .{},
-    /// One per slot: the profile's identity with the strength folded in (equal keys ablate identically); 0 = none.
+    /// One per slot: the profile's identity with the strength folded in (equal keys ablate identically); 0 = unkeyed. A
+    /// module may run one forward from position 0 under an unkeyed ablation and refuse any continuation of its rows; a
+    /// host that continues rows gives each distinct direction and strength a nonzero key.
     keys: Span(u64) = .{},
 };
 
