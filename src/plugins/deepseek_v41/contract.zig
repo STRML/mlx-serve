@@ -4575,7 +4575,6 @@ const Shell = struct {
         m.attn_merge_kernel = try b("dsv41_attn_merge", &v41.ATTN_MERGE_INS, &.{"out"}, v41.ATTN_MERGE_SOURCE, v41.UNROPE_HEADER);
         m.idx_score_kernel = try v41.buildIdxScoreKernel();
         m.idx_tile_kernel = try b("dsv41_index_tile", &v41.IDX_INS, &.{"scores"}, v41.IDX_TILE_SOURCE, "");
-        m.idx_nax_kernel = if (device.naxAvailable()) try b("dsv41_index_nax", &v41.IDX_INS, &.{"scores"}, v41.IDX_NAX_SOURCE, v41.MPP_OPS_HEADER) else null;
         m.gate_kernel = try b("dsv41_gate", &.{ "x", "w" }, &.{"logits"}, v41.GATE_SOURCE, "");
         m.topk_kernel = try b("dsv41_topk", &.{"x"}, &.{"out"}, v41.TOPK_SOURCE, v41.TOPK_HEADER);
         m.topk_tg = 1024;
@@ -4594,6 +4593,9 @@ const Shell = struct {
         m.moe_dn_kernel = try b("dsv41_moe_dn", &v41.MOE_DN_INS, &.{"out"}, v41.MOE_DN_SOURCE, v41.MOE_HEADER);
         m.moe_act_kernel = try b("dsv41_moe_act", &v41.MOE_ACT_INS, &.{"out"}, v41.MOE_ACT_SOURCE, "");
         m.moe_combine_kernel = try b("dsv41_moe_combine", &v41.MOE_COMBINE_INS, &.{"out"}, v41.MOE_COMBINE_SOURCE, "");
+        if (device.naxAvailable()) {
+            m.idx_nax_kernel = try b("dsv41_index_nax", &v41.IDX_INS, &.{"scores"}, v41.IDX_NAX_SOURCE, v41.MPP_OPS_HEADER);
+        }
         return .{ .m = m };
     }
 
