@@ -7971,12 +7971,13 @@ fn canEncodeChunk(m: *const Dsv41Model, st: *const State, ids: []const u32, visi
 }
 
 /// Non-final prompt chunk when the caller needs no logits: skips decoder layers `[ced_split..n_layers)` and head
-/// via `Want.encode` whenever all safety invariants hold, falling back to `extendResumable` otherwise.
+/// via `Want.encode` whenever all safety invariants hold (preserving `extendCold`'s `leadRows` split on cold chunks
+/// with Engram so SSD read-ahead still overlaps chunk 0), falling back to `extendResumable` otherwise.
 pub fn extendEncodeResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision: ?VisionRows, rem_hint: ?usize) !A {
     try snapshotIfDue(m);
     const st = &m.dec_state.?;
     if (canEncodeChunk(m, st, ids, vision, rem_hint)) {
-        return extendIds(m, gpa, st, .{ .host = ids }, .encode, vision);
+        return extendCold(m, gpa, st, ids, .encode, vision);
     }
     return extendResumable(m, gpa, ids, vision);
 }
@@ -7989,13 +7990,13 @@ pub fn leadRows(L: usize, read_ahead: bool) usize {
 }
 const LEAD_MIN = @import("config.zig").prefill_lead_min_rows;
 
-/// `extendIds` of a prompt chunk for its last row's logits, its lead (`leadRows`) run first without the decoder's
-/// replay, which the rest of the chunk makes at its own end.
-fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, vision: ?VisionRows) !A {
+/// `extendIds` of a prompt chunk for `want` (`.last` or `.encode`), its lead (`leadRows`) run first without the
+/// decoder's replay, which the rest of the chunk makes at its own end when `want == .last`.
+fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, want: Want, vision: ?VisionRows) !A {
     const whole = m.engrams.len == 0 or m.pair != null or m.tp != null or m.streamed != null or m.trace != null or
         m.ced_split == null or st.verify != null or !cedEnabled();
     const lead = if (whole) 0 else leadRows(ids.len, if (m.ahead) |a| a.covers(st.n, ids.len) else false);
-    if (lead == 0) return extendIds(m, gpa, st, .{ .host = ids }, .last, vision);
+    if (lead == 0) return extendIds(m, gpa, st, .{ .host = ids }, want, vision);
     defer m.next_rows = null;
     m.next_rows = ids.len - lead;
     _ = try extendIds(m, gpa, st, .{ .host = ids[0..lead] }, .encode, vision);
@@ -8003,7 +8004,7 @@ fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u
     if (rest) |*v| v.offset += std.mem.count(u32, ids[0..lead], &.{m.cfg.image_token_id});
     // The prompt's next chunk is expected as wide as this whole one, not as its rest.
     m.next_rows = ids.len;
-    return extendIds(m, gpa, st, .{ .host = ids[lead..] }, .last, rest);
+    return extendIds(m, gpa, st, .{ .host = ids[lead..] }, want, rest);
 }
 
 /// `extend` that takes the armed snapshot on the way: a chunk crossing its
@@ -8022,7 +8023,7 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
     const st = &m.dec_state.?;
     if (st.snap_at) |at| if (at > st.n and at < st.n + ids.len) {
         const k = at - st.n;
-        const head = try extendCold(m, gpa, st, ids[0..k], vision);
+        const head = try extendCold(m, gpa, st, ids[0..k], .last, vision);
         _ = mlx.mlx_array_free(head);
         try snapshotIfDue(m);
         // The tail's rows follow the head's.
@@ -8030,7 +8031,7 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
         if (rest) |*v| v.offset += std.mem.count(u32, ids[0..k], &.{m.cfg.image_token_id});
         return extendIds(m, gpa, st, .{ .host = ids[k..] }, .last, rest);
     };
-    const out = try extendCold(m, gpa, st, ids, vision);
+    const out = try extendCold(m, gpa, st, ids, .last, vision);
     try snapshotIfDue(m);
     return out;
 }

@@ -721,6 +721,133 @@ test "deepseek_v41 CED encode interior: all_rows, pair, TP and disabled CED neve
     try testing.expect(!m.mdl.dec_state.?.decoder_stale);
 }
 
+fn attachTinyEngramForTest(mdl: *dsv41.Dsv41Model, dir: []const u8) !void {
+    const gpa = mdl.gpa;
+    const fxmod = @import("decode/fixture.zig");
+    fxmod.engramConfig(&mdl.cfg, .{ 1, 2 });
+    mdl.token_map = try engram.loadTokenMap(gpa, dir, @intCast(mdl.vocab), mdl.cfg.dsv41_engram_compressed_vocab);
+    mdl.hash = try engram.Hash.init(&mdl.cfg, mdl.token_map[mdl.cfg.dsv41_engram_pad_id]);
+    const cols = mdl.hash.?.cols();
+    const d: c_int = @intCast(mdl.cfg.hidden_size);
+    const hc: c_int = @intCast(mdl.cfg.dsv4_hc_mult);
+    const in_dim: c_int = @intCast(cols * mdl.cfg.dsv41_engram_head_dim);
+    mdl.engrams = try gpa.alloc(dsv41.EngramLayer, 2);
+    var opened: usize = 0;
+    errdefer {
+        for (mdl.engrams[0..opened]) |*e| e.table.close();
+        gpa.free(mdl.engrams);
+        mdl.engrams = &.{};
+    }
+    const w_scale_f32 = mlx.mlx_array_new_float(0.01);
+    defer _ = mlx.mlx_array_free(w_scale_f32);
+    var w_scale = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_scale);
+    try mlx.check(mlx.mlx_astype(&w_scale, w_scale_f32, mdl.act, mdl.s));
+    const qk_scale = mlx.mlx_array_new_float(0.05);
+    defer _ = mlx.mlx_array_free(qk_scale);
+    for (0..2) |k| {
+        const l: usize = mdl.cfg.dsv41_engram_layers[k];
+        var w_ones = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w_ones);
+        try mlx.check(mlx.mlx_ones(&w_ones, &[_]c_int{ (hc + 1) * d, in_dim }, 2, mdl.act, mdl.s));
+        var w_arr = mlx.mlx_array_new();
+        {
+            errdefer _ = mlx.mlx_array_free(w_arr);
+            try mlx.check(mlx.mlx_multiply(&w_arr, w_ones, w_scale, mdl.s));
+            try mdl.owned.append(gpa, w_arr);
+        }
+
+        var qk_ones = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qk_ones);
+        try mlx.check(mlx.mlx_ones(&qk_ones, &[_]c_int{ hc, d }, 2, .float32, mdl.s));
+        var qk_arr = mlx.mlx_array_new();
+        {
+            errdefer _ = mlx.mlx_array_free(qk_arr);
+            try mlx.check(mlx.mlx_multiply(&qk_arr, qk_ones, qk_scale, mdl.s));
+            try mdl.owned.append(gpa, qk_arr);
+        }
+
+        try mlx.check(mlx.mlx_array_eval(w_arr));
+        try mlx.check(mlx.mlx_array_eval(qk_arr));
+        mdl.engrams[k] = .{
+            .layer = l,
+            .wkv = .{ .w = w_arr },
+            .qk = qk_arr,
+            .table = try engram.Table.open(gpa, dir, k, l, mdl.cfg.dsv41_engram_rows[k], mdl.cfg.dsv41_engram_head_dim),
+        };
+        mdl.engrams[k].table.openCodes();
+        opened += 1;
+    }
+}
+
+test "deepseek_v41 CED encode interior: cold Engram chunk splits leadRows and matches cold bit for bit" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const fxmod = @import("decode/fixture.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try fxmod.writeEngramPack(testing.allocator, td.dir, 96, .{ 1, 2 });
+    var path: [512]u8 = undefined;
+    const dir = path[0..try td.dir.realPath(io, &path)];
+
+    var p: [8705]u32 = undefined; // 4096 (cold lead) + 4096 (warm read-ahead) + 512 (cedTail) + 1 (final)
+    for (&p, 0..) |*x, i| x.* = @intCast(3 + (i * 37 + i * i) % 90);
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+
+    const cold_t = try Twin.open(files, "");
+    defer cold_t.close();
+    const cold_m: *v41.Model = @ptrCast(@alignCast(cold_t.m));
+    try attachTinyEngramForTest(cold_m.mdl, dir);
+    const w: usize = cold_m.mdl.cfg.sliding_window;
+    cold_m.mdl.ced_min_skip = w;
+    try testing.expect(aux.begin_prompt(cold_t.m, 1, .of(&p), .{}, 0, true).isOk());
+    for ([_][2]usize{ .{ 0, 4096 }, .{ 4096, 8192 }, .{ 8192, 8704 } }) |r| {
+        testing.allocator.free(try slotForward(cold_t, .prefill, &.{1}, p[r[0]..r[1]], &.{@intCast(r[0])}));
+    }
+    const cold_logits = try slotForward(cold_t, .prefill, &.{1}, p[8704..8705], &.{8704});
+    defer testing.allocator.free(cold_logits);
+    // Chunk 0 splits at leadRows (1 .encode + 1 .last); chunks 1..2 use read-ahead (1 .last each).
+    try testing.expectEqual(@as(u64, 1), cold_m.mdl.ced_stats.encode_chunks);
+    try testing.expectEqual(@as(u64, 3), cold_m.mdl.ced_stats.chunks);
+
+    const enc_t = try Twin.open(files, "");
+    defer enc_t.close();
+    const enc_m: *v41.Model = @ptrCast(@alignCast(enc_t.m));
+    try attachTinyEngramForTest(enc_m.mdl, dir);
+    enc_m.mdl.ced_min_skip = w;
+    try testing.expect(aux.begin_prompt(enc_t.m, 1, .of(&p), .{}, 0, true).isOk());
+    try testing.expect(enc_m.mdl.ahead == null);
+
+    // Cold chunk 0 (4096 >= LEAD_MIN, !read_ahead): extendEncodeResumable must split at leadRows -> 2 .encode chunks + ahead for [4096..8192).
+    try slotForwardNoLogits(enc_t, .prefill, &.{1}, p[0..4096], &.{0});
+    try testing.expectEqual(@as(u64, 2), enc_m.mdl.ced_stats.encode_chunks);
+    try testing.expectEqual(@as(u64, 4096), enc_m.mdl.ced_stats.encode_rows);
+    try testing.expectEqual(@as(u64, 0), enc_m.mdl.ced_stats.chunks);
+    try testing.expect(enc_m.mdl.dec_state.?.decoder_stale);
+    try testing.expect(enc_m.mdl.ahead != null);
+    try testing.expect(enc_m.mdl.ahead.?.covers(4096, 4096));
+
+    // Warm chunk 1 (4096 covered by read-ahead): runs in 1 .encode chunk and prefetches [8192..8704).
+    try slotForwardNoLogits(enc_t, .prefill, &.{1}, p[4096..8192], &.{4096});
+    try testing.expectEqual(@as(u64, 3), enc_m.mdl.ced_stats.encode_chunks);
+    try testing.expectEqual(@as(u64, 8192), enc_m.mdl.ced_stats.encode_rows);
+    try testing.expectEqual(@as(u64, 0), enc_m.mdl.ced_stats.chunks);
+    try testing.expect(enc_m.mdl.dec_state.?.decoder_stale);
+    try testing.expect(enc_m.mdl.ahead != null);
+    try testing.expect(enc_m.mdl.ahead.?.covers(8192, 512));
+
+    // Tail repair chunk 2 + final row 3: bit-identical to cold reference.
+    testing.allocator.free(try slotForward(enc_t, .prefill, &.{1}, p[8192..8704], &.{8192}));
+    try testing.expect(!enc_m.mdl.dec_state.?.decoder_stale);
+    try testing.expectEqual(@as(u64, 1), enc_m.mdl.ced_stats.chunks);
+    const enc_logits = try slotForward(enc_t, .prefill, &.{1}, p[8704..8705], &.{8704});
+    defer testing.allocator.free(enc_logits);
+    try testing.expectEqualSlices(f32, cold_logits, enc_logits);
+}
+
 /// The logits of `tail` on a slot restored from `sn` at its end (the prompt `ids`).
 fn restoredTail(t: *Twin, aux: *const abi.AuxHooks, sn: abi.Handle, ids: []const u32, tail: []const u32) ![]f32 {
     const n = ids.len - tail.len;
