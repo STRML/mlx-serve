@@ -937,6 +937,129 @@ const IdxNax = struct {
     }
 };
 
+const IdxNaxBmax = struct {
+    pub const Params = struct { ih: usize = IH, bs: usize = 8, pin_last: bool = false };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or p.ih == 0 or p.ih > 128 or s.k % 16 != 0 or s.k > 128 or (p.bs != 8 and p.bs != 16 and p.bs != 32)) return null;
+        const geom = v41.idxNaxGeom(s.rows, s.n, s.k);
+        const n_blocks = (s.n + p.bs - 1) / p.bs;
+        var g = metal.Geometry{ .grid = .{ ci(geom.gx), ci(geom.gy), 1 }, .tg = .{ ci(geom.tgn), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(n_blocks) }, .float32);
+        inline for (.{ .{ "IH", p.ih }, .{ "IHD", s.k }, .{ "BM", geom.bm }, .{ "BN", geom.bn }, .{ "DK", geom.dk }, .{ "BS", p.bs } }) |kv| {
+            g.int(kv[0], kv[1]);
+        }
+        g.flag("PIN_LAST", p.pin_last);
+        g.dtype("T", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try idxFill(k, f, rng, act, act);
+    }
+
+    pub fn count(p: Params, s: Shape) usize {
+        return s.rows * ((s.n + p.bs - 1) / p.bs);
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const nb = k.shape.n;
+        const bs = k.p.bs;
+        const n_blocks = (nb + bs - 1) / bs;
+        const tmp_out = try k.scratch().alloc(f64, L * nb);
+        defer k.scratch().free(tmp_out);
+        const tmp_mag = try k.scratch().alloc(f64, L * nb);
+        defer k.scratch().free(tmp_mag);
+        try idxCompute(k, tmp_out, tmp_mag, sum);
+        const p0: usize = @intFromFloat(k.in(3)[0]);
+        const ratio: usize = @intFromFloat(k.in(3)[1]);
+        for (0..L) |l| {
+            const seen = @min(nb, (p0 + l + 1) / ratio);
+            for (0..n_blocks) |b| {
+                var acc: f64 = -inf;
+                var mg: f64 = 0;
+                for (b * bs..@min(nb, (b + 1) * bs)) |j| {
+                    const v = tmp_out[l * nb + j];
+                    acc = if (std.math.isNan(acc) or std.math.isNan(v)) nan else @max(acc, v);
+                    mg = @max(mg, tmp_mag[l * nb + j]);
+                }
+                if (k.p.pin_last and seen > 0 and b == (seen - 1) / bs) acc = inf;
+                out[l * n_blocks + b] = acc;
+                mag[l * n_blocks + b] = mg;
+            }
+        }
+    }
+};
+
+const IdxNaxGather = struct {
+    pub const Params = struct { ih: usize = IH, bs: usize = 8 };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or p.ih == 0 or p.ih > 32 or s.k % 32 != 0 or s.k > 128 or (p.bs != 8 and p.bs != 16 and p.bs != 32)) return null;
+        const kb = (s.n + p.bs - 1) / p.bs;
+        const ncols = kb * p.bs;
+        const nranges = v41.idxNaxGatherRanges(s.rows, ncols);
+        var g = metal.Geometry{ .grid = .{ ci(nranges * s.rows * 128), 1, 1 }, .tg = .{ 128, 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(ncols) }, .float32);
+        g.int("IH", p.ih);
+        g.int("IHD", s.k);
+        g.int("BS", p.bs);
+        g.dtype("T", act);
+        g.dtype("QT", .float32);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try idxFill(k, f, rng, .float32, act);
+        for (k.in(0)) |*v| v.* = spec.roundTo(.bf16, v.*);
+        const L = k.shape.rows;
+        const kb = (k.shape.n + k.p.bs - 1) / k.p.bs;
+        const cand = try k.add(.int32, &.{ L, kb });
+        for (0..L) |l| for (0..kb) |b| {
+            cand[l * kb + b] = if (f == .random and kb >= 3 and b + 1 == kb) -1 else @floatFromInt((l + b) % kb);
+        };
+    }
+
+    pub fn count(p: Params, s: Shape) usize {
+        return s.rows * ((s.n + p.bs - 1) / p.bs) * p.bs;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const nb = k.shape.n;
+        const bs = k.p.bs;
+        const kb = (nb + bs - 1) / bs;
+        const ncols = kb * bs;
+        const tmp_out = try k.scratch().alloc(f64, L * nb);
+        defer k.scratch().free(tmp_out);
+        const tmp_mag = try k.scratch().alloc(f64, L * nb);
+        defer k.scratch().free(tmp_mag);
+        try idxCompute(k, tmp_out, tmp_mag, sum);
+        const p0: usize = @intFromFloat(k.in(3)[0]);
+        const ratio: usize = @intFromFloat(k.in(3)[1]);
+        for (0..L) |l| {
+            const seen = @min(nb, (p0 + l + 1) / ratio);
+            for (0..ncols) |s| {
+                const bid: i32 = @intFromFloat(k.in(5)[l * kb + s / bs]);
+                if (bid < 0) {
+                    out[l * ncols + s] = -inf;
+                    mag[l * ncols + s] = 0;
+                    continue;
+                }
+                const idx: usize = @as(usize, @intCast(bid)) * bs + s % bs;
+                if (idx >= seen or idx >= nb) {
+                    out[l * ncols + s] = -inf;
+                    mag[l * ncols + s] = 0;
+                } else {
+                    out[l * ncols + s] = tmp_out[l * nb + idx];
+                    mag[l * ncols + s] = tmp_mag[l * nb + idx];
+                }
+            }
+        }
+    }
+};
+
 // ── the V4.1 quantizers (`FP8_HEADER`): e4m3 round trips, ue8m0 / e4m3 scales, e2m1 codes ──
 
 /// e4m3fn round-to-nearest-even, saturating at 448 (the kernel sends 464 and above, NaN included, to 448).
@@ -4150,6 +4273,8 @@ const stage_x_l = launch("dsv41_hc_stage_x", hc_stage_x_ins, &.{ "h_out", "z", "
 const idx_l = launch("dsv41_index_scores", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_SCORE_SOURCE, "", 4 * IH * IHD, 416, false);
 const tile_l = launch("dsv41_index_tile", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_TILE_SOURCE, "", 2 * IdxTile.KT * IHD + 4 * IH + 4 * 4 * 64, 1024, false);
 const idx_nax_l = metal.Launch{ .name = "dsv41_index_nax", .inputs = &.{ "q", "keys", "w", "meta", "wsc" }, .outputs = &.{"scores"}, .source = v41.IDX_NAX_SOURCE, .header = @import("decode/attn.zig").HEADER, .tg_bytes = v41.idxNaxGeom(1, 1, IHD).bn * IHD * 2, .offline = false, .min_gen = 17 };
+const idx_nax_bmax_l = metal.Launch{ .name = "dsv41_index_nax_bmax", .inputs = &.{ "q", "keys", "w", "meta", "wsc" }, .outputs = &.{"bmax"}, .source = v41.IDX_NAX_BMAX_SOURCE, .header = @import("decode/attn.zig").HEADER, .tg_bytes = v41.idxNaxGeom(1, 1, IHD).bn * IHD * 2, .offline = false, .min_gen = 17 };
+const idx_nax_gather_l = metal.Launch{ .name = "dsv41_index_nax_gather", .inputs = &.{ "q", "keys", "w", "meta", "wsc", "cand" }, .outputs = &.{"scores"}, .source = v41.IDX_NAX_GATHER_SOURCE, .header = @import("decode/attn.zig").HEADER, .tg_bytes = 0, .offline = false, .min_gen = 17 };
 pub const rope_l = launch("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, v41.ROPE_TAIL_SOURCE, v41.FP8_HEADER, 0, 1024, false);
 const expand_into_l = launch("dsv41_hc_expand_into", &.{ "x", "res", "post", "comb", "dst", "after" }, &.{"carrier"}, sx1.expand_into_source, "", 0, 704, false);
 const expand_norm_l = launch("dsv41_hc_expand_norm", &.{ "y", "res", "post", "comb", "cpre", "w", "eps" }, &.{ "h_out", "x1" }, hcf.expand_norm_source, hcf.expand_norm_fresh_header, 4 * 32, 1024, true);
@@ -4311,6 +4436,7 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 17, .n = 300, .k = IHD }, .{ .rows = 33, .n = 200, .k = IHD }, .{ .rows = 18, .n = 128, .k = 64 } },
         .nax = true,
     });
+    try registerOnlineTopk(set);
     const rope_served: []const Shape = &.{ .{ .rows = 1, .n = 8, .k = HD }, .{ .rows = REGION, .n = 8, .k = HD } };
     try kit.add(set, RopeTail, &rope_l, .{ .qk = .none, .off = 3001 }, .{
         .name = "dsv41 rope_tail q",
@@ -4590,12 +4716,16 @@ const Shell = struct {
         m.moe_combine_kernel = try b("dsv41_moe_combine", &v41.MOE_COMBINE_INS, &.{"out"}, v41.MOE_COMBINE_SOURCE, "");
         const use_nax = device.naxAvailable();
         m.idx_nax_kernel = if (use_nax) try v41.buildIdxNaxKernel() else null;
+        m.idx_nax_bmax_kernel = if (use_nax) try v41.buildIdxNaxBmaxKernel() else null;
+        m.idx_nax_gather_kernel = if (use_nax) try v41.buildIdxNaxGatherKernel() else null;
         return .{ .m = m };
     }
 
     fn deinit(self: *Shell) void {
         const m = &self.m;
         if (m.idx_nax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+        if (m.idx_nax_bmax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+        if (m.idx_nax_gather_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         for ([_]mlx.mlx_fast_metal_kernel{ m.attn_dec_kernel, m.attn_split_kernel, m.attn_merge_kernel, m.idx_score_kernel, m.idx_tile_kernel, m.gate_kernel, m.topk_kernel, m.dense_f32x_kernel, m.route_kernel, m.hc_mix_kernel, m.hc_norm_kernel, m.hc_stage_kernel, m.hc_stage_x_kernel, m.hc_split_kernel, m.rope_kernel, m.rope_tail_only_kernel, m.kv_row_kernel, m.engram_kernel, m.moe_gu_kernel, m.moe_dn_kernel, m.moe_act_kernel, m.moe_combine_kernel }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
     }
 };
@@ -5020,6 +5150,14 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(IdxNax, a, &idx_nax_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
         try Expect.same(r.c, r.bytes, &.{try v41.indexScoresNax(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2], @floatCast(r.c.in(4)[0]), @intFromFloat(r.c.in(3)[0]), @intFromFloat(r.c.in(3)[1]))});
     }
+    if (m.idx_nax_bmax_kernel != null) {
+        const r = try ours(IdxNaxBmax, a, &idx_nax_bmax_l, .{ .bs = 8 }, .{ .rows = 18, .n = 200, .k = IHD });
+        try Expect.same(r.c, r.bytes, &.{try v41.indexScoresNaxBmax(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2], @floatCast(r.c.in(4)[0]), @intFromFloat(r.c.in(3)[0]), @intFromFloat(r.c.in(3)[1]), 8, false)});
+    }
+    if (m.idx_nax_gather_kernel != null) {
+        const r = try ours(IdxNaxGather, a, &idx_nax_gather_l, .{ .bs = 8 }, .{ .rows = 18, .n = 200, .k = IHD });
+        try Expect.same(r.c, r.bytes, &.{try v41.indexScoresNaxGather(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2], r.c.args[5], @floatCast(r.c.in(4)[0]), @intFromFloat(r.c.in(3)[0]), @intFromFloat(r.c.in(3)[1]), 8)});
+    }
     {
         const r = try ours(Engram, a, &engram_l, .{}, .{ .rows = 2, .n = HC, .k = DIM });
         try Expect.same(r.c, r.bytes, &.{try v41.engramGate(&sc, m, r.c.args[2], r.c.args[0], r.c.args[1])});
@@ -5087,4 +5225,41 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(MoeCombine, a, &combine_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
         try Expect.same(r.c, r.bytes, &.{try v41.flatKernel(&sc, m.moe_combine_kernel, r.c.args[0..3], &.{ 3, 256 }, act, 3 * 256, &.{ .{ .name = "D", .v = 256 }, .{ .name = "K", .v = TOPK } })});
     }
+}
+
+fn registerOnlineTopk(set: *kc.Set) !void {
+    try kit.add(set, IdxNaxBmax, &idx_nax_bmax_l, .{ .bs = 8 }, .{
+        .name = "dsv41 idx_nax_bmax (wide indexer block max, NAX matmul2d)",
+        .accum = .f32,
+        .depth = depthIdx,
+        .out = .f32,
+        .tiles = .{ .{ .size = 32, .step = 1, .min = 7 }, .{ .size = v41.idxNaxGeom(1, 1, IHD).bn }, .{} },
+        .served = &.{ .{ .rows = 17, .n = 300, .k = IHD }, .{ .rows = 33, .n = 200, .k = IHD }, .{ .rows = 18, .n = 128, .k = 64 } },
+        .nax = true,
+    });
+    try kit.add(set, IdxNaxGather, &idx_nax_gather_l, .{ .bs = 8 }, .{
+        .name = "dsv41 idx_nax_gather (wide indexer candidate gather, NAX matmul2d)",
+        .accum = .f32,
+        .depth = depthIdx,
+        .out = .f32,
+        .tiles = .{ .{}, .{ .size = 16 }, .{} },
+        .served = &.{ .{ .rows = 17, .n = 300, .k = IHD }, .{ .rows = 33, .n = 200, .k = IHD }, .{ .rows = 18, .n = 128, .k = 64 } },
+        .nax = true,
+    });
+}
+
+test "kernel contract dsv41 online_topk: passes gates 1-4 and planted controls fail" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var set = kc.Set.init(a);
+    defer set.deinit();
+    try @import("../../sdk/testing/kernel_contract/controls.zig").register(&set);
+    try registerOnlineTopk(&set);
+    var t: kc.gates.Tally = .{};
+    try kc.gates.runAll(a, set.kernels.items, 0xc0de, &t);
+    try std.testing.expectEqual(@as(usize, 0), t.problems());
+    try std.testing.expectEqual(@as(usize, 2), t.passed);
+    try std.testing.expectEqual(@as(usize, 0), t.known);
+    try std.testing.expectEqual(@as(usize, 7), t.controls);
+    try std.testing.expectEqual(t.controls, t.caught);
 }

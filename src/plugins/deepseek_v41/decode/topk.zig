@@ -33,7 +33,7 @@ const blocks_outs = [_][*:0]const u8{ "picks", "cand" };
 const chunk_outs = [_][*:0]const u8{ "ck", "cid" };
 
 /// The most elements a threadgroup selects among: `dec_scan` counts ties and keys above in 16 bits each.
-const max_elements: usize = 65535;
+pub const max_elements: usize = 65535;
 /// Registers per thread an instantiation holds: scores in a pick, blocks in a whole-row or chunk launch, pairs in a merge.
 const max_ept: usize = 64;
 /// Scores a thread holds before a plain row goes the way of its blocks.
@@ -199,6 +199,25 @@ fn longPlans(g: Geom, tg: usize, rows: usize, n: usize, kbl: usize) ?Long {
             .n_targs = 5,
         },
     };
+}
+
+/// Register-resident top-`k` picks of `[R, n]` f32 `scores` for any row count `R >= 1` (`dec_topk.metal`),
+/// optionally gathered from `cand` (`[R, kb]` i32); null when `n` exceeds `max_elements` or `max_ept * tg`.
+pub fn pickRows(sc: *Scope, kern: *const Kernels, scores: A, cand: ?A, p0: usize, ratio: usize, k: usize, bs: usize, kb: usize) !?A {
+    if (!mlx.streamIsGpu(sc.s) or mlx.mlx_array_dtype(scores) != .float32) return null;
+    const sh = mlx.getShape(scores);
+    if (sh.len != 2 or sh[0] < 1 or k == 0 or k > 1024 or bs == 0 or kb == 0) return null;
+    const rows: usize = @intCast(sh[0]);
+    const n: usize = @intCast(sh[1]);
+    if (n == 0) return null;
+    if (cand) |c| {
+        const csh = mlx.getShape(c);
+        if (csh.len != 2 or csh[0] != sh[0] or csh[1] != ci(kb) or n != kb * bs) return null;
+    }
+    const tg: usize = @intCast(kern.tg);
+    const plan = pickPlan(.{ .k = k, .bs = bs, .kb = kb }, tg, rows, n, cand != null) orelse return null;
+    const meta = try keep(sc, mlx.mlx_array_new_data(&[_]i32{ @intCast(p0), @intCast(ratio) }, &[_]c_int{2}, 1, .int32));
+    return (try run(sc, kern.pick, &.{ scores, meta, cand orelse kern.absent }, plan))[0];
 }
 
 /// The picks (and candidates) of a decode call; null where no instantiation covers the shape.

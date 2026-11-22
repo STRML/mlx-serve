@@ -479,6 +479,10 @@ pub const Dsv41Model = struct {
     idx_tile_kernel: mlx.mlx_fast_metal_kernel,
     /// Multi-row NAX indexer scorer (`IDX_NAX_SOURCE`); null without NAX.
     idx_nax_kernel: ?mlx.mlx_fast_metal_kernel = null,
+    /// Multi-row NAX indexer block-max scorer (`IDX_NAX_BMAX_SOURCE`); null without NAX.
+    idx_nax_bmax_kernel: ?mlx.mlx_fast_metal_kernel = null,
+    /// Register-staged NAX candidate-block gather scorer (`IDX_NAX_GATHER_SOURCE`); null without NAX.
+    idx_nax_gather_kernel: ?mlx.mlx_fast_metal_kernel = null,
     gate_kernel: mlx.mlx_fast_metal_kernel,
     topk_kernel: mlx.mlx_fast_metal_kernel,
     dense_f32x_kernel: mlx.mlx_fast_metal_kernel,
@@ -574,6 +578,8 @@ pub const Dsv41Model = struct {
         _ = mlx.mlx_fast_metal_kernel_free(self.idx_score_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.idx_tile_kernel);
         if (self.idx_nax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+        if (self.idx_nax_bmax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+        if (self.idx_nax_gather_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         _ = mlx.mlx_fast_metal_kernel_free(self.gate_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.route_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.hc_mix_kernel);
@@ -1545,6 +1551,8 @@ pub const IDX_TILE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_tile.
 /// Multi-row `IDX_TILE_SOURCE` on NAX `matmul2d`: one threadgroup scores BM query rows against BN keys
 /// staged once in threadgroup memory across all index heads, accumulating `w * relu(q_h . k)` in f32.
 pub const IDX_NAX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_nax.metal");
+pub const IDX_NAX_BMAX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_nax_bmax.metal");
+pub const IDX_NAX_GATHER_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_nax_gather.metal");
 
 /// Router logits `[L, E]` in f32 from bf16 rows: one simdgroup an expert,
 /// 8 inputs a lane per step.
@@ -1673,6 +1681,7 @@ pub fn buildKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []cons
 }
 
 pub const IDX_INS = [_][*:0]const u8{ "q", "keys", "w", "meta", "wsc" };
+pub const IDX_GATHER_INS = IDX_INS ++ [_][*:0]const u8{"cand"};
 
 pub fn buildIdxScoreKernel() !mlx.mlx_fast_metal_kernel {
     return buildKernel("dsv41_index_scores", &IDX_INS, &.{"scores"}, IDX_SCORE_SOURCE, "");
@@ -1680,6 +1689,14 @@ pub fn buildIdxScoreKernel() !mlx.mlx_fast_metal_kernel {
 
 pub fn buildIdxNaxKernel() !mlx.mlx_fast_metal_kernel {
     return buildKernel("dsv41_index_nax", &IDX_INS, &.{"scores"}, IDX_NAX_SOURCE, dkern.attn.HEADER);
+}
+
+pub fn buildIdxNaxBmaxKernel() !mlx.mlx_fast_metal_kernel {
+    return buildKernel("dsv41_index_nax_bmax", &IDX_INS, &.{"bmax"}, IDX_NAX_BMAX_SOURCE, dkern.attn.HEADER);
+}
+
+pub fn buildIdxNaxGatherKernel() !mlx.mlx_fast_metal_kernel {
+    return buildKernel("dsv41_index_nax_gather", &IDX_GATHER_INS, &.{"scores"}, IDX_NAX_GATHER_SOURCE, dkern.attn.HEADER);
 }
 
 pub const ATTN_INS = [_][*:0]const u8{ "q", "ring", "comp", "topk", "sink", "meta", "scal" };
@@ -1914,6 +1931,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         _ = mlx.mlx_fast_metal_kernel_free(m.idx_score_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.idx_tile_kernel);
         if (m.idx_nax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+        if (m.idx_nax_bmax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+        if (m.idx_nax_gather_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         _ = mlx.mlx_fast_metal_kernel_free(m.gate_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.route_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.hc_mix_kernel);
@@ -1934,6 +1953,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     }
     if (device.naxAvailable() and mlx.metalKernelsAvailable()) {
         m.idx_nax_kernel = try buildIdxNaxKernel();
+        m.idx_nax_bmax_kernel = try buildIdxNaxBmaxKernel();
+        m.idx_nax_gather_kernel = try buildIdxNaxGatherKernel();
     }
     if (worker) {
         m.embed = .{ .w = none };
@@ -3436,7 +3457,13 @@ pub fn idxNaxGeom(L: usize, nb: usize, ihd: usize) struct { bm: usize, bn: usize
     return .{ .bm = bm, .bn = bn, .tgn = tgn, .dk = dk, .gx = (L + bm - 1) / bm * tgn, .gy = (nb + bn - 1) / bn };
 }
 
-pub fn indexScoresNax(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize) !A {
+pub fn idxNaxGatherRanges(L: usize, ncols: usize) usize {
+    const ntiles = (ncols + 15) / 16;
+    const max_ranges: usize = if (L <= 32) 32 else 8;
+    return @min(max_ranges, @max(@as(usize, 1), (ntiles + 3) / 4));
+}
+
+fn launchIdxNax2d(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize, out_cols: usize, bs: ?usize, pin_last: bool) !A {
     const L = dim(q, 0);
     const nb = dim(keys, 0);
     const ihd = dim(q, 2);
@@ -3445,11 +3472,15 @@ pub fn indexScoresNax(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: 
     const meta = try sc.ints(&.{ @intCast(p0), @intCast(ratio) }, &.{2});
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(nb) }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(out_cols) }, 2, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(geom.gx), ci(geom.gy), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(geom.tgn), 1, 1));
     inline for (.{ .{ "IH", dim(q, 1) }, .{ "IHD", ihd }, .{ "BM", geom.bm }, .{ "BN", geom.bn }, .{ "DK", geom.dk } }) |kv| {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], ci(kv[1])));
+    }
+    if (bs) |b| {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BS", ci(b)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "PIN_LAST", pin_last));
     }
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
     const q_in = if (mlx.mlx_array_dtype(q) == dt) q else try sc.astype(q, dt);
@@ -3458,7 +3489,42 @@ pub fn indexScoresNax(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: 
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, m.idx_nax_kernel.?, iv, cfg, sc.s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+
+pub fn indexScoresNax(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize) !A {
+    return launchIdxNax2d(sc, m.idx_nax_kernel.?, q, keys, weights, wscale, p0, ratio, dim(keys, 0), null, false);
+}
+
+pub fn indexScoresNaxBmax(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize, bs: usize, pin_last: bool) !A {
+    const n_blocks = (dim(keys, 0) + bs - 1) / bs;
+    return launchIdxNax2d(sc, m.idx_nax_bmax_kernel.?, q, keys, weights, wscale, p0, ratio, n_blocks, bs, pin_last);
+}
+
+pub fn indexScoresNaxGather(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, cand: A, wscale: f32, p0: usize, ratio: usize, bs: usize) !A {
+    const L = dim(q, 0);
+    const kb = dim(cand, 1);
+    const ncols = kb * bs;
+    const nranges = idxNaxGatherRanges(L, ncols);
+    const meta = try sc.ints(&.{ @intCast(p0), @intCast(ratio) }, &.{2});
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(ncols) }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(nranges * L * 128), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "IH", ci(dim(q, 1))));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "IHD", ci(dim(q, 2))));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BS", ci(bs)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", mlx.mlx_array_dtype(keys)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "QT", mlx.mlx_array_dtype(q)));
+    const inputs = [_]A{ q, keys, weights, meta, try sc.keep(mlx.mlx_array_new_data(&[_]f32{wscale}, &[_]c_int{1}, 1, .float32)), cand };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, m.idx_nax_gather_kernel.?, iv, cfg, sc.s));
     var o = mlx.mlx_array_new();
     return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
@@ -3863,6 +3929,7 @@ fn indexerQ(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, w: A, q: A, p0: u
     const owner = m.latest(li, Dsv41Model.isOwner);
     const keys = try sc.keep(try st.layers[owner].idx_k.?.view(nb, sc.s));
     if (try indexerFused(sc, m, li, w, q, keys, p0, r, sh)) |picks| return picks;
+    if (try indexerOnlineTopk(sc, m, li, w, q, keys, p0, r, sh)) |picks| return picks;
     const wscale = 1.0 / @sqrt(@as(f32, @floatFromInt(ihd))) / @sqrt(@as(f32, @floatFromInt(ih)));
     // A query sees the groups that end at or before it.
     var scores = try indexScores(sc, m, q, keys, w, wscale, p0, r); // [L, nb]
@@ -3923,6 +3990,168 @@ fn indexerFused(sc: *Scope, m: *Dsv41Model, li: usize, w: A, q: A, keys: A, p0: 
         return if (cand.ctx != null) error.Dsv41CandidateIds else null;
     if (made) sh.cand = out.cand;
     return out.picks;
+}
+
+fn onlinePlainBs(nb: usize, max_pick: usize) usize {
+    if ((nb + 7) / 8 <= max_pick) return 8;
+    if ((nb + 15) / 16 <= max_pick) return 16;
+    return 32;
+}
+
+/// Whether `indexerOnlineTopk` can serve `(m, s, L, nb, ih, ihd, keys.dt, w.dt, q.dt)`.
+pub fn onlineTopkEligible(m: *const Dsv41Model, s: S, L: usize, nb: usize, ih: usize, ihd: usize, k_dt: mlx.mlx_dtype, w_dt: mlx.mlx_dtype, q_dt: mlx.mlx_dtype) bool {
+    if (m.trace != null or m.idx_nax_bmax_kernel == null or m.idx_nax_gather_kernel == null or m.dec.topk == null) return false;
+    if (!mlx.streamIsGpu(s) or L <= region_rows or nb == 0) return false;
+    if ((k_dt != .bfloat16 and k_dt != .float16) or w_dt != k_dt) return false;
+    if (q_dt != .float32 and q_dt != .bfloat16 and q_dt != .float16) return false;
+    return ih > 0 and ih <= 32 and ihd % 32 == 0 and ihd <= 128;
+}
+
+const OnlinePlan = union(enum) {
+    post_cand: struct { kb: usize, bs: usize },
+    cand_src: struct { kb: usize, bs: usize, n_blocks: usize },
+    dense_nax,
+    plain: struct { bs: usize, n_blocks: usize, k_blk: usize },
+
+    fn scratchBytes(plan: OnlinePlan, span: usize, nb: usize) u64 {
+        return switch (plan) {
+            .post_cand => |p| @as(u64, span) * p.kb * p.bs * 4,
+            .cand_src => |p| @as(u64, span) * (p.n_blocks + p.kb * p.bs) * 4,
+            .dense_nax => @as(u64, span) * nb * 4,
+            .plain => |p| @as(u64, span) * (p.n_blocks + p.k_blk * p.bs) * 4,
+        };
+    }
+};
+
+fn onlinePlan(
+    m: *const Dsv41Model,
+    li: usize,
+    s: S,
+    L: usize,
+    nb: usize,
+    ih: usize,
+    ihd: usize,
+    k_dt: mlx.mlx_dtype,
+    w_dt: mlx.mlx_dtype,
+    q_dt: mlx.mlx_dtype,
+    sh_cand: ?A,
+) ?OnlinePlan {
+    if (!onlineTopkEligible(m, s, L, nb, ih, ihd, k_dt, w_dt, q_dt)) return null;
+    const kt = &(m.dec.topk orelse return null);
+    const c = &m.cfg;
+    const k = @min(@as(usize, c.dsv4_index_topk), nb);
+    if (k == 0 or k > 1024) return null;
+    const max_pick = @min(dkern.topk.max_elements, @as(usize, @intCast(kt.tg)) * 64);
+
+    const cand_src = c.dsv41_candidate_source;
+    const bs: usize = c.dsv41_candidate_block_size;
+    const kb: usize = c.dsv41_candidate_topk_blocks;
+    const valid_bs = bs == 8 or bs == 16 or bs == 32;
+    // Pinning the last visible block to +inf consumes one of the kb slots, so exact top-k requires kb > k.
+    const cand_src_ok = valid_bs and kb > k and kb * bs >= k and kb * bs <= max_pick;
+
+    if (cand_src >= 0) {
+        const csrc: usize = @intCast(cand_src);
+        if (li > csrc) {
+            if (sh_cand) |cand| {
+                if (cand.ctx != null) {
+                    const csh = mlx.getShape(cand);
+                    if (mlx.mlx_array_dtype(cand) != .int32 or !valid_bs or csh.len != 2 or csh[0] != ci(L)) return null;
+                    const ckb: usize = @intCast(csh[1]);
+                    if (ckb == 0 or ckb * bs < k or ckb * bs > max_pick) return null;
+                    return .{ .post_cand = .{ .kb = ckb, .bs = bs } };
+                }
+            } else {
+                const n_blocks_cand = if (bs > 0) (nb + bs - 1) / bs else 0;
+                if (bs == 0 or n_blocks_cand > kb) {
+                    if (!cand_src_ok) return null;
+                    return .{ .post_cand = .{ .kb = kb, .bs = bs } };
+                }
+            }
+        } else if (li == csrc) {
+            const n_blocks_cand = if (bs > 0) (nb + bs - 1) / bs else 0;
+            if (bs == 0 or n_blocks_cand > kb) {
+                if (!cand_src_ok) return null;
+                return .{ .cand_src = .{ .kb = kb, .bs = bs, .n_blocks = n_blocks_cand } };
+            }
+        }
+    }
+
+    if (nb <= 16384 and nb <= max_pick and m.idx_nax_kernel != null) return .dense_nax;
+
+    const b_sz = onlinePlainBs(nb, max_pick);
+    const n_blocks = (nb + b_sz - 1) / b_sz;
+    const k_blk = @min(k, n_blocks);
+    if (k_blk * b_sz > max_pick) return null;
+    return .{ .plain = .{ .bs = b_sz, .n_blocks = n_blocks, .k_blk = k_blk } };
+}
+
+fn onlineSpanScratchBytes(m: *const Dsv41Model, li: usize, span: usize, nb: usize) u64 {
+    const c = &m.cfg;
+    const plan = onlinePlan(m, li, m.s, span, nb, c.dsv4_index_n_heads, c.dsv4_index_head_dim, m.act, m.act, .float32, null) orelse
+        return @as(u64, span) * nb * igroup.cell_bytes;
+    return plan.scratchBytes(span, nb);
+}
+
+fn selectBlocksTopk(sc: *Scope, m: *const Dsv41Model, kt: *const dkern.topk.Kernels, bmax: A, n_blocks: usize, k_blk: usize, bs: usize, max_pick: usize) !A {
+    if (n_blocks <= max_pick) {
+        if (try dkern.topk.pickRows(sc, kt, bmax, null, n_blocks - 1, 1, k_blk, bs, k_blk)) |bids| return bids;
+    }
+    return topkRows(sc, m, bmax, k_blk);
+}
+
+/// Wide-span indexer without `[L, nb]` f32 score materialization: block-max NAX reduction -> block top-K ->
+/// register-staged NAX gather -> exact register top-K (`dec_topk`). Post-candidate layers reuse `sh.cand` (`int32`)
+/// directly to score only `kb * bs` keys.
+fn indexerOnlineTopk(sc: *Scope, m: *Dsv41Model, li: usize, w: A, q: A, keys: A, p0: usize, r: usize, sh: *Shared) !?A {
+    const L = dim(q, 0);
+    const nb = dim(keys, 0);
+    const ih = dim(q, 1);
+    const ihd = dim(q, 2);
+    const plan = onlinePlan(m, li, sc.s, L, nb, ih, ihd, mlx.mlx_array_dtype(keys), mlx.mlx_array_dtype(w), mlx.mlx_array_dtype(q), sh.cand) orelse return null;
+    const kt = &(m.dec.topk orelse return null);
+    const c = &m.cfg;
+    const k = @min(@as(usize, c.dsv4_index_topk), nb);
+    const max_pick = @min(dkern.topk.max_elements, @as(usize, @intCast(kt.tg)) * 64);
+    const wscale = 1.0 / @sqrt(@as(f32, @floatFromInt(ihd))) / @sqrt(@as(f32, @floatFromInt(ih)));
+
+    if (c.dsv41_candidate_source >= 0 and li == @as(usize, @intCast(c.dsv41_candidate_source)) and plan != .cand_src) {
+        sh.cand = none;
+    }
+
+    switch (plan) {
+        .post_cand => |p| {
+            const scores_g = try indexScoresNaxGather(sc, m, q, keys, w, sh.cand, wscale, p0, r, p.bs);
+            return (try dkern.topk.pickRows(sc, kt, scores_g, sh.cand, p0, r, k, p.bs, p.kb)) orelse return error.Dsv41CandidateIds;
+        },
+        .dense_nax => {
+            const scores = try indexScoresNax(sc, m, q, keys, w, wscale, p0, r);
+            return (try dkern.topk.pickRows(sc, kt, scores, null, p0, r, k, 1, k)).?;
+        },
+        .cand_src, .plain => {
+            const is_cand = plan == .cand_src;
+            const bs = if (is_cand) plan.cand_src.bs else plan.plain.bs;
+            const n_blocks = if (is_cand) plan.cand_src.n_blocks else plan.plain.n_blocks;
+            const k_blk = if (is_cand) plan.cand_src.kb else plan.plain.k_blk;
+            const bmax = try indexScoresNaxBmax(sc, m, q, keys, w, wscale, p0, r, bs, is_cand);
+            var bids = try selectBlocksTopk(sc, m, kt, bmax, n_blocks, k_blk, bs, max_pick);
+            if (is_cand) {
+                if (@min(nb, (p0 + 1) / r) < nb) {
+                    const sb_h = try sc.a.alloc(i32, L);
+                    defer sc.a.free(sb_h);
+                    for (sb_h, 0..) |*v, l| {
+                        const seen_l = @min(nb, (p0 + l + 1) / r);
+                        v.* = @intCast((seen_l + bs - 1) / bs);
+                    }
+                    const seen_b = try sc.ints(sb_h, &.{ ci(L), 1 });
+                    bids = try sc.where(try sc.op2(mlx.mlx_less, bids, seen_b), bids, try sc.i(-1));
+                }
+                sh.cand = bids;
+            }
+            const scores_g = try indexScoresNaxGather(sc, m, q, keys, w, bids, wscale, p0, r, bs);
+            return (try dkern.topk.pickRows(sc, kt, scores_g, bids, p0, r, k, bs, k_blk)).?;
+        },
+    }
 }
 
 // ── MoE ──────────────────────────────────────────────────────────────────
@@ -5879,7 +6108,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     // an index layer's span picks evaluated a group at a time once the layer's indexer
     // scratch would pass the bound (a short prompt's layer: one group, its evaluation as before).
     const ig_r = m.ratio(li);
-    const ig_g: usize = if (ly.idx != null and ig_r > 0) igroup.groupSpans(n_spans, sp.span, (sp.p0 + sp.L) / ig_r) else n_spans;
+    const ig_g: usize = if (ly.idx != null and ig_r > 0) igroup.groupSpansBytes(n_spans, onlineSpanScratchBytes(m, li, sp.span, (sp.p0 + sp.L) / ig_r)) else n_spans;
     var ig_start: usize = 0;
     // a KV-source layer's compressor for
     // every span first, in span order, each span's rows appended to the layer's caches (comp, idx_k) before any span's
@@ -9128,6 +9357,494 @@ test "dsv41 index_nax: NAX multi-row scorer matches idx_tile scores and top-K pi
     const fbs = try randIdxInputs(&sc, key, region_rows, 100, 32, 128, .bfloat16, false);
     try testing.expect(!useIndexNax(&m, sc.s, fbs.q, fbs.keys));
     try expectF32Eq(gpa, try indexScoresScalar(&sc, &m, fbs.q, fbs.keys, fbs.w, 0.01, 50, 2), try indexScores(&sc, &m, fbs.q, fbs.keys, fbs.w, 0.01, 50, 2));
+}
+
+test "dsv41 index_online_topk: parity across plain, cand_src, post_cand, shapes, dtypes, and causal edges" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+
+    var m: Dsv41Model = undefined;
+    m.cfg = .{};
+    m.s = sc.s;
+    m.act = .bfloat16;
+    m.trace = null;
+    m.idx_score_kernel = try buildIdxScoreKernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_score_kernel);
+    m.idx_tile_kernel = try buildKernel("dsv41_index_tile", &IDX_INS, &.{"scores"}, IDX_TILE_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_tile_kernel);
+    m.idx_nax_kernel = try buildIdxNaxKernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_nax_kernel.?);
+    m.idx_nax_bmax_kernel = try buildIdxNaxBmaxKernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_nax_bmax_kernel.?);
+    m.idx_nax_gather_kernel = try buildIdxNaxGatherKernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_nax_gather_kernel.?);
+    m.topk_kernel = try buildKernel("dsv41_topk", &.{"x"}, &.{"out"}, TOPK_SOURCE, TOPK_HEADER);
+    m.topk_tg = 1024;
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.topk_kernel);
+    m.dec = .{ .topk = try dkern.topk.Kernels.build() };
+    defer m.dec.deinit();
+    try dkern.topk.probe(gpa, &m.dec.topk.?, sc.s);
+
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 37));
+
+    const Case = struct { ih: usize, ihd: usize, L: usize, nb: usize, p0: usize, ratio: usize, bs: usize, kb: usize, dt: mlx.mlx_dtype };
+    const cases = [_]Case{
+        .{ .ih = 32, .ihd = 128, .L = 17, .nb = 5, .p0 = 0, .ratio = 2, .bs = 8, .kb = 2048, .dt = .bfloat16 },
+        .{ .ih = 32, .ihd = 128, .L = 17, .nb = 65, .p0 = 1, .ratio = 1, .bs = 8, .kb = 2048, .dt = .bfloat16 },
+        .{ .ih = 32, .ihd = 128, .L = 70, .nb = 4099, .p0 = 2000, .ratio = 2, .bs = 8, .kb = 2048, .dt = .bfloat16 },
+        .{ .ih = 32, .ihd = 128, .L = 33, .nb = 20000, .p0 = 19967, .ratio = 1, .bs = 8, .kb = 2048, .dt = .bfloat16 },
+        .{ .ih = 32, .ihd = 128, .L = 33, .nb = 20000, .p0 = 100, .ratio = 1, .bs = 8, .kb = 2048, .dt = .bfloat16 },
+        .{ .ih = 32, .ihd = 128, .L = 20, .nb = 20000, .p0 = 19980, .ratio = 1, .bs = 16, .kb = 1024, .dt = .float16 },
+        .{ .ih = 8, .ihd = 32, .L = 40, .nb = 17000, .p0 = 33960, .ratio = 2, .bs = 32, .kb = 513, .dt = .bfloat16 },
+    };
+
+    for (cases) |cs| {
+        m.cfg.dsv4_index_topk = 512;
+        m.cfg.dsv41_candidate_block_size = @intCast(cs.bs);
+        m.cfg.dsv41_candidate_topk_blocks = @intCast(cs.kb);
+        var t: [3]A = undefined;
+        for ([_][]const c_int{ &.{ ci(cs.L), ci(cs.ih), ci(cs.ihd) }, &.{ ci(cs.nb), ci(cs.ihd) }, &.{ ci(cs.L), ci(cs.ih) } }, &t) |sh, *o| {
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, cs.dt, 0, 1, key, sc.s));
+            o.* = try sc.keep(r);
+        }
+        const q = try sc.astype(t[0], .float32);
+        const ws: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cs.ihd * cs.ih)));
+        const k = @min(@as(usize, 512), cs.nb);
+        const ref_s_a = try indexScoresNax(&sc, &m, q, t[1], t[2], ws, cs.p0, cs.ratio);
+        const ref_s = try hostF32(ref_s_a);
+        defer gpa.free(ref_s);
+        const sorted = try gpa.alloc(f32, cs.nb);
+        defer gpa.free(sorted);
+
+        // 1. Plain layer (cand_source = -1)
+        m.cfg.dsv41_candidate_source = -1;
+        var sh_plain: Shared = .{};
+        const got_plain_a = (try indexerOnlineTopk(&sc, &m, 0, t[2], q, t[1], cs.p0, cs.ratio, &sh_plain)).?;
+        const got_plain = try hostI32(got_plain_a);
+        defer gpa.free(got_plain);
+
+        // 2. Candidate source layer (cand_source = 0)
+        m.cfg.dsv41_candidate_source = 0;
+        var sh_cand: Shared = .{};
+        const got_csrc_a = (try indexerOnlineTopk(&sc, &m, 0, t[2], q, t[1], cs.p0, cs.ratio, &sh_cand)).?;
+        const got_csrc = try hostI32(got_csrc_a);
+        defer gpa.free(got_csrc);
+
+        // 3. Post-candidate layer (li = 1 > cand_source = 0)
+        const got_post_a = (try indexerOnlineTopk(&sc, &m, 1, t[2], q, t[1], cs.p0, cs.ratio, &sh_cand)).?;
+        const got_post = try hostI32(got_post_a);
+        defer gpa.free(got_post);
+
+        const n_blocks = (cs.nb + cs.bs - 1) / cs.bs;
+        // Reference candidate & post-candidate oracle computed independently from `ref_s`.
+        var post_ref_s = try gpa.dupe(f32, ref_s);
+        defer gpa.free(post_ref_s);
+        if (n_blocks <= cs.kb) {
+            try testing.expect(sh_cand.cand.ctx == null);
+        } else {
+            try testing.expectEqual(mlx.mlx_dtype.int32, mlx.mlx_array_dtype(sh_cand.cand));
+            try testing.expectEqual(@as(usize, cs.kb), dim(sh_cand.cand, 1));
+            const cids = try hostI32(sh_cand.cand);
+            defer gpa.free(cids);
+            const bmax_ref = try gpa.alloc(f32, n_blocks);
+            defer gpa.free(bmax_ref);
+            const bmax_sorted = try gpa.alloc(f32, n_blocks);
+            defer gpa.free(bmax_sorted);
+            const b_seen_map = try gpa.alloc(bool, n_blocks);
+            defer gpa.free(b_seen_map);
+            const row_keep = try gpa.alloc(bool, cs.nb);
+            defer gpa.free(row_keep);
+            for (0..cs.L) |l| {
+                const vis = @min(cs.nb, (cs.p0 + l + 1) / cs.ratio);
+                const vis_b = (vis + cs.bs - 1) / cs.bs;
+                for (0..n_blocks) |b| {
+                    var mx = -std.math.inf(f32);
+                    const start = b * cs.bs;
+                    const stop = @min(vis, start + cs.bs);
+                    if (stop > start) for (start..stop) |idx| {
+                        mx = @max(mx, ref_s[l * cs.nb + idx]);
+                    };
+                    bmax_ref[b] = mx;
+                }
+                if (vis > 0) bmax_ref[(vis - 1) / cs.bs] = std.math.inf(f32);
+
+                const row_cids = cids[l * cs.kb ..][0..cs.kb];
+                if (vis_b == 0) {
+                    for (row_cids) |cid| try testing.expectEqual(@as(i32, -1), cid);
+                } else if (vis_b <= cs.kb) {
+                    @memset(b_seen_map, false);
+                    var valid_cnt: usize = 0;
+                    for (row_cids) |cid| {
+                        if (cid == -1) continue;
+                        try testing.expect(cid >= 0 and @as(usize, @intCast(cid)) < vis_b);
+                        try testing.expect(!b_seen_map[@intCast(cid)]);
+                        b_seen_map[@intCast(cid)] = true;
+                        valid_cnt += 1;
+                    }
+                    try testing.expectEqual(vis_b, valid_cnt);
+                    for (0..vis_b) |b| try testing.expect(b_seen_map[b]);
+                } else {
+                    try expectTopkValid(bmax_ref, row_cids, vis_b, cs.kb, bmax_sorted);
+                    @memset(b_seen_map, false);
+                    for (row_cids) |cid| {
+                        try testing.expect(!b_seen_map[@intCast(cid)]);
+                        b_seen_map[@intCast(cid)] = true;
+                    }
+                }
+
+                @memset(row_keep, false);
+                if (vis_b <= cs.kb) {
+                    for (0..vis) |idx| row_keep[idx] = true;
+                } else {
+                    @memcpy(bmax_sorted[0..vis_b], bmax_ref[0..vis_b]);
+                    std.mem.sort(f32, bmax_sorted[0..vis_b], {}, std.sort.desc(f32));
+                    const b_kth = bmax_sorted[cs.kb - 1];
+                    var above_cnt: usize = 0;
+                    for (0..vis_b) |b| {
+                        if (bmax_ref[b] > b_kth) {
+                            above_cnt += 1;
+                            const s0 = b * cs.bs;
+                            for (s0..@min(cs.nb, s0 + cs.bs)) |idx| row_keep[idx] = true;
+                        }
+                    }
+                    var rem_ties = cs.kb -| above_cnt;
+                    for (0..vis_b) |b| {
+                        if (rem_ties == 0) break;
+                        if (bmax_ref[b] == b_kth) {
+                            rem_ties -= 1;
+                            const s0 = b * cs.bs;
+                            for (s0..@min(cs.nb, s0 + cs.bs)) |idx| row_keep[idx] = true;
+                        }
+                    }
+                }
+                for (0..cs.nb) |idx| {
+                    if (!row_keep[idx]) post_ref_s[l * cs.nb + idx] = -std.math.inf(f32);
+                }
+            }
+        }
+
+        for (0..cs.L) |l| {
+            const vis = @min(cs.nb, (cs.p0 + l + 1) / cs.ratio);
+            try expectTopkValid(ref_s[l * cs.nb ..][0..cs.nb], got_plain[l * k ..][0..k], vis, k, sorted);
+            try expectTopkValid(ref_s[l * cs.nb ..][0..cs.nb], got_csrc[l * k ..][0..k], vis, k, sorted);
+            if (vis == 0) {
+                for (got_plain[l * k ..][0..k]) |p| try testing.expectEqual(@as(i32, -1), p);
+                for (got_post[l * k ..][0..k]) |p| try testing.expectEqual(@as(i32, -1), p);
+            } else if (vis <= k) {
+                for (got_plain[l * k + vis ..][0 .. k - vis]) |p| try testing.expectEqual(@as(i32, -1), p);
+            } else {
+                try expectTopkValid(post_ref_s[l * cs.nb ..][0..cs.nb], got_post[l * k ..][0..k], vis, k, sorted);
+            }
+        }
+    }
+
+    // Eligibility / fallback guards & runtime decline alignment (`kb <= k`, `invalid bs`, `kb * bs > max_pick`, `k > 1024`, `nb <= 16384`).
+    try testing.expect(!onlineTopkEligible(&m, sc.s, 32, 100, 64, 128, .bfloat16, .bfloat16, .float32)); // ih > 32
+    try testing.expect(!onlineTopkEligible(&m, sc.s, 32, 100, 32, 16, .bfloat16, .bfloat16, .float32)); // ihd % 32 != 0
+    try testing.expect(!onlineTopkEligible(&m, sc.s, 32, 100, 32, 128, .float32, .float32, .float32)); // f32 keys
+    try testing.expect(!onlineTopkEligible(&m, sc.s, region_rows, 100, 32, 128, .bfloat16, .bfloat16, .float32)); // L <= region_rows
+    const saved_bmax = m.idx_nax_bmax_kernel;
+    m.idx_nax_bmax_kernel = null;
+    try testing.expect(!onlineTopkEligible(&m, sc.s, 32, 100, 32, 128, .bfloat16, .bfloat16, .float32));
+    m.idx_nax_bmax_kernel = saved_bmax;
+
+    // [P1] cand_src declines cleanly when kb <= k (pinning consumes 1 block slot, so kb >= k + 1 is required).
+    {
+        var tg: [3]A = undefined;
+        for ([_][]const c_int{ &.{ 17, 32, 128 }, &.{ 32, 128 }, &.{ 17, 32 } }, &tg) |sh, *o| {
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, .bfloat16, 0, 1, key, sc.s));
+            o.* = try sc.keep(r);
+        }
+        const qg = try sc.astype(tg[0], .float32);
+        m.cfg.dsv4_index_n_heads = 32;
+        m.cfg.dsv4_index_head_dim = 128;
+        m.cfg.dsv41_candidate_source = 0;
+        m.cfg.dsv41_candidate_block_size = 8;
+        for ([_]u32{ 1, 2 }) |kb_edge| {
+            m.cfg.dsv4_index_topk = 2;
+            m.cfg.dsv41_candidate_topk_blocks = kb_edge;
+            var sh_g: Shared = .{};
+            try testing.expect((try indexerOnlineTopk(&sc, &m, 0, tg[2], qg, tg[1], 15, 1, &sh_g)) == null);
+            try testing.expectEqual(@as(u64, 256) * 32 * igroup.cell_bytes, onlineSpanScratchBytes(&m, 0, 256, 32));
+            try testing.expectEqual(@as(u64, 256) * 32 * igroup.cell_bytes, onlineSpanScratchBytes(&m, 1, 256, 32));
+        }
+
+        // [P2] onlineSpanScratchBytes matches runtime eligibility and nb <= 16384 dense_nax size.
+        m.cfg.dsv4_index_topk = 512;
+        m.cfg.dsv41_candidate_block_size = 4; // invalid BS
+        m.cfg.dsv41_candidate_topk_blocks = 2048;
+        try testing.expectEqual(@as(u64, 256) * 65536 * igroup.cell_bytes, onlineSpanScratchBytes(&m, 0, 256, 65536));
+        try testing.expectEqual(@as(u64, 256) * 65536 * igroup.cell_bytes, onlineSpanScratchBytes(&m, 1, 256, 65536));
+
+        m.cfg.dsv41_candidate_block_size = 8;
+        m.cfg.dsv41_candidate_topk_blocks = 9000; // kb * bs > max_pick
+        try testing.expectEqual(@as(u64, 256) * 131072 * igroup.cell_bytes, onlineSpanScratchBytes(&m, 0, 256, 131072));
+        try testing.expectEqual(@as(u64, 256) * 131072 * igroup.cell_bytes, onlineSpanScratchBytes(&m, 1, 256, 131072));
+
+        m.cfg.dsv4_index_topk = 2048; // k > 1024
+        m.cfg.dsv41_candidate_topk_blocks = 2048;
+        m.cfg.dsv41_candidate_source = -1;
+        try testing.expectEqual(@as(u64, 256) * 65536 * igroup.cell_bytes, onlineSpanScratchBytes(&m, 0, 256, 65536));
+
+        m.cfg.dsv4_index_topk = 512;
+        m.cfg.dsv41_candidate_source = -1;
+        try testing.expectEqual(@as(u64, 256) * 8192 * 4, onlineSpanScratchBytes(&m, 0, 256, 8192));
+    }
+
+    // [P1] Invisible source blocks stay masked (-1) even when a later layer uses a smaller compression ratio.
+    {
+        const Lr: usize = 176;
+        const nb_src: usize = 88;
+        const nb_lat: usize = 176;
+        m.cfg.dsv4_index_n_heads = 32;
+        m.cfg.dsv4_index_head_dim = 128;
+        m.cfg.dsv4_index_topk = 4;
+        m.cfg.dsv41_candidate_source = 0;
+        m.cfg.dsv41_candidate_block_size = 8;
+        m.cfg.dsv41_candidate_topk_blocks = 5;
+        var qr = mlx.mlx_array_new();
+        var klat_r = mlx.mlx_array_new();
+        var wr = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&qr, &[_]c_int{ ci(Lr), 32, 128 }, 3, .bfloat16, 0, 1, key, sc.s));
+        try mlx.check(mlx.mlx_random_normal(&klat_r, &[_]c_int{ ci(nb_lat), 128 }, 2, .bfloat16, 0, 1, key, sc.s));
+        try mlx.check(mlx.mlx_random_normal(&wr, &[_]c_int{ ci(Lr), 32 }, 2, .bfloat16, 0, 1, key, sc.s));
+        const q_r = try sc.astype(try sc.keep(qr), .float32);
+        const k_lat = try sc.keep(klat_r);
+        const w_r = try sc.keep(wr);
+        const k_src = try sc.slice(k_lat, 0, 0, nb_src);
+        var sh_r: Shared = .{};
+        _ = (try indexerOnlineTopk(&sc, &m, 0, w_r, q_r, k_src, 0, 2, &sh_r)).?;
+        const cids_r = try hostI32(sh_r.cand);
+        defer gpa.free(cids_r);
+        for (cids_r[0..5]) |cid| try testing.expectEqual(@as(i32, -1), cid);
+        for (cids_r[5..10], 0..) |cid, idx| try testing.expectEqual(if (idx == 0) @as(i32, 0) else -1, cid);
+        const post_r_a = (try indexerOnlineTopk(&sc, &m, 1, w_r, q_r, k_lat, 0, 1, &sh_r)).?;
+        const post_r = try hostI32(post_r_a);
+        defer gpa.free(post_r);
+        for (post_r[0..4]) |p| try testing.expectEqual(@as(i32, -1), p);
+        for (post_r[4..8]) |p| try testing.expect(p == -1 or (p >= 0 and p < 2));
+    }
+
+    // [P1] idx_nax_gather accumulates heads sequentially (0..IH-1), matching idx_nax_bmax / idx_nax under cancellation.
+    {
+        const Lc: usize = 17;
+        const nbc: usize = 32;
+        const qh = try gpa.alloc(f32, Lc * 32 * 128);
+        defer gpa.free(qh);
+        const kh = try gpa.alloc(f32, nbc * 128);
+        defer gpa.free(kh);
+        const wh = try gpa.alloc(f32, Lc * 32);
+        defer gpa.free(wh);
+        @memset(qh, 0);
+        @memset(kh, 0);
+        @memset(wh, 0);
+        kh[0 * 128 + 0] = 1.0;
+        kh[8 * 128 + 1] = 1.5;
+        kh[9 * 128 + 1] = 1.25;
+        for (0..Lc) |row| {
+            for ([_]usize{ 0, 1, 4, 5, 8 }) |h| qh[(row * 32 + h) * 128 + if (h == 1) @as(usize, 1) else 0] = 1.0;
+            wh[row * 32 + 0] = 64.0 * 33554432.0; // +2^25 after wscale=1/64
+            wh[row * 32 + 1] = 64.0;
+            wh[row * 32 + 4] = -64.0 * 33554432.0; // -2^25 after wscale=1/64
+            wh[row * 32 + 5] = 64.0;
+            wh[row * 32 + 8] = 64.0;
+        }
+        const q_c = try sc.keep(mlx.mlx_array_new_data(qh.ptr, &[_]c_int{ ci(Lc), 32, 128 }, 3, .float32));
+        const k_c = try sc.astype(try sc.keep(mlx.mlx_array_new_data(kh.ptr, &[_]c_int{ ci(nbc), 128 }, 2, .float32)), .bfloat16);
+        const w_c = try sc.astype(try sc.keep(mlx.mlx_array_new_data(wh.ptr, &[_]c_int{ ci(Lc), 32 }, 2, .float32)), .bfloat16);
+        m.cfg.dsv4_index_n_heads = 32;
+        m.cfg.dsv4_index_head_dim = 128;
+        m.cfg.dsv4_index_topk = 2;
+        m.cfg.dsv41_candidate_source = 0;
+        m.cfg.dsv41_candidate_block_size = 8;
+        m.cfg.dsv41_candidate_topk_blocks = 3;
+        var sh_c: Shared = .{};
+        const p_src = try hostI32((try indexerOnlineTopk(&sc, &m, 0, w_c, q_c, k_c, 31, 1, &sh_c)).?);
+        defer gpa.free(p_src);
+        const p_post = try hostI32((try indexerOnlineTopk(&sc, &m, 1, w_c, q_c, k_c, 31, 1, &sh_c)).?);
+        defer gpa.free(p_post);
+        try testing.expectEqualSlices(i32, &.{ 0, 8 }, p_src[0..2]);
+        try testing.expectEqualSlices(i32, &.{ 0, 8 }, p_post[0..2]);
+    }
+}
+
+test "dsv41 index_online_topk: ubench" {
+    if (!dkern.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+
+    var m: Dsv41Model = undefined;
+    m.cfg = .{};
+    m.s = sc.s;
+    m.act = .bfloat16;
+    m.trace = null;
+    m.idx_nax_kernel = try buildIdxNaxKernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_nax_kernel.?);
+    m.idx_nax_bmax_kernel = try buildIdxNaxBmaxKernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_nax_bmax_kernel.?);
+    m.idx_nax_gather_kernel = try buildIdxNaxGatherKernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_nax_gather_kernel.?);
+    m.topk_kernel = try buildKernel("dsv41_topk", &.{"x"}, &.{"out"}, TOPK_SOURCE, TOPK_HEADER);
+    m.topk_tg = 1024;
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.topk_kernel);
+    m.dec = .{ .topk = try dkern.topk.Kernels.build() };
+    defer m.dec.deinit();
+    try dkern.topk.probe(gpa, &m.dec.topk.?, sc.s);
+
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 77));
+
+    const bench = struct {
+        fn med(us: *[5]f64) f64 {
+            std.mem.sort(f64, us, {}, std.sort.asc(f64));
+            return us[us.len / 2];
+        }
+    };
+
+    const k: usize = 512;
+    const bs: usize = 8;
+    const kb: usize = 2048;
+    m.cfg.dsv4_index_topk = @intCast(k);
+    m.cfg.dsv41_candidate_block_size = @intCast(bs);
+    m.cfg.dsv41_candidate_topk_blocks = @intCast(kb);
+
+    for ([_][3]usize{ .{ 256, 65536, 2 }, .{ 256, 131072, 1 }, .{ 256, 262144, 1 } }) |c| {
+        const L, const nb, const ratio = c;
+        const p0 = nb * ratio - L;
+        var q = mlx.mlx_array_new();
+        var keys = mlx.mlx_array_new();
+        var w = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&q, &[_]c_int{ ci(L), 32, 128 }, 3, .bfloat16, 0, 1, key, sc.s));
+        try mlx.check(mlx.mlx_random_normal(&keys, &[_]c_int{ ci(nb), 128 }, 2, .bfloat16, 0, 1, key, sc.s));
+        try mlx.check(mlx.mlx_random_normal(&w, &[_]c_int{ ci(L), 32 }, 2, .bfloat16, 0, 1, key, sc.s));
+        _ = try sc.keep(q);
+        _ = try sc.keep(keys);
+        _ = try sc.keep(w);
+        try mlx.check(mlx.mlx_array_eval(q));
+        try mlx.check(mlx.mlx_array_eval(keys));
+        try mlx.check(mlx.mlx_array_eval(w));
+        const ws: f32 = 1.0 / @sqrt(@as(f32, 128 * 32));
+        const lens_h = try gpa.alloc(i32, L);
+        defer gpa.free(lens_h);
+        for (lens_h, 0..) |*v, l| v.* = @intCast((p0 + l + 1) / ratio);
+
+        var t_base_plain: [5]f64 = undefined;
+        var t_base_csrc: [5]f64 = undefined;
+        var t_base_post: [5]f64 = undefined;
+        var t_on_plain: [5]f64 = undefined;
+        var t_on_csrc: [5]f64 = undefined;
+        var t_on_post: [5]f64 = undefined;
+
+        var cand_bool = none;
+        var cand_ids = none;
+        for (0..2 + t_base_plain.len) |rep| {
+            // Baseline plain
+            {
+                var rsc = Scope.init(gpa, mlx.gpuStream());
+                defer rsc.deinit();
+                const t0 = monoUs();
+                const s_a = try indexScoresNax(&rsc, &m, q, keys, w, ws, p0, ratio);
+                const idx = try topkRows(&rsc, &m, s_a, k);
+                const lens_i = try rsc.ints(lens_h, &.{ ci(L), 1 });
+                const out = if (lens_h[0] == nb) idx else try rsc.where(try rsc.op2(mlx.mlx_less, idx, lens_i), idx, try rsc.i(-1));
+                try mlx.check(mlx.mlx_array_eval(out));
+                if (rep >= 2) t_base_plain[rep - 2] = @floatFromInt(monoUs() - t0);
+            }
+            // Online plain
+            {
+                var rsc = Scope.init(gpa, mlx.gpuStream());
+                defer rsc.deinit();
+                m.cfg.dsv41_candidate_source = -1;
+                var sh: Shared = .{};
+                const t0 = monoUs();
+                const out = (try indexerOnlineTopk(&rsc, &m, 0, w, q, keys, p0, ratio, &sh)).?;
+                try mlx.check(mlx.mlx_array_eval(out));
+                if (rep >= 2) t_on_plain[rep - 2] = @floatFromInt(monoUs() - t0);
+            }
+            // Baseline cand_src
+            {
+                var rsc = Scope.init(gpa, mlx.gpuStream());
+                defer rsc.deinit();
+                const t0 = monoUs();
+                const s_a = try indexScoresNax(&rsc, &m, q, keys, w, ws, p0, ratio);
+                const ninf = try rsc.f(-std.math.inf(f32));
+                const lens_i = try rsc.ints(lens_h, &.{ ci(L), 1 });
+                const n_blocks = (nb + bs - 1) / bs;
+                var blocks = try rsc.max(try rsc.reshape(s_a, &.{ ci(L), ci(n_blocks), ci(bs) }), -1, false);
+                const last = try rsc.op1(mlx.mlx_floor, try rsc.div(try rsc.astype(try rsc.sub(lens_i, try rsc.i(1)), .float32), try rsc.f(@floatFromInt(bs))));
+                const bidx = try rsc.reshape(try rsc.arange(0, n_blocks), &.{ 1, ci(n_blocks) });
+                blocks = try rsc.where(try rsc.op2(mlx.mlx_equal, try rsc.astype(bidx, .float32), last), try rsc.f(std.math.inf(f32)), blocks);
+                const chosen = try topkRows(&rsc, &m, blocks, kb);
+                const reach = try rsc.op2(mlx.mlx_greater, try rsc.takeAlong(blocks, chosen, -1), ninf);
+                var co = mlx.mlx_array_new();
+                const cmask = try rsc.res(mlx.mlx_put_along_axis(&co, try rsc.zeros(&.{ ci(L), ci(n_blocks) }, .bool_), chosen, reach, -1, rsc.s), &co);
+                const idx = try topkRows(&rsc, &m, s_a, k);
+                const out = if (lens_h[0] == nb) idx else try rsc.where(try rsc.op2(mlx.mlx_less, idx, lens_i), idx, try rsc.i(-1));
+                try evalAll(&.{ out, cmask });
+                if (rep == 0) cand_bool = try sc.keep(rsc.out(cmask));
+                if (rep >= 2) t_base_csrc[rep - 2] = @floatFromInt(monoUs() - t0);
+            }
+            // Online cand_src
+            {
+                var rsc = Scope.init(gpa, mlx.gpuStream());
+                defer rsc.deinit();
+                m.cfg.dsv41_candidate_source = 0;
+                var sh: Shared = .{};
+                const t0 = monoUs();
+                const out = (try indexerOnlineTopk(&rsc, &m, 0, w, q, keys, p0, ratio, &sh)).?;
+                try evalAll(&.{ out, sh.cand });
+                if (rep == 0) cand_ids = try sc.keep(rsc.out(sh.cand));
+                if (rep >= 2) t_on_csrc[rep - 2] = @floatFromInt(monoUs() - t0);
+            }
+            // Baseline post_cand
+            {
+                var rsc = Scope.init(gpa, mlx.gpuStream());
+                defer rsc.deinit();
+                const t0 = monoUs();
+                var s_a = try indexScoresNax(&rsc, &m, q, keys, w, ws, p0, ratio);
+                const ninf = try rsc.f(-std.math.inf(f32));
+                const lens_i = try rsc.ints(lens_h, &.{ ci(L), 1 });
+                var o = mlx.mlx_array_new();
+                const rep_a = try rsc.res(mlx.mlx_repeat_axis(&o, cand_bool, ci(bs), -1, rsc.s), &o);
+                s_a = try rsc.where(try rsc.slice(rep_a, -1, 0, nb), s_a, ninf);
+                const idx = try topkRows(&rsc, &m, s_a, k);
+                const out = if (lens_h[0] == nb) idx else try rsc.where(try rsc.op2(mlx.mlx_less, idx, lens_i), idx, try rsc.i(-1));
+                try mlx.check(mlx.mlx_array_eval(out));
+                if (rep >= 2) t_base_post[rep - 2] = @floatFromInt(monoUs() - t0);
+            }
+            // Online post_cand
+            {
+                var rsc = Scope.init(gpa, mlx.gpuStream());
+                defer rsc.deinit();
+                m.cfg.dsv41_candidate_source = 0;
+                var sh: Shared = .{ .cand = cand_ids };
+                const t0 = monoUs();
+                const out = (try indexerOnlineTopk(&rsc, &m, 1, w, q, keys, p0, ratio, &sh)).?;
+                try mlx.check(mlx.mlx_array_eval(out));
+                if (rep >= 2) t_on_post[rep - 2] = @floatFromInt(monoUs() - t0);
+            }
+        }
+        const bp = bench.med(&t_base_plain);
+        const bc = bench.med(&t_base_csrc);
+        const bpost = bench.med(&t_base_post);
+        const op = bench.med(&t_on_plain);
+        const oc = bench.med(&t_on_csrc);
+        const opost = bench.med(&t_on_post);
+        std.debug.print(
+            "[idx-online-ubench] L={d} nb={d}: plain {d:.1}->{d:.1}us ({d:.2}x) | cand_src {d:.1}->{d:.1}us ({d:.2}x) | post_cand {d:.1}->{d:.1}us ({d:.2}x)\n",
+            .{ L, nb, bp, op, bp / op, bc, oc, bc / oc, bpost, opost, bpost / opost },
+        );
+    }
 }
 
 test "dsv41 decode attention: rows split across threadgroups give the one-threadgroup heads" {

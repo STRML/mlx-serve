@@ -19,12 +19,16 @@ pub const bound_bytes: u64 = 5 << 29;
 /// A cell's most scratch bytes: the f32 scores, the bool candidate mask and the f32 masked scores.
 pub const cell_bytes: u64 = 9;
 
+/// The spans of `n_spans` whose per-span scratch is `per` bytes that a wide layer builds before evaluating picks.
+pub fn groupSpansBytes(n_spans: usize, per: u64) usize {
+    if (per == 0 or @as(u64, n_spans) * per <= bound_bytes) return n_spans;
+    return @intCast(@max(1, bound_bytes / per));
+}
+
 /// The spans of `n_spans` (each `span` rows, `nb` compressed positions their indexer scores) a wide layer builds before it
 /// evaluates their picks.
 pub fn groupSpans(n_spans: usize, span: usize, nb: usize) usize {
-    const per: u64 = @as(u64, span) * nb * cell_bytes;
-    if (per == 0 or @as(u64, n_spans) * per <= bound_bytes) return n_spans;
-    return @intCast(@max(1, bound_bytes / per));
+    return groupSpansBytes(n_spans, @as(u64, span) * nb * cell_bytes);
 }
 
 /// Whether span `k` (0-based) of `n_spans` ends a group of `g` before the layer's own evaluation: its picks and the ones
