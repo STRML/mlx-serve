@@ -483,7 +483,7 @@ pub const Dsv41Model = struct {
     /// replayed.
     ced_split: ?usize = null,
     ced_min_skip: usize = CED_MIN_SKIP,
-    ced_stats: struct { chunks: u64 = 0, skipped: u64 = 0 } = .{},
+    ced_stats: struct { chunks: u64 = 0, skipped: u64 = 0, encode_chunks: u64 = 0, encode_rows: u64 = 0 } = .{},
     /// Threads per threadgroup of the hc kernels, all four alike so the wide and decode-width stages sum in one order.
     hc_tg: usize = HC_TG,
     /// Threads per top-k threadgroup (`probeTopkThreads`); the picks are the same at any width.
@@ -891,13 +891,18 @@ fn cedEnabled() bool {
     return ced_env.?;
 }
 
+pub fn resetCedEnvForTest() void {
+    ced_env = null;
+}
+
 /// The rows of a chunk the decoder runs over (its last `sliding_window`) when the chunk replays: last-row logits
 /// only, no verify block, no pair, and at least `ced_min_skip` rows to skip. A chunk that does not replay runs the
 /// full forward, its window continuing from the rows the last replay wrote.
 fn cedTail(m: *const Dsv41Model, st: *const State, L: usize, want: Want) ?usize {
     if (m.ced_split == null or want != .last or m.pair != null or st.verify != null) return null;
     const w: usize = m.cfg.sliding_window;
-    if (L < w + m.ced_min_skip or !cedEnabled()) return null;
+    const min_rows = if (st.decoder_stale) w else w + m.ced_min_skip;
+    if (L < min_rows or !cedEnabled()) return null;
     return w;
 }
 
@@ -2510,6 +2515,9 @@ pub const State = struct {
     /// The ablation key the state's rows were computed under (`abl.variantOf`; `.none` for none); null where nothing
     /// says: a snapshot read back from the disk tier, whose entry the host keys by its variant.
     variant: ?abl.Variant = .none,
+    /// True after a `Want.encode` chunk: encoder layers `[0..ced_split)` and compressed caches are up to date at `n`,
+    /// while decoder layers `[ced_split..n_layers)` window rings, `ds` and `mh` are stale until a `cedTail` pass runs.
+    decoder_stale: bool = false,
 
     pub fn deinit(self: *State) void {
         abl.stateDisarm(self);
@@ -5661,6 +5669,7 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     const ablation_was = m.ablation;
     m.ablation = st.ablation;
     defer m.ablation = ablation_was;
+    if (want == .encode and (m.ced_split == null or m.pair != null or m.tp != null or m.prefill_whole != null or st.verify != null)) return error.Dsv41EncodeUnsupported;
     const c = &m.cfg;
     const L = switch (given) {
         .host => |h| h.len,
@@ -5668,6 +5677,9 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
     };
     if (m.prefill_whole != null and given == .host and L > rowcut.max_rows)
         return leaderPrefill(m, gpa, st, given.host, want, vision);
+    if (st.decoder_stale and want != .encode and want != .replay and cedTail(m, st, L, want) == null) {
+        return error.Dsv41DecodeOnStaleState;
+    }
     const p0 = st.n;
     var full_profile: Profile = undefined;
     var tail_profile: Profile = undefined;
@@ -5832,13 +5844,16 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         try exchange(m, gpa, &sp, p0, st.snap_at != null and st.snap_at.? == p0 + L, if (st.verify) |v| v.n0 == p0 else false);
         from = p.hi;
     }
-    if (want == .encode and (m.ced_split == null or m.pair != null or st.verify != null)) return error.Dsv41EncodeUnsupported;
     const enc_hi = if (tail != null or want == .encode) m.ced_split.? else m.n_layers;
     try runLayers(m, gpa, st, &sp, held, from, enc_hi);
     Laps.lap(.build);
     if (want == .encode) {
         try cedCompress(m, gpa, st, &sp, enc_hi);
+        st.decoder_stale = true;
         st.n = p0 + L;
+        m.ced_stats.encode_chunks += 1;
+        m.ced_stats.encode_rows += L;
+        logCedPrefill(L, 0);
         var ev: std.ArrayList(A) = .empty;
         defer ev.deinit(gpa);
         for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
@@ -5868,6 +5883,9 @@ fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, w
         sp = tsp;
     }
     st.n = p0 + L;
+    if (want == .replay or tail != null) {
+        st.decoder_stale = false;
+    }
 
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
@@ -7860,6 +7878,7 @@ fn applySnap(st: *State, sn: *const Snap) !void {
     st.hist.clearRetainingCapacity();
     try st.hist.appendSlice(st.gpa, sn.hist);
     st.n = sn.n;
+    st.decoder_stale = false;
 }
 
 /// Constructs the full replacement before the caller installs it in a slot.
@@ -7925,16 +7944,42 @@ pub fn snapshotStateIfDue(st: *State, gen: u64) !void {
 
 /// The capture an unfinished prompt leaves: the state where its last forwarded chunk ended, keyed by the armed ids up
 /// to there, so an abandoned prefill resumes instead of starting over. Nothing when no capture is armed, nothing
-/// was forwarded, or an image of the prompt lies past that point (the armed key hashes every image row).
+/// was forwarded, decoder window rings are stale from `.encode`, or an image of the prompt lies past that point.
 pub fn snapshotStateAtChunk(m: *const Dsv41Model, st: *State, gen: u64) !void {
     const at = st.snap_at orelse return;
-    if (st.snap != null or st.n == 0 or st.n >= at) return;
+    if (st.snap != null or st.n == 0 or st.n >= at or st.decoder_stale) return;
     if (m.imageRows(st.snap_ids[0..st.n]) != m.imageRows(st.snap_ids)) return;
     const ids = try st.gpa.dupe(u32, st.snap_ids[0..st.n]);
     st.gpa.free(st.snap_ids);
     st.snap_ids = ids;
     st.snap_at = st.n;
     try snapshotStateIfDue(st, gen);
+}
+
+fn canEncodeChunk(m: *const Dsv41Model, st: *const State, ids: []const u32, vision: ?VisionRows, rem_hint: ?usize) bool {
+    if (m.ced_split == null or m.pair != null or m.tp != null or m.prefill_whole != null) return false;
+    if (st.verify != null or m.trace != null or vision != null or !cedEnabled()) return false;
+    const min_chunk = m.cfg.sliding_window + m.ced_min_skip;
+    if (ids.len < min_chunk) return false;
+    if (st.snap_at) |at| if (at < st.n + ids.len + min_chunk) return false;
+    if (m.prompt.len >= st.n + ids.len and std.mem.eql(u32, ids, m.prompt[st.n..][0..ids.len])) {
+        const rem = m.prompt.len - (st.n + ids.len);
+        return rem > min_chunk;
+    }
+    if (rem_hint) |rem| return rem >= min_chunk;
+    return false;
+}
+
+/// Non-final prompt chunk when the caller needs no logits: skips decoder layers `[ced_split..n_layers)` and head
+/// via `Want.encode` whenever all safety invariants hold (preserving `extendCold`'s `leadRows` split on cold chunks
+/// with Engram so SSD read-ahead still overlaps chunk 0), falling back to `extendResumable` otherwise.
+pub fn extendEncodeResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision: ?VisionRows, rem_hint: ?usize) !A {
+    try snapshotIfDue(m);
+    const st = &m.dec_state.?;
+    if (canEncodeChunk(m, st, ids, vision, rem_hint)) {
+        return extendCold(m, gpa, st, ids, .encode, vision);
+    }
+    return extendResumable(m, gpa, ids, vision);
 }
 
 /// A prompt chunk of at least `LEAD_MIN` rows whose Engram rows nothing read ahead sends its first half ahead of the
@@ -7945,13 +7990,13 @@ pub fn leadRows(L: usize, read_ahead: bool) usize {
 }
 const LEAD_MIN = @import("config.zig").prefill_lead_min_rows;
 
-/// `extendIds` of a prompt chunk for its last row's logits, its lead (`leadRows`) run first without the decoder's
-/// replay, which the rest of the chunk makes at its own end.
-fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, vision: ?VisionRows) !A {
+/// `extendIds` of a prompt chunk for `want` (`.last` or `.encode`), its lead (`leadRows`) run first without the
+/// decoder's replay, which the rest of the chunk makes at its own end when `want == .last`.
+fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, want: Want, vision: ?VisionRows) !A {
     const whole = m.engrams.len == 0 or m.pair != null or m.tp != null or m.streamed != null or m.trace != null or
         m.ced_split == null or st.verify != null or !cedEnabled();
     const lead = if (whole) 0 else leadRows(ids.len, if (m.ahead) |a| a.covers(st.n, ids.len) else false);
-    if (lead == 0) return extendIds(m, gpa, st, .{ .host = ids }, .last, vision);
+    if (lead == 0) return extendIds(m, gpa, st, .{ .host = ids }, want, vision);
     defer m.next_rows = null;
     m.next_rows = ids.len - lead;
     _ = try extendIds(m, gpa, st, .{ .host = ids[0..lead] }, .encode, vision);
@@ -7959,7 +8004,7 @@ fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u
     if (rest) |*v| v.offset += std.mem.count(u32, ids[0..lead], &.{m.cfg.image_token_id});
     // The prompt's next chunk is expected as wide as this whole one, not as its rest.
     m.next_rows = ids.len;
-    return extendIds(m, gpa, st, .{ .host = ids[lead..] }, .last, rest);
+    return extendIds(m, gpa, st, .{ .host = ids[lead..] }, want, rest);
 }
 
 /// `extend` that takes the armed snapshot on the way: a chunk crossing its
@@ -7967,6 +8012,7 @@ fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u
 /// One decode token still on the GPU (`Ids.gpu`), where `extendResumable` takes host ids.
 pub fn extendResumableGpu(m: *Dsv41Model, gpa: std.mem.Allocator, tok: A) !A {
     try snapshotIfDue(m);
+    if (m.dec_state.?.decoder_stale) return error.Dsv41DecodeOnStaleState;
     const out = try extendIds(m, gpa, &m.dec_state.?, .{ .gpu = tok }, .last, null);
     try snapshotIfDue(m);
     return out;
@@ -7977,7 +8023,7 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
     const st = &m.dec_state.?;
     if (st.snap_at) |at| if (at > st.n and at < st.n + ids.len) {
         const k = at - st.n;
-        const head = try extendCold(m, gpa, st, ids[0..k], vision);
+        const head = try extendCold(m, gpa, st, ids[0..k], .last, vision);
         _ = mlx.mlx_array_free(head);
         try snapshotIfDue(m);
         // The tail's rows follow the head's.
@@ -7985,7 +8031,7 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
         if (rest) |*v| v.offset += std.mem.count(u32, ids[0..k], &.{m.cfg.image_token_id});
         return extendIds(m, gpa, st, .{ .host = ids[k..] }, .last, rest);
     };
-    const out = try extendCold(m, gpa, st, ids, vision);
+    const out = try extendCold(m, gpa, st, ids, .last, vision);
     try snapshotIfDue(m);
     return out;
 }
@@ -8042,6 +8088,7 @@ fn extendBatchedUnder(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *S
     const R = offs[N];
     for (states, gens) |st, g| {
         if (st.verify != null) return error.Dsv41BatchUnsupported;
+        if (st.decoder_stale) return error.Dsv41DecodeOnStaleState;
         try snapshotStateIfDue(st, g);
     }
     if (verify) for (states, 0..) |st, k| armVerify(st, m.n_layers) catch |e| {
@@ -8335,6 +8382,7 @@ pub fn draftAheadFits(m: *const Dsv41Model, st: *const State, a: *const DraftAhe
 /// The same graph as `dsparkDraft`'s (`draftGraph` over this one state).
 pub fn dsparkDraftLaunch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) !DraftAhead {
     if (!draftAheadOk(m)) return error.DraftAheadUnsupported;
+    if (st.decoder_stale) return error.Dsv41DecodeOnStaleState;
     const t0 = monoUs();
     const ablation_was = m.ablation;
     m.ablation = st.ablation;
@@ -8392,6 +8440,7 @@ fn draftBatchedUnder(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     defer m.ablation = ablation_was;
     if (states.len == 0 or states.len > region_rows or gens.len != states.len or t1s.len != states.len) return error.Dsv41BatchUnsupported;
     if (m.draft_shard and keep_logits) return error.Dsv41DraftShardLogits;
+    for (states) |st| if (st.decoder_stale) return error.Dsv41DecodeOnStaleState;
     if (m.draft_shard) try tpDraft(m, states, gens, t1s);
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
@@ -8800,6 +8849,7 @@ pub fn dsparkBeginWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u
 fn dsparkBeginAs(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, d: *const DsparkDraft, o: VerifyOpts) !DsparkPending {
     const b = d.len;
     if (b > VERIFY_MAX_DRAFTS) return error.TooManyDrafts;
+    if (st.decoder_stale) return error.Dsv41DecodeOnStaleState;
     RoundLaps.mark(.verify);
     try armVerifyAs(st, m.n_layers, o);
     var ids: [16]u32 = undefined;

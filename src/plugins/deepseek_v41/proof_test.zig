@@ -116,22 +116,40 @@ test "deepseek_v41 plugin: trunk_weight hands out the loaded embedding and head"
     try testing.expectEqual(m.mdl.head.qp.bits, w.bits);
 }
 
-/// The plugin's logits `[rows, V]` (host f32, caller frees) for `toks` of `slots` at `positions`.
-fn slotForward(t: *Twin, mode: abi.Mode, slots: []const u32, toks: []const u32, positions: []const u32) ![]f32 {
+fn slotForwardRaw(t: *Twin, mode: abi.Mode, logits: abi.Logits, slots: []const u32, toks: []const u32, positions: []const u32) !abi.ForwardOut {
     var out: abi.ForwardOut = .{};
     const rows: u32 = if (mode == .batched_rows) 1 else @intCast(toks.len);
-    const v = v41.table.forward(t.m, &.{ .mode = mode, .rows = rows, .tokens = .of(toks), .slots = .of(slots), .positions = .of(positions) }, &out);
+    const v = v41.table.forward(t.m, &.{ .mode = mode, .logits = logits, .rows = rows, .tokens = .of(toks), .slots = .of(slots), .positions = .of(positions) }, &out);
     if (!v.isOk()) {
         std.debug.print("forward: {s}\n", .{v.why.slice()});
         return error.PluginForward;
     }
+    return out;
+}
+
+/// Runs a forward requesting no logits and verifies the plugin returns a null logits handle.
+fn slotForwardNoLogits(t: *Twin, mode: abi.Mode, slots: []const u32, toks: []const u32, positions: []const u32) !void {
+    const out = try slotForwardRaw(t, mode, .none, slots, toks, positions);
+    if (out.logits.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.logits.ctx });
+    try testing.expect(out.logits.ctx == null);
+}
+
+/// The plugin's logits `[rows, V]` (host f32, caller frees) for `toks` of `slots` at `positions`.
+fn slotForwardLogits(t: *Twin, mode: abi.Mode, logits: abi.Logits, slots: []const u32, toks: []const u32, positions: []const u32) ![]f32 {
+    std.debug.assert(logits != .none);
+    const out = try slotForwardRaw(t, mode, logits, slots, toks, positions);
     const l: mlx.mlx_array = .{ .ctx = out.logits.ctx };
     defer _ = mlx.mlx_array_free(l);
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
     try mlx.check(mlx.mlx_astype(&f, l, .float32, t.s));
     try mlx.check(mlx.mlx_array_eval(f));
-    return testing.allocator.dupe(f32, (mlx.mlx_array_data_float32(f) orelse return error.NoData)[0..mlx.mlx_array_size(f)]);
+    return try testing.allocator.dupe(f32, (mlx.mlx_array_data_float32(f) orelse return error.NoData)[0..mlx.mlx_array_size(f)]);
+}
+
+/// The plugin's logits `[rows, V]` (host f32, caller frees) for `toks` of `slots` at `positions`.
+fn slotForward(t: *Twin, mode: abi.Mode, slots: []const u32, toks: []const u32, positions: []const u32) ![]f32 {
+    return slotForwardLogits(t, mode, .last_row, slots, toks, positions);
 }
 
 /// Three batched ticks of two slots (prompts `a` and `b`, decode tokens `da` and `db`), each tick's `[2, V]` logits.
@@ -415,6 +433,419 @@ test "deepseek_v41 CED: a lead chunk that skips the decoder leaves what the chun
             try expectRowsEqual(b.win.buf, a.win.buf, n - w, n, a.win.cap);
         }
     }
+}
+
+test "deepseek_v41 CED encode interior: multi-chunk prefill skips decoder on interior chunks and matches bit for bit" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    var p: [65]u32 = undefined;
+    for (&p, 0..) |*x, i| x.* = @intCast(3 + (i * 37 + i * i) % 90);
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+
+    const cold_t = try Twin.open(files, "");
+    defer cold_t.close();
+    const cold_m: *v41.Model = @ptrCast(@alignCast(cold_t.m));
+    const w: usize = cold_m.mdl.cfg.sliding_window;
+    cold_m.mdl.ced_min_skip = w;
+    try testing.expect(aux.begin_prompt(cold_t.m, 1, .of(&p), .{}, 0, true).isOk());
+    for ([_][2]usize{ .{ 0, 16 }, .{ 16, 32 }, .{ 32, 48 }, .{ 48, 64 } }) |r| {
+        testing.allocator.free(try slotForward(cold_t, .prefill, &.{1}, p[r[0]..r[1]], &.{@intCast(r[0])}));
+    }
+    const cold_logits = try slotForward(cold_t, .prefill, &.{1}, p[64..65], &.{64});
+    defer testing.allocator.free(cold_logits);
+    try testing.expectEqual(@as(u64, 0), cold_m.mdl.ced_stats.encode_chunks);
+    try testing.expectEqual(@as(u64, 4), cold_m.mdl.ced_stats.chunks);
+
+    const enc_t = try Twin.open(files, "");
+    defer enc_t.close();
+    const enc_m: *v41.Model = @ptrCast(@alignCast(enc_t.m));
+    enc_m.mdl.ced_min_skip = w;
+    try testing.expect(aux.begin_prompt(enc_t.m, 1, .of(&p), .{}, 0, true).isOk());
+    for ([_][2]usize{ .{ 0, 16 }, .{ 16, 32 }, .{ 32, 48 } }) |r| {
+        try slotForwardNoLogits(enc_t, .prefill, &.{1}, p[r[0]..r[1]], &.{@intCast(r[0])});
+        try testing.expect(enc_m.mdl.dec_state.?.decoder_stale);
+    }
+    try testing.expectEqual(@as(u64, 3), enc_m.mdl.ced_stats.encode_chunks);
+    try testing.expectEqual(@as(u64, 48), enc_m.mdl.ced_stats.encode_rows);
+    try testing.expectEqual(@as(u64, 0), enc_m.mdl.ced_stats.chunks);
+    testing.allocator.free(try slotForward(enc_t, .prefill, &.{1}, p[48..64], &.{48}));
+    try testing.expect(!enc_m.mdl.dec_state.?.decoder_stale);
+    const enc_logits = try slotForward(enc_t, .prefill, &.{1}, p[64..65], &.{64});
+    defer testing.allocator.free(enc_logits);
+    try testing.expectEqual(@as(u64, 1), enc_m.mdl.ced_stats.chunks);
+    try testing.expectEqualSlices(f32, cold_logits, enc_logits);
+
+    // Every encoder/decoder KV and window ring at [p.len - w, p.len) matches bit for bit.
+    const st_a = &cold_m.mdl.dec_state.?;
+    const st_b = &enc_m.mdl.dec_state.?;
+    for (st_a.layers, st_b.layers) |*a, *b| {
+        inline for (.{ "comp", "idx_k" }) |f| if (@field(a, f)) |rows| {
+            try testing.expectEqual(rows.used, @field(b, f).?.used);
+            try expectRowsEqual(@field(b, f).?.buf, rows.buf, 0, rows.used, rows.used);
+        };
+        try expectRowsEqual(b.win.buf, a.win.buf, p.len - w, p.len, a.win.cap);
+    }
+
+    // Short-tail boundary: when remaining tokens <= w + ced_min_skip, the chunk before the short tail runs `.last` (cedTail) instead of `.encode`.
+    const short_p = p[0..55];
+    const short_cold_t = try Twin.open(files, "");
+    defer short_cold_t.close();
+    const short_cold_m: *v41.Model = @ptrCast(@alignCast(short_cold_t.m));
+    short_cold_m.mdl.ced_min_skip = w;
+    try testing.expect(aux.begin_prompt(short_cold_t.m, 1, .of(short_p), .{}, 0, true).isOk());
+    for ([_][2]usize{ .{ 0, 16 }, .{ 16, 32 }, .{ 32, 48 }, .{ 48, 54 } }) |r| {
+        testing.allocator.free(try slotForward(short_cold_t, .prefill, &.{1}, short_p[r[0]..r[1]], &.{@intCast(r[0])}));
+    }
+    const short_cold = try slotForward(short_cold_t, .prefill, &.{1}, short_p[54..55], &.{54});
+    defer testing.allocator.free(short_cold);
+
+    const short_enc_t = try Twin.open(files, "");
+    defer short_enc_t.close();
+    const short_enc_m: *v41.Model = @ptrCast(@alignCast(short_enc_t.m));
+    short_enc_m.mdl.ced_min_skip = w;
+    try testing.expect(aux.begin_prompt(short_enc_t.m, 1, .of(short_p), .{}, 0, true).isOk());
+    for ([_][2]usize{ .{ 0, 16 }, .{ 16, 32 }, .{ 32, 48 } }) |r| {
+        try slotForwardNoLogits(short_enc_t, .prefill, &.{1}, short_p[r[0]..r[1]], &.{@intCast(r[0])});
+    }
+    // Chunks [0..16) and [16..32) encoded; [32..48) declined `.encode` because remaining=7 <= 2*w=16.
+    try testing.expectEqual(@as(u64, 2), short_enc_m.mdl.ced_stats.encode_chunks);
+    try testing.expect(!short_enc_m.mdl.dec_state.?.decoder_stale);
+    testing.allocator.free(try slotForward(short_enc_t, .prefill, &.{1}, short_p[48..54], &.{48}));
+    const short_enc = try slotForward(short_enc_t, .prefill, &.{1}, short_p[54..55], &.{54});
+    defer testing.allocator.free(short_enc);
+    try testing.expectEqualSlices(f32, short_cold, short_enc);
+}
+
+test "deepseek_v41 CED encode interior: mid-prefill snap_at and cancelled prefill resume (long and short suffix)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    var p: [65]u32 = undefined;
+    for (&p, 0..) |*x, i| x.* = @intCast(3 + (i * 37 + i * i) % 90);
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+
+    // Reference cold run for 65 tokens.
+    const ref_t = try Twin.open(files, "");
+    defer ref_t.close();
+    const ref_m: *v41.Model = @ptrCast(@alignCast(ref_t.m));
+    const w: usize = ref_m.mdl.cfg.sliding_window;
+    ref_m.mdl.ced_min_skip = w;
+    for ([_][2]usize{ .{ 0, 16 }, .{ 16, 32 }, .{ 32, 48 }, .{ 48, 64 } }) |r| {
+        testing.allocator.free(try slotForward(ref_t, .prefill, &.{1}, p[r[0]..r[1]], &.{@intCast(r[0])}));
+    }
+    const cold = try slotForward(ref_t, .prefill, &.{1}, p[64..65], &.{64});
+    defer testing.allocator.free(cold);
+
+    // 1) Mid-prefill snap_at: chunks within `min_chunk` of snap_at must NOT leave `decoder_stale == true`,
+    // and the split chunk containing snap_at runs `.last` + captures an exact snapshot.
+    {
+        const t = try Twin.open(files, "");
+        defer t.close();
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        m.mdl.ced_min_skip = w;
+        try testing.expect(aux.begin_prompt(t.m, 1, .of(&p), .{}, 0, true).isOk());
+        // Override snap_at to land inside chunk [16..32) at position 24 (within min_chunk=16 of chunk 0 end 16).
+        m.mdl.dec_state.?.snap_at = 24;
+        m.mdl.dec_state.?.gpa.free(m.mdl.dec_state.?.snap_ids);
+        m.mdl.dec_state.?.snap_ids = try m.mdl.dec_state.?.gpa.dupe(u32, p[0..24]);
+        try slotForwardNoLogits(t, .prefill, &.{1}, p[0..16], &.{0});
+        try testing.expectEqual(@as(u64, 0), m.mdl.ced_stats.encode_chunks);
+        try testing.expect(!m.mdl.dec_state.?.decoder_stale);
+        try slotForwardNoLogits(t, .prefill, &.{1}, p[16..32], &.{16});
+        try testing.expectEqual(@as(u64, 0), m.mdl.ced_stats.encode_chunks);
+        try testing.expect(!m.mdl.dec_state.?.decoder_stale);
+        try testing.expect(m.mdl.dec_state.?.snap != null);
+        try testing.expectEqual(@as(usize, 24), m.mdl.dec_state.?.snap.?.n);
+        try slotForwardNoLogits(t, .prefill, &.{1}, p[32..48], &.{32});
+        testing.allocator.free(try slotForward(t, .prefill, &.{1}, p[48..64], &.{48}));
+        const got = try slotForward(t, .prefill, &.{1}, p[64..65], &.{64});
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(f32, cold, got);
+    }
+    {
+        const t = try Twin.open(files, "");
+        defer t.close();
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        m.mdl.ced_min_skip = w;
+        try testing.expect(aux.begin_prompt(t.m, 1, .of(&p), .{}, 0, true).isOk());
+        // Override snap_at to 40 (inside chunk [32..48)): chunk 0 encodes, chunk 1 repairs via cedTail before split at 40.
+        m.mdl.dec_state.?.snap_at = 40;
+        m.mdl.dec_state.?.gpa.free(m.mdl.dec_state.?.snap_ids);
+        m.mdl.dec_state.?.snap_ids = try m.mdl.dec_state.?.gpa.dupe(u32, p[0..40]);
+        try slotForwardNoLogits(t, .prefill, &.{1}, p[0..16], &.{0});
+        try testing.expectEqual(@as(u64, 1), m.mdl.ced_stats.encode_chunks);
+        try testing.expect(m.mdl.dec_state.?.decoder_stale);
+        try slotForwardNoLogits(t, .prefill, &.{1}, p[16..32], &.{16});
+        try testing.expectEqual(@as(u64, 1), m.mdl.ced_stats.encode_chunks);
+        try testing.expect(!m.mdl.dec_state.?.decoder_stale);
+        try slotForwardNoLogits(t, .prefill, &.{1}, p[32..48], &.{32});
+        try testing.expectEqual(@as(u64, 1), m.mdl.ced_stats.encode_chunks);
+        try testing.expect(!m.mdl.dec_state.?.decoder_stale);
+        try testing.expect(m.mdl.dec_state.?.snap != null);
+        try testing.expectEqual(@as(usize, 40), m.mdl.dec_state.?.snap.?.n);
+        testing.allocator.free(try slotForward(t, .prefill, &.{1}, p[48..64], &.{48}));
+        const got = try slotForward(t, .prefill, &.{1}, p[64..65], &.{64});
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(f32, cold, got);
+    }
+
+    // 2) Cancelled prefill after `.encode` chunk (`decoder_stale == true`): snapshot is skipped (`snap == null`),
+    // and direct decode on stale state without a `cedTail` / `.replay` chunk is refused (`error.Dsv41DecodeOnStaleState`).
+    {
+        const t = try Twin.open(files, "");
+        defer t.close();
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        m.mdl.ced_min_skip = w;
+        try testing.expect(aux.begin_prompt(t.m, 1, .of(&p), .{}, 0, true).isOk());
+        try slotForwardNoLogits(t, .prefill, &.{1}, p[0..16], &.{0});
+        try slotForwardNoLogits(t, .prefill, &.{1}, p[16..32], &.{16});
+        try testing.expect(m.mdl.dec_state.?.decoder_stale);
+
+        var snap_stale: abi.Handle = null;
+        try testing.expect(aux.snapshot(t.m, 1, &snap_stale).isOk());
+        try testing.expectEqual(@as(abi.Handle, null), snap_stale);
+        try testing.expect(m.mdl.dec_state.?.decoder_stale);
+        try testing.expectError(
+            error.Dsv41DecodeOnStaleState,
+            dsv41.extend(m.mdl, testing.allocator, &m.mdl.dec_state.?, p[32..33], .last),
+        );
+        v41.table.release_slot.?(t.m, 1);
+    }
+
+    // 3) Cancelled prefill after `.encode` chunks followed by a `.last` (`cedTail`) chunk (`decoder_stale == false`):
+    // snapshot captures an exact `whole` state, and resuming with both >= w + ced_min_skip and < w + ced_min_skip
+    // remaining rows produces bit-identical logits to cold prefill.
+    {
+        const short_prompt = p[0..55]; // suffix 48..55 has 7 rows (< w + ced_min_skip = 16)
+        const cold_short_t = try Twin.open(files, "");
+        defer cold_short_t.close();
+        const cold_short_m: *v41.Model = @ptrCast(@alignCast(cold_short_t.m));
+        cold_short_m.mdl.ced_min_skip = w;
+        testing.allocator.free(try slotForward(cold_short_t, .prefill, &.{1}, short_prompt[0..16], &.{0}));
+        testing.allocator.free(try slotForward(cold_short_t, .prefill, &.{1}, short_prompt[16..32], &.{16}));
+        testing.allocator.free(try slotForward(cold_short_t, .prefill, &.{1}, short_prompt[32..48], &.{32}));
+        testing.allocator.free(try slotForward(cold_short_t, .prefill, &.{1}, short_prompt[48..54], &.{48}));
+        const cold_short = try slotForward(cold_short_t, .prefill, &.{1}, short_prompt[54..55], &.{54});
+        defer testing.allocator.free(cold_short);
+
+        const t = try Twin.open(files, "");
+        defer t.close();
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        m.mdl.ced_min_skip = w;
+        try testing.expect(aux.begin_prompt(t.m, 1, .of(&p), .{}, 0, true).isOk());
+        try slotForwardNoLogits(t, .prefill, &.{1}, p[0..16], &.{0});
+        try slotForwardNoLogits(t, .prefill, &.{1}, p[16..32], &.{16});
+        try testing.expect(m.mdl.dec_state.?.decoder_stale);
+        testing.allocator.free(try slotForward(t, .prefill, &.{1}, p[32..48], &.{32}));
+        try testing.expect(!m.mdl.dec_state.?.decoder_stale);
+
+        var snap_48: abi.Handle = null;
+        try testing.expect(aux.snapshot(t.m, 1, &snap_48).isOk());
+        try testing.expect(snap_48 != null);
+        defer aux.free(t.m, snap_48);
+
+        var info: abi.AuxSnapshotInfo = .{};
+        try testing.expect(aux.describe(t.m, snap_48, &info).isOk());
+        try testing.expectEqual(@as(u64, 48), info.n);
+        v41.table.release_slot.?(t.m, 1);
+
+        // Long suffix (>= w + ced_min_skip: 17 rows remaining).
+        try testing.expect(aux.restore_at(t.m, 2, snap_48, 48).isOk());
+        try testing.expect(aux.begin_prompt(t.m, 2, .of(&p), .{}, 48, true).isOk());
+        testing.allocator.free(try slotForward(t, .prefill, &.{2}, p[48..64], &.{48}));
+        const warm_long = try slotForward(t, .prefill, &.{2}, p[64..65], &.{64});
+        defer testing.allocator.free(warm_long);
+        try testing.expectEqualSlices(f32, cold, warm_long);
+        v41.table.release_slot.?(t.m, 2);
+
+        // Short suffix (< w + ced_min_skip: 7 rows remaining).
+        try testing.expect(aux.restore_at(t.m, 3, snap_48, 48).isOk());
+        try testing.expect(aux.begin_prompt(t.m, 3, .of(short_prompt), .{}, 48, true).isOk());
+        testing.allocator.free(try slotForward(t, .prefill, &.{3}, short_prompt[48..54], &.{48}));
+        const warm_short = try slotForward(t, .prefill, &.{3}, short_prompt[54..55], &.{54});
+        defer testing.allocator.free(warm_short);
+        try testing.expectEqualSlices(f32, cold_short, warm_short);
+    }
+}
+
+test "deepseek_v41 CED encode interior: all_rows, pair, TP and disabled CED never encode" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    var p: [40]u32 = undefined;
+    for (&p, 0..) |*x, i| x.* = @intCast(3 + (i * 37 + i * i) % 90);
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+
+    const t = try Twin.open(files, "");
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    const w: usize = m.mdl.cfg.sliding_window;
+    m.mdl.ced_min_skip = w;
+
+    // 1) `.all_rows` (prompt logprobs path) never encodes and returns [L, V].
+    try testing.expect(aux.begin_prompt(t.m, 1, .of(&p), .{}, 0, true).isOk());
+    const all_logits = try slotForwardLogits(t, .prefill, .all_rows, &.{1}, p[0..16], &.{0});
+    defer testing.allocator.free(all_logits);
+    try testing.expectEqual(16 * m.mdl.vocab, all_logits.len);
+    try testing.expectEqual(@as(u64, 0), m.mdl.ced_stats.encode_chunks);
+    v41.table.release_slot.?(t.m, 1);
+
+    // 2) `m.pair != null`, `m.tp != null`, and `m.prefill_whole != null` refuse `Want.encode`.
+    var st = try dsv41.initState(m.mdl, testing.allocator);
+    defer st.deinit();
+    m.mdl.pair = .{ .lo = 1, .hi = 2, .worker = false };
+    try testing.expectError(error.Dsv41EncodeUnsupported, dsv41.extend(m.mdl, testing.allocator, &st, p[0..16], .encode));
+    m.mdl.pair = null;
+    m.mdl.tp = .{ .rank = 0, .size = 4 };
+    try testing.expectError(error.Dsv41EncodeUnsupported, dsv41.extend(m.mdl, testing.allocator, &st, p[0..16], .encode));
+    m.mdl.tp = null;
+    m.mdl.prefill_whole = m.mdl;
+    try testing.expectError(error.Dsv41EncodeUnsupported, dsv41.extend(m.mdl, testing.allocator, &st, p[0..16], .encode));
+    m.mdl.prefill_whole = null;
+
+    // 3) Disabled CED (`MLX_SERVE_DSV41_CED=0`) never encodes even on `.none` forwards.
+    const prev_ced = env.get(.MLX_SERVE_DSV41_CED);
+    env.set(.MLX_SERVE_DSV41_CED, "0");
+    dsv41.resetCedEnvForTest();
+    defer {
+        if (prev_ced) |v| env.set(.MLX_SERVE_DSV41_CED, v) else env.unset(.MLX_SERVE_DSV41_CED);
+        dsv41.resetCedEnvForTest();
+    }
+    try testing.expect(aux.begin_prompt(t.m, 2, .of(&p), .{}, 0, true).isOk());
+    try slotForwardNoLogits(t, .prefill, &.{2}, p[0..16], &.{0});
+    try testing.expectEqual(@as(u64, 0), m.mdl.ced_stats.encode_chunks);
+    try testing.expect(!m.mdl.dec_state.?.decoder_stale);
+}
+
+fn attachTinyEngramForTest(mdl: *dsv41.Dsv41Model, dir: []const u8) !void {
+    const gpa = mdl.gpa;
+    const fxmod = @import("decode/fixture.zig");
+    fxmod.engramConfig(&mdl.cfg, .{ 1, 2 });
+    mdl.token_map = try engram.loadTokenMap(gpa, dir, @intCast(mdl.vocab), mdl.cfg.dsv41_engram_compressed_vocab);
+    mdl.hash = try engram.Hash.init(&mdl.cfg, mdl.token_map[mdl.cfg.dsv41_engram_pad_id]);
+    const cols = mdl.hash.?.cols();
+    const d: c_int = @intCast(mdl.cfg.hidden_size);
+    const hc: c_int = @intCast(mdl.cfg.dsv4_hc_mult);
+    const in_dim: c_int = @intCast(cols * mdl.cfg.dsv41_engram_head_dim);
+    mdl.engrams = try gpa.alloc(dsv41.EngramLayer, 2);
+    var opened: usize = 0;
+    errdefer {
+        for (mdl.engrams[0..opened]) |*e| e.table.close();
+        gpa.free(mdl.engrams);
+        mdl.engrams = &.{};
+    }
+    const w_scale_f32 = mlx.mlx_array_new_float(0.01);
+    defer _ = mlx.mlx_array_free(w_scale_f32);
+    var w_scale = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_scale);
+    try mlx.check(mlx.mlx_astype(&w_scale, w_scale_f32, mdl.act, mdl.s));
+    const qk_scale = mlx.mlx_array_new_float(0.05);
+    defer _ = mlx.mlx_array_free(qk_scale);
+    for (0..2) |k| {
+        const l: usize = mdl.cfg.dsv41_engram_layers[k];
+        var w_ones = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w_ones);
+        try mlx.check(mlx.mlx_ones(&w_ones, &[_]c_int{ (hc + 1) * d, in_dim }, 2, mdl.act, mdl.s));
+        var w_arr = mlx.mlx_array_new();
+        {
+            errdefer _ = mlx.mlx_array_free(w_arr);
+            try mlx.check(mlx.mlx_multiply(&w_arr, w_ones, w_scale, mdl.s));
+            try mdl.owned.append(gpa, w_arr);
+        }
+
+        var qk_ones = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qk_ones);
+        try mlx.check(mlx.mlx_ones(&qk_ones, &[_]c_int{ hc, d }, 2, .float32, mdl.s));
+        var qk_arr = mlx.mlx_array_new();
+        {
+            errdefer _ = mlx.mlx_array_free(qk_arr);
+            try mlx.check(mlx.mlx_multiply(&qk_arr, qk_ones, qk_scale, mdl.s));
+            try mdl.owned.append(gpa, qk_arr);
+        }
+
+        try mlx.check(mlx.mlx_array_eval(w_arr));
+        try mlx.check(mlx.mlx_array_eval(qk_arr));
+        mdl.engrams[k] = .{
+            .layer = l,
+            .wkv = .{ .w = w_arr },
+            .qk = qk_arr,
+            .table = try engram.Table.open(gpa, dir, k, l, mdl.cfg.dsv41_engram_rows[k], mdl.cfg.dsv41_engram_head_dim),
+        };
+        mdl.engrams[k].table.openCodes();
+        opened += 1;
+    }
+}
+
+test "deepseek_v41 CED encode interior: cold Engram chunk splits leadRows and matches cold bit for bit" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const fxmod = @import("decode/fixture.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try fxmod.writeEngramPack(testing.allocator, td.dir, 96, .{ 1, 2 });
+    var path: [512]u8 = undefined;
+    const dir = path[0..try td.dir.realPath(io, &path)];
+
+    var p: [8705]u32 = undefined; // 4096 (cold lead) + 4096 (warm read-ahead) + 512 (cedTail) + 1 (final)
+    for (&p, 0..) |*x, i| x.* = @intCast(3 + (i * 37 + i * i) % 90);
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+
+    const cold_t = try Twin.open(files, "");
+    defer cold_t.close();
+    const cold_m: *v41.Model = @ptrCast(@alignCast(cold_t.m));
+    try attachTinyEngramForTest(cold_m.mdl, dir);
+    const w: usize = cold_m.mdl.cfg.sliding_window;
+    cold_m.mdl.ced_min_skip = w;
+    try testing.expect(aux.begin_prompt(cold_t.m, 1, .of(&p), .{}, 0, true).isOk());
+    for ([_][2]usize{ .{ 0, 4096 }, .{ 4096, 8192 }, .{ 8192, 8704 } }) |r| {
+        testing.allocator.free(try slotForward(cold_t, .prefill, &.{1}, p[r[0]..r[1]], &.{@intCast(r[0])}));
+    }
+    const cold_logits = try slotForward(cold_t, .prefill, &.{1}, p[8704..8705], &.{8704});
+    defer testing.allocator.free(cold_logits);
+    // Chunk 0 splits at leadRows (1 .encode + 1 .last); chunks 1..2 use read-ahead (1 .last each).
+    try testing.expectEqual(@as(u64, 1), cold_m.mdl.ced_stats.encode_chunks);
+    try testing.expectEqual(@as(u64, 3), cold_m.mdl.ced_stats.chunks);
+
+    const enc_t = try Twin.open(files, "");
+    defer enc_t.close();
+    const enc_m: *v41.Model = @ptrCast(@alignCast(enc_t.m));
+    try attachTinyEngramForTest(enc_m.mdl, dir);
+    enc_m.mdl.ced_min_skip = w;
+    try testing.expect(aux.begin_prompt(enc_t.m, 1, .of(&p), .{}, 0, true).isOk());
+    try testing.expect(enc_m.mdl.ahead == null);
+
+    // Cold chunk 0 (4096 >= LEAD_MIN, !read_ahead): extendEncodeResumable must split at leadRows -> 2 .encode chunks + ahead for [4096..8192).
+    try slotForwardNoLogits(enc_t, .prefill, &.{1}, p[0..4096], &.{0});
+    try testing.expectEqual(@as(u64, 2), enc_m.mdl.ced_stats.encode_chunks);
+    try testing.expectEqual(@as(u64, 4096), enc_m.mdl.ced_stats.encode_rows);
+    try testing.expectEqual(@as(u64, 0), enc_m.mdl.ced_stats.chunks);
+    try testing.expect(enc_m.mdl.dec_state.?.decoder_stale);
+    try testing.expect(enc_m.mdl.ahead != null);
+    try testing.expect(enc_m.mdl.ahead.?.covers(4096, 4096));
+
+    // Warm chunk 1 (4096 covered by read-ahead): runs in 1 .encode chunk and prefetches [8192..8704).
+    try slotForwardNoLogits(enc_t, .prefill, &.{1}, p[4096..8192], &.{4096});
+    try testing.expectEqual(@as(u64, 3), enc_m.mdl.ced_stats.encode_chunks);
+    try testing.expectEqual(@as(u64, 8192), enc_m.mdl.ced_stats.encode_rows);
+    try testing.expectEqual(@as(u64, 0), enc_m.mdl.ced_stats.chunks);
+    try testing.expect(enc_m.mdl.dec_state.?.decoder_stale);
+    try testing.expect(enc_m.mdl.ahead != null);
+    try testing.expect(enc_m.mdl.ahead.?.covers(8192, 512));
+
+    // Tail repair chunk 2 + final row 3: bit-identical to cold reference.
+    testing.allocator.free(try slotForward(enc_t, .prefill, &.{1}, p[8192..8704], &.{8192}));
+    try testing.expect(!enc_m.mdl.dec_state.?.decoder_stale);
+    try testing.expectEqual(@as(u64, 1), enc_m.mdl.ced_stats.chunks);
+    const enc_logits = try slotForward(enc_t, .prefill, &.{1}, p[8704..8705], &.{8704});
+    defer testing.allocator.free(enc_logits);
+    try testing.expectEqualSlices(f32, cold_logits, enc_logits);
 }
 
 /// The logits of `tail` on a slot restored from `sn` at its end (the prompt `ids`).

@@ -107,6 +107,9 @@ pub const ForwardCtx = struct {
     /// reaches the plugin as `Mode.decode`. False from the first decode step on. Reaches plugins as `Forward.prefill`,
     /// which the calibration tap gates on: by mode alone, the last prompt token is dropped.
     prefill: bool = false,
+    /// An interior prefill chunk whose logits and hidden rows are discarded: `owns_decode_state` plugins receive
+    /// `abi.Logits.none` with `want_hidden = false`.
+    no_logits: bool = false,
     /// Hand the graph built so far to the GPU every this many layers (0 =
     /// build it whole): a spec round's verify waits on the host otherwise.
     pipeline_build: u32 = 0,
