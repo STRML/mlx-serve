@@ -39,9 +39,17 @@ const sendResponse = @import("../http/respond.zig").sendResponse;
 /// clients that genuinely need the template can still get it from the
 /// model's `config.json` / `chat_template.jinja` on disk, or by rendering
 /// through `/v1/chat/completions` server-side.
+/// Whether `GET /props` exposes active per-request prefill chunking for `config` on `engine`:
+/// MLX-served models whose config supports per-request prefill chunking (`ModelConfig.perRequestPrefillChunk`),
+/// with no explicit `--prefill-chunk` override (`explicit_prefill_chunk == 0`).
+fn perRequestPrefillChunkActive(config: *const model_mod.ModelConfig, engine: PropsEngine, explicit_prefill_chunk: u32) bool {
+    return engine == .mlx and explicit_prefill_chunk == 0 and config.perRequestPrefillChunk();
+}
+
 fn renderPropsBody(
     allocator: std.mem.Allocator,
     config: *const model_mod.ModelConfig,
+    per_request_prefill_chunk: bool,
     ctx_str: []const u8,
     active_mem: usize,
     peak_mem: usize,
@@ -65,7 +73,7 @@ fn renderPropsBody(
     // was invisible: the panel read 19.6 GB of `active_bytes` while the process
     // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"weights_bytes":{d},"kv_cache_bytes":{d}}}{s},"build_id":"{s}"}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"weights_bytes":{d},"kv_cache_bytes":{d}}}{s},"per_request_prefill_chunk":{},"build_id":"{s}"}}
     , .{
         config.model_type,              ctx_str,
         config.vocab_size,              config.hidden_size,
@@ -76,7 +84,8 @@ fn renderPropsBody(
         peak_mem,                       available_mem,
         safe_ctx,                       cache_mem,
         weights_mem,                    kv_cache_mem,
-        extra_json,                     build_options.build_id,
+        extra_json,                     per_request_prefill_chunk,
+        build_options.build_id,
     });
 }
 
@@ -294,7 +303,9 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
         sch.resident_hot_cache_bytes.load(.monotonic) + sch.resident_live_kv_bytes.load(.monotonic)
     else
         0;
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, residentWeightsBytes(stream.io), kv_cache_mem, extra_json);
+    const engine: PropsEngine = if (lm.engine) |e| e.kind else .mlx;
+    const per_request_prefill_chunk = perRequestPrefillChunkActive(config, engine, mlx_engine.settings().explicit_prefill_chunk);
+    const body = try renderPropsBody(allocator, config, per_request_prefill_chunk, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, residentWeightsBytes(stream.io), kv_cache_mem, extra_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -373,7 +384,7 @@ test "renderPropsBody omits chat_template" {
     config.max_position_embeddings = 8192;
     config.model_type = "gemma4";
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, 7777, 8888, "");
+    const body = try renderPropsBody(testing.allocator, &config, false, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, 7777, 8888, "");
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
@@ -391,7 +402,7 @@ test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill 
     // Spliced into a props body it stays valid JSON with the object present.
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen3_5_moe";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
+    const body = try renderPropsBody(testing.allocator, &config, false, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -415,7 +426,7 @@ test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill 
     };
     const dual = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &two);
     defer testing.allocator.free(dual);
-    const dual_body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, dual);
+    const dual_body = try renderPropsBody(testing.allocator, &config, false, "4096", 1, 2, 3, 4, 5, 0, 0, dual);
     defer testing.allocator.free(dual_body);
     var dual_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, dual_body, .{});
     defer dual_parsed.deinit();
@@ -452,7 +463,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     defer testing.allocator.free(frag);
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen3_5";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
+    const body = try renderPropsBody(testing.allocator, &config, false, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -534,7 +545,7 @@ test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
 
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen4_exp";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
+    const body = try renderPropsBody(testing.allocator, &config, false, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -549,7 +560,7 @@ test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
     defer testing.allocator.free(ane);
     const both = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ ane, frag });
     defer testing.allocator.free(both);
-    const body2 = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, both);
+    const body2 = try renderPropsBody(testing.allocator, &config, false, "4096", 1, 2, 3, 4, 5, 0, 0, both);
     defer testing.allocator.free(body2);
     var parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, body2, .{});
     defer parsed2.deinit();
@@ -570,7 +581,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     config.quant_group_size = 64;
     config.max_position_embeddings = 8192;
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, 7777, 8888, "");
+    const body = try renderPropsBody(testing.allocator, &config, false, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, 7777, 8888, "");
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.
@@ -590,4 +601,38 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     try testing.expect(std.mem.indexOf(u8, body, "\"weights_bytes\":7777") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"kv_cache_bytes\":8888") != null);
     try testing.expect(std.mem.endsWith(u8, body, ",\"build_id\":\"" ++ build_options.build_id ++ "\"}"));
+}
+
+test "renderPropsBody and perRequestPrefillChunkActive report per_request_prefill_chunk" {
+    var dsv41 = model_mod.ModelConfig{};
+    dsv41.model_type = "deepseek_v41";
+    // Resident DS4.1 unpinned on MLX -> true; pinned or streamed or non-MLX -> false.
+    try testing.expect(perRequestPrefillChunkActive(&dsv41, .mlx, 0));
+    try testing.expect(!perRequestPrefillChunkActive(&dsv41, .mlx, 4096));
+    try testing.expect(!perRequestPrefillChunkActive(&dsv41, .ds4, 0));
+    try testing.expect(!perRequestPrefillChunkActive(&dsv41, .llama, 0));
+    try testing.expect(!perRequestPrefillChunkActive(&dsv41, .ane, 0));
+    dsv41.legacy.caps.streamed_weights = true;
+    try testing.expect(!perRequestPrefillChunkActive(&dsv41, .mlx, 0));
+
+    // Non-adaptive arch -> false even unpinned on MLX.
+    var gemma = model_mod.ModelConfig{};
+    gemma.model_type = "gemma4";
+    try testing.expect(!perRequestPrefillChunkActive(&gemma, .mlx, 0));
+
+    // Long-context-gated arch -> true unpinned on MLX, false when pinned.
+    var qwen4 = model_mod.ModelConfig{};
+    qwen4.model_type = "qwen4_exp";
+    qwen4.legacy.caps.long_ctx = true;
+    try testing.expect(perRequestPrefillChunkActive(&qwen4, .mlx, 0));
+    try testing.expect(!perRequestPrefillChunkActive(&qwen4, .mlx, 4096));
+
+    for ([_]bool{ false, true }) |flag| {
+        const body = try renderPropsBody(testing.allocator, &gemma, flag, "4096", 1, 2, 3, 4, 5, 0, 0, "");
+        defer testing.allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        const v = parsed.value.object.get("per_request_prefill_chunk") orelse return error.MissingPerRequestPrefillChunk;
+        try testing.expectEqual(flag, v.bool);
+    }
 }
