@@ -525,6 +525,8 @@ pub const Dsv41Model = struct {
     attn_f16: bool = true,
     idx_score_kernel: mlx.mlx_fast_metal_kernel,
     idx_tile_kernel: mlx.mlx_fast_metal_kernel,
+    /// Multi-row NAX indexer scorer (`IDX_NAX_SOURCE`); null without NAX.
+    idx_nax_kernel: ?mlx.mlx_fast_metal_kernel = null,
     gate_kernel: mlx.mlx_fast_metal_kernel,
     topk_kernel: mlx.mlx_fast_metal_kernel,
     dense_f32x_kernel: mlx.mlx_fast_metal_kernel,
@@ -628,6 +630,7 @@ pub const Dsv41Model = struct {
         if (self.moe_wt_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         _ = mlx.mlx_fast_metal_kernel_free(self.idx_score_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.idx_tile_kernel);
+        if (self.idx_nax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         _ = mlx.mlx_fast_metal_kernel_free(self.gate_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.route_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.hc_mix_kernel);
@@ -1559,6 +1562,11 @@ pub const IDX_SCORE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_scor
 /// to that dtype before widening, so the cast is exact.
 pub const IDX_TILE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_tile.metal");
 
+/// Multi-row `IDX_TILE_SOURCE` on NAX `matmul2d`: one threadgroup scores BM query rows against BN keys
+/// staged once in threadgroup memory across all index heads, accumulating `w * relu(q_h . k)` in f32.
+pub const IDX_NAX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_nax.metal");
+pub const MPP_OPS_HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
+
 /// Router logits `[L, E]` in f32 from bf16 rows: one simdgroup an expert,
 /// 8 inputs a lane per step.
 pub const GATE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/gate.metal");
@@ -1692,6 +1700,10 @@ pub const IDX_INS = [_][*:0]const u8{ "q", "keys", "w", "meta", "wsc" };
 
 pub fn buildIdxScoreKernel() !mlx.mlx_fast_metal_kernel {
     return buildKernel("dsv41_index_scores", &IDX_INS, &.{"scores"}, IDX_SCORE_SOURCE, "");
+}
+
+pub fn buildIdxNaxKernel() !mlx.mlx_fast_metal_kernel {
+    return buildKernel("dsv41_index_nax", &IDX_INS, &.{"scores"}, IDX_NAX_SOURCE, MPP_OPS_HEADER);
 }
 
 pub const ATTN_INS = [_][*:0]const u8{ "q", "ring", "comp", "topk", "sink", "meta", "scal" };
@@ -1960,6 +1972,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         if (m.attn_gather) |*g| g.deinit();
         _ = mlx.mlx_fast_metal_kernel_free(m.idx_score_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.idx_tile_kernel);
+        if (m.idx_nax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         _ = mlx.mlx_fast_metal_kernel_free(m.gate_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.route_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.hc_mix_kernel);
@@ -1977,6 +1990,9 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         _ = mlx.mlx_fast_metal_kernel_free(m.moe_dn_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+    }
+    if (device.naxAvailable() and mlx.metalKernelsAvailable()) {
+        m.idx_nax_kernel = try buildIdxNaxKernel();
     }
     if (worker) {
         m.embed = .{ .w = none };
@@ -3506,14 +3522,71 @@ pub fn attnWide(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, keys_w: A, wp: 
     return sc.astype(o, out_dt);
 }
 
+/// Whether `indexScores` will take `indexScoresNax` for `(m, s, q, keys)`.
+pub fn useIndexNax(m: *const Dsv41Model, s: mlx.mlx_stream, q: A, keys: A) bool {
+    const dt = mlx.mlx_array_dtype(keys);
+    return m.idx_nax_kernel != null and mlx.streamIsGpu(s) and dim(q, 0) > tiledIndexRows() and dim(keys, 0) > 0 and (dt == .bfloat16 or dt == .float16) and dim(q, 1) > 0 and dim(q, 1) <= 128 and dim(q, 2) % 16 == 0 and dim(q, 2) <= 128;
+}
+
 /// The indexer's scores `[L, nb]` (`IDX_SCORE_SOURCE`): a decode block keeps the scalar kernel's bits,
-/// a wide block whose geometry tiles by 8 rides the matrix kernel.
+/// a wide block takes the multi-row NAX matrix kernel where available and eligible, else `idx_tile`.
 pub fn indexScores(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize) !A {
+    if (useIndexNax(m, sc.s, q, keys))
+        return indexScoresNax(sc, m, q, keys, weights, wscale, p0, ratio);
+    const L = dim(q, 0);
+    const nb = dim(keys, 0);
     const ih = dim(q, 1);
     const ihd = dim(q, 2);
-    if (dim(q, 0) > tiledIndexRows() and dim(keys, 0) > 0 and ih % 8 == 0 and ih <= 128 and ihd % 8 == 0)
+    if (L > tiledIndexRows() and nb > 0 and ih % 8 == 0 and ih <= 128 and ihd % 8 == 0)
         return indexScoresTiled(sc, m, q, keys, weights, wscale, p0, ratio);
     return indexScoresScalar(sc, m, q, keys, weights, wscale, p0, ratio);
+}
+
+pub const idx_nax_bn: usize = 32;
+
+pub fn idxNaxBm(L: usize) usize {
+    return if (L <= 16) 16 else 32;
+}
+
+pub fn idxNaxTgn(bm: usize, bn: usize) usize {
+    return (bm / 16) * (bn / 32) * 32;
+}
+
+pub fn idxNaxDk(ihd: usize) usize {
+    return if (ihd % 64 == 0) 64 else if (ihd % 32 == 0) 32 else 16;
+}
+
+pub fn indexScoresNax(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize) !A {
+    const L = dim(q, 0);
+    const nb = dim(keys, 0);
+    const ih = dim(q, 1);
+    const ihd = dim(q, 2);
+    const dt = mlx.mlx_array_dtype(keys);
+    const bm = idxNaxBm(L);
+    const bn = idx_nax_bn;
+    const tgn = idxNaxTgn(bm, bn);
+    const dk = idxNaxDk(ihd);
+    const meta = try sc.ints(&.{ @intCast(p0), @intCast(ratio) }, &.{2});
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(nb) }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci((L + bm - 1) / bm * tgn), ci((nb + bn - 1) / bn), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tgn), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "IH", ci(ih)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "IHD", ci(ihd)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BM", ci(bm)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BN", ci(bn)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "DK", ci(dk)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    const q_in = if (mlx.mlx_array_dtype(q) == dt) q else try sc.astype(q, dt);
+    const inputs = [_]A{ q_in, keys, weights, meta, try sc.keep(mlx.mlx_array_new_data(&[_]f32{wscale}, &[_]c_int{1}, 1, .float32)) };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, m.idx_nax_kernel.?, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
 
 /// Rows above which index scores take the tiled matrix kernel (`DSV41_IDX_TILED_ROWS`, default 6, the fused decode
@@ -10232,6 +10305,204 @@ test "dsv41 index scores: the matrix kernel scores what the scalar kernel scores
             }
         }
     };
+}
+
+fn expectTopkValid(judge_row: []const f32, picks_row: []const i32, visible: usize, k: usize, sorted: []f32) !void {
+    if (visible == 0) return;
+    if (visible <= k) {
+        for (0..visible) |v| {
+            try testing.expect(std.mem.indexOfScalar(i32, picks_row[0..k], @intCast(v)) != null);
+        }
+        return;
+    }
+    @memcpy(sorted[0..visible], judge_row[0..visible]);
+    std.mem.sort(f32, sorted[0..visible], {}, std.sort.desc(f32));
+    const kth = sorted[k - 1];
+    try testing.expect(std.math.isFinite(kth));
+    const tol = 1e-4 * @max(1.0, @abs(kth));
+    for (picks_row[0..k]) |p| {
+        try testing.expect(p >= 0);
+        const idx: usize = @intCast(p);
+        try testing.expect(idx < visible);
+        try testing.expect(judge_row[idx] >= kth - tol);
+    }
+}
+
+test "dsv41 index_nax: NAX multi-row scorer matches idx_tile scores and top-K picks across shapes, causal edges, and dtypes" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    m.idx_score_kernel = try buildIdxScoreKernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_score_kernel);
+    m.idx_tile_kernel = try buildKernel("dsv41_index_tile", &IDX_INS, &.{"scores"}, IDX_TILE_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_tile_kernel);
+    m.idx_nax_kernel = try buildIdxNaxKernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_nax_kernel.?);
+    m.topk_kernel = try buildKernel("dsv41_topk", &.{"x"}, &.{"out"}, TOPK_SOURCE, TOPK_HEADER);
+    m.topk_tg = 1024;
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.topk_kernel);
+
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 17));
+
+    const Case = struct { ih: usize, ihd: usize, L: usize, nb: usize, p0: usize, ratio: usize, dt: mlx.mlx_dtype };
+    const cases = [_]Case{
+        .{ .ih = 32, .ihd = 128, .L = 9, .nb = 5, .p0 = 0, .ratio = 2, .dt = .bfloat16 },
+        .{ .ih = 32, .ihd = 128, .L = 17, .nb = 65, .p0 = 1, .ratio = 1, .dt = .bfloat16 },
+        .{ .ih = 32, .ihd = 128, .L = 70, .nb = 130, .p0 = 37, .ratio = 2, .dt = .bfloat16 },
+        .{ .ih = 32, .ihd = 128, .L = 128, .nb = 4096, .p0 = 0, .ratio = 1, .dt = .bfloat16 },
+        .{ .ih = 32, .ihd = 128, .L = 256, .nb = 4099, .p0 = 2000, .ratio = 2, .dt = .bfloat16 },
+        .{ .ih = 32, .ihd = 128, .L = 256, .nb = 8192, .p0 = 8192, .ratio = 1, .dt = .bfloat16 },
+        .{ .ih = 32, .ihd = 128, .L = 33, .nb = 300, .p0 = 120, .ratio = 2, .dt = .float16 },
+        .{ .ih = 8, .ihd = 32, .L = 40, .nb = 700, .p0 = 1300, .ratio = 2, .dt = .bfloat16 },
+    };
+
+    for (cases) |cs| {
+        var t: [3]A = undefined;
+        for ([_][]const c_int{ &.{ ci(cs.L), ci(cs.ih), ci(cs.ihd) }, &.{ ci(cs.nb), ci(cs.ihd) }, &.{ ci(cs.L), ci(cs.ih) } }, &t, 0..) |sh, *o, i| {
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, if (i == 2) cs.dt else cs.dt, 0, 1, key, sc.s));
+            o.* = try sc.keep(r);
+        }
+        const q = try sc.astype(t[0], .float32);
+        const ws: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cs.ihd * cs.ih)));
+        try testing.expect(useIndexNax(&m, sc.s, q, t[1]));
+        const want_a = try indexScoresTiled(&sc, &m, q, t[1], t[2], ws, cs.p0, cs.ratio);
+        const nax_a = try indexScoresNax(&sc, &m, q, t[1], t[2], ws, cs.p0, cs.ratio);
+        const via_dispatch_a = try indexScores(&sc, &m, q, t[1], t[2], ws, cs.p0, cs.ratio);
+        const want = try hostF32(want_a);
+        defer gpa.free(want);
+        const direct = try hostF32(nax_a);
+        defer gpa.free(direct);
+        const via_dispatch = try hostF32(via_dispatch_a);
+        defer gpa.free(via_dispatch);
+        try testing.expectEqualSlices(f32, direct, via_dispatch);
+        try testing.expectEqual(cs.L * cs.nb, direct.len);
+        for (want, direct) |w, v| {
+            if (std.math.isInf(w)) {
+                try testing.expectEqual(w, v);
+            } else {
+                try testing.expectApproxEqAbs(w, v, 1e-4 * @max(1.0, @abs(w)));
+            }
+        }
+        const sorted = try gpa.alloc(f32, cs.nb);
+        defer gpa.free(sorted);
+        for ([_]usize{ 4, 512 }) |kk| {
+            const k = @min(kk, cs.nb);
+            const pw = try hostI32(try topkRows(&sc, &m, want_a, k));
+            defer gpa.free(pw);
+            const pg = try hostI32(try topkRows(&sc, &m, via_dispatch_a, k));
+            defer gpa.free(pg);
+            for (0..cs.L) |l| {
+                const visible = @min(cs.nb, (cs.p0 + l + 1) / cs.ratio);
+                try expectTopkValid(want[l * cs.nb ..][0..cs.nb], pg[l * k ..][0..k], visible, k, sorted);
+                try expectTopkValid(direct[l * cs.nb ..][0..cs.nb], pw[l * k ..][0..k], visible, k, sorted);
+            }
+        }
+    }
+
+    // Fallback check: float32 keys, null idx_nax_kernel, and L <= tiledIndexRows() keep fallback paths clean.
+    {
+        var t32: [3]A = undefined;
+        for ([_][]const c_int{ &.{ 12, 32, 128 }, &.{ 100, 128 }, &.{ 12, 32 } }, &t32) |sh, *o| {
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, .float32, 0, 1, key, sc.s));
+            o.* = try sc.keep(r);
+        }
+        try testing.expect(!useIndexNax(&m, sc.s, t32[0], t32[1]));
+        const f32_got = try hostF32(try indexScores(&sc, &m, t32[0], t32[1], t32[2], 0.01, 50, 2));
+        defer gpa.free(f32_got);
+        const f32_want = try hostF32(try indexScoresTiled(&sc, &m, t32[0], t32[1], t32[2], 0.01, 50, 2));
+        defer gpa.free(f32_want);
+        try testing.expectEqualSlices(f32, f32_want, f32_got);
+
+        var tb: [3]A = undefined;
+        for ([_][]const c_int{ &.{ 12, 32, 128 }, &.{ 100, 128 }, &.{ 12, 32 } }, &tb) |sh, *o| {
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, .bfloat16, 0, 1, key, sc.s));
+            o.* = try sc.keep(r);
+        }
+        const saved = m.idx_nax_kernel;
+        m.idx_nax_kernel = null;
+        defer m.idx_nax_kernel = saved;
+        try testing.expect(!useIndexNax(&m, sc.s, tb[0], tb[1]));
+        const no_nax = try hostF32(try indexScores(&sc, &m, tb[0], tb[1], tb[2], 0.01, 50, 2));
+        defer gpa.free(no_nax);
+        const tiled = try hostF32(try indexScoresTiled(&sc, &m, tb[0], tb[1], tb[2], 0.01, 50, 2));
+        defer gpa.free(tiled);
+        try testing.expectEqualSlices(f32, tiled, no_nax);
+
+        m.idx_nax_kernel = saved;
+        var ts: [3]A = undefined;
+        const small_l = tiledIndexRows();
+        for ([_][]const c_int{ &.{ ci(small_l), 32, 128 }, &.{ 100, 128 }, &.{ ci(small_l), 32 } }, &ts) |sh, *o| {
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, .bfloat16, 0, 1, key, sc.s));
+            o.* = try sc.keep(r);
+        }
+        try testing.expect(!useIndexNax(&m, sc.s, ts[0], ts[1]));
+        const small_got = try hostF32(try indexScores(&sc, &m, ts[0], ts[1], ts[2], 0.01, 50, 2));
+        defer gpa.free(small_got);
+        const small_want = try hostF32(try indexScoresScalar(&sc, &m, ts[0], ts[1], ts[2], 0.01, 50, 2));
+        defer gpa.free(small_want);
+        try testing.expectEqualSlices(f32, small_want, small_got);
+    }
+}
+
+test "dsv41 index_nax: ubench" {
+    if (!dkern.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    m.idx_tile_kernel = try buildKernel("dsv41_index_tile", &IDX_INS, &.{"scores"}, IDX_TILE_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_tile_kernel);
+    m.idx_nax_kernel = try buildIdxNaxKernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_nax_kernel.?);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 99));
+
+    for ([_][3]usize{ .{ 256, 65536, 2 }, .{ 128, 131072, 1 } }) |c| {
+        const L, const nb, const ratio = c;
+        const p0 = nb * ratio - L;
+        var q = mlx.mlx_array_new();
+        var keys = mlx.mlx_array_new();
+        var w = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&q, &[_]c_int{ ci(L), 32, 128 }, 3, .bfloat16, 0, 1, key, sc.s));
+        try mlx.check(mlx.mlx_random_normal(&keys, &[_]c_int{ ci(nb), 128 }, 2, .bfloat16, 0, 1, key, sc.s));
+        try mlx.check(mlx.mlx_random_normal(&w, &[_]c_int{ ci(L), 32 }, 2, .bfloat16, 0, 1, key, sc.s));
+        _ = try sc.keep(q);
+        _ = try sc.keep(keys);
+        _ = try sc.keep(w);
+        try mlx.check(mlx.mlx_array_eval(q));
+        try mlx.check(mlx.mlx_array_eval(keys));
+        try mlx.check(mlx.mlx_array_eval(w));
+        const ws: f32 = 1.0 / @sqrt(@as(f32, 128 * 32));
+        const flops = 2.0 * @as(f64, @floatFromInt(L)) * @as(f64, @floatFromInt(nb)) * 32.0 * 128.0;
+
+        for ([_]bool{ false, true }) |use_nax| {
+            var times: [7]f64 = undefined;
+            for (0..2 + times.len) |rep| {
+                var rsc = Scope.init(gpa, mlx.gpuStream());
+                defer rsc.deinit();
+                const t0 = dkern.seg_bounds.nowUs();
+                const out = if (use_nax) try indexScoresNax(&rsc, &m, q, keys, w, ws, p0, ratio) else try indexScoresTiled(&rsc, &m, q, keys, w, ws, p0, ratio);
+                try mlx.check(mlx.mlx_array_eval(out));
+                const us: f64 = @floatFromInt(dkern.seg_bounds.nowUs() - t0);
+                if (rep >= 2) times[rep - 2] = us;
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            const med = times[times.len / 2];
+            const tflops = flops / (med * 1e6);
+            std.debug.print("[idx-ubench] {s} L={d} nb={d}: {d:.1} us ({d:.1} TFLOPS)\n", .{ if (use_nax) "idx_nax " else "idx_tile", L, nb, med, tflops });
+        }
+    }
 }
 
 test "dsv41 decode attention: rows split across threadgroups give the one-threadgroup heads" {
