@@ -56,7 +56,7 @@ invalidate after tool calls and pad-only generations.
 ### Sliding layers keep the full buffer; the view is what is trimmed
 Defect: (design) Gemma 4 E4B's 512-token window. Fix: the buffer keeps every row, as mlx-lm's `RotatingKVCache` does;
 `slidingViewFor` sizes the view the forward reaches (`window + q_len - 1`), at prefill too (it was once decode-only,
-see below).
+see below). A plugin that declares `CacheFacts.sliding_ring` keeps a ring instead (below).
 
 ### A short restore kept the long donor's KV capacity (#492)
 Defect: a "hi" chat matching only an 80k session's system prompt kept 80k of capacity (1.9 GB), and the byte budget
@@ -1162,8 +1162,12 @@ replay. Guard: `tests/test_mimo_v2.sh` [9].
 Defect: 87% of MiMo's 222 KB/token KV was sliding rows attention never reads; at the app's 1M context the bill left no
 hot cache and an 88k agent turn re-prefilled every turn (~38 s). Fix: `slidingRing` keeps window + slack rows per
 sliding layer (`KVCache.updateSliding`, absolute `offset` via `entry.base`), billed once per slot; a ring cannot
-rewind past dropped rows, so restores stay above `ringFloor` and rings never spill to SSD. Guard: `KVCache sliding
-ring`, the prefix-cache and DiskTier ring tests.
+rewind past dropped rows, so restores stay above `ringFloor`; on SSD a ring's layers go only into the chunks it holds
+whole (meta v11 `ring.from`) and a restore reads their newest `keep` rows.
+MiMo, laguna's family, gpt_oss and gemma4 declare it (`CacheFacts.sliding_ring`). It drops whole 32-row blocks: the
+hd-256 band kernel tiles a whole-buffer view from its first row, and a ring starting off a block boundary summed its
+keys in other groups than the full buffer. Guard: `KVCache sliding ring`, the prefix-cache and DiskTier ring tests,
+each plugin's `keep a ring` proof.
 
 ## GLM-5.3 and Flash Next kernels
 
@@ -1549,6 +1553,14 @@ keyed on the build, the OS build and the pack, makes every later load owe nothin
 `tests/test_first_request_compiles.sh` (a copy of the binary under another bundle id starts with an empty cache),
 `owed`, `nextStep`, `forget`, `an idle warm-up waits beside a real request without holding its model`.
 
+### A fresh build's warm-up taught the round-cost table its shader compiles
+Defect: on a build's first load of Flash Next, the first requests drafted 2 wide where 3 to 5 pay, and a release
+bench read 151 tok/s against 167 for the same binary on a later load. Cause: the warm-up requests (`warm_requests.zig`)
+draft at several widths while their kernels compile, and their rounds fed the model-wide round-cost table like any
+request's: a width's first cell (w3 at 17.7 ms per token, about three times a warm round) priced it out until enough
+later samples outvoted it. Fix: a warm slot's generator (`Generator.warm`) skips every table feed (width grid, serial
+row, lookup row). Guard: `specObserveRound: a warm-up's round teaches the model's round-cost table nothing`.
+
 ### A streamed bank's open read the box before macOS counted the trunk
 Defect: on about one load in six of a glm5_next streaming pack (GLM-5.3, Ling-3.1), the bank's open read the box's
 non-file memory below the server's own footprint, the bank took the trunk's size of extra room, and the box went past
@@ -1578,3 +1590,55 @@ Follower idle exits arm on the first leader byte. Aborting bell failures request
 under its mutex. Release/fall refuse unsafe threads or active work and drain before OP_RELEASE. Planned down waits for
 follower EOFs under one two-second cap; an independent teardown deadline covers drain and backend destruction. A failed
 RELEASE leaves the caller its rank for exitReleaseFailed. The slice3 and dist fix2 loopback tests guard these paths.
+
+### A streamed bank's second request ran outside the room the bank was sized against
+Defect: on a glm5_next streaming pack (GLM-5.3, Ling-3.1) a request could end past the GPU ceiling the bank was sized
+for: beside a hot-cache entry from an earlier turn, beside a second live request, or near the context limit on a
+bills-only bank. Cause: the bank leaves the hot cache 2 GiB (`GLM5_HOT_CACHE_BYTES` in the decode bill; the fitter,
+`g53_fit_bank.py`, adds the same 2 GiB to each fitted base), and admission bills a streamed pack at 0, so nothing evicts
+or holds on live memory. Yet the hot cache asked for one whole session at the working context (over 11 GiB for Ling at
+32K), an oversized commit's `trimmedCopy` was made before the entry it replaces was evicted, a second request
+interleaved in its own slot, and the bills-only fit ignored the bills' growth past the cell. Fix: a streamed bank's
+hot-cache budget is held to the term (`streamedHotCacheCapped`; a module-path plugin keeps its own accounting), its
+oversized commit evicts before it copies (`evict_before_copy`), a streamed bank is single-flight
+(`modelExclusiveDecode`), and every fit gives up the growth (`billsBudget`). Guards: `ungatedHotCacheAsk: a streamed
+bank's GLM or Ling asks no more than the hot-cache term its decode room holds`, `HotPrefixCache: a capped streamed
+bank's oversized commit evicts before it copies`, `outside model: a fitted base carries the hot cache's resident entry`,
+`a streamed bank's slot is exclusive on GLM and Ling`, `outside model: a bills-only fit gives each phase's bills' growth`.
+
+### A one-row matmul over a pre-transposed weight cost five launches
+Defect: Inkling 2's one-row decode sat at 72 tok/s with its glue already in kernels; the dense attention projections
+(bf16, loaded pre-transposed `[in, out]`, the loader's convention) were the top entry of the profile. Cause: MLX runs
+`x @ W` for one row as `gemv_t`, about 43 us of latency at a 2304-wide input whatever the output width, where
+`x @ W.T` over the checkpoint's `[out, in]` weight is its `gemv`, 9 us and bandwidth-bound; prompt-width GEMM is as
+fast either way. A one-row step is bound by the dependent launches on its critical path (5-7 us each) plus bytes,
+not by node count. Fix: `layers.projectRows` keeps dense projections `[out, in]`, the gates' down projections too.
+Guard: `inkling2 kernels: the stream kernels serve the projections of the chain they replace`.
+
+### A few-row f32 matmul is TF32, and the slow one
+Defect: Inkling 2's draft verify and batched decode (2-8 rows) ran each visit's router, an f32 product, as MLX's f32
+GEMM; a 3-row GPU proof flipped an expert pick against one-row steps, and every visit paid the GEMM's latency. Cause:
+on a NAX GPU MLX runs an f32 matmul past one row as TF32 (see "An f32 reference on M5 is a TF32 reference"), ~7x the
+one-row `gemv`'s latency and ~1e-3 relative where the `gemv` is exact. Fix: `kernels.routerRows` and `kernels.gate`
+keep these dots in a kernel up to `small_rows`; the batched proof's GPU arm compares forwards of the same width.
+Guard: `inkling2 kernels: the router kernel's rows are the matmul's`.
+
+### An auto context left its own prompt cache nothing
+Defect: Inkling 2's 8-bit pack on a 32 GB M1 Pro re-prefilled every long turn (16.8k tokens, 99 s each): the hot cache
+was clamped 3280 -> 116 MB, and a 16.8k entry is 1.2 GB. Cause: the auto context is sized against the request figure
+(what macOS can move) beside a cache share (`ctxCacheShare`), but the clamp reads the idle figure (what nobody holds)
+and subtracts the whole context's KV, which no idle server holds; after 17 GB of weights the two left nothing. An
+emulated ceiling (`MLX_SERVE_GPU_CEILING_MB`) on a big Mac hid it: its idle figure stays huge. Fix: an auto context's
+cache keeps `ctxCacheShare` of the idle figure. Guard: `an auto context leaves its hot cache the share it was sized
+beside`.
+
+### A drafted round kept the turn's end and the token after it
+Defect: Inkling 2's agent run on an M5 re-prefilled its whole ~100k-token context on many turns:
+`sliding ring holds rows from ...; match ... falls behind them`. Cause: the native drafter's round kept every draft
+the trunk agreed with, a stop token and a draft after it included; the decode-end entry then held tokens the
+conversation never contains, the next prompt matched one or two short of its end, and the nearest checkpoint below
+that sat behind the sliding ring. A kept stop alone still left the live state one row past the committed length,
+which `rollbackSsmTo` cannot undo after a drafted round, so no decode-end entry was written. Fix: the engine hands a
+round the request's stop ids (`Forward.stop_ids`) and the drafter never verifies one (`draftsToVerify`): the trunk's
+token carries the stop. Guards: `plugin native drafter: a round is handed the request's stop ids`, `inkling2 draft: a
+round never verifies a stop`.

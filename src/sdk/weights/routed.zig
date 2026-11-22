@@ -37,6 +37,9 @@ pub const Routed = struct {
     decode_ids: usize = max_call_ids,
     /// A `source` call of at most `decode_ids` ids gives each row the bytes that row's call alone gets.
     exact_rows: bool = false,
+    /// A prompt call of `source` (more ids than `decode_ids`) sums each routed row by itself (its bytes do not depend on
+    /// the call's other rows), so a model may join several prompt spans' rows into one call.
+    rows_independent: bool = false,
 
     /// A wide call's routed sum plus the shared expert's rows (`[n, hidden]` f32, the last argument) as one combine over
     /// the call's unjoined outputs: `source`'s sum + the shared rows, word for word. A narrower call (a replaying chunk's
@@ -56,6 +59,10 @@ pub const Routed = struct {
     /// Model layer `layer`'s predicted routes (an unevaluated int32 [rows, k] array made before the call before it),
     /// read ahead during that call once its routes are made. Null: not offered.
     next_fn: ?*const fn (*anyopaque, u32, mlx.mlx_array) Ret(void) = null,
+    /// `source` for a decode-lane call (at most `decode_ids` ids) with a hoist (the last argument: an array the call does
+    /// not read, the model's shared expert over its rows), which the source may commit while the call waits for its
+    /// reads: `source`'s sum word for word; the model adds the hoist itself. Null: not offered.
+    source_hoist: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
 
     pub fn settle(r: Routed) !void {
         return r.settle_fn(r.ctx).get();

@@ -22,7 +22,7 @@ The model plugin table (`ModelTable`) and every struct that crosses it. Extern l
 | `Stream` | `common.Stream` |  |
 | `Claim` | `common.Claim` |  |
 | `PackDir` | `common.PackDir` |  |
-| `version` | `u32 = 1` |  |
+| `version` | `u32 = 2` | Moves when a struct the plugin writes whole (`Parsed`, `Bill`) grows: an older host refuses the newer table, so a plugin never writes past the host's shorter struct; this host takes every older table, whose structs it reads by size. |
 | `Handle` | `?*anyopaque` | An object the engine owns and the plugin only passes back (a slot's KV cache): opaque until P3 types it. |
 | `max_eos` | `16` |  |
 | `stream_room_cell` | `u64 = 16_384 + 1_024` | The request the stream rooms are billed at (16K prompt + 1K reply): a bank calibration's evidence cell. |
@@ -450,6 +450,8 @@ Every `Str` here points at static text or at memory the plugin owns until `Model
 | `mrope` | `MropeFacts` | `.{}` |  |
 | `private` | `?*anyopaque` | `null` | The plugin's own parsed config, read by its `bill` and `load`. |
 | `speech` | `SpeechFacts` | `.{}` |  |
+| `_pre_engine_config` | `u32` | `0` | Ends the struct at the size a plugin built before `engine_config` writes (728 bytes: `speech` ends at 724, the rest was padding it may have left unset), so `engine_config` lies past it and the size gate reads it unset. |
+| `engine_config` | `bool` | `false` | This plugin serves a `model_type` the engine parses and wants the engine's own config (family fields, weight renames, bills) with its binding attached, instead of the generic config of its facts alone. The engine then sizes and bills the pack as it does that type, so the plugin must match the engine's layout for that type. A pack the engine cannot parse keeps the generic config. Read through `wantsEngineConfig`. |
 
 ### `Shape` (extern struct)
 
@@ -464,7 +466,7 @@ The load-time shape `bill` prices.
 
 ### `Bill` (extern struct)
 
-The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout.
+The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout. `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 
 | Field | Type | Default | |
 |---|---|---|---|
@@ -479,6 +481,25 @@ The plugin's memory terms. A zero or null term is the engine's default arithmeti
 | `prefill_attn_keys` | `?*const fn (p: *const Parsed, seq: u64) callconv(.c) u64` | `null` |  |
 | `prefill_bytes` | `?*const fn (p: *const Parsed, seq: u64, chunk: u32, kv_bits: u8, warm: u64) callconv(.c) u64` | `null` |  |
 | `batched_kv_len` | `?*const fn (p: *const Parsed, kv: u32, gather_on: bool, min: u32) callconv(.c) u32` | `null` |  |
+| `flags` | `BillFlags` | `.{}` | A u32 at offset 88, read through `billFlags`. Zero keeps the host's rules from before it. |
+
+### `BillFlags` (packed struct(u32))
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `decode_room` | `DecodeRoom` | `.by_name` |  |
+| `reserves_request` | `bool` | `false` | A decode-billed request reserves its whole KV (prompt, reply to the context, verify rows) at its prompt and its decode bill prices that KV once (`reservedPrefillTokens`, `glm5DecodeMemoryNeeded`). |
+| `_` | `u29` | `0` |  |
+
+### `DecodeRoom` (enum(u2))
+
+Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`). `billed` prices it with the KDA-hybrid trunk's decode bill (`glm5DecodeMemoryNeeded`), so only a model on that trunk (GLM-5, Ling) sets it: another streamed family (DeepSeek) must not, since that bill is not its own.
+
+| Member | Value | |
+|---|---|---|
+| `by_name` | `0` | The host's rule: a GLM-5 whose plugin prices no prompt, and Ling. The unnamed values 2 and 3 read as this. |
+| `billed` | `1` |  |
+| `_` | |  |
 
 ### `LoadCtx` (extern struct)
 
@@ -504,6 +525,7 @@ Valid during `load` only: the model keeps none of its pointers.
 | `gpu_ceiling_bytes` | `u64` | `0` | The GPU ceiling both rooms were taken from (a bank calibration's key); 0 = unknown. |
 | `stream_grow_prompt` | `u64` | `0` | Each phase's bill growth from the rooms' cell (`stream_room_cell`) to the server's context limit: what a bank calibrated at the cell gives up for a longer context; 0 = none or unknown. |
 | `stream_grow_decode` | `u64` | `0` |  |
+| `bank_fit_key` | `Str` | `.{}` | The key a bank calibration must carry to apply on this server (`bank-fit.json` v3): the canonical key text (`sdk/quant/bank_fit_key.zig`), empty when the host has none. |
 
 ### `Mode` (enum(u8))
 
@@ -1217,6 +1239,7 @@ Where a format reads a pack's tensors: the resident source (`sdk/weights/residen
 | `ctx` | `?*anyopaque` |  |  |
 | `get` | `*const fn (ctx: ?*anyopaque, name: Str) callconv(.c) Array` |  | The tensor `name` (the full key, `<base>.weight`) as the source holds it, borrowed for the source's life; an empty array when the pack has none. |
 | `resident` | `bool` | `false` | `ctx` is an SDK `Resident` whose map an in-tree model may take (`Resident.take`). A flag, not `get`'s address: every compile unit holds its own copy of the function. |
+| `release` | `?*const fn (ctx: ?*anyopaque, a: Array) callconv(.c) bool` | `null` | Lets go of the source's own handle `a` (a tensor `get` handed out) before the source's life ends: `get` and the engine's reads after the load no longer see it, and the caller holds no borrowed handle of it. True when the source held it. Null = every tensor kept for the source's life. Appended: called only where `size` reaches it. |
 
 ### `Weight` (extern struct)
 
@@ -1341,6 +1364,8 @@ A streamed bank of routed experts, as the trunk's MoE reads one whose math it do
 | `next_ahead` | `?*const fn (ctx: ?*anyopaque, layer: u32, ids: Array) callconv(.c) Verdict` | `null` |  |
 | `meters` | `?*const fn (ctx: ?*anyopaque, out: *Str) callconv(.c) void` | `null` | The bank's lines for the request's summary (`[stream-stats]` by phase, newline-separated), valid until the next call; the model logs them beside `[spec-stats]` at the request's end. Null: none. |
 | `exact_rows` | `bool` | `false` | A decode-phase `rows` call (at most `decode_ids` ids) gives each row the bytes that row's call alone gets. Appended: read only where `size` reaches it. |
+| `rows_independent` | `bool` | `false` | A prompt-phase `rows` call (more ids than `decode_ids`) sums each routed row by itself: a row's bytes do not depend on the call's other rows, so a model may join several prompt spans' rows into one call. False: not declared. Appended: read only where `size` reaches it. |
+| `rows_hoist` | `?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, hoist: Array, out: *Array) callconv(.c) Verdict` | `null` | `rows` for a decode-phase call (at most `decode_ids` ids) with `hoist`, an array the call does not read (the model's shared expert over the same rows): the bank may commit it while the call waits for its reads. `out` is `rows`' sum word for word; the model adds `hoist` itself. Null: not offered. Appended: read only where `size` reaches it. |
 
 ### `Swiglu` (extern struct)
 
@@ -1451,6 +1476,11 @@ One custom kernel as mlx-c's `mlx_fast_{metal,cuda}_kernel_new` takes it. The ca
 | `memory_ceiling` | `*const fn (ctx: ?*anyopaque) callconv(.c) u64` |  | Bytes the plugin may still allocate on the GPU right now: the host's ceiling less what is resident. |
 | `gpu` | `*const HostGpu` |  |  |
 | `ane` | `?*const HostAne` | `null` | The Neural Engine; read it through `aneOf`, which also answers null for a host older than this field. |
+| `quant_claimant` | `?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable` | `null` | The outside quant table the host loaded that claims a pack's quantization block `block_json` of `config_json`: the highest claim; null when none claims or two tie (the host logs a tie by name). A model plugin's own dylib holds no quant table, so its loads ask here (`outside.Format.open`). Read it through `quantClaimantOf`, which also answers null for a host older than this field. Any thread. |
+
+### `quantClaimantOf(h: *const Host) ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable`
+
+`h.quant_claimant`, or null where the host has none or predates it (its `size` ends before the field).
 
 ### `aneOf(h: *const Host) ?*const HostAne`
 

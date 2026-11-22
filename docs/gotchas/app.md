@@ -454,3 +454,19 @@ table row compared it with the GPU's working set. Fix: every fit check takes a `
 `usableBytes`; a RAM band caps the starter pick, which steps down to the largest pick that fits. Guards:
 `RecommendedModelsTests` (bands, a raised wired limit, every tier fits its band's bottom), `RAMFitnessTests`,
 `testMediaPresetRequirementsReadTheUsableBudget`.
+
+## The console's MP4 lost frames, or failed with "no decoder configuration" (#1115)
+Defect: a console video came out with fewer frames than the server sent, and under load the save failed with "H.264
+encoder returned no decoder configuration." Cause: `encode-video.ts` configured WebCodecs with `latencyMode:
+"realtime"`, which lets the encoder drop frames it cannot keep up with (Chrome kept 17 of 25 noisy 512x288 frames);
+when it drops every frame, no chunk carries the `decoderConfig`. Fix: the default `quality` mode, which drops none.
+Guard: `openShotEncoder` "keeps every frame…" in `app-web/test/shot-encoder.test.ts`.
+
+## Burned-in captions came out white, or a fifth too bright (2026-11-19)
+
+Defect: the Templates captioner returned a solid white video for a 256x448 test clip, and on a real 544x960 H3 clip
+every frame came out about 19% brighter than the source. Cause: `AVVideoCompositionCoreAnimationTool` renders
+canvases of 320x576 and below as white, and composites an untagged clip in a different colour space (tagging the
+composition Rec. 709 did not change it). Fix: `CaptionBurner` composites the caption images per frame in
+`videoComposition(with:applyingCIFiltersWithHandler:)`, which keeps the source's colours at every size. Guard:
+`CaptionBurnerTests.testBurnDrawsTheCaptionAndKeepsTheAudio` measures the frame outside the caption against the source.

@@ -293,6 +293,8 @@ test "plugin config: a shape its plugin declines is refused by name; a drafter s
     var got = (try plugin_config.parseServed(io, a, dir, q4)) orelse return error.TestExpectedPluginParse;
     defer got.deinit(a);
     try testing.expectEqual(@as(u32, 8192), got.max_position_embeddings);
+    // A served load (an outside plugin's too: both bind in `resolve`) reads its bill's terms once, where it binds.
+    try testing.expect(got.plugin.?.bill_terms != null);
 }
 
 test "plugin config: a served pack's engine config is the legacy parse with the binding attached" {
@@ -745,7 +747,7 @@ test "plugin forward: an ablated request hands every forward and draft round its
     try testing.expectEqual(@as(u64, 0x5eed), seen.key);
     try testing.expectEqual(@as(f32, 1), seen.first);
     T.seen = null;
-    _ = try driver.nativeRound(&b.xfm, &s.ctx, 9, 4);
+    _ = try driver.nativeRound(&b.xfm, &s.ctx, 9, 4, &.{});
     try testing.expect(T.seen != null);
     s.ctx.ablation = null;
     _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{10})));
