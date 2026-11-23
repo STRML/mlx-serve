@@ -136,7 +136,8 @@ pub fn cachedFormatChat(
 fn captureEnginePromptTail(allocator: std.mem.Allocator, lm: *LoadedModel, ids: []const u32, context: *RecentRequestContext) void {
     const engine = lm.engine orelse return;
     if (!engine.caps().owns_template) return;
-    const prompt = engine.decode(allocator, ids) catch return;
+    // The tail is 500 bytes; 256 tokens cover it without decoding a long context.
+    const prompt = engine.decode(allocator, ids[ids.len -| 256..]) catch return;
     defer allocator.free(prompt);
     context.setPromptTail(prompt);
 }
