@@ -2534,23 +2534,17 @@ const HcStage = struct {
 
 // ── Engram's gate: sigmoid of the signed sqrt of a normalized stream-key dot, times the value, added ──
 
-/// MLX's row-reduce threads for a row of `n` (`mlxRowReduceThreads`).
-fn rowThreads(n: usize) usize {
-    if (n <= 64) return 1;
-    if (n <= 512) return 32;
-    if (n <= 1024) return 128;
-    return @min(1024, ((n + 3) / 4 + 31) / 32 * 32);
-}
-
 const Engram = struct {
     pub const Params = struct { xdt: mlx.mlx_dtype = act };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.k == 0) return null;
-        const tg = rowThreads(s.k);
-        var g = metal.Geometry{ .grid = .{ ci(tg), HC, ci(s.rows) }, .tg = .{ ci(tg), 1, 1 } };
+        const tg = v41.engramThreads(s.k);
+        var g = metal.Geometry{ .grid = .{ ci(tg), ci(s.rows), 1 }, .tg = .{ ci(tg), 1, 1 } };
         g.out(&.{ ci(s.rows), HC, ci(s.k) }, p.xdt);
         g.dtype("OT", p.xdt);
+        g.dtype("KT", act);
+        g.flag("CACHE_X", p.xdt != .float32 and s.k <= 8192 and HC <= 8);
         return g;
     }
 
@@ -4163,7 +4157,7 @@ const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw",
 const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 6 + 4) * 32, 1024, true);
 const rope_only_l = launch("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "", 0, 1024, false);
 const kv_l = launch("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER, 4 * (32 + 1024), 1024, false);
-const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (3 * 32 + 1), 928, false);
+const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (8 * 3 * 8 + 8), 1024, false);
 const dec_l = launch("dsv41_attn_decode", attn_ins ++ &[_][*:0]const u8{"periods"}, &.{"out"}, v41.ATTN_DEC_SOURCE, v41.UNROPE_HEADER, 4 * (AttnDec.NSG * HD + 2 * AttnDec.NSG), 768, false);
 const split_attn_l = launch("dsv41_attn_split", attn_ins, &.{ "pacc", "pm", "pl" }, v41.ATTN_SPLIT_SOURCE, "", 4 * (AttnSplit.NSG * HD + 2 * AttnSplit.NSG), 768, false);
 const merge_l = launch("dsv41_attn_merge", &.{ "pacc", "pm", "pl", "sink", "meta", "periods" }, &.{"out"}, v41.ATTN_MERGE_SOURCE, v41.UNROPE_HEADER, 0, 928, false);
@@ -4371,10 +4365,7 @@ pub fn register(set: *kc.Set) !void {
         .depth = depthK,
         .ops = 16,
         .out = .bf16,
-        .replaces = "engramGateOps (the op chain)",
-        .known = .{ .gate = .limits, .finding = "at the release's 5120 wide rows it launches MLX's row-sum thread count, 1024, and M1/M2 compile it for 928 with no probe: a decode-width Engram write fails on M1/M2 (the op chain past region_rows does not)" },
         .served = &.{ .{ .rows = 1, .n = HC, .k = DIM }, .{ .rows = REGION, .n = HC, .k = DIM } },
-        .sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "bit-equal to the op chain's MLX row sums (gate 3); random rows, not a stress" },
     });
     const attn_nan: spec.Nan = .{ .stated = "classes as float64 gives them; outputs within the intervals of the online softmax's roundings" };
     const split_nan: spec.Nan = .{ .stated = "a split whose weights go NaN reports max -inf and sum 0 (Metal's max and den > 0 drop the NaN) and a NaN partial output, which the merge propagates; else classes as float64 gives them" };

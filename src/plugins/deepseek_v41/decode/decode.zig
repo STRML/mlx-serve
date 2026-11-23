@@ -170,6 +170,237 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
     }
 }
 
+test "dsv41 wide: hoisted indexer and compress match per-span" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const L: usize = 128;
+    for ([_][2]usize{ .{ 20, 24 }, .{ 2, 5 } }) |range| {
+        const lo = range[0];
+        const hi = range[1];
+        for ([_]u64{ 1, 2, 3 }) |seed| {
+            var fxs: [3]*fixture.Fixture = undefined;
+            var made: usize = 0;
+            defer for (fxs[0..made]) |fx| fx.deinit();
+            for (&fxs, [_]mlx.mlx_dtype{ .bfloat16, .bfloat16, .float32 }, [_]usize{ 64, L, L }) |*fx, act, sp| {
+                fx.* = try fixture.Fixture.init(gpa, .{ .lo = lo, .hi = hi, .experts = 8, .ctx = 0, .seed = seed, .act = act, .fused = false });
+                fx.*.m.span = sp;
+                made += 1;
+            }
+            var got: [3][]f32 = undefined;
+            var n_got: usize = 0;
+            defer for (got[0..n_got]) |g| gpa.free(g);
+            for (fxs, &got) |fx, *g| {
+                const x = try fx.stream(L);
+                defer _ = mlx.mlx_array_free(x);
+                const pre = try fx.cpre(L);
+                defer _ = mlx.mlx_array_free(pre);
+                const out = try dsv41.workerStep(fx.m, gpa, x, pre, 0, false, false);
+                defer for (out) |o| {
+                    _ = mlx.mlx_array_free(o);
+                };
+                g.* = try dsv41.hostF32(out[0]);
+                n_got += 1;
+            }
+            for (got[0]) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            // Cache rows (comp + idx_k) produced by hoisted compress vs single-span compress in f32/bf16.
+            var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+            defer sc.deinit();
+            for (lo..hi) |li| {
+                const c0 = fxs[0].m.dec_state.?.layers[li].comp orelse continue;
+                const c1 = fxs[1].m.dec_state.?.layers[li].comp orelse continue;
+                const clen = L / fxs[0].m.layers[li].ratio;
+                const k0 = try dsv41.hostF32(try sc.keep(try c0.view(clen, sc.s)));
+                defer gpa.free(k0);
+                const k1 = try dsv41.hostF32(try sc.keep(try c1.view(clen, sc.s)));
+                defer gpa.free(k1);
+                try std.testing.expectApproxEqAbs(@as(f64, 0), relRms(k0, k1), 1e-3);
+            }
+            const ratio = relRms(got[0], got[2]) / @max(relRms(got[1], got[2]), 1e-4);
+            std.debug.print("[wide] layers {d}..{d} seed={d}: wide/single distance to f32 = {d:.3}\n", .{ lo, hi, seed, ratio });
+            if (ratio > 1.15) return error.FurtherFromTruth;
+        }
+    }
+}
+
+test "dsv41 wide ubench: engram gate, wide engram hoist, and indexer/comp hoist (DSV41_DEC_UBENCH)" {
+    if (!ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const iou = @import("../../../sdk/util/io_util.zig");
+    const gpu = mlx.gpuStream();
+
+    // 1. Vectorized engramGate vs engramGateOps across decode (L=1), single span (L=256), and chunk (L=2048).
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 31));
+    var gm: dsv41.Dsv41Model = undefined;
+    gm.cfg = .{};
+    gm.cfg.dsv4_hc_mult = 4;
+    gm.cfg.hidden_size = 5120;
+    gm.act = .bfloat16;
+    gm.engram_kernel = try dsv41.buildKernel("dsv41_engram", &dsv41.ENGRAM_INS, &.{"out"}, dsv41.ENGRAM_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(gm.engram_kernel);
+
+    const D: c_int = 5120;
+    const HC: c_int = 4;
+    for ([_]usize{ 1, 256, 2048 }) |L| {
+        var gsc = dsv41.Scope.init(gpa, gpu);
+        defer gsc.deinit();
+        var x0 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&x0, &[_]c_int{ @intCast(L), HC, D }, 3, .bfloat16, 0, 1, key, gpu));
+        x0 = try gsc.keep(x0);
+        var kv = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&kv, &[_]c_int{ @intCast(L), (HC + 1) * D }, 2, .bfloat16, 0, 1, key, gpu));
+        kv = try gsc.keep(kv);
+        var qk = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&qk, &[_]c_int{ HC, D }, 2, .float32, 0, 1, key, gpu));
+        qk = try gsc.keep(qk);
+        const steps: usize = if (L == 1) 16 else if (L == 256) 8 else 4;
+        var ops_med: [2]f64 = undefined;
+        var kern_med: [2]f64 = undefined;
+        // ABBA: Ops, Gate, Gate, Ops
+        for ([_]bool{ false, true, true, false }, 0..) |use_kern, leg| {
+            var times: [5]f64 = undefined;
+            for (0..2 + times.len) |rep| {
+                const t0 = iou.nowUsMonotonic(io);
+                var esc = dsv41.Scope.init(gpa, gpu);
+                defer esc.deinit();
+                var cur = x0;
+                for (0..steps) |_| cur = if (use_kern) try dsv41.engramGate(&esc, &gm, qk, cur, kv) else try dsv41.engramGateOps(&esc, &gm, qk, cur, kv);
+                try mlx.check(mlx.mlx_array_eval(cur));
+                if (rep >= 2) times[rep - 2] = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / @as(f64, @floatFromInt(steps));
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            if (use_kern) kern_med[if (leg == 1) 0 else 1] = times[times.len / 2] else ops_med[if (leg == 0) 0 else 1] = times[times.len / 2];
+        }
+        const ops_us = (ops_med[0] + ops_med[1]) * 0.5;
+        const kern_us = (kern_med[0] + kern_med[1]) * 0.5;
+        std.debug.print("[wide-ubench] engramGate L={d}: kernel={d:.1} us, ops={d:.1} us (AB={d:.1}/{d:.1}, BA={d:.1}/{d:.1}), speedup={d:.2}x\n", .{ L, kern_us, ops_us, ops_med[0], ops_med[1], kern_med[0], kern_med[1], ops_us / kern_us });
+    }
+
+    // 2. Wide Engram hoist: 8x M=256 (per-span wkv+gate+concat) vs 1x M=2048 (release wkv [25600, 6144] bf16 = 314.6 MB).
+    {
+        var wsc = dsv41.Scope.init(gpa, gpu);
+        defer wsc.deinit();
+        gm.ablation = null;
+        var wkv_w = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&wkv_w, &[_]c_int{ 25600, 6144 }, 2, .bfloat16, 0, 0.05, key, gpu));
+        wkv_w = try wsc.keep(wkv_w);
+        var qk = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&qk, &[_]c_int{ HC, D }, 2, .float32, 0, 1, key, gpu));
+        qk = try wsc.keep(qk);
+        const eng_layer: dsv41.EngramLayer = .{ .layer = 1, .wkv = .{ .w = wkv_w }, .qk = qk, .table = undefined };
+        const chunk_L: usize = 2048;
+        const span_L: usize = 256;
+        const n_spans: usize = chunk_L / span_L;
+        var x_chunk = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&x_chunk, &[_]c_int{ @intCast(chunk_L), HC, D }, 3, .bfloat16, 0, 1, key, gpu));
+        x_chunk = try wsc.keep(x_chunk);
+        var er_chunk = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&er_chunk, &[_]c_int{ @intCast(chunk_L), 6144 }, 2, .bfloat16, 0, 1, key, gpu));
+        er_chunk = try wsc.keep(er_chunk);
+        try mlx.check(mlx.mlx_array_eval(wkv_w));
+        try mlx.check(mlx.mlx_array_eval(x_chunk));
+        try mlx.check(mlx.mlx_array_eval(er_chunk));
+
+        var span_med: [2]f64 = undefined;
+        var hoist_med: [2]f64 = undefined;
+        // ABBA: 8x256, 1x2048, 1x2048, 8x256
+        for ([_]bool{ false, true, true, false }, 0..) |hoist, leg| {
+            var times: [5]f64 = undefined;
+            for (0..2 + times.len) |rep| {
+                const t0 = iou.nowUsMonotonic(io);
+                var esc = dsv41.Scope.init(gpa, gpu);
+                defer esc.deinit();
+                const out = if (hoist)
+                    try dsv41.engramApply(&esc, &gm, &eng_layer, x_chunk, er_chunk)
+                else blk: {
+                    var parts: [n_spans]A = undefined;
+                    for (&parts, 0..) |*p, k| {
+                        const lo = k * span_L;
+                        const hi = lo + span_L;
+                        p.* = try dsv41.engramApply(&esc, &gm, &eng_layer, try esc.slice(x_chunk, 0, @intCast(lo), @intCast(hi)), try esc.slice(er_chunk, 0, @intCast(lo), @intCast(hi)));
+                    }
+                    break :blk try esc.concat(&parts, 0);
+                };
+                try mlx.check(mlx.mlx_array_eval(out));
+                if (rep >= 2) times[rep - 2] = @floatFromInt(iou.nowUsMonotonic(io) - t0);
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            if (hoist) hoist_med[if (leg == 1) 0 else 1] = times[times.len / 2] else span_med[if (leg == 0) 0 else 1] = times[times.len / 2];
+        }
+        const sp_us = (span_med[0] + span_med[1]) * 0.5;
+        const hs_us = (hoist_med[0] + hoist_med[1]) * 0.5;
+        std.debug.print("[wide-ubench] engram M=2048 (8x256 vs 1x2048): hoist={d:.1} us, span8x={d:.1} us (AB={d:.1}/{d:.1}, BA={d:.1}/{d:.1}), speedup={d:.2}x\n", .{ hs_us, sp_us, span_med[0], span_med[1], hoist_med[0], hoist_med[1], sp_us / hs_us });
+    }
+
+    // 3. Release-shape wideLayer hoisted vs chunk-level compress+indexer projections (ratio-2 layer 2, L=2048, 8x256 vs 1x2048).
+    {
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = 2, .hi = 3, .experts = 8, .ctx = 0, .seed = 5, .act = .bfloat16, .fused = false });
+        defer fx.deinit();
+        var wsc = dsv41.Scope.init(gpa, gpu);
+        defer wsc.deinit();
+        const chunk_L: usize = 2048;
+        const span_L: usize = 256;
+        const n_spans: usize = chunk_L / span_L;
+        const ly = &fx.m.layers[2];
+        const iw = &ly.idx.?;
+        const cw = &ly.comp.?;
+        var h_in = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&h_in, &[_]c_int{ @intCast(chunk_L), D }, 2, .bfloat16, 0, 1, key, gpu));
+        h_in = try wsc.keep(h_in);
+        var qr_in = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&qr_in, &[_]c_int{ @intCast(chunk_L), @intCast(fx.m.cfg.dsv4_q_lora_rank) }, 2, .bfloat16, 0, 1, key, gpu));
+        qr_in = try wsc.keep(qr_in);
+        try mlx.check(mlx.mlx_array_eval(h_in));
+        try mlx.check(mlx.mlx_array_eval(qr_in));
+
+        var span_med: [2]f64 = undefined;
+        var hoist_med: [2]f64 = undefined;
+        // ABBA: 8x256 (per-span compress + wq_b + ropeQat(f32) + weights_proj), 1x2048 (hoist + ropeQat(bf16))
+        for ([_]bool{ false, true, true, false }, 0..) |hoist, leg| {
+            var times: [5]f64 = undefined;
+            for (0..2 + times.len) |rep| {
+                var st = try dsv41.initState(fx.m, gpa);
+                defer st.deinit();
+                const t0 = iou.nowUsMonotonic(io);
+                var csc = dsv41.Scope.init(gpa, gpu);
+                defer csc.deinit();
+                const pos = try csc.i(0);
+                if (hoist) {
+                    try dsv41.compress(&csc, fx.m, &st, 2, cw, h_in, 0);
+                    const iq = try dsv41.ropeQat(&csc, fx.m, try csc.reshape(try iw.wq_b.apply(&csc, qr_in), &.{ @intCast(chunk_L), @intCast(fx.m.cfg.dsv4_index_n_heads), @intCast(fx.m.cfg.dsv4_index_head_dim) }), fx.m.rope_yarn.fwd, pos, 1.0, .fp4_ue8m0, fx.m.act);
+                    const iwt = try iw.weights_proj.apply(&csc, h_in);
+                    try mlx.check(mlx.mlx_array_eval(try csc.keep(try st.layers[2].comp.?.view(chunk_L / 2, gpu))));
+                    try mlx.check(mlx.mlx_array_eval(try csc.keep(try st.layers[2].idx_k.?.view(chunk_L / 2, gpu))));
+                    try mlx.check(mlx.mlx_array_eval(iq));
+                    try mlx.check(mlx.mlx_array_eval(iwt));
+                } else {
+                    for (0..n_spans) |k| {
+                        const lo = k * span_L;
+                        const hi = (k + 1) * span_L;
+                        const hs = try csc.slice(h_in, 0, lo, hi);
+                        const qs = try csc.slice(qr_in, 0, lo, hi);
+                        try dsv41.compress(&csc, fx.m, &st, 2, cw, hs, lo);
+                        const iq = try dsv41.ropeQat(&csc, fx.m, try csc.reshape(try iw.wq_b.apply(&csc, qs), &.{ @intCast(span_L), @intCast(fx.m.cfg.dsv4_index_n_heads), @intCast(fx.m.cfg.dsv4_index_head_dim) }), fx.m.rope_yarn.fwd, try csc.i(@intCast(lo)), 1.0, .fp4_ue8m0, .float32);
+                        const iwt = try iw.weights_proj.apply(&csc, hs);
+                        try mlx.check(mlx.mlx_array_eval(iq));
+                        try mlx.check(mlx.mlx_array_eval(iwt));
+                    }
+                    try mlx.check(mlx.mlx_array_eval(try csc.keep(try st.layers[2].comp.?.view(chunk_L / 2, gpu))));
+                    try mlx.check(mlx.mlx_array_eval(try csc.keep(try st.layers[2].idx_k.?.view(chunk_L / 2, gpu))));
+                }
+                if (rep >= 2) times[rep - 2] = @floatFromInt(iou.nowUsMonotonic(io) - t0);
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            if (hoist) hoist_med[if (leg == 1) 0 else 1] = times[times.len / 2] else span_med[if (leg == 0) 0 else 1] = times[times.len / 2];
+        }
+        const sp_us = (span_med[0] + span_med[1]) * 0.5;
+        const hs_us = (hoist_med[0] + hoist_med[1]) * 0.5;
+        std.debug.print("[wide-ubench] idx+comp M=2048 (8x256 vs 1x2048): hoist={d:.1} us, span8x={d:.1} us (AB={d:.1}/{d:.1}, BA={d:.1}/{d:.1}), speedup={d:.2}x\n", .{ hs_us, sp_us, span_med[0], span_med[1], hoist_med[0], hoist_med[1], sp_us / hs_us });
+    }
+}
+
 test {
     _ = fixture;
     _ = @import("exact_test.zig");

@@ -2287,7 +2287,7 @@ pub const Rows = struct {
     }
 
     /// Rows [0, n) (caller frees).
-    fn view(self: *const Rows, n: usize, s: S) !A {
+    pub fn view(self: *const Rows, n: usize, s: S) !A {
         var o = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(o);
         try mlx.check(mlx.mlx_slice(&o, self.buf, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(n), ci(self.width) }, 2, &[_]c_int{ 1, 1 }, 2, s));
@@ -3009,6 +3009,8 @@ pub const Shared = struct {
     topk: A = none, // [L, k] compressed indices, -1 = none
     cand: A = none, // [L, n_blocks] candidate blocks
     img: A = none, // [L] bool: the rows inside an image span (`Spans.img` for this span)
+    iq: A = none, // [L, heads, head_dim] hoisted roped indexer query
+    iw: A = none, // [L, heads] hoisted indexer head weights
     /// A replay tail's first position: the window band stops there, the decode-width graphs are skipped and no
     /// compressor runs (the split layer's read the whole chunk).
     floor: ?usize = null,
@@ -3094,7 +3096,7 @@ fn compressed(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, qr: A, p0
     if (ly.ratio == 0) return .{ none, none };
     const clen = (p0 + dim(x, 0)) / ly.ratio;
     if (ly.comp) |*cw| if (sh.floor == null and !sh.compressed) try compress(sc, m, st, li, cw, x, p0);
-    if (ly.idx) |*iw| sh.topk = if (clen == 0) none else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
+    if (ly.idx) |*iw| sh.topk = if (clen == 0) none else if (sh.iq.ctx != null) try indexerQ(sc, m, st, li, sh.iw, sh.iq, p0, sh) else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
     if (clen == 0 or sh.topk.ctx == null) return .{ none, sh.topk };
     return .{ try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s)), sh.topk };
 }
@@ -3835,7 +3837,8 @@ pub fn topkRows(sc: *Scope, m: *const Dsv41Model, x: A, k: usize) !A {
 pub fn indexer(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, iw: *const Idx, x: A, qr: A, p0: usize, sh: *Shared) !A {
     const c = &m.cfg;
     const L = dim(x, 0);
-    const q = try ropeQat(sc, m, try sc.reshape(try iw.wq_b.apply(sc, qr), &.{ ci(L), ci(c.dsv4_index_n_heads), ci(c.dsv4_index_head_dim) }), m.rope_yarn.fwd, try sc.i(ci(p0)), 1.0, .fp4_ue8m0, .float32);
+    const q_dt: mlx.mlx_dtype = if (mlx.mlx_array_dtype(qr) == .float32) .float32 else m.act;
+    const q = try ropeQat(sc, m, try sc.reshape(try iw.wq_b.apply(sc, qr), &.{ ci(L), ci(c.dsv4_index_n_heads), ci(c.dsv4_index_head_dim) }), m.rope_yarn.fwd, try sc.i(ci(p0)), 1.0, .fp4_ue8m0, q_dt);
     return indexerQ(sc, m, st, li, try rowLinear(sc, &iw.weights_proj, x), q, p0, sh);
 }
 /// the widest call the indexer's linears give the gemv twin, a verify's widest (5 drafts and the bonus
@@ -4688,7 +4691,8 @@ fn routedOutside(sc: *Scope, m: *const Dsv41Model, e: *const [3]outside.Weight, 
 /// sigmoid of the signed sqrt of a per-copy normalized stream-key dot.
 /// Under an ablation the value loses the pass's direction first (`abl.ablateValue`).
 pub fn engramApply(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A, rows: A) !A {
-    const kv = try abl.ablateValue(sc, m, try engramWkv(sc, e, try sc.astype(rows, m.act)));
+    const act_rows = if (mlx.mlx_array_dtype(rows) == m.act) rows else try sc.astype(rows, m.act);
+    const kv = try abl.ablateValue(sc, m, try engramWkv(sc, e, act_rows));
     if (mlx.streamIsGpu(sc.s)) return engramGate(sc, m, e.qk, x, kv);
     return engramGateOps(sc, m, e.qk, x, kv);
 }
@@ -4744,11 +4748,11 @@ pub fn engramGateOps(sc: *Scope, m: *const Dsv41Model, qk: A, x: A, kv: A) !A {
     return sc.astype(out, mlx.mlx_array_dtype(x));
 }
 
-/// `engramGateOps` as one kernel (`ENGRAM_SOURCE`), a threadgroup a (row, copy).
+/// `engramGateOps` as one kernel (`ENGRAM_SOURCE`), one threadgroup a row across all `hc` copies.
 pub fn engramGate(sc: *Scope, m: *const Dsv41Model, qk: A, x: A, kv: A) !A {
     const c = &m.cfg;
     const d = c.hidden_size;
-    const tg = mlxRowReduceThreads(d);
+    const tg = engramThreads(d);
     const cst_v = [_]f32{ @floatCast(1.0 / @as(f64, @floatFromInt(d))), c.rms_norm_eps, 1.0 / @sqrt(@as(f32, @floatFromInt(d))) };
     const cst = try sc.keep(mlx.mlx_array_new_data(&cst_v, &[_]c_int{cst_v.len}, 1, .float32));
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -4756,9 +4760,11 @@ pub fn engramGate(sc: *Scope, m: *const Dsv41Model, qk: A, x: A, kv: A) !A {
     const sh = mlx.getShape(x);
     const dt = mlx.mlx_array_dtype(x);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, sh.ptr, sh.len, dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(tg), ci(c.dsv4_hc_mult), ci(dim(x, 0))));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(tg), ci(dim(x, 0)), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "KT", mlx.mlx_array_dtype(kv)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "CACHE_X", dt != .float32 and d <= 8192 and c.dsv4_hc_mult <= 8));
     const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, kv, qk, cst }, 4);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -4768,19 +4774,16 @@ pub fn engramGate(sc: *Scope, m: *const Dsv41Model, qk: A, x: A, kv: A) !A {
     return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
 
-/// The threads MLX's sum gives a contiguous row of `n` floats (`threadgroup_size_from_row_size`);
-/// at 64 or fewer one thread adds the row in order (`row_reduce_small`).
-fn mlxRowReduceThreads(n: usize) usize {
-    if (n <= 64) return 1;
-    if (n <= 512) return 32;
-    if (n <= 1024) return 128;
-    return @min(1024, ((n + 3) / 4 + 31) / 32 * 32);
+/// Threadgroup size for `engramGate` (at most 256 so M1/M2 GPUs run every width).
+pub fn engramThreads(n: usize) usize {
+    if (n <= 128) return 32;
+    if (n <= 512) return 128;
+    return 256;
 }
 
-/// `engramGateOps` for one (row l, copy j) of the stream `x` [L, hc, D], `kv` the `wkv` rows
-/// [L, (hc + 1) * D]: the three row sums in MLX's order (`mlxRowReduceThreads`: each thread its
-/// 4-wide blocks then its tail, simd sums, then the simdgroup partials), then every op of the
-/// chain in its order, uncontracted, so the bits are the chain's. cst = {1 / D, eps, 1 / sqrt(D)}.
+/// `engramGateOps` for one row `l` across all `hc` copies of the stream `x` [L, hc, D], `kv` the `wkv` rows
+/// [L, (hc + 1) * D]: vectorized loads caching `x` (16-bit) and `val` in registers across all `hc` copies,
+/// 256-thread reductions. cst = {1 / D, eps, 1 / sqrt(D)}.
 pub const ENGRAM_SOURCE = kernelSource("plugins/deepseek_v41/kernels/engram.metal");
 
 pub const ENGRAM_INS = [_][*:0]const u8{ "x", "kv", "qk", "cst" };
@@ -5829,16 +5832,22 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     const ly = &m.layers[li];
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    const parts = try gpa.alloc(A, n_spans);
-    defer gpa.free(parts);
-    for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
-    // The last wide layer's whole stream and mix when every span still holds its rows of them (this layer writes no
-    // Engram rows, and nothing replaced a span since): the same words, no copy.
-    const whole = sp.whole.len == 2 and sp.whole[0].ctx != null and (for (parts, sp.xs) |p, sx| {
-        if (p.ctx != sx.ctx) break false;
-    } else true);
-    const x = if (whole) sp.whole[0] else try sc.concat(parts, 0);
-    const pres = if (whole) sp.whole[1] else try sc.concat(sp.pres, 0);
+    // The last wide layer's whole stream and mix when present: hoist any Engram table over the full chunk instead of
+    // streaming weights per 256-row span.
+    const whole = sp.whole.len == 2 and sp.whole[0].ctx != null;
+    const has_engram = for (m.engrams) |*e| {
+        if (e.layer == li) break true;
+    } else false;
+    const x_in = if (whole) sp.whole[0] else if (n_spans == 1) sp.xs[0] else try sc.concat(sp.xs, 0);
+    const x = if (has_engram) try wideEngram(&sc, m, gpa, sp, li, x_in) else x_in;
+    const pres = if (whole) sp.whole[1] else if (n_spans == 1) sp.pres[0] else try sc.concat(sp.pres, 0);
+    if (m.n_mtp > 0) if (m.dsparkTarget(li)) |t| {
+        const mh = try sc.astype(try sc.mean(try sc.astype(x, .float32), 1, false), m.act);
+        for (0..n_spans) |k| {
+            const lo, const hi = sp.bounds(k);
+            hold(&sp.mh[k * m.cfg.dsv4_n_dspark_target_layers + t], try sc.slice(mh, 0, lo, hi));
+        }
+    };
     // The attention-side mix first, and the read-ahead's prediction from one more pass of its
     // norm kernel under the FFN's norm (the same collapse of the same rows with the same previous mix), not the op chain.
     // The attention's input is the same kernels' over the same arrays; only the predicted experts may round apart.
@@ -5881,18 +5890,39 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     const ig_r = m.ratio(li);
     const ig_g: usize = if (ly.idx != null and ig_r > 0) igroup.groupSpans(n_spans, sp.span, (sp.p0 + sp.L) / ig_r) else n_spans;
     var ig_start: usize = 0;
-    // a KV-source layer's compressor for
-    // every span first, in span order, each span's rows appended to the layer's caches (comp, idx_k) before any span's
-    // attention takes a view of them. The appends then update one buffer in place, not a copy of the whole cache per
-    // span kept alive by the spans' pending views, and each span's attention and indexer read their own causal prefix
-    // (clen) of that one buffer: the same rows from the same compressor calls.
-    const comp_first = ly.comp != null and sp.floor == null;
-    if (comp_first) for (0..n_spans) |k| {
-        const lo, const hi = sp.bounds(k);
-        var csc = Scope.init(gpa, m.s);
-        defer csc.deinit();
-        try compress(&csc, m, st, li, &ly.comp.?, try csc.slice(pa.h, 0, lo, hi), sp.p0 + lo);
+    // Hoist the indexer's query (`wq_b` + RoPE/QAT in `m.act`) and head weights (`weights_proj`) across the whole chunk.
+    var iq_all = none;
+    var iw_all = none;
+    if (ly.ratio > 0) if (ly.idx) |*iw| if ((sp.p0 + sp.L) / ly.ratio > 0) {
+        const c = &m.cfg;
+        const q_dt: mlx.mlx_dtype = if (mlx.mlx_array_dtype(pj.qr) == .float32) .float32 else m.act;
+        iq_all = try ropeQat(
+            &sc,
+            m,
+            try sc.reshape(try iw.wq_b.apply(&sc, pj.qr), &.{ ci(sp.L), ci(c.dsv4_index_n_heads), ci(c.dsv4_index_head_dim) }),
+            m.rope_yarn.fwd,
+            pos,
+            1.0,
+            .fp4_ue8m0,
+            q_dt,
+        );
+        iw_all = try iw.weights_proj.apply(&sc, pa.h);
     };
+    // a KV-source layer's compressor for the whole chunk before any span's attention takes a view of the caches: one
+    // projection (`cw.wkv`), one `Rows.append` per cache instead of per-span small matmuls and repeated appends.
+    const comp_first = ly.comp != null and sp.floor == null;
+    if (comp_first) {
+        if (st.verify == null) {
+            var csc = Scope.init(gpa, m.s);
+            defer csc.deinit();
+            try compress(&csc, m, st, li, &ly.comp.?, pa.h, sp.p0);
+        } else for (0..n_spans) |k| {
+            const lo, const hi = sp.bounds(k);
+            var csc = Scope.init(gpa, m.s);
+            defer csc.deinit();
+            try compress(&csc, m, st, li, &ly.comp.?, try csc.slice(pa.h, 0, lo, hi), sp.p0 + lo);
+        }
+    }
     // scratch_attn.zig: a full run's grouped heads straight into a run region (`[rows, og, in]`), its `wo_a` reading
     // the region: no join, no transpose (with an EXL3 `wo_a`).
     const heads_b = run > 1 and m.act == .bfloat16 and try sat.headsLayerBegin(ly.wo_a.ext != null, run * sp.span, m.cfg.dsv4_o_groups, @as(usize, m.cfg.num_attention_heads) / m.cfg.dsv4_o_groups * m.cfg.head_dim, m.act);
@@ -5903,7 +5933,14 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         // A span's core intermediates are dropped once built, as in the per-span path.
         var ssc = Scope.init(gpa, m.s);
         defer ssc.deinit();
-        var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .compressed = comp_first };
+        var sh: Shared = .{
+            .topk = sp.topks[k],
+            .cand = sp.cands[k],
+            .floor = sp.floor,
+            .compressed = comp_first,
+            .iq = if (iq_all.ctx != null) try ssc.slice(iq_all, 0, lo, hi) else none,
+            .iw = if (iw_all.ctx != null) try ssc.slice(iw_all, 0, lo, hi) else none,
+        };
         var span_pj: Proj = .{ .q = try ssc.slice(pj.q, 0, lo, hi), .kv = try ssc.slice(pj.kv, 0, lo, hi), .qr = try ssc.slice(pj.qr, 0, lo, hi) };
         if (pj.qt.ctx != null) span_pj.qt = try ssc.slice(pj.qt, 0, lo, hi);
         // Whether this span's run takes a region (its `run` spans all of `sp.span` rows).
@@ -6100,6 +6137,15 @@ fn cedCompress(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
     const ly = &m.layers[li];
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
+    if (st.verify == null) {
+        const whole = sp.whole.len == 2 and sp.whole[0].ctx != null;
+        const n_spans = sp.xs.len;
+        const x = if (whole) sp.whole[0] else if (n_spans == 1) sp.xs[0] else try sc.concat(sp.xs, 0);
+        const pre = if (whole) sp.whole[1] else if (n_spans == 1) sp.pres[0] else try sc.concat(sp.pres, 0);
+        const pa = try hcPreNormWide(&sc, m, x, pre, &ly.hc_attn, ly.attn_norm);
+        try compress(&sc, m, st, li, &ly.comp.?, pa.h, sp.p0);
+        return;
+    }
     for (sp.xs, sp.pres, 0..) |x, pre, k| {
         const pa = try hcPreNormWide(&sc, m, x, pre, &ly.hc_attn, ly.attn_norm);
         try compress(&sc, m, st, li, &ly.comp.?, pa.h, sp.p0 + k * sp.span);
@@ -6144,12 +6190,12 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
             // A batch reads grid k, state k's rows, as one span.
             const raw = if (sp.offs.len > 0) try pf.take(k, ek, 0) else try pf.take(sp.p0, ek, k);
             defer raw.deinit(gpa);
-            break :blk try sc.keep(try e.table.dequant(raw, (hi - lo) * nc, sc.s));
+            break :blk try sc.keep(try e.table.dequantAs(raw, (hi - lo) * nc, m.act, sc.s));
         } else blk: {
             const mine = try gpa.alloc(u32, (hi - lo) * nc);
             defer gpa.free(mine);
             for (lo..hi) |t| @memcpy(mine[(t - lo) * nc ..][0..nc], sp.eng_ids[(t * m.engrams.len + ek) * nc ..][0..nc]);
-            break :blk try sc.keep(try e.table.gather(gpa, mine, sc.s));
+            break :blk try sc.keep(try e.table.gatherAs(gpa, mine, m.act, sc.s));
         };
         const er = try sc.reshape(rows, &.{ ci(hi - lo), -1 });
         const y = if (exactPart(m, verify, hi - lo, "engram")) try engramRows(sc, m, e, x, er) else try engramApply(sc, m, e, x, er);
@@ -6161,6 +6207,43 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
         hold(&sp.mh[k * m.cfg.dsv4_n_dspark_target_layers + t], try sc.astype(try sc.mean(try sc.astype(x, .float32), 1, false), m.act));
     };
     return x;
+}
+
+/// Chunk-wide Engram on layer `li` across every row of `sp` in one `dequantAs` + `wkv` + `engramGate` pass, dropping
+/// intermediates before attention projections allocate.
+fn wideEngram(sc: *Scope, m: *const Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, li: usize, x_in: A) !A {
+    var esc = Scope.init(gpa, sc.s);
+    defer esc.deinit();
+    var x = x_in;
+    const nc = sp.ncols;
+    const img_mask = if (sp.img.ctx != null) try esc.expand(try esc.expand(try sp.imgSlice(&esc, 0, sp.L), -1), -1) else none;
+    for (m.engrams, 0..) |*e, ek| {
+        if (e.layer != li) continue;
+        const rows = if (sp.prefetch) |pf| blk: {
+            const raws = try gpa.alloc(engram.Table.Raw, sp.xs.len);
+            defer gpa.free(raws);
+            var taken: usize = 0;
+            defer for (raws[0..taken]) |raw| raw.deinit(gpa);
+            for (0..sp.xs.len) |k| {
+                raws[k] = if (sp.offs.len > 0) try pf.take(k, ek, 0) else try pf.take(sp.p0, ek, k);
+                taken += 1;
+            }
+            const merged = try engram.Table.Raw.merge(gpa, raws);
+            defer merged.deinit(gpa);
+            break :blk try esc.keep(try e.table.dequantAs(merged, sp.L * nc, m.act, esc.s));
+        } else blk: {
+            if (m.engrams.len == 1) break :blk try esc.keep(try e.table.gatherAs(gpa, sp.eng_ids[0 .. sp.L * nc], m.act, esc.s));
+            const mine = try gpa.alloc(u32, sp.L * nc);
+            defer gpa.free(mine);
+            for (0..sp.L) |t| @memcpy(mine[t * nc ..][0..nc], sp.eng_ids[(t * m.engrams.len + ek) * nc ..][0..nc]);
+            break :blk try esc.keep(try e.table.gatherAs(gpa, mine, m.act, esc.s));
+        };
+        const er = try esc.reshape(rows, &.{ ci(sp.L), -1 });
+        const y = try engramApply(&esc, m, e, x, er);
+        x = if (img_mask.ctx != null) try esc.where(img_mask, x, y) else y;
+        if (m.trace) |t| try t.put("engram_{d}", .{li}, x);
+    }
+    return sc.keep(esc.out(x));
 }
 
 // ── compiled decode stretches ────────────────────────────────────────────
@@ -9250,8 +9333,101 @@ test "dsv41 engram: the kernel writes the op chain's stream bit for bit, decode 
         defer gpa.free(want);
         const got = try hostF32(try engramGate(&sc, &m, t[2], t[0], t[1]));
         defer gpa.free(got);
-        for (want, got) |a, b| try testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+        try expectRowsClose("engramGate", got, want, d);
     };
+}
+
+test "dsv41 engram: wide hoist matches spanInAt" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    const n_rows_tab = 64;
+    const hd_tab = 64;
+    const rec = hd_tab + hd_tab / 32;
+    var tab_bytes: [n_rows_tab * rec]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(19);
+    prng.random().bytes(&tab_bytes);
+    for (0..n_rows_tab) |r| @memset(tab_bytes[r * rec + hd_tab ..][0 .. hd_tab / 32], 125); // ~0.25 scale, all finite e4m3
+    try td.dir.createDirPath(io, "engram");
+    try td.dir.writeFile(io, .{ .sub_path = "engram/engram-manifest.json", .data = "{\"layers\":[{\"layer_id\":1,\"file\":\"engram-L1.bin\",\"rows\":64,\"record_bytes\":66," ++
+        "\"quant\":{\"bits\":8,\"group_size\":32,\"mode\":\"mxfp8\",\"head_dim\":64}}]}" });
+    try td.dir.writeFile(io, .{ .sub_path = "engram/engram-L1.bin", .data = &tab_bytes });
+    var pbuf: [512]u8 = undefined;
+    const dir = pbuf[0..try td.dir.realPath(io, &pbuf)];
+
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.hidden_size = 128;
+    m.cfg.dsv4_hc_mult = 4;
+    m.act = .bfloat16;
+    m.ablation = null;
+    m.trace = null;
+    m.n_mtp = 0;
+    m.engram_kernel = try buildKernel("dsv41_engram", &ENGRAM_INS, &.{"out"}, ENGRAM_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.engram_kernel);
+
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 23));
+    const nc: usize = 3;
+    const ed: usize = nc * hd_tab;
+    const d: usize = @intCast(m.cfg.hidden_size);
+    const hc: usize = @intCast(m.cfg.dsv4_hc_mult);
+    var wkv_w = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&wkv_w, &[_]c_int{ ci((hc + 1) * d), ci(ed) }, 2, .bfloat16, 0, 0.05, key, sc.s));
+    wkv_w = try sc.keep(wkv_w);
+    var qk = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&qk, &[_]c_int{ ci(hc), ci(d) }, 2, .float32, 0, 1.0, key, sc.s));
+    qk = try sc.keep(qk);
+
+    var eng = [_]EngramLayer{.{
+        .layer = 1,
+        .wkv = .{ .w = wkv_w },
+        .qk = qk,
+        .table = try engram.Table.open(gpa, dir, 0, 1, n_rows_tab, hd_tab),
+    }};
+    defer eng[0].table.close();
+    m.engrams = &eng;
+
+    const L: usize = 64;
+    const span: usize = 16;
+    const n_spans: usize = L / span;
+    var x_whole = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&x_whole, &[_]c_int{ ci(L), ci(hc), ci(d) }, 3, .bfloat16, 0, 1.0, key, sc.s));
+    x_whole = try sc.keep(x_whole);
+    var xs: [n_spans]A = undefined;
+    for (&xs, 0..) |*slot, k| slot.* = try sc.slice(x_whole, 0, k * span, (k + 1) * span);
+    var img_h: [L]bool = @splat(false);
+    for (12..20) |i| img_h[i] = true;
+    const img = try sc.keep(mlx.mlx_array_new_data(&img_h, &[_]c_int{ci(L)}, 1, .bool_));
+    var eng_ids: [L * nc]u32 = undefined;
+    for (&eng_ids, 0..) |*id, i| id.* = @intCast((i * 7 + 3) % n_rows_tab);
+    var dummy: [n_spans]A = @splat(none);
+    const sp: Spans = .{
+        .xs = &xs,
+        .pres = &dummy,
+        .topks = &dummy,
+        .cands = &dummy,
+        .mh = &.{},
+        .eng_ids = &eng_ids,
+        .ncols = nc,
+        .img = img,
+        .p0 = 0,
+        .span = span,
+        .L = L,
+    };
+
+    var parts: [n_spans]A = undefined;
+    for (&parts, 0..) |*p, k| p.* = try spanInAt(&sc, &m, gpa, &sp, 1, k, false);
+    const want = try hostF32(try sc.concat(&parts, 0));
+    defer gpa.free(want);
+    const got = try hostF32(try wideEngram(&sc, &m, gpa, &sp, 1, x_whole));
+    defer gpa.free(got);
+    try expectRowsClose("wideEngram", got, want, hc * d);
 }
 
 test "dsv41 wide attention: the f16 core and the matrix-unit core give the f32 chain's heads at the release's span shape" {

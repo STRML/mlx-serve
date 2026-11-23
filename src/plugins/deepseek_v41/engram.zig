@@ -519,6 +519,34 @@ pub const Table = struct {
             gpa.free(self.s);
             gpa.free(self.b);
         }
+
+        pub fn merge(gpa: std.mem.Allocator, parts: []const Raw) !Raw {
+            var wl: usize = 0;
+            var sl: usize = 0;
+            var bl: usize = 0;
+            for (parts) |p| {
+                wl += p.w.len;
+                sl += p.s.len;
+                bl += p.b.len;
+            }
+            const w = try gpa.alignedAlloc(u8, .@"4", wl);
+            errdefer gpa.free(w);
+            const s = try gpa.alignedAlloc(u8, .@"4", sl);
+            errdefer gpa.free(s);
+            const b = try gpa.alignedAlloc(u8, .@"4", bl);
+            var wo: usize = 0;
+            var so: usize = 0;
+            var bo: usize = 0;
+            for (parts) |p| {
+                @memcpy(w[wo..][0..p.w.len], p.w);
+                @memcpy(s[so..][0..p.s.len], p.s);
+                if (p.b.len > 0) @memcpy(b[bo..][0..p.b.len], p.b);
+                wo += p.w.len;
+                so += p.s.len;
+                bo += p.b.len;
+            }
+            return .{ .w = w, .s = s, .b = b };
+        }
     };
 
     pub fn read(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !Raw {
@@ -682,6 +710,11 @@ pub const Table = struct {
     }
     /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (caller frees).
     pub fn dequant(self: *const Table, raw: Raw, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+        return self.dequantAs(raw, n, .float32, s);
+    }
+
+    /// The first `n` rows of `raw` dequantized directly to `dt`: `[n, head_dim]` (caller frees).
+    pub fn dequantAs(self: *const Table, raw: Raw, n: usize, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
         if (self.mode == .gguf) {
             // IQ4_NL blocks in the kernels' split row layout.
             const kernels = gguf_root.kernels;
@@ -691,7 +724,7 @@ pub const Table = struct {
             kernels.packRows(.iq4_nl, self.head_dim, tmp, raw.w[0 .. n * self.wlen]);
             const wa = mlx.mlx_array_new_data(tmp.ptr, &[_]c_int{ @intCast(n), @intCast(rb) }, 2, .uint8);
             defer _ = mlx.mlx_array_free(wa);
-            return kernels.dequantize(.iq4_nl, wa, .float32, s);
+            return kernels.dequantize(.iq4_nl, wa, dt, s);
         }
         const wcols: c_int = @intCast(self.wlen / 4);
         const scols: c_int = @intCast(if (self.mode == .affine) self.slen / 2 else self.slen);
@@ -707,15 +740,20 @@ pub const Table = struct {
         };
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_dequantize(&out, wa, sa, ba, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), self.mode.cstr(), .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+        try mlx.check(mlx.mlx_dequantize(&out, wa, sa, ba, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), self.mode.cstr(), .{ .ctx = null }, .{ .value = dt, .has_value = true }, s));
         return out;
     }
 
     /// Rows `ids`, dequantized: f32 `[ids.len, head_dim]` (caller frees).
     pub fn gather(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
+        return self.gatherAs(gpa, ids, .float32, s);
+    }
+
+    /// Rows `ids`, dequantized directly to `dt`: `[ids.len, head_dim]` (caller frees).
+    pub fn gatherAs(self: *const Table, gpa: std.mem.Allocator, ids: []const u32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
         const raw = try self.read(gpa, ids);
         defer raw.deinit(gpa);
-        return self.dequant(raw, ids.len, s);
+        return self.dequantAs(raw, ids.len, dt, s);
     }
 
     /// Asks the kernel to read every `stride`-th of `ids` from `first` into the page cache now
@@ -1522,4 +1560,35 @@ test "dsv41 engram: an affine table bills the shard bytes it occupies, a repack 
     var r = try Table.open(testing.allocator, dir, 0, 1, 4, 64);
     defer r.close();
     try testing.expectEqual(@as(u64, 0), r.shardBytes());
+}
+
+test "dsv41 engram: dequantAs bfloat16 matches astype(dequant float32, bfloat16) and Raw.merge concatenates parts" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeRawFp8Fixture(io, td.dir);
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    var t = try Table.open(testing.allocator, dir, 0, 1, 4, 64);
+    defer t.close();
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const ids = [_]u32{ 3, 1, 0, 2 };
+    const r0 = try t.read(testing.allocator, ids[0..2]);
+    defer r0.deinit(testing.allocator);
+    const r1 = try t.read(testing.allocator, ids[2..4]);
+    defer r1.deinit(testing.allocator);
+    const merged = try Table.Raw.merge(testing.allocator, &.{ r0, r1 });
+    defer merged.deinit(testing.allocator);
+    const f32_rows = try t.dequant(merged, 4, s);
+    defer _ = mlx.mlx_array_free(f32_rows);
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx.mlx_astype(&want, f32_rows, .bfloat16, s));
+    const got = try t.dequantAs(merged, 4, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(want));
+    try mlx.check(mlx.mlx_array_eval(got));
+    const n = 4 * 64;
+    try testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(want).?[0..n], mlx.mlx_array_data_bfloat16(got).?[0..n]);
 }
