@@ -804,6 +804,51 @@ test "dsv41 dec moe_fp4: down over mxfp4 experts, rows 1 2 4 6, against today's 
     };
 }
 
+test "dsv41 dec moe_fp4: down at R=6 with 36 distinct experts (pairs 32..35 unique) matches R=1 bit-for-bit and truth" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 36, .ctx = 0, .experts_fp4 = true });
+    defer fx.deinit();
+    const m = fx.m;
+    const ly = fx.layer(20);
+    const kern = try build(m.cfg.dsv4_swiglu_limit);
+    defer kern.deinit();
+    const rows = decode.max_rows;
+    const topk = ly.top_k;
+    try testing.expectEqual(@as(usize, 36), rows * topk);
+    const inter = m.cfg.moe_intermediate_size;
+    const hc = m.cfg.dsv4_hc_mult;
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const act = try sc.keep(try fx.normal(&.{ ci(rows), ci(topk + 1), ci(inter) }, .bfloat16, 0, 0.5));
+    var ids: [36]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(i);
+    const idx = try sc.keep(mlx.mlx_array_new_data(&ids, &[_]c_int{ ci(rows), ci(topk) }, 2, .uint32));
+    const x1 = try sc.keep(try fx.stream(rows));
+    const sp: dsv41.Split = .{ .pre = none, .post = try sc.keep(try fx.uniform(&.{ ci(rows), ci(hc) }, 0.05, 1.5)), .comb = try sc.keep(try fx.uniform(&.{ ci(rows), ci(hc), ci(hc) }, -0.5, 0.5)) };
+    const got = (try moeDown(&sc, kern, ly, act, idx, x1, &sp)).?;
+    const want = try todaysDown(&sc, m, ly, act, idx, x1, &sp);
+    const tr = try truthDown(gpa, &sc, ly, act, &ids, x1, &sp);
+    defer gpa.free(tr);
+    const g = try dsv41.hostF32(got);
+    defer gpa.free(g);
+    const w = try dsv41.hostF32(want);
+    defer gpa.free(w);
+    try decode.expectNoWorse("moe_fp4 down R=6 36-distinct", g, w, tr);
+    const gb = try moe_up.bitsOf(got);
+    defer gpa.free(gb);
+    const per = hc * dims(got, 2);
+    for (0..rows) |row| {
+        var rs = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer rs.deinit();
+        const sp1: dsv41.Split = .{ .pre = none, .post = try rowOf(&rs, sp.post, row), .comb = try rowOf(&rs, sp.comb, row) };
+        const one = (try moeDown(&rs, kern, ly, try rowOf(&rs, act, row), try rowOf(&rs, idx, row), try rowOf(&rs, x1, row), &sp1)).?;
+        const ob = try moe_up.bitsOf(one);
+        defer gpa.free(ob);
+        try testing.expectEqualSlices(u16, ob, gb[row * per ..][0..per]);
+    }
+}
+
 test "dsv41 dec moe_fp4: formats and shapes it does not serve are declined" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;

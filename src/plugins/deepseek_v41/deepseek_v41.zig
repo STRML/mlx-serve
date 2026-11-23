@@ -7212,7 +7212,9 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
 
 /// Test helper: runs `batchedLayer` across the model's held layers for independent states (`xs[k]` `[rk, hc, D]`),
 /// advancing each `st.n` and evaluating outputs and layer states.
-pub fn batchedStep(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, xs: []const A, pres: []const A) !A {
+pub const batchedStep = if (@import("builtin").is_test) batchedStepImpl else struct {};
+
+fn batchedStepImpl(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, xs: []const A, pres: []const A) !A {
     const N = states.len;
     const lo = if (m.pair) |p| p.lo else 0;
     const hi = if (m.pair) |p| p.hi else m.n_layers;

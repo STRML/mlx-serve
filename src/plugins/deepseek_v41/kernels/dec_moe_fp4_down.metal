@@ -48,11 +48,12 @@ if (R * TOPK <= 64) {
     const bool rep0 = p0 < uint(PAIRS) && (m0 & ((1ul << p0) - 1ul)) == 0ul;
     const bool rep1 = p1 < uint(PAIRS) && (m1 & ((1ul << p1) - 1ul)) == 0ul;
     const uint cnt0 = metal::simd_sum(uint(rep0));
+    const uint cnt1 = metal::simd_sum(uint(rep1));
     const uint off0 = metal::simd_prefix_exclusive_sum(uint(rep0));
     const uint off1 = cnt0 + metal::simd_prefix_exclusive_sum(uint(rep1));
     if (rep0) { uniq_e[off0] = e0; uniq_mask[off0] = m0; }
     if (rep1) { uniq_e[off1] = e1; uniq_mask[off1] = m1; }
-    if (lane == 0u) num_uniq = cnt0 + metal::simd_sum(uint(rep1));
+    if (lane == 0u) num_uniq = cnt0 + cnt1;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (sgi == uint(TOPK)) {
