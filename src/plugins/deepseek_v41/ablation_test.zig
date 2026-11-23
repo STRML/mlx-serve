@@ -890,3 +890,41 @@ test "deepseek_v41 ablation forward: a DSpark draft of an ablated state leaves i
     defer own[0].deinit(testing.allocator);
     try expectProbe(mdl, own[0], true);
 }
+
+test "deepseek_v41 dsparkDraftBatched: matches solo dsparkDraft bit for bit with and without conf/logits" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41DsparkFiles(arena.allocator(), 7), "");
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    const mdl = m.mdl;
+    testing.allocator.free(try forwardUnder(t, .prefill, &.{1}, &short_prompt, &.{0}, null));
+    testing.allocator.free(try forwardUnder(t, .prefill, &.{2}, &.{ 5, 9, 2 }, &.{0}, null));
+    var sts: [2]*dsv41.State = undefined;
+    var gens: [2]u64 = undefined;
+    try testing.expect(v41.slotStates(t.m, &.{ 1, 2 }, &sts, &gens));
+    const t1s = [2]u32{ 5, 11 };
+    for ([_]bool{ false, true }) |want_conf| for ([_]bool{ false, true }) |keep_logits| {
+        mdl.ds_want_conf = want_conf;
+        var batched: [2]dsv41.DsparkDraft = undefined;
+        try dsv41.dsparkDraftBatched(mdl, testing.allocator, &sts, &t1s, keep_logits, &batched);
+        defer for (&batched) |*d| d.deinit(testing.allocator);
+        for (sts, 0..) |st, k| {
+            var solo = try dsv41.dsparkDraft(mdl, testing.allocator, st, t1s[k]);
+            defer solo.deinit(testing.allocator);
+            try testing.expectEqualSlices(u32, solo.ids, batched[k].ids);
+            try testing.expectEqual(solo.len, batched[k].len);
+            for (solo.confidence, batched[k].confidence) |a, b| try testing.expectApproxEqAbs(a, b, 1e-4);
+            if (!keep_logits) {
+                try testing.expectEqual(@as(usize, 0), batched[k].logits.len);
+            } else {
+                var one: [1]dsv41.DsparkDraft = undefined;
+                try dsv41.dsparkDraftBatched(mdl, testing.allocator, &.{st}, &.{t1s[k]}, true, &one);
+                defer one[0].deinit(testing.allocator);
+                try testing.expectEqual(mdl.ds_block * mdl.vocab, batched[k].logits.len);
+                for (one[0].logits, batched[k].logits) |a, b| try testing.expectApproxEqAbs(a, b, 1e-3);
+            }
+        }
+    };
+}

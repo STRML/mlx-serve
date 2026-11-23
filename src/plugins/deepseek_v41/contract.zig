@@ -1778,6 +1778,7 @@ const MarkovStep = struct {
         g.int("NT", MK_NT);
         g.int("KEEP", 1);
         g.int("ZZ", 1);
+        g.int("NB", 1);
         return g;
     }
 
@@ -2820,6 +2821,143 @@ const AttnDec = struct {
                 const got = outAt(k, .bf16, 0, idx);
                 const ok = if (at == .nonfinite) spec.classOf(got) == spec.classOf(r.lo) else r.has(got);
                 if (!ok) return std.fmt.bufPrint(&k.msg, "query {d} head {d} channel {d} is {e} outside [{e}, {e}]", .{ i, h, d, got, r.lo, r.hi }) catch "attn";
+            }
+        };
+        return null;
+    }
+};
+
+/// DSpark stage attention over the ring's committed window [p0 - nw, p0) and B draft keys `kv`, with sink and
+/// inverse tail RoPE (`kernels/dspark_attn.metal`, `shape.rows` = B, `shape.n` = H, `shape.k` = nw).
+const DsparkAttn = struct {
+    pub const Params = struct { rd: usize = RD, cap: usize = WINDOW + 16, p0: usize = 3001, scale: f64 = 1.0 / @sqrt(@as(f64, HD)) };
+    const NSG = v41.DSPARK_ATTN_NSG;
+
+    fn pos0(p: Params, nw: usize) usize {
+        return if (nw == 0) 0 else if (nw < WINDOW) nw else p.p0;
+    }
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or s.k > p.cap) return null;
+        var g = metal.Geometry{ .grid = .{ ci(s.n * NSG * 32), ci(s.rows), 1 }, .tg = .{ NSG * 32, 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n), HD }, act);
+        g.int("D", HD);
+        g.int("NSG", NSG);
+        g.int("RD", p.rd);
+        g.dtype("T", act);
+        g.dtype("OT", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const p = k.p;
+        const B = k.shape.rows;
+        const H = k.shape.n;
+        const nw = k.shape.k;
+        const p0 = pos0(p, nw);
+        const q = try k.add(act, &.{ B, H, HD });
+        const ring = try k.add(act, &.{ p.cap, HD });
+        const kv = try k.add(act, &.{ B, HD });
+        const sink = try k.add(.float32, &.{ 1, H, 1 });
+        const meta = try k.add(.int32, &.{3});
+        const scal = try k.add(.float32, &.{1});
+        kit.uniform(rng, q, -2, 2);
+        kit.uniform(rng, ring, -2, 2);
+        kit.uniform(rng, kv, -2, 2);
+        kit.uniform(rng, sink, -3, 3);
+        @memcpy(meta, &[_]f64{ @floatFromInt(p0), @floatFromInt(nw), @floatFromInt(p.cap) });
+        scal[0] = p.scale;
+        periodsFill(try k.add(.float32, &.{if (p.rd > 0) p.rd / 2 else 1}), -1);
+        if (f == .nonfinite) kit.plantRows(q, B * H, HD);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n * HD;
+    }
+
+    fn keyRow(k: anytype, p: Params, nw: usize, t: usize) []const f64 {
+        const lo = pos0(p, nw) - nw;
+        if (t < nw) return k.in(1)[((lo + t) % p.cap) * HD ..][0..HD];
+        return k.in(2)[(t - nw) * HD ..][0..HD];
+    }
+
+    fn head(k: anytype, i: usize, h: usize, sum: Sum, point: bool, out: []Iv) !void {
+        const p = k.p;
+        const B = k.shape.rows;
+        const H = k.shape.n;
+        const nw = k.shape.k;
+        const n = nw + B;
+        const q = k.in(0)[(i * H + h) * HD ..][0..HD];
+        const a = k.scratch();
+        const buf = try a.alloc(f64, 4 * n + HD);
+        defer a.free(buf);
+        const s = buf[0..n];
+        const ds = buf[n .. 2 * n];
+        const wts = buf[2 * n .. 3 * n];
+        const terms = buf[3 * n .. 4 * n];
+        const tmp = buf[4 * n ..][0..HD];
+        var m = -inf;
+        var serr: f64 = 0;
+        for (s, ds, 0..) |*sv, *dv, t| {
+            const key = keyRow(k, p, nw, t);
+            var mg: f64 = 0;
+            for (tmp, q, key) |*x, qv, kv| {
+                x.* = qv * kv;
+                mg += @abs(x.*);
+            }
+            sv.* = sum.of(tmp) * p.scale;
+            dv.* = spec.gamma(HD, u) * mg * p.scale + 2 * u * @abs(sv.*);
+            m = maxN(m, sv.*);
+            serr = @max(serr, dv.*);
+        }
+        const nf: f64 = @floatFromInt(n);
+        for (wts, s) |*w, sv| w.* = @exp(sv - m);
+        const l = sum.of(wts);
+        var lerr: f64 = 0;
+        const rel = try a.alloc(f64, n);
+        defer a.free(rel);
+        for (rel, wts, s, ds) |*r, w, sv, d| {
+            r.* = 2 * d + 2 * serr + (@abs(sv - m) + nf + 16) * u;
+            lerr += w * r.*;
+        }
+        const sk = k.in(3)[h];
+        const M = maxN(m, sk);
+        const wm = @exp(m - M);
+        const total = @exp(sk - M) + l * wm;
+        var o: [HD]Iv = undefined;
+        for (0..HD) |d| {
+            var e: f64 = 0;
+            for (terms, wts, rel, 0..) |*x, w, r, t| {
+                x.* = w * keyRow(k, p, nw, t)[d];
+                e += @abs(x.*) * r;
+            }
+            const av = sum.of(terms);
+            const v = av * wm / total;
+            o[d] = if (point) Iv.pt(v) else Iv.of(v, (e * wm + @abs(v) * lerr * wm) / total + 8 * u * @abs(v));
+        }
+        unropeIv(&o, p.rd, pos0(p, nw) + i, k.in(6), out, point);
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const H = k.shape.n;
+        var iv: [HD]Iv = undefined;
+        for (0..k.shape.rows) |i| for (0..H) |h| {
+            try head(k, i, h, sum, true, &iv);
+            for (iv, 0..) |r, d| out[(i * H + h) * HD + d] = r.lo;
+        };
+        @memset(mag, 0);
+    }
+
+    pub fn check(k: anytype, at: spec.Gate) !?[]const u8 {
+        const H = k.shape.n;
+        var iv: [HD]Iv = undefined;
+        for (0..k.shape.rows) |i| for (0..H) |h| {
+            try head(k, i, h, .{}, at == .nonfinite, &iv);
+            for (iv, 0..) |r, d| {
+                const idx = (i * H + h) * HD + d;
+                const got = outAt(k, .bf16, 0, idx);
+                const ok = if (at == .nonfinite) spec.classOf(got) == spec.classOf(r.lo) else r.has(got);
+                if (!ok) return std.fmt.bufPrint(&k.msg, "dspark query {d} head {d} channel {d} is {e} outside [{e}, {e}]", .{ i, h, d, got, r.lo, r.hi }) catch "dspark_attn";
             }
         };
         return null;
@@ -4165,6 +4303,7 @@ const rope_only_l = launch("dsv41_rope_tail_only", &.{ "x", "periods", "off", "s
 const kv_l = launch("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER, 4 * (32 + 1024), 1024, false);
 const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (3 * 32 + 1), 928, false);
 const dec_l = launch("dsv41_attn_decode", attn_ins ++ &[_][*:0]const u8{"periods"}, &.{"out"}, v41.ATTN_DEC_SOURCE, v41.UNROPE_HEADER, 4 * (AttnDec.NSG * HD + 2 * AttnDec.NSG), 768, false);
+const dspark_attn_l = launch("dsv41_dspark_attn", &v41.DSPARK_ATTN_INS, &.{"out"}, v41.DSPARK_ATTN_SOURCE, v41.UNROPE_HEADER, 4 * (DsparkAttn.NSG * HD + 2 * DsparkAttn.NSG), 768, false);
 const split_attn_l = launch("dsv41_attn_split", attn_ins, &.{ "pacc", "pm", "pl" }, v41.ATTN_SPLIT_SOURCE, "", 4 * (AttnSplit.NSG * HD + 2 * AttnSplit.NSG), 768, false);
 const merge_l = launch("dsv41_attn_merge", &.{ "pacc", "pm", "pl", "sink", "meta", "periods" }, &.{"out"}, v41.ATTN_MERGE_SOURCE, v41.UNROPE_HEADER, 0, 928, false);
 const softmax_l = launch("dsv41_attn_softmax", &.{ "lw", "lc", "topk", "sink", "meta", "scal" }, &.{ "pw", "pc" }, v41.ATTN_SOFTMAX_SOURCE, "", 0, 928, false);
@@ -4386,6 +4525,14 @@ pub fn register(set: *kc.Set) !void {
         .nan = attn_nan,
         .served = &.{ .{ .rows = 1, .n = 8, .k = 0 }, .{ .rows = 4, .n = 8, .k = 150 } },
     });
+    try kit.add(set, DsparkAttn, &dspark_attn_l, .{ .rd = RD }, .{
+        .name = "dsv41 dspark_attn (ring + draft keys, sink, inverse rope)",
+        .accum = .none,
+        .depth = depthAttn,
+        .out = .bf16,
+        .nan = attn_nan,
+        .served = &.{ .{ .rows = 1, .n = 8, .k = 0 }, .{ .rows = 5, .n = 8, .k = 10 }, .{ .rows = 5, .n = 8, .k = WINDOW } },
+    });
     try kit.add(set, AttnSplit, &split_attn_l, .{ .s = 4 }, .{
         .name = "dsv41 attn_split S=4",
         .accum = .none,
@@ -4568,6 +4715,7 @@ const Shell = struct {
         m.attn_dec_kernel = try b("dsv41_attn_decode", &v41.ATTN_DEC_INS, &.{"out"}, v41.ATTN_DEC_SOURCE, v41.UNROPE_HEADER);
         m.attn_split_kernel = try b("dsv41_attn_split", &v41.ATTN_INS, &.{ "pacc", "pm", "pl" }, v41.ATTN_SPLIT_SOURCE, "");
         m.attn_merge_kernel = try b("dsv41_attn_merge", &v41.ATTN_MERGE_INS, &.{"out"}, v41.ATTN_MERGE_SOURCE, v41.UNROPE_HEADER);
+        m.dspark_attn_kernel = try b("dsv41_dspark_attn", &v41.DSPARK_ATTN_INS, &.{"out"}, v41.DSPARK_ATTN_SOURCE, v41.UNROPE_HEADER);
         m.idx_score_kernel = try v41.buildIdxScoreKernel();
         m.idx_tile_kernel = try b("dsv41_index_tile", &v41.IDX_INS, &.{"scores"}, v41.IDX_TILE_SOURCE, "");
         m.gate_kernel = try b("dsv41_gate", &.{ "x", "w" }, &.{"logits"}, v41.GATE_SOURCE, "");
@@ -4596,6 +4744,7 @@ const Shell = struct {
     fn deinit(self: *Shell) void {
         const m = &self.m;
         if (m.idx_nax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+        if (m.dspark_attn_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         for ([_]mlx.mlx_fast_metal_kernel{ m.attn_dec_kernel, m.attn_split_kernel, m.attn_merge_kernel, m.idx_score_kernel, m.idx_tile_kernel, m.gate_kernel, m.topk_kernel, m.dense_f32x_kernel, m.route_kernel, m.hc_mix_kernel, m.hc_norm_kernel, m.hc_stage_kernel, m.hc_stage_x_kernel, m.hc_split_kernel, m.rope_kernel, m.rope_tail_only_kernel, m.kv_row_kernel, m.engram_kernel, m.moe_gu_kernel, m.moe_dn_kernel, m.moe_act_kernel, m.moe_combine_kernel }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
     }
 };
@@ -5032,6 +5181,14 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         try Expect.same(r.c, r.bytes, &.{try v41.attnDecodeSplit(&sc, m, &ly, r.c.args[0], win, if (K > 0) r.c.args[2] else none, r.c.args[3], g.p0, @floatCast(g.scale), 1, r.c.args[7])});
     }
     {
+        const p: DsparkAttn.Params = .{ .rd = RD };
+        const r = try ours(DsparkAttn, a, &dspark_attn_l, p, .{ .rows = 5, .n = 4, .k = WINDOW });
+        ly.sink = r.c.args[3];
+        m.rope_plain.inv = r.c.args[6];
+        const win: v41.Ring = .{ .buf = r.c.args[1], .cap = p.cap, .width = HD };
+        try Expect.same(r.c, r.bytes, &.{try v41.dsparkAttn(&sc, m, &ly, r.c.args[0], win, r.c.args[2], p.p0) orelse return error.ExpectedFusedDsparkAttn});
+    }
+    {
         // Split S=4 then our merge launch, against the wrapper's split + merge.
         const g: AttnGeo = .{};
         const L = 2;
@@ -5087,4 +5244,22 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(MoeCombine, a, &combine_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
         try Expect.same(r.c, r.bytes, &.{try v41.flatKernel(&sc, m.moe_combine_kernel, r.c.args[0..3], &.{ 3, 256 }, act, 3 * 256, &.{ .{ .name = "D", .v = 256 }, .{ .name = "K", .v = TOPK } })});
     }
+}
+
+test "kernel contract dsv41 dspark_attn: gates 1-4 pass" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var set = kc.Set.init(a);
+    defer set.deinit();
+    try kit.add(&set, DsparkAttn, &dspark_attn_l, .{ .rd = RD }, .{
+        .name = "dsv41 dspark_attn (ring + draft keys, sink, inverse rope)",
+        .accum = .none,
+        .depth = depthAttn,
+        .out = .bf16,
+        .nan = .{ .stated = "classes as float64 gives them; outputs within the intervals of the online softmax's roundings" },
+        .served = &.{ .{ .rows = 1, .n = 8, .k = 0 }, .{ .rows = 5, .n = 8, .k = 10 }, .{ .rows = 5, .n = 8, .k = WINDOW } },
+    });
+    var t: kc.gates.Tally = .{};
+    try kc.gates.runAll(a, set.kernels.items, 0xc0de, &t);
+    try std.testing.expectEqual(@as(usize, 0), t.problems());
 }

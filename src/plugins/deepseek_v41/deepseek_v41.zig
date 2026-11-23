@@ -469,6 +469,7 @@ pub const Dsv41Model = struct {
     attn_split_kernel: mlx.mlx_fast_metal_kernel,
     attn_merge_kernel: mlx.mlx_fast_metal_kernel,
     attn_softmax_kernel: mlx.mlx_fast_metal_kernel,
+    dspark_attn_kernel: ?mlx.mlx_fast_metal_kernel = null,
     /// The wide attention core on the matrix units (`attnGather`); null without them.
     attn_gather: ?GatherAttn = null,
     /// The routing weight on a fused gate/up's activation (`MOE_WT_SOURCE`); null off the GPU.
@@ -568,6 +569,7 @@ pub const Dsv41Model = struct {
         _ = mlx.mlx_fast_metal_kernel_free(self.attn_split_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.attn_merge_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.attn_softmax_kernel);
+        if (self.dspark_attn_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         sat.releaseAll();
         if (self.attn_gather) |*g| g.deinit();
         if (self.moe_wt_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
@@ -1402,6 +1404,11 @@ pub const ATTN_MERGE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/attn_me
 /// Swept on M5 Ultra over 4..8 simdgroups and 1..4 rows a pass: 8 x 1.
 pub const ATTN_DEC_NSG = 8;
 
+/// DSpark stage attention over the ring's committed window [p0 - nw, p0) and the B draft keys, with sink and inverse rope.
+pub const DSPARK_ATTN_NSG = 4;
+pub const DSPARK_ATTN_INS = [_][*:0]const u8{ "q", "ring", "kv", "sink", "meta", "scal", "periods" };
+pub const DSPARK_ATTN_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dspark_attn.metal");
+
 /// A wide span's softmax, one simdgroup per (row, head): the raw window scores
 /// `lw` [L*H, Wk] under the band (query l sees columns (wp + l - window, wp + l]),
 /// the raw selected scores `lc` [L, H, K] where the pick is >= 0, scaled by
@@ -1893,7 +1900,10 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     m.quant = opts.quant;
     defer m.quant = null;
     if (device.naxAvailable()) m.attn_gather = try GatherAttn.init();
-    if (mlx.metalKernelsAvailable()) m.moe_wt_kernel = try buildKernel("dsv41_moe_wt", &.{ "a", "wts" }, &.{"out"}, MOE_WT_SOURCE, "");
+    if (mlx.metalKernelsAvailable()) {
+        m.moe_wt_kernel = try buildKernel("dsv41_moe_wt", &.{ "a", "wts" }, &.{"out"}, MOE_WT_SOURCE, "");
+        m.dspark_attn_kernel = try buildKernel("dsv41_dspark_attn", &DSPARK_ATTN_INS, &.{"out"}, DSPARK_ATTN_SOURCE, UNROPE_HEADER);
+    }
     const tp_worker = if (opts.tp) |t| t.rank != 0 else false;
     const worker = if (opts.pair) |p| p.worker else false;
     if (opts.pair) |p| if (p.worker and engramIn(cfg, p.lo, p.hi)) return error.DsvPairEngram;
@@ -1910,6 +1920,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         _ = mlx.mlx_fast_metal_kernel_free(m.attn_split_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.attn_merge_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.attn_softmax_kernel);
+        if (m.dspark_attn_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         if (m.attn_gather) |*g| g.deinit();
         _ = mlx.mlx_fast_metal_kernel_free(m.idx_score_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.idx_tile_kernel);
@@ -7278,10 +7289,51 @@ fn commitMain(sc: *Scope, m: *Dsv41Model, st: *State, mh: A, p0: usize) !void {
 /// A stage's attention heads for one state's draft rows at [p0, p0 + B) from their projections `rows` (made over every
 /// state's rows), inverse-roped for `attnOutRoped`: every row sees the stage's window of committed main rows and every
 /// draft row.
-fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_keys: A, p0: usize) !A {
+pub fn dsparkAttn(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, q: A, win: Ring, kv: A, p0: usize) !?A {
+    const kern = m.dspark_attn_kernel orelse return null;
+    if (!mlx.streamIsGpu(sc.s)) return null;
+    const qs = mlx.getShape(q);
+    const kvs = mlx.getShape(kv);
+    if (qs.len != 3 or kvs.len != 2) return null;
+    const B: usize = @intCast(qs[0]);
+    const H: usize = @intCast(qs[1]);
+    const D: usize = @intCast(qs[2]);
+    const rd: usize = @intCast(m.cfg.dsv4_rope_head_dim);
+    if (B == 0 or H == 0 or D == 0 or D % 32 != 0 or rd % 2 != 0 or rd > D) return null;
+    if (kvs[0] != qs[0] or kvs[1] != qs[2] or win.width != D) return null;
+    const dt = mlx.mlx_array_dtype(q);
+    if (mlx.mlx_array_dtype(win.buf) != dt or mlx.mlx_array_dtype(kv) != dt) return null;
+    const nw = @min(m.cfg.sliding_window, p0);
+    if (nw > win.cap) return null;
+    const meta_v = [_]i32{ @intCast(p0), @intCast(nw), @intCast(win.cap) };
+    const meta = try sc.ints(&meta_v, &.{meta_v.len});
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
+    const periods = if (rd > 0) m.rope_plain.inv else try sc.zeros(&.{1}, .float32);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(B), ci(H), ci(D) }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(H * DSPARK_ATTN_NSG * 32), ci(B), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, DSPARK_ATTN_NSG * 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", ci(D)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NSG", DSPARK_ATTN_NSG));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RD", ci(rd)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", dt));
+    const inputs = [_]A{ q, win.buf, kv, ly.sink, meta, scal, periods };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+
+pub fn dsparkHeadsOps(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, pj: Proj, win: Ring, p0: usize, pos: A) !A {
     const hd = m.cfg.head_dim;
-    const pos = try sc.i(ci(p0));
-    const pj = try ropeProj(sc, m, ly, m.rope_plain.fwd, rows, pos);
+    const window = @min(m.cfg.sliding_window, p0);
+    const main_keys = try win.read(sc, p0 - window, p0);
     const keys = try sc.astype(try sc.concat(&.{ main_keys, pj.kv }, 0), .float32);
     const qf = try sc.astype(pj.q, .float32);
     const logits = try sc.mul(try sc.matmul(qf, try sc.t2(keys)), try sc.f(1.0 / @sqrt(@as(f32, @floatFromInt(hd)))));
@@ -7290,6 +7342,13 @@ fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_ke
     const denom = try sc.add(try sc.sum(p, -1, true), try sc.op1(mlx.mlx_exp, try sc.sub(ly.sink, mx)));
     const o = try sc.astype(try sc.div(try sc.matmul(p, keys), denom), m.act);
     return ropeTail(sc, m, o, m.rope_plain.inv, pos, 1.0);
+}
+
+fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, win: Ring, p0: usize) !A {
+    const pos = try sc.i(ci(p0));
+    const pj = try ropeProj(sc, m, ly, m.rope_plain.fwd, rows, pos);
+    if (try dsparkAttn(sc, m, ly, pj.q, win, pj.kv, p0)) |o| return o;
+    return dsparkHeadsOps(sc, m, ly, pj, win, p0, pos);
 }
 
 pub const DsparkDraft = dsv4.DsparkDraft;
@@ -7507,10 +7566,17 @@ fn draftBatchedUnder(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     for (firsts, t1s) |*f, t| f.* = @intCast(t);
     var cur = try sc.ints(firsts, &.{ci(N)});
     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
+    const fused: ?markov.Out = try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = cur, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .want_conf = want_conf, .keep = keep_logits });
+    if (fused) |f| {
+        _ = try sc.keep(f.toks);
+        if (f.conf) |fc| _ = try sc.keep(fc);
+        if (f.rows) |fr| _ = try sc.keep(fr);
+    }
+    const ops = fused == null;
     var toks: [16]A = undefined;
     var confs: [16]A = undefined;
     var rows_k: [16]A = undefined;
-    for (0..B) |k| {
+    if (ops) for (0..B) |k| {
         const e = try sc.take(ds.markov_embed, cur, 0); // [N, rank]
         const me = try sc.astype(e, .float32);
         const bias = try sc.astype(try sc.matmul(try sc.astype(e, m.act), try sc.t2(ds.markov_head)), .float32);
@@ -7519,10 +7585,16 @@ fn draftBatchedUnder(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
         if (want_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.reshape(try sc.slice(hout, 1, k, k + 1), &.{ ci(N), ci(d) }), .float32), me }, -1), try sc.t2(ds.conf));
         cur = try sc.astype(try sc.argmax(row, -1), .int32);
         toks[k] = cur;
-    }
-    const all = try sc.stack(toks[0..B], 1); // [N, B]
-    const rows_all = if (keep_logits) try sc.stack(rows_k[0..B], 1) else all;
-    var ev = [_]A{ all, if (want_conf) try sc.astype(try sc.concat(confs[0..B], -1), .float32) else all, rows_all };
+    };
+    const all = if (ops) try sc.stack(toks[0..B], 1) else fused.?.toks; // [N, B]
+    const conf_ops = want_conf and (ops or fused.?.conf == null);
+    if (conf_ops and !ops) for (0..B) |k| {
+        const prev = if (k == 0) cur else try sc.reshape(try sc.slice(all, 1, k - 1, k), &.{ci(N)});
+        const me = try sc.astype(try sc.take(ds.markov_embed, prev, 0), .float32);
+        confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.reshape(try sc.slice(hout, 1, k, k + 1), &.{ ci(N), ci(d) }), .float32), me }, -1), try sc.t2(ds.conf));
+    };
+    const rows_all = if (!keep_logits) all else if (ops) try sc.stack(rows_k[0..B], 1) else fused.?.rows.?;
+    var ev = [_]A{ all, if (!want_conf) all else if (conf_ops) try sc.astype(try sc.concat(confs[0..B], -1), .float32) else fused.?.conf.?, rows_all };
     try evalAll(&ev);
     const data = mlx.mlx_array_data_int32(all) orelse return error.NoData;
     const conf_data: []const f32 = if (want_conf) (mlx.mlx_array_data_float32(ev[1]) orelse return error.NoData)[0 .. N * B] else &.{};
@@ -7563,10 +7635,8 @@ fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: 
     const rows = try qkvRows(sc, m, ly, pa.h);
     var heads: [region_rows]A = undefined;
     for (states, heads[0..states.len], 0..) |st, *o, k| {
-        const window = @min(m.cfg.sliding_window, st.n);
-        const keys = try st.ds[si].read(sc, st.n - window, st.n);
         const mine: Proj = if (states.len == 1) rows else .{ .q = try sc.slice(rows.q, 0, k * B, (k + 1) * B), .kv = try sc.slice(rows.kv, 0, k * B, (k + 1) * B), .qr = rows.qr };
-        o.* = try dsparkHeads(sc, m, ly, mine, keys, st.n);
+        o.* = try dsparkHeads(sc, m, ly, mine, st.ds[si], st.n);
     }
     const h = try abl.ablate(sc, m, try attnOutRoped(sc, m, ly, if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0)));
     const pf = try hcExpandPreNorm(sc, m, x, h, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
@@ -9459,6 +9529,207 @@ test "dsv41 bench: one hyper-connection stage as a dependent chain (DSV41_BENCH_
         best = @min(best, @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / 200);
     }
     std.debug.print("[hc] {d} rows: expand+mix+norm+add chain {d:.1} us/call\n", .{ L, best });
+}
+
+test "dsv41 dspark attention: fused kernel matches unfused op chain across p0, B, and dtypes" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    m.s = sc.s;
+    m.qat_off = true;
+    m.cfg = .{};
+    m.cfg.sliding_window = 128;
+    m.cfg.dsv4_rope_head_dim = 64;
+    m.rope_kernel = try buildKernel("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, ROPE_TAIL_SOURCE, FP8_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.rope_kernel);
+    m.dspark_attn_kernel = try buildKernel("dsv41_dspark_attn", &DSPARK_ATTN_INS, &.{"out"}, DSPARK_ATTN_SOURCE, UNROPE_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.dspark_attn_kernel.?);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 17));
+    var per: [32]f32 = undefined;
+    for (&per, 0..) |*v, k| v.* = -std.math.pow(f32, 10000, @as(f32, @floatFromInt(k)) / 32);
+    m.rope_plain.inv = try sc.keep(mlx.mlx_array_new_data(&per, &[_]c_int{32}, 1, .float32));
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float16, .float32 }) |act| {
+        m.act = act;
+        for ([_]usize{ 64, 512 }) |hd| {
+            m.cfg.head_dim = @intCast(hd);
+            const H: usize = 8;
+            var ly: Layer = undefined;
+            var sink_r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&sink_r, &[_]c_int{ 1, ci(H), 1 }, 3, .float32, 0, 1, key, sc.s));
+            ly.sink = try sc.keep(sink_r);
+            var win_r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&win_r, &[_]c_int{ 144, ci(hd) }, 2, act, 0, 1, key, sc.s));
+            const win: Ring = .{ .buf = try sc.keep(win_r), .cap = 144, .width = hd };
+            for ([_]usize{ 1, 5 }) |B| for ([_]usize{ 0, 10, 3001 }) |p0| {
+                var q_r = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_random_normal(&q_r, &[_]c_int{ ci(B), ci(H), ci(hd) }, 3, act, 0, 1, key, sc.s));
+                const q = try sc.keep(q_r);
+                var kv_r = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_random_normal(&kv_r, &[_]c_int{ ci(B), ci(hd) }, 2, act, 0, 1, key, sc.s));
+                const kv = try sc.keep(kv_r);
+                const got = (try dsparkAttn(&sc, &m, &ly, q, win, kv, p0)) orelse return error.ExpectedFusedDsparkAttn;
+                const want = try dsparkHeadsOps(&sc, &m, &ly, .{ .q = q, .kv = kv, .qr = none }, win, p0, try sc.i(ci(p0)));
+                const gh = try hostF32(got);
+                defer gpa.free(gh);
+                const wh = try hostF32(want);
+                defer gpa.free(wh);
+                const rel = dkern.relRms(gh, wh);
+                const tol: f32 = switch (act) {
+                    .bfloat16 => 2e-2,
+                    .float16 => 5e-3,
+                    else => 5e-3,
+                };
+                for (gh, wh) |a, b| try testing.expectApproxEqAbs(b, a, tol * @max(1.0, @abs(b)));
+                const rel_tol: f64 = switch (act) {
+                    .bfloat16 => 1e-2,
+                    .float16 => 2e-3,
+                    else => 2e-3,
+                };
+                try testing.expect(rel < rel_tol);
+            };
+        }
+    }
+}
+
+test "dsv41 dspark: ubench ABBA fused dsparkAttn and batched markov vs unfused ops (DSV41_DEC_UBENCH)" {
+    if (std.c.getenv("DSV41_DEC_UBENCH") == null or !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const iou = @import("../../sdk/util/io_util.zig");
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    m.s = sc.s;
+    m.qat_off = true;
+    m.act = .bfloat16;
+    m.cfg = .{};
+    m.cfg.sliding_window = 128;
+    m.cfg.head_dim = 512;
+    m.cfg.num_attention_heads = 64;
+    m.cfg.dsv4_rope_head_dim = 64;
+    m.rope_kernel = try buildKernel("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, ROPE_TAIL_SOURCE, FP8_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.rope_kernel);
+    m.dspark_attn_kernel = try buildKernel("dsv41_dspark_attn", &DSPARK_ATTN_INS, &.{"out"}, DSPARK_ATTN_SOURCE, UNROPE_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.dspark_attn_kernel.?);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 0xD5));
+    var per: [32]f32 = undefined;
+    for (&per, 0..) |*v, k| v.* = -std.math.pow(f32, 10000, @as(f32, @floatFromInt(k)) / 32);
+    m.rope_plain.inv = try sc.keep(mlx.mlx_array_new_data(&per, &[_]c_int{32}, 1, .float32));
+
+    const rnd = struct {
+        fn n(sc_: *Scope, k_: A, sh: []const c_int, dt: mlx.mlx_dtype) !A {
+            var o = mlx.mlx_array_new();
+            const a = try sc_.res(mlx.mlx_random_normal(&o, sh.ptr, sh.len, dt, 0, 1, k_, sc_.s), &o);
+            try evalAll(&.{a});
+            return a;
+        }
+    };
+    // 1) dsparkAttn vs dsparkHeadsOps (B=5, H=64, D=512, window=128, 3 stages per draft -> report per-stage & 3-stage)
+    const B: usize = 5;
+    const H: usize = 64;
+    const D: usize = 512;
+    var ly: Layer = undefined;
+    ly.sink = try rnd.n(&sc, key, &.{ 1, ci(H), 1 }, .float32);
+    const win: Ring = .{ .buf = try rnd.n(&sc, key, &.{ 144, ci(D) }, .bfloat16), .cap = 144, .width = D };
+    const q = try rnd.n(&sc, key, &.{ ci(B), ci(H), ci(D) }, .bfloat16);
+    const kv = try rnd.n(&sc, key, &.{ ci(B), ci(D) }, .bfloat16);
+    const pos = try sc.i(3001);
+    const stages = 60;
+    const measureAttn = struct {
+        fn run(sc_: *Scope, m_: *const Dsv41Model, ly_: *const Layer, q_: A, win_: Ring, kv_: A, pos_: A, fused: bool, io_: std.Io) !f64 {
+            var times: [7]f64 = undefined;
+            for (0..2 + times.len) |rep| {
+                var cur = q_;
+                const t0 = iou.nowUsMonotonic(io_);
+                for (0..stages) |_| {
+                    const out = if (fused)
+                        (try dsparkAttn(sc_, m_, ly_, cur, win_, kv_, 3001)).?
+                    else
+                        try dsparkHeadsOps(sc_, m_, ly_, .{ .q = cur, .kv = kv_, .qr = none }, win_, 3001, pos_);
+                    cur = out;
+                }
+                try evalAll(&.{cur});
+                const us = @as(f64, @floatFromInt(iou.nowUsMonotonic(io_) - t0)) / stages;
+                if (rep >= 2) times[rep - 2] = us;
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            return times[times.len / 2];
+        }
+    };
+    // ABBA
+    const a1 = try measureAttn.run(&sc, &m, &ly, q, win, kv, pos, false, io);
+    const b1 = try measureAttn.run(&sc, &m, &ly, q, win, kv, pos, true, io);
+    const b2 = try measureAttn.run(&sc, &m, &ly, q, win, kv, pos, true, io);
+    const a2 = try measureAttn.run(&sc, &m, &ly, q, win, kv, pos, false, io);
+    std.debug.print("[dspark-ubench] dsparkAttn (B=5 H=64 D=512 W=128) ABBA: unfused {d:.1} / {d:.1} us, fused {d:.1} / {d:.1} us (mean {d:.2}x)\n", .{
+        a1, a2, b1, b2, (a1 + a2) / (b1 + b2),
+    });
+
+    // 2) Batched Markov (N=4, B=5, V=129280, R=256, D=5120) fused vs unfused MLX ops
+    const N: usize = 4;
+    const V: usize = 129280;
+    const R: usize = 256;
+    const Dm: usize = 5120;
+    const lg = try rnd.n(&sc, key, &.{ ci(N), ci(B), ci(V) }, .float32);
+    const hout = try rnd.n(&sc, key, &.{ ci(N), ci(B), ci(Dm) }, .bfloat16);
+    const emb = try rnd.n(&sc, key, &.{ ci(V), ci(R) }, .bfloat16);
+    const mh = try rnd.n(&sc, key, &.{ ci(V), ci(R) }, .bfloat16);
+    const cw = try sc.astype(try rnd.n(&sc, key, &.{ 1, ci(Dm + R) }, .bfloat16), .float32);
+    try evalAll(&.{cw});
+    const t1s_v = [_]i32{ 5, 11, 29, 43 };
+    const t1 = try sc.ints(&t1s_v, &.{ci(N)});
+    const measureMk = struct {
+        fn run(sc_: *Scope, lg_: A, hout_: A, t1_: A, emb_: A, mh_: A, cw_: A, fused: bool, io_: std.Io) !f64 {
+            const mk_steps = 8;
+            var times: [5]f64 = undefined;
+            for (0..2 + times.len) |rep| {
+                var evs: [mk_steps * 2]A = undefined;
+                const t0 = iou.nowUsMonotonic(io_);
+                for (0..mk_steps) |si| {
+                    if (fused) {
+                        const o = (try markov.chain(sc_.s, .{ .logits = lg_, .hout = hout_, .t1 = t1_, .emb = emb_, .mh = mh_, .cw = cw_, .want_conf = true, .keep = false })).?;
+                        evs[2 * si] = try sc_.keep(o.toks);
+                        evs[2 * si + 1] = try sc_.keep(o.conf.?);
+                    } else {
+                        var cur = t1_;
+                        var toks: [16]A = undefined;
+                        var confs: [16]A = undefined;
+                        for (0..B) |k| {
+                            const e = try sc_.take(emb_, cur, 0);
+                            const me = try sc_.astype(e, .float32);
+                            const bias = try sc_.astype(try sc_.matmul(try sc_.astype(e, .bfloat16), try sc_.t2(mh_)), .float32);
+                            const row = try sc_.add(try sc_.reshape(try sc_.slice(lg_, 1, k, k + 1), &.{ ci(N), -1 }), bias);
+                            confs[k] = try sc_.matmul(try sc_.concat(&.{ try sc_.astype(try sc_.reshape(try sc_.slice(hout_, 1, k, k + 1), &.{ ci(N), ci(Dm) }), .float32), me }, -1), try sc_.t2(cw_));
+                            cur = try sc_.astype(try sc_.argmax(row, -1), .int32);
+                            toks[k] = cur;
+                        }
+                        const all = try sc_.stack(toks[0..B], 1);
+                        const cf = try sc_.astype(try sc_.concat(confs[0..B], -1), .float32);
+                        evs[2 * si] = all;
+                        evs[2 * si + 1] = cf;
+                    }
+                }
+                try evalAll(&evs);
+                const us = @as(f64, @floatFromInt(iou.nowUsMonotonic(io_) - t0)) / mk_steps;
+                if (rep >= 2) times[rep - 2] = us;
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            return times[times.len / 2];
+        }
+    };
+    const ma1 = try measureMk.run(&sc, lg, hout, t1, emb, mh, cw, false, io);
+    const mb1 = try measureMk.run(&sc, lg, hout, t1, emb, mh, cw, true, io);
+    const mb2 = try measureMk.run(&sc, lg, hout, t1, emb, mh, cw, true, io);
+    const ma2 = try measureMk.run(&sc, lg, hout, t1, emb, mh, cw, false, io);
+    std.debug.print("[dspark-ubench] batched markov (N=4 B=5 V=129280 R=256) ABBA: unfused {d:.1} / {d:.1} us, fused {d:.1} / {d:.1} us (mean {d:.2}x)\n", .{
+        ma1, ma2, mb1, mb2, (ma1 + ma2) / (mb1 + mb2),
+    });
 }
 
 /// A model with only the hc kernels built, at the release's widths.

@@ -123,27 +123,32 @@ fn ci(v: usize) c_int {
     return @intCast(v);
 }
 
-/// The fused chain's arrays for one draft (lazy), or null where `plan.refusal` keeps the op chain.
+/// The fused chain's arrays for one draft `[B, V]` or a batch `[N, B, V]` (lazy), or null where `plan.refusal` keeps the op chain.
 pub fn chain(s: mlx.mlx_stream, in: In) !?Out {
+    const l_sh = mlx.getShape(in.logits);
+    const h_sh = mlx.getShape(in.hout);
+    if (l_sh.len != 2 and l_sh.len != 3) return error.MarkovShape;
+    const batched = l_sh.len == 3;
+    const N: usize = if (batched) @intCast(l_sh[0]) else 1;
+    const B: usize = @intCast(l_sh[l_sh.len - 2]);
+    const V: usize = @intCast(l_sh[l_sh.len - 1]);
     const sh: plan.Shape = .{
         .act = dt(in.mh),
         .embed = dt(in.emb),
         .hout = dt(in.hout),
         .vocab = dimOf(in.mh, 0),
         .rank = dimOf(in.mh, 1),
-        .dim = dimOf(in.hout, 1),
-        .block = dimOf(in.logits, 0),
+        .dim = if (h_sh.len >= 2) @intCast(h_sh[h_sh.len - 1]) else 0,
+        .block = B,
     };
     if (plan.refusal(sh)) |r| {
         if (!refusal_said) log.info("deepseek_v41: Markov chain: the draft keeps the op chain ({s})\n", .{@tagName(r)});
         refusal_said = true;
         return null;
     }
-    if (dimOf(in.emb, 0) != sh.vocab or dimOf(in.emb, 1) != sh.rank or dimOf(in.logits, 1) != sh.vocab or dimOf(in.hout, 0) != sh.block) return error.MarkovShape;
+    if (N == 0 or dimOf(in.emb, 0) != sh.vocab or dimOf(in.emb, 1) != sh.rank or V != sh.vocab or h_sh.len != l_sh.len or (batched and dimOf(in.hout, 0) != N) or dimOf(in.hout, h_sh.len - 2) != B or dimOf(in.t1, 0) != N) return error.MarkovShape;
     const k = try kernels();
     const conf = in.want_conf and plan.confFused(sh, try confExact(in.cw));
-    const B = sh.block;
-    const V = sh.vocab;
     const nt = plan.step_groups;
     const act = mlx.mlx_array_dtype(in.mh);
     const edt = mlx.mlx_array_dtype(in.emb);
@@ -159,9 +164,15 @@ pub fn chain(s: mlx.mlx_stream, in: In) !?Out {
     for (0..B) |p| {
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ci((p + 1) * nt * 2)}, 1, .uint32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ci(if (in.keep) V else 1)}, 1, .float32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(nt * plan.step_threads), 1, 1));
+        if (batched) {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(N), ci((p + 1) * nt * 2) }, 2, .uint32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(N), ci(if (in.keep) V else 1) }, 2, .float32));
+        } else {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ci((p + 1) * nt * 2)}, 1, .uint32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ci(if (in.keep) V else 1)}, 1, .float32));
+        }
+        const nb: usize = if (batched) @min(N, 4) else 1;
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(nt * plan.step_threads), ci((N + nb - 1) / nb), 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(plan.step_threads), 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", act));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "E", edt));
@@ -171,6 +182,7 @@ pub fn chain(s: mlx.mlx_stream, in: In) !?Out {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NT", ci(nt)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KEEP", if (in.keep) 1 else 0));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ZZ", 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NB", ci(nb)));
         var o: [2]A = undefined;
         try apply(k.step, cfg, &.{ in.logits, in.emb, in.mh, in.t1, pin }, s, &o);
         _ = mlx.mlx_array_free(pin);
@@ -182,9 +194,14 @@ pub fn chain(s: mlx.mlx_stream, in: In) !?Out {
     }
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ci(B)}, 1, .int32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ci(if (conf) B else 1)}, 1, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(plan.final_threads), ci(B), 1));
+    if (batched) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(N), ci(B) }, 2, .int32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(N), ci(if (conf) B else 1) }, 2, .float32));
+    } else {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ci(B)}, 1, .int32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ci(if (conf) B else 1)}, 1, .float32));
+    }
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(plan.final_threads), ci(B), ci(N)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(plan.final_threads), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "B", ci(B)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NT", ci(nt)));
@@ -205,7 +222,7 @@ pub fn chain(s: mlx.mlx_stream, in: In) !?Out {
         const vec = mlx.mlx_vector_array_new_data(&rows, n_rows);
         defer _ = mlx.mlx_vector_array_free(vec);
         var r = mlx.mlx_array_new();
-        mlx.check(mlx.mlx_stack_axis(&r, vec, 0, s)) catch |e| {
+        mlx.check(mlx.mlx_stack_axis(&r, vec, if (batched) 1 else 0, s)) catch |e| {
             _ = mlx.mlx_array_free(r);
             return e;
         };
@@ -238,4 +255,91 @@ pub fn warm(s: mlx.mlx_stream, emb: A, mh: A, cw: A, hout_dtype: mlx.mlx_dtype, 
     const vec = mlx.mlx_vector_array_new_data(&ev, ev.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_eval(vec));
+}
+
+const testing = std.testing;
+
+test "markov: batched chain (N > 1) matches per-state chain and op chain bit for bit" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const gpa = testing.allocator;
+    const N = 3;
+    const B = 4;
+    const V = 256;
+    const R = 128;
+    const D = 64;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 0x42));
+    var lg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lg);
+    try mlx.check(mlx.mlx_random_normal(&lg, &[_]c_int{ N, B, V }, 3, .float32, 0, 2, key, s));
+    var hout = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hout);
+    try mlx.check(mlx.mlx_random_normal(&hout, &[_]c_int{ N, B, D }, 3, .bfloat16, 0, 1, key, s));
+    var emb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(emb);
+    try mlx.check(mlx.mlx_random_normal(&emb, &[_]c_int{ V, R }, 2, .bfloat16, 0, 1, key, s));
+    var mh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mh);
+    try mlx.check(mlx.mlx_random_normal(&mh, &[_]c_int{ V, R }, 2, .bfloat16, 0, 1, key, s));
+    var cw_bf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cw_bf);
+    try mlx.check(mlx.mlx_random_normal(&cw_bf, &[_]c_int{ 1, D + R }, 2, .bfloat16, 0, 0.5, key, s));
+    var cw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cw);
+    try mlx.check(mlx.mlx_astype(&cw, cw_bf, .float32, s));
+    const t1s = [_]i32{ 3, 17, 200 };
+    const t1 = mlx.mlx_array_new_data(&t1s, &[_]c_int{N}, 1, .int32);
+    defer _ = mlx.mlx_array_free(t1);
+    const ev0 = mlx.mlx_vector_array_new_data(&[_]A{ lg, hout, emb, mh, cw }, 5);
+    defer _ = mlx.mlx_vector_array_free(ev0);
+    try mlx.check(mlx.mlx_eval(ev0));
+
+    const batched = (try chain(s, .{ .logits = lg, .hout = hout, .t1 = t1, .emb = emb, .mh = mh, .cw = cw, .want_conf = true, .keep = true })) orelse return error.ExpectedBatchedMarkov;
+    defer {
+        _ = mlx.mlx_array_free(batched.toks);
+        if (batched.conf) |x| _ = mlx.mlx_array_free(x);
+        if (batched.rows) |x| _ = mlx.mlx_array_free(x);
+    }
+    const ev1 = mlx.mlx_vector_array_new_data(&[_]A{ batched.toks, batched.conf.?, batched.rows.? }, 3);
+    defer _ = mlx.mlx_vector_array_free(ev1);
+    try mlx.check(mlx.mlx_eval(ev1));
+    const b_toks = mlx.mlx_array_data_int32(batched.toks).?[0 .. N * B];
+    const b_conf = mlx.mlx_array_data_float32(batched.conf.?).?[0 .. N * B];
+    const b_rows = mlx.mlx_array_data_float32(batched.rows.?).?[0 .. N * B * V];
+
+    for (0..N) |n| {
+        var lg_n = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lg_n);
+        try mlx.check(mlx.mlx_slice(&lg_n, lg, &[_]c_int{ ci(n), 0, 0 }, 3, &[_]c_int{ ci(n + 1), B, V }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        var lg_2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lg_2);
+        try mlx.check(mlx.mlx_reshape(&lg_2, lg_n, &[_]c_int{ B, V }, 2, s));
+        var h_n = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h_n);
+        try mlx.check(mlx.mlx_slice(&h_n, hout, &[_]c_int{ ci(n), 0, 0 }, 3, &[_]c_int{ ci(n + 1), B, D }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        var h_2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h_2);
+        try mlx.check(mlx.mlx_reshape(&h_2, h_n, &[_]c_int{ B, D }, 2, s));
+        var t_n = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(t_n);
+        try mlx.check(mlx.mlx_slice(&t_n, t1, &[_]c_int{ci(n)}, 1, &[_]c_int{ci(n + 1)}, 1, &[_]c_int{1}, 1, s));
+        const solo = (try chain(s, .{ .logits = lg_2, .hout = h_2, .t1 = t_n, .emb = emb, .mh = mh, .cw = cw, .want_conf = true, .keep = true })).?;
+        defer {
+            _ = mlx.mlx_array_free(solo.toks);
+            if (solo.conf) |x| _ = mlx.mlx_array_free(x);
+            if (solo.rows) |x| _ = mlx.mlx_array_free(x);
+        }
+        const ev2 = mlx.mlx_vector_array_new_data(&[_]A{ solo.toks, solo.conf.?, solo.rows.? }, 3);
+        defer _ = mlx.mlx_vector_array_free(ev2);
+        try mlx.check(mlx.mlx_eval(ev2));
+        const s_toks = mlx.mlx_array_data_int32(solo.toks).?[0..B];
+        const s_conf = mlx.mlx_array_data_float32(solo.conf.?).?[0..B];
+        const s_rows = mlx.mlx_array_data_float32(solo.rows.?).?[0 .. B * V];
+        try testing.expectEqualSlices(i32, s_toks, b_toks[n * B ..][0..B]);
+        for (s_conf, b_conf[n * B ..][0..B]) |a, b| try testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+        for (s_rows, b_rows[n * B * V ..][0 .. B * V]) |a, b| try testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+    }
+    _ = gpa;
 }
