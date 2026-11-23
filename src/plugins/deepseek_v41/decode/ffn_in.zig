@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
+const device = @import("../../../mlx/device.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mxfp8_qmv = @import("../../../sdk/blocks/qmm/mxfp8_qmv.zig");
@@ -20,7 +21,7 @@ const mixes = (2 + hc) * hc;
 
 const A_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in.metal");
 const B_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_post.metal");
-const HEADER = mxfp8_qmv.HEADER;
+const HEADER = mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal");
 
 const A_INS = [_][*:0]const u8{ "oa", "w_q", "scales", "x", "spre", "spost", "scomb" };
 /// `ctr`, `parts` and `scores` are launch 2's scratch: launch 1 zeroes the counters and writes neither of the others.
@@ -52,11 +53,20 @@ fn ci(v: usize) c_int {
 // ── launch geometry ──
 
 /// Launch 1: simdgroups a threadgroup, K steps loaded ahead, and the output columns a simdgroup: two once the rows' x
-/// reads outweigh the weights.
+/// reads outweigh the weights. From `a_nax_rows` on NAX hardware, `a_nax_nsg` simdgroups split K over 32 output rows.
 const a_nsg: usize = 8;
+const a_nax_nsg: usize = 4;
+const a_nax_nr: usize = 32;
+const a_nax_rows: usize = 4;
 const a_unroll: usize = 2;
-fn aCols(rows: usize) usize {
-    return if (rows > 4) 2 else 1;
+fn aCols(rows: usize, nax: bool) usize {
+    return if (nax) a_nax_nr else if (rows > 4) 2 else 1;
+}
+fn aNsg(nax: bool) usize {
+    return if (nax) a_nax_nsg else a_nsg;
+}
+fn useNaxA(p: Dims) bool {
+    return p.rows >= a_nax_rows and p.rows <= 8 and device.naxAvailable() and servesA(p, true);
 }
 /// Launch 2: columns a mix slice, experts a router threadgroup (two simdgroups an expert), threads a threadgroup.
 const slice_cols: usize = 128;
@@ -76,14 +86,15 @@ pub const Dims = struct {
 
 pub const TArg = struct { name: [*:0]const u8, v: usize };
 
-fn servesA(p: Dims) bool {
-    return p.rows >= 1 and p.rows <= decode.max_rows and p.d % (a_nsg * aCols(p.rows)) == 0 and p.d >= slice_cols and p.k % (512 * a_unroll) == 0;
+fn servesA(p: Dims, nax: bool) bool {
+    if (nax) return p.rows >= a_nax_rows and p.rows <= 8 and p.d >= slice_cols and p.d % a_nax_nr == 0 and p.k > 0 and p.k % 512 == 0;
+    return p.rows >= 1 and p.rows <= decode.max_rows and p.d % (a_nsg * aCols(p.rows, false)) == 0 and p.d >= slice_cols and p.k % (512 * a_unroll) == 0;
 }
 
-/// Floats of threadgroup memory launch 2 uses: a router threadgroup's h2 rows, the slices' partials with the reduced
-/// mixes, or the scores with their biased values.
+/// Floats of threadgroup memory launch 2 uses: a router threadgroup's 512-column h2 chunk, the reduced mixes, or
+/// one row of router scores and their biased values.
 fn bWords(p: Dims) usize {
-    return @max(@max(rowsTg(p) * (p.d / 2 + 16), p.rows * (slices(p) + 1) * (mixes + 1)), 2 * p.rows * p.e);
+    return @max(@max(rowsTg(p) * 256 + 16 * rowsTg(p), p.rows * (mixes + 1)), 2 * p.e);
 }
 
 fn servesB(p: Dims) bool {
@@ -95,7 +106,7 @@ fn servesB(p: Dims) bool {
 /// Whether the launches take `p` (rows 1..6, D a multiple of 512 up to 6144, K a multiple of 1024); otherwise the caller
 /// keeps today's chain.
 pub fn serves(p: Dims) bool {
-    return servesA(p) and servesB(p);
+    return (servesA(p, false) or useNaxA(p)) and servesB(p);
 }
 
 fn slices(p: Dims) usize {
@@ -106,9 +117,9 @@ fn routerGroups(p: Dims) usize {
     return (p.e + experts_tg - 1) / experts_tg;
 }
 
-/// Rows a router threadgroup takes: it reads its experts' gate rows once for all of them.
+/// Rows a router threadgroup takes: all decode rows at once when batched up to 6.
 fn rowsTg(p: Dims) usize {
-    return @min(p.rows, 3);
+    return @min(p.rows, 6);
 }
 
 fn routerTgs(p: Dims) usize {
@@ -120,18 +131,18 @@ fn partsLen(p: Dims) usize {
     return p.rows * slices(p) * (mixes + 1);
 }
 
-fn gridA(p: Dims) usize {
-    return p.d / aCols(p.rows) * 32;
+fn gridA(p: Dims, nax: bool) usize {
+    return if (nax) p.d / a_nax_nr * a_nax_nsg * 32 else p.d / aCols(p.rows, false) * 32;
 }
 
 fn gridB(p: Dims) usize {
     return (slices(p) + routerTgs(p)) * b_threads;
 }
 
-fn aTargs(p: Dims) [7]TArg {
+fn aTargs(p: Dims, nax: bool) [8]TArg {
     return .{
-        .{ .name = "R", .v = p.rows }, .{ .name = "NSG", .v = a_nsg }, .{ .name = "NR", .v = aCols(p.rows) }, .{ .name = "U", .v = a_unroll },
-        .{ .name = "K", .v = p.k },    .{ .name = "D", .v = p.d },     .{ .name = "HC", .v = hc },
+        .{ .name = "R", .v = p.rows },          .{ .name = "NSG", .v = aNsg(nax) }, .{ .name = "NR", .v = aCols(p.rows, nax) }, .{ .name = "U", .v = a_unroll },
+        .{ .name = "K", .v = p.k },             .{ .name = "D", .v = p.d },          .{ .name = "HC", .v = hc },                  .{ .name = "NAX", .v = @intFromBool(nax) },
     };
 }
 
@@ -194,13 +205,14 @@ fn run(comptime n: usize, sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, ins
 /// Launch 1 for `p.rows` rows: wo_b over `oa` `[R, K]`, then each output column's hc expand with `x` `[R, 4, D]` and `sa`
 /// (the attention's split), and the collapse; it also zeroes launch 2's counters and sizes its scratch.
 pub fn launchA(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, oa: A, x: A, sa: *const dsv41.Split) !AOut {
+    const nax = useNaxA(p);
     const a = try run(5, sc, ks.a, &.{ oa, w.wo_w, w.wo_s, x, sa.pre, sa.post, sa.comb }, .{
         .{ .shape = &.{ ci(p.rows), hc, ci(p.d) }, .dt = act },
         .{ .shape = &.{ ci(p.rows), ci(p.d) }, .dt = act },
         .{ .shape = &.{16}, .dt = .uint32 },
         .{ .shape = &.{ci(partsLen(p))}, .dt = .float32 },
         .{ .shape = &.{ ci(p.rows), ci(p.e) }, .dt = .float32 },
-    }, gridA(p), a_nsg * 32, &aTargs(p));
+    }, gridA(p, nax), aNsg(nax) * 32, &aTargs(p, nax));
     return .{ .x1 = a[0], .hv = a[1], .ctr = a[2], .parts = a[3], .logits = a[4] };
 }
 
@@ -285,23 +297,24 @@ fn depthB(s: Shape) usize {
 
 /// wo_b over the attention output, then each column's expand and collapse. Shape: rows, D columns, K.
 const FfnA = struct {
-    pub const Params = struct {};
+    pub const Params = struct { nax: bool = false };
 
     fn dims(s: Shape) Dims {
         return .{ .rows = s.rows, .d = s.n, .k = s.k };
     }
 
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+    pub fn geometry(par: Params, s: Shape) ?metal.Geometry {
         const p = dims(s);
-        if (!servesA(p)) return null;
+        if (!servesA(p, par.nax)) return null;
+        if (!par.nax and s.rows > decode.max_rows) return null;
         // The counters, partials and scores are launch 2's scratch (launch 1 writes only the counters).
-        var g = metal.Geometry{ .grid = .{ ci(gridA(p)), 1, 1 }, .tg = .{ ci(a_nsg * 32), 1, 1 }, .unread = 0b11100 };
+        var g = metal.Geometry{ .grid = .{ ci(gridA(p, par.nax)), 1, 1 }, .tg = .{ ci(aNsg(par.nax) * 32), 1, 1 }, .unread = 0b11100 };
         g.out(&.{ ci(p.rows), hc, ci(p.d) }, act);
         g.out(&.{ ci(p.rows), ci(p.d) }, act);
         g.out(&.{16}, .uint32);
         g.out(&.{ci(partsLen(p))}, .float32);
         g.out(&.{ ci(p.rows), ci(p.e) }, .float32);
-        for (aTargs(p)) |t| g.int(t.name, t.v);
+        for (aTargs(p, par.nax)) |t| g.int(t.name, t.v);
         g.dtype("T", act);
         return g;
     }
@@ -801,12 +814,22 @@ const launch_a = metal.Launch{
     .m1 = 512,
     .m2 = 512,
 };
+const launch_a_nax = metal.Launch{
+    .name = "dsv41_dec_ffn_in",
+    .inputs = &A_INS,
+    .outputs = &A_OUTS,
+    .source = A_SOURCE,
+    .header = HEADER,
+    .tg_bytes = 4 * (a_nax_nsg - 1) * 8 * a_nax_nr,
+    .offline = false,
+    .min_gen = 17,
+};
 const launch_b = metal.Launch{
     .name = "dsv41_dec_ffn_in_post",
     .inputs = &B_INS,
     .outputs = &B_OUTS,
     .source = B_SOURCE,
-    .tg_bytes = 4 * 7728 + 4,
+    .tg_bytes = 4 * 1632 + 4,
     .m1 = 704,
     .m2 = 704,
 };
@@ -823,6 +846,17 @@ pub fn register(set: *kc.Set) !void {
         .nan = nan_rule,
         .tiles = .{ .{ .size = 3 }, .{ .size = 128, .step = 128, .min = 128 }, .{ .size = 1024, .step = 1024, .min = 1024 } },
         .served = &.{ .{ .rows = 1, .n = 256, .k = 8192 }, .{ .rows = 6, .n = 256, .k = 8192 }, .{ .rows = 1, .n = 5120, .k = 8192 } },
+    });
+    try kit.add(set, FfnA, &launch_a_nax, .{ .nax = true }, .{
+        .name = "dsv41 dec ffn_in A (matrix units)",
+        .accum = .f32,
+        .depth = depthA,
+        .mids = 1,
+        .out = .bf16,
+        .nan = nan_rule,
+        .tiles = .{ .{}, .{ .size = 128, .step = 128, .min = 128 }, .{ .size = 512, .step = 512, .min = 512 } },
+        .served = &.{ .{ .rows = a_nax_rows, .n = 256, .k = 8192 }, .{ .rows = decode.max_rows, .n = 256, .k = 8192 }, .{ .rows = decode.max_rows, .n = 5120, .k = 8192 } },
+        .nax = true,
     });
     try kit.add(set, FfnB, &launch_b, .{}, .{
         .name = "dsv41 dec ffn_in B (mixes, split, norm, router)",
@@ -1178,6 +1212,18 @@ test "dsv41 dec ffn_in: the contract's launches write the shipped wrapper's byte
     const a = try launchA(&sc, ks, pa, wa, ca.args[0], ca.args[3], &sa);
     try std.testing.expect(try sameBytes(&ca.rig, a.x1, ca.rig.output(0)));
     try std.testing.expect(try sameBytes(&ca.rig, a.hv, ca.rig.output(1)));
+    if (device.naxAvailable()) {
+        var can = kit.Case(FfnA).init(gpa, &launch_a_nax, .{ .nax = true });
+        defer can.deinit();
+        try std.testing.expect(try can.prepare(.{ .rows = 6, .n = 256, .k = 8192 }, .random, 7));
+        try can.run();
+        const pan: Dims = .{ .rows = 6, .d = 256 };
+        const san: dsv41.Split = .{ .pre = can.args[4], .post = can.args[5], .comb = can.args[6] };
+        const wan: Weights = .{ .wo_w = can.args[1], .wo_s = can.args[2], .fn_w = none, .fn_scale = none, .fn_base = none, .norm_w = none, .gate_w = none, .gate_bias = none };
+        const an = try launchA(&sc, ks, pan, wan, can.args[0], can.args[3], &san);
+        try std.testing.expect(try sameBytes(&can.rig, an.x1, can.rig.output(0)));
+        try std.testing.expect(try sameBytes(&can.rig, an.hv, can.rig.output(1)));
+    }
     var cb = kit.Case(FfnB).init(gpa, &launch_b, .{});
     defer cb.deinit();
     try std.testing.expect(try cb.prepare(.{ .rows = 3, .n = 5120, .k = 384 }, .random, 9));

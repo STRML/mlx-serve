@@ -209,7 +209,7 @@ pub fn select(sc: *Scope, m: *const dsv41.Dsv41Model, k: *const Kernels, a: Args
 pub fn selectG(sc: *Scope, g: Geom, k: *const Kernels, a: Args) !?Out {
     if (!mlx.streamIsGpu(sc.s) or mlx.mlx_array_dtype(a.scores) != .float32) return null;
     const sh = mlx.getShape(a.scores);
-    if (sh.len != 2 or sh[0] < 1 or sh[0] > decode.max_rows or sh[1] < 1 or g.k == 0 or g.k > 1024 or g.bs == 0 or g.kb == 0) return null;
+    if (sh.len != 2 or sh[0] < 1 or sh[0] > decode.batch_rows or sh[1] < 1 or g.k == 0 or g.k > 1024 or g.bs == 0 or g.kb == 0) return null;
     const rows: usize = @intCast(sh[0]);
     const n: usize = @intCast(sh[1]);
     const tg: usize = @intCast(k.tg);

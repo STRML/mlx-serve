@@ -9,10 +9,10 @@ constexpr int NCH = D / 8;
 constexpr int NC = D / 512;
 constexpr int W = D / P;
 constexpr int NRT = G * ((R + RG - 1) / RG);
-constexpr int TH = RG * NCH * 4;
+constexpr int TH = RG * 256;
 constexpr int T0 = TH + 16 * RG;
-constexpr int T1 = R * P * PL + R * PL;
-constexpr int T2 = 2 * R * E;
+constexpr int T1 = R * PL;
+constexpr int T2 = 2 * E;
 constexpr int TGM = (T0 > T1 ? (T0 > T2 ? T0 : T2) : (T1 > T2 ? T1 : T2));
 const int tg = int(threadgroup_position_in_grid.x);
 const int tid = int(thread_index_in_threadgroup);
@@ -63,15 +63,13 @@ if (is_mix) {
   }
 } else {
   threadgroup uint4* h2s = (threadgroup uint4*)tgm4;
-  // The sums of squares of each simdgroup's rows, then the two halves of each expert's dots.
+  // Sums of squares across the TG, then 512-column chunked h2 into 4 experts/TG (two simdgroups per expert).
   threadgroup float* red = tgm + TH;
   const int rt = tg - P;
   const int gi = rt % G;
   const int r0 = (rt / G) * RG;
   const int e = gi * 4 + sg / 2;
   const int half_c = (sg & 1) * NC;
-  uint4 gw[NC];
-  for (int c = 0; c < NC; ++c) gw[c] = e < E ? ((const device uint4*)(gate_w + (size_t)e * D))[(half_c + c) * 32 + lane] : uint4(0u);
   float ss[RG];
   for (int rr = 0; rr < RG; ++rr) ss[rr] = 0.0f;
   for (int j = 0; j < 3; ++j) {
@@ -97,40 +95,40 @@ if (is_mix) {
     for (int g = 0; g < 8; ++g) tot += red[g * RG + rr];
     inv[rr] = metal::precise::rsqrt(tot / float(D) + eps[0]);
   }
-  for (int j = 0; j < 3; ++j) {
-    const int q = tid + 256 * j;
-    if (q < NCH) {
-      const uint4 wq = ((const device uint4*)w)[q];
-      const uint wn[4] = {wq.x, wq.y, wq.z, wq.w};
-      for (int rr = 0; rr < RG; ++rr) if (r0 + rr < R) {
-        const uint4 h = ((const device uint4*)(hv + (size_t)(r0 + rr) * D))[q];
-        const uint wd[4] = {h.x, h.y, h.z, h.w};
-        uint o[4];
-        for (int i = 0; i < 4; ++i) {
-          const float a = as_type<float>(wd[i] << 16), b = as_type<float>(wd[i] & 0xffff0000u);
-          const float wa = as_type<float>(wn[i] << 16), wb = as_type<float>(wn[i] & 0xffff0000u);
-          const T ha = T(wa * float(T(a * inv[rr]))), hb = T(wb * float(T(b * inv[rr])));
-          o[i] = (uint(as_type<ushort>(hb)) << 16) | uint(as_type<ushort>(ha));
-        }
-        const uint4 ov = uint4(o[0], o[1], o[2], o[3]);
-        h2s[rr * NCH + q] = ov;
-        if (q % G == gi) ((device uint4*)(h2 + (size_t)(r0 + rr) * D))[q] = ov;
-      }
-    }
-  }
-  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
   float acc[RG];
   for (int rr = 0; rr < RG; ++rr) acc[rr] = 0.0f;
+  const int idx = tid & 63;
+  const int sub = tid >> 6;
   for (int c = 0; c < NC; ++c) {
-    const uint gv[4] = {gw[c].x, gw[c].y, gw[c].z, gw[c].w};
-    for (int rr = 0; rr < RG; ++rr) {
-      const uint4 hx = h2s[rr * NCH + (half_c + c) * 32 + lane];
+    const uint4 gw = e < E ? ((const device uint4*)(gate_w + (size_t)e * D))[(half_c + c) * 32 + lane] : uint4(0u);
+    const int q = idx < 32 ? c * 32 + idx : (NC + c) * 32 + (idx - 32);
+    const uint4 wq = ((const device uint4*)w)[q];
+    const uint wn[4] = {wq.x, wq.y, wq.z, wq.w};
+    for (int rr = sub; rr < RG; rr += 4) if (r0 + rr < R) {
+      const uint4 h = ((const device uint4*)(hv + (size_t)(r0 + rr) * D))[q];
+      const uint wd[4] = {h.x, h.y, h.z, h.w};
+      uint o[4];
+      for (int i = 0; i < 4; ++i) {
+        const float a = as_type<float>(wd[i] << 16), b = as_type<float>(wd[i] & 0xffff0000u);
+        const float wa = as_type<float>(wn[i] << 16), wb = as_type<float>(wn[i] & 0xffff0000u);
+        const T ha = T(wa * float(T(a * inv[rr]))), hb = T(wb * float(T(b * inv[rr])));
+        o[i] = (uint(as_type<ushort>(hb)) << 16) | uint(as_type<ushort>(ha));
+      }
+      const uint4 ov = uint4(o[0], o[1], o[2], o[3]);
+      h2s[rr * 64 + idx] = ov;
+      if (q % G == gi) ((device uint4*)(h2 + (size_t)(r0 + rr) * D))[q] = ov;
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    const uint gv[4] = {gw.x, gw.y, gw.z, gw.w};
+    for (int rr = 0; rr < RG; ++rr) if (r0 + rr < R) {
+      const uint4 hx = h2s[rr * 64 + (sg & 1) * 32 + lane];
       const uint hw[4] = {hx.x, hx.y, hx.z, hx.w};
       for (int i = 0; i < 4; ++i) {
         acc[rr] = metal::fma(as_type<float>(hw[i] << 16), as_type<float>(gv[i] << 16), acc[rr]);
         acc[rr] = metal::fma(as_type<float>(hw[i] & 0xffff0000u), as_type<float>(gv[i] & 0xffff0000u), acc[rr]);
       }
     }
+    if (c + 1 < NC) threadgroup_barrier(metal::mem_flags::mem_threadgroup);
   }
   for (int rr = 0; rr < RG; ++rr) {
     const float t = metal::simd_sum(acc[rr]);
@@ -157,15 +155,13 @@ if (!last) return;
 atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
 
 if (is_mix) {
-  threadgroup float* zr = tgm + R * P * PL;
-  for (int i = tid; i < R * P * PL; i += 256) tgm[i] = atomic_load_explicit(partsa + i, metal::memory_order_relaxed);
-  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-  // A simdgroup reduces whole (row, mix) columns over the slices: lanes stride them, then a tree.
+  threadgroup float* zr = tgm;
+  // A simdgroup reduces whole (row, mix) columns over the slices directly from device partials.
   #pragma clang loop unroll(disable)
   for (int pair = sg; pair < R * PL; pair += 8) {
     const int r = pair / PL, m = pair % PL;
     float v = 0.0f;
-    for (int p = int(lane); p < P; p += 32) v += tgm[(r * P + p) * PL + m];
+    for (int p = int(lane); p < P; p += 32) v += atomic_load_explicit(partsa + (r * P + p) * PL + m, metal::memory_order_relaxed);
     v = metal::simd_sum(v);
     if (lane == 0) zr[pair] = v;
   }
@@ -203,39 +199,41 @@ if (is_mix) {
     *(device float4*)(comb + (r * HC + i) * HC) = float4(v[0], v[1], v[2], v[3]);
   }
 } else {
-  // Scores and their biased values in threadgroup memory; a NaN is the lowest pick (lowest index first) and weighs NaN.
-  for (int i = tid; i < R * E; i += 256) {
-    const float s = atomic_load_explicit(scorea + i, metal::memory_order_relaxed);
-    const float b = s + bias[i % E];
-    tgm[i] = s;
-    tgm[R * E + i] = b == b ? b : -3.4e38f;
-  }
-  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-  if (sg < R) {
-    const int r = sg;
-    threadgroup float* vt = tgm + R * E + r * E;
-    float sum = 0.0f, mine_s = 0.0f;
-    int mine_e = 0;
-    #pragma clang loop unroll(disable)
-    for (int t = 0; t < TOPK; ++t) {
-      float bv = -INFINITY;
-      int be = 0x7fffffff;
-      for (int ex = int(lane); ex < E; ex += 32) {
-        const float x = vt[ex];
-        if (x > bv) { bv = x; be = ex; }
+  // Scores and their biased values in threadgroup memory one row at a time; a NaN is lowest, lowest index first.
+  for (int r = 0; r < R; ++r) {
+    for (int i = tid; i < E; i += 256) {
+      const float s = atomic_load_explicit(scorea + (size_t)r * E + i, metal::memory_order_relaxed);
+      const float b = s + bias[i];
+      tgm[i] = s;
+      tgm[E + i] = b == b ? b : -3.4e38f;
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      threadgroup float* vt = tgm + E;
+      float sum = 0.0f, mine_s = 0.0f;
+      int mine_e = 0;
+      #pragma clang loop unroll(disable)
+      for (int t = 0; t < TOPK; ++t) {
+        float bv = -INFINITY;
+        int be = 0x7fffffff;
+        for (int ex = int(lane); ex < E; ex += 32) {
+          const float x = vt[ex];
+          if (x > bv) { bv = x; be = ex; }
+        }
+        const float gv = metal::simd_max(bv);
+        const int pick = metal::simd_min(bv == gv ? be : 0x7fffffff);
+        const float s = tgm[pick];
+        if (int(lane) == t) { mine_s = s; mine_e = pick; }
+        if (lane == 0) vt[pick] = -INFINITY;
+        sum += s;
+        metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
       }
-      const float gv = metal::simd_max(bv);
-      const int pick = metal::simd_min(bv == gv ? be : 0x7fffffff);
-      const float s = tgm[r * E + pick];
-      if (int(lane) == t) { mine_s = s; mine_e = pick; }
-      if (lane == 0) vt[pick] = -INFINITY;
-      sum += s;
-      metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+      if (lane < TOPK) {
+        const float div = NORM ? sum + 1e-20f : 1.0f;
+        idx[r * TOPK + lane] = uint(mine_e);
+        wts[r * TOPK + lane] = mine_s / div * scal[0];
+      }
     }
-    if (lane < TOPK) {
-      const float div = NORM ? sum + 1e-20f : 1.0f;
-      idx[r * TOPK + lane] = uint(mine_e);
-      wts[r * TOPK + lane] = mine_s / div * scal[0];
-    }
+    if (r + 1 < R) threadgroup_barrier(metal::mem_flags::mem_threadgroup);
   }
 }

@@ -136,9 +136,9 @@ pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, 
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .bfloat16));
     const nc = downCols(K, N, hc) orelse return null;
     const tg = 32 * (topk + 1);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / nc * tg), ci(R), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / nc * tg), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
-    inline for (.{ .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "NC", nc } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    inline for (.{ .{ "R", R }, .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "NC", nc } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     const ins = [_]A{ act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
@@ -177,7 +177,7 @@ fn depth(s: Shape) usize {
 }
 
 const up_l = cv.launch("dsv41_dec_moe_fp4_up", &UP_INS, &.{"out"}, UP_SOURCE, HEADER, 0, up_threads, false);
-const down_l = cv.launch("dsv41_dec_moe_fp4_down", &DOWN_INS, &.{"out"}, DOWN_SOURCE, HEADER, 4 * (TOPK + 1), 32 * (TOPK + 1), false);
+const down_l = cv.launch("dsv41_dec_moe_fp4_down", &DOWN_INS, &.{"out"}, DOWN_SOURCE, HEADER, 4 * (decode.max_rows * 8 * (TOPK + 1) + 64 * 3 + 1), 32 * (TOPK + 1), false);
 
 /// e2m1 magnitudes by code bits 0..2; bit 3 is the sign.
 const e2m1 = [8]f64{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
@@ -436,8 +436,9 @@ const DownK = struct {
         if (s.rows < 1 or s.rows > decode.max_rows or s.n == 0 or s.k == 0 or s.k % 32 != 0 or p.experts < TOPK or p.experts > 64) return null;
         const nc = downCols(s.k, s.n, HC) orelse return null;
         const tg = 32 * (TOPK + 1);
-        var g = metal.Geometry{ .grid = .{ ci(s.n / nc * tg), ci(s.rows), 1 }, .tg = .{ tg, 1, 1 } };
+        var g = metal.Geometry{ .grid = .{ ci(s.n / nc * tg), 1, 1 }, .tg = .{ tg, 1, 1 } };
         g.out(&.{ ci(s.rows), HC, ci(s.n) }, adt);
+        g.int("R", s.rows);
         g.int("K", s.k);
         g.int("N", s.n);
         g.int("TOPK", TOPK);
@@ -892,4 +893,92 @@ test "dsv41 dec moe_fp4: the registered kernels pass the contract's gates 1-4" {
     var tally: kc.gates.Tally = .{};
     try kc.gates.runAll(testing.allocator, set.kernels.items, 0xc0de, &tally);
     try testing.expectEqual(@as(usize, 0), tally.problems());
+}
+
+test "dsv41 dec moe_fp4: ubench, R = 1 and 6 against today's chain (DSV41_DEC_UBENCH)" {
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const iou = @import("../../../sdk/util/io_util.zig");
+    const fx = try fp4Fixture(gpa);
+    defer fx.deinit();
+    const m = fx.m;
+    const ly = fx.layer(20);
+    const kern = try build(m.cfg.dsv4_swiglu_limit);
+    defer kern.deinit();
+    const topk = ly.top_k;
+    const hc = m.cfg.dsv4_hc_mult;
+    const hidden = m.cfg.hidden_size;
+    var prng = std.Random.DefaultPrng.init(0xf04b);
+    for ([_][2]usize{ .{ 1, 0 }, .{ 6, 0 }, .{ 6, 1 } }) |case| {
+        const rows = case[0];
+        const overlap = case[1] == 1;
+        const h2 = try fx.normal(&.{ ci(rows), ci(hidden) }, .bfloat16, 0, 1);
+        defer _ = mlx.mlx_array_free(h2);
+        const x1 = try fx.stream(rows);
+        defer _ = mlx.mlx_array_free(x1);
+        var ids: [64]u32 = undefined;
+        var ws: [64]f32 = undefined;
+        moe_up.route(prng.random(), if (overlap) .shared_all else .random, rows, topk, 16, &ids, &ws);
+        var sum_uniq: usize = 0;
+        var seen: [64]bool = @splat(false);
+        for (ids[0 .. rows * topk]) |e| if (!seen[e]) {
+            seen[e] = true;
+            sum_uniq += 1;
+        };
+        const idx = mlx.mlx_array_new_data(&ids, &[_]c_int{ ci(rows), ci(topk) }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(idx);
+        const wts = mlx.mlx_array_new_data(&ws, &[_]c_int{ ci(rows), ci(topk) }, 2, .float32);
+        defer _ = mlx.mlx_array_free(wts);
+        const sp_post = try fx.uniform(&.{ ci(rows), ci(hc) }, 0.05, 1.5);
+        defer _ = mlx.mlx_array_free(sp_post);
+        const sp_comb = try fx.uniform(&.{ ci(rows), ci(hc), ci(hc) }, -0.5, 0.5);
+        defer _ = mlx.mlx_array_free(sp_comb);
+        const sp: dsv41.Split = .{ .pre = none, .post = sp_post, .comb = sp_comb };
+        const steps = 16;
+        const measure = struct {
+            fn go(sc_gpa: std.mem.Allocator, f_new: bool, mod: *const dsv41.Dsv41Model, lyr: *const dsv41.Layer, k: Kernels, in_h2: A, in_x1: A, in_idx: A, in_wts: A, in_sp: *const dsv41.Split) !f64 {
+                var times: [7]f64 = undefined;
+                for (0..2 + times.len) |rep| {
+                    var sc = dsv41.Scope.init(sc_gpa, mlx.gpuStream());
+                    defer sc.deinit();
+                    var cur_h2 = in_h2;
+                    var cur_x1 = in_x1;
+                    for (0..steps) |_| {
+                        const out = if (f_new) blk: {
+                            const u_a = (try moeUp(&sc, mod, k, lyr, cur_h2, in_idx, in_wts)).?;
+                            break :blk (try moeDown(&sc, k, lyr, u_a, in_idx, cur_x1, in_sp)).?;
+                        } else blk: {
+                            const u_a = try todaysUp(&sc, mod, lyr, cur_h2, in_idx, in_wts);
+                            break :blk try todaysDown(&sc, mod, lyr, u_a, in_idx, cur_x1, in_sp);
+                        };
+                        cur_x1 = out;
+                        var sl = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_slice(&sl, out, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ ci(dims(in_h2, 0)), 1, ci(dims(in_h2, 1)) }, 3, &[_]c_int{ 1, 1, 1 }, 3, sc.s));
+                        try sc.items.append(sc.a, sl);
+                        var rs = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_reshape(&rs, sl, &[_]c_int{ ci(dims(in_h2, 0)), ci(dims(in_h2, 1)) }, 2, sc.s));
+                        try sc.items.append(sc.a, rs);
+                        cur_h2 = rs;
+                    }
+                    const t0 = iou.nowUsMonotonic(std.Io.Threaded.global_single_threaded.io());
+                    try mlx.check(mlx.mlx_array_eval(cur_x1));
+                    const dt = @as(f64, @floatFromInt(iou.nowUsMonotonic(std.Io.Threaded.global_single_threaded.io()) - t0)) / steps;
+                    if (rep >= 2) times[rep - 2] = dt;
+                }
+                std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+                return times[times.len / 2];
+            }
+        }.go;
+        var new_us: f64 = std.math.inf(f64);
+        var old_us: f64 = std.math.inf(f64);
+        for (0..3) |_| {
+            new_us = @min(new_us, try measure(gpa, true, m, ly, kern, h2, x1, idx, wts, &sp));
+            old_us = @min(old_us, try measure(gpa, false, m, ly, kern, h2, x1, idx, wts, &sp));
+        }
+        const inter = m.cfg.moe_intermediate_size;
+        const routed_b: f64 = @floatFromInt(sum_uniq * (3 * hidden * inter / 2 + 3 * hidden * inter / 32));
+        const shared_b: f64 = @floatFromInt(3 * hidden * inter + 3 * hidden * inter / 32);
+        std.debug.print("[dec-ubench] moe_fp4 {s} routing ({d} distinct experts):\n", .{ if (overlap) "overlapping" else "distinct", sum_uniq });
+        decode.report("moe_fp4", rows, new_us, routed_b + shared_b, old_us);
+    }
 }

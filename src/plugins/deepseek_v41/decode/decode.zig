@@ -23,8 +23,11 @@ const dsv41 = @import("../deepseek_v41.zig");
 
 const A = mlx.mlx_array;
 
-/// The most rows a decode kernel serves in one launch: a plain step, or a DSpark verify block.
+/// The most rows a single launch of a tiled decode kernel takes (`exact`, hardware contracts, M1/M2 caps).
 pub const max_rows = 6;
+
+/// The most rows a batched decode or DSpark verify block runs on the fused decode path (tiled at `max_rows` where needed).
+pub const batch_rows = 16;
 
 /// What this machine streams from memory in practice (a plain reduction on the M5 Ultra), bytes a microsecond.
 pub const stream_bytes_per_us: f64 = 1.065e6;
@@ -90,20 +93,83 @@ test "dsv41 dec layers: the fused kernels decode no further from an f32 model th
     for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 }, .{ 0, 1 } }) |range| try layersAgree(gpa, range[0], range[1], false);
 }
 
+test "dsv41 dec layers: L = 8 and 15 tiled verify on the fused kernels decode no further from an f32 model than today's chain" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |range| try layersAgreeSteps(gpa, range[0], range[1], false, &.{ 1, 1, 8, 15, 1 });
+}
+
+test "dsv41 dec batched: B = 2, 4, 8, 16 on TP1 + NAX fused kernels decode no further from an f32 model than today's chain" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const seeds = [_]u64{ 9, 1, 2, 3, 4, 5, 6 };
+    for ([_]usize{ 2, 4, 8, 16 }) |bsz| {
+        var ratio: [seeds.len]f64 = undefined;
+        for (seeds, 0..) |seed, si| {
+            var fxs: [3]*fixture.Fixture = undefined;
+            var made: usize = 0;
+            defer for (fxs[0..made]) |fx| fx.deinit();
+            for (&fxs, [_]mlx.mlx_dtype{ .bfloat16, .bfloat16, .float32 }, [_]bool{ true, false, false }) |*fx, act, fused| {
+                fx.* = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 25, .ctx = 601, .seed = seed, .act = act, .fused = fused });
+                made += 1;
+            }
+            var got: [3][]f32 = undefined;
+            for (fxs, &got) |fx, *g| {
+                const sts = try gpa.alloc(dsv41.State, bsz);
+                defer {
+                    for (sts) |*st| st.deinit();
+                    gpa.free(sts);
+                }
+                const ptrs = try gpa.alloc(*dsv41.State, bsz);
+                defer gpa.free(ptrs);
+                const xs = try gpa.alloc(A, bsz);
+                defer {
+                    for (xs) |a| _ = mlx.mlx_array_free(a);
+                    gpa.free(xs);
+                }
+                const pres = try gpa.alloc(A, bsz);
+                defer {
+                    for (pres) |a| _ = mlx.mlx_array_free(a);
+                    gpa.free(pres);
+                }
+                for (0..bsz) |k| {
+                    sts[k] = try dsv41.initState(fx.m, gpa);
+                    sts[k].n = 601;
+                    ptrs[k] = &sts[k];
+                    xs[k] = try fx.stream(1);
+                    pres[k] = try fx.cpre(1);
+                }
+                // Warm-up state KV windows with one batched step, then compare the second batched step.
+                const warm = try dsv41.batchedStep(fx.m, gpa, ptrs, xs, pres);
+                _ = mlx.mlx_array_free(warm);
+                const out = try dsv41.batchedStep(fx.m, gpa, ptrs, xs, pres);
+                defer _ = mlx.mlx_array_free(out);
+                g.* = try dsv41.hostF32(out);
+            }
+            defer for (got) |g| gpa.free(g);
+            for (got[0]) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            ratio[si] = relRms(got[0], got[2]) / @max(relRms(got[1], got[2]), 1e-4);
+        }
+        std.mem.sort(f64, &ratio, {}, std.sort.asc(f64));
+        std.debug.print("[dec] batched B={d} layers 20..25: fused/chain distance to the f32 model, median {d:.3} (min {d:.2}, max {d:.2})\n", .{ bsz, ratio[seeds.len / 2], ratio[0], ratio[seeds.len - 1] });
+        if (ratio[seeds.len / 2] > 1.15) return error.FurtherFromTruth;
+    }
+}
+
 test "dsv41 dec layers: the fused kernels over mxfp4 experts decode no further from an f32 model than today's chain" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    // The mxfp4 kernels build only without NAX (`Dec.moe_fp4`): with NAX this compares the NAX attention against the
-    // chain at a bf16 near-tie instead. The kernel contract checks the mxfp4 kernels on every GPU.
-    if (device.naxAvailable()) return error.SkipZigTest;
     try layersAgree(std.testing.allocator, 20, 23, true);
 }
 
 fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
+    try layersAgreeSteps(gpa, lo, hi, fp4, &.{ 1, 1, 1, max_rows, 1 });
+}
+
+fn layersAgreeSteps(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool, steps: []const usize) !void {
     // One seed lands up to 1.6x either side of the chain (five random layers amplify any rounding; under TF32 the f32
     // model itself moves 8% at the verify step), so the bar is each step's median over seeds.
     const seeds = [_]u64{ 9, 1, 2, 3, 4, 5, 6 };
-    const steps = [_]usize{ 1, 1, 1, max_rows, 1 };
-    var ratio: [steps.len][seeds.len]f64 = undefined;
+    var ratio: [16][seeds.len]f64 = undefined;
     for (seeds, 0..) |seed, si| {
         // Same seed, so the same weights, prefill and step inputs: the fused kernels, today's chain, and the f32 model.
         var fxs: [3]*fixture.Fixture = undefined;
@@ -133,7 +199,7 @@ fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
             p0 += rows;
         }
     }
-    for (&ratio, steps) |*r, rows| {
+    for (ratio[0..steps.len], steps) |*r, rows| {
         std.mem.sort(f64, r, {}, std.sort.asc(f64));
         std.debug.print("[dec] layers {d}..{d}, {d} rows: fused/chain distance to the f32 model, median {d:.3} (min {d:.2}, max {d:.2})\n", .{ lo, hi, rows, r[seeds.len / 2], r[0], r[seeds.len - 1] });
         if (r[seeds.len / 2] > 1.15) return error.FurtherFromTruth;
@@ -151,7 +217,7 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
         const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 40, .experts = 64, .ctx = 4096, .fused = fused });
         defer fx.deinit();
         var p0: usize = 4096;
-        for ([_]usize{ 1, max_rows }) |rows| {
+        for ([_]usize{ 1, max_rows, 8, 15 }) |rows| {
             const x = try fx.stream(rows);
             defer _ = mlx.mlx_array_free(x);
             const pre = try fx.cpre(rows);
@@ -167,11 +233,42 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
             std.mem.sort(f64, &times, {}, std.sort.asc(f64));
             std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer (median step {d:.0} us)\n", .{ rows, if (fused) "fused" else "chain", times[times.len / 2] / 20, times[times.len / 2] });
         }
+        for ([_]usize{ 2, 4, 8, 16 }) |bsz| {
+            var sts: [batch_rows]dsv41.State = undefined;
+            var ptrs: [batch_rows]*dsv41.State = undefined;
+            var xs: [batch_rows]A = undefined;
+            var pres: [batch_rows]A = undefined;
+            var made_s: usize = 0;
+            defer {
+                for (0..made_s) |k| {
+                    sts[k].deinit();
+                    _ = mlx.mlx_array_free(xs[k]);
+                    _ = mlx.mlx_array_free(pres[k]);
+                }
+            }
+            for (0..bsz) |k| {
+                sts[k] = try dsv41.initState(fx.m, gpa);
+                sts[k].n = 4096;
+                ptrs[k] = &sts[k];
+                xs[k] = try fx.stream(1);
+                pres[k] = try fx.cpre(1);
+                made_s += 1;
+            }
+            var times: [7]f64 = undefined;
+            for (0..2 + times.len) |rep| {
+                const t0 = iou.nowUsMonotonic(io);
+                const out = try dsv41.batchedStep(fx.m, gpa, ptrs[0..bsz], xs[0..bsz], pres[0..bsz]);
+                _ = mlx.mlx_array_free(out);
+                if (rep >= 2) times[rep - 2] = @floatFromInt(iou.nowUsMonotonic(io) - t0);
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            std.debug.print("[dec-ubench] layers 20..40 batched B={d} {s}: {d:.1} us a layer (median step {d:.0} us)\n", .{ bsz, if (fused) "fused" else "chain", times[times.len / 2] / 20, times[times.len / 2] });
+        }
     }
 }
 
 test {
     _ = fixture;
     _ = @import("exact_test.zig");
-    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;
+    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_fp4, moe_down }) |k| _ = k;
 }

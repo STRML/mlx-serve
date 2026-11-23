@@ -92,7 +92,7 @@ fn ranges(rows: usize, ncols: usize) usize {
 pub fn scores(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, k: *const Kernels, q: A, w: A, keys: A, p0: usize, ratio: usize, cand: ?A) !?A {
     if (!mlx.streamIsGpu(sc.s) or !nax.naxAvailable() or m.qat_off) return null;
     const rows = dim(q, 0);
-    if (rows == 0 or rows > decode.max_rows or ratio == 0) return null;
+    if (rows == 0 or rows > decode.batch_rows or ratio == 0) return null;
     const qdt = mlx.mlx_array_dtype(q);
     if ((qdt != .float32 and qdt != .bfloat16) or mlx.mlx_array_dtype(keys) != .bfloat16 or mlx.mlx_array_dtype(w) != .bfloat16) return null;
     if (mlx.getShape(q).len != 3 or dim(q, 1) != heads or dim(q, 2) != channels) return null;
@@ -146,7 +146,7 @@ fn poolPlan(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, li: usize, rows: A, pe
     const wk = iw.wk orelse return null;
     const ratio: usize = ly.ratio;
     const r = dim(rows, 0);
-    if (r == 0 or r > decode.max_rows or (ratio != 1 and ratio != 2) or m.cfg.head_dim != 512 or m.cfg.dsv4_index_head_dim != channels) return null;
+    if (r == 0 or r > decode.batch_rows or (ratio != 1 and ratio != 2) or m.cfg.head_dim != 512 or m.cfg.dsv4_index_head_dim != channels) return null;
     if (wk.ext != null or mlx.mlx_array_dtype(wk.w) != .bfloat16 or wk.s.ctx != null or mlx.mlx_array_dtype(cw.norm) != .bfloat16 or mlx.mlx_array_dtype(iw.k_norm) != .bfloat16) return null;
     const pooling = ratio == 2;
     if (dim(rows, 1) != (if (pooling) @as(usize, 1024) else 512) or mlx.mlx_array_dtype(rows) != (if (pooling) mlx.mlx_dtype.float32 else .bfloat16)) return null;

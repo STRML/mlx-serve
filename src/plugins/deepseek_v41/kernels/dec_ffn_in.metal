@@ -1,9 +1,57 @@
 // dec_ffn_in, launch 1: y = wo_b(oa) for R rows (mxfp8: e4m3 words, an e8m0 exponent per 32), then each output column's
 // hc expand x1 = post * y + comb . x and the collapse hv = pre . x1. A simdgroup owns NR columns across the lanes' K slices.
+threadgroup float part_nax[NAX ? (NSG - 1) * 8 * NR : 1];
 const uint lane = thread_index_in_simdgroup;
 const uint sg = simdgroup_index_in_threadgroup;
 const int tg = int(threadgroup_position_in_grid.x);
 const int tid = int(thread_index_in_threadgroup);
+if constexpr (NAX) {
+  if (tg == 0 && tid < 16) ctr[tid] = 0u;
+  const short qid = short(lane >> 2);
+  const short fm = (qid & 4) | short((lane >> 1) & 3);
+  const short f4 = (qid & 2) | short(lane & 1);
+  const uint col0 = uint(tg) * NR;
+  const bool live = int(fm) < R;
+  const device uint4* xp = (const device uint4*)(oa + (live ? (size_t)fm * K : 0) + sg * 64) + f4 * 2;
+  dsv41_nax_rows r0;
+  for (int j = 0; j < 4; ++j) {
+    const uint row = col0 + uint(fm) + 8u * uint(j);
+    r0.w[j] = (const device uint4*)(w_q + (size_t)row * (K / 4)) + sg * 4 + f4;
+    r0.s[j] = scales + (size_t)row * (K / 32) + sg * 2 + (f4 >> 1);
+  }
+  const dsv41_nax_first f0 = dsv41_nax_head(r0);
+  float acc[16] = {0};
+  dsv41_nax_mxfp8<K / (NSG * 64), NSG * 4, NSG * 2, NSG * 8>(acc, r0, f0, xp, live);
+  if (sg > 0 && live) {
+    for (int i = 0; i < 4; ++i) {
+      part_nax[((sg - 1) * 8 + uint(fm)) * NR + uint(f4) * 4u + i] = acc[i];
+      part_nax[((sg - 1) * 8 + uint(fm)) * NR + uint(f4) * 4u + 16u + i] = acc[8 + i];
+    }
+  }
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  if (sg == 0 && live) {
+    const int r = int(fm);
+    const auto po = spost + r * HC;
+    const auto cb = scomb + r * HC * HC;
+    const auto pr = spre + r * HC;
+    for (int half_i = 0; half_i < 2; ++half_i) for (int i = 0; i < 4; ++i) {
+      float sum = acc[half_i * 8 + i];
+      for (int s = 1; s < NSG; ++s) sum += part_nax[((s - 1) * 8 + uint(r)) * NR + uint(f4) * 4u + uint(half_i * 16 + i)];
+      const int col = int(col0) + int(f4) * 4 + half_i * 16 + i;
+      const float yv = float(T(sum));
+      float h = 0.0f;
+      for (int a = 0; a < HC; ++a) {
+        float ax = 0.0f;
+        for (int b = 0; b < HC; ++b) ax = metal::fma(cb[b * HC + a], float(x[((size_t)r * HC + b) * D + col]), ax);
+        const T o = T(metal::fma(po[a], yv, ax));
+        x1[((size_t)r * HC + a) * D + col] = o;
+        h = metal::fma(pr[a], float(o), h);
+      }
+      hv[(size_t)r * D + col] = T(h);
+    }
+  }
+  return;
+}
 const int nb = tg * (NSG * NR) + int(sg) * NR;
 constexpr int KW = K / 4, KG = K / 32, STEPS = K / 512;
 const device uint4* wr[NR];
@@ -60,7 +108,7 @@ for (int s0 = 0; s0 < STEPS; s0 += U) {
     }
   }
 }
-threadgroup float ys[R * NSG * NR];
+threadgroup float ys[NAX ? 1 : R * NSG * NR];
 for (int j = 0; j < NR; ++j) for (int r = 0; r < R; ++r) {
   const float v = metal::simd_sum(acc[j][r]);
   if (lane == 0) ys[r * (NSG * NR) + int(sg) * NR + j] = v;
