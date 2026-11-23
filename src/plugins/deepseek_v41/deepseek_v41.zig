@@ -7937,6 +7937,8 @@ pub fn hostF32(a: A) ![]f32 {
 /// norm ratio, and the largest error against the reference's peak.
 fn expectRowsClose(label: []const u8, got: []const f32, want: []const f32, width: usize) !void {
     try testing.expectEqual(want.len, got.len);
+    for (got) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+    for (want) |v| if (!std.math.isFinite(v)) return error.NonFinite;
     var peak: f64 = 0;
     for (want) |v| peak = @max(peak, @abs(v));
     var worst_cos: f64 = 1;
@@ -9338,7 +9340,7 @@ test "dsv41 engram: the kernel writes the op chain's stream bit for bit, decode 
 }
 
 test "dsv41 engram: wide hoist matches spanInAt" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = testing.tmpDir(.{});
@@ -9349,7 +9351,12 @@ test "dsv41 engram: wide hoist matches spanInAt" {
     var tab_bytes: [n_rows_tab * rec]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(19);
     prng.random().bytes(&tab_bytes);
-    for (0..n_rows_tab) |r| @memset(tab_bytes[r * rec + hd_tab ..][0 .. hd_tab / 32], 125); // ~0.25 scale, all finite e4m3
+    for (0..n_rows_tab) |r| {
+        for (tab_bytes[r * rec ..][0..hd_tab]) |*b| {
+            if ((b.* & 0x7F) == 0x7F) b.* &= 0xFE; // clamp E4M3 NaN (S1111111) to finite max
+        }
+        @memset(tab_bytes[r * rec + hd_tab ..][0 .. hd_tab / 32], 125); // ~0.25 scale, all finite e4m3
+    }
     try td.dir.createDirPath(io, "engram");
     try td.dir.writeFile(io, .{ .sub_path = "engram/engram-manifest.json", .data = "{\"layers\":[{\"layer_id\":1,\"file\":\"engram-L1.bin\",\"rows\":64,\"record_bytes\":66," ++
         "\"quant\":{\"bits\":8,\"group_size\":32,\"mode\":\"mxfp8\",\"head_dim\":64}}]}" });

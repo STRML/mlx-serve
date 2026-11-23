@@ -173,7 +173,8 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
 test "dsv41 wide: hoisted indexer and compress match per-span" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    const L: usize = 128;
+    const ctx: usize = 1024;
+    const L: usize = 256;
     for ([_][2]usize{ .{ 20, 24 }, .{ 2, 5 } }) |range| {
         const lo = range[0];
         const hi = range[1];
@@ -182,7 +183,7 @@ test "dsv41 wide: hoisted indexer and compress match per-span" {
             var made: usize = 0;
             defer for (fxs[0..made]) |fx| fx.deinit();
             for (&fxs, [_]mlx.mlx_dtype{ .bfloat16, .bfloat16, .float32 }, [_]usize{ 64, L, L }) |*fx, act, sp| {
-                fx.* = try fixture.Fixture.init(gpa, .{ .lo = lo, .hi = hi, .experts = 8, .ctx = 0, .seed = seed, .act = act, .fused = false });
+                fx.* = try fixture.Fixture.init(gpa, .{ .lo = lo, .hi = hi, .experts = 8, .ctx = ctx, .seed = seed, .act = act, .fused = false });
                 fx.*.m.span = sp;
                 made += 1;
             }
@@ -194,26 +195,35 @@ test "dsv41 wide: hoisted indexer and compress match per-span" {
                 defer _ = mlx.mlx_array_free(x);
                 const pre = try fx.cpre(L);
                 defer _ = mlx.mlx_array_free(pre);
-                const out = try dsv41.workerStep(fx.m, gpa, x, pre, 0, false, false);
+                const out = try dsv41.workerStep(fx.m, gpa, x, pre, ctx, false, false);
                 defer for (out) |o| {
                     _ = mlx.mlx_array_free(o);
                 };
                 g.* = try dsv41.hostF32(out[0]);
                 n_got += 1;
             }
-            for (got[0]) |v| if (!std.math.isFinite(v)) return error.NonFinite;
-            // Cache rows (comp + idx_k) produced by hoisted compress vs single-span compress in f32/bf16.
+            for (got) |slice| for (slice) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            // Cache rows (comp + idx_k) produced by hoisted compress vs single-span compress, with nb > topk (512).
             var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
             defer sc.deinit();
             for (lo..hi) |li| {
-                const c0 = fxs[0].m.dec_state.?.layers[li].comp orelse continue;
-                const c1 = fxs[1].m.dec_state.?.layers[li].comp orelse continue;
-                const clen = L / fxs[0].m.layers[li].ratio;
-                const k0 = try dsv41.hostF32(try sc.keep(try c0.view(clen, sc.s)));
-                defer gpa.free(k0);
-                const k1 = try dsv41.hostF32(try sc.keep(try c1.view(clen, sc.s)));
-                defer gpa.free(k1);
-                try std.testing.expectApproxEqAbs(@as(f64, 0), relRms(k0, k1), 1e-3);
+                const r = fxs[0].m.layers[li].ratio;
+                if (r == 0) continue;
+                const clen = (ctx + L) / r;
+                if (clen <= fxs[0].m.cfg.dsv4_index_topk) return error.SelectionDidNotDiscriminate;
+                const s0 = fxs[0].m.dec_state.?.layers[li];
+                const s1 = fxs[1].m.dec_state.?.layers[li];
+                for ([_]?@TypeOf(s0.comp.?){ s0.comp, s0.idx_k }, [_]?@TypeOf(s1.comp.?){ s1.comp, s1.idx_k }) |r0_opt, r1_opt| {
+                    const r0 = r0_opt orelse continue;
+                    const r1 = r1_opt orelse continue;
+                    const k0 = try dsv41.hostF32(try sc.keep(try r0.view(clen, sc.s)));
+                    defer gpa.free(k0);
+                    const k1 = try dsv41.hostF32(try sc.keep(try r1.view(clen, sc.s)));
+                    defer gpa.free(k1);
+                    for (k0) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+                    for (k1) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+                    try std.testing.expectApproxEqAbs(@as(f64, 0), relRms(k0, k1), 1e-3);
+                }
             }
             const ratio = relRms(got[0], got[2]) / @max(relRms(got[1], got[2]), 1e-4);
             std.debug.print("[wide] layers {d}..{d} seed={d}: wide/single distance to f32 = {d:.3}\n", .{ lo, hi, seed, ratio });
