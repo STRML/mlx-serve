@@ -241,6 +241,7 @@ pub fn handleCompletions(
     const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    stream.recent_request.stream = is_stream;
 
     const sampled = resolveSampling(gen, root, config);
     const temperature = sampled.temperature;
@@ -305,6 +306,10 @@ pub fn handleCompletions(
         .ids => |ids| log.info("  > [{d} token ids]\n", .{ids.len}),
         else => unreachable,
     }
+    switch (prompt) {
+        .text => |text| if (stream.recent_request.capture_prompt_tail) stream.recent_request.setPromptTail(text),
+        else => {},
+    }
 
     // Tokenize prompt directly (no chat template). ds4-backed models
     // tokenize through the engine's GGUF vocab; MLX models go through
@@ -321,7 +326,7 @@ pub fn handleCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
-        countRejected();
+        countRejected(stream, @intCast(@min(prompt_ids.len, std.math.maxInt(u32))));
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -559,6 +564,7 @@ fn handleStreamingCompletion(
         .cache_key = cache_key,
         .client = stream.client,
         .priority = stream.priority,
+        .recent_request = stream.recent_request,
         .ablation = stream.ablation,
     });
     var ts = StreamingTokenStream.initFromStream(running.?.stream, stream_mode, eos_token_ids);

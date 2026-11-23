@@ -241,6 +241,16 @@ pub fn handleConnection(
         return;
     }
     stream.noteRequestHeadersAt(request[0..header_end_pos], raw.header_read_ms);
+    if (instr.isRecentGenerationPath(path)) {
+        stream.recent_request.ts_start = @as(f64, @floatFromInt(io_util.nowMs(stream.io))) / 1000.0;
+        stream.recent_request.setPath(path);
+        stream.recent_request.capture_prompt_tail = http_server.g_metrics != null;
+        var peer_storage: [128]u8 = undefined;
+        var peer_writer: std.Io.Writer = .fixed(&peer_storage);
+        stream.stream.socket.address.format(&peer_writer) catch {};
+        if (peer_writer.buffered().len > 0) stream.recent_request.setPeer(peer_writer.buffered());
+        stream.recent_request.setRouterId(findHeaderValue(request[0..header_end_pos], "x-ds41-request-id"));
+    }
     const cache_internal = stream.cache_export or isRoute(path, "/v1/cache/import");
     if (cache_internal) {
         if (!peerIsCacheTrusted(stream.stream.socket.address)) {

@@ -607,6 +607,7 @@ pub fn handleAnthropicMessages(
     const effort_word: ?[]const u8 = if (thinking.effort) |cfg| cfg.effort else null;
     const reasoning_budget = forcedReasoningBudget(gen, budget_tokens orelse default_budget);
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    stream.recent_request.stream = is_stream;
     const model_name = echoModelName(root, config.model_type);
 
     // Wave 1.A: per-request KV-quant override (Anthropic mirror).
@@ -692,7 +693,7 @@ pub fn handleAnthropicMessages(
     // The `thinking` budget object carries no effort string, but
     // `output_config.effort` does — templates that read the word (dsv4,
     // qwen3.8) get it; requests without one still render their default.
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final, &stream.recent_request);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (output_cfg.schema != null and !has_tools and enable_thinking and reasoning_budget < 0) {
@@ -710,7 +711,7 @@ pub fn handleAnthropicMessages(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, false, effort_word, continue_final);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, false, effort_word, continue_final, &stream.recent_request);
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,
@@ -776,7 +777,7 @@ pub fn handleAnthropicMessages(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/messages -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
-        countRejected();
+        countRejected(stream, @intCast(@min(prompt_ids.len, std.math.maxInt(u32))));
         var ovf_buf: [160]u8 = undefined;
         try sendAnthropicError(allocator, stream, "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;

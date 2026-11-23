@@ -185,10 +185,7 @@ pub fn formatChat(
     /// Extend the trailing assistant message instead of answering after it.
     continue_final: bool,
 ) ![]u32 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const marked = try markUntrustedContent(arena.allocator(), tok, messages, chat_config.chat_template);
-    const rendered = try renderChatTemplate(allocator, marked, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
+    const rendered = try renderChatPrompt(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
 
     var ids = std.ArrayList(u32).empty;
@@ -204,6 +201,23 @@ pub fn formatChat(
     log.debug("  prompt: {d} chars -> {d} tokens\n", .{ rendered.len, ids.items.len });
 
     return ids.toOwnedSlice(allocator);
+}
+
+pub fn renderChatPrompt(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    messages: []const Message,
+    chat_config: *const ChatConfig,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    effort: ?[]const u8,
+    continue_final: bool,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const marked = try markUntrustedContent(arena.allocator(), tok, messages, chat_config.chat_template);
+    return renderChatTemplate(allocator, marked, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
 }
 
 /// A control token inside a user, system or tool turn is TEXT, never a turn marker (transformers'
@@ -247,7 +261,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
     // not be served at all.
     const a = std.testing.allocator;
 
-    {   // the shape that panicked: pick the entry named "default"
+    { // the shape that panicked: pick the entry named "default"
         const json =
             \\{"chat_template":[{"name":"tool_use","template":"TOOLS"},
             \\{"name":"default","template":"PLAIN"}]}
@@ -256,7 +270,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         defer p.deinit();
         try std.testing.expectEqualStrings("PLAIN", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // no "default" named: fall back to the first usable entry
+    { // no "default" named: fall back to the first usable entry
         const json =
             \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
         ;
@@ -264,7 +278,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         defer p.deinit();
         try std.testing.expectEqualStrings("TOOLS", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // the ordinary string shape is untouched
+    { // the ordinary string shape is untouched
         const json =
             \\{"chat_template":"BARE"}
         ;
@@ -272,7 +286,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         defer p.deinit();
         try std.testing.expectEqualStrings("BARE", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // junk shapes return null so the caller uses its jinja/family fallback
+    { // junk shapes return null so the caller uses its jinja/family fallback
         const json =
             \\{"chat_template":[{"name":"x"},{"nope":1}]}
         ;
@@ -282,7 +296,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
     }
     try std.testing.expect(chatTemplateFromValue(null) == null);
 
-    {   // transformers >= 5 saves the template to chat_template.jinja and leaves
+    { // transformers >= 5 saves the template to chat_template.jinja and leaves
         // an `{% include %}` POINTER in tokenizer_config.json (mlx-community
         // Laguna-S-2.1-oQ4e-fast, issue #169). jinja.cpp has no `include`, so
         // taking the pointer literally fails the render and SILENTLY drops to
@@ -295,7 +309,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
-    {   // whitespace/dash variants are the same pointer
+    { // whitespace/dash variants are the same pointer
         const json =
             \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
         ;
@@ -303,7 +317,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
-    {   // a real template that merely CONTAINS the word include is untouched
+    { // a real template that merely CONTAINS the word include is untouched
         const json =
             \\{"chat_template":"{% if x %}include{% endif %}"}
         ;
@@ -337,8 +351,12 @@ test "RADIO video placeholders: literal HTML stays text in every role" {
     defer tok.deinit();
     const config = ChatConfig{
         .chat_template = "{% for m in messages %}{{ m.role + ':' }}{% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{% if p.type == 'image' %}{{ '<image>' }}{% elif p.type == 'video' %}{{ '<video>' }}{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endif %}{% endfor %}",
-        .bos_token = null, .eos_token = null, .add_bos_token = false,
-        .allocator = a, .renders_tool_turn = true, .video_placeholder = "<img>",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = a,
+        .renders_tool_turn = true,
+        .video_placeholder = "<img>",
     };
     for ([_][]const u8{ "system", "user", "assistant", "tool" }) |role| {
         const messages = [_]Message{.{ .role = role, .content = "How do I autoplay a <video> element?" }};
@@ -357,7 +375,11 @@ test "RADIO video placeholders: only attached clips create video atoms" {
     defer tok.deinit();
     const config = ChatConfig{
         .chat_template = "{% for m in messages %}{% for p in m.content %}{% if p.type == 'image' %}{{ '<image>' }}{% elif p.type == 'video' %}{{ '<video>' }}{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endfor %}",
-        .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .video_placeholder = "<img>",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = a,
+        .video_placeholder = "<img>",
     };
     const clips = [_]VideoData{.{ .pixels = "", .grid_t = 128, .grid_h = 32, .grid_w = 32 }};
     const images = [_]ImageData{.{ .pixels = "", .width = 32, .height = 32 }};

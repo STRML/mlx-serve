@@ -392,8 +392,16 @@ fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *S
 }
 
 /// A request refused before it owned a slot. A null sink (metrics off) is one branch.
-pub fn countRejected() void {
-    if (http_server.g_metrics) |m| m.recordRejected();
+pub fn countRejected(stream: ?*Conn, prompt_tokens: u32) void {
+    if (http_server.g_metrics) |m| {
+        if (stream) |c| {
+            if (instr.isRecentGenerationPath(c.recent_request.path[0..c.recent_request.path_len])) {
+                m.recordRejectedRequest(c.recent_request, @as(f64, @floatFromInt(@import("../../sdk/util/io_util.zig").nowMs(c.io))) / 1000.0, prompt_tokens);
+                return;
+            }
+        }
+        m.recordRejected();
+    }
 }
 
 pub fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
@@ -643,11 +651,11 @@ test "outcome row 7/9: countRejected moves the rejected counter, and does nothin
     defer http_server.g_metrics = saved;
 
     http_server.g_metrics = null;
-    countRejected();
+    countRejected(null, 0);
 
     var m = instr.Metrics.init();
     http_server.g_metrics = &m;
-    countRejected();
+    countRejected(null, 0);
     try t.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
     try t.expectEqual(@as(u64, 0), m.requests_failed_total.load());
     try t.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
