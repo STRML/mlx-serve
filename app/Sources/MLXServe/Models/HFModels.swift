@@ -58,6 +58,7 @@ let supportedModelTypes: Set<String> = [
     "mimo_v2", "mimo_v2_flash", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout packs)
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA hybrid MoE, text + vision)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
+    "inkling2_loop", // Thinking Machines Inkling 2 Mini (26.4B-A3.4B looped MoE; text and images)
     "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
@@ -99,9 +100,23 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // `MediaModalityParityTests` reads every media plugin's `model_types` out of src/plugins/*/config.zig and
 // asserts this agrees; the server's own discovery and dispatch read those plugins.
 private let mediaModelTypeExactValues: Set<String> = [
-    "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_h3_image", "minimax_music3", "kokoro", "mageflow",
-    "laya", "kev", "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d", "idol",
+    "qwen3_tts", "dense", "AudioVideo", "acestep", "minimax_h3", "minimax_h3_image", "minimax_music3", "kokoro",
+    "mageflow", "laya", "kev", "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d",
+    "idol",
 ]
+
+/// `dense` is a generic `model_type`: the server's ming_tts claims it only beside `ditar_config` and
+/// `aggregator_config` (`src/plugins/ming_tts/config.zig`). A local config is judged on the same keys.
+let mediaTypeMarkers: [String: [String]] = ["dense": ["ditar_config", "aggregator_config"]]
+
+/// A Hub search row's config carries only `model_type` and `architectures`, so there the class the
+/// marker-claimed packs declare stands in for the markers.
+let mediaTypeHubArchitectures: [String: String] = ["dense": "BailingMMNativeForConditionalGeneration"]
+
+/// False when `config` declares a marker-claimed media type without its markers.
+func mediaMarkersHold(modelType: String, config: [String: Any]) -> Bool {
+    mediaTypeMarkers[modelType].map { $0.allSatisfy { config[$0] != nil } } ?? true
+}
 
 func isMediaModelType(_ modelType: String) -> Bool {
     if mediaModelTypeExactValues.contains(modelType) { return true }
@@ -166,7 +181,7 @@ enum MediaModality: CaseIterable {
             || modelType.hasPrefix("qwen_image") || modelType == "moss_image" || modelType == "minimax_h3_image" { self = .image; return }
         if modelType.hasPrefix("hunyuan3d") || modelType == "trellis2" || modelType == "pixal3d" || modelType == "idol" { self = .mesh; return }
         switch modelType {
-        case "qwen3_tts", "kokoro": self = .voice
+        case "qwen3_tts", "kokoro", "dense": self = .voice
         case "acestep", "minimax_music3", "yue2": self = .music
         case "stable_audio3": self = .sound
         case "AudioVideo", "minimax_h3": self = .video
@@ -216,13 +231,14 @@ enum MediaModality: CaseIterable {
 struct HFConfigMeta: Codable {
     let modelType: String?
     var diffusers: DiffusersMeta? = nil
+    var architectures: [String]? = nil
     var diffusersClassName: String? { diffusers?.className }
 
     struct DiffusersMeta: Codable {
         let className: String?
         enum CodingKeys: String, CodingKey { case className = "_class_name" }
     }
-    enum CodingKeys: String, CodingKey { case modelType = "model_type", diffusers }
+    enum CodingKeys: String, CodingKey { case modelType = "model_type", diffusers, architectures }
 }
 
 /// Served media families recognizable from a diffusers repo's `_class_name`.
@@ -288,9 +304,12 @@ struct HFModel: Identifiable, Codable {
     /// nil = not a media repo we serve; Kokoro deliberately maps nowhere
     /// (voice-mode-only catalog rule — see `discoverableMediaModelType`).
     var mediaFamilyModelType: String? {
-        if let t = config?.modelType, discoverableMediaModelType(t) { return t }
+        if let t = config?.modelType, discoverableMediaModelType(t) {
+            guard let arch = mediaTypeHubArchitectures[t] else { return t }
+            return config?.architectures?.contains(arch) == true ? t : nil
+        }
         if let c = config?.diffusersClassName, let t = servedDiffusersClasses[c] { return t }
-        return (tags ?? []).first(where: discoverableMediaModelType)
+        return (tags ?? []).first { discoverableMediaModelType($0) && mediaTypeMarkers[$0] == nil }
     }
 
     var isServedMediaRepo: Bool { mediaFamilyModelType != nil }

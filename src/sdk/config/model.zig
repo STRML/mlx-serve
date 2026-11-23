@@ -1041,19 +1041,22 @@ pub const ModelConfig = struct {
 
     /// Rows a sliding layer keeps past its window on an arch that caches only the window
     /// (`slidingRing`): spec rollback plus the prefix-cache matches that land near an entry's end.
-    pub const SLIDING_RING_SLACK: u32 = 2048;
+    pub const SLIDING_RING_SLACK: u32 = @import("sliding_ring.zig").slack;
 
     /// Recurrent (SSM / conv) layers beside attention: a cached state restores only at a checkpoint.
     pub fn hasSsmLayers(self: *const ModelConfig) bool {
         return self.has_hybrid_layers or self.full_attention_interval > 0;
     }
 
-    /// Sliding layers cache a bounded ring of rows, as mlx-lm's `RotatingKVCache`, not every token.
+    /// Sliding layers cache a bounded ring of rows, as mlx-lm's `RotatingKVCache`, not every token:
+    /// the plugin declares it (`CacheFacts.sliding_ring`).
     pub fn slidingRing(self: *const ModelConfig) bool {
+        if (self.plugin) |b| return b.parsed.cache.sliding_ring > 0;
         return self.isMimo();
     }
 
     pub fn slidingKeepRows(self: *const ModelConfig) u32 {
+        if (self.plugin) |b| if (b.parsed.cache.sliding_ring > 0) return b.parsed.cache.sliding_ring;
         return self.sliding_window + SLIDING_RING_SLACK;
     }
 
@@ -1063,7 +1066,7 @@ pub const ModelConfig = struct {
         var sum: u64 = 0;
         for (0..self.num_hidden_layers) |i| {
             const li: u32 = @intCast(i);
-            if (!self.isGlobalLayer(li)) sum += self.layerKvRowBytes(li);
+            if (!self.isGlobalLayer(li) and self.getKVSourceLayer(li) == null) sum += self.layerKvRowBytes(li);
         }
         return sum;
     }
@@ -1093,13 +1096,15 @@ pub const ModelConfig = struct {
         }
         // GLM-5-Next stores one latent row plus the indexer's key and gate per token.
         if (self.isGlm5()) return @as(u64, self.attnCacheLayerCount()) * (self.dsa_kv_lora_rank + 2 * self.dsa_index_head_dim) * 2;
-        // An arch that declares its own V width (MiMo) also varies KV heads per
-        // layer type: billed layer by layer. Ring layers are a fixed per-slot term.
-        if (self.v_head_dim > 0) {
+        // An arch that declares its own V width (MiMo) or keeps sliding rings also varies KV heads
+        // and widths per layer type: billed layer by layer. Ring layers are a fixed per-slot term,
+        // and a KV-shared layer reads another layer's rows.
+        if (self.v_head_dim > 0 or self.slidingRing()) {
             var sum: u64 = 0;
             for (0..self.num_hidden_layers) |i| {
                 const li: u32 = @intCast(i);
                 if (self.slidingRing() and !self.isGlobalLayer(li)) continue;
+                if (self.getKVSourceLayer(li) != null) continue;
                 sum += self.layerKvRowBytes(li);
             }
             return sum;
@@ -1735,10 +1740,11 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 
     // A served pack's engine config is the legacy parse with the plugin's binding attached, so every engine read
     // (bills, cache sizing, batching, sampling and thinking defaults) stays as it was; the plugin's facts alone
-    // only for a type the legacy parse cannot read.
+    // only for a type the legacy parse cannot read. An outside plugin's binding takes the legacy parse only when its
+    // parse asks for it (`Parsed.engine_config`); otherwise its facts alone.
     const binding = if (served) try plugin_config.bindServed(io, allocator, model_dir, content) else null;
     errdefer if (binding) |b| b.destroy(allocator);
-    if (binding) |b| if (b.outside) return plugin_config.adapted(b);
+    if (binding) |b| if (b.outside and !b.parsed.wantsEngineConfig()) return plugin_config.adapted(b);
     var config = parseConfigFromJson(allocator, content) catch |e| {
         const b = binding orelse return e;
         log.info("[plugin] {s}: the legacy parse refused {s} ({s}); the engine config is the plugin's facts\n", .{ b.table.name.slice(), b.parsed.shell.model_type.slice(), @errorName(e) });

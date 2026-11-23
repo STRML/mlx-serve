@@ -53,6 +53,7 @@ test {
     _ = @import("plugins/hy_v3/mtp_head_test.zig");
     _ = @import("plugins/gemma3/proof_test.zig");
     _ = @import("plugins/inkling/proof_test.zig");
+    _ = @import("plugins/inkling2/proof_test.zig");
     _ = @import("plugins/nemotron_h/proof_test.zig");
     _ = @import("plugins/nemotron_h/mtp_head_test.zig");
     _ = @import("plugins/gemma4/proof_test.zig");
@@ -211,6 +212,8 @@ test {
     _ = @import("sdk/blocks/moe/moe_fp4.zig");
     _ = @import("sdk/quant/exl3/sushi_pack.zig");
     _ = @import("sdk/quant/outside_model.zig");
+    _ = @import("sdk/quant/bank_fit_key.zig");
+    _ = @import("engines/mlx/plugin/fit_key.zig");
     _ = @import("engines/mlx/load/sushi_adapt.zig");
     _ = @import("sdk/quant/nvfp4/modelopt_pack.zig");
     _ = @import("sdk/quant/formats.zig");
@@ -253,6 +256,7 @@ test {
     _ = @import("plugins/glm5_next/model_config.zig");
     _ = @import("plugins/glm5_next/proof_test.zig");
     _ = @import("plugins/glm5_next/served_test.zig");
+    _ = @import("sdk/bases/kda_hybrid/cuts_test.zig");
     _ = @import("plugins/bailing_hybrid/bill_test.zig");
     _ = @import("engines/mlx/plugin/deepseek_test.zig");
     _ = @import("plugins/deepseek_v41/engram.zig");
@@ -303,6 +307,8 @@ test {
     _ = @import("sdk/media/pack_bytes.zig");
     _ = @import("sdk/media/image_pixels.zig");
     _ = @import("sdk/media/lora_set.zig");
+    _ = @import("sdk/media/istft.zig");
+    _ = @import("sdk/media/number_words.zig");
     _ = @import("sdk/blocks/dit/w8a8_bill.zig");
     _ = @import("sdk/media/job.zig");
     _ = @import("sdk/media/image_request.zig");

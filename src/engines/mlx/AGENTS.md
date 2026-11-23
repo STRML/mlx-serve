@@ -37,22 +37,29 @@ Memory bills + admission:
 - **The GPU ceiling sees EXTERNAL pressure** (`currentGpuMemoryCeiling`); Metal OOM is UNCATCHABLE; embedded-engine requests are exempt (`mlxMemoryGuardApplies`). On macOS it counts the RAM outside wired + compressor less the reserve (`getLoadRoomBytes`), the hot cache only what nobody holds; the app's meter still shows free + file-backed + PURGEABLE pages (`computeAvailableBytes`, Swift twin `computeAvailableForModel`; #932).
 - **macOS shows memory MLX returned about a second late** (`system.ReturnLag`, added in both figures and always fed the free one): the re-check right after an eviction or an unload read the old figure and refused a prompt that fit (#987); a new allocation takes that memory at once, so it is credited until the OS shows it.
 - **macOS also shows MLX's NEW buffers late** (`outside_model.settled`): a streamed bank's open read non-file memory below the server's own footprint and took the trunk's size as room. The open takes in use as at least what was outside the server at the load's start plus its footprint now; a reading still below the footprint is refused by name.
+- **A streamed bank's rooms are billed at the 16K + 1K cell, so every budget gives up the bills' growth to the context limit** (`Fit.grow_*`, `billsBudget`): the bills-only arm ignored it and billed no KV past the cell.
 - **Every request is re-billed against LIVE memory before prefill** (`slotHoldsForMemory`): no fit + company = back to `pending`; alone it proceeds. Guard: `tests/test_memory_pressure_4way.sh`.
 - **A generation's growth is billed to the KV reserve's HEADROOM, never the auto budget** (`glm5PrefillMemoryNeeded`): an omitted `max_tokens` is the rest of a 1M window, and pricing that answer refused a 431-token prompt at 43 GB beside 36 GB free.
 - **Siblings are billed against un-allocated promises and the plan leaves the OS an eighth of RAM** (`PromiseLedger`, 2 GB `SIBLING_MARGIN_BYTES`; `osReserveBytes` 2..8 GB, `--os-reserve-gib 0` / app toggle).
 - **A long prefill EVICTS the hot cache to be admitted, on the inference thread** (#353, `evictLruToAdmit`); refusals by NAME (`PrefillDoesNotFit` → 400); warm prompts bill via `WarmPrefix`; ONE `[admission]` line.
 - **A prompt that does not fit UNLOADS idle resident models before it is refused** (`fitAfterUnloadingIdle`, LRU, never its own model): an image model idle beside GLM-5.3 held the memory an agent turn needed, and the 400 ended the agent's session. A load refused for memory does the same and retries (`loadAfterUnloadingIdle`): a plugin sizes its own caches from what is free, past the gate.
-- **A multi-chunk prompt RESERVES its KV up front** (`reservedPrefillTokens`: a grow copies the cache); qwen4_exp past 32k pre-buys generation headroom (`KVCache.reservedTokens`); `max_tokens` clamped FIRST.
+- **A multi-chunk prompt RESERVES its KV up front** (`reservedPrefillTokens`: a grow copies the cache); qwen4_exp past 32k pre-buys generation headroom (`KVCache.reservedTokens`); `max_tokens` clamped FIRST. A decode-billed bill that sets `reserves_request` (streamed Ling) reserves its whole request to the context, and its decode bill prices that KV once.
 - **Long-context mechanisms of #363 gate on ONE predicate** (`ModelConfig.longCtxGated()`, qwen4_exp).
 - **Gates, preflight and COMMIT read ONE estimator** (#126, `estimatePeakResidentBytes` → `gateEstimateBytes`); a refusal quotes the number it COMPARED (`loadRequirementBytes`); staged bills are per-STAGE and a residency bill is a PLAN (`stagedPeakBytes`, `ltxPeakBytes`).
 - **An H3 request is billed on its OWN sequence** (`h3ActivationBytes`: `h3RequestRows` x `H3_ROW_BYTES` + the fast recipe's per-block attention cache; it prices the resident plan too, and `handleVideoH3` refuses the staged one by NAME before any stage loads, #764): the per-model peak bills one canvas, and a 1536x672 x 124f run died in an uncatchable Metal OOM on its first step.
 - **A video response is ONE JSON body**: the transport cap bills DELIVERED frames incl. chain windows (#283, `videoRgbTransportReason`, 768 MB).
 - **A resident H3 DiT must skip the AdaLN precompute and keep its adapters in the cache** (`minimax_h3.Resident`): precompute frees the modulation weights and bakes tables for ONE schedule, and a LoRA stack's refs point into the stack that bound them. Residency is all-or-nothing against LIVE memory and every other load releases it before refusing (`availForLoad`).
 - **Serial ≠ exclusive**: module-owned decode state needs admission single-flight (`admitPendingTick` on `modelExclusiveDecode`); held slots stay in `pending`.
+  A streamed bank (`Caps.streamed_weights`) is single-flight too: its rooms bill one live request and its admission bills 0.
 
 Prefix cache (RAM + SSD):
 - Disabled prefix retention reserves zero bytes in context sizing, chunk sizing and reported cache budgets; the configured byte cap is not proof that the cache exists.
 - **The hot-cache budget is CLAMPED at load, a HARD cap, and FOLLOWS residency** (#364, `clampedPrefixCacheMem`, `reviseHotCacheBudgets`). Guard: `tests/test_prefix_cache_budget_revisit.sh`.
+- **An auto context leaves the hot cache the share it was sized beside** (`ctxCacheShare` of the idle figure): the clamp took the whole context's
+  KV, not yet allocated, out of what was free after the load, and a 32 GB Mac's cache held no long turn.
+- **A streamed bank's hot cache stays in the term its decode room holds** (`GLM5_HOT_CACHE_BYTES`, `streamedHotCacheCapped`;
+  a module-path plugin keeps its own): admission bills a streamed pack at 0, so nothing evicts beside the next request.
+  Its oversized commit evicts before `trimmedCopy` (`evict_before_copy`): copying first held the old entry beside the copy.
 - **An oversized candidate is TRIMMED to the longest restorable prefix** (#330, `trimLenForBudget`, `trimmedCopy` a real copy; QSA bank priced via `trimmedCheckpointBytes`); the replace path sheds inherited checkpoints first; commit owns `ssm_cps` on EVERY outcome.
 - **A disk restore leaves the first grow's ROOM** (`DiskTier.restoreKvInto` + `KVCache.nextCapacity`): an exact-size restore made the re-forwarded token grow every layer (a grow COPIES), and the honest bill refused a restored 38k prompt on 16 GB.
 - **A restored cache shares its donor's buffer; a SHORT restore regrows from the prefix** (`KVCache.restoredOversized`, #492), never copies the donor's capacity.
@@ -99,8 +106,8 @@ Attention + KV:
 - **An array-masked prefill SDPA computes EVERY key block, so a sliding layer pays the whole chunk**: sliding layers read a band kernel (`msv_attn_p256` at hd 256, `nax_attention` at q/k 192/128 + v 128); without one the wide prefill chunk loses.
 - **Fused decode QK-norm+RoPE** (`fusedQkNormRope`, laguna): bit-identical; live paired A/B is the bar.
 - **Decode-only dense-attention requant** (`--decode-attn-quant`, default ON, LOSSY): side copies at decode AND verify; prefill dense; tail layers nvfp4-g16 (`attnDqFor`). A/B per newly-adopted dense arch. dsv4 comp_in requant is EXPLICIT opt-in (`decodeAttnQuantExplicit`).
-- **KV invalidation** after tool calls + pad-only gens. Sliding layers keep the full BUFFER (MiMo: a RING, below); the VIEW is sized by the whole BLOCK (`slidingViewFor`, `window + q_len - 1`).
-- **A full-buffer sliding layer caches every token it never reads**: `slidingRing` keeps window + slack rows, billed per slot (`slotFixedKvBytes`), restores above `ringFloor`, never spills.
+- **KV invalidation** after tool calls + pad-only gens. Sliding layers keep the full BUFFER (a RING where the plugin declares `CacheFacts.sliding_ring`, below); the VIEW is sized by the whole BLOCK (`slidingViewFor`, `window + q_len - 1`).
+- **A full-buffer sliding layer caches every token it never reads**: `slidingRing` keeps window + slack rows, billed per slot (`slotFixedKvBytes`), restores above `ringFloor`, spills its ring layers from the first whole chunk they hold (meta v11 `ring`).
 - **Hot-cache restore ALWAYS clamps** (`truncate(final_len)`); a failed restore hands back an EMPTY cache (`errdefer`); every eviction loop needs a no-progress exit (`evictOneLruProgress`). The hybrid DISK arm adopts the spec sidecar of the entry it RESTORED, honours `poisoned`.
 - **kv-quant contract**: attention reads `KVCache.denseView` on EVERY path; schemes extend via enum + two switch arms; `HotEntry` records its scheme; quant snapshots carry 6 handles.
 - **kv8/kv4 attention at hd 256 rides `matmul2d` over a threadgroup tile** (`qkvAttnMppKernel`, window `qkvMppWins`: t_q>=4 from 2K KV, 2-3 from 8K, 1 from 16K).
@@ -126,6 +133,8 @@ Spec decode:
 - **A capture gate is a promise the forward must keep**: `supportsLayerCapture` said yes while `forwardGlm5With` ignored `capture_layers`, and the first DFlash prefill crashed on an unfilled slot. An arch that passes the gate fills every slot (GLM taps the MEAN of its hyper-connection streams); `dflash.encodeContext` names an unfilled one (`DflashCaptureMissing`). Guard: `glm5_next DFlash capture`.
 - **A stalled round is not what a round costs** (`Drafting.record` bounds a round at twice the rounds before it): one round that waited on a kernel's first compile owed hundreds of plain ticks, and DeepSeek-V4.1's first request after an install wrote code at serial speed.
 - **A sparse target's DFlash is policy-driven** (`engines/mlx/spec/dflash/policy.zig`, GLM): rows follow the selector's calibrated confidence, plain ticks ride the serial pipeline with their taps parked (`dflash_pending`), and the plain cost is the REQUEST's own tick interval — the shared round-cost table's plain cell ran stale-high and the policy never stepped back.
+- **A native drafter's round is handed the request's stop ids and never verifies one** (`Forward.stop_ids`): the trunk's own
+  token carries the stop, as in serial decode; a kept stop row left no decode-end entry, and an agent re-prefilled its context.
 - **A block decoder checks its ENTRY token first** (`generate.tokenStops`, all five); only an ALL-pad generation declines commit (`commitDeclinesPadOnly`); a cancel mid batched tick still RECORDS the row (`batchedTickAction`).
 - **The token budget is a PRE-COMMIT invariant in every block decoder**; blocks publish through ONE `+= 1` loop.
 - **A spec path that refuses a KV scheme must be gated at LOAD, or implemented**: `compactRows` refused quantized KV mid-decode, so a draft tree under `--kv-quant 8` 500'd the second request. Guard: smoke `drafter_kv8`.
@@ -160,6 +169,7 @@ Spec decode:
 - **A forward asked for hidden rows returns them or refuses** (`Forward.want_hidden`): the driver fails an `.ok` with none (`no hidden rows`); `/v1/embeddings` refuses a module-owned-state model by name before any forward.
 - **Round cost is MEASURED** (`round_cost.zig`): per model/width/KV bucket from solo SINGLE-CHUNK rounds; `tok` is a workload MIXTURE (plan on `planTok`); per-silicon rows are COLD-START caps (`mtp_depth_free`), never deleted.
 - **Table hygiene**: interleaved prefill drops the round clock; refuse past `IMPLAUSIBLE_STEP` 1.5x / `SELF_SPIKE` 3x at fold AND load; load sweep also `IMPLAUSIBLE_WIDER` 1.25x (#382). Persistence OPT-IN (`MLX_SERVE_ROUND_COST_PERSIST=1`), keyed on chip/model/quant/OS/engine build.
+- **A warm-up request teaches the round-cost table nothing** (`Generator.warm` from `Slot.warm`): its rounds time first-use compiles, and a cold first cell kept a fresh build's Flash Next drafting 2 wide for its first requests.
 - **Width trials** (`mtpWidthTrialTarget`): m_lo then m_lo+1, NEVER m_lo−1; `[spec-stats]` carries `width_trials= table=`.
 - **Auto MTP depth**: below 8192 KV plan tokens from acceptance EMAs + table round TIME in ONE chunk (`MtpDepthPolicy.accept`); past 8k legacy. Rank policies in `src/engines/mlx/spec/mtp_replay_test.zig`, never live tok/s.
 - **The adaptive serial switch serves sidecar heads too** (`mtpSerialProbeEarned`: 16 rounds, EMA < 2.0, floor 32k KV).
@@ -184,6 +194,8 @@ Kernels + numerics:
 - **Every forward path carries a `[dtype-trace]`**; 1-D f16 tables narrowed at load (`narrowsLoadedF16`); a kernel's dtype and threadgroup BLOCK SIZE are ONE decision (`gdnBlockTFor`); signatures come from each input's ACTUAL dtype, <8-element arrays land in `constant`.
 - **A decode kernel can be LATENCY-bound** (qwen4 `hcReadFused`): split-K + unrolled loads beat the op chain; redistributing a reduction into every threadgroup LOSES. Meter: `MLX_SERVE_DIAG=decode-fwd-ubench=N`.
 - **A prefill-tiled kernel at decode width is ONE threadgroup's work**: gate by rows (`MIXES_KERNEL_MIN_ROWS`, `decodeSelect`).
+- **A one-row dense matmul wants the checkpoint's `[out, in]` weight** (`x @ W.T`, MLX's `gemv`): over a pre-transposed `[in, out]` one it is `gemv_t`, several times the latency; prompt-width GEMM is the same either way.
+- **A few-row f32 product (a router, a gate) wants its own kernel or the one-row path**: on NAX, MLX's f32 matmul past one row is TF32 (~1e-3 relative) at ~7x a row's latency; its one-row `gemv` is exact.
 - **Partials crossing threadgroups in ONE dispatch go by atomic store/load** (`hcPre`): plain loads read a stale L1 even after a device fence.
 - **A cache row no op in this forward reads is never computed** (decode evals token + logits only): tie it to the output (`mlx_depends`; GLM's indexer below its budget).
 - **An ablation that leaves an output unwritten measures NaN ROUTING, not cost** (garbage activations send every MoE layer to the same cached experts): ablate with sane values.

@@ -108,7 +108,8 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
 /// A sampled round of the served plugin's drafter: the plugin drafts and verifies, the engine accepts under the
 /// request's sampling, the plugin keeps what was accepted.
 fn nativeSampledRound(self: *Generator, allocator: std.mem.Allocator, cap: u32) !?DrafterStepResult {
-    var v = try plugin_driver.nativeVerify(self.xfm, &self.ctx, self.next_token_id, cap);
+    const watch = io_util.Stopwatch.init(self.timer.io);
+    var v = try plugin_driver.nativeVerify(self.xfm, &self.ctx, self.next_token_id, cap, self.eos_token_ids);
     defer _ = mlx.mlx_array_free(v.logits);
     const ids = v.round.tokens[0..v.round.n];
     // A failure below leaves the plugin's verify open, which is the model's, not this request's: close it.
@@ -122,6 +123,9 @@ fn nativeSampledRound(self: *Generator, allocator: std.mem.Allocator, cap: u32) 
     const tokens = try allocator.dupe(u32, ids[0 .. 1 + verdict.accepted]);
     errdefer allocator.free(tokens);
     self.dspark_stats.record(v.round.rows -| 1, verdict.accepted);
+    if (self.dspark_pol) |*pol| if (std.math.isFinite(pol.plain.ms)) {
+        pol.drafting.record(@as(f32, @floatFromInt(1 + verdict.accepted)) * pol.plain.ms, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
+    };
     return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = verdict.accepted, .next_token = verdict.next_token }, @intCast(position));
 }
 
@@ -137,10 +141,14 @@ fn nativeRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResu
     };
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     if (self.dspark_stochastic) return nativeSampledRound(self, allocator, @min(cap, abi.max_round_tokens - 1));
-    const r = try plugin_driver.nativeRound(self.xfm, &self.ctx, self.next_token_id, @min(cap, abi.max_round_tokens - 1));
+    const watch = io_util.Stopwatch.init(self.timer.io);
+    const r = try plugin_driver.nativeRound(self.xfm, &self.ctx, self.next_token_id, @min(cap, abi.max_round_tokens - 1), self.eos_token_ids);
     const tokens = try allocator.dupe(u32, r.tokens[0..r.n]);
     errdefer allocator.free(tokens);
     self.dspark_stats.record(r.rows -| 1, r.accepted);
+    if (self.dspark_pol) |*pol| if (std.math.isFinite(pol.plain.ms)) {
+        pol.drafting.record(@as(f32, @floatFromInt(r.n)) * pol.plain.ms, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
+    };
     return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = r.accepted, .next_token = r.next_token }, @intCast(r.position));
 }
 
@@ -148,6 +156,8 @@ fn nativeRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResu
 pub fn moduleRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
     if (intree.dsv41(self.xfm)) |mdl| {
         try plugin_settle.activate(self.xfm, &self.ctx);
+        // An exact greedy accept masks what the serial sampler masks.
+        mdl.suppress = self.xfm.suppress_mask orelse .{ .ctx = null };
         if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
         return self.dsparkPolicyStep(allocator, mdl);
     }
@@ -161,7 +171,7 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     const t1 = self.next_token_id;
     const idx = try self.mtpLookupIndex(allocator);
     const found = idx.matchBest(t1, @intCast(dsv41_mod.maxVerifyDrafts(mdl)));
-    const longest = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, mdl.ds_block);
+    const longest = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, dsv41_mod.copyBlock(mdl));
     if (longest == 0) return null;
     const n = sizedCopyLen(self, longest, found.?.suffix);
     if (n == 0) return null;
@@ -300,6 +310,8 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     defer d.deinit(allocator);
     const drafted = d.len;
     d.len = if (pol.pin_rows > 0) @min(d.len, pol.pin_rows - 1) else dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+    // An exact verify stays within the decode-width rows (`maxVerifyDrafts`; the block itself otherwise).
+    d.len = @min(d.len, dsv41_mod.maxVerifyDrafts(mdl));
     if (forcedVerifyRows()) |rows| d.len = @min(rows - 1, drafted);
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     const verify_watch = io_util.Stopwatch.init(self.timer.io);

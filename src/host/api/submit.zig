@@ -98,6 +98,7 @@ pub fn nonStreamingViaScheduler(
         .cache_key = cache_key,
         .session = if (conn) |c| c.session_key else 0,
         .client = if (conn) |c| c.client else .other,
+        .priority = if (conn) |c| c.priority else false,
         .ablation = if (conn) |c| c.ablation else null,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,

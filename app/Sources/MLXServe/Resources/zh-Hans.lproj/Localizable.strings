@@ -1304,6 +1304,10 @@
 "Qwen's largest model here — 125 billion parameters, of which it wakes only about 6 billion per word (mixture of experts), so it answers at a pace closer to a mid-size model than to one this big. Reasoning, coding and agent work at the same level as DeepSeek-V4-Flash, it reads images, and it ships with a built-in speed trick that drafts and double-checks several words at once. This is our own mixed 4/8-bit build, about 100 GB on disk, of which a 32 GB lookup table stays on disk while it runs, so it fits a Mac with 96 GB of memory." = "这是 Qwen 在此最大的模型 —— 1250 亿参数，但每个词只唤醒其中约 60 亿（MoE），因此它的作答速度更接近中等规模模型，而非这个体量的模型。推理、编码和 Agent 工作与 DeepSeek-V4-Flash 处于同一水平，它能读图，并内置了一项可一次草拟并复核多个词的加速技巧。这是我们自制的 4/8-bit 混合构建版本，磁盘上约 100 GB，运行时其中 32 GB 的查找表留在磁盘上，因此可在 96 GB 内存的 Mac 上运行。";
 "Qwen's mixture-of-experts model — 35 billion parameters in total, but like the Gemma mixture-of-experts model above, it only activates a few billion per word. It ships with a built-in speed trick that drafts and double-checks several words at once, which makes it the fastest model on this list by a wide margin. Excellent for demanding coding and reasoning work." = "Qwen 的 MoE 模型 —— 总共 350 亿参数，但与上文 Gemma 的 MoE 模型一样，每个词只激活其中几十亿。它内置了一项可一次草拟并复核多个词的加速技巧，因此是这份列表中快出一大截的最快模型。非常适合高强度的编码和推理工作。";
 "Qwen-Image 2.1 quantized to 4-bit for smaller Macs — the same 40-step model at about half the memory, with some loss of fine detail. Open (Apache-2.0)." = "为小内存 Mac 量化为 4-bit 的 Qwen-Image 2.1 —— 同样是 40 步模型，内存占用约为一半，细节略有损失。开源（Apache-2.0）。";
+"Ming-3.0-tts 0.5B 8-bit (44.1 kHz, ~1.6 GB)" = "Ming-3.0-tts 0.5B 8-bit（44.1 kHz，约 1.6 GB）";
+"Ming-3.0-tts 0.5B bf16 (full precision, ~2.9 GB)" = "Ming-3.0-tts 0.5B bf16（全精度，约 2.9 GB）";
+"Clear 44.1 kHz speech in English, Chinese, French and more, faster than real time, with voice cloning from a clip of up to 20 seconds." = "清晰的 44.1 kHz 语音，支持英语、中文、法语等，生成速度快于实时，并可从最长 20 秒的片段克隆声音。";
+"The same Ming voice model at full precision — the fastest Ming build on a Mac GPU, at more memory than the 8-bit build." = "同一 Ming 语音模型的全精度版本 —— 在 Mac GPU 上是最快的 Ming 版本，但比 8-bit 版本占用更多内存。";
 "Qwen3-TTS 0.6B 8-bit (balanced, ~2 GB)" = "Qwen3-TTS 0.6B 8-bit（均衡，约 2 GB）";
 "Qwen3-TTS 0.6B bf16 (full precision, ~2.5 GB)" = "Qwen3-TTS 0.6B bf16（全精度，约 2.5 GB）";
 "Qwen3-TTS 1.7B 8-bit (quality, ~3.1 GB)" = "Qwen3-TTS 1.7B 8-bit（高质量，约 3.1 GB）";
@@ -1782,6 +1786,10 @@
 "Unlock to Delete" = "解锁以删除";
 "Unmute" = "取消静音";
 "Unreachable" = "无法访问";
+"Unreachable — nothing is listening at %@" = "无法访问 —— %@ 上没有服务在监听";
+"Unreachable — %@ does not resolve" = "无法访问 —— 无法解析 %@";
+"Unreachable — no answer from %@ in time" = "无法访问 —— %@ 未及时响应";
+"Unreachable — the secure connection to %@ failed" = "无法访问 —— 与 %@ 的安全连接失败";
 "Unsupported" = "不支持";
 "Unsupported architecture" = "不支持的架构";
 "Unsupported ModelOpt layout" = "不支持的 ModelOpt 布局";
@@ -2519,3 +2527,19 @@
 "Quit MLX-Serve" = "退出 MLX-Serve";
 "Keep running when I press ⌘Q" = "按 ⌘Q 时保持运行";
 "⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both." = "⌘Q 关闭窗口，服务器继续运行。菜单栏中的“退出”仍会同时停止两者。";
+
+/* MiniMax-H3-Image */
+"MiniMax's H3 image model — photoreal detail and sharp in-image text from 4 to 16 megapixels, and edits that combine up to 16 pictures, in six steps. MiniMax-H3-Image Community License (not for use in the EU, UK, South Korea or the US)." = "MiniMax 的 H3 图像模型——400 万到 1600 万像素下的写实细节与清晰的图中文字，编辑时最多可组合 16 张图片，只需六步。MiniMax-H3-Image 社区许可（不可在欧盟、英国、韩国或美国使用）。";
+"Refer to the pictures by name — the source is <Picture 1>, references follow in order: “put the hat from <Picture 2> on the man in <Picture 1>”. Click a picture to drop its name into the prompt." = "用名称来指代图片 —— 源图是 <Picture 1>，参考图按顺序跟在后面：“把 <Picture 2> 中的帽子戴到 <Picture 1> 中男子的头上”。点击图片即可把它的名称插入提示词。";
+"2048 × 2048 (square, 4 MP)" = "2048 × 2048（方形，400 万像素）";
+"4096 × 4096 (square, 16 MP)" = "4096 × 4096（方形，1600 万像素）";
+"2368 × 1776 (landscape 4:3, 4 MP)" = "2368 × 1776（横版 4:3，400 万像素）";
+"1776 × 2368 (portrait 3:4, 4 MP)" = "1776 × 2368（竖版 3:4，400 万像素）";
+"2736 × 1536 (landscape 16:9, 4 MP)" = "2736 × 1536（横版 16:9，400 万像素）";
+"1536 × 2736 (portrait 9:16, 4 MP)" = "1536 × 2736（竖版 9:16，400 万像素）";
+"4736 × 3552 (landscape 4:3, 16 MP)" = "4736 × 3552（横版 4:3，1600 万像素）";
+"3552 × 4736 (portrait 3:4, 16 MP)" = "3552 × 4736（竖版 3:4，1600 万像素）";
+"5472 × 3072 (landscape 16:9, 16 MP)" = "5472 × 3072（横版 16:9，1600 万像素）";
+"3072 × 5472 (portrait 9:16, 16 MP)" = "3072 × 5472（竖版 9:16，1600 万像素）";
+"6272 × 2688 (cinematic 21:9, 16 MP)" = "6272 × 2688（电影宽幅 21:9，1600 万像素）";
+"Travel poster" = "旅行海报";
