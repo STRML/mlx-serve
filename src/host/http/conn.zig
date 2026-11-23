@@ -83,6 +83,8 @@ pub const Conn = struct {
     ollama_sink: ?*ollama_mod.Sink = null,
     /// Agent named by the current request's User-Agent.
     client: instr.Client = .other,
+    /// Fixed-size metadata for the current generation request.
+    recent_request: instr.RecentRequestContext = .{},
     /// The current request's `X-Ablation-Key` header, borrowed from the request buffer; never logged.
     ablation_key: ?[]const u8 = null,
     /// The current request's directional ablation (`api/ablation.zig`), and the `X-Ablation` line every response
@@ -101,6 +103,7 @@ pub const Conn = struct {
         c.stream = stream;
         c.io = io;
         c.client = .other;
+        c.recent_request = .{};
         c.chat_request_id = 0;
         c.clearAblation();
         c.write_state = stream.writer(io, &c.write_buf);
@@ -128,6 +131,7 @@ pub const Conn = struct {
 
     pub fn noteRequestHeadersAt(c: *Conn, headers: []const u8, head_read_ms: i64) void {
         c.client = instr.Client.fromUserAgent(findHeaderValue(headers, "user-agent"));
+        c.recent_request = .{ .client = c.client };
         c.chat_request_id = 0;
         c.clearAblation();
         c.ablation_key = findHeaderValue(headers, "x-ablation-key");

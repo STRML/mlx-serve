@@ -7,15 +7,13 @@
 //!            No allocation, no atomics, no work. Unmeasurable.
 //!   * ON   — a handful of RELAXED atomic adds per request, recorded at the
 //!            `finishSlot` funnel which is already off the per-token decode
-//!            path. The inference thread never locks, waits, or blocks on the
-//!            metrics subsystem. Gauges are sampled on a separate thread;
+//!            path. The inference thread takes one short lock to append a
+//!            finished request. Gauges are sampled on a separate thread;
 //!            `/metrics` renders on the scrape connection thread.
 //!
-//! Thread-safety: every write is `std.atomic.Value(u64)` with `.monotonic`
-//! (relaxed) ordering. Writers are N connection threads + the inference
-//! thread; readers (render) tolerate a slightly inconsistent cross-counter
-//! snapshot — fine for metrics. No mutex on the write path: the one lock is the
-//! per-model table's CLAIM of a row, taken the first time a model id is seen.
+//! Thread-safety: counters use `std.atomic.Value(u64)` with `.monotonic`
+//! ordering. The fixed recent-request ring uses a mutex for append and a short
+//! snapshot; readers tolerate a slightly inconsistent cross-counter snapshot.
 
 const std = @import("std");
 
@@ -50,6 +48,77 @@ const TOKEN_BOUNDS: [8]u64 = .{ 32, 128, 256, 512, 1024, 2048, 4096, 8192 };
 
 /// How a request that owned a slot ended.
 pub const Outcome = enum { success, cancelled, failed };
+pub const RecentOutcome = enum { success, failed, cancelled, rejected };
+pub const RECENT_REQUESTS_CAPACITY = 256;
+const RECENT_PATH_MAX = 128;
+const RECENT_PEER_MAX = 64;
+const RECENT_ROUTER_ID_MAX = 64;
+
+/// Fixed-size request metadata carried from the HTTP connection to the slot.
+pub const RecentRequestContext = struct {
+    ts_start: f64 = 0,
+    path: [RECENT_PATH_MAX]u8 = @splat(0),
+    path_len: u8 = 0,
+    peer: [RECENT_PEER_MAX]u8 = @splat(0),
+    peer_len: u8 = 0,
+    router_id: [RECENT_ROUTER_ID_MAX]u8 = @splat(0),
+    router_id_len: u8 = 0,
+    client: Client = .other,
+    stream: bool = false,
+
+    pub fn setPath(self: *RecentRequestContext, path: []const u8) void {
+        self.path_len = @intCast(@min(path.len, self.path.len));
+        @memcpy(self.path[0..self.path_len], path[0..self.path_len]);
+    }
+
+    pub fn setPeer(self: *RecentRequestContext, peer: []const u8) void {
+        self.peer_len = @intCast(@min(peer.len, self.peer.len));
+        @memcpy(self.peer[0..self.peer_len], peer[0..self.peer_len]);
+    }
+
+    pub fn setRouterId(self: *RecentRequestContext, value: ?[]const u8) void {
+        self.router_id_len = 0;
+        const id = value orelse return;
+        if (!validRouterId(id)) return;
+        self.router_id_len = @intCast(id.len);
+        @memcpy(self.router_id[0..id.len], id);
+    }
+};
+
+fn validRouterId(id: []const u8) bool {
+    if (id.len == 0 or id.len > RECENT_ROUTER_ID_MAX) return false;
+    for (id) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_')) return false;
+    return true;
+}
+
+pub fn isRecentGenerationPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/v1/chat/completions") or
+        std.mem.eql(u8, path, "/v1/completions") or
+        std.mem.eql(u8, path, "/v1/messages") or
+        std.mem.eql(u8, path, "/v1/responses") or
+        std.mem.eql(u8, path, "/api/chat") or
+        std.mem.eql(u8, path, "/api/generate");
+}
+
+const RecentRequest = struct {
+    id: u64 = 0,
+    ts_start: f64 = 0,
+    ts_end: f64 = 0,
+    path: [RECENT_PATH_MAX]u8 = @splat(0),
+    path_len: u8 = 0,
+    outcome: RecentOutcome = .failed,
+    prompt_tokens: u32 = 0,
+    cached_tokens: u32 = 0,
+    generation_tokens: u32 = 0,
+    ttft_ms: ?f64 = null,
+    dur_ms: f64 = 0,
+    stream: bool = false,
+    client: Client = .other,
+    peer: [RECENT_PEER_MAX]u8 = @splat(0),
+    peer_len: u8 = 0,
+    router_id: [RECENT_ROUTER_ID_MAX]u8 = @splat(0),
+    router_id_len: u8 = 0,
+};
 
 /// Rows of the per-model table, the last one the shared `other` row.
 pub const MAX_USAGE_MODELS: usize = 64;
@@ -88,9 +157,12 @@ pub const ModelUsage = struct {
 // Metrics — the single global struct allocated when --metrics is on
 // ---------------------------------------------------------------------------
 
-/// All instrumented metrics for one mlx-serve instance.
-/// Zero-allocation after init; every field is a lock-free primitive.
+/// All instrumented metrics for one mlx-serve instance. Zero-allocation after init.
 pub const Metrics = struct {
+    recent_requests: [RECENT_REQUESTS_CAPACITY]RecentRequest,
+    recent_request_count: usize,
+    recent_request_next: usize,
+    recent_request_lock: std.atomic.Mutex,
     // Latency histograms (observe in nanoseconds; rendered as seconds)
     ttft_ns: Histogram(LATENCY_BUCKETS), // time to first token
     e2e_latency_ns: Histogram(LATENCY_BUCKETS), // end-to-end request latency
@@ -192,6 +264,10 @@ pub const Metrics = struct {
 
     pub fn init() Metrics {
         return .{
+            .recent_requests = @splat(.{}),
+            .recent_request_count = 0,
+            .recent_request_next = 0,
+            .recent_request_lock = .unlocked,
             .ttft_ns = Histogram(LATENCY_BUCKETS).init(LATENCY_BOUNDS_NS),
             .e2e_latency_ns = Histogram(LATENCY_BUCKETS).init(LATENCY_BOUNDS_NS),
             .prefill_time_ns = Histogram(LATENCY_BUCKETS).init(LATENCY_BOUNDS_NS),
@@ -283,6 +359,40 @@ pub const Metrics = struct {
 
     pub fn recordRejected(self: *Metrics) void {
         self.requests_rejected_total.inc();
+    }
+
+    pub fn recordRejectedRequest(self: *Metrics, context: RecentRequestContext, ts_end: f64, prompt_tokens: u32) void {
+        self.recordRejected();
+        if (isRecentGenerationPath(context.path[0..context.path_len]))
+            self.recordRecentRequest(nextRequestId(), context, .rejected, ts_end, prompt_tokens, 0, 0, null);
+    }
+
+    pub fn recordRecentRequest(self: *Metrics, id: u64, context: RecentRequestContext, outcome: RecentOutcome, ts_end: f64, prompt_tokens: u32, cached_tokens: u32, generation_tokens: u32, ttft_ms: ?f64) void {
+        while (!self.recent_request_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.recent_request_lock.unlock();
+        const dur_ms = @max(0, (ts_end - context.ts_start) * 1000.0);
+        var entry: RecentRequest = .{
+            .id = id,
+            .ts_start = context.ts_start,
+            .ts_end = ts_end,
+            .outcome = outcome,
+            .prompt_tokens = prompt_tokens,
+            .cached_tokens = cached_tokens,
+            .generation_tokens = generation_tokens,
+            .ttft_ms = ttft_ms,
+            .dur_ms = dur_ms,
+            .stream = context.stream,
+            .client = context.client,
+        };
+        entry.path_len = context.path_len;
+        @memcpy(entry.path[0..entry.path_len], context.path[0..context.path_len]);
+        entry.peer_len = context.peer_len;
+        @memcpy(entry.peer[0..entry.peer_len], context.peer[0..context.peer_len]);
+        entry.router_id_len = context.router_id_len;
+        @memcpy(entry.router_id[0..entry.router_id_len], context.router_id[0..context.router_id_len]);
+        self.recent_requests[self.recent_request_next] = entry;
+        self.recent_request_next = (self.recent_request_next + 1) % RECENT_REQUESTS_CAPACITY;
+        self.recent_request_count = @min(self.recent_request_count + 1, RECENT_REQUESTS_CAPACITY);
     }
 
     /// Record per-request metrics once per request that owned a slot.
@@ -640,7 +750,35 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
     var first_row = true;
     for (m.usage[0..m.usage_count.load(.acquire)]) |*u| try writeUsageRow(w, u, &first_row);
     if (m.usage_other.requests.load() > 0) try writeUsageRow(w, &m.usage_other, &first_row);
+    try w.print("],\"recent_requests\":[", .{});
+    while (!@constCast(&m.recent_request_lock).tryLock()) std.atomic.spinLoopHint();
+    var recent_snapshot: [RECENT_REQUESTS_CAPACITY]RecentRequest = undefined;
+    const recent_count = m.recent_request_count;
+    const start = (m.recent_request_next + RECENT_REQUESTS_CAPACITY - recent_count) % RECENT_REQUESTS_CAPACITY;
+    for (0..recent_count) |i| recent_snapshot[i] = m.recent_requests[(start + i) % RECENT_REQUESTS_CAPACITY];
+    @constCast(&m.recent_request_lock).unlock();
+    for (0..recent_count) |i| {
+        if (i > 0) try w.print(",", .{});
+        const r = &recent_snapshot[i];
+        try writeRecentRequest(w, r);
+    }
     try w.print("]}}", .{});
+}
+
+fn writeRecentRequest(w: *std.Io.Writer, r: *const RecentRequest) !void {
+    try w.print("{{\"id\":{d},\"ts_start\":{d},\"ts_end\":{d},\"path\":", .{ r.id, r.ts_start, r.ts_end });
+    try std.json.Stringify.encodeJsonString(r.path[0..r.path_len], .{}, w);
+    try w.print(",\"outcome\":\"{s}\",\"prompt_tokens\":{d},\"cached_tokens\":{d},\"generation_tokens\":{d},\"ttft_ms\":", .{
+        @tagName(r.outcome), r.prompt_tokens, r.cached_tokens, r.generation_tokens,
+    });
+    if (r.ttft_ms) |v| try w.print("{d}", .{v}) else try w.print("null", .{});
+    try w.print(",\"dur_ms\":{d},\"stream\":{s},\"client\":", .{ r.dur_ms, if (r.stream) "true" else "false" });
+    try std.json.Stringify.encodeJsonString(r.client.label(), .{}, w);
+    try w.print(",\"peer\":", .{});
+    if (r.peer_len > 0) try std.json.Stringify.encodeJsonString(r.peer[0..r.peer_len], .{}, w) else try w.print("null", .{});
+    try w.print(",\"router_id\":", .{});
+    if (r.router_id_len > 0) try std.json.Stringify.encodeJsonString(r.router_id[0..r.router_id_len], .{}, w) else try w.print("null", .{});
+    try w.print("}}", .{});
 }
 
 fn writeUsageRow(w: *std.Io.Writer, u: *const ModelUsage, first: *bool) !void {
@@ -1322,6 +1460,60 @@ test "Metrics.recordRejected moves only the rejected counter" {
     try testing.expectEqual(@as(u64, 2), m.requests_rejected_total.load());
     try testing.expectEqual(@as(u64, 0), m.requests_failed_total.load());
     try testing.expectEqual(@as(u64, 0), m.prefix_cache_queries_total.load());
+}
+
+test "recent request ring keeps the newest 256 entries in oldest-first order" {
+    var m = Metrics.init();
+    var context: RecentRequestContext = .{};
+    context.setPath("/v1/chat/completions");
+    for (0..300) |i| m.recordRecentRequest(@intCast(i + 1), context, .success, 2, 0, 0, 0, null);
+    try std.testing.expectEqual(@as(usize, RECENT_REQUESTS_CAPACITY), m.recent_request_count);
+    const start = (m.recent_request_next + RECENT_REQUESTS_CAPACITY - m.recent_request_count) % RECENT_REQUESTS_CAPACITY;
+    try std.testing.expectEqual(@as(u64, 45), m.recent_requests[start].id);
+    try std.testing.expectEqual(@as(u64, 300), m.recent_requests[(start + 255) % RECENT_REQUESTS_CAPACITY].id);
+    var storage: [128 * 1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try renderJson(&m, &.{}, &writer);
+    const json = writer.buffered();
+    const first_id = std.mem.indexOf(u8, json, "\"id\":45") orelse return error.TestUnexpectedResult;
+    const last_id = std.mem.indexOf(u8, json, "\"id\":300") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first_id < last_id);
+}
+
+test "recent request JSON includes every field and validates router ids" {
+    var m = Metrics.init();
+    var context: RecentRequestContext = .{ .ts_start = 100.125, .client = .codex, .stream = true };
+    context.setPath("/v1/responses");
+    context.setPeer("192.0.2.5");
+    context.setRouterId("Abc_012-xyz");
+    m.recordRecentRequest(77, context, .success, 100.5, 120, 30, 8, 15.25);
+    var storage: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try renderJson(&m, &.{}, &writer);
+    const json = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"recent_requests\":[{\"id\":77,\"ts_start\":100.125,\"ts_end\":100.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"path\":\"/v1/responses\",\"outcome\":\"success\",\"prompt_tokens\":120,\"cached_tokens\":30,\"generation_tokens\":8,\"ttft_ms\":15.25,\"dur_ms\":375,\"stream\":true,\"client\":\"codex\",\"peer\":\"192.0.2.5\",\"router_id\":\"Abc_012-xyz\"") != null);
+
+    context.setRouterId("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefx");
+    try std.testing.expectEqual(@as(u8, 0), context.router_id_len);
+    context.setRouterId("bad id");
+    try std.testing.expectEqual(@as(u8, 0), context.router_id_len);
+    context.setRouterId("bad\"id");
+    try std.testing.expectEqual(@as(u8, 0), context.router_id_len);
+}
+
+test "rejected request is recorded as rejected with no router id" {
+    var m = Metrics.init();
+    var context: RecentRequestContext = .{ .ts_start = 3.0 };
+    context.setPath("/v1/messages");
+    m.recordRejectedRequest(context, 3.125, 0);
+    var storage: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try renderJson(&m, &.{}, &writer);
+    const json = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"outcome\":\"rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"router_id\":null") != null);
+    try std.testing.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
 }
 
 test "failed and rejected counters render under their Prometheus and JSON names" {

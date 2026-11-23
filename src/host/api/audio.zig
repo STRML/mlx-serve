@@ -213,7 +213,7 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
 
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
-        countRejected();
+        countRejected(stream, @intCast(@min(prompt_ids.len, std.math.maxInt(u32))));
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return null;
@@ -282,7 +282,7 @@ pub fn handleSpeech(allocator: std.mem.Allocator, stream: *Conn, body: []const u
 
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
-        countRejected();
+        countRejected(stream, @intCast(@min(prompt_ids.len, std.math.maxInt(u32))));
         var ovf_buf: [160]u8 = undefined;
         return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
     }

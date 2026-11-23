@@ -5,6 +5,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const metrics_mod = @import("../../host/metrics/metrics.zig");
 const log = @import("../../sdk/util/log.zig");
+const io_util = @import("../../sdk/util/io_util.zig");
 const testing = std.testing;
 
 const publishHotCacheResidency = @import("cache/budget.zig").publishHotCacheResidency;
@@ -143,6 +144,20 @@ pub fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: met
         slot.cached_tokens,
         slot.model.id,
     );
+    if (slot.recent_request.path_len > 0) m.recordRecentRequest(
+        slot.request_id,
+        slot.recent_request,
+        switch (outcome) {
+            .success => .success,
+            .failed => .failed,
+            .cancelled => .cancelled,
+        },
+        @as(f64, @floatFromInt(io_util.nowMs(slot.io))) / 1000.0,
+        slot.prompt_tokens,
+        slot.cached_tokens,
+        slot.completion_tokens,
+        if (slot.first_token_ns > 0) @as(f64, @floatFromInt(slot.first_token_ns)) / 1_000_000.0 else null,
+    );
 }
 
 /// The cleanup drain's count: a slot refused before its first forward is a rejection, anything
@@ -153,6 +168,16 @@ pub fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
     if (slot.error_code) |name| if (std.mem.eql(u8, name, "PrefillDoesNotFit")) {
         slot.metrics_recorded = true;
         m.recordRejected();
+        if (slot.recent_request.path_len > 0) m.recordRecentRequest(
+            slot.request_id,
+            slot.recent_request,
+            .rejected,
+            @as(f64, @floatFromInt(io_util.nowMs(slot.io))) / 1000.0,
+            slot.prompt_tokens,
+            slot.cached_tokens,
+            slot.completion_tokens,
+            null,
+        );
         return;
     };
     recordSlotEnd(m, slot, cleanupOutcome(slot));

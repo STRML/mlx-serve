@@ -171,6 +171,7 @@ pub const LoadParams = struct {
 /// ownership transfers into the slot when non-null (the slot will free on
 /// deinit).
 pub const SubmitParams = struct {
+    recent_request: metrics_mod.RecentRequestContext = .{},
     prompt_ids: []const u32,
     /// Where the request's events go (`abi.Event`): the host's stream. Null = the slot's own buffer only.
     sink: ?abi.Sink = null,

@@ -607,6 +607,7 @@ pub fn handleAnthropicMessages(
     const effort_word: ?[]const u8 = if (thinking.effort) |cfg| cfg.effort else null;
     const reasoning_budget = forcedReasoningBudget(gen, budget_tokens orelse default_budget);
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    stream.recent_request.stream = is_stream;
     const model_name = echoModelName(root, config.model_type);
 
     // Wave 1.A: per-request KV-quant override (Anthropic mirror).
@@ -776,7 +777,7 @@ pub fn handleAnthropicMessages(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/messages -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
-        countRejected();
+        countRejected(stream, @intCast(@min(prompt_ids.len, std.math.maxInt(u32))));
         var ovf_buf: [160]u8 = undefined;
         try sendAnthropicError(allocator, stream, "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
