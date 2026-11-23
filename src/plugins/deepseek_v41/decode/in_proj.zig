@@ -18,7 +18,7 @@ const MAIN_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_in_proj.metal
 const STAGE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_in_proj_stage.metal");
 /// bf16 pairs from a word, and the mxfp8 e4m3 pair decode.
 const HEADER = mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_in_proj_header.metal");
-const MAIN_INS = [_][*:0]const u8{ "x", "cpre", "attn_w", "eps", "hin", "fn_w", "scale", "base", "wq", "wsc", "wp", "cw" };
+const MAIN_INS = [_][*:0]const u8{ "x", "cpre", "attn_w", "eps", "hin", "fn_w", "scale", "base", "wq", "wsc", "wbi", "wp", "wpsc", "wpbi", "cw", "cwsc", "cwbi" };
 const MAIN_OUTS = [_][*:0]const u8{ "h", "qa", "kv", "iw", "comp", "z" };
 const STAGE_INS = [_][*:0]const u8{ "x", "cpre", "w", "eps" };
 const STAGE_OUTS = [_][*:0]const u8{"h"};
@@ -63,6 +63,10 @@ pub const Plan = struct {
     comp_f32: bool = false,
     /// Every threadgroup collapses the stream itself (up to `fuse_rows` rows); else `dec_in_proj_stage.metal` makes h first.
     fuse: bool = true,
+    /// Quant group sizes (0 = mxfp8 for q_kv, bf16 for weights_proj / compressor; 32/64/128 = affine 8-bit).
+    q_gs: usize = 0,
+    w_gs: usize = 0,
+    c_gs: usize = 0,
 
     fn compDtype(p: Plan) mlx.mlx_dtype {
         return if (p.comp_f32) .float32 else .bfloat16;
@@ -78,8 +82,25 @@ pub const Plan = struct {
     }
 };
 
-/// Every array a launch reads (`wp`, `cw`: null where the layer has no such rows).
-pub const Args = struct { x: A, cpre: A, attn_w: A, eps: A, fn_w: A, scale: A, base: A, wq: A, wsc: A, wp: ?A = null, cw: ?A = null };
+/// Every array a launch reads (`wp`, `cw` and their affine scale/bias tensors: null where unused).
+pub const Args = struct {
+    x: A,
+    cpre: A,
+    attn_w: A,
+    eps: A,
+    fn_w: A,
+    scale: A,
+    base: A,
+    wq: A,
+    wsc: A,
+    wbi: ?A = null,
+    wp: ?A = null,
+    wpsc: ?A = null,
+    wpbi: ?A = null,
+    cw: ?A = null,
+    cwsc: ?A = null,
+    cwbi: ?A = null,
+};
 
 pub const Out = struct {
     /// rms(collapse(x, cpre), attn_norm) `[R, D]`.
@@ -114,6 +135,19 @@ fn bf16Rows(l: *const v41.Lin, d: usize) ?usize {
     return @intCast(sh[0]);
 }
 
+/// An affine 8-bit `[rows, D]` linear (g32/g64/g128, scale/bias dtype `st`), returning `{ rows, gs }`, or null.
+fn aff8Rows(l: *const v41.Lin, d: usize, st: mlx.mlx_dtype) ?struct { rows: usize, gs: usize } {
+    if (l.ext != null or l.qp.mode != .affine or l.qp.bits != 8 or l.s.ctx == null or l.b.ctx == null) return null;
+    const gs = l.qp.group_size;
+    if (gs != 32 and gs != 64 and gs != 128) return null;
+    if (mlx.mlx_array_dtype(l.w) != .uint32 or mlx.mlx_array_dtype(l.s) != st or mlx.mlx_array_dtype(l.b) != st) return null;
+    const sh = dims(l.w);
+    if (sh.len != 2 or sh[0] <= 0 or @mod(sh[0], rt) != 0) return null;
+    const n: usize = @intCast(sh[0]);
+    if (!is(l.w, .uint32, &.{ n, d / 4 }) or !is(l.s, st, &.{ n, d / gs }) or !is(l.b, st, &.{ n, d / gs })) return null;
+    return .{ .rows = n, .gs = gs };
+}
+
 /// The launch `ly` takes for the stream `x` `[R, hc, D]`, or null where the kernel does not serve it: another dtype,
 /// width or row count, a q_kv, weights_proj or compressor in another format, a layer without q_kv (the DSpark stages).
 pub fn plan(m: *const v41.Dsv41Model, ly: *const v41.Layer, x: A) ?Plan {
@@ -130,16 +164,38 @@ pub fn planRows(m: *const v41.Dsv41Model, ly: *const v41.Layer, rows: usize) ?Pl
     const d: usize = c.hidden_size;
     if (rows < 1 or rows > decode.max_rows or c.dsv4_hc_mult != hc or d % 256 != 0 or d > 8192) return null;
     const q = ly.q_kv orelse return null;
-    if (q.qp.mode != .mxfp8 or q.qp.bits != 8 or q.qp.group_size != 32 or q.b.ctx != null) return null;
     const nq: usize = c.dsv4_q_lora_rank + c.head_dim;
-    if (nq % rt != 0 or !is(q.w, .uint32, &.{ nq, d / 4 }) or !is(q.s, .uint8, &.{ nq, d / 32 })) return null;
+    if (nq % rt != 0) return null;
+    var q_gs: usize = 0;
+    if (q.qp.mode == .mxfp8) {
+        if (q.qp.bits != 8 or q.qp.group_size != 32 or q.b.ctx != null) return null;
+        if (!is(q.w, .uint32, &.{ nq, d / 4 }) or !is(q.s, .uint8, &.{ nq, d / 32 })) return null;
+    } else {
+        const aq = aff8Rows(&q, d, .bfloat16) orelse return null;
+        if (aq.rows != nq) return null;
+        q_gs = aq.gs;
+    }
     const f = ly.hc_attn;
     if (!is(f.fn_w, .float32, &.{ n_mix, hc * d }) or !is(f.scale, .float32, &.{n_mix}) or !is(f.base, .float32, &.{n_mix}) or !is(ly.attn_norm, .bfloat16, &.{d})) return null;
-    var p: Plan = .{ .rows = rows, .dim = d, .nq = nq, .qa = c.dsv4_q_lora_rank, .fuse = rows <= fuse_rows };
-    if (ly.idx) |*iw| p.nw = bf16Rows(&iw.weights_proj, d) orelse return null;
+    var p: Plan = .{ .rows = rows, .dim = d, .nq = nq, .qa = c.dsv4_q_lora_rank, .fuse = rows <= fuse_rows, .q_gs = q_gs };
+    if (ly.idx) |*iw| {
+        if (bf16Rows(&iw.weights_proj, d)) |nw| {
+            p.nw = nw;
+        } else {
+            const aw = aff8Rows(&iw.weights_proj, d, .bfloat16) orelse return null;
+            p.nw = aw.rows;
+            p.w_gs = aw.gs;
+        }
+    }
     if (ly.comp) |*cw| {
-        p.nc = bf16Rows(&cw.wkv, d) orelse return null;
         p.comp_f32 = ly.ratio > 1;
+        if (bf16Rows(&cw.wkv, d)) |nc| {
+            p.nc = nc;
+        } else {
+            const ac = aff8Rows(&cw.wkv, d, p.compDtype()) orelse return null;
+            p.nc = ac.rows;
+            p.c_gs = ac.gs;
+        }
     }
     return p;
 }
@@ -157,8 +213,13 @@ pub fn argsOf(ly: *const v41.Layer, x: A, cpre: A, eps: A) Args {
         .base = ly.hc_attn.base,
         .wq = q.w,
         .wsc = q.s,
+        .wbi = if (q.b.ctx != null) q.b else null,
         .wp = if (ly.idx) |iw| iw.weights_proj.w else null,
+        .wpsc = if (ly.idx) |iw| (if (iw.weights_proj.s.ctx != null) iw.weights_proj.s else null) else null,
+        .wpbi = if (ly.idx) |iw| (if (iw.weights_proj.b.ctx != null) iw.weights_proj.b else null) else null,
         .cw = if (ly.comp) |cw| cw.wkv.w else null,
+        .cwsc = if (ly.comp) |cw| (if (cw.wkv.s.ctx != null) cw.wkv.s else null) else null,
+        .cwbi = if (ly.comp) |cw| (if (cw.wkv.b.ctx != null) cw.wkv.b else null) else null,
     };
 }
 
@@ -199,9 +260,13 @@ fn launchGeometry(p: Plan) kc.metal.Geometry {
     g.out(&.{ r, @max(ci(p.nw), 1) }, .bfloat16);
     g.out(&.{ r, @max(ci(p.nc), 1) }, p.compDtype());
     g.out(&.{ r, n_mix }, .float32);
-    inline for (.{ .{ "R", p.rows }, .{ "RT", rt }, .{ "NQ", p.nq }, .{ "QA", p.qa }, .{ "NW", p.nw }, .{ "NC", p.nc }, .{ "D", p.dim } }) |t| g.int(t[0], t[1]);
+    inline for (.{ .{ "R", p.rows }, .{ "RT", rt }, .{ "NQ", p.nq }, .{ "QA", p.qa }, .{ "NW", p.nw }, .{ "NC", p.nc }, .{ "D", p.dim }, .{ "Q_GS", if (p.q_gs > 0) p.q_gs else 32 }, .{ "W_GS", if (p.w_gs > 0) p.w_gs else 32 }, .{ "C_GS", if (p.c_gs > 0) p.c_gs else 32 } }) |t| g.int(t[0], t[1]);
     g.flag("FUSE", p.fuse);
+    g.flag("Q_AFF", p.q_gs > 0);
+    g.flag("W_AFF", p.w_gs > 0);
+    g.flag("C_AFF", p.c_gs > 0);
     g.dtype("CT", p.compDtype());
+    g.dtype("CST", p.compDtype());
     // The outputs the plan does not make are never written.
     g.unread = @as(u8, if (p.fuse) 0 else 1) | @as(u8, if (p.nw == 0) 8 else 0) | @as(u8, if (p.nc == 0) 16 else 0);
     return g;
@@ -253,7 +318,8 @@ fn project(sc: *v41.Scope, k: *const Kernels, p: Plan, a: Args, hin: ?A) !Out {
     std.debug.assert((hin == null) == p.fuse);
     var o: [6]A = undefined;
     // An input the launch does not read is the stream (bf16, like the rows it stands in for).
-    try dispatch(sc, k.main, launchGeometry(p), &.{ a.x, a.cpre, a.attn_w, a.eps, hin orelse a.x, a.fn_w, a.scale, a.base, a.wq, a.wsc, a.wp orelse a.x, a.cw orelse a.x }, &o);
+    const c_dummy = if (p.comp_f32) a.scale else a.x;
+    try dispatch(sc, k.main, launchGeometry(p), &.{ a.x, a.cpre, a.attn_w, a.eps, hin orelse a.x, a.fn_w, a.scale, a.base, a.wq, a.wsc, a.wbi orelse a.x, a.wp orelse a.x, a.wpsc orelse a.x, a.wpbi orelse a.x, a.cw orelse a.x, a.cwsc orelse c_dummy, a.cwbi orelse c_dummy }, &o);
     return .{ .h = hin orelse o[0], .qa = o[1], .kv = o[2], .iw = if (p.nw > 0) o[3] else null, .comp = if (p.nc > 0) o[4] else null, .z = o[5] };
 }
 
@@ -335,6 +401,32 @@ fn packCodes(codes: []const u8, words: []f64) void {
     for (words, 0..) |*w, i| w.* = @floatFromInt(@as(u32, codes[4 * i]) | @as(u32, codes[4 * i + 1]) << 8 | @as(u32, codes[4 * i + 2]) << 16 | @as(u32, codes[4 * i + 3]) << 24);
 }
 
+/// Row `n` of affine 8-bit weights (packed uint8 words, scales, biases) as values, `out.len` wide.
+fn aff8Row(words: []const f64, scales: []const f64, biases: []const f64, gs: usize, n: usize, out: []f64) void {
+    const d = out.len;
+    for (out, 0..) |*o, i| {
+        const word: u32 = @intFromFloat(words[n * (d / 4) + i / 4]);
+        const q: f64 = @floatFromInt((word >> @intCast(8 * (i % 4))) & 0xFF);
+        const gi = n * (d / gs) + i / gs;
+        o.* = q * scales[gi] + biases[gi];
+    }
+}
+
+fn fillAff8Random(rng: std.Random, words: []f64, scales: []f64, biases: []f64, codes: []u8) void {
+    rng.bytes(codes);
+    packCodes(codes, words);
+    for (scales, biases) |*sc, *bi| {
+        sc.* = (0.5 + rng.float(f64)) * 0.04 / 256.0;
+        bi.* = -sc.* * 128.0;
+    }
+}
+
+fn fillAff8Stress(wr: []const f64, words: []f64, scales: []f64, biases: []f64, codes: []u8) void {
+    for (codes, wr) |*c, v| c.* = @intFromFloat(128.0 + v);
+    packCodes(codes, words);
+    @memset(scales, 1.0);
+    @memset(biases, -128.0);
+}
 /// Row `n` of mxfp8 weights (packed words, e8m0 scales) as values, `out.len` wide.
 fn mxRow(words: []const f64, scales: []const f64, n: usize, out: []f64) void {
     const d = out.len;
@@ -424,14 +516,15 @@ fn depthNorm(s: Shape) usize {
 }
 
 /// The main kernel with `fuse` (every threadgroup collapses the stream; else `hin` holds the normed collapse), `nw`
-/// weights_proj rows and `nc` compressor rows (f32 when `cf32`).
-fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool) type {
+/// weights_proj rows and `nc` compressor rows (f32 when `cf32`). `q_gs`, `w_gs`, `c_gs`: 0 = mxfp8/bf16, >0 = affine 8b group size.
+fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime q_gs: usize, comptime w_gs: usize, comptime c_gs: usize) type {
     return struct {
         pub const Params = struct {};
         const comp_elem: spec.Elem = if (cf32) .f32 else .bf16;
+        const c_st: mlx.mlx_dtype = if (cf32) .float32 else .bfloat16;
 
         fn planOf(s: Shape) Plan {
-            return .{ .rows = s.rows, .dim = s.k, .nq = NQ, .qa = QA, .nw = nw, .nc = nc, .comp_f32 = cf32, .fuse = fuse };
+            return .{ .rows = s.rows, .dim = s.k, .nq = NQ, .qa = QA, .nw = nw, .nc = nc, .comp_f32 = cf32, .fuse = fuse, .q_gs = q_gs, .w_gs = w_gs, .c_gs = c_gs };
         }
 
         pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
@@ -469,7 +562,13 @@ fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf
         /// Weight row `i` of the dots as values.
         fn weightRow(k: anytype, i: usize, w: []f64) void {
             const d = k.shape.k;
-            if (i < NQ) mxRow(k.in(8), k.in(9), i, w) else if (i < NQ + nw) @memcpy(w, k.in(10)[(i - NQ) * d ..][0..d]) else @memcpy(w, k.in(11)[(i - NQ - nw) * d ..][0..d]);
+            if (i < NQ) {
+                if (q_gs > 0) aff8Row(k.in(8), k.in(9), k.in(10), q_gs, i, w) else mxRow(k.in(8), k.in(9), i, w);
+            } else if (i < NQ + nw) {
+                if (w_gs > 0) aff8Row(k.in(11), k.in(12), k.in(13), w_gs, i - NQ, w) else @memcpy(w, k.in(11)[(i - NQ) * d ..][0..d]);
+            } else {
+                if (c_gs > 0) aff8Row(k.in(14), k.in(15), k.in(16), c_gs, i - NQ - nw, w) else @memcpy(w, k.in(14)[(i - NQ - nw) * d ..][0..d]);
+            }
         }
 
         pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
@@ -485,9 +584,14 @@ fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf
             const scale = try k.add(.float32, &.{n_mix});
             const base = try k.add(.float32, &.{n_mix});
             const wq = try k.add(.uint32, &.{ NQ, d / 4 });
-            const wsc = try k.add(.uint8, &.{ NQ, d / 32 });
-            const wp = try k.add(.bfloat16, if (nw > 0) &[_]usize{ nw, d } else &[_]usize{16});
-            const cw = try k.add(.bfloat16, if (nc > 0) &[_]usize{ nc, d } else &[_]usize{16});
+            const wsc = try k.add(if (q_gs > 0) .bfloat16 else .uint8, &.{ NQ, d / (if (q_gs > 0) q_gs else 32) });
+            const wbi = try k.add(.bfloat16, if (q_gs > 0) &[_]usize{ NQ, d / q_gs } else &[_]usize{16});
+            const wp = try k.add(if (nw > 0 and w_gs > 0) .uint32 else .bfloat16, if (nw > 0) (if (w_gs > 0) &[_]usize{ nw, d / 4 } else &[_]usize{ nw, d }) else &[_]usize{16});
+            const wpsc = try k.add(.bfloat16, if (nw > 0 and w_gs > 0) &[_]usize{ nw, d / w_gs } else &[_]usize{16});
+            const wpbi = try k.add(.bfloat16, if (nw > 0 and w_gs > 0) &[_]usize{ nw, d / w_gs } else &[_]usize{16});
+            const cw = try k.add(if (nc > 0 and c_gs > 0) .uint32 else .bfloat16, if (nc > 0) (if (c_gs > 0) &[_]usize{ nc, d / 4 } else &[_]usize{ nc, d }) else &[_]usize{16});
+            const cwsc = try k.add(c_st, if (nc > 0 and c_gs > 0) &[_]usize{ nc, d / c_gs } else &[_]usize{16});
+            const cwbi = try k.add(c_st, if (nc > 0 and c_gs > 0) &[_]usize{ nc, d / c_gs } else &[_]usize{16});
             kit.uniform(rng, x, -3, 3);
             kit.uniform(rng, cpre, 0.05, 0.45);
             kit.uniform(rng, aw, 0.5, 1.5);
@@ -497,13 +601,18 @@ fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf
             kit.uniform(rng, fnw, -0.02, 0.02);
             kit.uniform(rng, scale, 0.5, 1.5);
             kit.uniform(rng, base, -0.5, 0.5);
-            const codes = try k.scratch().alloc(u8, NQ * d);
+            const max_codes = @max(NQ, @max(nw, nc)) * d;
+            const codes = try k.scratch().alloc(u8, max_codes);
             defer k.scratch().free(codes);
-            for (codes) |*c| c.* = (if (rng.boolean()) @as(u8, 0x80) else 0) | rng.intRangeAtMost(u8, 1, 10) << 3 | rng.intRangeAtMost(u8, 0, 7);
-            packCodes(codes, wq);
-            for (wsc) |*v| v.* = @floatFromInt(rng.intRangeAtMost(u8, 118, 121));
-            kit.uniform(rng, wp, -0.05, 0.05);
-            kit.uniform(rng, cw, -0.05, 0.05);
+            if (q_gs > 0) {
+                fillAff8Random(rng, wq, wsc, wbi, codes[0 .. NQ * d]);
+            } else {
+                for (codes[0 .. NQ * d]) |*c| c.* = (if (rng.boolean()) @as(u8, 0x80) else 0) | rng.intRangeAtMost(u8, 1, 10) << 3 | rng.intRangeAtMost(u8, 0, 7);
+                packCodes(codes[0 .. NQ * d], wq);
+                for (wsc) |*v| v.* = @floatFromInt(rng.intRangeAtMost(u8, 118, 121));
+            }
+            if (nw > 0 and w_gs > 0) fillAff8Random(rng, wp, wpsc, wpbi, codes[0 .. nw * d]) else kit.uniform(rng, wp, -0.05, 0.05);
+            if (nc > 0 and c_gs > 0) fillAff8Random(rng, cw, cwsc, cwbi, codes[0 .. nc * d]) else kit.uniform(rng, cw, -0.05, 0.05);
             switch (f) {
                 .random => {},
                 .nonfinite => {
@@ -528,11 +637,19 @@ fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf
                         cpre[r * hc + j] = if (j == 0) 1 else 0;
                     };
                     if (fuse) @memcpy(aw, pat) else for (0..rows) |r| @memcpy(hin[r * d ..][0..d], pat);
-                    for (codes, wr[0 .. NQ * d]) |*c, v| c.* = e4m3Int(v);
-                    packCodes(codes, wq);
-                    @memset(wsc, 127);
-                    if (nw > 0) @memcpy(wp, wr[NQ * d ..][0 .. nw * d]);
-                    if (nc > 0) @memcpy(cw, wr[(NQ + nw) * d ..][0 .. nc * d]);
+                    if (q_gs > 0) {
+                        fillAff8Stress(wr[0 .. NQ * d], wq, wsc, wbi, codes[0 .. NQ * d]);
+                    } else {
+                        for (codes[0 .. NQ * d], wr[0 .. NQ * d]) |*c, v| c.* = e4m3Int(v);
+                        packCodes(codes[0 .. NQ * d], wq);
+                        @memset(wsc, 127);
+                    }
+                    if (nw > 0) {
+                        if (w_gs > 0) fillAff8Stress(wr[NQ * d ..][0 .. nw * d], wp, wpsc, wpbi, codes[0 .. nw * d]) else @memcpy(wp, wr[NQ * d ..][0 .. nw * d]);
+                    }
+                    if (nc > 0) {
+                        if (c_gs > 0) fillAff8Stress(wr[(NQ + nw) * d ..][0 .. nc * d], cw, cwsc, cwbi, codes[0 .. nc * d]) else @memcpy(cw, wr[(NQ + nw) * d ..][0 .. nc * d]);
+                    }
                 },
             }
         }
@@ -691,8 +808,8 @@ const nan_rule: spec.Nan = .{ .stated = "classes as float64 gives them; the norm
 const fused_shapes: []const Shape = &.{ .{ .rows = 1, .n = NQ, .k = DIM }, .{ .rows = fuse_rows, .n = NQ, .k = DIM } };
 const staged_shapes: []const Shape = &.{ .{ .rows = fuse_rows + 1, .n = NQ, .k = DIM }, .{ .rows = decode.max_rows, .n = NQ, .k = DIM } };
 
-fn addMain(set: *kc.Set, comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime name: []const u8) !void {
-    const T = Main(fuse, nw, nc, cf32);
+fn addMain(set: *kc.Set, comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime q_gs: usize, comptime w_gs: usize, comptime c_gs: usize, comptime name: []const u8) !void {
+    const T = Main(fuse, nw, nc, cf32, q_gs, w_gs, c_gs);
     try kit.add(set, T, &main_l, .{}, .{
         .name = name,
         .accum = .f32,
@@ -707,12 +824,17 @@ fn addMain(set: *kc.Set, comptime fuse: bool, comptime nw: usize, comptime nc: u
 }
 
 pub fn register(set: *kc.Set) !void {
-    try addMain(set, true, 0, 0, false, "dsv41 dec in_proj, 1..2 rows (q_kv, hc mixes)");
-    try addMain(set, true, 8, 16, true, "dsv41 dec in_proj, 1..2 rows (+ weights_proj, f32 compressor)");
-    try addMain(set, true, 8, 16, false, "dsv41 dec in_proj, 1..2 rows (+ weights_proj, bf16 compressor)");
-    try addMain(set, false, 0, 0, false, "dsv41 dec in_proj, 3..6 rows (q_kv, hc mixes)");
-    try addMain(set, false, 8, 16, true, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, f32 compressor)");
-    try addMain(set, false, 8, 16, false, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, bf16 compressor)");
+    try addMain(set, true, 0, 0, false, 0, 0, 0, "dsv41 dec in_proj, 1..2 rows (q_kv, hc mixes)");
+    try addMain(set, true, 8, 16, true, 0, 0, 0, "dsv41 dec in_proj, 1..2 rows (+ weights_proj, f32 compressor)");
+    try addMain(set, true, 8, 16, false, 0, 0, 0, "dsv41 dec in_proj, 1..2 rows (+ weights_proj, bf16 compressor)");
+    try addMain(set, false, 0, 0, false, 0, 0, 0, "dsv41 dec in_proj, 3..6 rows (q_kv, hc mixes)");
+    try addMain(set, false, 8, 16, true, 0, 0, 0, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, f32 compressor)");
+    try addMain(set, false, 8, 16, false, 0, 0, 0, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, bf16 compressor)");
+    inline for (.{ 32, 64, 128 }) |gs| {
+        try addMain(set, true, 0, 0, false, gs, 0, 0, std.fmt.comptimePrint("dsv41 dec in_proj, 1..2 rows (affine 8b g{d} q_kv)", .{gs}));
+        try addMain(set, false, 8, 16, true, gs, gs, gs, std.fmt.comptimePrint("dsv41 dec in_proj, 3..6 rows (affine 8b g{d} + weights_proj + f32 compressor)", .{gs}));
+        try addMain(set, true, 8, 16, false, gs, gs, gs, std.fmt.comptimePrint("dsv41 dec in_proj, 1..2 rows (affine 8b g{d} + weights_proj + bf16 compressor)", .{gs}));
+    }
     try kit.add(set, Stage, &stage_l, .{}, .{
         .name = "dsv41 dec in_proj_stage (normed collapse)",
         .accum = .f32,
@@ -734,15 +856,41 @@ test "dsv41 dec in_proj: the declared launches are the shipped wrapper's, byte f
     defer kn.deinit();
     var sc = v41.Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
-    inline for (.{ .{ true, 0, 0, false, 1 }, .{ true, 8, 16, true, 2 }, .{ true, 8, 16, false, 1 }, .{ false, 0, 0, false, 3 }, .{ false, 8, 16, true, 6 }, .{ false, 8, 16, false, 4 } }) |v| {
-        const T = Main(v[0], v[1], v[2], v[3]);
-        const shape: Shape = .{ .rows = v[4], .n = NQ, .k = DIM };
+    inline for (.{
+        .{ true, 0, 0, false, 0, 0, 0, 1 },
+        .{ true, 8, 16, true, 0, 0, 0, 2 },
+        .{ true, 8, 16, false, 0, 0, 0, 1 },
+        .{ false, 0, 0, false, 0, 0, 0, 3 },
+        .{ false, 8, 16, true, 0, 0, 0, 6 },
+        .{ false, 8, 16, false, 0, 0, 0, 4 },
+        .{ true, 8, 16, true, 64, 64, 64, 1 },
+        .{ false, 8, 16, false, 64, 64, 64, 4 },
+    }) |v| {
+        const T = Main(v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+        const shape: Shape = .{ .rows = v[7], .n = NQ, .k = DIM };
         var c = kit.Case(T).init(gpa, &main_l, .{});
         defer c.deinit();
         try testing.expect(try c.prepare(shape, .random, 7));
         try c.run();
         const p = T.planOf(shape);
-        const a = Args{ .x = c.args[0], .cpre = c.args[1], .attn_w = c.args[2], .eps = c.args[3], .fn_w = c.args[5], .scale = c.args[6], .base = c.args[7], .wq = c.args[8], .wsc = c.args[9], .wp = if (v[1] > 0) c.args[10] else null, .cw = if (v[2] > 0) c.args[11] else null };
+        const a = Args{
+            .x = c.args[0],
+            .cpre = c.args[1],
+            .attn_w = c.args[2],
+            .eps = c.args[3],
+            .fn_w = c.args[5],
+            .scale = c.args[6],
+            .base = c.args[7],
+            .wq = c.args[8],
+            .wsc = c.args[9],
+            .wbi = if (v[4] > 0) c.args[10] else null,
+            .wp = if (v[1] > 0) c.args[11] else null,
+            .wpsc = if (v[1] > 0 and v[5] > 0) c.args[12] else null,
+            .wpbi = if (v[1] > 0 and v[5] > 0) c.args[13] else null,
+            .cw = if (v[2] > 0) c.args[14] else null,
+            .cwsc = if (v[2] > 0 and v[6] > 0) c.args[15] else null,
+            .cwbi = if (v[2] > 0 and v[6] > 0) c.args[16] else null,
+        };
         const out = try project(&sc, &kn, p, a, if (v[0]) null else c.args[4]);
         var theirs: [6]A = undefined;
         var n: usize = 0;
@@ -876,8 +1024,9 @@ fn joinRows(gpa: std.mem.Allocator, qa: []const f32, kv: []const f32, rows: usiz
 }
 
 fn dequantHost(sc: *v41.Scope, l: *const v41.Lin) ![]f32 {
+    if (l.s.ctx == null) return host(l.w);
     var d = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_dequantize(&d, l.w, l.s, none, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", none, .{ .value = .float32, .has_value = true }, sc.s));
+    try mlx.check(mlx.mlx_dequantize(&d, l.w, l.s, l.b, mlx.mlx_optional_int.some(@intCast(l.qp.group_size)), mlx.mlx_optional_int.some(@intCast(l.qp.bits)), l.qp.mode.cstr(), none, .{ .value = .float32, .has_value = true }, sc.s));
     return host(try keep(sc, d));
 }
 
@@ -936,7 +1085,7 @@ fn expectLayer(gpa: std.mem.Allocator, fx: *fixture.Fixture, k: *const Kernels, 
     try decode.expectNoWorse("q_kv", yn, y, yt);
 
     if (ly.idx) |*iw| {
-        const w = try host(iw.weights_proj.w);
+        const w = try dequantHost(&sc, &iw.weights_proj);
         defer testing.allocator.free(w);
         const want = try host(try iw.weights_proj.apply(&sc, staged.h));
         defer testing.allocator.free(want);
@@ -947,7 +1096,7 @@ fn expectLayer(gpa: std.mem.Allocator, fx: *fixture.Fixture, k: *const Kernels, 
         try decode.expectNoWorse("weights_proj", got, want, t);
     } else try testing.expect(out.iw == null);
     if (ly.comp) |*cw| {
-        const w = try host(cw.wkv.w);
+        const w = try dequantHost(&sc, &cw.wkv);
         defer testing.allocator.free(w);
         const chain = if (ly.ratio > 1) try v41.denseF32x(&sc, m, &cw.wkv, try asF32(&sc, staged.h)) else try cw.wkv.apply(&sc, staged.h);
         const want = try host(chain);

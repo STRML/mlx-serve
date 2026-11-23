@@ -43,9 +43,9 @@ pub fn Case(comptime D: type) type {
         p: D.Params,
         arena: std.heap.ArenaAllocator,
         shape: Shape = undefined,
-        ins: [16]In = undefined,
+        ins: [20]In = undefined,
         n_in: usize = 0,
-        args: [16]mlx.mlx_array = undefined,
+        args: [20]mlx.mlx_array = undefined,
         /// A stated rule's finding, returned by `check`.
         msg: [256]u8 = undefined,
         /// The outputs `D.output` gathers after each run, for a kernel whose result lands in a bound input.

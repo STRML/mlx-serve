@@ -910,20 +910,27 @@ test "segmented NAX sorted gather: a gate/up bank fused along its rows gives the
     defer _ = mlx.mlx_array_free(ids);
     const row_map = mlx.mlx_array_new_data(map_data.ptr, &[_]c_int{rows}, 1, .uint32);
     defer _ = mlx.mlx_array_free(row_map);
-    for ([_]u32{ 2, 3 }) |bits| {
-        const gate = try randomBank(experts, n, k, bits, 64, false, 0x2267, s);
+    for ([_]struct { bits: u32, group: u32, mx: bool }{
+        .{ .bits = 2, .group = 64, .mx = false },
+        .{ .bits = 3, .group = 64, .mx = false },
+        .{ .bits = 4, .group = 32, .mx = true },
+        .{ .bits = 4, .group = 16, .mx = true },
+    }) |cfg| {
+        const gate = try randomBank(experts, n, k, cfg.bits, cfg.group, cfg.mx, 0x2267, s);
         defer gate.deinit();
-        const up = try randomBank(experts, n, k, bits, 64, false, 0x4521, s);
+        const up = try randomBank(experts, n, k, cfg.bits, cfg.group, cfg.mx, 0x4521, s);
         defer up.deinit();
-        var fused: [3]mlx.mlx_array = undefined;
-        for ([_][2]mlx.mlx_array{ .{ gate.w, up.w }, .{ gate.sc, up.sc }, .{ gate.bi, up.bi } }, &fused) |pair, *o| {
+        var fused: [3]mlx.mlx_array = .{ gate.w, gate.sc, gate.bi };
+        const n_parts: usize = if (cfg.mx) 2 else 3;
+        const parts: [3][2]mlx.mlx_array = .{ .{ gate.w, up.w }, .{ gate.sc, up.sc }, .{ gate.bi, up.bi } };
+        for (parts[0..n_parts], fused[0..n_parts]) |pair, *o| {
             const v = mlx.mlx_vector_array_new_data(&pair, 2);
             defer _ = mlx.mlx_vector_array_free(v);
             o.* = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_concatenate_axis(o, v, 1, s));
             try mlx.check(mlx.mlx_array_eval(o.*));
         }
-        defer for (fused) |f| {
+        defer for (fused[0..n_parts]) |f| {
             _ = mlx.mlx_array_free(f);
         };
         var x = mlx.mlx_array_new();
@@ -931,9 +938,9 @@ test "segmented NAX sorted gather: a gate/up bank fused along its rows gives the
         try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ tokens, 1, k }, 3, .bfloat16, 0, 0.5, gate.key, s));
         const sigtab = try @import("../hc/hc_prefill.zig").sigmoidTable(s);
         for ([_]u32{ 0, 10 }) |limit| {
-            const want = (try sortedGateUp(x, row_map, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, ids, sigtab, limit, bits, 64, false, true, s)) orelse return error.KernelDeclinedTestShape;
+            const want = (try sortedGateUp(x, row_map, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, ids, sigtab, limit, cfg.bits, cfg.group, cfg.mx, true, s)) orelse return error.KernelDeclinedTestShape;
             defer _ = mlx.mlx_array_free(want);
-            const got = (try sortedGateUpFused(x, row_map, fused[0], fused[1], fused[2], ids, sigtab, limit, bits, 64, false, true, s)) orelse return error.KernelDeclinedTestShape;
+            const got = (try sortedGateUpFused(x, row_map, fused[0], fused[1], fused[2], ids, sigtab, limit, cfg.bits, cfg.group, cfg.mx, true, s)) orelse return error.KernelDeclinedTestShape;
             defer _ = mlx.mlx_array_free(got);
             try expectBitEqual(want, got, s);
         }

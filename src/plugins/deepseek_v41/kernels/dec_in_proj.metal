@@ -60,18 +60,47 @@ if (tg >= NGQ + NGW + NGC) {
 }
 
 const bool is_q = tg < NGQ, is_w = !is_q && tg < NGQ + NGW;
+const bool is_aff = (is_q && Q_AFF) || (is_w && W_AFF) || (!is_q && !is_w && C_AFF);
 const int row0 = (is_q ? tg : (is_w ? tg - NGQ : tg - NGQ - NGW)) * RT;
 uint2 wq8[RT];
 uint sc8[RT];
+float af_s[RT], af_b[RT];
 uint4 wb[RT];
 if (is_q) {
+  if constexpr (Q_AFF) {
+    const int sg_idx = int(t) / (Q_GS / 8);
+    #pragma unroll
+    for (int i = 0; i < RT; ++i) {
+      wq8[i] = *(const device uint2*)((const device uint*)wq + size_t(row0 + i) * (D / 4) + 2 * t);
+      const size_t si = size_t(row0 + i) * (D / Q_GS) + sg_idx;
+      af_s[i] = float(((const device bfloat16_t*)wsc)[si]);
+      af_b[i] = float(((const device bfloat16_t*)wbi)[si]);
+    }
+  } else {
+    #pragma unroll
+    for (int i = 0; i < RT; ++i) {
+      wq8[i] = *(const device uint2*)((const device uint*)wq + size_t(row0 + i) * (D / 4) + 2 * t);
+      sc8[i] = uint(((const device uchar*)wsc)[size_t(row0 + i) * (D / 32) + t / 4]);
+    }
+  }
+} else if (is_aff) {
+  const device uint* wr = is_w ? (const device uint*)wp : (const device uint*)cw;
+  const int gs = is_w ? W_GS : C_GS;
+  const int sg_idx = int(t) / (gs / 8);
   #pragma unroll
   for (int i = 0; i < RT; ++i) {
-    wq8[i] = *(const device uint2*)(wq + size_t(row0 + i) * (D / 4) + 2 * t);
-    sc8[i] = uint(wsc[size_t(row0 + i) * (D / 32) + t / 4]);
+    wq8[i] = *(const device uint2*)(wr + size_t(row0 + i) * (D / 4) + 2 * t);
+    const size_t si = size_t(row0 + i) * (D / gs) + sg_idx;
+    if (is_w) {
+      af_s[i] = float(((const device bfloat16_t*)wpsc)[si]);
+      af_b[i] = float(((const device bfloat16_t*)wpbi)[si]);
+    } else {
+      af_s[i] = float(((const device CST*)cwsc)[si]);
+      af_b[i] = float(((const device CST*)cwbi)[si]);
+    }
   }
 } else {
-  const device bfloat16_t* wr = is_w ? wp : cw;
+  const device bfloat16_t* wr = is_w ? (const device bfloat16_t*)wp : (const device bfloat16_t*)cw;
   #pragma unroll
   for (int i = 0; i < RT; ++i) wb[i] = *(const device uint4*)(wr + size_t(row0 + i) * D + 8 * t);
 }
@@ -150,7 +179,9 @@ if (FUSE) {
 
 // This thread's dot of each row against its 8 positions; a simdgroup's sums go to threadgroup memory a float4 at a time.
 float dv[RT][R];
-if (is_q) {
+if (is_aff) {
+  dsv41_in_proj_aff8<R, RT>(wq8, af_s, af_b, hf, dv);
+} else if (is_q) {
   #pragma unroll
   for (int i = 0; i < RT; ++i) {
     // The e8m0 scale is 2^(e - 127); the e4m3 bit placement leaves out a 2^8.

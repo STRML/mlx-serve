@@ -1,16 +1,23 @@
-// dec_ffn_in, launch 1: y = wo_b(oa) for R rows (mxfp8: e4m3 words, an e8m0 exponent per 32), then each output column's
+// dec_ffn_in, launch 1: y = wo_b(oa) for R rows (mxfp8 when !AFF, affine 8-bit group GS when AFF), then each output column's
 // hc expand x1 = post * y + comb . x and the collapse hv = pre . x1. A simdgroup owns NR columns across the lanes' K slices.
 const uint lane = thread_index_in_simdgroup;
 const uint sg = simdgroup_index_in_threadgroup;
 const int tg = int(threadgroup_position_in_grid.x);
 const int tid = int(thread_index_in_threadgroup);
 const int nb = tg * (NSG * NR) + int(sg) * NR;
-constexpr int KW = K / 4, KG = K / 32, STEPS = K / 512;
+constexpr int KW = K / 4, KG = K / (AFF ? GS : 32), STEPS = K / 512;
 const device uint4* wr[NR];
 const device uchar* sr[NR];
+const device T* sa[NR];
+const device T* ba[NR];
 for (int j = 0; j < NR; ++j) {
   wr[j] = (const device uint4*)(w_q + (size_t)(nb + j) * KW);
-  sr[j] = scales + (size_t)(nb + j) * KG;
+  if constexpr (AFF) {
+    sa[j] = (const device T*)scales + (size_t)(nb + j) * KG;
+    ba[j] = (const device T*)biases + (size_t)(nb + j) * KG;
+  } else {
+    sr[j] = (const device uchar*)scales + (size_t)(nb + j) * KG;
+  }
 }
 // The epilogue's stream columns, loaded before the K loop.
 float sv[HC];
@@ -23,24 +30,42 @@ for (int j = 0; j < NR; ++j) for (int r = 0; r < R; ++r) acc[j][r] = 0.0f;
 for (int s0 = 0; s0 < STEPS; s0 += U) {
   uint4 q[U][NR];
   uint e[U][NR];
+  float af_s[U][NR], af_b[U][NR];
   for (int u = 0; u < U; ++u) for (int j = 0; j < NR; ++j) {
     q[u][j] = wr[j][(s0 + u) * 32 + lane];
-    e[u][j] = uint(sr[j][(s0 + u) * 16 + lane / 2]);
+    if constexpr (AFF) {
+      constexpr int SSTEP = 512 / GS, LPG = GS / 16;
+      const int gi = (s0 + u) * SSTEP + int(lane) / LPG;
+      af_s[u][j] = float(sa[j][gi]);
+      af_b[u][j] = float(ba[j][gi]);
+    } else {
+      e[u][j] = uint(sr[j][(s0 + u) * 16 + lane / 2]);
+    }
   }
   for (int u = 0; u < U; ++u) {
     const int s = s0 + u;
     float wv[NR][16], sc[NR];
     for (int j = 0; j < NR; ++j) {
-      // e8m0 as 2^(e - 127), times the 2^8 the e4m3 bit placement leaves out.
-      sc[j] = as_type<float>(e[u][j] == 0u ? 0x400000u : (e[u][j] << 23)) * 256.0f;
       const uint words[4] = {q[u][j].x, q[u][j].y, q[u][j].z, q[u][j].w};
-      for (int i = 0; i < 4; ++i) {
-        const float2 lo = mlxserve_e4m3x2(words[i]);
-        const float2 hi = mlxserve_e4m3x2(words[i] >> 8);
-        wv[j][4 * i + 0] = lo.x;
-        wv[j][4 * i + 1] = hi.x;
-        wv[j][4 * i + 2] = lo.y;
-        wv[j][4 * i + 3] = hi.y;
+      if constexpr (AFF) {
+        const float s_v = af_s[u][j], b_v = af_b[u][j];
+        for (int i = 0; i < 4; ++i) {
+          wv[j][4 * i + 0] = metal::fma(float(words[i] & 0xFFu), s_v, b_v);
+          wv[j][4 * i + 1] = metal::fma(float((words[i] >> 8) & 0xFFu), s_v, b_v);
+          wv[j][4 * i + 2] = metal::fma(float((words[i] >> 16) & 0xFFu), s_v, b_v);
+          wv[j][4 * i + 3] = metal::fma(float(words[i] >> 24), s_v, b_v);
+        }
+      } else {
+        // e8m0 as 2^(e - 127), times the 2^8 the e4m3 bit placement leaves out.
+        sc[j] = as_type<float>(e[u][j] == 0u ? 0x400000u : (e[u][j] << 23)) * 256.0f;
+        for (int i = 0; i < 4; ++i) {
+          const float2 lo = mlxserve_e4m3x2(words[i]);
+          const float2 hi = mlxserve_e4m3x2(words[i] >> 8);
+          wv[j][4 * i + 0] = lo.x;
+          wv[j][4 * i + 1] = hi.x;
+          wv[j][4 * i + 2] = lo.y;
+          wv[j][4 * i + 3] = hi.y;
+        }
       }
     }
     for (int r = 0; r < R; ++r) {
@@ -53,9 +78,15 @@ for (int s0 = 0; s0 < STEPS; s0 += U) {
         xf[2 * i + 1] = as_type<float>(wd[i] & 0xffff0000u);
       }
       for (int j = 0; j < NR; ++j) {
-        float d = 0.0f;
-        for (int i = 0; i < 16; ++i) d += xf[i] * wv[j][i];
-        acc[j][r] += d * sc[j];
+        if constexpr (AFF) {
+          float d = acc[j][r];
+          for (int i = 0; i < 16; ++i) d = metal::fma(xf[i], wv[j][i], d);
+          acc[j][r] = d;
+        } else {
+          float d = 0.0f;
+          for (int i = 0; i < 16; ++i) d = metal::fma(xf[i], wv[j][i], d);
+          acc[j][r] += d * sc[j];
+        }
       }
     }
   }

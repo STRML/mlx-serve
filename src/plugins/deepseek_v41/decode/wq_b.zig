@@ -14,7 +14,7 @@ const none: A = .{ .ctx = null };
 
 pub const SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_wq_b.metal");
 pub const HEADER = dsv41.FP8_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_wq_b_header.metal");
-pub const INS = [_][*:0]const u8{ "qa", "qn", "w_q", "s_q", "w_i", "s_i", "kv", "kvn", "periods", "periods_i", "pos", "z", "eps" };
+pub const INS = [_][*:0]const u8{ "qa", "qn", "w_q", "s_q", "b_q", "w_i", "s_i", "b_i", "kv", "kvn", "periods", "periods_i", "pos", "z", "eps" };
 pub const OUTS = [_][*:0]const u8{ "q", "q_idx", "kv_row", "pre", "post", "comb" };
 
 /// The query latent's width and the kv row's.
@@ -44,12 +44,26 @@ fn dim(x: A, axis: usize) usize {
     return @intCast(mlx.getShape(x)[axis]);
 }
 
-fn mxfp8Rows(l: dsv41.Lin, n: usize) bool {
-    if (l.qp.mode != .mxfp8 or l.qp.bits != 8 or l.qp.group_size != 32) return false;
-    if (mlx.mlx_array_dtype(l.w) != .uint32 or mlx.mlx_array_dtype(l.s) != .uint8) return false;
+/// Quantization layout supported by `dec_wq_b`: 0 = mxfp8 g32, 32/64/128 = affine 8-bit group size.
+fn linKind(l: dsv41.Lin, n: usize) ?usize {
+    if (l.qp.bits != 8 or l.s.ctx == null) return null;
+    if (mlx.mlx_array_dtype(l.w) != .uint32) return null;
     const ws = mlx.getShape(l.w);
     const ss = mlx.getShape(l.s);
-    return ws.len == 2 and ss.len == 2 and ws[0] == n and ss[0] == n and ws[1] * 4 == K and ss[1] * 32 == K;
+    if (ws.len != 2 or ss.len != 2 or ws[0] != n or ss[0] != n or ws[1] * 4 != K) return null;
+    if (l.qp.mode == .mxfp8) {
+        if (l.qp.group_size != 32 or mlx.mlx_array_dtype(l.s) != .uint8 or ss[1] * 32 != K) return null;
+        return 0;
+    }
+    if (l.qp.mode == .affine) {
+        const gs = l.qp.group_size;
+        if (gs != 32 and gs != 64 and gs != 128) return null;
+        if (l.b.ctx == null or mlx.mlx_array_dtype(l.s) != .bfloat16 or mlx.mlx_array_dtype(l.b) != .bfloat16) return null;
+        const bs = mlx.getShape(l.b);
+        if (bs.len != 2 or bs[0] != n or ss[1] * ci(gs) != K or bs[1] * ci(gs) != K) return null;
+        return gs;
+    }
+    return null;
 }
 
 /// Rows at positions `pos` (int32 `[rows]`, `rowsAt` for one state's run; a batch's states each at their own): `qa`
@@ -65,10 +79,10 @@ pub fn servesLayer(m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer) bool {
     if (m.qat_off or m.act != .bfloat16) return false;
     const heads = c.num_attention_heads;
     if (c.head_dim != KV or c.dsv4_rope_head_dim != 64 or c.dsv4_hc_mult != 4) return false;
-    if (c.dsv4_q_lora_rank != K or !mxfp8Rows(ly.wq_b, heads * c.head_dim)) return false;
+    if (c.dsv4_q_lora_rank != K or linKind(ly.wq_b, heads * c.head_dim) == null) return false;
     if (ly.idx) |iw| {
         const idx_n = c.dsv4_index_n_heads * c.dsv4_index_head_dim;
-        if (c.dsv4_index_head_dim != 128 or idx_n % 32 != 0 or !mxfp8Rows(iw.wq_b, idx_n)) return false;
+        if (c.dsv4_index_head_dim != 128 or idx_n % 32 != 0 or linKind(iw.wq_b, idx_n) == null) return false;
     }
     return heads * c.head_dim % (SGS * 2) == 0;
 }
@@ -90,9 +104,13 @@ pub fn launch(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_m
     const hc = c.dsv4_hc_mult;
     if (rows < 1 or rows > decode.max_rows or dim(qa, 1) != K or hd != KV or c.dsv4_rope_head_dim != 64 or hc != 4) return null;
     if (mlx.getShape(pos).len != 1 or dim(pos, 0) != rows or mlx.mlx_array_dtype(pos) != .int32) return null;
-    if (c.dsv4_q_lora_rank != K or !mxfp8Rows(ly.wq_b, heads * hd)) return null;
+    if (c.dsv4_q_lora_rank != K) return null;
+    const q_gs = linKind(ly.wq_b, heads * hd) orelse return null;
     const idx_n = if (ly.idx != null) c.dsv4_index_n_heads * c.dsv4_index_head_dim else 0;
-    if (ly.idx) |iw| if (c.dsv4_index_head_dim != 128 or idx_n % 32 != 0 or !mxfp8Rows(iw.wq_b, idx_n)) return null;
+    const i_gs: usize = if (ly.idx) |iw| blk: {
+        if (c.dsv4_index_head_dim != 128 or idx_n % 32 != 0) return null;
+        break :blk linKind(iw.wq_b, idx_n) orelse return null;
+    } else 0;
     if (heads * hd % (SGS * 2) != 0 or g < rows + 1) return null;
     const iw_q = if (ly.idx) |iw| iw.wq_b else ly.wq_b;
 
@@ -119,10 +137,16 @@ pub fn launch(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_m
         .{ "HC", hc },
         .{ "ITERS", c.dsv4_hc_sinkhorn_iters },
         .{ "RD", c.dsv4_rope_head_dim },
+        .{ "Q_GS", if (q_gs > 0) q_gs else 32 },
+        .{ "I_GS", if (i_gs > 0) i_gs else 32 },
     }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "Q_AFF", q_gs > 0));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "I_AFF", i_gs > 0));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", act));
     const eps = try dsv41.hcEps(sc, m);
-    const iv = mlx.mlx_vector_array_new_data(&[_]A{ qa, ly.q_norm, ly.wq_b.w, ly.wq_b.s, iw_q.w, iw_q.s, kv, ly.kv_norm, dsv41.ropeFor(m, li).fwd, m.rope_yarn.fwd, pos, z, eps }, INS.len);
+    const qb = if (ly.wq_b.b.ctx != null) ly.wq_b.b else qa;
+    const ib = if (iw_q.b.ctx != null) iw_q.b else qa;
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ qa, ly.q_norm, ly.wq_b.w, ly.wq_b.s, qb, iw_q.w, iw_q.s, ib, kv, ly.kv_norm, dsv41.ropeFor(m, li).fwd, m.rope_yarn.fwd, pos, z, eps }, INS.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
@@ -164,14 +188,14 @@ const I = struct {
     const qa = 0;
     const qn = 1;
     const wq = 2;
-    const wi = 4;
-    const kv = 6;
-    const kvn = 7;
-    const periods = 8;
-    const periods_i = 9;
-    const pos = 10;
-    const z = 11;
-    const eps = 12;
+    const wi = 5;
+    const kv = 8;
+    const kvn = 9;
+    const periods = 10;
+    const periods_i = 11;
+    const pos = 12;
+    const z = 13;
+    const eps = 14;
 };
 
 /// An e4m3 byte's value (the OCP fn variant; S.1111.111 is never drawn).
@@ -182,14 +206,30 @@ fn e4m3(b: u8) f64 {
     return if (b & 0x80 != 0) -v else v;
 }
 
-/// Row `c` of the mxfp8 linear at inputs `at` (words) and `at + 1` (exponents), dequantized in float64.
-fn weightRow(k: anytype, at: usize, c: usize, out: []f64) void {
+/// Row `c` of the quantized linear at inputs `at` (words), `at + 1` (scales), `at + 2` (biases, if `gs > 0`),
+/// dequantized in float64. When `gs > 0` (`affine` 8b), `mag_w` receives `|s * code| + |b|` so magnitude tracking covers
+/// non-fused `(s * dot(x, code)) + b * sum(x)` cancellation.
+fn weightRow(k: anytype, at: usize, gs: usize, c: usize, out: []f64, mag_w: []f64) void {
     const words = k.in(at)[c * (K / 4) ..][0 .. K / 4];
+    if (gs > 0) {
+        const scales = k.in(at + 1)[c * (K / gs) ..][0 .. K / gs];
+        const biases = k.in(at + 2)[c * (K / gs) ..][0 .. K / gs];
+        for (out, mag_w, 0..) |*o, *mw, j| {
+            const w: u32 = @intFromFloat(words[j / 4]);
+            const q: f64 = @floatFromInt((w >> @intCast(8 * (j % 4))) & 0xFF);
+            const s = scales[j / gs];
+            const b = biases[j / gs];
+            o.* = s * q + b;
+            mw.* = @abs(s * q) + @abs(b);
+        }
+        return;
+    }
     const exps = k.in(at + 1)[c * (K / 32) ..][0 .. K / 32];
-    for (out, 0..) |*o, j| {
+    for (out, mag_w, 0..) |*o, *mw, j| {
         const w: u32 = @intFromFloat(words[j / 4]);
         const byte: u8 = @truncate(w >> @intCast(8 * (j % 4)));
         o.* = std.math.ldexp(e4m3(byte), @as(i32, @intFromFloat(exps[j / 32])) - 127);
+        mw.* = @abs(o.*);
     }
 }
 
@@ -211,31 +251,35 @@ fn normed(k: anytype, x: []const f64, w: []const f64, sum: Sum, point: bool, out
 
 /// `T(qr . W[c])` for the `n` rows of the linear at input `at` against `rows` latents `qr` [rows, K]: intervals
 /// through the f32 sum, or points in `point` (summed as `sum` adds them; `mg` the terms' magnitude).
-fn gemv(k: anytype, at: usize, n: usize, rows: usize, qr: []const Iv, sum: Sum, point: bool, y: []Iv, mg: []f64) !void {
+fn gemv(k: anytype, at: usize, gs: usize, n: usize, rows: usize, qr: []const Iv, sum: Sum, point: bool, y: []Iv, mg: []f64) !void {
     const a = k.scratch();
     const w = try a.alloc(f64, K);
     defer a.free(w);
+    const mw = try a.alloc(f64, K);
+    defer a.free(mw);
     const t = try a.alloc(f64, K);
     defer a.free(t);
     const gm = spec.gamma(K + 8, cx.u);
     for (0..n) |c| {
-        weightRow(k, at, c, w);
+        weightRow(k, at, gs, c, w, mw);
         for (0..rows) |r| {
             const x = qr[r * K ..][0..K];
             var m: f64 = 0;
             if (point) {
-                for (t, x, w) |*o, q, wv| o.* = q.lo * wv;
-                for (t) |v| m += @abs(v);
+                for (t, x, w, mw) |*o, q, wv, mwv| {
+                    o.* = q.lo * wv;
+                    m += @abs(q.lo) * mwv;
+                }
                 y[r * n + c] = Iv.pt(cx.bf(sum.of(t)));
             } else {
                 var lo: f64 = 0;
                 var hi: f64 = 0;
-                for (x, w) |q, wv| {
+                for (x, w, mw) |q, wv, mwv| {
                     const p0 = q.lo * wv;
                     const p1 = q.hi * wv;
                     lo += @min(p0, p1);
                     hi += @max(p0, p1);
-                    m += @max(@abs(p0), @abs(p1));
+                    m += @max(@abs(q.lo), @abs(q.hi)) * mwv;
                 }
                 y[r * n + c] = (Iv{ .lo = lo - gm * m, .hi = hi + gm * m }).round(cx.act);
             }
@@ -320,10 +364,30 @@ fn combN(s: Shape) usize {
     return s.rows * cx.HC * cx.HC;
 }
 
+fn packU8(codes: []const u8, words: []f64) void {
+    for (words, 0..) |*w, i| w.* = @floatFromInt(@as(u32, codes[4 * i]) | @as(u32, codes[4 * i + 1]) << 8 | @as(u32, codes[4 * i + 2]) << 16 | @as(u32, codes[4 * i + 3]) << 24);
+}
+
+fn fillAff8Random(rng: std.Random, words: []f64, scales: []f64, biases: []f64, codes: []u8) void {
+    rng.bytes(codes);
+    packU8(codes, words);
+    for (scales, biases) |*sc, *bi| {
+        sc.* = (0.5 + rng.float(f64)) * 0.04 / 256.0;
+        bi.* = -sc.* * 128.0;
+    }
+}
+
+fn packAff8Stress(w: []const f64, words: []f64, scales: []f64, biases: []f64, codes: []u8) void {
+    for (codes, w) |*c, v| c.* = @intFromFloat(128.0 + v);
+    packU8(codes, words);
+    @memset(scales, 1.0);
+    @memset(biases, -128.0);
+}
+
 /// Contract shapes: `rows` the step's rows, `n` the q rows (heads x 512), `k` the indexer's rows (0: none); the
-/// latent is always K = 1280 wide. `g`: threadgroups that walk the units.
+/// latent is always K = 1280 wide. `g`: threadgroups that walk the units; `q_gs`/`i_gs` 0 for mxfp8, or 32/64/128 for affine 8-bit.
 const Wqb = struct {
-    pub const Params = struct { g: usize };
+    pub const Params = struct { g: usize, q_gs: usize = 0, i_gs: usize = 0 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows < 1 or s.rows > decode.max_rows or s.n == 0 or s.n % KV != 0 or s.k % cx.IHD != 0 or p.g < s.rows + 1) return null;
@@ -339,7 +403,20 @@ const Wqb = struct {
         g.out(&.{ ci(s.rows), cx.HC }, .float32);
         g.out(&.{ ci(s.rows), cx.HC }, .float32);
         g.out(&.{ ci(s.rows), cx.HC, cx.HC }, .float32);
-        inline for (.{ .{ "R", s.rows }, .{ "SGS", SGS }, .{ "G", p.g }, .{ "NQ", s.n }, .{ "NI", s.k }, .{ "HC", cx.HC }, .{ "ITERS", cx.ITERS }, .{ "RD", cx.RD } }) |t| g.int(t[0], t[1]);
+        inline for (.{
+            .{ "R", s.rows },
+            .{ "SGS", SGS },
+            .{ "G", p.g },
+            .{ "NQ", s.n },
+            .{ "NI", s.k },
+            .{ "HC", cx.HC },
+            .{ "ITERS", cx.ITERS },
+            .{ "RD", cx.RD },
+            .{ "Q_GS", if (p.q_gs > 0) p.q_gs else 32 },
+            .{ "I_GS", if (p.i_gs > 0) p.i_gs else 32 },
+        }) |t| g.int(t[0], t[1]);
+        g.flag("Q_AFF", p.q_gs > 0);
+        g.flag("I_AFF", p.i_gs > 0);
         g.dtype("T", cx.act);
         return g;
     }
@@ -348,13 +425,17 @@ const Wqb = struct {
         const R = k.shape.rows;
         const nq = k.shape.n;
         const ni = k.shape.k;
+        const q_gs = k.p.q_gs;
+        const i_gs = k.p.i_gs;
         const qa = try k.add(cx.act, &.{ R, K });
         const qn = try k.add(cx.act, &.{K});
         const wq = try k.add(.uint32, &.{ nq, K / 4 });
-        const sq = try k.add(.uint8, &.{ nq, K / 32 });
+        const sq = try k.add(if (q_gs > 0) cx.act else .uint8, &.{ nq, K / (if (q_gs > 0) q_gs else 32) });
+        const bq = try k.add(cx.act, if (q_gs > 0) &[_]usize{ nq, K / q_gs } else &[_]usize{16});
         // Without the indexer the kernel is still bound a (never read) pair.
         const wi = try k.add(.uint32, &.{ @max(ni, 1), K / 4 });
-        const si = try k.add(.uint8, &.{ @max(ni, 1), K / 32 });
+        const si = try k.add(if (i_gs > 0) cx.act else .uint8, &.{ @max(ni, 1), K / (if (i_gs > 0) i_gs else 32) });
+        const bi = try k.add(cx.act, if (i_gs > 0) &[_]usize{ @max(ni, 1), K / i_gs } else &[_]usize{16});
         const kv = try k.add(cx.act, &.{ R, KV });
         const kvn = try k.add(cx.act, &.{KV});
         const periods = try k.add(.float32, &.{cx.RD / 2});
@@ -374,8 +455,11 @@ const Wqb = struct {
         for (pos, 0..) |*v, r| v.* = @floatFromInt(3001 + 37 * r);
         eps[0] = cx.EPS_RMS;
         eps[1] = cx.EPS_HC;
-        randomWeights(rng, wq, sq);
-        randomWeights(rng, wi, si);
+        const a = k.scratch();
+        const codes = try a.alloc(u8, @max(nq, @max(ni, 1)) * K);
+        defer a.free(codes);
+        if (q_gs > 0) fillAff8Random(rng, wq, sq, bq, codes[0 .. nq * K]) else randomWeights(rng, wq, sq);
+        if (i_gs > 0) fillAff8Random(rng, wi, si, bi, codes[0 .. @max(ni, 1) * K]) else randomWeights(rng, wi, si);
         switch (f) {
             .random => {},
             .nonfinite => {
@@ -389,14 +473,26 @@ const Wqb = struct {
                 // the window row +-32 (an exact rsqrt) and z 0 keep the other stages inside `ops`.
                 eps[0] = 0;
                 @memset(qa, 1);
-                const a = k.scratch();
                 const w = try a.alloc(f64, (nq + ni) * K);
                 defer a.free(w);
                 try cx.stressDot(rng, qn, w, nq + ni, K, 255, 15, a);
-                packCodes(w[0 .. nq * K], wq);
-                packCodes(w[nq * K ..], wi[0 .. ni * K / 4]);
-                @memset(sq, 127);
-                @memset(si, 127);
+                if (q_gs > 0) {
+                    packAff8Stress(w[0 .. nq * K], wq, sq, bq, codes[0 .. nq * K]);
+                } else {
+                    packCodes(w[0 .. nq * K], wq);
+                    @memset(sq, 127);
+                }
+                if (ni > 0) {
+                    if (i_gs > 0) {
+                        packAff8Stress(w[nq * K ..], wi, si, bi, codes[0 .. ni * K]);
+                    } else {
+                        packCodes(w[nq * K ..], wi[0 .. ni * K / 4]);
+                        @memset(si, 127);
+                    }
+                } else if (i_gs > 0) {
+                    @memset(si, 0);
+                    @memset(bi, 0);
+                } else @memset(si, 127);
                 @memset(periods, kit.inf);
                 @memset(periods_i, kit.inf);
                 for (kv) |*v| v.* = if (rng.boolean()) 32 else -32;
@@ -444,12 +540,12 @@ const Wqb = struct {
         defer a.free(mg);
         @memset(mag, 0);
         for (0..R) |r| try normed(k, k.in(I.qa)[r * K ..][0..K], k.in(I.qn), sum, true, qr[r * K ..][0..K]);
-        try gemv(k, I.wq, s.n, R, qr, sum, true, y, mg);
+        try gemv(k, I.wq, k.p.q_gs, s.n, R, qr, sum, true, y, mg);
         rope(k, y, R, s.n, KV, I.periods, true, o);
         for (out[0 .. R * s.n], o[0 .. R * s.n]) |*v, iv| v.* = iv.lo;
         @memcpy(mag[0 .. R * s.n], mg[0 .. R * s.n]);
         if (s.k > 0) {
-            try gemv(k, I.wi, s.k, R, qr, sum, true, y, mg);
+            try gemv(k, I.wi, k.p.i_gs, s.k, R, qr, sum, true, y, mg);
             rope(k, y, R, s.k, cx.IHD, I.periods_i, true, o);
             const dst = out[R * s.n ..][0 .. R * s.k];
             for (dst, o[0 .. R * s.k]) |*v, iv| v.* = iv.lo;
@@ -508,12 +604,12 @@ const Wqb = struct {
         const mg = try a.alloc(f64, R * wide);
         defer a.free(mg);
         for (0..R) |r| try normed(k, k.in(I.qa)[r * K ..][0..K], k.in(I.qn), .{}, false, qr[r * K ..][0..K]);
-        try gemv(k, I.wq, s.n, R, qr, .{}, false, y, mg);
+        try gemv(k, I.wq, k.p.q_gs, s.n, R, qr, .{}, false, y, mg);
         rope(k, y, R, s.n, KV, I.periods, false, o);
         for (o[0 .. R * s.n], got[0 .. R * s.n], 0..) |iv, g, i| if (!iv.has(g))
             return std.fmt.bufPrint(&k.msg, "q output {d} is {e} outside [{e}, {e}]", .{ i, g, iv.lo, iv.hi }) catch "q";
         if (s.k > 0) {
-            try gemv(k, I.wi, s.k, R, qr, .{}, false, y, mg);
+            try gemv(k, I.wi, k.p.i_gs, s.k, R, qr, .{}, false, y, mg);
             rope(k, y, R, s.k, cx.IHD, I.periods_i, false, o);
             const idx = got[R * s.n ..][0 .. R * s.k];
             var b: usize = 0;
@@ -528,18 +624,25 @@ const Wqb = struct {
 };
 
 pub fn register(set: *kc.Set) !void {
-    try kit.add(set, Wqb, &wq_b_l, .{ .g = 9 }, .{
-        .name = "dsv41 dec wq_b (rms, wq_b + rope, indexer q fp4, window row fp8, attention split)",
-        .accum = .f32,
-        .depth = depthWqb,
-        .ops = cx.sinkhorn_ops,
-        .out = .bf16,
-        .outs = &.{ .{ .elem = .bf16, .count = qN }, .{ .elem = .f32, .count = idxN }, .{ .elem = .bf16, .count = kvN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = combN } },
-        .nan = cx.quant_nan,
-        .known = cx.nan_code,
-        .tiles = .{ .{ .size = 4 }, .{}, .{ .size = cx.IHD, .step = cx.IHD, .min = cx.IHD } },
-        .served = &.{ .{ .rows = 1, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = cx.IHD }, .{ .rows = 1, .n = KV, .k = 0 }, .{ .rows = 6, .n = 2 * KV, .k = 0 } },
-    });
+    inline for ([_]struct { name: []const u8, q_gs: usize, i_gs: usize }{
+        .{ .name = "dsv41 dec wq_b (rms, wq_b + rope, indexer q fp4, window row fp8, attention split)", .q_gs = 0, .i_gs = 0 },
+        .{ .name = "dsv41 dec wq_b affine8 g32 (rms, wq_b + rope, indexer q fp4, window row fp8, attention split)", .q_gs = 32, .i_gs = 32 },
+        .{ .name = "dsv41 dec wq_b affine8 g64 (rms, wq_b + rope, indexer q fp4, window row fp8, attention split)", .q_gs = 64, .i_gs = 64 },
+        .{ .name = "dsv41 dec wq_b affine8 g128 (rms, wq_b + rope, indexer q fp4, window row fp8, attention split)", .q_gs = 128, .i_gs = 128 },
+    }) |cfg| {
+        try kit.add(set, Wqb, &wq_b_l, .{ .g = 9, .q_gs = cfg.q_gs, .i_gs = cfg.i_gs }, .{
+            .name = cfg.name,
+            .accum = .f32,
+            .depth = depthWqb,
+            .ops = cx.sinkhorn_ops,
+            .out = .bf16,
+            .outs = &.{ .{ .elem = .bf16, .count = qN }, .{ .elem = .f32, .count = idxN }, .{ .elem = .bf16, .count = kvN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = combN } },
+            .nan = cx.quant_nan,
+            .known = cx.nan_code,
+            .tiles = .{ .{ .size = 4 }, .{}, .{ .size = cx.IHD, .step = cx.IHD, .min = cx.IHD } },
+            .served = &.{ .{ .rows = 1, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = cx.IHD }, .{ .rows = 1, .n = KV, .k = 0 }, .{ .rows = 6, .n = 2 * KV, .k = 0 } },
+        });
+    }
 }
 
 // ── tests ──
@@ -801,10 +904,73 @@ fn f32Of(sc: *dsv41.Scope, a: A) !A {
     return sc.res(mlx.mlx_astype(&o, a, .float32, sc.s), &o);
 }
 
+/// A linear of `n` rows whose weights hold small integers (either mxfp8 or affine 8-bit group `gs`).
+fn integerAff8Lin(sc: *dsv41.Scope, rng: std.Random, n: usize, gs: usize) !dsv41.Lin {
+    const w = try testing.allocator.alloc(u8, n * K);
+    defer testing.allocator.free(w);
+    for (w) |*c| c.* = @intCast(124 + rng.uintLessThan(usize, 9));
+    const ng = n * (K / gs);
+    const s = try testing.allocator.alloc(f32, ng);
+    defer testing.allocator.free(s);
+    const b = try testing.allocator.alloc(f32, ng);
+    defer testing.allocator.free(b);
+    @memset(s, 1);
+    @memset(b, -128);
+    return .{
+        .w = try sc.keep(mlx.mlx_array_new_data(w.ptr, &[_]c_int{ ci(n), K / 4 }, 2, .uint32)),
+        .s = try f32Array(sc, s, &.{ ci(n), ci(K / gs) }, .bfloat16),
+        .b = try f32Array(sc, b, &.{ ci(n), ci(K / gs) }, .bfloat16),
+        .qp = .{ .bits = 8, .group_size = @intCast(gs), .mode = .affine },
+    };
+}
+
+test "dsv41 dec wq_b: bit-equal to the chain for affine 8-bit g32/g64/g128 small integers" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const fx = try fixture.Fixture.init(testing.allocator, .{ .lo = 20, .hi = 21, .experts = 2, .ctx = 0 });
+    defer fx.deinit();
+    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    var prng = std.Random.DefaultPrng.init(0x5AE7);
+    const rng = prng.random();
+    var qn: [K]f32 = undefined;
+    for (&qn) |*v| v.* = ([_]f32{ 1, 2, 0.5, -1, 3 })[rng.uintLessThan(usize, 5)];
+    var kn: [KV]f32 = undefined;
+    for (&kn) |*v| v.* = 0.5 + rng.float(f32);
+    for ([_]usize{ 32, 64, 128 }) |gs| {
+        var ly = fx.layer(20).*;
+        ly.wq_b = try integerAff8Lin(&sc, rng, 32768, gs);
+        ly.idx.?.wq_b = try integerAff8Lin(&sc, rng, 4096, gs);
+        ly.q_norm = try f32Array(&sc, &qn, &.{K}, .bfloat16);
+        ly.kv_norm = try f32Array(&sc, &kn, &.{KV}, .bfloat16);
+        for ([_]bool{ true, false }) |with_idx| {
+            var l = ly;
+            if (!with_idx) l.idx = null;
+            for ([_]usize{ 1, 6 }) |rows| {
+                var qa_h: [decode.max_rows * K]f32 = undefined;
+                for (qa_h[0 .. rows * K]) |*v| v.* = if (rng.boolean()) 1 else -1;
+                const qa = try f32Array(&sc, qa_h[0 .. rows * K], &.{ ci(rows), K }, .bfloat16);
+                const kv = try randn(&sc, 21 + rows, &.{ ci(rows), KV }, .bfloat16, 2);
+                const z = try randn(&sc, 31 + rows, &.{ ci(rows), 24 }, .float32, 1.5);
+                const pos = try scalar(&sc, @intCast(3001 + 17 * rows));
+                const want = try chain(&sc, fx.m, &l, 20, qa, kv, z, pos);
+                const got = (try launch(&sc, fx.m, kern, &l, 20, qa, kv, z, try rowsAt(&sc, 3001 + 17 * rows, rows), groups())) orelse return error.Declined;
+                try testing.expectEqual(@as(usize, 0), try differing(got.q, want.q));
+                if (with_idx) try testing.expectEqual(@as(usize, 0), try differing(got.q_idx.?, want.q_idx.?));
+                try testing.expectEqual(@as(usize, 0), try differing(got.kv_row, want.kv_row));
+                try testing.expectEqual(@as(usize, 0), try differing(got.sa.pre, want.sa.pre));
+                try testing.expectEqual(@as(usize, 0), try differing(got.sa.post, want.sa.post));
+                try testing.expectEqual(@as(usize, 0), try differing(got.sa.comb, want.sa.comb));
+            }
+        }
+    }
+}
+
 /// `x [rows, K]` against the dequantized rows of `l`, in f32.
 fn denseDot(sc: *dsv41.Scope, x: A, l: dsv41.Lin) !A {
     var w = mlx.mlx_array_new();
-    const wd = try sc.res(mlx.mlx_dequantize(&w, l.w, l.s, none, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", none, .{ .value = .float32, .has_value = true }, sc.s), &w);
+    const wd = try sc.res(mlx.mlx_dequantize(&w, l.w, l.s, l.b, mlx.mlx_optional_int.some(@intCast(l.qp.group_size)), mlx.mlx_optional_int.some(@intCast(l.qp.bits)), l.qp.mode.cstr(), none, .{ .value = .float32, .has_value = true }, sc.s), &w);
     var t = mlx.mlx_array_new();
     const wt = try sc.res(mlx.mlx_transpose(&t, wd, sc.s), &t);
     var o = mlx.mlx_array_new();
@@ -878,7 +1044,7 @@ test "dsv41 dec wq_b: the declared launch is the wrapper's dispatch, with and wi
     var set = kc.Set.init(testing.allocator);
     defer set.deinit();
     try register(&set);
-    try testing.expectEqual(@as(usize, 1), set.kernels.items.len);
+    try testing.expectEqual(@as(usize, 4), set.kernels.items.len);
     const fx = try fixture.Fixture.init(testing.allocator, .{ .lo = 20, .hi = 21, .experts = 2, .ctx = 0 });
     defer fx.deinit();
     var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
@@ -897,7 +1063,9 @@ test "dsv41 dec wq_b: the declared launch is the wrapper's dispatch, with and wi
         const pos = try rowsAt(&sc, 3001, rows);
         const got = (try launch(&sc, fx.m, kern, &ly, 20, qa, kv, z, pos, 9)) orelse return error.Declined;
         const iw = if (ly.idx) |i| i.wq_b else ly.wq_b;
-        const args = [_]A{ qa, ly.q_norm, ly.wq_b.w, ly.wq_b.s, iw.w, iw.s, kv, ly.kv_norm, dsv41.ropeFor(fx.m, 20).fwd, fx.m.rope_yarn.fwd, pos, z, eps };
+        const qb = if (ly.wq_b.b.ctx != null) ly.wq_b.b else qa;
+        const ib = if (iw.b.ctx != null) iw.b else qa;
+        const args = [_]A{ qa, ly.q_norm, ly.wq_b.w, ly.wq_b.s, qb, iw.w, iw.s, ib, kv, ly.kv_norm, dsv41.ropeFor(fx.m, 20).fwd, fx.m.rope_yarn.fwd, pos, z, eps };
         const shape = Shape{ .rows = rows, .n = 32768, .k = if (with_idx) 4096 else 0 };
         try rig.launch(&wq_b_l, Wqb.geometry(.{ .g = 9 }, shape).?, &args);
         const declared = try testing.allocator.dupe(u8, rig.outputBytes());

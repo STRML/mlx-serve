@@ -34,6 +34,11 @@ pub const Opts = struct {
     /// Every routed projection affine at this width over groups of 128 (the expert-pruned packs) instead of the iQ
     /// pack's plan (gate/up 2 or 3 bits, down 3, groups of 64).
     experts_affine: ?u32 = null,
+    /// oQ2.5e-mtp projections (`wq_a/wkv/wq_b/wo_b/indexer.{wq_b,weights_proj}/compressor.wkv/shared_experts.{w1,w3,w2}`)
+    /// stored as affine 8-bit group 64 instead of mxfp8/bf16.
+    aff8_64: bool = false,
+    /// Router `ffn.gate.weight` stored as float16 instead of bfloat16.
+    f16_gate: bool = false,
 };
 
 pub const Fixture = struct {
@@ -44,6 +49,8 @@ pub const Fixture = struct {
     draws: u64 = 0,
     /// The routed experts' affine group.
     group: c_int = 64,
+    aff8_64: bool = false,
+    f16_gate: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, opts: Opts) !*Fixture {
         mlx.installErrorHandler(); // the model's threadgroup probes raise on M1/M2: latch it, never exit
@@ -51,7 +58,7 @@ pub const Fixture = struct {
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();
         cfg.num_experts = opts.experts;
-        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64 };
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64, .aff8_64 = opts.aff8_64, .f16_gate = opts.f16_gate };
         errdefer fx.w.deinit();
         for (opts.lo..opts.hi) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
         if (opts.tp) |t| try fx.sliceShard(t);
@@ -178,6 +185,13 @@ pub const Fixture = struct {
         const w = try fx.normal(shape, .bfloat16, 0, 1 / @sqrt(fan_in));
         switch (fmt) {
             .bf16 => return fx.putNamed(base ++ ".weight", args, w),
+            .f16 => {
+                defer _ = mlx.mlx_array_free(w);
+                var o = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_astype(&o, w, .float16, mlx.gpuStream()));
+                try mlx.check(mlx.mlx_array_eval(o));
+                return fx.putNamed(base ++ ".weight", args, o);
+            },
             .fp8_exact => {
                 // Values an mxfp8 code holds exactly, kept as bf16 (the release's fp8 wo_a).
                 defer _ = mlx.mlx_array_free(w);
@@ -190,9 +204,9 @@ pub const Fixture = struct {
                 try mlx.check(mlx.mlx_array_eval(d));
                 return fx.putNamed(base ++ ".weight", args, d);
             },
-            .mxfp8, .mxfp4, .affine => {
+            .mxfp8, .mxfp4, .affine, .aff8_64 => {
                 defer _ = mlx.mlx_array_free(w);
-                const q = if (fmt == .mxfp8) try quantize(w, 32, 8, "mxfp8") else if (fmt == .mxfp4) try quantize(w, 32, 4, "mxfp4") else try quantize(w, fx.group, @intCast(fmt.affine), "affine");
+                const q = if (fmt == .mxfp8) try quantize(w, 32, 8, "mxfp8") else if (fmt == .mxfp4) try quantize(w, 32, 4, "mxfp4") else if (fmt == .aff8_64) try quantize(w, 64, 8, "affine") else try quantize(w, fx.group, @intCast(fmt.affine), "affine");
                 try fx.putNamed(base ++ ".weight", args, q[0]);
                 try fx.putNamed(base ++ ".scales", args, q[1]);
                 if (q[2].ctx != null) try fx.putNamed(base ++ ".biases", args, q[2]);
@@ -233,31 +247,32 @@ pub const Fixture = struct {
             try fx.putVec(pfx ++ "hc_" ++ which ++ "_scale", .{li}, &.{3}, .float32, 0.5, 0.1);
             try fx.putVec(pfx ++ "hc_" ++ which ++ "_base", .{li}, &.{mix}, .float32, 0, 0.5);
         }
-        try fx.putLin(pfx ++ "attn.wq_a", .{li}, &.{ ql, d }, .mxfp8);
-        try fx.putLin(pfx ++ "attn.wq_b", .{li}, &.{ H * hd, ql }, .mxfp8);
-        try fx.putLin(pfx ++ "attn.wkv", .{li}, &.{ hd, d }, .mxfp8);
+        const proj_fmt: Fmt = if (fx.aff8_64) .aff8_64 else .mxfp8;
+        try fx.putLin(pfx ++ "attn.wq_a", .{li}, &.{ ql, d }, proj_fmt);
+        try fx.putLin(pfx ++ "attn.wq_b", .{li}, &.{ H * hd, ql }, proj_fmt);
+        try fx.putLin(pfx ++ "attn.wkv", .{li}, &.{ hd, d }, proj_fmt);
         try fx.putLin(pfx ++ "attn.wo_a", .{li}, &.{ og * ol, @divExact(H * hd, og) }, .fp8_exact);
-        try fx.putLin(pfx ++ "attn.wo_b", .{li}, &.{ d, og * ol }, .mxfp8);
+        try fx.putLin(pfx ++ "attn.wo_b", .{li}, &.{ d, og * ol }, proj_fmt);
         try fx.putVec(pfx ++ "attn.attn_sink", .{li}, &.{H}, .float32, 0, 1);
         if (kv_src) {
-            try fx.putLin(pfx ++ "attn.compressor.wkv", .{li}, &.{ hd, d }, .bf16);
-            if (ratio > 1) try fx.putLin(pfx ++ "attn.compressor.wgate", .{li}, &.{ hd, d }, .bf16);
+            try fx.putLin(pfx ++ "attn.compressor.wkv", .{li}, &.{ hd, d }, if (fx.aff8_64) .aff8_64 else .bf16);
+            if (ratio > 1) try fx.putLin(pfx ++ "attn.compressor.wgate", .{li}, &.{ hd, d }, if (fx.aff8_64) .aff8_64 else .bf16);
             try fx.putVec(pfx ++ "attn.compressor.norm.weight", .{li}, &.{hd}, .bfloat16, 1, 0.1);
         }
         if (ix_src) {
-            try fx.putLin(pfx ++ "attn.indexer.wq_b", .{li}, &.{ ih * ihd, ql }, .mxfp8);
-            try fx.putLin(pfx ++ "attn.indexer.weights_proj", .{li}, &.{ ih, d }, .bf16);
+            try fx.putLin(pfx ++ "attn.indexer.wq_b", .{li}, &.{ ih * ihd, ql }, proj_fmt);
+            try fx.putLin(pfx ++ "attn.indexer.weights_proj", .{li}, &.{ ih, d }, if (fx.aff8_64) .aff8_64 else .bf16);
             if (kv_src) {
                 try fx.putLin(pfx ++ "attn.indexer.wk", .{li}, &.{ ihd, hd }, .bf16);
                 try fx.putVec(pfx ++ "attn.indexer.k_norm.weight", .{li}, &.{ihd}, .bfloat16, 1, 0.1);
             }
         }
-        try fx.putLin(pfx ++ "ffn.gate", .{li}, &.{ e, d }, .bf16);
+        try fx.putLin(pfx ++ "ffn.gate", .{li}, &.{ e, d }, if (fx.f16_gate) .f16 else .bf16);
         try fx.putVec(pfx ++ "ffn.gate.bias", .{li}, &.{e}, .float32, 0, 0.05);
         try fx.putVec(pfx ++ "ffn.gate.bias_vl", .{li}, &.{e}, .float32, 0, 0.05);
-        try fx.putLin(pfx ++ "ffn.shared_experts.w1", .{li}, &.{ inter, d }, .mxfp8);
-        try fx.putLin(pfx ++ "ffn.shared_experts.w3", .{li}, &.{ inter, d }, .mxfp8);
-        try fx.putLin(pfx ++ "ffn.shared_experts.w2", .{li}, &.{ d, inter }, .mxfp8);
+        try fx.putLin(pfx ++ "ffn.shared_experts.w1", .{li}, &.{ inter, d }, proj_fmt);
+        try fx.putLin(pfx ++ "ffn.shared_experts.w3", .{li}, &.{ inter, d }, proj_fmt);
+        try fx.putLin(pfx ++ "ffn.shared_experts.w2", .{li}, &.{ d, inter }, proj_fmt);
         // One tensor an expert (the loader stacks them), so a full 384-expert bank never exists in bf16.
         for (0..E) |x| {
             try fx.putLin(pfx ++ "ffn.experts.{d}.w1", .{ li, x }, &.{ inter, d }, if (fp4) .mxfp4 else .{ .affine = gu_bits });
@@ -267,7 +282,7 @@ pub const Fixture = struct {
     }
 };
 
-const Fmt = union(enum) { bf16, fp8_exact, mxfp8, mxfp4, affine: u32 };
+const Fmt = union(enum) { bf16, f16, fp8_exact, mxfp8, mxfp4, affine: u32, aff8_64 };
 
 pub fn quantize(w: A, gs: c_int, bits: c_int, mode: [*:0]const u8) ![3]A {
     var qv = mlx.mlx_vector_array_new();
@@ -785,4 +800,88 @@ fn expectSameArray(gpa: std.mem.Allocator, a: A, b: A) !void {
     const v = try dsv41.hostF32(b);
     defer gpa.free(v);
     try std.testing.expectEqualSlices(f32, u, v);
+}
+
+test "dsv41 dec oQ2.5e-mtp: all five dec_* kernels engage without declining and decode with chain parity" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const dkern = @import("decode.zig");
+    for ([_][2]usize{ .{ 2, 4 }, .{ 20, 25 } }) |range| {
+        const base: Opts = .{ .lo = range[0], .hi = range[1], .experts = 8, .ctx = 0, .aff8_64 = true, .f16_gate = true, .seed = 9025 + range[0] };
+        var o_truth = base;
+        o_truth.act = .float32;
+        const truth_fx = try Fixture.init(gpa, o_truth);
+        defer truth_fx.deinit();
+        const plain_fx = try Fixture.init(gpa, base);
+        defer plain_fx.deinit();
+        var o_fused = base;
+        o_fused.fused = true;
+        const fused_fx = try Fixture.init(gpa, o_fused);
+        defer fused_fx.deinit();
+        // Every layer must be accepted by in_proj, wq_b, ffn_in, and (when NAX) moe_up / moe_down.
+        const probe_x = try fused_fx.stream(1);
+        defer _ = mlx.mlx_array_free(probe_x);
+        for (range[0]..range[1]) |li| {
+            const ly = fused_fx.layer(li);
+            try std.testing.expect(dkern.in_proj.plan(fused_fx.m, ly, probe_x) != null);
+            try std.testing.expect(dkern.wq_b.servesLayer(fused_fx.m, ly));
+            try std.testing.expectEqual(@as(usize, 64), ly.wo_b.qp.group_size);
+            try std.testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(ly.gate_w));
+            try std.testing.expect(try dsv41.checkFfnAndMoeFusedForTest(gpa, fused_fx.m, ly));
+        }
+        const in = try Input.of(plain_fx, 1);
+        defer in.deinit();
+        const t = try streamOf(gpa, truth_fx, in);
+        defer gpa.free(t);
+        const c = try streamOf(gpa, plain_fx, in);
+        defer gpa.free(c);
+        const f = try streamOf(gpa, fused_fx, in);
+        defer gpa.free(f);
+        try std.testing.expect(!std.mem.eql(f32, f, c));
+        try decode.expectNoWorse("oQ2.5e-mtp fused vs chain", f, c, t);
+    }
+}
+
+test "dsv41 dec oQ2.5e-mtp ubench: fused affine-8b g64 + f16 gate_w vs chain ABBA (DSV41_DEC_UBENCH)" {
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const iou = @import("../../../sdk/util/io_util.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const base: Opts = .{ .lo = 20, .hi = 25, .experts = 16, .ctx = 64, .aff8_64 = true, .f16_gate = true, .seed = 777 };
+    const plain = try Fixture.init(gpa, base);
+    defer plain.deinit();
+    var o_fused = base;
+    o_fused.fused = true;
+    const fused = try Fixture.init(gpa, o_fused);
+    defer fused.deinit();
+    const x = try plain.stream(1);
+    defer _ = mlx.mlx_array_free(x);
+    const pre = try plain.cpre(1);
+    defer _ = mlx.mlx_array_free(pre);
+    // Warm up
+    for (0..2) |w| {
+        for ([_]*Fixture{ fused, plain }) |fx| {
+            const out = try dsv41.workerStep(fx.m, gpa, x, pre, 64 + w, false, false);
+            for (out) |a| _ = mlx.mlx_array_free(a);
+        }
+    }
+    var fused_us: [6]f64 = undefined;
+    var chain_us: [6]f64 = undefined;
+    // ABBA interleaved rounds (6 rounds x 5 layers)
+    for (0..6) |r| {
+        const pair: [2]*Fixture = if (r % 2 == 0) .{ fused, plain } else .{ plain, fused };
+        for (pair) |fx| {
+            const t0 = iou.nowUsMonotonic(io);
+            const out = try dsv41.workerStep(fx.m, gpa, x, pre, 66 + r, false, false);
+            try mlx.check(mlx.mlx_array_eval(out[0]));
+            const dt = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0));
+            for (out) |a| _ = mlx.mlx_array_free(a);
+            if (fx == fused) fused_us[r] = dt else chain_us[r] = dt;
+        }
+    }
+    std.mem.sort(f64, &fused_us, {}, std.sort.asc(f64));
+    std.mem.sort(f64, &chain_us, {}, std.sort.asc(f64));
+    const fm = (fused_us[2] + fused_us[3]) / 2;
+    const cm = (chain_us[2] + chain_us[3]) / 2;
+    std.debug.print("[dec-ubench] oQ2.5e-mtp 5-layer decode (R=1): fused {d:.1} us vs chain {d:.1} us ({d:.2}x)\n", .{ fm, cm, cm / fm });
 }

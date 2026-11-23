@@ -36,7 +36,7 @@ pub const max_k = blk: {
     break :blk k;
 };
 
-pub const INS = [_][*:0]const u8{ "x", "w", "scales", "biases", "sw", "sscales", "inds", "res", "post", "comb" };
+pub const INS = [_][*:0]const u8{ "x", "w", "scales", "biases", "sw", "sscales", "sbiases", "inds", "res", "post", "comb" };
 
 /// A thread owns one output row and one 128-value unit of the reduction axis (32 or 48 bytes of 2- or 3-bit codes, 128 of fp8). The
 /// threadgroup stages each pair's activation row once in threadgroup memory (terms prescaled by their field's shift, so a
@@ -56,11 +56,28 @@ fn dims(a: A, axis: usize) usize {
     return @intCast(mlx.getShape(a)[axis]);
 }
 
+fn sharedKind(shared: *const dsv41.Lin, dt: mlx.mlx_dtype, K: usize, N: usize) ?usize {
+    if (shared.s.ctx == null or shared.qp.bits != 8 or mlx.mlx_array_dtype(shared.w) != .uint32) return null;
+    if (dims(shared.w, 0) != N or dims(shared.w, 1) != K / 4 or dims(shared.s, 0) != N) return null;
+    if (shared.qp.mode == .mxfp8) {
+        if (shared.qp.group_size != 32 or mlx.mlx_array_dtype(shared.s) != .uint8 or dims(shared.s, 1) != K / 32) return null;
+        return 0;
+    }
+    if (shared.qp.mode == .affine) {
+        const sgs = shared.qp.group_size;
+        if (sgs != 32 and sgs != 64 and sgs != 128) return null;
+        if (shared.b.ctx == null or mlx.mlx_array_dtype(shared.s) != dt or mlx.mlx_array_dtype(shared.b) != dt) return null;
+        if (dims(shared.s, 1) != K / sgs or dims(shared.b, 0) != N or dims(shared.b, 1) != K / sgs) return null;
+        return sgs;
+    }
+    return null;
+}
+
 /// x' `[R, hc, N]` = `hcExpand(x1, y, sp)` for y = the `idx` `[R, 6]` experts' down rows plus the shared expert's over
 /// `act` `[R, 7, K]` (the 6 weighted routed slots, then the shared: what `moe_up` makes). `down` is the routed bank
-/// (the one-expert view of `Experts.views`: the kernel addresses experts from its buffer pointer), `shared` the mxfp8
-/// down linear, `rb` what `probe` returned. Null where the kernel does not serve the call: more than `max_rows` rows,
-/// a down that is not 2- or 3-bit group-64 or -128 affine over bf16 scales, a shared that is not mxfp8, a stream that is not bf16,
+/// (the one-expert view of `Experts.views`: the kernel addresses experts from its buffer pointer), `shared` the mxfp8 or
+/// affine 8-bit g32/g64/g128 down linear, `rb` what `probe` returned. Null where the kernel does not serve the call: more than `max_rows` rows,
+/// a down that is not 2- or 3-bit group-64 or -128 affine over bf16 scales, a shared that is not mxfp8 or affine 8-bit g32/g64/g128, a stream that is not bf16,
 /// K not a multiple of 128 or past `max_k`, or N not a multiple of `rb`.
 pub fn moeDown(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, rb: usize, down: *const dsv41.Bank, shared: *const dsv41.Lin, act: A, idx: A, x1: A, sp: *const dsv41.Split) !?A {
     if (!mlx.streamIsGpu(sc.s)) return null;
@@ -74,21 +91,23 @@ pub fn moeDown(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, rb: usize, dow
     const bits = down.qp.bits;
     const gs = down.qp.group_size;
     if (down.qp.mode != .affine or (bits != 2 and bits != 3) or (gs != 64 and gs != 128) or down.b.ctx == null) return null;
-    if (shared.qp.mode != .mxfp8 or shared.qp.bits != 8 or shared.qp.group_size != 32) return null;
     const bfd: mlx.mlx_dtype = .bfloat16;
     if (mlx.mlx_array_dtype(act) != bfd or mlx.mlx_array_dtype(x1) != bfd or mlx.mlx_array_dtype(down.s) != bfd or mlx.mlx_array_dtype(down.b) != bfd) return null;
-    if (mlx.mlx_array_dtype(down.w) != .uint32 or mlx.mlx_array_dtype(shared.w) != .uint32 or mlx.mlx_array_dtype(shared.s) != .uint8) return null;
+    if (mlx.mlx_array_dtype(down.w) != .uint32) return null;
     if (mlx.mlx_array_dtype(sp.post) != .float32 or mlx.mlx_array_dtype(sp.comb) != .float32 or mlx.mlx_array_size(sp.post) != R * HC or mlx.mlx_array_size(sp.comb) != R * HC * HC) return null;
-    if (dims(down.w, 1) != N or dims(down.w, 2) != K * bits / 32 or dims(down.s, 2) != K / gs or dims(shared.w, 0) != N or dims(shared.w, 1) != K / 4 or dims(shared.s, 1) != K / 32) return null;
+    if (dims(down.w, 1) != N or dims(down.w, 2) != K * bits / 32 or dims(down.s, 2) != K / gs) return null;
+    const sgs = sharedKind(shared, bfd, K, N) orelse return null;
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const shape = [_]c_int{ ci(R), HC, ci(N) };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, bfd));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / rb * nt), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(nt), 1, 1));
-    inline for (.{ .{ "K", K }, .{ "N", N }, .{ "ROWS", R }, .{ "RB", rb }, .{ "HC", HC }, .{ "TOPK", TOPK }, .{ "BITS", bits }, .{ "GS", gs } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    inline for (.{ .{ "K", K }, .{ "N", N }, .{ "ROWS", R }, .{ "RB", rb }, .{ "HC", HC }, .{ "TOPK", TOPK }, .{ "BITS", bits }, .{ "GS", gs }, .{ "SGS", if (sgs > 0) sgs else 32 } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "SAFF", sgs > 0));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", bfd));
-    const ins = [_]A{ act, down.w, down.s, down.b, shared.w, shared.s, idx, x1, sp.post, sp.comb };
+    const sb = if (shared.b.ctx != null) shared.b else x1;
+    const ins = [_]A{ act, down.w, down.s, down.b, shared.w, shared.s, sb, idx, x1, sp.post, sp.comb };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -170,8 +189,9 @@ fn truthOf(sc: *dsv41.Scope, ly: *const dsv41.Layer, act: A, picked: []const u32
     const K = dims(act, 2);
     const N = dims(x1, 2);
     const bank = &ly.experts.down;
+    const sdn = &ly.shared[2];
     const dq = try dequant(sc, bank.w, bank.s, bank.b, bank.qp.bits, bank.qp.group_size, "affine");
-    const dsh = try dequant(sc, ly.shared[2].w, ly.shared[2].s, none, 8, 32, "mxfp8");
+    const dsh = try dequant(sc, sdn.w, sdn.s, sdn.b, sdn.qp.bits, sdn.qp.group_size, sdn.qp.mode.cstr());
     const act32 = try sc.astype(act, .float32);
     var ys: [decode.max_rows]A = undefined;
     for (0..R) |r| {
@@ -249,6 +269,37 @@ test "dsv41 dec moe_down: 2-bit group-128 experts (the pruned packs), 1 2 6 rows
     try std.testing.expectEqual(@as(u32, 128), fx.layer(20).experts.down.qp.group_size);
     const rb = try probe(gpa, kern, fx.m.cfg.moe_intermediate_size, fx.m.cfg.hidden_size);
     for (20..22) |li| for ([_]usize{ 1, 2, 6 }) |rows| for ([_]u32{ 0, 8 }) |pool| try checkRows(gpa, fx, li, kern, rb, rows, pool);
+}
+
+test "dsv41 dec moe_down: affine 8-bit g32/g64/g128 shared expert, 1 and 6 rows, no further from f32 truth than today's chain" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    mlx.installErrorHandler();
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .ctx = 0 });
+    defer fx.deinit();
+    const K = fx.m.cfg.moe_intermediate_size;
+    const N = fx.m.cfg.hidden_size;
+    const rb = try probe(gpa, kern, K, N);
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const sw_raw = try sc.keep(try fx.normal(&.{ ci(N), ci(K) }, .bfloat16, 0, 0.02));
+    for ([_]u32{ 32, 64, 128 }) |sgs| {
+        var qv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(qv);
+        try mlx.check(mlx.mlx_quantize(&qv, sw_raw, mlx.mlx_optional_int.some(@intCast(sgs)), mlx.mlx_optional_int.some(8), "affine", none, mlx.gpuStream()));
+        var qt: [3]A = undefined;
+        for (&qt, 0..) |*a, qi| {
+            a.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(a, qv, qi));
+            _ = try sc.keep(a.*);
+        }
+        const old_ly = fx.layer(20).*;
+        defer fx.layer(20).* = old_ly;
+        fx.layer(20).shared[2] = .{ .w = qt[0], .s = qt[1], .b = qt[2], .qp = .{ .bits = 8, .group_size = sgs, .mode = .affine } };
+        for ([_]usize{ 1, 6 }) |rows| try checkRows(gpa, fx, 20, kern, rb, rows, 0);
+    }
 }
 
 fn serve(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, rb: usize, o: struct { rows: usize = 2, bits: u32 = 3, shared_mode: params.QuantMode = .mxfp8, x_dt: mlx.mlx_dtype = .bfloat16, k: usize = 256 }) !?A {
@@ -486,17 +537,25 @@ fn depthK(s: Shape) usize {
 
 const down_l = metal.Launch{ .name = "dsv41_dec_moe_down", .inputs = &INS, .outputs = &.{"out"}, .source = SOURCE, .header = HEADER, .tg_bytes = tgBytes(max_k, decode.max_rows), .m1 = 640, .m2 = 640 };
 
-/// Row `d` of the shared mxfp8 operand as float64: the `words` (e4m3 bytes, little endian) times the e8m0 `exps`.
-fn sharedAt(words: []const f64, exps: []const f64, d: usize, i: usize, k: usize) f64 {
+/// Row `d` of the shared operand as float64 (`sgs == 0` mxfp8, else affine 8-bit group `sgs`) plus |s*q|+|b| mag.
+fn sharedAt(words: []const f64, scales: []const f64, biases: []const f64, sgs: u32, d: usize, i: usize, k: usize) [2]f64 {
     const word: u32 = @intFromFloat(words[d * (k / 4) + i / 4]);
     const byte: u8 = @truncate(word >> @intCast(8 * (i % 4)));
-    return kc.host.e4m3(byte) * std.math.pow(f64, 2, exps[d * (k / 32) + i / 32] - 127);
+    if (sgs > 0) {
+        const gi = d * (k / sgs) + i / sgs;
+        const q: f64 = @floatFromInt(byte);
+        const s = scales[gi];
+        const b = biases[gi];
+        return .{ s * q + b, @abs(s * q) + @abs(b) };
+    }
+    const w = kc.host.e4m3(byte) * std.math.pow(f64, 2, scales[d * (k / 32) + i / 32] - 127);
+    return .{ w, @abs(w) };
 }
 
 /// The block's down half: `rows` decode rows over `Params.experts` routed experts of a `bits`-bit group-`gs` bank plus
-/// the shared mxfp8 expert, y rounded to bf16 once, then the hc expand.
+/// the shared mxfp8 or affine 8-bit expert, y rounded to bf16 once, then the hc expand.
 const DownK = struct {
-    pub const Params = struct { experts: usize = 8, bits: u32 = 3, gs: u32 = 64 };
+    pub const Params = struct { experts: usize = 8, bits: u32 = 3, gs: u32 = 64, sgs: u32 = 0 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         const nt = rows_per_tg * (s.k / 128);
@@ -511,6 +570,8 @@ const DownK = struct {
         g.int("TOPK", TOPK);
         g.int("BITS", p.bits);
         g.int("GS", p.gs);
+        g.int("SGS", if (p.sgs > 0) p.sgs else 32);
+        g.flag("SAFF", p.sgs > 0);
         g.dtype("T", adt);
         return g;
     }
@@ -523,7 +584,8 @@ const DownK = struct {
         const x = try k.add(adt, &.{ R, TOPK + 1, K });
         const routed = try contract.Bank.add(k, &.{ p.experts, N }, p.bits, p.gs, K);
         const words = try k.add(.uint32, &.{ N, K / 4 });
-        const exps = try k.add(.uint8, &.{ N, K / 32 });
+        const exps = try k.add(if (p.sgs > 0) adt else .uint8, &.{ N, K / (if (p.sgs > 0) p.sgs else 32) });
+        const sbiases = try k.add(adt, if (p.sgs > 0) &[_]usize{ N, K / p.sgs } else &[_]usize{16});
         const inds = try k.add(.uint32, &.{ R, TOPK });
         const res = try k.add(adt, &.{ R, HC, N });
         const post = try k.add(.float32, &.{ R, HC });
@@ -547,11 +609,19 @@ const DownK = struct {
         switch (f) {
             .random, .nonfinite => {
                 try routed.random(rng, k.scratch());
-                for (bytes) |*b| {
-                    b.* = rng.int(u8);
-                    if (b.* & 0x7f == 0x7f) b.* -= 1; // S.1111.111 is fp8's NaN; the kernel reads it as 480
+                if (p.sgs > 0) {
+                    rng.bytes(bytes);
+                    for (exps, sbiases) |*sc, *bi| {
+                        sc.* = (0.5 + rng.float(f64)) * 0.04 / 256.0;
+                        bi.* = -sc.* * 128.0;
+                    }
+                } else {
+                    for (bytes) |*b| {
+                        b.* = rng.int(u8);
+                        if (b.* & 0x7f == 0x7f) b.* -= 1; // S.1111.111 is fp8's NaN; the kernel reads it as 480
+                    }
+                    for (exps) |*e| e.* = @floatFromInt(rng.intRangeAtMost(u8, 120, 130));
                 }
-                for (exps) |*e| e.* = @floatFromInt(rng.intRangeAtMost(u8, 120, 130));
                 if (f == .nonfinite) {
                     // A NaN or infinite group scale in output s's row of row 0's slot s (s < 4): NaN, +inf, -inf, +inf. Every
                     // pair's first group is positive, so a row sharing the expert meets the same infinity.
@@ -567,15 +637,22 @@ const DownK = struct {
                 contract.mirroredX(rng, x[0..K], perm);
                 for (1..R * (TOPK + 1)) |i| @memcpy(x[i * K ..][0..K], x[0..K]);
                 try routed.mirrored(rng, perm, k.scratch());
-                // fp8 integers 1..15 (exact) on the first half, their negatives on the shuffled second, unit scales.
                 for (0..N) |d| for (0..K / 2) |i| {
                     const c: u8 = if (i < 8) 1 else rng.intRangeAtMost(u8, 1, 15);
-                    var code: u8 = 0;
-                    while (kc.host.e4m3(code) != @as(f64, @floatFromInt(c))) code += 1;
-                    bytes[d * K + i] = code;
-                    bytes[d * K + K / 2 + perm[i]] = code | 0x80;
+                    if (p.sgs > 0) {
+                        bytes[d * K + i] = 128 + c;
+                        bytes[d * K + K / 2 + perm[i]] = 128 - c;
+                    } else {
+                        var code: u8 = 0;
+                        while (kc.host.e4m3(code) != @as(f64, @floatFromInt(c))) code += 1;
+                        bytes[d * K + i] = code;
+                        bytes[d * K + K / 2 + perm[i]] = code | 0x80;
+                    }
                 };
-                @memset(exps, 127);
+                if (p.sgs > 0) {
+                    @memset(exps, 1.0);
+                    @memset(sbiases, -128.0);
+                } else @memset(exps, 127);
                 @memset(post, 1);
                 @memset(comb, 0);
             },
@@ -600,7 +677,7 @@ const DownK = struct {
         for (0..R) |r| for (0..N) |d| {
             var m: f64 = 0;
             for (0..TOPK) |s| {
-                const e: usize = @intFromFloat(k.in(6)[r * TOPK + s]);
+                const e: usize = @intFromFloat(k.in(7)[r * TOPK + s]);
                 const q = routed.dot(e * N + d, k.in(0)[(r * (TOPK + 1) + s) * K ..][0..K], sum, t);
                 parts[s] = q[0];
                 m += q[1];
@@ -608,9 +685,9 @@ const DownK = struct {
             const xs = k.in(0)[(r * (TOPK + 1) + TOPK) * K ..][0..K];
             var sm: f64 = 0;
             for (0..K) |i| {
-                const term = xs[i] * sharedAt(k.in(4), k.in(5), d, i, K);
-                t[i] = term;
-                sm += @abs(term);
+                const wm = sharedAt(k.in(4), k.in(5), k.in(6), k.p.sgs, d, i, K);
+                t[i] = xs[i] * wm[0];
+                sm += @abs(xs[i]) * wm[1];
             }
             parts[TOPK] = sum.of(t[0..K]);
             m += sm;
@@ -618,11 +695,11 @@ const DownK = struct {
             const y = bf(tot);
             m += (@abs(tot) + @abs(y)) * flip;
             for (0..HC) |i| {
-                const po = k.in(8)[r * HC + i];
+                const po = k.in(9)[r * HC + i];
                 var acc = po * y;
                 var cm: f64 = 0;
                 for (0..HC) |j| {
-                    const term = k.in(9)[(r * HC + j) * HC + i] * k.in(7)[(r * HC + j) * N + d];
+                    const term = k.in(10)[(r * HC + j) * HC + i] * k.in(8)[(r * HC + j) * N + d];
                     acc += term;
                     cm += @abs(term);
                 }
@@ -636,8 +713,18 @@ const DownK = struct {
 /// Served shapes cut the output rows to a few where the float64 reference would run for seconds; the reduction axis stays
 /// the release's.
 pub fn register(set: *kc.Set) !void {
-    inline for (.{ .{ 3, 64 }, .{ 2, 64 }, .{ 2, 128 }, .{ 3, 128 } }) |w| try kit.add(set, DownK, &down_l, .{ .bits = w[0], .gs = w[1] }, .{
+    inline for (.{ .{ 3, 64 }, .{ 2, 64 }, .{ 2, 128 }, .{ 3, 128 } }) |w| try kit.add(set, DownK, &down_l, .{ .bits = w[0], .gs = w[1], .sgs = 0 }, .{
         .name = std.fmt.comptimePrint("dsv41 dec moe_down ({d}-bit g{d} routed + mxfp8 shared, hc expand)", .{ w[0], w[1] }),
+        .accum = .f32,
+        .depth = depthK,
+        .ops = 4,
+        .mids = 1,
+        .out = .bf16,
+        .tiles = .{ .{}, .{ .size = rows_per_tg, .step = rows_per_tg, .min = rows_per_tg }, .{ .size = 128, .step = 128, .min = 128 } },
+        .served = &.{ .{ .rows = 1, .n = 64, .k = 2304 }, .{ .rows = 6, .n = 64, .k = 2304 }, .{ .rows = 2, .n = 32, .k = 128 } },
+    });
+    inline for (.{ 32, 64, 128 }) |sgs| try kit.add(set, DownK, &down_l, .{ .bits = 2, .gs = 64, .sgs = sgs }, .{
+        .name = std.fmt.comptimePrint("dsv41 dec moe_down (2-bit g64 routed + affine8 g{d} shared, hc expand)", .{sgs}),
         .accum = .f32,
         .depth = depthK,
         .ops = 4,
@@ -653,13 +740,13 @@ test "dsv41 dec moe_down: the declared launch is the shipped wrapper's, byte for
     const a = std.testing.allocator;
     const kern = try build();
     defer _ = mlx.mlx_fast_metal_kernel_free(kern);
-    inline for (.{ .{ 3, 64 }, .{ 2, 64 }, .{ 2, 128 } }) |wd| for ([_]usize{ 1, 2, 6 }) |rows| {
+    inline for (.{ .{ 3, 64, 0 }, .{ 2, 64, 0 }, .{ 2, 128, 0 }, .{ 2, 64, 64 } }) |wd| for ([_]usize{ 1, 2, 6 }) |rows| {
         const c = try a.create(kit.Case(DownK));
         defer {
             c.deinit();
             a.destroy(c);
         }
-        c.* = .init(a, &down_l, .{ .bits = wd[0], .gs = wd[1] });
+        c.* = .init(a, &down_l, .{ .bits = wd[0], .gs = wd[1], .sgs = wd[2] });
         try std.testing.expect(try c.prepare(.{ .rows = rows, .n = 64, .k = 256 }, .random, 7));
         try c.run();
         const mine = try a.dupe(u8, c.rig.outputBytes());
@@ -667,8 +754,11 @@ test "dsv41 dec moe_down: the declared launch is the shipped wrapper's, byte for
         var sc = dsv41.Scope.init(a, c.rig.stream());
         defer sc.deinit();
         const down: dsv41.Bank = .{ .w = c.args[1], .s = c.args[2], .b = c.args[3], .qp = .{ .bits = wd[0], .group_size = wd[1] } };
-        const shared: dsv41.Lin = .{ .w = c.args[4], .s = c.args[5], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
-        const got = (try moeDown(&sc, kern, rows_per_tg, &down, &shared, c.args[0], c.args[6], c.args[7], &.{ .pre = none, .post = c.args[8], .comb = c.args[9] })) orelse return error.Declined;
+        const shared: dsv41.Lin = if (wd[2] > 0)
+            .{ .w = c.args[4], .s = c.args[5], .b = c.args[6], .qp = .{ .bits = 8, .group_size = wd[2], .mode = .affine } }
+        else
+            .{ .w = c.args[4], .s = c.args[5], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
+        const got = (try moeDown(&sc, kern, rows_per_tg, &down, &shared, c.args[0], c.args[7], c.args[8], &.{ .pre = none, .post = c.args[9], .comb = c.args[10] })) orelse return error.Declined;
         try std.testing.expectEqualSlices(u8, try c.rig.bytesOf(&.{got}), mine);
     };
 }

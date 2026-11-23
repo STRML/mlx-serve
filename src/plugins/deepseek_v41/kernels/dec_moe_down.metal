@@ -147,15 +147,25 @@ for (int f = 0; f < PAIRS; ++f) {
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// The shared expert: its weights load once, then each row's shared activation in turn.
+// The shared expert (mxfp8 when !SAFF, affine 8-bit group SGS when SAFF): its weights load once, then each row's shared activation in turn.
 {
   uint4 sr[8];
-  uint ss_;
+  uint ss_ = 0u;
+  constexpr int G128 = SAFF ? (128 / SGS) : 1;
+  float sf[G128], bf[G128];
   {
     const size_t row = d0 + rb;
     const device uint4* sp = (const device uint4*)(sw + row * (K / 4) + 32 * u);
     for (int i = 0; i < 8; ++i) sr[i] = sp[i];
-    ss_ = ((const device uint*)(sscales + row * (K / 32)))[u];
+    if constexpr (SAFF) {
+      const size_t sbase = row * (size_t)(K / SGS) + (size_t)u * G128;
+      for (int i = 0; i < G128; ++i) {
+        sf[i] = float(((const device T*)sscales)[sbase + i]);
+        bf[i] = float(((const device T*)sbiases)[sbase + i]);
+      }
+    } else {
+      ss_ = ((const device uint*)((const device uint8_t*)sscales + row * (K / 32)))[u];
+    }
   }
   for (int rr = 0; rr < ROWS; ++rr) {
     const int cur = (PAIRS + rr) & 1;
@@ -168,18 +178,32 @@ for (int f = 0; f < PAIRS; ++f) {
         const float4 v = ((const threadgroup float4*)(pu + q * 32))[h];
         xf[4 * h] = v.x; xf[4 * h + 1] = v.y; xf[4 * h + 2] = v.z; xf[4 * h + 3] = v.w;
       }
-      float d = 0.0f;
-      for (int k = 0; k < 8; ++k) {
-        const uint wk = sr[2 * q + k / 4][k % 4];
-        const float2 lo = mlxserve_e4m3x2(wk), hi = mlxserve_e4m3x2(wk >> 8);
-        d = metal::fma(xf[4 * k], lo.x, d);
-        d = metal::fma(xf[4 * k + 1], hi.x, d);
-        d = metal::fma(xf[4 * k + 2], lo.y, d);
-        d = metal::fma(xf[4 * k + 3], hi.y, d);
+      if constexpr (SAFF) {
+        const int gi = q / (SGS / 32);
+        const float s_q = sf[gi], b_q = bf[gi];
+        float d = c;
+        for (int k = 0; k < 8; ++k) {
+          const uint wk = sr[2 * q + k / 4][k % 4];
+          d = metal::fma(xf[4 * k], metal::fma(float(wk & 0xFFu), s_q, b_q), d);
+          d = metal::fma(xf[4 * k + 1], metal::fma(float((wk >> 8) & 0xFFu), s_q, b_q), d);
+          d = metal::fma(xf[4 * k + 2], metal::fma(float((wk >> 16) & 0xFFu), s_q, b_q), d);
+          d = metal::fma(xf[4 * k + 3], metal::fma(float(wk >> 24), s_q, b_q), d);
+        }
+        c = d;
+      } else {
+        float d = 0.0f;
+        for (int k = 0; k < 8; ++k) {
+          const uint wk = sr[2 * q + k / 4][k % 4];
+          const float2 lo = mlxserve_e4m3x2(wk), hi = mlxserve_e4m3x2(wk >> 8);
+          d = metal::fma(xf[4 * k], lo.x, d);
+          d = metal::fma(xf[4 * k + 1], hi.x, d);
+          d = metal::fma(xf[4 * k + 2], lo.y, d);
+          d = metal::fma(xf[4 * k + 3], hi.y, d);
+        }
+        // e8m0 as 2^(e - 127), times the 2^8 the e4m3 bit placement leaves out.
+        const uint e8 = (ss_ >> (8 * q)) & 0xFFu;
+        c = metal::fma(as_type<float>(e8 == 0u ? 0x400000u : (e8 << 23)) * 256.0f, d, c);
       }
-      // e8m0 as 2^(e - 127), times the 2^8 the e4m3 bit placement leaves out.
-      const uint e8 = (ss_ >> (8 * q)) & 0xFFu;
-      c = metal::fma(as_type<float>(e8 == 0u ? 0x400000u : (e8 << 23)) * 256.0f, d, c);
     }
     for (int a = 0; a < ROWS; ++a) accr[a] += rr == a ? c : 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);

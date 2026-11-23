@@ -127,8 +127,14 @@ if (is_mix) {
       const uint4 hx = h2s[rr * NCH + (half_c + c) * 32 + lane];
       const uint hw[4] = {hx.x, hx.y, hx.z, hx.w};
       for (int i = 0; i < 4; ++i) {
-        acc[rr] = metal::fma(as_type<float>(hw[i] << 16), as_type<float>(gv[i] << 16), acc[rr]);
-        acc[rr] = metal::fma(as_type<float>(hw[i] & 0xffff0000u), as_type<float>(gv[i] & 0xffff0000u), acc[rr]);
+        if constexpr (F16_GATE) {
+          const float2 g2 = float2(as_type<half2>(gv[i]));
+          acc[rr] = metal::fma(as_type<float>(hw[i] << 16), g2.x, acc[rr]);
+          acc[rr] = metal::fma(as_type<float>(hw[i] & 0xffff0000u), g2.y, acc[rr]);
+        } else {
+          acc[rr] = metal::fma(as_type<float>(hw[i] << 16), as_type<float>(gv[i] << 16), acc[rr]);
+          acc[rr] = metal::fma(as_type<float>(hw[i] & 0xffff0000u), as_type<float>(gv[i] & 0xffff0000u), acc[rr]);
+        }
       }
     }
   }

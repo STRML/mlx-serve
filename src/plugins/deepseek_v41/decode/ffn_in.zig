@@ -22,7 +22,7 @@ const A_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in.metal");
 const B_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_post.metal");
 const HEADER = mxfp8_qmv.HEADER;
 
-const A_INS = [_][*:0]const u8{ "oa", "w_q", "scales", "x", "spre", "spost", "scomb" };
+const A_INS = [_][*:0]const u8{ "oa", "w_q", "scales", "biases", "x", "spre", "spost", "scomb" };
 /// `ctr`, `parts` and `scores` are launch 2's scratch: launch 1 zeroes the counters and writes neither of the others.
 const A_OUTS = [_][*:0]const u8{ "x1", "hv", "ctr", "parts", "logits" };
 const B_INS = [_][*:0]const u8{ "x1", "hv", "fn", "scale", "base", "w", "gate_w", "bias", "scal", "eps", "ctr", "parts", "logits" };
@@ -64,6 +64,7 @@ const experts_tg: usize = 4;
 const b_threads: usize = 256;
 
 /// What a call is for: `rows` stream rows through a `d`-wide layer with wo_b `[d, k]` and `e` routed experts.
+/// `wo_gs`: 0 for mxfp8 g32, or 32/64/128 for affine 8-bit group size. `f16_gate`: true when `gate_w` is float16.
 pub const Dims = struct {
     rows: usize,
     d: usize = 5120,
@@ -72,12 +73,16 @@ pub const Dims = struct {
     top_k: usize = 6,
     iters: usize = 20,
     norm: bool = true,
+    wo_gs: usize = 0,
+    f16_gate: bool = false,
 };
 
 pub const TArg = struct { name: [*:0]const u8, v: usize };
+pub const Flag = struct { name: [*:0]const u8, v: bool };
 
 fn servesA(p: Dims) bool {
-    return p.rows >= 1 and p.rows <= decode.max_rows and p.d % (a_nsg * aCols(p.rows)) == 0 and p.d >= slice_cols and p.k % (512 * a_unroll) == 0;
+    const gs_ok = p.wo_gs == 0 or p.wo_gs == 32 or p.wo_gs == 64 or p.wo_gs == 128;
+    return gs_ok and p.rows >= 1 and p.rows <= decode.max_rows and p.d % (a_nsg * aCols(p.rows)) == 0 and p.d >= slice_cols and p.k % (512 * a_unroll) == 0;
 }
 
 /// Floats of threadgroup memory launch 2 uses: a router threadgroup's h2 rows, the slices' partials with the reduced
@@ -128,10 +133,16 @@ fn gridB(p: Dims) usize {
     return (slices(p) + routerTgs(p)) * b_threads;
 }
 
-fn aTargs(p: Dims) [7]TArg {
+fn aTargs(p: Dims) [8]TArg {
     return .{
-        .{ .name = "R", .v = p.rows }, .{ .name = "NSG", .v = a_nsg }, .{ .name = "NR", .v = aCols(p.rows) }, .{ .name = "U", .v = a_unroll },
-        .{ .name = "K", .v = p.k },    .{ .name = "D", .v = p.d },     .{ .name = "HC", .v = hc },
+        .{ .name = "R", .v = p.rows },
+        .{ .name = "NSG", .v = a_nsg },
+        .{ .name = "NR", .v = aCols(p.rows) },
+        .{ .name = "U", .v = a_unroll },
+        .{ .name = "K", .v = p.k },
+        .{ .name = "D", .v = p.d },
+        .{ .name = "HC", .v = hc },
+        .{ .name = "GS", .v = if (p.wo_gs > 0) p.wo_gs else 32 },
     };
 }
 
@@ -144,15 +155,16 @@ fn bTargs(p: Dims) [10]TArg {
 }
 
 pub const Weights = struct {
-    /// wo_b: e4m3 words `[D, K/4]` u32 and e8m0 scales `[D, K/32]` u8.
+    /// wo_b: `[D, K/4]` u32 weights, scales, and optional affine biases.
     wo_w: A,
     wo_s: A,
+    wo_b: A = none,
     /// The FFN's hc mixes: f32 `[24, 4 D]`, `[24]`, `[24]`.
     fn_w: A,
     fn_scale: A,
     fn_base: A,
     norm_w: A,
-    /// bf16 `[E, D]` and f32 `[1, E]`.
+    /// bf16 or float16 `[E, D]` and f32 `[1, E]`.
     gate_w: A,
     gate_bias: A,
 };
@@ -163,7 +175,7 @@ pub const BOut = struct { h2: A, sf: dsv41.Split, idx: A, wts: A };
 
 const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype };
 
-fn run(comptime n: usize, sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, outs: [n]OutSpec, grid: usize, tg: usize, targs: []const TArg) ![n]A {
+fn run(comptime n: usize, sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, outs: [n]OutSpec, grid: usize, tg: usize, targs: []const TArg, flags: []const Flag) ![n]A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, o.shape.ptr, o.shape.len, o.dt));
@@ -171,6 +183,7 @@ fn run(comptime n: usize, sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, ins
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", act));
     for (targs) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t.name, ci(t.v)));
+    for (flags) |fl| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, fl.name, fl.v));
     const iv = mlx.mlx_vector_array_new_data(ins.ptr, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -194,13 +207,14 @@ fn run(comptime n: usize, sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, ins
 /// Launch 1 for `p.rows` rows: wo_b over `oa` `[R, K]`, then each output column's hc expand with `x` `[R, 4, D]` and `sa`
 /// (the attention's split), and the collapse; it also zeroes launch 2's counters and sizes its scratch.
 pub fn launchA(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, oa: A, x: A, sa: *const dsv41.Split) !AOut {
-    const a = try run(5, sc, ks.a, &.{ oa, w.wo_w, w.wo_s, x, sa.pre, sa.post, sa.comb }, .{
+    const bi = if (w.wo_b.ctx != null) w.wo_b else oa;
+    const a = try run(5, sc, ks.a, &.{ oa, w.wo_w, w.wo_s, bi, x, sa.pre, sa.post, sa.comb }, .{
         .{ .shape = &.{ ci(p.rows), hc, ci(p.d) }, .dt = act },
         .{ .shape = &.{ ci(p.rows), ci(p.d) }, .dt = act },
         .{ .shape = &.{16}, .dt = .uint32 },
         .{ .shape = &.{ci(partsLen(p))}, .dt = .float32 },
         .{ .shape = &.{ ci(p.rows), ci(p.e) }, .dt = .float32 },
-    }, gridA(p), a_nsg * 32, &aTargs(p));
+    }, gridA(p), a_nsg * 32, &aTargs(p), &.{.{ .name = "AFF", .v = p.wo_gs > 0 }});
     return .{ .x1 = a[0], .hv = a[1], .ctr = a[2], .parts = a[3], .logits = a[4] };
 }
 
@@ -214,7 +228,7 @@ pub fn launchB(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, a: AOut, eps:
         .{ .shape = &.{ ci(p.rows), hc, hc }, .dt = .float32 },
         .{ .shape = &.{ ci(p.rows), ci(p.top_k) }, .dt = .uint32 },
         .{ .shape = &.{ ci(p.rows), ci(p.top_k) }, .dt = .float32 },
-    }, gridB(p), b_threads, &bTargs(p));
+    }, gridB(p), b_threads, &bTargs(p), &.{.{ .name = "F16_GATE", .v = p.f16_gate }});
     return .{ .h2 = b[0], .sf = .{ .pre = b[1], .post = b[2], .comb = b[3] }, .idx = b[4], .wts = b[5] };
 }
 
@@ -285,14 +299,14 @@ fn depthB(s: Shape) usize {
 
 /// wo_b over the attention output, then each column's expand and collapse. Shape: rows, D columns, K.
 const FfnA = struct {
-    pub const Params = struct {};
+    pub const Params = struct { gs: usize = 0 };
 
-    fn dims(s: Shape) Dims {
-        return .{ .rows = s.rows, .d = s.n, .k = s.k };
+    fn dims(pm: Params, s: Shape) Dims {
+        return .{ .rows = s.rows, .d = s.n, .k = s.k, .wo_gs = pm.gs };
     }
 
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
-        const p = dims(s);
+    pub fn geometry(pm: Params, s: Shape) ?metal.Geometry {
+        const p = dims(pm, s);
         if (!servesA(p)) return null;
         // The counters, partials and scores are launch 2's scratch (launch 1 writes only the counters).
         var g = metal.Geometry{ .grid = .{ ci(gridA(p)), 1, 1 }, .tg = .{ ci(a_nsg * 32), 1, 1 }, .unread = 0b11100 };
@@ -302,6 +316,7 @@ const FfnA = struct {
         g.out(&.{ci(partsLen(p))}, .float32);
         g.out(&.{ ci(p.rows), ci(p.e) }, .float32);
         for (aTargs(p)) |t| g.int(t.name, t.v);
+        g.flag("AFF", p.wo_gs > 0);
         g.dtype("T", act);
         return g;
     }
@@ -310,9 +325,11 @@ const FfnA = struct {
         const R = k.shape.rows;
         const D = k.shape.n;
         const K = k.shape.k;
+        const gs = k.p.gs;
         const oa = try k.add(act, &.{ R, K });
         const words = try k.add(.uint32, &.{ D, K / 4 });
-        const exps = try k.add(.uint8, &.{ D, K / 32 });
+        const exps = try k.add(if (gs > 0) act else .uint8, &.{ D, K / (if (gs > 0) gs else 32) });
+        const biases = try k.add(act, if (gs > 0) &[_]usize{ D, K / gs } else &[_]usize{16});
         const x = try k.add(act, &.{ R, hc, D });
         const pre = try k.add(.float32, &.{ R, hc });
         const post = try k.add(.float32, &.{ R, hc });
@@ -322,14 +339,22 @@ const FfnA = struct {
         kit.uniform(rng, pre, 0, 1);
         kit.uniform(rng, post, 0, 2);
         kit.uniform(rng, comb, 0, 0.5);
-        for (exps) |*e| e.* = @floatFromInt(rng.intRangeAtMost(u8, 117, 121));
-        for (words) |*wd| {
-            var b: [4]u8 = undefined;
-            rng.bytes(&b);
-            for (&b) |*q| if (q.* & 0x7f == 0x7f) {
-                q.* -= 1;
-            };
-            wd.* = @floatFromInt(std.mem.readInt(u32, &b, .little));
+        if (gs > 0) {
+            for (exps, biases) |*sc, *bi| {
+                sc.* = (0.5 + rng.float(f64)) * 0.04 / 256.0;
+                bi.* = -sc.* * 128.0;
+            }
+            for (words) |*wd| wd.* = @floatFromInt(rng.int(u32));
+        } else {
+            for (exps) |*e| e.* = @floatFromInt(rng.intRangeAtMost(u8, 117, 121));
+            for (words) |*wd| {
+                var b: [4]u8 = undefined;
+                rng.bytes(&b);
+                for (&b) |*q| if (q.* & 0x7f == 0x7f) {
+                    q.* -= 1;
+                };
+                wd.* = @floatFromInt(std.mem.readInt(u32, &b, .little));
+            }
         }
         switch (f) {
             .random => {},
@@ -345,17 +370,27 @@ const FfnA = struct {
                 defer k.scratch().free(wf);
                 try contract.stressDot(rng, oa[0..K], wf, D, K, 64, 7, k.scratch());
                 for (1..R) |r| @memcpy(oa[r * K ..][0..K], oa[0..K]);
-                var table: [8]u8 = undefined;
-                for (&table, 0..) |*t, c| t.* = intByte(@intCast(c));
-                for (words, 0..) |*wd, i| {
-                    var b: [4]u8 = undefined;
-                    for (&b, 0..) |*q, j| {
-                        const c = wf[4 * i + j];
-                        q.* = table[@intFromFloat(@abs(c))] | @as(u8, if (c < 0) 0x80 else 0);
+                if (gs > 0) {
+                    for (words, 0..) |*wd, i| {
+                        var b: [4]u8 = undefined;
+                        for (&b, 0..) |*q, j| q.* = @intFromFloat(128.0 + wf[4 * i + j]);
+                        wd.* = @floatFromInt(std.mem.readInt(u32, &b, .little));
                     }
-                    wd.* = @floatFromInt(std.mem.readInt(u32, &b, .little));
+                    @memset(exps, 1.0);
+                    @memset(biases, -128.0);
+                } else {
+                    var table: [8]u8 = undefined;
+                    for (&table, 0..) |*t, c| t.* = intByte(@intCast(c));
+                    for (words, 0..) |*wd, i| {
+                        var b: [4]u8 = undefined;
+                        for (&b, 0..) |*q, j| {
+                            const c = wf[4 * i + j];
+                            q.* = table[@intFromFloat(@abs(c))] | @as(u8, if (c < 0) 0x80 else 0);
+                        }
+                        wd.* = @floatFromInt(std.mem.readInt(u32, &b, .little));
+                    }
+                    @memset(exps, 127);
                 }
-                @memset(exps, 127);
                 @memset(x, 0);
                 @memset(post, 1);
                 @memset(comb, 0);
@@ -372,7 +407,23 @@ const FfnA = struct {
     /// Row `r`'s wo_b column `n` as f64: the products `oa . w` into `t` (K of them), their magnitude returned.
     fn dot(k: anytype, r: usize, n: usize, t: []f64) f64 {
         const K = k.shape.k;
+        const gs = k.p.gs;
         var mg: f64 = 0;
+        if (gs > 0) {
+            for (0..K / gs) |g| {
+                const sc = k.in(2)[n * (K / gs) + g];
+                const bi = k.in(3)[n * (K / gs) + g];
+                for (0..gs) |q| {
+                    const i = g * gs + q;
+                    const wd: u32 = @intFromFloat(k.in(1)[n * (K / 4) + i / 4]);
+                    const b: f64 = @floatFromInt((wd >> @intCast(8 * (i % 4))) & 0xFF);
+                    const xv = k.in(0)[r * K + i];
+                    t[i] = xv * (sc * b + bi);
+                    mg += @abs(xv) * (@abs(sc * b) + @abs(bi));
+                }
+            }
+            return mg;
+        }
         for (0..K / 32) |g| {
             const sc = std.math.pow(f64, 2, k.in(2)[n * (K / 32) + g] - 127);
             for (0..32) |q| {
@@ -397,11 +448,11 @@ const FfnA = struct {
             var th: [hc]f64 = undefined;
             for (0..hc) |i| {
                 var terms: [hc + 1]f64 = undefined;
-                terms[0] = k.in(5)[r * hc + i] * yb;
-                for (0..hc) |j| terms[j + 1] = k.in(6)[r * hc * hc + j * hc + i] * k.in(3)[(r * hc + j) * D + n];
+                terms[0] = k.in(6)[r * hc + i] * yb;
+                for (0..hc) |j| terms[j + 1] = k.in(7)[r * hc * hc + j * hc + i] * k.in(4)[(r * hc + j) * D + n];
                 const x1 = bf(sum.of(&terms));
                 out[(r * hc + i) * D + n] = x1;
-                th[i] = k.in(4)[r * hc + i] * x1;
+                th[i] = k.in(5)[r * hc + i] * x1;
             }
             out[R * hc * D + r * D + n] = bf(sum.of(&th));
         };
@@ -426,11 +477,11 @@ const FfnA = struct {
                 var a: f64 = 0;
                 var am: f64 = 0;
                 for (0..hc) |j| {
-                    const term = k.in(6)[r * hc * hc + j * hc + i] * k.in(3)[(r * hc + j) * D + n];
+                    const term = k.in(7)[r * hc * hc + j * hc + i] * k.in(4)[(r * hc + j) * D + n];
                     a += term;
                     am += @abs(term);
                 }
-                const post = k.in(5)[r * hc + i];
+                const post = k.in(6)[r * hc + i];
                 const iv = if (point)
                     Iv.pt(bf(post * yiv.lo + a))
                 else
@@ -438,7 +489,7 @@ const FfnA = struct {
                 const g = outAt(k, .bf16, 0, (r * hc + i) * D + n);
                 const ok = if (point) spec.classOf(g) == spec.classOf(iv.lo) else iv.has(g);
                 if (!ok) return std.fmt.bufPrint(&k.msg, "row {d} stream {d} column {d}: x1 is {e} outside [{e}, {e}]", .{ r, i, n, g, iv.lo, iv.hi }) catch "x1";
-                const pre = k.in(4)[r * hc + i];
+                const pre = k.in(5)[r * hc + i];
                 h += pre * g;
                 hm += @abs(pre * g);
             }
@@ -520,13 +571,13 @@ fn pickKey(v: f64) f64 {
 
 /// The FFN's mixes and split, the rms-normed collapse and the router. Shape: rows, D, E.
 const FfnB = struct {
-    pub const Params = struct {};
+    pub const Params = struct { f16_gate: bool = false };
 
     fn dims(s: Shape) Dims {
         return .{ .rows = s.rows, .d = s.n, .e = s.k };
     }
 
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+    pub fn geometry(pm: Params, s: Shape) ?metal.Geometry {
         const p = dims(s);
         if (!servesB(p)) return null;
         var g = metal.Geometry{ .grid = .{ ci(gridB(p)), 1, 1 }, .tg = .{ ci(b_threads), 1, 1 } };
@@ -537,6 +588,7 @@ const FfnB = struct {
         g.out(&.{ ci(p.rows), ci(p.top_k) }, .uint32);
         g.out(&.{ ci(p.rows), ci(p.top_k) }, .float32);
         for (bTargs(p)) |t| g.int(t.name, t.v);
+        g.flag("F16_GATE", pm.f16_gate);
         g.dtype("T", act);
         return g;
     }
@@ -553,7 +605,7 @@ const FfnB = struct {
         const scale = try k.add(.float32, &.{mixes});
         const base = try k.add(.float32, &.{mixes});
         const w = try k.add(act, &.{D});
-        const gw = try k.add(act, &.{ E, D });
+        const gw = try k.add(if (k.p.f16_gate) .float16 else act, &.{ E, D });
         const bias = try k.add(.float32, &.{ 1, E });
         const scal = try k.add(.float32, &.{1});
         const eps = try k.add(.float32, &.{2});
@@ -814,36 +866,48 @@ const launch_b = metal.Launch{
 const nan_rule: spec.Nan = .{ .stated = "classes as float64 gives them; every output within the intervals of its roundings, the picks by the stated rule (a NaN score is picked last, lowest index first)" };
 
 pub fn register(set: *kc.Set) !void {
-    try kit.add(set, FfnA, &launch_a, .{}, .{
-        .name = "dsv41 dec ffn_in A (wo_b, expand, collapse)",
-        .accum = .f32,
-        .depth = depthA,
-        .mids = 1,
-        .out = .bf16,
-        .nan = nan_rule,
-        .tiles = .{ .{ .size = 3 }, .{ .size = 128, .step = 128, .min = 128 }, .{ .size = 1024, .step = 1024, .min = 1024 } },
-        .served = &.{ .{ .rows = 1, .n = 256, .k = 8192 }, .{ .rows = 6, .n = 256, .k = 8192 }, .{ .rows = 1, .n = 5120, .k = 8192 } },
-    });
-    try kit.add(set, FfnB, &launch_b, .{}, .{
-        .name = "dsv41 dec ffn_in B (mixes, split, norm, router)",
-        .accum = .f32,
-        .depth = depthB,
-        .ops = split_ops,
-        .mids = 1,
-        .out = .bf16,
-        .outs = &.{
-            .{ .elem = .bf16, .count = perD },
-            .{ .elem = .f32, .count = perHc },
-            .{ .elem = .f32, .count = perHc },
-            .{ .elem = .f32, .count = perComb },
-            .{ .elem = .u32, .count = perPick },
-            .{ .elem = .f32, .count = perPick },
-        },
-        .in_place = true,
-        .nan = nan_rule,
-        .tiles = .{ .{ .size = 3 }, .{}, .{ .size = 16, .step = 8, .min = 8 } },
-        .served = &.{ .{ .rows = 1, .n = 5120, .k = 384 }, .{ .rows = 6, .n = 5120, .k = 384 } },
-    });
+    inline for ([_]struct { name: []const u8, gs: usize }{
+        .{ .name = "dsv41 dec ffn_in A (wo_b, expand, collapse)", .gs = 0 },
+        .{ .name = "dsv41 dec ffn_in A affine8 g32 (wo_b, expand, collapse)", .gs = 32 },
+        .{ .name = "dsv41 dec ffn_in A affine8 g64 (wo_b, expand, collapse)", .gs = 64 },
+        .{ .name = "dsv41 dec ffn_in A affine8 g128 (wo_b, expand, collapse)", .gs = 128 },
+    }) |cfg| {
+        try kit.add(set, FfnA, &launch_a, .{ .gs = cfg.gs }, .{
+            .name = cfg.name,
+            .accum = .f32,
+            .depth = depthA,
+            .mids = 1,
+            .out = .bf16,
+            .nan = nan_rule,
+            .tiles = .{ .{ .size = 3 }, .{ .size = 128, .step = 128, .min = 128 }, .{ .size = 1024, .step = 1024, .min = 1024 } },
+            .served = &.{ .{ .rows = 1, .n = 256, .k = 8192 }, .{ .rows = 6, .n = 256, .k = 8192 }, .{ .rows = 1, .n = 5120, .k = 8192 } },
+        });
+    }
+    inline for ([_]struct { name: []const u8, f16: bool }{
+        .{ .name = "dsv41 dec ffn_in B (mixes, split, norm, router)", .f16 = false },
+        .{ .name = "dsv41 dec ffn_in B f16 gate (mixes, split, norm, router)", .f16 = true },
+    }) |cfg| {
+        try kit.add(set, FfnB, &launch_b, .{ .f16_gate = cfg.f16 }, .{
+            .name = cfg.name,
+            .accum = .f32,
+            .depth = depthB,
+            .ops = split_ops,
+            .mids = 1,
+            .out = .bf16,
+            .outs = &.{
+                .{ .elem = .bf16, .count = perD },
+                .{ .elem = .f32, .count = perHc },
+                .{ .elem = .f32, .count = perHc },
+                .{ .elem = .f32, .count = perComb },
+                .{ .elem = .u32, .count = perPick },
+                .{ .elem = .f32, .count = perPick },
+            },
+            .in_place = true,
+            .nan = nan_rule,
+            .tiles = .{ .{ .size = 3 }, .{}, .{ .size = 16, .step = 8, .min = 8 } },
+            .served = &.{ .{ .rows = 1, .n = 5120, .k = 384 }, .{ .rows = 6, .n = 5120, .k = 384 } },
+        });
+    }
 }
 
 // ── tests ──
@@ -851,7 +915,7 @@ pub fn register(set: *kc.Set) !void {
 const Fixture = @import("fixture.zig").Fixture;
 
 pub fn weightsOf(ly: *const dsv41.Layer) Weights {
-    return .{ .wo_w = ly.wo_b.w, .wo_s = ly.wo_b.s, .fn_w = ly.hc_ffn.fn_w, .fn_scale = ly.hc_ffn.scale, .fn_base = ly.hc_ffn.base, .norm_w = ly.ffn_norm, .gate_w = ly.gate_w, .gate_bias = ly.gate_bias };
+    return .{ .wo_w = ly.wo_b.w, .wo_s = ly.wo_b.s, .wo_b = ly.wo_b.b, .fn_w = ly.hc_ffn.fn_w, .fn_scale = ly.hc_ffn.scale, .fn_base = ly.hc_ffn.base, .norm_w = ly.ffn_norm, .gate_w = ly.gate_w, .gate_bias = ly.gate_bias };
 }
 
 /// `ly` with `w` in the places today's chain reads them.
@@ -859,6 +923,7 @@ fn layerWith(ly: *const dsv41.Layer, w: Weights) dsv41.Layer {
     var l = ly.*;
     l.wo_b.w = w.wo_w;
     l.wo_b.s = w.wo_s;
+    l.wo_b.b = w.wo_b;
     l.hc_ffn = .{ .fn_w = w.fn_w, .scale = w.fn_scale, .base = w.fn_base };
     l.ffn_norm = w.norm_w;
     l.gate_w = w.gate_w;
@@ -1022,13 +1087,22 @@ fn equivalence(gpa: std.mem.Allocator, fx: *Fixture, ks: Kernels, ly: *const dsv
     const eps = try dsv41.hcEps(&sc, m);
     const scal = mlx.mlx_array_new_data(&[_]f32{m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32);
     try sc.items.append(sc.a, scal);
-    const p: Dims = .{ .rows = rows, .d = D, .e = @intCast(mlx.getShape(ly.gate_w)[0]), .top_k = ly.top_k, .iters = m.cfg.dsv4_hc_sinkhorn_iters, .norm = m.cfg.moe_route_norm and ly.top_k > 1 };
+    const p: Dims = .{
+        .rows = rows,
+        .d = D,
+        .e = @intCast(mlx.getShape(ly.gate_w)[0]),
+        .top_k = ly.top_k,
+        .iters = m.cfg.dsv4_hc_sinkhorn_iters,
+        .norm = m.cfg.moe_route_norm and ly.top_k > 1,
+        .wo_gs = if (ly.wo_b.qp.mode == .affine) ly.wo_b.qp.group_size else 0,
+        .f16_gate = mlx.mlx_array_dtype(ly.gate_w) == .float16,
+    };
     const out = (try launch(&sc, ks, p, w, oa, x, &sa, eps, scal)) orelse return error.Declined;
     try dsv41.evalAll(&.{ pf.x1, pf.h, pf.sp.pre, pf.sp.post, pf.sp.comb, rt.idx, rt.wts, out.x1, out.h2, out.sf.pre, out.sf.post, out.sf.comb, out.idx, out.wts });
     // Float64 truth over the dequantized wo_b.
     var wd = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wd);
-    try mlx.check(mlx.mlx_dequantize(&wd, w.wo_w, w.wo_s, none, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", none, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&wd, w.wo_w, w.wo_s, w.wo_b, mlx.mlx_optional_int.some(@intCast(ly.wo_b.qp.group_size)), mlx.mlx_optional_int.some(@intCast(ly.wo_b.qp.bits)), ly.wo_b.qp.mode.cstr(), none, .{ .value = .float32, .has_value = true }, s));
     var hosts: [12][]f32 = undefined;
     const srcs = [_]A{ wd, oa, x, sa.pre, sa.post, sa.comb, w.fn_w, w.fn_scale, w.fn_base, w.norm_w, w.gate_w, w.gate_bias };
     for (srcs, &hosts) |a, *hs| hs.* = try dsv41.hostF32(a);
@@ -1136,8 +1210,20 @@ fn randomWeights(seed: u64) !Weights {
     };
 }
 
+fn quantAff8(w: A, gs: usize) ![3]A {
+    defer _ = mlx.mlx_array_free(w);
+    var qv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qv);
+    try mlx.check(mlx.mlx_quantize(&qv, w, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(8), "affine", none, mlx.gpuStream()));
+    var out: [3]A = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    for (&out, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, qv, i));
+    try dsv41.evalAll(&out);
+    return out;
+}
+
 fn freeWeights(w: Weights) void {
     for ([_]A{ w.wo_w, w.wo_s, w.fn_w, w.fn_scale, w.fn_base, w.norm_w, w.gate_w, w.gate_bias }) |a| _ = mlx.mlx_array_free(a);
+    if (w.wo_b.ctx != null) _ = mlx.mlx_array_free(w.wo_b);
 }
 
 test "dsv41 dec ffn_in: R = 1 and 6 at the release's 384 experts match today's chain, no further from float64" {
@@ -1151,6 +1237,39 @@ test "dsv41 dec ffn_in: R = 1 and 6 at the release's 384 experts match today's c
     defer freeWeights(w);
     const ly = layerWith(fx.layer(21), w);
     for ([_]usize{ 1, 6 }) |rows| try equivalence(gpa, fx, ks, &ly, w, rows);
+}
+
+test "dsv41 dec ffn_in: affine 8-bit g32/g64/g128 wo_b and float16 gate_w match today's chain, no further from float64" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
+    defer fx.deinit();
+    const ks = try build();
+    defer free(ks);
+    const base_w = try randomWeights(200);
+    defer freeWeights(base_w);
+    const gw16 = try normal(210, &.{ 384, 5120 }, .float16, 0, 0.014);
+    defer _ = mlx.mlx_array_free(gw16);
+    for ([_]usize{ 32, 64, 128 }) |gs| {
+        const q = try quantAff8(try normal(220 + gs, &.{ 5120, 8192 }, act, 0, 0.008), gs);
+        defer for (q) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const w: Weights = .{
+            .wo_w = q[0],
+            .wo_s = q[1],
+            .wo_b = q[2],
+            .fn_w = base_w.fn_w,
+            .fn_scale = base_w.fn_scale,
+            .fn_base = base_w.fn_base,
+            .norm_w = base_w.norm_w,
+            .gate_w = gw16,
+            .gate_bias = base_w.gate_bias,
+        };
+        var ly = layerWith(fx.layer(21), w);
+        ly.wo_b.qp = .{ .bits = 8, .group_size = @intCast(gs), .mode = .affine };
+        for ([_]usize{ 1, 6 }) |rows| try equivalence(gpa, fx, ks, &ly, w, rows);
+    }
 }
 
 /// `a` and `b` hold the same bytes.
@@ -1173,9 +1292,9 @@ test "dsv41 dec ffn_in: the contract's launches write the shipped wrapper's byte
     try std.testing.expect(try ca.prepare(.{ .rows = 3, .n = 256, .k = 8192 }, .random, 7));
     try ca.run();
     const pa: Dims = .{ .rows = 3, .d = 256 };
-    const sa: dsv41.Split = .{ .pre = ca.args[4], .post = ca.args[5], .comb = ca.args[6] };
-    const wa: Weights = .{ .wo_w = ca.args[1], .wo_s = ca.args[2], .fn_w = none, .fn_scale = none, .fn_base = none, .norm_w = none, .gate_w = none, .gate_bias = none };
-    const a = try launchA(&sc, ks, pa, wa, ca.args[0], ca.args[3], &sa);
+    const sa: dsv41.Split = .{ .pre = ca.args[5], .post = ca.args[6], .comb = ca.args[7] };
+    const wa: Weights = .{ .wo_w = ca.args[1], .wo_s = ca.args[2], .wo_b = ca.args[3], .fn_w = none, .fn_scale = none, .fn_base = none, .norm_w = none, .gate_w = none, .gate_bias = none };
+    const a = try launchA(&sc, ks, pa, wa, ca.args[0], ca.args[4], &sa);
     try std.testing.expect(try sameBytes(&ca.rig, a.x1, ca.rig.output(0)));
     try std.testing.expect(try sameBytes(&ca.rig, a.hv, ca.rig.output(1)));
     var cb = kit.Case(FfnB).init(gpa, &launch_b, .{});

@@ -2585,6 +2585,7 @@ fn registerNax(set: *kc.Set) !void {
     const chain = "take (the row map) -> " ++ gather ++ " for gate and up -> sigmoid -> multiply -> multiply";
     try set.add(GqmmNax, .init(a, .paired, .affine, 4, 64, 32), .{ .name = "gather_qmm_nax paired bf16 (4-bit g64)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = chain, .served = paired }, null);
     try set.add(GqmmNax, .init(a, .paired, .mxfp4, 4, 32, 32), .{ .name = "gather_qmm_nax paired bf16 (MXFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = chain, .served = paired[0..1] }, null);
+    try set.add(GqmmNax, .init(a, .paired, .nvfp4, 4, 16, 32), .{ .name = "gather_qmm_nax paired bf16 (NVFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = chain, .served = paired[0..1] }, null);
     var lim = GqmmNax.init(a, .paired, .affine, 4, 64, 32);
     lim.limit = 7;
     try set.add(GqmmNax, lim, .{ .name = "gather_qmm_nax paired bf16 (4-bit g64, limit 7)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> clampedSwiGLU", .served = paired[0..1], .known = limit_drops_nan }, null);

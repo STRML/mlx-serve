@@ -98,36 +98,56 @@ inline void dec_up_routed(const device uint32_t* w, const device T* sc, const de
   }
 }
 
+inline float4 dec_up_u8x4(uint w) {
+  return float4(float(w & 0xFFu), float((w >> 8) & 0xFFu), float((w >> 16) & 0xFFu), float(w >> 24));
+}
+
 // The shared expert's gate (acc[r][0]) and up (acc[r][1]) of output row n against each of R x rows; its weights are
-// decoded once whatever R is.
-template <int R, int K, int N, typename T>
-inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, uint n, const device T* x, uint lane, thread float (*acc)[2]) {
-  constexpr uint KWS = K / 4, KGS = K / 32, UPL = K / 1024;
+// decoded once whatever R is (mxfp8 when !SAFF, affine 8-bit group SGS when SAFF).
+template <int R, int K, int N, bool SAFF, int SGS, typename T>
+inline void dec_up_shared(const device uint32_t* sw, const device void* ss, const device void* sb, uint n, const device T* x, uint lane, thread float (*acc)[2]) {
+  constexpr uint KWS = K / 4, KGS = K / (SAFF ? SGS : 32), UPL = K / 1024;
+  constexpr uint UPG = SAFF ? (SGS / 32) : 1, STEPG = SAFF ? (1024 / SGS) : 32;
   const uint wo[2] = {n * KWS + lane * 8, (n + N) * KWS + lane * 8};
-  const uint so[2] = {n * KGS + lane, (n + N) * KGS + lane};
+  const uint so[2] = {n * KGS + lane / UPG, (n + N) * KGS + lane / UPG};
+  const device T* ssa = (const device T*)ss;
+  const device T* sba = (const device T*)sb;
+  const device uint8_t* ssu = (const device uint8_t*)ss;
 #pragma unroll
   for (int r = 0; r < R; ++r) acc[r][0] = acc[r][1] = 0.0f;
 #pragma unroll
   for (int k = 0; k < UPL; ++k) {
     uint q[2][8];
-    float f[2];
+    float f[2], b_f[2];
 #pragma unroll
     for (int wr = 0; wr < 2; ++wr) {
 #pragma unroll
       for (int j = 0; j < 8; ++j) q[wr][j] = sw[wo[wr] + k * 256 + j];
-      const uint e = uint(ss[so[wr] + 32 * k]);
-      f[wr] = as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f;
+      if constexpr (SAFF) {
+        f[wr] = float(ssa[so[wr] + STEPG * k]);
+        b_f[wr] = float(sba[so[wr] + STEPG * k]);
+      } else {
+        const uint e = uint(ssu[so[wr] + STEPG * k]);
+        f[wr] = as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f;
+      }
     }
     float dq[R][2];
 #pragma unroll
-    for (int r = 0; r < R; ++r) dq[r][0] = dq[r][1] = 0.0f;
+    for (int r = 0; r < R; ++r) {
+      dq[r][0] = dq[r][1] = 0.0f;
+    }
 #pragma unroll
     for (int c = 0; c < 4; ++c) {  // eight inputs: words 2c and 2c + 1
       float4 wv[2][2];
 #pragma unroll
       for (int wr = 0; wr < 2; ++wr) {
-        wv[wr][0] = dec_up_e4m3x4(q[wr][2 * c]);
-        wv[wr][1] = dec_up_e4m3x4(q[wr][2 * c + 1]);
+        if constexpr (SAFF) {
+          wv[wr][0] = fma(dec_up_u8x4(q[wr][2 * c]), f[wr], b_f[wr]);
+          wv[wr][1] = fma(dec_up_u8x4(q[wr][2 * c + 1]), f[wr], b_f[wr]);
+        } else {
+          wv[wr][0] = dec_up_e4m3x4(q[wr][2 * c]);
+          wv[wr][1] = dec_up_e4m3x4(q[wr][2 * c + 1]);
+        }
       }
 #pragma unroll
       for (int r = 0; r < R; ++r) {
@@ -147,8 +167,13 @@ inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, u
     }
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-      acc[r][0] = fma(f[0], dq[r][0], acc[r][0]);
-      acc[r][1] = fma(f[1], dq[r][1], acc[r][1]);
+      if constexpr (SAFF) {
+        acc[r][0] += dq[r][0];
+        acc[r][1] += dq[r][1];
+      } else {
+        acc[r][0] = fma(f[0], dq[r][0], acc[r][0]);
+        acc[r][1] = fma(f[1], dq[r][1], acc[r][1]);
+      }
     }
   }
 #pragma unroll
@@ -156,6 +181,11 @@ inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, u
     acc[r][0] = simd_sum(acc[r][0]);
     acc[r][1] = simd_sum(acc[r][1]);
   }
+}
+
+template <int R, int K, int N, typename T>
+inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, uint n, const device T* x, uint lane, thread float (*acc)[2]) {
+  dec_up_shared<R, K, N, false, 32, T>(sw, ss, ss, n, x, lane, acc);
 }
 
 // clampedSwiglu(gate, up) * wt with the two sums rounded to T where gather_qmm writes them; a NaN stays NaN

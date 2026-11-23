@@ -113,10 +113,10 @@ if constexpr (UI > 0) {
   for (int i = int(tg); i < UI; i += G) {
     // The indexer's q: rope the last RD of each head, then the fp4 / 32 / ue8m0 round trip over the unit's 32 rows.
     const int n_base = i * 32 + int(sg) * 2 * PI;
-    dsv41_wqb_w<PI> wi;
-    dsv41_wqb_load<PI>(wi, (const device uint4*)w_i + n_base * 80, (const device uchar*)s_i + n_base * 40, lane);
+    dsv41_wqb_w<PI, I_AFF> wi;
+    dsv41_wqb_load<PI, I_AFF, I_GS, T>(wi, (const device uint4*)w_i, s_i, b_i, n_base, lane);
     float acc[PI][R];
-    dsv41_wqb_dots<R, PI>(wi, xs, lane, acc);
+    dsv41_wqb_dots<R, PI, I_AFF>(wi, xs, lane, acc);
     float vals[PI];
     float amax = 0.0f;
     for (int p = 0; p < PI; ++p) {
@@ -153,19 +153,19 @@ if constexpr (UI > 0) {
 // wq_b: rope the last RD of each head; the next unit's rows are read while this one's are multiplied.
 const int i_q = int(tg) >= UI ? int(tg) : int(tg) + ((UI - int(tg) + int(G) - 1) / int(G)) * int(G);
 if (i_q < UI + UQ) {
-  dsv41_wqb_w<1> wq;
+  dsv41_wqb_w<1, Q_AFF> wq;
   const int n_first = (i_q - UI) * RQ + int(sg) * 2;
-  dsv41_wqb_load<1>(wq, (const device uint4*)w_q + n_first * 80, (const device uchar*)s_q + n_first * 40, lane);
+  dsv41_wqb_load<1, Q_AFF, Q_GS, T>(wq, (const device uint4*)w_q, s_q, b_q, n_first, lane);
   for (int i = i_q; i < UI + UQ; i += G) {
     const int n_base = (i - UI) * RQ + int(sg) * 2;
-    dsv41_wqb_w<1> nx;
+    dsv41_wqb_w<1, Q_AFF> nx;
     const bool more = i + int(G) < UI + UQ;
     if (more) {
       const int n_next = n_base + int(G) * RQ;
-      dsv41_wqb_load<1>(nx, (const device uint4*)w_q + n_next * 80, (const device uchar*)s_q + n_next * 40, lane);
+      dsv41_wqb_load<1, Q_AFF, Q_GS, T>(nx, (const device uint4*)w_q, s_q, b_q, n_next, lane);
     }
     float acc[1][R];
-    dsv41_wqb_dots<R, 1>(wq, xs, lane, acc);
+    dsv41_wqb_dots<R, 1, Q_AFF>(wq, xs, lane, acc);
     float vr = 0.0f;
     for (int r = 0; r < R; ++r) {
       const float t = float(T(dsv41_wqb_sum16(acc[0][r])));
