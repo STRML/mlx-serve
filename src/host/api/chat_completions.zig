@@ -762,7 +762,7 @@ pub fn handleChatCompletions(
     defer if (request_kwargs) |k| allocator.free(k);
     if (request_kwargs) |k| render_config.chat_template_kwargs = k;
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final, &stream.recent_request);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !has_tools and enable_thinking and reasoning_budget < 0) {
@@ -780,7 +780,7 @@ pub fn handleChatCompletions(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else null, continue_final);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else null, continue_final, &stream.recent_request);
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,

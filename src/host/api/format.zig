@@ -4,6 +4,7 @@ const std = @import("std");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const request_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
+const renderChatPrompt = @import("../chat/template_load.zig").renderChatPrompt;
 const log = @import("../../sdk/util/log.zig");
 const responses_mod = @import("responses/model.zig");
 const tokenize_cache_mod = @import("../tokenizer/cache.zig");
@@ -14,6 +15,7 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
 const ollama_mod = @import("ollama/translate.zig");
 const testing = std.testing;
+const RecentRequestContext = @import("../metrics/metrics.zig").RecentRequestContext;
 
 /// Returns the number of trailing bytes that form an incomplete UTF-8 sequence.
 /// If the string ends with a complete codepoint (or is empty), returns 0.
@@ -82,14 +84,27 @@ pub fn cachedFormatChat(
     reasoning_effort: ?[]const u8,
     /// Extend the trailing assistant message rather than answering after it.
     continue_final: bool,
+    recent_request: ?*RecentRequestContext,
 ) ![]u32 {
+    if (recent_request) |context| if (context.capture_prompt_tail) {
+        const engine_owns_template = if (lm.engine) |engine| engine.caps().owns_template else false;
+        if (!engine_owns_template) {
+            if (renderChatPrompt(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final)) |rendered| {
+                defer allocator.free(rendered);
+                context.setPromptTail(rendered);
+            } else |_| {}
+        }
+    };
     const cache_ptr: ?*tokenize_cache_mod.TokenizeCache = if (lm.tokenize_cache) |*tc| tc else null;
     const key_opt: ?u64 = if (cache_ptr != null)
         tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final, chat_config.chat_template_kwargs)
     else
         null;
     if (cache_ptr) |cache| if (key_opt) |key| {
-        if (try cache.get(io, key, allocator)) |cached| return cached;
+        if (try cache.get(io, key, allocator)) |cached| {
+            if (recent_request) |context| if (context.capture_prompt_tail) captureEnginePromptTail(allocator, lm, cached, context);
+            return cached;
+        }
     };
     // ds4 renders through the GGUF engine's own template, which never reads
     // the effort string — only the Jinja paths thread it.
@@ -107,6 +122,7 @@ pub fn cachedFormatChat(
         try engine_prompt.encodeChat(allocator, e, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final)
     else
         try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final);
+    if (recent_request) |context| if (context.capture_prompt_tail) captureEnginePromptTail(allocator, lm, ids, context);
     if (cache_ptr) |cache| if (key_opt) |key| {
         // Insert is best-effort; an OOM in the cache shouldn't fail the
         // request — the user already has their tokenized prompt.
@@ -115,6 +131,14 @@ pub fn cachedFormatChat(
         };
     };
     return ids;
+}
+
+fn captureEnginePromptTail(allocator: std.mem.Allocator, lm: *LoadedModel, ids: []const u32, context: *RecentRequestContext) void {
+    const engine = lm.engine orelse return;
+    if (!engine.caps().owns_template) return;
+    const prompt = engine.decode(allocator, ids) catch return;
+    defer allocator.free(prompt);
+    context.setPromptTail(prompt);
 }
 
 /// `formatChatUsage` with `completion_tokens_details.reasoning_tokens` when the reply reasoned; a re-encoded count can

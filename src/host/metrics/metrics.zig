@@ -53,6 +53,7 @@ pub const RECENT_REQUESTS_CAPACITY = 256;
 const RECENT_PATH_MAX = 128;
 const RECENT_PEER_MAX = 64;
 const RECENT_ROUTER_ID_MAX = 64;
+const RECENT_PROMPT_TAIL_MAX = 500;
 
 /// Fixed-size request metadata carried from the HTTP connection to the slot.
 pub const RecentRequestContext = struct {
@@ -63,6 +64,10 @@ pub const RecentRequestContext = struct {
     peer_len: u8 = 0,
     router_id: [RECENT_ROUTER_ID_MAX]u8 = @splat(0),
     router_id_len: u8 = 0,
+    prompt_tail: [512]u8 = @splat(0),
+    prompt_tail_len: u16 = 0,
+    has_prompt_tail: bool = false,
+    capture_prompt_tail: bool = false,
     client: Client = .other,
     stream: bool = false,
 
@@ -82,6 +87,18 @@ pub const RecentRequestContext = struct {
         if (!validRouterId(id)) return;
         self.router_id_len = @intCast(id.len);
         @memcpy(self.router_id[0..id.len], id);
+    }
+
+    pub fn setPromptTail(self: *RecentRequestContext, prompt: []const u8) void {
+        self.prompt_tail_len = 0;
+        self.has_prompt_tail = false;
+        if (!std.unicode.utf8ValidateSlice(prompt)) return;
+        var start = prompt.len -| RECENT_PROMPT_TAIL_MAX;
+        while (start < prompt.len and prompt[start] & 0xC0 == 0x80) start += 1;
+        const tail = prompt[start..];
+        @memcpy(self.prompt_tail[0..tail.len], tail);
+        self.prompt_tail_len = @intCast(tail.len);
+        self.has_prompt_tail = true;
     }
 };
 
@@ -118,6 +135,9 @@ const RecentRequest = struct {
     peer_len: u8 = 0,
     router_id: [RECENT_ROUTER_ID_MAX]u8 = @splat(0),
     router_id_len: u8 = 0,
+    prompt_tail: [512]u8 = @splat(0),
+    prompt_tail_len: u16 = 0,
+    has_prompt_tail: bool = false,
 };
 
 /// Rows of the per-model table, the last one the shared `other` row.
@@ -390,6 +410,9 @@ pub const Metrics = struct {
         @memcpy(entry.peer[0..entry.peer_len], context.peer[0..context.peer_len]);
         entry.router_id_len = context.router_id_len;
         @memcpy(entry.router_id[0..entry.router_id_len], context.router_id[0..context.router_id_len]);
+        entry.prompt_tail_len = context.prompt_tail_len;
+        entry.has_prompt_tail = context.has_prompt_tail;
+        @memcpy(entry.prompt_tail[0..entry.prompt_tail_len], context.prompt_tail[0..context.prompt_tail_len]);
         self.recent_requests[self.recent_request_next] = entry;
         self.recent_request_next = (self.recent_request_next + 1) % RECENT_REQUESTS_CAPACITY;
         self.recent_request_count = @min(self.recent_request_count + 1, RECENT_REQUESTS_CAPACITY);
@@ -778,6 +801,8 @@ fn writeRecentRequest(w: *std.Io.Writer, r: *const RecentRequest) !void {
     if (r.peer_len > 0) try std.json.Stringify.encodeJsonString(r.peer[0..r.peer_len], .{}, w) else try w.print("null", .{});
     try w.print(",\"router_id\":", .{});
     if (r.router_id_len > 0) try std.json.Stringify.encodeJsonString(r.router_id[0..r.router_id_len], .{}, w) else try w.print("null", .{});
+    try w.print(",\"prompt_tail\":", .{});
+    if (r.has_prompt_tail) try std.json.Stringify.encodeJsonString(r.prompt_tail[0..r.prompt_tail_len], .{}, w) else try w.print("null", .{});
     try w.print("}}", .{});
 }
 
@@ -1514,6 +1539,63 @@ test "rejected request is recorded as rejected with no router id" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"outcome\":\"rejected\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"router_id\":null") != null);
     try std.testing.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
+}
+
+test "recent request prompt tail keeps the last 500 ASCII bytes" {
+    var context: RecentRequestContext = .{};
+    const prompt: [2000]u8 = @splat('a');
+    context.setPromptTail(prompt);
+    try std.testing.expect(context.has_prompt_tail);
+    try std.testing.expectEqual(@as(u16, 500), context.prompt_tail_len);
+    try std.testing.expectEqualStrings(prompt[1500..], context.prompt_tail[0..context.prompt_tail_len]);
+}
+
+test "recent request prompt tail advances past a split UTF-8 character" {
+    var prompt: [1000]u8 = @splat('a');
+    prompt[499] = 0xe2;
+    prompt[500] = 0x82;
+    prompt[501] = 0xac;
+    var context: RecentRequestContext = .{};
+    context.setPromptTail(&prompt);
+    const tail = context.prompt_tail[0..context.prompt_tail_len];
+    try std.testing.expect(context.has_prompt_tail);
+    try std.testing.expectEqual(@as(usize, 498), tail.len);
+    try std.testing.expectEqual(@as(u8, 'a'), tail[0]);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(tail));
+}
+
+test "recent request prompt tail stores a short prompt and renders null when unset" {
+    var m = Metrics.init();
+    var context: RecentRequestContext = .{};
+    context.setPath("/v1/chat/completions");
+    context.setPromptTail("short prompt");
+    m.recordRecentRequest(1, context, .success, 1, 0, 0, 0, null);
+    m.recordRecentRequest(2, .{ .path = context.path, .path_len = context.path_len }, .success, 1, 0, 0, 0, null);
+    var storage: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try renderJson(&m, &.{}, &writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("recent_requests").?.array.items;
+    try std.testing.expectEqualStrings("short prompt", rows[0].object.get("prompt_tail").?.string);
+    try std.testing.expectEqual(.null, rows[1].object.get("prompt_tail").?);
+    context.setPromptTail(&.{0xff});
+    try std.testing.expect(!context.has_prompt_tail);
+}
+
+test "recent request prompt tail JSON escapes quotes, backslashes, and newlines" {
+    var m = Metrics.init();
+    var context: RecentRequestContext = .{};
+    context.setPath("/v1/chat/completions");
+    context.setPromptTail("quote: \" slash: \\\nline");
+    m.recordRecentRequest(1, context, .success, 1, 0, 0, 0, null);
+    var storage: [8192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try renderJson(&m, &.{}, &writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("recent_requests").?.array.items;
+    try std.testing.expectEqualStrings("quote: \" slash: \\\nline", rows[0].object.get("prompt_tail").?.string);
 }
 
 test "failed and rejected counters render under their Prometheus and JSON names" {

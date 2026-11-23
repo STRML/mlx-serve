@@ -244,6 +244,7 @@ pub fn handleConnection(
     if (instr.isRecentGenerationPath(path)) {
         stream.recent_request.ts_start = @as(f64, @floatFromInt(io_util.nowMs(stream.io))) / 1000.0;
         stream.recent_request.setPath(path);
+        stream.recent_request.capture_prompt_tail = http_server.g_metrics != null;
         var peer_storage: [128]u8 = undefined;
         var peer_writer: std.Io.Writer = .fixed(&peer_storage);
         stream.stream.socket.address.format(&peer_writer) catch {};

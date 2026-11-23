@@ -641,7 +641,7 @@ fn handleResponsesInner(
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, effort_word, false);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, effort_word, false, &stream.recent_request);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !active_has_tools and enable_thinking) {
@@ -659,7 +659,7 @@ fn handleResponsesInner(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, effort_word, false);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, effort_word, false, &stream.recent_request);
             log.info("[grammar] reasoning protocol unsupported for this model/prompt; rerendered with thinking off\n", .{});
         },
         .no_mask, .token_zero => schema_proto_active = false,

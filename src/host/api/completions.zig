@@ -306,6 +306,10 @@ pub fn handleCompletions(
         .ids => |ids| log.info("  > [{d} token ids]\n", .{ids.len}),
         else => unreachable,
     }
+    switch (prompt) {
+        .text => |text| if (stream.recent_request.capture_prompt_tail) stream.recent_request.setPromptTail(text),
+        else => {},
+    }
 
     // Tokenize prompt directly (no chat template). ds4-backed models
     // tokenize through the engine's GGUF vocab; MLX models go through

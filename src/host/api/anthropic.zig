@@ -693,7 +693,7 @@ pub fn handleAnthropicMessages(
     // The `thinking` budget object carries no effort string, but
     // `output_config.effort` does — templates that read the word (dsv4,
     // qwen3.8) get it; requests without one still render their default.
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final, &stream.recent_request);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (output_cfg.schema != null and !has_tools and enable_thinking and reasoning_budget < 0) {
@@ -711,7 +711,7 @@ pub fn handleAnthropicMessages(
             schema_proto_active = false;
             allocator.free(prompt_ids_raw);
             enable_thinking = false;
-            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, false, effort_word, continue_final);
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, false, effort_word, continue_final, &stream.recent_request);
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,
