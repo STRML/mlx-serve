@@ -9579,12 +9579,14 @@ test "dsv41 flash attention bench: prefill (DSV41_BENCH_FLASH)" {
 
     var times: [7]f64 = undefined;
     for (0..2 + times.len) |rep| {
+        var rep_sc = Scope.init(gpa, mlx.gpuStream());
+        defer rep_sc.deinit();
         var outs: [n_spans]A = undefined;
         const t0 = iou.nowUsMonotonic(io);
         for (0..n_spans) |sp| {
             const f_ins = [_]A{ q, kw, comp, picks[sp], meta, qt, sink, scal, periods };
             var f_o: [1]A = .{none};
-            try flashLaunch(&sc, fk, &f_ins, &.{.{ .shape = &.{ ci(og), ci(L), ci(H / og * D) }, .dt = .bfloat16 }}, L, H, true, .bfloat16, &f_o);
+            try flashLaunch(&rep_sc, fk, &f_ins, &.{.{ .shape = &.{ ci(og), ci(L), ci(H / og * D) }, .dt = .bfloat16 }}, L, H, true, .bfloat16, &f_o);
             outs[sp] = f_o[0];
         }
         try evalAll(&outs);
@@ -9605,10 +9607,12 @@ test "dsv41 flash attention bench: prefill (DSV41_BENCH_FLASH)" {
 
     var rtimes: [7]f64 = undefined;
     for (0..2 + rtimes.len) |rep| {
+        var rep_sc = Scope.init(gpa, mlx.gpuStream());
+        defer rep_sc.deinit();
+        var rops: [4]A = undefined;
         const t0 = iou.nowUsMonotonic(io);
-        var o = q_wide;
-        for (0..4) |_| o = try ropeTailOnly(&sc, &m, q_wide, periods, off0);
-        try evalAll(&.{o});
+        for (&rops) |*r| r.* = try ropeTailOnly(&rep_sc, &m, q_wide, periods, off0);
+        try evalAll(&rops);
         const us = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / 4.0;
         if (rep >= 2) rtimes[rep - 2] = us;
     }
@@ -9617,9 +9621,11 @@ test "dsv41 flash attention bench: prefill (DSV41_BENCH_FLASH)" {
 
     var ktimes: [7]f64 = undefined;
     for (0..2 + ktimes.len) |rep| {
+        var rep_sc = Scope.init(gpa, mlx.gpuStream());
+        defer rep_sc.deinit();
         const t0 = iou.nowUsMonotonic(io);
         var o = kv_wide;
-        for (0..8) |_| o = try kvRow(&sc, &m, &ly, periods, o, off0);
+        for (0..8) |_| o = try kvRow(&rep_sc, &m, &ly, periods, o, off0);
         try evalAll(&.{o});
         const us = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / 8.0;
         if (rep >= 2) ktimes[rep - 2] = us;
@@ -9788,6 +9794,30 @@ test "dsv41 kv row: a head-width row launches and is normed by its own rms on th
         for (xs[l * D ..][0..D]) |v| ss += v * v;
         const inv = 1.0 / @sqrt(ss / D + 1e-6);
         for (0..D - 64) |d| try testing.expectApproxEqAbs(xs[l * D + d] * inv, got[l * D + d], 1e-2 * @max(1.0, @abs(xs[l * D + d] * inv)));
+    }
+    // Even rotary dim not divisible by 4 (RD = 62 -> head = 450 inside the 4-element vector at d4 = 448).
+    m.cfg.dsv4_rope_head_dim = 62;
+    const periods62 = try sc.keep(mlx.mlx_array_new_data(&@as([31]f32, @splat(2)), &[_]c_int{31}, 1, .float32));
+    const got62 = try hostF32(try kvRow(&sc, &m, &ly, periods62, x, try sc.i(5)));
+    defer gpa.free(got62);
+    for (0..L) |l| {
+        var ss: f32 = 0;
+        for (xs[l * D ..][0..D]) |v| ss += v * v;
+        const inv = 1.0 / @sqrt(ss / D + 1e-6);
+        const head = D - 62;
+        for (0..head) |d| try testing.expectApproxEqAbs(xs[l * D + d] * inv, got62[l * D + d], 1e-2 * @max(1.0, @abs(xs[l * D + d] * inv)));
+        const th = @as(f32, @floatFromInt(l + 5)) / 2.0;
+        const cs = @cos(th);
+        const sn = @sin(th);
+        var p: usize = 0;
+        while (p < 62) : (p += 2) {
+            const x0 = xs[l * D + head + p] * inv;
+            const x1 = xs[l * D + head + p + 1] * inv;
+            const e0 = x0 * cs - x1 * sn;
+            const e1 = x0 * sn + x1 * cs;
+            try testing.expectApproxEqAbs(e0, got62[l * D + head + p], 2e-2 * @max(1.0, @abs(e0)));
+            try testing.expectApproxEqAbs(e1, got62[l * D + head + p + 1], 2e-2 * @max(1.0, @abs(e1)));
+        }
     }
 }
 

@@ -16,16 +16,20 @@ const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
 const metal::vec<T, 4> y4(w4[0] * T(fv[0] * inv), w4[1] * T(fv[1] * inv), w4[2] * T(fv[2] * inv), w4[3] * T(fv[3] * inv));
 float4 r4 = float4(float(y4[0]), float(y4[1]), float(y4[2]), float(y4[3]));
 const int head = D - RD;
-if (d4 >= head) {
-  const int p0 = (d4 - head) >> 1;
+if (d4 + 2 >= head) {
   const float pos = float(l + off);
-  const float t0 = pos * (1.0f / periods[p0]);
-  const float t1 = pos * (1.0f / periods[p0 + 1]);
-  const float c0 = metal::fast::cos(t0), s0 = metal::fast::sin(t0);
+  if (d4 >= head) {
+    const int p0 = (d4 - head) >> 1;
+    const float t0 = pos * (1.0f / periods[p0]);
+    const float c0 = metal::fast::cos(t0), s0 = metal::fast::sin(t0);
+    const float x0 = r4[0], x1 = r4[1];
+    r4[0] = float(T(x0 * c0 - x1 * s0));
+    r4[1] = float(T(x0 * s0 + x1 * c0));
+  }
+  const int p1 = (d4 + 2 - head) >> 1;
+  const float t1 = pos * (1.0f / periods[p1]);
   const float c1 = metal::fast::cos(t1), s1 = metal::fast::sin(t1);
-  const float x0 = r4[0], x1 = r4[1], x2 = r4[2], x3 = r4[3];
-  r4[0] = float(T(x0 * c0 - x1 * s0));
-  r4[1] = float(T(x0 * s0 + x1 * c0));
+  const float x2 = r4[2], x3 = r4[3];
   r4[2] = float(T(x2 * c1 - x3 * s1));
   r4[3] = float(T(x2 * s1 + x3 * c1));
 }
