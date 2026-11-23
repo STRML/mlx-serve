@@ -75,7 +75,7 @@ pub fn servesLayer(m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer) bool {
 
 /// The positions p0 .. p0 + rows of one state's rows, from the host (no launch).
 pub fn rowsAt(sc: *dsv41.Scope, p0: usize, rows: usize) !A {
-    var v: [decode.batch_rows]i32 = undefined;
+    var v: [decode.max_rows]i32 = undefined;
     for (v[0..rows], 0..) |*o, r| o.* = @intCast(p0 + r);
     return sc.ints(v[0..rows], &.{ci(rows)});
 }

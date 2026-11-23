@@ -23,11 +23,8 @@ const dsv41 = @import("../deepseek_v41.zig");
 
 const A = mlx.mlx_array;
 
-/// The most rows a single launch of a tiled decode kernel takes (`exact`, hardware contracts, M1/M2 caps).
+/// The most rows a decode kernel serves in one launch: a plain step, batched decode, or a DSpark verify block.
 pub const max_rows = 6;
-
-/// The most rows a batched decode or DSpark verify block runs on the fused decode path (tiled at `max_rows` where needed).
-pub const batch_rows = 16;
 
 /// What this machine streams from memory in practice (a plain reduction on the M5 Ultra), bytes a microsecond.
 pub const stream_bytes_per_us: f64 = 1.065e6;
@@ -93,17 +90,11 @@ test "dsv41 dec layers: the fused kernels decode no further from an f32 model th
     for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 }, .{ 0, 1 } }) |range| try layersAgree(gpa, range[0], range[1], false);
 }
 
-test "dsv41 dec layers: L = 8 and 15 tiled verify on the fused kernels decode no further from an f32 model than today's chain" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    const gpa = std.testing.allocator;
-    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |range| try layersAgreeSteps(gpa, range[0], range[1], false, &.{ 1, 1, 8, 15, 1 });
-}
-
-test "dsv41 dec batched: B = 2, 4, 8, 16 on TP1 + NAX fused kernels decode no further from an f32 model than today's chain" {
+test "dsv41 dec batched: B = 2, 4, 6 on TP1 + NAX fused kernels decode no further from an f32 model than today's chain" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const seeds = [_]u64{ 9, 1, 2, 3, 4, 5, 6 };
-    for ([_]usize{ 2, 4, 8, 16 }) |bsz| {
+    for ([_]usize{ 2, 4, max_rows }) |bsz| {
         var ratio: [seeds.len]f64 = undefined;
         for (seeds, 0..) |seed, si| {
             var fxs: [3]*fixture.Fixture = undefined;
@@ -162,14 +153,11 @@ test "dsv41 dec layers: the fused kernels over mxfp4 experts decode no further f
 }
 
 fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
-    try layersAgreeSteps(gpa, lo, hi, fp4, &.{ 1, 1, 1, max_rows, 1 });
-}
-
-fn layersAgreeSteps(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool, steps: []const usize) !void {
     // One seed lands up to 1.6x either side of the chain (five random layers amplify any rounding; under TF32 the f32
     // model itself moves 8% at the verify step), so the bar is each step's median over seeds.
     const seeds = [_]u64{ 9, 1, 2, 3, 4, 5, 6 };
-    var ratio: [16][seeds.len]f64 = undefined;
+    const steps = [_]usize{ 1, 1, 1, max_rows, 1 };
+    var ratio: [steps.len][seeds.len]f64 = undefined;
     for (seeds, 0..) |seed, si| {
         // Same seed, so the same weights, prefill and step inputs: the fused kernels, today's chain, and the f32 model.
         var fxs: [3]*fixture.Fixture = undefined;
@@ -199,7 +187,7 @@ fn layersAgreeSteps(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool, ste
             p0 += rows;
         }
     }
-    for (ratio[0..steps.len], steps) |*r, rows| {
+    for (&ratio, steps) |*r, rows| {
         std.mem.sort(f64, r, {}, std.sort.asc(f64));
         std.debug.print("[dec] layers {d}..{d}, {d} rows: fused/chain distance to the f32 model, median {d:.3} (min {d:.2}, max {d:.2})\n", .{ lo, hi, rows, r[seeds.len / 2], r[0], r[seeds.len - 1] });
         if (r[seeds.len / 2] > 1.15) return error.FurtherFromTruth;
@@ -217,7 +205,7 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
         const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 40, .experts = 64, .ctx = 4096, .fused = fused });
         defer fx.deinit();
         var p0: usize = 4096;
-        for ([_]usize{ 1, max_rows, 8, 15 }) |rows| {
+        for ([_]usize{ 1, max_rows }) |rows| {
             const x = try fx.stream(rows);
             defer _ = mlx.mlx_array_free(x);
             const pre = try fx.cpre(rows);
@@ -233,11 +221,11 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
             std.mem.sort(f64, &times, {}, std.sort.asc(f64));
             std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer (median step {d:.0} us)\n", .{ rows, if (fused) "fused" else "chain", times[times.len / 2] / 20, times[times.len / 2] });
         }
-        for ([_]usize{ 2, 4, 8, 16 }) |bsz| {
-            var sts: [batch_rows]dsv41.State = undefined;
-            var ptrs: [batch_rows]*dsv41.State = undefined;
-            var xs: [batch_rows]A = undefined;
-            var pres: [batch_rows]A = undefined;
+        for ([_]usize{ 2, 4, max_rows }) |bsz| {
+            var sts: [max_rows]dsv41.State = undefined;
+            var ptrs: [max_rows]*dsv41.State = undefined;
+            var xs: [max_rows]A = undefined;
+            var pres: [max_rows]A = undefined;
             var made_s: usize = 0;
             defer {
                 for (0..made_s) |k| {

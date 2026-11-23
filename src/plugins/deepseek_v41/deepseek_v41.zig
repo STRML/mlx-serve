@@ -674,8 +674,8 @@ pub const Dec = struct {
     wq_b: ?mlx.mlx_fast_metal_kernel = null,
     attn: ?mlx.mlx_fast_metal_kernel = null,
     wo_a: ?mlx.mlx_fast_metal_kernel = null,
-    /// `wo_a`'s arrival counters, zeroed once; each row tile or batched state takes its own.
-    wo_a_counters: [dkern.batch_rows]A = @splat(none),
+    /// `wo_a`'s arrival counters, zeroed once; each batched state takes its own.
+    wo_a_counters: [dkern.max_rows]A = @splat(none),
     ffn_in: ?dkern.ffn_in.Kernels = null,
     moe_up: ?dkern.moe_up.Kernel = null,
     moe_fp4: ?dkern.moe_fp4.Kernels = null,
@@ -3953,23 +3953,6 @@ pub const MOE_DN_INS = [_][*:0]const u8{ "x", "w", "scales", "biases", "sw", "ss
 /// (rows, formats, an f32 stream).
 pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A, x1: A, sp: *const Split) !?A {
     if (ly.experts.gate.qp.mode == .gguf) return ffnDecodeGguf(sc, m, ly, h, idx, wts, x1, sp);
-    const R = dim(h, 0);
-    if (R > dkern.max_rows and R <= dkern.batch_rows) {
-        const tiles = (R + dkern.max_rows - 1) / dkern.max_rows;
-        var ys: [4]A = undefined;
-        var lo: usize = 0;
-        for (0..tiles) |ti| {
-            const hi = @min(R, lo + dkern.max_rows);
-            const sub_sp: Split = .{
-                .pre = if (sp.pre.ctx != null) try sc.slice(sp.pre, 0, lo, hi) else none,
-                .post = try sc.slice(sp.post, 0, lo, hi),
-                .comb = try sc.slice(sp.comb, 0, lo, hi),
-            };
-            ys[ti] = try ffnDecode(sc, m, ly, try sc.slice(h, 0, lo, hi), try sc.slice(idx, 0, lo, hi), try sc.slice(wts, 0, lo, hi), try sc.slice(x1, 0, lo, hi), &sub_sp) orelse return null;
-            lo = hi;
-        }
-        return try sc.concat(ys[0..tiles], 0);
-    }
     const gu = ly.experts.gu orelse return null;
     const sgu = ly.shared_gu orelse return null;
     const dn = &ly.experts.down;
@@ -4817,7 +4800,7 @@ pub const Want = enum { last, all, replay, encode };
 /// attention and the MoE. Returns the new stream; `pre` becomes the FFN's
 /// mix, which the next layer's attention collapses with.
 pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !A {
-    if (sh.floor == null and sh.img.ctx == null and m.streamed == null and li < m.regions.len and dim(x, 0) <= dkern.batch_rows and compiledAt(m, dim(x, 0)))
+    if (sh.floor == null and sh.img.ctx == null and m.streamed == null and li < m.regions.len and dim(x, 0) <= dkern.max_rows and compiledAt(m, dim(x, 0)))
         if (try blockFused(sc, m, st, li, x, pre, p0, sh)) |y| return y;
     if (exactPart(m, st.verify != null, dim(x, 0), "tail")) exactMiss(m, li);
     if (sh.floor == null and sh.img.ctx == null and li < m.regions.len and compiledAt(m, dim(x, 0)) and fetchServes(m, dim(x, 0))) {
@@ -4872,143 +4855,16 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     return out;
 }
 
-fn inProjTiled(sc: *Scope, kp: *const dkern.in_proj.Kernels, m: *const Dsv41Model, ly: *const Layer, x: A, pre: A) !?dkern.in_proj.Out {
-    const L = dim(x, 0);
-    if (L <= dkern.max_rows) return dkern.in_proj.run(sc, kp, m, ly, x, pre);
-    if (L > dkern.batch_rows) return null;
-    const TMAX = (dkern.batch_rows + dkern.max_rows - 1) / dkern.max_rows;
-    var hs: [TMAX]A = undefined;
-    var qas: [TMAX]A = undefined;
-    var kvs: [TMAX]A = undefined;
-    var iws: [TMAX]A = undefined;
-    var comps: [TMAX]A = undefined;
-    var zs: [TMAX]A = undefined;
-    var nt: usize = 0;
-    var lo: usize = 0;
-    while (lo < L) : (nt += 1) {
-        const hi = @min(L, lo + dkern.max_rows);
-        const o = try dkern.in_proj.run(sc, kp, m, ly, try sc.slice(x, 0, lo, hi), try sc.slice(pre, 0, lo, hi)) orelse return null;
-        hs[nt] = o.h;
-        qas[nt] = o.qa;
-        kvs[nt] = o.kv;
-        iws[nt] = o.iw orelse none;
-        comps[nt] = o.comp orelse none;
-        zs[nt] = o.z;
-        lo = hi;
-    }
-    return .{
-        .h = try sc.concat(hs[0..nt], 0),
-        .qa = try sc.concat(qas[0..nt], 0),
-        .kv = try sc.concat(kvs[0..nt], 0),
-        .iw = if (iws[0].ctx != null) try sc.concat(iws[0..nt], 0) else null,
-        .comp = if (comps[0].ctx != null) try sc.concat(comps[0..nt], 0) else null,
-        .z = try sc.concat(zs[0..nt], 0),
-    };
-}
-
-fn wqBTiled(sc: *Scope, m: *const Dsv41Model, kq: mlx.mlx_fast_metal_kernel, ly: *const Layer, li: usize, qa: A, kv: A, z: A, pos: A) !?dkern.wq_b.Out {
-    const L = dim(qa, 0);
-    if (L <= dkern.max_rows) return dkern.wq_b.run(sc, m, kq, ly, li, qa, kv, z, pos);
-    if (L > dkern.batch_rows) return null;
-    const TMAX = (dkern.batch_rows + dkern.max_rows - 1) / dkern.max_rows;
-    var qs: [TMAX]A = undefined;
-    var qis: [TMAX]A = undefined;
-    var kvs: [TMAX]A = undefined;
-    var pres: [TMAX]A = undefined;
-    var posts: [TMAX]A = undefined;
-    var combs: [TMAX]A = undefined;
-    var nt: usize = 0;
-    var lo: usize = 0;
-    while (lo < L) : (nt += 1) {
-        const hi = @min(L, lo + dkern.max_rows);
-        const w = try dkern.wq_b.run(sc, m, kq, ly, li, try sc.slice(qa, 0, lo, hi), try sc.slice(kv, 0, lo, hi), try sc.slice(z, 0, lo, hi), try sc.slice(pos, 0, lo, hi)) orelse return null;
-        qs[nt] = w.q;
-        qis[nt] = w.q_idx orelse none;
-        kvs[nt] = w.kv_row;
-        pres[nt] = w.sa.pre;
-        posts[nt] = w.sa.post;
-        combs[nt] = w.sa.comb;
-        lo = hi;
-    }
-    return .{
-        .q = try sc.concat(qs[0..nt], 0),
-        .q_idx = if (qis[0].ctx != null) try sc.concat(qis[0..nt], 0) else null,
-        .kv_row = try sc.concat(kvs[0..nt], 0),
-        .sa = .{ .pre = try sc.concat(pres[0..nt], 0), .post = try sc.concat(posts[0..nt], 0), .comb = try sc.concat(combs[0..nt], 0) },
-    };
-}
-
-fn woATiled(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, kw: mlx.mlx_fast_metal_kernel, cidx: *usize, inv: A, p0: usize, q: A, win: Ring, comp_rows: A, topk: A, acc: A, pm: A, pl: A) !?A {
-    const L = dim(q, 0);
-    if (L <= dkern.max_rows) {
-        const ctr = m.dec.wo_a_counters[cidx.*];
-        cidx.* += 1;
-        return dkern.wo_a.apply(sc, m, ly, kw, ctr, inv, try attnMeta(sc, m, q, win, comp_rows, topk, p0), acc, pm, pl);
-    }
-    if (L > dkern.batch_rows) return null;
-    const TMAX = (dkern.batch_rows + dkern.max_rows - 1) / dkern.max_rows;
-    var oas: [TMAX]A = undefined;
-    var nt: usize = 0;
-    var lo: usize = 0;
-    while (lo < L) : (nt += 1) {
-        const hi = @min(L, lo + dkern.max_rows);
-        const q_s = try sc.slice(q, 0, lo, hi);
-        const tk_s = if (topk.ctx != null) try sc.slice(topk, 0, lo, hi) else none;
-        const ctr = m.dec.wo_a_counters[cidx.*];
-        cidx.* += 1;
-        oas[nt] = try dkern.wo_a.apply(sc, m, ly, kw, ctr, inv, try attnMeta(sc, m, q_s, win, comp_rows, tk_s, p0 + lo), try sc.slice(acc, 0, lo, hi), try sc.slice(pm, 0, lo, hi), try sc.slice(pl, 0, lo, hi)) orelse return null;
-        lo = hi;
-    }
-    return try sc.concat(oas[0..nt], 0);
-}
-
-fn ffnInTiled(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, oa: A, x: A, sa: *const Split) !?dkern.ffn_in.Out {
-    const L = dim(x, 0);
-    if (L <= dkern.max_rows) return ffnInFused(sc, m, ly, oa, x, sa);
-    if (L > dkern.batch_rows) return null;
-    const TMAX = (dkern.batch_rows + dkern.max_rows - 1) / dkern.max_rows;
-    var x1s: [TMAX]A = undefined;
-    var h2s: [TMAX]A = undefined;
-    var pres: [TMAX]A = undefined;
-    var posts: [TMAX]A = undefined;
-    var combs: [TMAX]A = undefined;
-    var idxs: [TMAX]A = undefined;
-    var wtss: [TMAX]A = undefined;
-    var nt: usize = 0;
-    var lo: usize = 0;
-    while (lo < L) : (nt += 1) {
-        const hi = @min(L, lo + dkern.max_rows);
-        const sub_sa: Split = .{ .pre = try sc.slice(sa.pre, 0, lo, hi), .post = try sc.slice(sa.post, 0, lo, hi), .comb = try sc.slice(sa.comb, 0, lo, hi) };
-        const f = try ffnInFused(sc, m, ly, try sc.slice(oa, 0, lo, hi), try sc.slice(x, 0, lo, hi), &sub_sa) orelse return null;
-        x1s[nt] = f.x1;
-        h2s[nt] = f.h2;
-        pres[nt] = f.sf.pre;
-        posts[nt] = f.sf.post;
-        combs[nt] = f.sf.comb;
-        idxs[nt] = f.idx;
-        wtss[nt] = f.wts;
-        lo = hi;
-    }
-    return .{
-        .x1 = try sc.concat(x1s[0..nt], 0),
-        .h2 = try sc.concat(h2s[0..nt], 0),
-        .sf = .{ .pre = try sc.concat(pres[0..nt], 0), .post = try sc.concat(posts[0..nt], 0), .comb = try sc.concat(combs[0..nt], 0) },
-        .idx = try sc.concat(idxs[0..nt], 0),
-        .wts = try sc.concat(wtss[0..nt], 0),
-    };
-}
-
-/// `block` for at most `dkern.batch_rows` rows on the fused decode kernels (`decode/`), tiled in `dkern.max_rows`
-/// chunks where single launches cap at `max_rows`, today's stretches where one is missing; null (before any state
-/// moves) where a kernel declines the layer.
+/// `block` for at most `dkern.max_rows` rows on the fused decode kernels (`decode/`), today's stretches where one is
+/// missing; null (before any state moves) where a kernel declines the layer.
 fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !?A {
     const kp = &(m.dec.in_proj orelse return null);
     const kq = m.dec.wq_b orelse return null;
     const ly = &m.layers[li];
     const ls = &st.layers[li];
     const L = dim(x, 0);
-    const a = try inProjTiled(sc, kp, m, ly, x, pre.*) orelse return null;
-    const w = try wqBTiled(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, p0, L)) orelse return null;
+    const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
+    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, p0, L)) orelse return null;
     try ls.win.write(w.kv_row, p0, sc.s);
     var comp_rows = none;
     var topk = none;
@@ -5031,12 +4887,11 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.cfg.head_dim)));
     const inv = ropeFor(m, li).inv;
     var oa: ?A = null;
-    var cidx: usize = 0;
     if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, q, ls.win, comp_rows, topk, p0, scale)) |p| {
-        oa = try woATiled(sc, m, ly, kw, &cidx, inv, p0, q, ls.win, comp_rows, topk, p.acc, p.m, p.l);
+        oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counters[0], inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first and an ablation ablates before its expand.
-    if (m.tp == null and m.ablation == null) if (oa) |v| if (try ffnInTiled(sc, m, ly, v, x, &sa)) |f| {
+    if (m.tp == null and m.ablation == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
         pre.* = f.sf.pre;
         return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
     };
@@ -5210,17 +5065,6 @@ fn ffnStretch(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, ao: A, sa: *con
 fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A) !?A {
     const kf = m.dec.moe_fp4 orelse return null;
     const R = dim(h, 0);
-    if (R > dkern.max_rows and R <= dkern.batch_rows) {
-        const tiles = (R + dkern.max_rows - 1) / dkern.max_rows;
-        var ys: [4]A = undefined;
-        var lo: usize = 0;
-        for (0..tiles) |ti| {
-            const hi = @min(R, lo + dkern.max_rows);
-            ys[ti] = try moeFused(sc, m, ly, try sc.slice(h, 0, lo, hi), try sc.slice(idx, 0, lo, hi), try sc.slice(wts, 0, lo, hi)) orelse return null;
-            lo = hi;
-        }
-        return try sc.concat(ys[0..tiles], 0);
-    }
     const act = try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts) orelse return null;
     const one = &m.tp_units[R - 1];
     const y = try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, one.pre, one) orelse return null;
@@ -7410,29 +7254,28 @@ pub fn batchedStep(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *Stat
 }
 
 /// `batchedLayer` on the fused decode kernels, false (before any state moves) where they decline: the projections over
-/// every state's rows (up to `dkern.batch_rows` = 16, tiled at `dkern.max_rows` where needed), rows roped at their own
-/// state's positions; each state's window, compressor, indexer and attention (NAX `dec_attn` + `dec_wo_a` on NAX GPUs,
-/// else compiled attention + `.attn_out`) its own; TP1 uses `ffn_in` + `ffnDecode` when `dec_wo_a` produces `oa`.
+/// every state's rows (at most `dkern.max_rows` = 6), roped at their own state's positions; each state's window,
+/// compressor, indexer and attention (NAX `dec_attn` + `dec_wo_a` on NAX GPUs, else compiled attention + `.attn_out`)
+/// its own; TP1 uses `ffn_in` + `ffnDecode` when `dec_wo_a` produces `oa`.
 fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const Spans, li: usize, parts: []const A) !bool {
     const kp = &(m.dec.in_proj orelse return false);
     const kq = m.dec.wq_b orelse return false;
-    if (sp.L > dkern.batch_rows or li >= m.regions.len or m.streamed != null) return false;
+    if (sp.L > dkern.max_rows or li >= m.regions.len or m.streamed != null) return false;
     const ly = &m.layers[li];
     const x = try sc.concat(parts, 0);
-    const a = try inProjTiled(sc, kp, m, ly, x, try sc.concat(sp.pres, 0)) orelse return false;
-    var pos: [dkern.batch_rows]i32 = undefined;
+    const a = try dkern.in_proj.run(sc, kp, m, ly, x, try sc.concat(sp.pres, 0)) orelse return false;
+    var pos: [dkern.max_rows]i32 = undefined;
     for (states, 0..) |st, k| {
         const lo, const hi = sp.bounds(k);
         for (pos[lo..hi], 0..) |*o, r| o.* = @intCast(st.n + r);
     }
-    const w = try wqBTiled(sc, m, kq, ly, li, a.qa, a.kv, a.z, try sc.ints(pos[0..sp.L], &.{ci(sp.L)})) orelse return false;
+    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try sc.ints(pos[0..sp.L], &.{ci(sp.L)})) orelse return false;
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.cfg.head_dim)));
     const inv = ropeFor(m, li).inv;
-    var heads: [dkern.batch_rows]A = undefined;
-    var oas: [dkern.batch_rows]A = undefined;
+    var heads: [dkern.max_rows]A = undefined;
+    var oas: [dkern.max_rows]A = undefined;
     var oa_count: usize = 0;
     var oa_all = true;
-    var cidx: usize = 0;
     for (states, 0..) |st, k| {
         const lo, const hi = sp.bounds(k);
         const p0 = st.n;
@@ -7453,7 +7296,7 @@ fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const S
         var got_oa: ?A = null;
         if (oa_all) if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| {
             if (try dkern.attn.partials(sc, ka, m, q_s, ls.win, comp_rows, sh.topk, p0, scale)) |p| {
-                got_oa = try woATiled(sc, m, ly, kw, &cidx, inv, p0, q_s, ls.win, comp_rows, sh.topk, p.acc, p.m, p.l);
+                got_oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counters[k], inv, try attnMeta(sc, m, q_s, ls.win, comp_rows, sh.topk, p0), p.acc, p.m, p.l);
             }
         };
         if (got_oa) |v| {
@@ -7479,7 +7322,7 @@ fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const S
     if (oa_all) {
         const oa = try sc.concat(oas[0..states.len], 0);
         var did_ffn = false;
-        if (m.tp == null and m.ablation == null) if (try ffnInTiled(sc, m, ly, oa, x, &w.sa)) |f| {
+        if (m.tp == null and m.ablation == null) if (try ffnInFused(sc, m, ly, oa, x, &w.sa)) |f| {
             pre = f.sf.pre;
             y = try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
             did_ffn = true;

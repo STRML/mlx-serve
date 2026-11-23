@@ -66,7 +66,7 @@ fn aNsg(nax: bool) usize {
     return if (nax) a_nax_nsg else a_nsg;
 }
 fn useNaxA(p: Dims) bool {
-    return p.rows >= a_nax_rows and p.rows <= 8 and device.naxAvailable() and servesA(p, true);
+    return p.rows >= a_nax_rows and p.rows <= decode.max_rows and device.naxAvailable() and servesA(p, true);
 }
 /// Launch 2: columns a mix slice, experts a router threadgroup (two simdgroups an expert), threads a threadgroup.
 const slice_cols: usize = 128;
@@ -87,7 +87,7 @@ pub const Dims = struct {
 pub const TArg = struct { name: [*:0]const u8, v: usize };
 
 fn servesA(p: Dims, nax: bool) bool {
-    if (nax) return p.rows >= a_nax_rows and p.rows <= 8 and p.d >= slice_cols and p.d % a_nax_nr == 0 and p.k > 0 and p.k % 512 == 0;
+    if (nax) return p.rows >= a_nax_rows and p.rows <= decode.max_rows and p.d >= slice_cols and p.d % a_nax_nr == 0 and p.k > 0 and p.k % 512 == 0;
     return p.rows >= 1 and p.rows <= decode.max_rows and p.d % (a_nsg * aCols(p.rows, false)) == 0 and p.d >= slice_cols and p.k % (512 * a_unroll) == 0;
 }
 
@@ -117,9 +117,9 @@ fn routerGroups(p: Dims) usize {
     return (p.e + experts_tg - 1) / experts_tg;
 }
 
-/// Rows a router threadgroup takes: all decode rows at once when batched up to 6.
+/// Rows a router threadgroup takes: all decode rows at once when batched up to 3.
 fn rowsTg(p: Dims) usize {
-    return @min(p.rows, 6);
+    return @min(p.rows, 3);
 }
 
 fn routerTgs(p: Dims) usize {
@@ -829,7 +829,7 @@ const launch_b = metal.Launch{
     .inputs = &B_INS,
     .outputs = &B_OUTS,
     .source = B_SOURCE,
-    .tg_bytes = 4 * 1632 + 4,
+    .tg_bytes = 4 * 816 + 4,
     .m1 = 704,
     .m2 = 704,
 };
