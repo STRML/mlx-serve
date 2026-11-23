@@ -914,17 +914,12 @@ const IdxNax = struct {
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.n == 0 or p.ih == 0 or p.ih > 128 or s.k % 16 != 0 or s.k > 128) return null;
-        const bm = v41.idxNaxBm(s.rows);
-        const bn = v41.idx_nax_bn;
-        const tgn = v41.idxNaxTgn(bm, bn);
-        const dk = v41.idxNaxDk(s.k);
-        var g = metal.Geometry{ .grid = .{ ci((s.rows + bm - 1) / bm * tgn), ci((s.n + bn - 1) / bn), 1 }, .tg = .{ ci(tgn), 1, 1 } };
+        const geom = v41.idxNaxGeom(s.rows, s.n, s.k);
+        var g = metal.Geometry{ .grid = .{ ci(geom.gx), ci(geom.gy), 1 }, .tg = .{ ci(geom.tgn), 1, 1 } };
         g.out(&.{ ci(s.rows), ci(s.n) }, .float32);
-        g.int("IH", p.ih);
-        g.int("IHD", s.k);
-        g.int("BM", bm);
-        g.int("BN", bn);
-        g.int("DK", dk);
+        inline for (.{ .{ "IH", p.ih }, .{ "IHD", s.k }, .{ "BM", geom.bm }, .{ "BN", geom.bn }, .{ "DK", geom.dk } }) |kv| {
+            g.int(kv[0], kv[1]);
+        }
         g.dtype("T", act);
         return g;
     }
@@ -4154,7 +4149,7 @@ const stage_l = launch("dsv41_hc_stage", hc_stage_ins, &.{ "h_out", "z" }, v41.H
 const stage_x_l = launch("dsv41_hc_stage_x", hc_stage_x_ins, &.{ "h_out", "z", "x1" }, v41.HC_STAGE_X_SOURCE, "", 2 * 4 * 32, 1024, true);
 const idx_l = launch("dsv41_index_scores", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_SCORE_SOURCE, "", 4 * IH * IHD, 416, false);
 const tile_l = launch("dsv41_index_tile", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_TILE_SOURCE, "", 2 * IdxTile.KT * IHD + 4 * IH + 4 * 4 * 64, 1024, false);
-const idx_nax_l = metal.Launch{ .name = "dsv41_index_nax", .inputs = &.{ "q", "keys", "w", "meta", "wsc" }, .outputs = &.{"scores"}, .source = v41.IDX_NAX_SOURCE, .header = v41.MPP_OPS_HEADER, .tg_bytes = v41.idx_nax_bn * IHD * 2, .offline = false, .min_gen = 17 };
+const idx_nax_l = metal.Launch{ .name = "dsv41_index_nax", .inputs = &.{ "q", "keys", "w", "meta", "wsc" }, .outputs = &.{"scores"}, .source = v41.IDX_NAX_SOURCE, .header = @import("decode/attn.zig").HEADER, .tg_bytes = v41.idxNaxGeom(1, 1, IHD).bn * IHD * 2, .offline = false, .min_gen = 17 };
 pub const rope_l = launch("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, v41.ROPE_TAIL_SOURCE, v41.FP8_HEADER, 0, 1024, false);
 const expand_into_l = launch("dsv41_hc_expand_into", &.{ "x", "res", "post", "comb", "dst", "after" }, &.{"carrier"}, sx1.expand_into_source, "", 0, 704, false);
 const expand_norm_l = launch("dsv41_hc_expand_norm", &.{ "y", "res", "post", "comb", "cpre", "w", "eps" }, &.{ "h_out", "x1" }, hcf.expand_norm_source, hcf.expand_norm_fresh_header, 4 * 32, 1024, true);
@@ -4312,7 +4307,7 @@ pub fn register(set: *kc.Set) !void {
         .accum = .f32,
         .depth = depthIdx,
         .out = .f32,
-        .tiles = .{ .{ .size = 32, .step = 1, .min = 7 }, .{ .size = v41.idx_nax_bn }, .{} },
+        .tiles = .{ .{ .size = 32, .step = 1, .min = 7 }, .{ .size = v41.idxNaxGeom(1, 1, IHD).bn }, .{} },
         .served = &.{ .{ .rows = 17, .n = 300, .k = IHD }, .{ .rows = 33, .n = 200, .k = IHD }, .{ .rows = 18, .n = 128, .k = 64 } },
         .nax = true,
     });
@@ -5094,24 +5089,3 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
     }
 }
 
-test "kernel contract dsv41 idx_nax: passes gates 1-4 and planted controls fail" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    var set = kc.Set.init(a);
-    defer set.deinit();
-    try @import("../../sdk/testing/kernel_contract/controls.zig").register(&set);
-    try kit.add(&set, IdxNax, &idx_nax_l, .{}, .{
-        .name = "dsv41 idx_nax (wide indexer, NAX matmul2d)",
-        .accum = .f32,
-        .depth = depthIdx,
-        .out = .f32,
-        .tiles = .{ .{ .size = 32, .step = 1, .min = 7 }, .{ .size = v41.idx_nax_bn }, .{} },
-        .served = &.{ .{ .rows = 17, .n = 300, .k = IHD }, .{ .rows = 33, .n = 200, .k = IHD }, .{ .rows = 18, .n = 128, .k = 64 } },
-        .nax = true,
-    });
-    var t: kc.gates.Tally = .{};
-    try kc.gates.runAll(a, set.kernels.items, 0xc0de, &t);
-    try std.testing.expectEqual(@as(usize, 1), t.passed);
-    try std.testing.expect(t.caught >= 7);
-    try std.testing.expectEqual(@as(usize, 0), t.problems());
-}
