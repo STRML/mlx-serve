@@ -701,7 +701,7 @@ const HcSplit = struct {
 };
 
 const HcMix = struct {
-    pub const Params = struct { tg: usize = 1024, cols: usize = 6 };
+    pub const Params = struct { tg: usize = 1024, cols: usize = 8 };
     const R = 4;
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
@@ -711,6 +711,7 @@ const HcMix = struct {
         g.int("TG", p.tg);
         g.int("R", R);
         g.int("M", p.cols);
+        g.dtype("T", act);
         return g;
     }
 
@@ -1189,7 +1190,7 @@ fn normedCollapse(x: []const f64, cpre: []const f64, ws: []const []const f64, ep
 }
 
 const HcMixNorm = struct {
-    pub const Params = struct { tg: usize = 1024, cols: usize = 6, h2: bool = true };
+    pub const Params = struct { tg: usize = 1024, cols: usize = 8, h2: bool = true };
     const R = 4;
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
@@ -4143,7 +4144,7 @@ const dense_l = launch("dsv41_dense_f32x", &.{ "x", "w" }, &.{"out"}, v41.DENSE_
 const route_l = launch("dsv41_route", &.{ "logits", "bias", "scal" }, &.{ "idx", "wts" }, v41.ROUTE_SOURCE, "", 4 * (1024 + 32 + 32 + TOPK), 1024, false);
 const topk_l = launch("dsv41_topk", &.{"x"}, &.{"out"}, v41.TOPK_SOURCE, v41.TOPK_HEADER, 4 * (256 + 2 + TopK.TG / 32), 1024, false);
 const split_l = launch("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, v41.HC_SPLIT_SOURCE, "", 0, 1024, false);
-const mix_l = launch("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, v41.HC_MIX_SOURCE, "", 4 * (4 * 6 + 4) * 32, 1024, true);
+const mix_l = launch("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, v41.HC_MIX_SOURCE, "", 4 * (4 * 8 + 4) * 32, 1024, true);
 const norm_l = launch("dsv41_hc_norm", &.{ "z", "x", "cpre", "w", "eps" }, &.{ "pre", "post", "comb", "h_out" }, v41.HC_NORM_SOURCE, "", 4 * 32, 1024, true);
 const stage_l = launch("dsv41_hc_stage", hc_stage_ins, &.{ "h_out", "z" }, v41.HC_STAGE_SOURCE, "", 2 * 4 * 32, 1024, true);
 const stage_x_l = launch("dsv41_hc_stage_x", hc_stage_x_ins, &.{ "h_out", "z", "x1" }, v41.HC_STAGE_X_SOURCE, "", 2 * 4 * 32, 1024, true);
@@ -4160,7 +4161,7 @@ const markov_final_l = launch("dsv41_markov_final", &.{ "parts", "t1", "hout", "
 const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherAttn.FLASH_INS, .outputs = &.{"o"}, .source = fa.source, .header = @import("decode/attn.zig").HEADER, .tg_bytes = 4 * 2 * 128 + 4 * 2 * 4 * 4 * 16 + 2 * 4 * 8 * 256, .offline = false, .min_gen = 17 };
 const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
 const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
-const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 6 + 4) * 32, 1024, true);
+const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 8 + 4) * 32, 1024, true);
 const rope_only_l = launch("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "", 0, 1024, false);
 const kv_l = launch("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER, 4 * (32 + 1024), 1024, false);
 const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (3 * 32 + 1), 928, false);

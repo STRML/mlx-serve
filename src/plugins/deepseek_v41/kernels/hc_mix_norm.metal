@@ -8,20 +8,42 @@ const int mb = threadgroup_position_in_grid.x, l0 = threadgroup_position_in_grid
 const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
 const int N = fn_shape[1], MIX = fn_shape[0], L = x_shape[0];
 threadgroup float t_d[R][M][TG / 32], t_s[R][TG / 32];
+const int D = N / HC;
 if (mb < MIX / M) {
   const int m0 = mb * M;
   float d[R][M], ss[R];
   for (int r = 0; r < R; ++r) { ss[r] = 0.0f; for (int j = 0; j < M; ++j) d[r][j] = 0.0f; }
-  for (int k = tid; k < N; k += TG) {
-    float fv[M];
-    #pragma clang loop unroll(full)
-    for (int j = 0; j < M; ++j) fv[j] = fn[size_t(m0 + j) * N + k];
-    #pragma clang loop unroll(full)
-    for (int r = 0; r < R; ++r) {
-      const float v = l0 + r < L ? float(x[size_t(l0 + r) * N + k]) : 0.0f;
+  if ((D & 3) == 0) {
+    const int D4 = D >> 2;
+    for (int d4 = tid; d4 < D4; d4 += TG) {
+      for (int i = 0; i < HC; ++i) {
+        const int col = i * D + (d4 << 2);
+        float4 v[R];
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < R; ++r) {
+          v[r] = l0 + r < L ? float4(*(const device vec<T, 4>*)(x + size_t(l0 + r) * N + col)) : float4(0.0f);
+          ss[r] += metal::dot(v[r], v[r]);
+        }
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < M; ++j) {
+          const float4 fv = *(const device float4*)(fn + size_t(m0 + j) * N + col);
+          #pragma clang loop unroll(full)
+          for (int r = 0; r < R; ++r) d[r][j] += metal::dot(v[r], fv);
+        }
+      }
+    }
+  } else {
+    for (int k = tid; k < N; k += TG) {
+      float fv[M];
       #pragma clang loop unroll(full)
-      for (int j = 0; j < M; ++j) d[r][j] += v * fv[j];
-      ss[r] += v * v;
+      for (int j = 0; j < M; ++j) fv[j] = fn[size_t(m0 + j) * N + k];
+      #pragma clang loop unroll(full)
+      for (int r = 0; r < R; ++r) {
+        const float v = l0 + r < L ? float(x[size_t(l0 + r) * N + k]) : 0.0f;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < M; ++j) d[r][j] += v * fv[j];
+        ss[r] += v * v;
+      }
     }
   }
   for (int r = 0; r < R; ++r) {
@@ -37,38 +59,77 @@ if (mb < MIX / M) {
     if (l0 + r < L) z[(l0 + r) * MIX + m0 + j] = a * metal::precise::rsqrt(b / float(N) + eps[0]) * scale[m0 + j] + base[m0 + j];
   }
 } else {
-  const int D = N / HC;
   float ss[R];
-  for (int r = 0; r < R; ++r) {
-    ss[r] = 0.0f;
-    const int l = l0 + r;
-    if (l >= L) continue;
-    float cp[HC];
-    for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
-    for (int d = tid; d < D; d += TG) {
-      float h = 0.0f;
-      for (int j = 0; j < HC; ++j) h += cp[j] * float(x[(size_t(l) * HC + j) * D + d]);
-      const T hb = T(h);
-      h_out[size_t(l) * D + d] = hb;
-      ss[r] += float(hb) * float(hb);
+  if ((D & 3) == 0) {
+    const int D4 = D >> 2;
+    for (int r = 0; r < R; ++r) {
+      ss[r] = 0.0f;
+      const int l = l0 + r;
+      if (l >= L) continue;
+      float cp[HC];
+      for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
+      for (int d4 = tid; d4 < D4; d4 += TG) {
+        const int d_off = d4 << 2;
+        float4 h = 0.0f;
+        for (int j = 0; j < HC; ++j) h += float4(cp[j]) * float4(*(const device vec<T, 4>*)(x + (size_t(l) * HC + j) * D + d_off));
+        const vec<T, 4> hb = vec<T, 4>(h);
+        *(device vec<T, 4>*)(h_out + size_t(l) * D + d_off) = hb;
+        const float4 hf = float4(hb);
+        ss[r] += (hf.x * hf.x + hf.y * hf.y) + (hf.z * hf.z + hf.w * hf.w);
+      }
     }
-  }
-  for (int r = 0; r < R; ++r) {
-    const float v = metal::simd_sum(ss[r]);
-    if (lane == 0) t_s[r][sg] = v;
-  }
-  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-  for (int r = 0; r < R; ++r) {
-    const int l = l0 + r;
-    if (l >= L) continue;
-    float tot = 0.0f;
-    for (int g = 0; g < TG / 32; ++g) tot += t_s[r][g];
-    const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
-    for (int d = tid; d < D; d += TG) {
-      const size_t o = size_t(l) * D + d;
-      const float hv = float(h_out[o]);
-      h_out[o] = w[d] * T(hv * inv);
-      if (H2 != 0) h2[o] = w2[d] * T(hv * inv);
+    for (int r = 0; r < R; ++r) {
+      const float v = metal::simd_sum(ss[r]);
+      if (lane == 0) t_s[r][sg] = v;
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    for (int r = 0; r < R; ++r) {
+      const int l = l0 + r;
+      if (l >= L) continue;
+      float tot = 0.0f;
+      for (int g = 0; g < TG / 32; ++g) tot += t_s[r][g];
+      const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
+      for (int d4 = tid; d4 < D4; d4 += TG) {
+        const int d_off = d4 << 2;
+        const size_t o = size_t(l) * D + d_off;
+        const float4 hv = float4(*(const device vec<T, 4>*)(h_out + o));
+        const vec<T, 4> hs = vec<T, 4>(hv * inv);
+        *(device vec<T, 4>*)(h_out + o) = *(const device vec<T, 4>*)(w + d_off) * hs;
+        if (H2 != 0) *(device vec<T, 4>*)(h2 + o) = *(const device vec<T, 4>*)(w2 + d_off) * hs;
+      }
+    }
+  } else {
+    for (int r = 0; r < R; ++r) {
+      ss[r] = 0.0f;
+      const int l = l0 + r;
+      if (l >= L) continue;
+      float cp[HC];
+      for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
+      for (int d_i = tid; d_i < D; d_i += TG) {
+        float h = 0.0f;
+        for (int j = 0; j < HC; ++j) h += cp[j] * float(x[(size_t(l) * HC + j) * D + d_i]);
+        const T hb = T(h);
+        h_out[size_t(l) * D + d_i] = hb;
+        ss[r] += float(hb) * float(hb);
+      }
+    }
+    for (int r = 0; r < R; ++r) {
+      const float v = metal::simd_sum(ss[r]);
+      if (lane == 0) t_s[r][sg] = v;
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    for (int r = 0; r < R; ++r) {
+      const int l = l0 + r;
+      if (l >= L) continue;
+      float tot = 0.0f;
+      for (int g = 0; g < TG / 32; ++g) tot += t_s[r][g];
+      const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
+      for (int d_i = tid; d_i < D; d_i += TG) {
+        const size_t o = size_t(l) * D + d_i;
+        const float hv = float(h_out[o]);
+        h_out[o] = w[d_i] * T(hv * inv);
+        if (H2 != 0) h2[o] = w2[d_i] * T(hv * inv);
+      }
     }
   }
 }

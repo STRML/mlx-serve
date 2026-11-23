@@ -39,17 +39,17 @@ test "hc_fuse kernel texts name no address space for an input's pointer" {
 test "hc_fuse kernel texts carry the stock kernels' statements" {
     // hc_mix.metal's accumulations and its mix, hc_norm.metal's collapse, rounding, sum and scale, the expand's fmas.
     for ([_][]const u8{
-        "for (int k = tid; k < N; k += TG) {",
-        "for (int j = 0; j < M; ++j) d[r][j] += v * fv[j];",
-        "ss[r] += v * v;",
+        "for (int d4 = tid; d4 < D4; d4 += TG) {",
+        "for (int r = 0; r < R; ++r) d[r][j] += metal::dot(v[r], fv);",
+        "ss[r] += metal::dot(v[r], v[r]);",
         "z[(l0 + r) * MIX + m0 + j] = a * metal::precise::rsqrt(b / float(N) + eps[0]) * scale[m0 + j] + base[m0 + j];",
-        "for (int j = 0; j < HC; ++j) h += cp[j] * float(x[(size_t(l) * HC + j) * D + d]);",
+        "for (int j = 0; j < HC; ++j) h += float4(cp[j]) * float4(*(const device vec<T, 4>*)(x + (size_t(l) * HC + j) * D + d_off));",
         "const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);",
     }) |s| try std.testing.expect(std.mem.indexOf(u8, mix_norm_source, s) != null);
     for ([_][]const u8{
-        "for (int j = 0; j < HC; ++j) acc = fma(cb[j * HC + i], sv[j], acc);",
-        "const T o = T(fma(pr[i], xv, acc));",
-        "h += cp[i] * float(o);",
-        "h_out[o] = w[d] * T(float(h_out[o]) * inv);",
+        "for (int j = 0; j < HC; ++j) acc = fma(float4(cb[j * HC + i]), sv[j], acc);",
+        "const vec<T, 4> o = vec<T, 4>(fma(float4(pr[i]), xv, acc));",
+        "h += float4(cp[i]) * float4(o);",
+        "*(device vec<T, 4>*)(h_out + o) = *(const device vec<T, 4>*)(w + d) * vec<T, 4>(float4(hb) * inv);",
     }) |s| try std.testing.expect(std.mem.indexOf(u8, expand_norm_source, s) != null);
 }

@@ -93,7 +93,7 @@ const none: A = .{ .ctx = null };
 pub const SPAN: usize = 256;
 
 /// Threads in a hyper-connection threadgroup before `probeHcThreads` finds what the GPU grants.
-const HC_TG: usize = 1024;
+const HC_TG: usize = 128;
 
 /// Rows one MoE call handles: a layer's expert banks stream once per call.
 const MOE_ROWS: usize = 8192;
@@ -1578,7 +1578,7 @@ pub const HC_MIX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/hc_mix.meta
 /// `HC_MIX_SOURCE`'s tile: rows a threadgroup, and the mixes a threadgroup
 /// (the largest of these that divides the mix count).
 const hc_mix_rows = 4;
-const hc_mix_cols = [_]usize{ 6, 4, 3, 2, 1 };
+const hc_mix_cols = [_]usize{ 8, 6, 4, 3, 2, 1 };
 
 /// One hyper-connection stage as two kernels. The staggered collapse reads the PREVIOUS mix (`cpre`), so in
 /// `HC_STAGE_SOURCE` threadgroup 0 collapses and rms-norms the stream without waiting for this stage's
@@ -2559,9 +2559,13 @@ pub fn hcPreNorm(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc,
     return n;
 }
 
-/// `hcPreNorm` for blocks of many rows, where throughput rules: the mix and norm kernels.
+/// `hcPreNorm` for blocks of many rows, where throughput rules: the fused mix+norm launch when available, else the
+/// separate mix and norm kernels.
 pub fn hcPreNormWide(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc, norm_w: A) !Normed {
     const eps = try hcEps(sc, m);
+    if (hcf_k != null and mlx.streamIsGpu(sc.s)) {
+        return (try hcMixNormFused(sc, m, x, cpre, hc, norm_w, null, eps)).n;
+    }
     return hcNorm(sc, m, try hcMixWide(sc, m, x, hc, eps), x, cpre, norm_w, eps);
 }
 /// `hcPreNormWide`'s mix kernel: `x`'s mix logits `[L, mix]` f32, which `hcNorm` turns into the split.
@@ -2583,6 +2587,7 @@ pub fn hcMixWide(sc: *Scope, m: *const Dsv41Model, x: A, hc: *const Hc, eps: A) 
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", ci(tg)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", ci(hc_mix_rows)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "M", ci(cols)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", mlx.mlx_array_dtype(x)));
         const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, hc.fn_w, hc.scale, hc.base, eps }, 5);
         defer _ = mlx.mlx_vector_array_free(iv);
         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&zv, m.hc_mix_kernel, iv, cfg, sc.s));
@@ -2637,7 +2642,8 @@ fn probeHcOnce(gpa: std.mem.Allocator, m: *const Dsv41Model) !void {
     const cpre = try sc.zeros(&.{ 1, nh }, .float32);
     const hc: Hc = .{ .fn_w = try sc.zeros(&.{ mix, nh * D }, .float32), .scale = try sc.zeros(&.{mix}, .float32), .base = try sc.zeros(&.{mix}, .float32) };
     const sp: Split = .{ .pre = none, .post = try sc.zeros(&.{ 1, nh }, .float32), .comb = try sc.zeros(&.{ 1, nh, nh }, .float32) };
-    const wide = try hcPreNormWide(&sc, m, x, cpre, &hc, w);
+    const eps = try hcEps(&sc, m);
+    const wide = try hcNorm(&sc, m, try hcMixWide(&sc, m, x, &hc, eps), x, cpre, w, eps);
     const plain = try hcStage(&sc, m, x, null, cpre, &hc, w);
     const expand = try hcStage(&sc, m, x, .{ .y = y, .sp = &sp }, cpre, &hc, w);
     try evalAll(&.{ wide.h, wide.sp.comb, plain.h, plain.sp.comb, expand.h, expand.x1, expand.sp.comb });
@@ -2717,6 +2723,12 @@ pub fn hcStage(sc: *Scope, m: *const Dsv41Model, x: A, ex: ?Expand, cpre: A, hc:
 /// block pays for that rebuild in every mix, so it expands once.
 pub fn hcExpandPreNorm(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, hc: *const Hc, norm_w: A) !Staged {
     const s: Staged = if (dim(x, 0) <= region_rows) try hcStage(sc, m, x, .{ .y = y, .sp = sp }, cpre, hc, norm_w) else blk: {
+        if (hcf_k != null and mlx.streamIsGpu(sc.s)) {
+            const eps = try hcEps(sc, m);
+            const f = try hcExpandNormLaunch(sc, m, x, y, sp, cpre, norm_w, eps, null, none);
+            const z = try hcMixWide(sc, m, f.x1, hc, eps);
+            break :blk .{ .x1 = f.x1, .sp = try hcSplitWide(sc, m, z, eps), .h = f.h };
+        }
         const x1 = try hcExpand(sc, x, y, sp);
         const r = try hcPreNormWide(sc, m, x1, cpre, hc, norm_w);
         break :blk .{ .x1 = x1, .sp = r.sp, .h = r.h };
@@ -3046,7 +3058,10 @@ pub fn attention(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: us
     const window = c.sliding_window;
     var keys_w = none;
     var wp: usize = 0;
-    if (compiled) try ls.win.write(kv, p0, sc.s) else {
+    if (compiled) try ls.win.write(kv, p0, sc.s) else if (pre != null and pre.?.keys_w.ctx != null) {
+        keys_w = pre.?.keys_w;
+        wp = pre.?.wp;
+    } else {
         const prev_lo = @max(sh.floor orelse 0, if (p0 + 1 > window) p0 + 1 - window else 0);
         const prev = if (p0 > prev_lo) try ls.win.read(sc, prev_lo, p0) else none;
         wp = p0 - prev_lo;
@@ -3608,7 +3623,7 @@ pub fn attnSplits(rows: usize) c_int {
 }
 
 /// `qt` (q_tail.zig): the heads' roped last channels [L, H, rope dims]; `q` is then the unroped heads.
-pub const Proj = struct { q: A, kv: A, qr: A, qt: A = none };
+pub const Proj = struct { q: A, kv: A, qr: A, qt: A = none, keys_w: A = none, wp: usize = 0 };
 /// Rows at `pos` -> the roped query heads, the window row (roped, fp8
 /// round-trip) and the query latent the indexer reads.
 pub fn qkvProj(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, x: A, pos: A) !Proj {
@@ -5861,6 +5876,12 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     // records).
     const q_tail = m.attn_gather != null and m.trace == null and m.cfg.dsv4_rope_head_dim == 64 and m.cfg.head_dim % 64 == 0;
     const pj = try qkvProjWith(&sc, m, ly, ropeFor(m, li).fwd, pa.h, pos, q_tail);
+    const window = m.cfg.sliding_window;
+    const win_prev_lo = @max(sp.floor orelse 0, if (sp.p0 + 1 > window) sp.p0 + 1 - window else 0);
+    const win_wp0 = sp.p0 - win_prev_lo;
+    const win_prev = if (sp.p0 > win_prev_lo) try st.layers[li].win.read(&sc, win_prev_lo, sp.p0) else none;
+    const all_kv = if (win_prev.ctx != null) try sc.concat(&.{ win_prev, pj.kv }, 0) else pj.kv;
+    try st.layers[li].win.write(pj.kv, sp.p0, sc.s);
     const heads = try gpa.alloc(A, n_spans);
     defer gpa.free(heads);
     var n_heads: usize = 0;
@@ -5904,7 +5925,11 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         var ssc = Scope.init(gpa, m.s);
         defer ssc.deinit();
         var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .compressed = comp_first };
-        var span_pj: Proj = .{ .q = try ssc.slice(pj.q, 0, lo, hi), .kv = try ssc.slice(pj.kv, 0, lo, hi), .qr = try ssc.slice(pj.qr, 0, lo, hi) };
+        const p0_k = sp.p0 + lo;
+        const prev_lo_k = @max(sp.floor orelse 0, if (p0_k + 1 > window) p0_k + 1 - window else 0);
+        const wp_k = p0_k - prev_lo_k;
+        const span_keys = try ssc.slice(all_kv, 0, win_wp0 + lo - wp_k, win_wp0 + hi);
+        var span_pj: Proj = .{ .q = try ssc.slice(pj.q, 0, lo, hi), .kv = try ssc.slice(pj.kv, 0, lo, hi), .qr = try ssc.slice(pj.qr, 0, lo, hi), .keys_w = span_keys, .wp = wp_k };
         if (pj.qt.ctx != null) span_pj.qt = try ssc.slice(pj.qt, 0, lo, hi);
         // Whether this span's run takes a region (its `run` spans all of `sp.span` rows).
         if (heads_b) {
@@ -9434,6 +9459,8 @@ test "dsv41 bench: one hyper-connection stage as a dependent chain (DSV41_BENCH_
     var m: Dsv41Model = undefined;
     try hcTestModel(&m);
     defer hcTestModelFree(&m);
+    try probeHcThreads(gpa, &m);
+    try hcFuseInit(gpa, &m);
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
     try mlx.check(mlx.mlx_random_key(&key, 3));
@@ -9444,21 +9471,48 @@ test "dsv41 bench: one hyper-connection stage as a dependent chain (DSV41_BENCH_
         o.* = try sc.keep(r);
     }
     const hc: Hc = .{ .fn_w = t[1], .scale = t[2], .base = t[3] };
-    var x = t[0];
-    var pre = try onehotPre(&sc, &m, @intCast(L));
-    try evalAll(&t);
-    var best: f64 = std.math.inf(f64);
-    for (0..3) |_| {
-        const t0 = iou.nowUsMonotonic(io);
-        for (0..200) |_| {
-            const r = try hcExpandPreNorm(&sc, &m, x, t[5], &.{ .pre = t[6], .post = t[6], .comb = t[7] }, pre, &hc, t[4]);
-            pre = r.sp.pre;
-            x = try sc.add(r.x1, try sc.mul(try sc.expand(r.h, 1), try sc.f(1e-3)));
+    const x = t[0];
+    const pre = try onehotPre(&sc, &m, @intCast(L));
+    try evalAll(&.{ pre, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7] });
+    const sp0: Split = .{ .pre = t[6], .post = t[6], .comb = t[7] };
+    const saved_hcf = hcf_k;
+    defer hcf_k = saved_hcf;
+    const steps: usize = 10;
+    const saved_tg = m.hc_tg;
+    defer m.hc_tg = saved_tg;
+    for ([_]usize{ 1024, saved_tg }) |tg| {
+        if (tg == 1024 and saved_tg == 1024) continue;
+        m.hc_tg = tg;
+        for ([_]u8{ 0, 1 }) |part| {
+            for ([_]bool{ false, true, true, false }) |fused| {
+                hcf_k = if (fused) saved_hcf else null;
+                var best: f64 = std.math.inf(f64);
+                for (0..3) |_| {
+                    var rsc = Scope.init(gpa, mlx.gpuStream());
+                    defer rsc.deinit();
+                    var outs: [2 * steps]A = undefined;
+                    var n_out: usize = 0;
+                    const t0 = iou.nowUsMonotonic(io);
+                    for (0..steps) |_| {
+                        if (part == 0) {
+                            const pa = try hcPreNormWide(&rsc, &m, x, pre, &hc, t[4]);
+                            outs[n_out] = pa.h;
+                            outs[n_out + 1] = pa.sp.comb;
+                            n_out += 2;
+                        } else {
+                            const pf = try hcExpandPreNorm(&rsc, &m, x, t[5], &sp0, pre, &hc, t[4]);
+                            outs[n_out] = pf.h;
+                            outs[n_out + 1] = pf.sp.comb;
+                            n_out += 2;
+                        }
+                    }
+                    try evalAll(outs[0..n_out]);
+                    best = @min(best, @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / @as(f64, @floatFromInt(steps)));
+                }
+                std.debug.print("[hc] L={d} tg={d} ({s}, {s}): {d:.1} us/call\n", .{ L, tg, if (part == 0) "preNorm" else "expandPreNorm", if (fused) "fused" else "unfused", best });
+            }
         }
-        try evalAll(&.{x});
-        best = @min(best, @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / 200);
     }
-    std.debug.print("[hc] {d} rows: expand+mix+norm+add chain {d:.1} us/call\n", .{ L, best });
 }
 
 /// A model with only the hc kernels built, at the release's widths.
@@ -9593,9 +9647,9 @@ test "dsv41 hc: a threadgroup the GPU refuses is halved until the kernels launch
     var m: Dsv41Model = undefined;
     try hcTestModel(&m);
     defer hcTestModelFree(&m);
-    m.hc_tg = 4 * HC_TG; // above any Metal cap
+    m.hc_tg = 4096; // above any Metal cap
     try probeHcThreads(testing.allocator, &m);
-    try testing.expect(m.hc_tg >= 32 and m.hc_tg <= HC_TG and m.hc_tg % 32 == 0);
+    try testing.expect(m.hc_tg >= 32 and m.hc_tg <= 1024 and m.hc_tg % 32 == 0);
     const granted = m.hc_tg;
     try probeHcThreads(testing.allocator, &m);
     try testing.expectEqual(granted, m.hc_tg);
@@ -9654,6 +9708,130 @@ test "dsv41 hc: a decode-width stage gives the wide path's mixes, split, norm an
                 try testing.expect(same);
             }
         }
+    }
+}
+
+test "dsv41 hc: hcPreNormWide and hcExpandPreNorm use fused hc_fuse kernels bit-for-bit on GPU" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    try hcTestModel(&m);
+    defer hcTestModelFree(&m);
+    try probeHcThreads(gpa, &m);
+    try hcFuseInit(gpa, &m);
+    if (hcf_k == null) return error.SkipZigTest;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 17));
+    const saved = hcf_k;
+    defer hcf_k = saved;
+    for ([_]c_int{ 17, 18, 64 }) |L| {
+        var t: [8]A = undefined;
+        for ([_][]const c_int{ &.{ L, 4, 5120 }, &.{ L, 5120 }, &.{ L, 4 }, &.{ L, 4, 4 }, &.{ 24, 20480 }, &.{24}, &.{5120}, &.{ L, 4 } }, &t, 0..) |sh, *o, i| {
+            var r = mlx.mlx_array_new();
+            const dt: mlx.mlx_dtype = if (i <= 1 or i == 6) .bfloat16 else .float32;
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, dt, 0, if (i == 4) 0.01 else 1, key, sc.s));
+            o.* = try sc.keep(r);
+        }
+        const hc: Hc = .{ .fn_w = t[4], .scale = t[5], .base = t[5] };
+        const sp: Split = .{ .pre = t[2], .post = t[2], .comb = t[3] };
+        const cpre = t[7];
+        hcf_k = null;
+        const want_pre = try hcPreNormWide(&sc, &m, t[0], cpre, &hc, t[6]);
+        const want_exp = try hcExpandPreNorm(&sc, &m, t[0], t[1], &sp, cpre, &hc, t[6]);
+        hcf_k = saved;
+        const got_pre = try hcPreNormWide(&sc, &m, t[0], cpre, &hc, t[6]);
+        const got_exp = try hcExpandPreNorm(&sc, &m, t[0], t[1], &sp, cpre, &hc, t[6]);
+        for ([_][2]A{
+            .{ want_pre.h, got_pre.h },         .{ want_pre.sp.pre, got_pre.sp.pre },
+            .{ want_pre.sp.post, got_pre.sp.post }, .{ want_pre.sp.comb, got_pre.sp.comb },
+            .{ want_exp.x1, got_exp.x1 },       .{ want_exp.h, got_exp.h },
+            .{ want_exp.sp.pre, got_exp.sp.pre }, .{ want_exp.sp.post, got_exp.sp.post },
+            .{ want_exp.sp.comb, got_exp.sp.comb },
+        }) |pr| {
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            try mlx.check(mlx.mlx_array_equal(&eq, pr[0], pr[1], false, sc.s));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+            try testing.expect(same);
+        }
+    }
+}
+
+test "dsv41 wide window hoist: chunk-level Ring read/write matches per-span Ring read/concat/write bit for bit" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const s = mlx.gpuStream();
+    const window: usize = 128;
+    const cap: usize = window + RING_SLACK;
+    const width: usize = 512;
+    const span: usize = 256;
+    const L: usize = 700;
+    const n_spans: usize = (L + span - 1) / span;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 23));
+    const Case = struct { p0: usize, floor: ?usize };
+    for ([_]Case{
+        .{ .p0 = 0, .floor = null },
+        .{ .p0 = 100, .floor = null },
+        .{ .p0 = 300, .floor = null },
+        .{ .p0 = 300, .floor = 250 },
+    }) |cs| {
+        var sc = Scope.init(gpa, s);
+        defer sc.deinit();
+        var win_ref = try Ring.init(cap, width, .bfloat16, s);
+        defer win_ref.deinit();
+        var win_new = try Ring.init(cap, width, .bfloat16, s);
+        defer win_new.deinit();
+        if (cs.p0 > 0) {
+            var seed_kv = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(seed_kv);
+            try mlx.check(mlx.mlx_random_normal(&seed_kv, &[_]c_int{ ci(cs.p0), ci(width) }, 2, .bfloat16, 0, 1, key, s));
+            try win_ref.write(seed_kv, 0, s);
+            try win_new.write(seed_kv, 0, s);
+        }
+        var pj_kv_r = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&pj_kv_r, &[_]c_int{ ci(L), ci(width) }, 2, .bfloat16, 0, 1, key, s));
+        const pj_kv = try sc.keep(pj_kv_r);
+
+        // Hoisted path:
+        const win_prev_lo = @max(cs.floor orelse 0, if (cs.p0 + 1 > window) cs.p0 + 1 - window else 0);
+        const win_wp0 = cs.p0 - win_prev_lo;
+        const win_prev = if (cs.p0 > win_prev_lo) try win_new.read(&sc, win_prev_lo, cs.p0) else none;
+        const all_kv = if (win_prev.ctx != null) try sc.concat(&.{ win_prev, pj_kv }, 0) else pj_kv;
+        try win_new.write(pj_kv, cs.p0, s);
+
+        for (0..n_spans) |k| {
+            const lo = k * span;
+            const hi = @min(L, lo + span);
+            const p0_k = cs.p0 + lo;
+            const prev_lo_k = @max(cs.floor orelse 0, if (p0_k + 1 > window) p0_k + 1 - window else 0);
+            const wp_ref = p0_k - prev_lo_k;
+            const prev_ref = if (p0_k > prev_lo_k) try win_ref.read(&sc, prev_lo_k, p0_k) else none;
+            const kv_k = try sc.slice(pj_kv, 0, lo, hi);
+            const kw_ref = if (prev_ref.ctx != null) try sc.concat(&.{ prev_ref, kv_k }, 0) else kv_k;
+            try win_ref.write(kv_k, p0_k, s);
+
+            const kw_new = try sc.slice(all_kv, 0, win_wp0 + lo - wp_ref, win_wp0 + hi);
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            try mlx.check(mlx.mlx_array_equal(&eq, kw_ref, kw_new, false, s));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+            try testing.expect(same);
+        }
+        var eq_w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq_w);
+        try mlx.check(mlx.mlx_array_equal(&eq_w, win_ref.buf, win_new.buf, false, s));
+        var same_w = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same_w, eq_w));
+        try testing.expect(same_w);
     }
 }
 

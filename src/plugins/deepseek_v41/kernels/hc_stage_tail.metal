@@ -2,39 +2,81 @@ if (role == 0) {
   float cp[HC];
   for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
   float ss = 0.0f;
-  T hv[ND];
-  #pragma clang loop unroll(full)
-  for (int c = 0; c < ND; ++c) {
-    float h = 0.0f;
-    for (int j = 0; j < HC; ++j) h += cp[j] * v[j][c];
-    hv[c] = T(h);
-    ss += float(hv[c]) * float(hv[c]);
-  }
-  ss = metal::simd_sum(ss);
-  if (lane == 0) t_a[sg] = ss;
-  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-  float tot = 0.0f;
-  for (int g = 0; g < TG / 32; ++g) tot += t_a[g];
-  const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
-  #pragma clang loop unroll(full)
-  for (int c = 0; c < ND; ++c) {
-    const int d = int(tid) + c * TG;
-    if (d < D) h_out[size_t(l) * D + d] = w[d] * T(float(hv[c]) * inv);
+  if (use4) {
+    vec<T, 4> hv[ND4];
+    #pragma clang loop unroll(full)
+    for (int c = 0; c < ND4; ++c) {
+      const int d4 = int(tid) + c * TG;
+      float4 h = 0.0f;
+      for (int j = 0; j < HC; ++j) h += float4(cp[j]) * v4[j][c];
+      hv[c] = vec<T, 4>(h);
+      if (d4 < D4) {
+        const float4 hf = float4(hv[c]);
+        ss += (hf.x * hf.x + hf.y * hf.y) + (hf.z * hf.z + hf.w * hf.w);
+      }
+    }
+    ss = metal::simd_sum(ss);
+    if (lane == 0) t_a[sg] = ss;
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int g = 0; g < TG / 32; ++g) tot += t_a[g];
+    const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
+    #pragma clang loop unroll(full)
+    for (int c = 0; c < ND4; ++c) {
+      const int d4 = int(tid) + c * TG;
+      if (d4 < D4) {
+        const int d = d4 << 2;
+        *(device vec<T, 4>*)(h_out + size_t(l) * D + d) = *(const device vec<T, 4>*)(w + d) * vec<T, 4>(float4(hv[c]) * inv);
+      }
+    }
+  } else {
+    T hv[ND];
+    #pragma clang loop unroll(full)
+    for (int c = 0; c < ND; ++c) {
+      float h = 0.0f;
+      for (int j = 0; j < HC; ++j) h += cp[j] * v4[j][c >> 2][c & 3];
+      hv[c] = T(h);
+      ss += float(hv[c]) * float(hv[c]);
+    }
+    ss = metal::simd_sum(ss);
+    if (lane == 0) t_a[sg] = ss;
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int g = 0; g < TG / 32; ++g) tot += t_a[g];
+    const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
+    #pragma clang loop unroll(full)
+    for (int c = 0; c < ND; ++c) {
+      const int d = int(tid) + c * TG;
+      if (d < D) h_out[size_t(l) * D + d] = w[d] * T(float(hv[c]) * inv);
+    }
   }
   return;
 }
 const int m = int(role) - 1;
 const device float* fr = fn + size_t(m) * N;
 float dd = 0.0f, sq = 0.0f;
-#pragma clang loop unroll(full)
-for (int i = 0; i < HC; ++i)
+if (use4) {
   #pragma clang loop unroll(full)
-  for (int c = 0; c < ND; ++c) {
-    const int d = int(tid) + c * TG;
-    const float u = v[i][c];
-    if (d < D) dd += u * fr[i * D + d];
-    sq += u * u;
+  for (int c = 0; c < ND4; ++c) {
+    const int d4 = int(tid) + c * TG;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < HC; ++i) {
+      const float4 u = v4[i][c];
+      if (d4 < D4) dd += metal::dot(u, *(const device float4*)(fr + i * D + (d4 << 2)));
+      sq += metal::dot(u, u);
+    }
   }
+} else {
+  #pragma clang loop unroll(full)
+  for (int i = 0; i < HC; ++i)
+    #pragma clang loop unroll(full)
+    for (int c = 0; c < ND; ++c) {
+      const int d = int(tid) + c * TG;
+      const float u = v4[i][c >> 2][c & 3];
+      if (d < D) dd += u * fr[i * D + d];
+      sq += u * u;
+    }
+}
 dd = metal::simd_sum(dd); sq = metal::simd_sum(sq);
 if (lane == 0) { t_a[sg] = dd; t_b[sg] = sq; }
 threadgroup_barrier(metal::mem_flags::mem_threadgroup);
