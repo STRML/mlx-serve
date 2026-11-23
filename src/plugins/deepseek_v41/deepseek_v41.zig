@@ -3652,8 +3652,8 @@ pub fn kvRow(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, kv: A, po
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(D) }, 2, mlx.mlx_array_dtype(kv)));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(D), ci(L), 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(D), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(@divExact(D, 4)), ci(L), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(@divExact(D, 4)), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RD", @intCast(m.cfg.dsv4_rope_head_dim)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "QAT", !m.qat_off));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", mlx.mlx_array_dtype(kv)));
@@ -9421,6 +9421,211 @@ test "dsv41 bench: one-token decode attention as a dependent chain (DSV41_BENCH_
         }
         std.debug.print("[attn] window 128 + {d} selected rows: build {d:.1} us/call, eval {d:.1} us/call\n", .{ k, best[0], best[1] });
     }
+}
+
+test "dsv41 flash attention: release span shape matches f32 chain" {
+    if (!mlx.metalKernelsAvailable() or !device.naxAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.sliding_window = 128;
+    m.cfg.dsv4_o_groups = 8;
+    m.cfg.dsv4_rope_head_dim = 64;
+    m.qat_off = false;
+    m.act = .bfloat16;
+    m.rope_kernel = try buildKernel("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, ROPE_TAIL_SOURCE, FP8_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.rope_kernel);
+    m.rope_tail_only_kernel = try buildKernel("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.rope_tail_only_kernel);
+    const fk = try buildKernel("dsv41_attn_flash", &GatherAttn.FLASH_INS, &.{"o"}, fa.source, dkern.attn.HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 19));
+    var per: [32]f32 = undefined;
+    for (&per, 0..) |*v, i| v.* = -std.math.pow(f32, 10000, @as(f32, @floatFromInt(i)) / 32);
+    const periods = try sc.keep(mlx.mlx_array_new_data(&per, &[_]c_int{32}, 1, .float32));
+    const Case = struct { L: usize, wp: usize, nc: usize, K: usize };
+    for ([_]Case{
+        .{ .L = 256, .wp = 127, .nc = 4096, .K = 512 },
+        .{ .L = 256, .wp = 0, .nc = 0, .K = 0 },
+        .{ .L = 200, .wp = 40, .nc = 300, .K = 512 },
+    }) |cs| {
+        const H: usize = 64;
+        const D: usize = 512;
+        const W: usize = 128;
+        const og: usize = 8;
+        const p0: usize = 1000;
+        const scale = 1.0 / @sqrt(@as(f32, D));
+        var t: [4]A = undefined;
+        const shapes = [_][]const c_int{ &.{ 1, ci(H), 1 }, &.{ ci(cs.L), ci(H), ci(D) }, &.{ ci(cs.wp + cs.L), ci(D) }, &.{ ci(@max(cs.nc, 1)), ci(D) } };
+        const widths = [_]f32{ 1, 4, 1, 1 };
+        for (shapes, widths, &t, 0..) |sh, width, *o, k| {
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, if (k == 0) .float32 else .bfloat16, 0, width, key, sc.s));
+            o.* = try sc.keep(r);
+        }
+        const sink = t[0];
+        const q_raw = t[1];
+        const keys_w = t[2];
+        const comp = if (cs.K > 0) t[3] else keys_w;
+        var topk = none;
+        if (cs.K > 0) {
+            const ids = try gpa.alloc(i32, cs.L * cs.K);
+            defer gpa.free(ids);
+            for (ids, 0..) |*v, i| v.* = if (i % 37 == 5) -1 else @intCast((i * 13) % cs.nc);
+            topk = try sc.ints(ids, &.{ ci(cs.L), ci(cs.K) });
+        }
+        const meta = try sc.ints(&.{ @intCast(cs.wp), @intCast(W), @intCast(dim(keys_w, 0)), @intCast(cs.K), @intCast(H), @intCast(D), @intCast(p0), @intCast(cs.L), @intCast(og) }, &.{9});
+        const picks = if (cs.K > 0) topk else meta;
+        const q_roped = try ropeTail(&sc, &m, q_raw, periods, try sc.i(ci(p0)), 1.0);
+        const qt = try ropeTailOnly(&sc, &m, q_raw, periods, try sc.i(ci(p0)));
+        const band = try windowBand(&sc, cs.wp, cs.L, W);
+        const ref_h = try ropeTail(&sc, &m, try attnWideF32(&sc, sink, q_roped, keys_w, band, if (cs.K > 0) comp else none, topk, scale, .float32), periods, try sc.i(ci(p0)), 1.0);
+        const ref_g = try hostF32(try sc.transpose(try sc.reshape(ref_h, &.{ ci(cs.L), ci(og), ci(H / og * D) }), &.{ 1, 0, 2 }));
+        defer gpa.free(ref_g);
+        const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
+        for ([_]bool{ true, false }) |qt_on| {
+            const ins = [_]A{ if (qt_on) q_raw else q_roped, keys_w, comp, picks, meta, if (qt_on) qt else q_roped, sink, scal, periods };
+            var out: [1]A = .{none};
+            try flashLaunch(&sc, fk, &ins, &.{.{ .shape = &.{ ci(og), ci(cs.L), ci(H / og * D) }, .dt = .bfloat16 }}, cs.L, H, qt_on, .bfloat16, &out);
+            const got = try hostF32(out[0]);
+            defer gpa.free(got);
+            for (got) |v| try testing.expect(std.math.isFinite(v));
+            var worst_cos: f64 = 1;
+            var worst_ratio: f64 = 1;
+            for (0..og * cs.L * H / og) |r| {
+                var dot: f64 = 0;
+                var gg: f64 = 0;
+                var ww: f64 = 0;
+                for (got[r * D ..][0..D], ref_g[r * D ..][0..D]) |a, b| {
+                    dot += @as(f64, a) * b;
+                    gg += @as(f64, a) * a;
+                    ww += @as(f64, b) * b;
+                }
+                worst_cos = @min(worst_cos, dot / @sqrt(gg * ww));
+                const ratio = @sqrt(gg / ww);
+                if (@abs(ratio - 1) > @abs(worst_ratio - 1)) worst_ratio = ratio;
+            }
+            std.debug.print("flash_attn L={d} K={d} qt={any}: min cos {d:.7} rms ratio {d:.6}\n", .{ cs.L, cs.K, qt_on, worst_cos, worst_ratio });
+            try testing.expect(worst_cos > 0.9999);
+            try testing.expect(@abs(worst_ratio - 1) < 1e-2);
+        }
+    }
+}
+
+test "dsv41 flash attention bench: prefill (DSV41_BENCH_FLASH)" {
+    if (std.c.getenv("DSV41_BENCH_FLASH") == null) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or !device.naxAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const iou = @import("../../sdk/util/io_util.zig");
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.sliding_window = 128;
+    m.cfg.dsv4_o_groups = 8;
+    m.cfg.dsv4_rope_head_dim = 64;
+    m.qat_off = false;
+    m.act = .bfloat16;
+    m.rope_tail_only_kernel = try buildKernel("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.rope_tail_only_kernel);
+    m.kv_row_kernel = try buildKernel("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, KV_ROW_SOURCE, FP8_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.kv_row_kernel);
+    const fk = try buildKernel("dsv41_attn_flash", &GatherAttn.FLASH_INS, &.{"o"}, fa.source, dkern.attn.HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+
+    const L: usize = 256;
+    const H: usize = 64;
+    const D: usize = 512;
+    const W: usize = 128;
+    const K: usize = 512;
+    const og: usize = 8;
+    const nc: usize = 131072; // 134 MB compressed cache (> SLC)
+    const wp: usize = 127;
+    const scale = 1.0 / @sqrt(@as(f32, D));
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 23));
+    const rnd = struct {
+        fn f(sc_: *Scope, key_: A, shape: []const c_int) !A {
+            var o = mlx.mlx_array_new();
+            return sc_.res(mlx.mlx_random_normal(&o, shape.ptr, shape.len, .bfloat16, 0, 1, key_, sc_.s), &o);
+        }
+    };
+    const n_spans: usize = 32; // 8192 rows total per sweep
+    const q = try rnd.f(&sc, key, &.{ ci(L), ci(H), ci(D) });
+    const qt = try rnd.f(&sc, key, &.{ ci(L), ci(H), 64 });
+    const kw = try rnd.f(&sc, key, &.{ ci(wp + L), ci(D) });
+    const comp = try rnd.f(&sc, key, &.{ ci(nc), ci(D) });
+    const sink = try sc.zeros(&.{ 1, ci(H), 1 }, .float32);
+    const periods = try sc.ones(&.{32}, .float32);
+    const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
+    const meta = try sc.ints(&.{ @intCast(wp), @intCast(W), @intCast(wp + L), @intCast(K), @intCast(H), @intCast(D), 1000, @intCast(L), @intCast(og) }, &.{9});
+    var picks: [n_spans]A = undefined;
+    {
+        const ids = try gpa.alloc(i32, L * K);
+        defer gpa.free(ids);
+        for (0..n_spans) |sp| {
+            for (ids, 0..) |*v, i| v.* = @intCast((i * 17 + sp * 4099) % nc);
+            picks[sp] = try sc.ints(ids, &.{ ci(L), ci(K) });
+        }
+    }
+    try evalAll(&.{ q, qt, kw, comp, sink, periods, scal, meta });
+    try evalAll(&picks);
+
+    var times: [7]f64 = undefined;
+    for (0..2 + times.len) |rep| {
+        var outs: [n_spans]A = undefined;
+        const t0 = iou.nowUsMonotonic(io);
+        for (0..n_spans) |sp| {
+            const f_ins = [_]A{ q, kw, comp, picks[sp], meta, qt, sink, scal, periods };
+            var f_o: [1]A = .{none};
+            try flashLaunch(&sc, fk, &f_ins, &.{.{ .shape = &.{ ci(og), ci(L), ci(H / og * D) }, .dt = .bfloat16 }}, L, H, true, .bfloat16, &f_o);
+            outs[sp] = f_o[0];
+        }
+        try evalAll(&outs);
+        const us = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / @as(f64, n_spans);
+        if (rep >= 2) times[rep - 2] = us;
+    }
+    std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+    std.debug.print("[flash-ubench] attn_flash L=256 H=64 K=512 (32 spans): median {d:.1} us/span ({d:.2} ms/8k)\n", .{ times[times.len / 2], times[times.len / 2] * 32.0 / 1000.0 });
+
+    // Microbench rope_tail_only at L=8192 and kv_row at L=8192
+    const q_wide = try rnd.f(&sc, key, &.{ 8192, ci(H), ci(D) });
+    const kv_wide = try rnd.f(&sc, key, &.{ 8192, ci(D) });
+    const kvn = try sc.ones(&.{ci(D)}, .bfloat16);
+    try evalAll(&.{ q_wide, kv_wide, kvn });
+    const off0 = try sc.i(1000);
+    var ly: Layer = undefined;
+    ly.kv_norm = kvn;
+
+    var rtimes: [7]f64 = undefined;
+    for (0..2 + rtimes.len) |rep| {
+        const t0 = iou.nowUsMonotonic(io);
+        var o = q_wide;
+        for (0..4) |_| o = try ropeTailOnly(&sc, &m, q_wide, periods, off0);
+        try evalAll(&.{o});
+        const us = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / 4.0;
+        if (rep >= 2) rtimes[rep - 2] = us;
+    }
+    std.mem.sort(f64, &rtimes, {}, std.sort.asc(f64));
+    std.debug.print("[flash-ubench] rope_tail_only L=8192 H=64 D=512: median {d:.1} us/call\n", .{rtimes[rtimes.len / 2]});
+
+    var ktimes: [7]f64 = undefined;
+    for (0..2 + ktimes.len) |rep| {
+        const t0 = iou.nowUsMonotonic(io);
+        var o = kv_wide;
+        for (0..8) |_| o = try kvRow(&sc, &m, &ly, periods, o, off0);
+        try evalAll(&.{o});
+        const us = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / 8.0;
+        if (rep >= 2) ktimes[rep - 2] = us;
+    }
+    std.mem.sort(f64, &ktimes, {}, std.sort.asc(f64));
+    std.debug.print("[flash-ubench] kv_row L=8192 D=512: median {d:.1} us/call\n", .{ktimes[ktimes.len / 2]});
 }
 
 test "dsv41 bench: one hyper-connection stage as a dependent chain (DSV41_BENCH_HC = rows)" {

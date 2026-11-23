@@ -27,8 +27,8 @@ pub fn explicitOn(value: ?[]const u8) bool {
     return std.mem.eql(u8, v, "1");
 }
 
-/// Groups of 16 heads a threadgroup (the fa1u microbench's choice: fa4).
-pub const hgn: c_int = 4;
+/// Groups of 16 heads a threadgroup (2 groups = 8 simdgroups per threadgroup).
+pub const hgn: c_int = 2;
 
 /// The kernel's text; its heads-region twin replaces the grouped store's address with the run region's row layout
 /// (`[rows, og, in]`, the span's first row `soff[1]`), as the heads pv twin does.

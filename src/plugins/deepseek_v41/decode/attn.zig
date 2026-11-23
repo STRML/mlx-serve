@@ -40,13 +40,14 @@ fn dimOf(x: A, axis: usize) c_int {
     return mlx.getShape(x)[axis];
 }
 
-/// The splits for a list of `keys`: at most BK keys each, and for a short list about 32, which is all the parallelism
-/// a row's 16-head groups get. Null: the list needs more than MAX_SPLITS.
-fn splitsFor(keys: usize) ?c_int {
+/// The splits for a list of `keys` across `rows`: at most BK keys each; for a single row or short list up to 8 splits
+/// of ~32 keys for core parallelism, and for batched rows (`rows >= 2`) above 256 keys `least` full BK splits so no
+/// simdgroup sits idle. Null: the list needs more than MAX_SPLITS.
+fn splitsFor(keys: usize, rows: usize) ?c_int {
     const least = (keys + BK - 1) / BK;
     if (least > MAX_SPLITS) return null;
-    const s: c_int = @intCast(@max(least, @min(MAX_SPLITS, (keys + 31) / 32)));
-    return s;
+    const want = if (rows <= 1 or keys <= 256) (keys + 31) / 32 else least;
+    return @intCast(@max(least, @min(MAX_SPLITS, want)));
 }
 
 /// Rows q [R, H, 512] bf16 (roped, 1..`decode.max_rows` of them, H a multiple of 16) at positions p0.., the window
@@ -67,7 +68,7 @@ fn run(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Model, 
     const K: c_int = if (comp_rows.ctx != null) dimOf(topk, 1) else 0;
     const nc: c_int = if (K > 0) dimOf(comp_rows, 0) else 0;
     if (K > 0 and nc == 0) return null;
-    const S = splitsFor(m.cfg.sliding_window + @as(usize, @intCast(K))) orelse return null;
+    const S = splitsFor(m.cfg.sliding_window + @as(usize, @intCast(K)), @intCast(R)) orelse return null;
     const meta_v = [_]i32{ @intCast(p0), nc, @intCast(m.cfg.sliding_window), @intCast(win.cap) };
     const meta = try sc.ints(&meta_v, &.{meta_v.len});
     const comp = if (K > 0) try sc.astype(comp_rows, .bfloat16) else win.buf;
@@ -467,7 +468,7 @@ test "dsv41 dec attn: the declared launch is the wrapper's, byte for byte" {
     defer sc.deinit();
     const kern = try build();
     defer _ = mlx.mlx_fast_metal_kernel_free(kern);
-    inline for (.{ .{ 8, 6, 64, 512 }, .{ 8, 1, 16, 100 }, .{ 4, 3, 32, 0 } }) |c| {
+    inline for (.{ .{ 5, 6, 64, 512 }, .{ 8, 1, 16, 100 }, .{ 4, 3, 32, 0 } }) |c| {
         const cs = try a.create(kit.Case(DecAttn));
         defer {
             cs.deinit();

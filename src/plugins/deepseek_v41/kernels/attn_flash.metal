@@ -39,9 +39,9 @@ auto krow = [&](int s) -> const device T* {
   return s >= RING ? kw + size_t(s - RING) * D : comp + size_t(metal::max(s, 0)) * D;
 };
 
-constexpr auto qk_desc = matmul2d_descriptor(16, 32, 16, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+constexpr auto qk_desc = matmul2d_descriptor(16, 32, 32, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
 matmul2d<qk_desc, execution_simdgroup> qk_op;
-constexpr auto pv_desc = matmul2d_descriptor(16, 32, 16, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+constexpr auto pv_desc = matmul2d_descriptor(16, 32, 16, false, false, true, matmul2d_descriptor::mode::multiply_accumulate);
 matmul2d<pv_desc, execution_simdgroup> pv_op;
 
 auto qa = qk_op.template get_left_input_cooperative_tensor<T, T, float>();
@@ -65,19 +65,18 @@ for (short e = 0; e < 16; ++e) {
   o3[e] = 0.0f;
 }
 
-const float scale = scal[0];
+constexpr float LOG2E = 1.44269504088896341f;
+const float scale_log2 = scal[0] * LOG2E;
 // This lane's two head rows: h0 and h0 + 8 (the tensor op's rows fm and fm + 8).
 const int h0 = 16 * hg + fm;
-float m_run[2] = {sink[h0], sink[h0 + 8]};
+float m_run[2] = {sink[h0] * LOG2E, sink[h0 + 8] * LOG2E};
 float l_run[2] = {1.0f, 1.0f};
 const device T* qr0 = q + (size_t(l) * H + h0) * D + fn;
 const device T* qr1 = qr0 + 8 * D;
 const device T* qt0 = qt + (size_t(l) * H + h0) * 64 + fn;
 const device T* qt1 = qt0 + 8 * 64;
 
-const int nb = (NK + BK - 1) / BK;
-for (int b = 0; b < nb; ++b) {
-  const int sb = b & 1;
+auto stage_sel = [&](int b) {
   if (int(tid) < BK) {
     const int c = b * BK + int(tid);
     int s = -1;
@@ -88,9 +87,17 @@ for (int b = 0; b < nb; ++b) {
       const int r = picks[size_t(l) * K + (c - W)];
       if (r >= 0) s = r;
     }
-    sel[sb][tid] = s;
+    sel[b & 1][tid] = s;
   }
+};
+
+const int nb = (NK + BK - 1) / BK;
+if (nb > 0) {
+  stage_sel(0);
   threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+}
+for (int b = 0; b < nb; ++b) {
+  const int sb = b & 1;
 
   // ---- S = Q K^T: head group hg, keys 32 qq .. 32 qq + 31 of the block
   for (short e = 0; e < 16; ++e) sc[e] = 0.0f;
@@ -98,30 +105,58 @@ for (int b = 0; b < nb; ++b) {
     const device T* kr[2][2];
     for (short tn = 0; tn < 2; ++tn)
       for (short i = 0; i < 2; ++i) kr[tn][i] = krow(sel[sb][qq * 32 + tn * 16 + fm + i * 8]) + fn;
-    _Pragma("clang loop unroll_count(4)")
-    for (short kk = 0; kk < D; kk += 16) {
-      metal::vec<T, 4> a0, a1;
-      if (QT && kk >= D - 64) {
-        a0 = *(const device metal::vec<T, 4>*)(qt0 + (kk - (D - 64)));
-        a1 = *(const device metal::vec<T, 4>*)(qt1 + (kk - (D - 64)));
-      } else {
-        a0 = *(const device metal::vec<T, 4>*)(qr0 + kk);
-        a1 = *(const device metal::vec<T, 4>*)(qr1 + kk);
-      }
+    constexpr short K_MAIN = QT ? (D - 64) : D;
+    _Pragma("clang loop unroll_count(2)")
+    for (short kk = 0; kk < K_MAIN; kk += 32) {
+      const metal::vec<T, 4> a0_lo = *(const device metal::vec<T, 4>*)(qr0 + kk);
+      const metal::vec<T, 4> a1_lo = *(const device metal::vec<T, 4>*)(qr1 + kk);
+      const metal::vec<T, 4> a0_hi = *(const device metal::vec<T, 4>*)(qr0 + kk + 16);
+      const metal::vec<T, 4> a1_hi = *(const device metal::vec<T, 4>*)(qr1 + kk + 16);
       for (short j = 0; j < 4; ++j) {
-        qa[j] = a0[j];
-        qa[4 + j] = a1[j];
+        qa[j] = a0_lo[j];
+        qa[4 + j] = a1_lo[j];
+        qa[8 + j] = a0_hi[j];
+        qa[12 + j] = a1_hi[j];
       }
       for (short tn = 0; tn < 2; ++tn)
         for (short i = 0; i < 2; ++i) {
-          const metal::vec<T, 4> kv = *(const device metal::vec<T, 4>*)(kr[tn][i] + kk);
-          for (short j = 0; j < 4; ++j) kb[tn * 8 + i * 4 + j] = kv[j];
+          const metal::vec<T, 4> kv0 = *(const device metal::vec<T, 4>*)(kr[tn][i] + kk);
+          const metal::vec<T, 4> kv1 = *(const device metal::vec<T, 4>*)(kr[tn][i] + kk + 16);
+          for (short j = 0; j < 4; ++j) {
+            kb[tn * 8 + i * 4 + j] = kv0[j];
+            kb[16 + tn * 8 + i * 4 + j] = kv1[j];
+          }
         }
       qk_op.run(qa, kb, sc);
     }
+    if (QT) {
+      for (short kt = 0; kt < 64; kt += 32) {
+        const metal::vec<T, 4> a0_lo = *(const device metal::vec<T, 4>*)(qt0 + kt);
+        const metal::vec<T, 4> a1_lo = *(const device metal::vec<T, 4>*)(qt1 + kt);
+        const metal::vec<T, 4> a0_hi = *(const device metal::vec<T, 4>*)(qt0 + kt + 16);
+        const metal::vec<T, 4> a1_hi = *(const device metal::vec<T, 4>*)(qt1 + kt + 16);
+        for (short j = 0; j < 4; ++j) {
+          qa[j] = a0_lo[j];
+          qa[4 + j] = a1_lo[j];
+          qa[8 + j] = a0_hi[j];
+          qa[12 + j] = a1_hi[j];
+        }
+        const short kk = (D - 64) + kt;
+        for (short tn = 0; tn < 2; ++tn)
+          for (short i = 0; i < 2; ++i) {
+            const metal::vec<T, 4> kv0 = *(const device metal::vec<T, 4>*)(kr[tn][i] + kk);
+            const metal::vec<T, 4> kv1 = *(const device metal::vec<T, 4>*)(kr[tn][i] + kk + 16);
+            for (short j = 0; j < 4; ++j) {
+              kb[tn * 8 + i * 4 + j] = kv0[j];
+              kb[16 + tn * 8 + i * 4 + j] = kv1[j];
+            }
+          }
+        qk_op.run(qa, kb, sc);
+      }
+    }
   }
 
-  // ---- the block's max per head (scaled, live keys only), joined across the head group's quarters
+  // ---- the block's max per head (log2 scaled, live keys only), joined across the head group's quarters
   bool ok[2][4];
   for (short tn = 0; tn < 2; ++tn)
     for (short j = 0; j < 4; ++j) ok[tn][j] = sel[sb][qq * 32 + tn * 16 + fn + j] >= 0;
@@ -130,33 +165,34 @@ for (int b = 0; b < nb; ++b) {
     float m = -INFINITY;
     for (short tn = 0; tn < 2; ++tn)
       for (short j = 0; j < 4; ++j)
-        if (ok[tn][j]) m = metal::max(m, scale * float(sc[tn * 8 + i * 4 + j]));
+        if (ok[tn][j]) m = metal::max(m, float(sc[tn * 8 + i * 4 + j]));
     m = metal::max(m, metal::simd_shuffle_xor(m, ushort(1)));
     m = metal::max(m, metal::simd_shuffle_xor(m, ushort(8)));
-    bmx[i] = m;
+    bmx[i] = m == -INFINITY ? -INFINITY : m * scale_log2;
   }
   if (row_writer) {
     red_max[sg][fm] = bmx[0];
     red_max[sg][fm + 8] = bmx[1];
   }
   threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  if (b + 1 < nb) stage_sel(b + 1);
   float mnew[2], alpha[2];
   for (short i = 0; i < 2; ++i) {
     const int r = fm + i * 8;
     const int s0 = hgl * 4;
     const float bm = metal::max(metal::max(red_max[s0][r], red_max[s0 + 1][r]), metal::max(red_max[s0 + 2][r], red_max[s0 + 3][r]));
     mnew[i] = metal::max(m_run[i], bm);
-    alpha[i] = metal::exp(m_run[i] - mnew[i]);
+    alpha[i] = metal::fast::exp2(m_run[i] - mnew[i]);
     m_run[i] = mnew[i];
   }
 
-  // ---- P = exp(scale * s - m) as f16 into the head group's tile, its f32 row sums joined across the quarters
+  // ---- P = exp2(scale_log2 * s - m) as f16 into the head group's tile, its f32 row sums joined across the quarters
   float rs[2] = {0.0f, 0.0f};
   for (short tn = 0; tn < 2; ++tn) {
     metal::vec<half, 8> hv;
     for (short i = 0; i < 2; ++i)
       for (short j = 0; j < 4; ++j) {
-        const float e = ok[tn][j] ? metal::exp(scale * float(sc[tn * 8 + i * 4 + j]) - mnew[i]) : 0.0f;
+        const float e = ok[tn][j] ? metal::fast::exp2(float(sc[tn * 8 + i * 4 + j]) * scale_log2 - mnew[i]) : 0.0f;
         hv[i * 4 + j] = half(e);
         rs[i] += e;
       }
@@ -178,12 +214,14 @@ for (int b = 0; b < nb; ++b) {
   }
 
   // ---- O = O * alpha + P V: dims 128 qq .. 128 qq + 127 of head group hg, the block's keys 16 a step
-  for (short e = 0; e < 16; ++e) {
-    const float a = alpha[(e >> 2) & 1];
-    o0[e] *= a;
-    o1[e] *= a;
-    o2[e] *= a;
-    o3[e] *= a;
+  if (!metal::simd_all(alpha[0] == 1.0f && alpha[1] == 1.0f)) {
+    for (short e = 0; e < 16; ++e) {
+      const float a = alpha[(e >> 2) & 1];
+      o0[e] *= a;
+      o1[e] *= a;
+      o2[e] *= a;
+      o3[e] *= a;
+    }
   }
   for (short ks = 0; ks < BK / 16; ++ks) {
     if (!metal::simd_any(sel[sb][ks * 16 + int(lane & 15u)] >= 0)) continue;
