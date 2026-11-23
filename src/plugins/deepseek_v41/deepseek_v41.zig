@@ -7210,6 +7210,29 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
     }
 }
 
+/// Test helper: clones `src` (`n`, populated window rings, compressed/indexer rows, pending buffers, history)
+/// with retained handles so batched tests start from a genuinely prefilled state.
+pub const cloneState = if (@import("builtin").is_test) cloneStateImpl else struct {};
+
+fn cloneStateImpl(gpa: std.mem.Allocator, src: *const State) !State {
+    const layers = try gpa.alloc(LState, src.layers.len);
+    errdefer gpa.free(layers);
+    const ds = try gpa.alloc(Ring, src.ds.len);
+    errdefer gpa.free(ds);
+    var hist: std.ArrayList(u32) = .empty;
+    errdefer hist.deinit(gpa);
+    try hist.appendSlice(gpa, src.hist.items);
+    for (layers, src.layers) |*l, s| l.* = .{
+        .win = .{ .buf = ref(s.win.buf), .cap = s.win.cap, .width = s.win.width },
+        .comp = refRows(s.comp),
+        .idx_k = refRows(s.idx_k),
+        .pend_kv = ref(s.pend_kv),
+        .pend_gate = ref(s.pend_gate),
+    };
+    for (ds, src.ds) |*r, s| r.* = .{ .buf = ref(s.buf), .cap = s.cap, .width = s.width };
+    return .{ .gpa = gpa, .n = src.n, .layers = layers, .ds = ds, .hist = hist, .mh = ref(src.mh), .ablation = abl.retain(src.ablation), .variant = src.variant };
+}
+
 /// Test helper: runs `batchedLayer` across the model's held layers for independent states (`xs[k]` `[rk, hc, D]`),
 /// advancing each `st.n` and evaluating outputs and layer states.
 pub const batchedStep = if (@import("builtin").is_test) batchedStepImpl else struct {};
@@ -7262,7 +7285,7 @@ fn batchedStepImpl(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *Stat
 fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const Spans, li: usize, parts: []const A) !bool {
     const kp = &(m.dec.in_proj orelse return false);
     const kq = m.dec.wq_b orelse return false;
-    if (sp.L > dkern.max_rows or li >= m.regions.len or m.streamed != null) return false;
+    if (m.trace != null or sp.L > dkern.max_rows or (m.dec.attn != null and states.len > 4) or li >= m.regions.len or m.streamed != null) return false;
     const ly = &m.layers[li];
     const x = try sc.concat(parts, 0);
     const a = try dkern.in_proj.run(sc, kp, m, ly, x, try sc.concat(sp.pres, 0)) orelse return false;

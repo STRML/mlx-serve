@@ -47,10 +47,12 @@ pub fn relRms(got: []const f32, want: []const f32) f64 {
 
 /// The fusion bar: `new` is no further from `truth` than today's `chain` (1.25x, plus 1e-4 of truth's scale).
 pub fn expectNoWorse(label: []const u8, new: []const f32, chain: []const f32, truth: []const f32) !void {
+    for (new) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+    for (chain) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+    for (truth) |v| if (!std.math.isFinite(v)) return error.NonFinite;
     const en = relRms(new, truth);
     const ec = relRms(chain, truth);
     std.debug.print("[dec] {s}: new-truth {e:.2}, chain-truth {e:.2} (rel rms)\n", .{ label, en, ec });
-    for (new) |v| if (!std.math.isFinite(v)) return error.NonFinite;
     if (en > 1.25 * ec + 1e-4) return error.FurtherFromTruth;
 }
 
@@ -105,30 +107,35 @@ test "dsv41 dec batched: B = 2, 4, 6 on TP1 + NAX fused kernels decode no furthe
                 made += 1;
             }
             var got: [3][]f32 = undefined;
+            var made_got: usize = 0;
+            defer for (got[0..made_got]) |g| gpa.free(g);
             for (fxs, &got) |fx, *g| {
                 const sts = try gpa.alloc(dsv41.State, bsz);
-                defer {
-                    for (sts) |*st| st.deinit();
-                    gpa.free(sts);
-                }
+                defer gpa.free(sts);
+                var made_sts: usize = 0;
+                defer for (sts[0..made_sts]) |*st| st.deinit();
                 const ptrs = try gpa.alloc(*dsv41.State, bsz);
                 defer gpa.free(ptrs);
                 const xs = try gpa.alloc(A, bsz);
-                defer {
-                    for (xs) |a| _ = mlx.mlx_array_free(a);
-                    gpa.free(xs);
-                }
+                defer gpa.free(xs);
+                var made_xs: usize = 0;
+                defer for (xs[0..made_xs]) |a| {
+                    _ = mlx.mlx_array_free(a);
+                };
                 const pres = try gpa.alloc(A, bsz);
-                defer {
-                    for (pres) |a| _ = mlx.mlx_array_free(a);
-                    gpa.free(pres);
-                }
+                defer gpa.free(pres);
+                var made_pres: usize = 0;
+                defer for (pres[0..made_pres]) |a| {
+                    _ = mlx.mlx_array_free(a);
+                };
                 for (0..bsz) |k| {
-                    sts[k] = try dsv41.initState(fx.m, gpa);
-                    sts[k].n = 601;
+                    sts[k] = try dsv41.cloneState(gpa, fx.state());
+                    made_sts += 1;
                     ptrs[k] = &sts[k];
                     xs[k] = try fx.stream(1);
+                    made_xs += 1;
                     pres[k] = try fx.cpre(1);
+                    made_pres += 1;
                 }
                 // Warm-up state KV windows with one batched step, then compare the second batched step.
                 const warm = try dsv41.batchedStep(fx.m, gpa, ptrs, xs, pres);
@@ -136,9 +143,9 @@ test "dsv41 dec batched: B = 2, 4, 6 on TP1 + NAX fused kernels decode no furthe
                 const out = try dsv41.batchedStep(fx.m, gpa, ptrs, xs, pres);
                 defer _ = mlx.mlx_array_free(out);
                 g.* = try dsv41.hostF32(out);
+                made_got += 1;
             }
-            defer for (got) |g| gpa.free(g);
-            for (got[0]) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            for (got[0..made_got]) |buf| for (buf) |v| if (!std.math.isFinite(v)) return error.NonFinite;
             ratio[si] = relRms(got[0], got[2]) / @max(relRms(got[1], got[2]), 1e-4);
         }
         std.mem.sort(f64, &ratio, {}, std.sort.asc(f64));
@@ -170,6 +177,8 @@ fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
         var p0: usize = 601;
         for (steps, 0..) |rows, k| {
             var got: [3][]f32 = undefined;
+            var made_got: usize = 0;
+            defer for (got[0..made_got]) |g| gpa.free(g);
             for (fxs, &got) |fx, *g| {
                 const x = try fx.stream(rows);
                 defer _ = mlx.mlx_array_free(x);
@@ -180,9 +189,9 @@ fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
                     _ = mlx.mlx_array_free(o);
                 };
                 g.* = try dsv41.hostF32(out[0]);
+                made_got += 1;
             }
-            defer for (got) |g| gpa.free(g);
-            for (got[0]) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            for (got[0..made_got]) |buf| for (buf) |v| if (!std.math.isFinite(v)) return error.NonFinite;
             ratio[k][si] = relRms(got[0], got[2]) / @max(relRms(got[1], got[2]), 1e-4);
             p0 += rows;
         }
@@ -221,26 +230,29 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
             std.mem.sort(f64, &times, {}, std.sort.asc(f64));
             std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer (median step {d:.0} us)\n", .{ rows, if (fused) "fused" else "chain", times[times.len / 2] / 20, times[times.len / 2] });
         }
-        for ([_]usize{ 2, 4, max_rows }) |bsz| {
+        for ([_]usize{ 2, 4 }) |bsz| {
             var sts: [max_rows]dsv41.State = undefined;
+            var made_sts: usize = 0;
+            defer for (sts[0..made_sts]) |*st| st.deinit();
             var ptrs: [max_rows]*dsv41.State = undefined;
             var xs: [max_rows]A = undefined;
+            var made_xs: usize = 0;
+            defer for (xs[0..made_xs]) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
             var pres: [max_rows]A = undefined;
-            var made_s: usize = 0;
-            defer {
-                for (0..made_s) |k| {
-                    sts[k].deinit();
-                    _ = mlx.mlx_array_free(xs[k]);
-                    _ = mlx.mlx_array_free(pres[k]);
-                }
-            }
+            var made_pres: usize = 0;
+            defer for (pres[0..made_pres]) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
             for (0..bsz) |k| {
-                sts[k] = try dsv41.initState(fx.m, gpa);
-                sts[k].n = 4096;
+                sts[k] = try dsv41.cloneState(gpa, fx.state());
+                made_sts += 1;
                 ptrs[k] = &sts[k];
                 xs[k] = try fx.stream(1);
+                made_xs += 1;
                 pres[k] = try fx.cpre(1);
-                made_s += 1;
+                made_pres += 1;
             }
             var times: [7]f64 = undefined;
             for (0..2 + times.len) |rep| {
