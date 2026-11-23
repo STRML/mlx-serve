@@ -2262,10 +2262,10 @@ fn rowsWriteHandles() !struct { kern: mlx.mlx_fast_metal_kernel, ev: i32 } {
     if (st.kern.ctx == null) {
         st.kern = try buildKernel("dsv41_rows_append", &.{ "dst", "src", "meta" }, &.{"carrier"}, ROWS_APPEND_SOURCE, "");
     }
-    if (st.ready_event < 0) {
+    if (st.ready_event <= 0) {
         var obj: u64 = 0;
         const ev = dsv41ev_create_metal(1, &obj);
-        if (ev < 0) return error.RowsEvent;
+        if (ev <= 0) return error.RowsEvent;
         st.ready_event = ev;
     }
     return .{ .kern = st.kern, .ev = st.ready_event };
@@ -2334,34 +2334,35 @@ pub const Rows = struct {
         const end = self.used + n;
         if (comptime rows_shimmed) {
             if (mlx.metalKernelsAvailable() and mlx.streamIsGpu(s)) {
-                const h = try rowsWriteHandles();
-                const cfg = mlx.mlx_fast_metal_kernel_config_new();
-                defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-                const total = try std.math.mul(usize, n, self.width);
-                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{1}, 1, .uint32));
-                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci((total + 255) / 256 * 256), 1, 1));
-                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
-                try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", self.dtype));
-                const meta_vals = [_]u32{ @intCast(self.used), @intCast(self.width), @intCast(n) };
-                const meta = mlx.mlx_array_new_data(&meta_vals, &[_]c_int{3}, 1, .uint32);
-                defer _ = mlx.mlx_array_free(meta);
-                const ins = [_]A{ self.buf, xc, meta };
-                const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
-                defer _ = mlx.mlx_vector_array_free(iv);
-                var ov = mlx.mlx_vector_array_new();
-                defer _ = mlx.mlx_vector_array_free(ov);
-                try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, h.kern, iv, cfg, s));
-                var carrier = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(carrier);
-                try mlx.check(mlx.mlx_vector_array_get(&carrier, ov, 0));
-                const gated = [2]A{ self.buf, carrier };
-                var outs = [2]A{ mlx.mlx_array_new(), mlx.mlx_array_new() };
-                defer _ = mlx.mlx_array_free(outs[1]);
-                errdefer _ = mlx.mlx_array_free(outs[0]);
-                if (dsv41ev_wait(&gated, 2, h.ev, 1, null, 0, true, s, &outs) != 0) return error.RowsWaitFailed;
-                _ = mlx.mlx_array_free(self.buf);
-                self.buf = outs[0];
-                return;
+                if (rowsWriteHandles()) |h| {
+                    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+                    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+                    const total = try std.math.mul(usize, n, self.width);
+                    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{1}, 1, .uint32));
+                    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci((total + 255) / 256 * 256), 1, 1));
+                    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+                    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", self.dtype));
+                    const meta_vals = [_]u32{ @intCast(self.used), @intCast(self.width), @intCast(n) };
+                    const meta = mlx.mlx_array_new_data(&meta_vals, &[_]c_int{3}, 1, .uint32);
+                    defer _ = mlx.mlx_array_free(meta);
+                    const ins = [_]A{ self.buf, xc, meta };
+                    const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+                    defer _ = mlx.mlx_vector_array_free(iv);
+                    var ov = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(ov);
+                    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, h.kern, iv, cfg, s));
+                    var carrier = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(carrier);
+                    try mlx.check(mlx.mlx_vector_array_get(&carrier, ov, 0));
+                    const gated = [2]A{ self.buf, carrier };
+                    var outs = [2]A{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+                    defer _ = mlx.mlx_array_free(outs[1]);
+                    errdefer _ = mlx.mlx_array_free(outs[0]);
+                    if (dsv41ev_wait(&gated, 2, h.ev, 1, null, 0, true, s, &outs) != 0) return error.RowsWaitFailed;
+                    _ = mlx.mlx_array_free(self.buf);
+                    self.buf = outs[0];
+                    return;
+                } else |_| {}
             }
         }
         var up = mlx.mlx_array_new();
@@ -5070,13 +5071,16 @@ pub fn checkFfnAndMoeFusedForTest(gpa: std.mem.Allocator, m: *const Dsv41Model, 
         .comb = try sc.zeros(&.{ 1, ci(m.cfg.dsv4_hc_mult), ci(m.cfg.dsv4_hc_mult) }, .float32),
     };
     const fi = (try ffnInFused(&sc, m, ly, oa, x, &sa)) orelse return false;
-    if (m.dec.moe_up) |ku| if (m.dec.moe_down) |kd| if (ly.experts.views) |v| {
-        const up = (try dkern.moe_up.moeUp(&sc, m, ku, ly, fi.h2, fi.idx, fi.wts)) orelse return false;
-        const dn = (try dkern.moe_down.moeDown(&sc, kd, m.dec.moe_down_rb, &v[1], &ly.shared[2], up, fi.idx, fi.x1, &fi.sf)) orelse return false;
-        try evalAll(&.{dn});
+    if (!device.naxAvailable()) {
+        try evalAll(&.{fi.h2});
         return true;
-    };
-    try evalAll(&.{fi.h2});
+    }
+    const ku = m.dec.moe_up orelse return false;
+    const kd = m.dec.moe_down orelse return false;
+    const v = ly.experts.views orelse return false;
+    const up = (try dkern.moe_up.moeUp(&sc, m, ku, ly, fi.h2, fi.idx, fi.wts)) orelse return false;
+    const dn = (try dkern.moe_down.moeDown(&sc, kd, m.dec.moe_down_rb, &v[1], &ly.shared[2], up, fi.idx, fi.x1, &fi.sf)) orelse return false;
+    try evalAll(&.{dn});
     return true;
 }
 

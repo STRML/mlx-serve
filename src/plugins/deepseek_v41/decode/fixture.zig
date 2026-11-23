@@ -829,6 +829,11 @@ test "dsv41 dec oQ2.5e-mtp: all five dec_* kernels engage without declining and 
             try std.testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(ly.gate_w));
             try std.testing.expect(try dsv41.checkFfnAndMoeFusedForTest(gpa, fused_fx.m, ly));
         }
+        if (device.naxAvailable()) {
+            var missing = fused_fx.m.*;
+            missing.dec.moe_down = null;
+            try std.testing.expect(!try dsv41.checkFfnAndMoeFusedForTest(gpa, &missing, fused_fx.layer(range[0])));
+        }
         const in = try Input.of(plain_fx, 1);
         defer in.deinit();
         const t = try streamOf(gpa, truth_fx, in);
