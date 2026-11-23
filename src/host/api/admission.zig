@@ -60,7 +60,7 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_
     // is evictable here by construction (the withheld case took the deferral arm).
     const msg = try errors.memoryRefusalMessage(allocator, prompt_ids.len, bill.needed / (1024 * 1024), bill.available / (1024 * 1024), bill);
     defer allocator.free(msg);
-    errors.countRejected();
+    errors.countRejected(stream, @intCast(@min(prompt_ids.len, std.math.maxInt(u32))));
     if (is_anthropic) {
         try sendAnthropicErrorWithReason(allocator, stream, "invalid_request_error", msg, 400, errors.MEMORY_REFUSAL_REASON);
     } else {

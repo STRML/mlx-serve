@@ -75,6 +75,7 @@ pub fn handle(
         .cache_key = cache_key,
         .client = stream.client,
         .priority = stream.priority,
+        .recent_request = stream.recent_request,
         .ablation = stream.ablation,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,

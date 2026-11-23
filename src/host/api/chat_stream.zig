@@ -251,6 +251,7 @@ pub fn handleStreamingGeneration(
         .session = stream.session_key,
         .client = stream.client,
         .priority = stream.priority,
+        .recent_request = stream.recent_request,
         .ablation = stream.ablation,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,

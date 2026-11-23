@@ -397,6 +397,7 @@ pub fn handleChatCompletions(
     const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    stream.recent_request.stream = is_stream;
     if (stream.cache_export and cache_transfer.speechAsked(root)) {
         try sendErrorResponse(allocator, stream, "422 Unprocessable Entity", "invalid_request_error", "Cache export does not support speech output", 422);
         return;
@@ -837,7 +838,7 @@ pub fn handleChatCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
-        countRejected();
+        countRejected(stream, @intCast(@min(prompt_ids.len, std.math.maxInt(u32))));
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;

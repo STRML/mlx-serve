@@ -136,6 +136,7 @@ pub fn handleAnthropicStreaming(
         .cache_key = cache_key,
         .client = stream.client,
         .priority = stream.priority,
+        .recent_request = stream.recent_request,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,

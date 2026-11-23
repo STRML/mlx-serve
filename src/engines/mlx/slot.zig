@@ -73,6 +73,7 @@ pub const Slot = struct {
     cache_key: u64 = 0,
     session: u64 = 0,
     client: metrics_mod.Client = .other,
+    recent_request: metrics_mod.RecentRequestContext = .{},
     request_id: u64 = 0,
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
     restored_entry: u64 = 0,
@@ -318,6 +319,7 @@ pub const Slot = struct {
             .cache_key = params.cache_key,
             .session = params.session,
             .client = params.client,
+            .recent_request = params.recent_request,
             .request_id = metrics_mod.nextRequestId(),
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,

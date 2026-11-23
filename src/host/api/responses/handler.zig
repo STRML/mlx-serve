@@ -396,6 +396,7 @@ fn handleResponsesInner(
 
     // ── streaming ──
     const is_stream = if (root.get("stream")) |v| (v == .bool and v.bool) else false;
+    stream.recent_request.stream = is_stream;
 
     // ── text.format (or chat-style response_format alias) ──
     var text_format = responses_mod.parseTextFormat(root.get("text"));
@@ -693,7 +694,7 @@ fn handleResponsesInner(
     // ── context limit ──
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
-        countRejected();
+        countRejected(stream, @intCast(@min(prompt_ids.len, std.math.maxInt(u32))));
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -945,6 +946,7 @@ fn handleResponsesInner(
             .cache_key = cache_key,
             .client = stream.client,
             .priority = stream.priority,
+            .recent_request = stream.recent_request,
             .mrope_pos = slot_mrope.pos,
             .mrope_total = slot_mrope.total,
             .mrope_delta = slot_mrope.delta,
