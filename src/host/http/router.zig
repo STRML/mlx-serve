@@ -49,6 +49,7 @@ const handleDetokenize = @import("../api/tokenize.zig").handleDetokenize;
 const handleChatCompletions = @import("../api/chat_completions.zig").handleChatCompletions;
 const handleCompletions = @import("../api/completions.zig").handleCompletions;
 const handleCacheImport = @import("../api/cache_transfer.zig").handleCacheImport;
+const cache_rdma = @import("../api/cache_rdma.zig");
 const sendResponse = @import("respond.zig").sendResponse;
 const sendResponseQuiet = @import("respond.zig").sendResponseQuiet;
 const logHttpRequest = @import("respond.zig").logHttpRequest;
@@ -265,8 +266,9 @@ pub fn handleConnection(
         }
     }
 
-    // ── `/v1/internal/*` has its own key and never meets the serving key or the LAN gate.
+    // ── `/v1/internal/*` and `/v1/cache/rdma/*` take the internal key and never meet the serving key or the LAN gate.
     if (internal_ep.isInternalPath(path)) return serveInternal(allocator, stream, method, path, request[0..header_end_pos], request_body);
+    if (cache_rdma.isRdmaPath(path)) return cache_rdma.handleRequest(allocator, stream, method, raw_path, path, request[0..header_end_pos], request_body);
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
     //    requires the key (the OpenAI/Anthropic/Ollama APIs AND the index page
@@ -1048,8 +1050,8 @@ test "HTTP build_id: internal mode preserves the legacy poll body" {
     const expected_id = @import("build_options").build_id;
     try t.expect(expected_id.len > 0);
     const expected = try std.fmt.allocPrint(t.allocator,
-        \\{{"ok":true,"reason":"","mode":"tp1","n":0,"high_water":0,"role":"none","state":"idle","failure":"none","failure_rank":null,"peers":0,"in_flight":0,"admitting":true,"quarantined":false,"progress":null,"stalled_ms":0,"clock_ms":{d},"room_mib":{?d},"build_id":"{s}"}}
-    , .{ parsed.value.clock_ms, parsed.value.room_mib, expected_id });
+        \\{{"ok":true,"reason":"","mode":"tp1","n":0,"high_water":0,"role":"none","state":"idle","failure":"none","failure_rank":null,"peers":0,"in_flight":0,"admitting":true,"quarantined":false,"progress":null,"stalled_ms":0,"clock_ms":{d},"room_mib":{?d},"build_id":"{s}","cache_rdma":{s}}}
+    , .{ parsed.value.clock_ms, parsed.value.room_mib, expected_id, if (cache_rdma.isAvailable()) "true" else "false" });
     defer t.allocator.free(expected);
     try t.expectEqualStrings(expected, body);
 }

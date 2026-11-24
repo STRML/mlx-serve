@@ -258,7 +258,7 @@ fn isCacheImportPath(target: []const u8) bool {
     return std.mem.eql(u8, path, "/v1/cache/import");
 }
 
-fn cacheImportPeakFits(peak: u64) bool {
+pub fn cacheImportPeakFits(peak: u64) bool {
     if (import_headroom_override) |headroom| return peak <= headroom;
     const scheduler = http_server.launch().global_scheduler orelse return true;
     const model = scheduler.current_model orelse return true;
