@@ -6,6 +6,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const attempt = @import("attempt.zig");
 const sw_mod = @import("switch.zig");
+const cache_rdma = @import("../api/cache_rdma.zig");
 
 pub const prefix = "/v1/internal/";
 
@@ -40,7 +41,7 @@ const not_inference = [_][]const u8{
 /// (tokenize, detokenize, load and unload can load, unload or run a model, so they count). The Responses WebSocket
 /// is admitted per turn by `Admission`, never for the life of its connection.
 pub fn isInference(method: []const u8, path: []const u8) bool {
-    if (isInternalPath(path)) return false;
+    if (isInternalPath(path) or cache_rdma.isRdmaPath(path)) return false;
     if (!std.mem.eql(u8, method, "POST")) return false;
     for (not_inference) |p| if (std.mem.eql(u8, path, p)) return false;
     return true;
@@ -157,7 +158,12 @@ pub fn handle(sw: *sw_mod.Switch, internal_key: ?[32]u8, req: Request, wall_now_
     const is_get = std.mem.eql(u8, req.method, "GET");
     if (std.mem.eql(u8, route, "mode")) {
         if (!is_get) return plain(buf, 405, "method not allowed");
-        return render(sw.io, buf, 200, "", null, sw.snapshot(), ",\"build_id\":\"" ++ build_options.build_id ++ "\"");
+        cache_rdma.sweepExpiredNonBlocking(sw.io);
+        const extra = if (cache_rdma.isAvailable())
+            ",\"build_id\":\"" ++ build_options.build_id ++ "\",\"cache_rdma\":true"
+        else
+            ",\"build_id\":\"" ++ build_options.build_id ++ "\",\"cache_rdma\":false";
+        return render(sw.io, buf, 200, "", null, sw.snapshot(), extra);
     }
     const cmd = commandOf(route) orelse return plain(buf, 404, "not found");
     if (!std.mem.eql(u8, req.method, "POST")) return plain(buf, 405, "method not allowed");

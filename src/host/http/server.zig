@@ -749,6 +749,7 @@ pub fn serve(
     }
 
     deinitGlobalResponseStore();
+    @import("../api/cache_rdma.zig").quiesceGlobal(io);
 
     log.info("\nShutting down gracefully...\n", .{});
 }
@@ -946,6 +947,7 @@ test {
     _ = @import("../api/audio.zig");
     _ = @import("../api/chat_completions.zig");
     _ = @import("../api/cache_transfer.zig");
+    _ = @import("../api/cache_rdma.zig");
     _ = @import("../api/chat_stream.zig");
     _ = @import("../api/completions.zig");
     _ = @import("../api/embeddings.zig");
