@@ -8,10 +8,10 @@
  * - Each HCA enforces max_mr_size (~15.6 MiB), max_mr (100), and < 4 MiB of
  *   simultaneously posted IBV_WR_RECV bytes per QP.
  * - Each QP owns one pre-registered ~4 MiB staging ring MR (8 x 512 KiB data
- *   slots + 16 x 64 B control slots) created once at QP setup. Per-transfer
+ *   slots + 16 KiB control region) created once at QP setup. Per-transfer
  *   ibv_reg_mr latency is 0 ms, arbitrary KV cache sizes (1 B to 100+ GiB) are
  *   supported, and credit-paced 512 KiB x 4 (2 MiB window) streaming saturates
- *   the Thunderbolt 5 link (~8.75 GiB/s) while remaining well below the 4 MiB
+ *   the Thunderbolt 5 link (~8.71 GiB/s) while remaining well below the 4 MiB
  *   posted-recv ceiling. End-to-end integrity is verified by mlx-serve's 64-bit
  *   peer_wire Wyhash checksum on import. */
 
@@ -34,7 +34,6 @@
 #define MSV_DATA_SLOTS    8U                 /* 4 MiB ring (8 x 512 KiB) */
 #define MSV_WINDOW        4U                 /* 2 MiB inflight (< 4 MiB TB5 RX cap) */
 #define MSV_CREDIT_BATCH  2U                 /* 1 MiB credit refill cadence */
-#define MSV_CTRL_SLOTS    16U                /* 8 recv + 8 send control slots */
 #define MSV_CTRL_RECV_N   8U
 #define MSV_CTRL_SEND_N   8U
 #define MSV_CTRL_STRIDE   64U
@@ -102,6 +101,23 @@ static uint64_t mono_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000L);
+}
+
+static inline uint64_t compute_deadline_ms(uint64_t timeout_ms) {
+    if (timeout_ms == 0) return 0;
+    uint64_t now = mono_ms();
+    if (now == 0) return 0;
+    return (UINT64_MAX - now < timeout_ms) ? UINT64_MAX : (now + timeout_ms);
+}
+
+static inline int deadline_exceeded(uint64_t deadline_ms) {
+    if (deadline_ms == 0) return 0;
+    uint64_t now = mono_ms();
+    return now > 0 && now >= deadline_ms;
+}
+
+static inline int stop_requested(volatile int *stop_flag) {
+    return stop_flag && __atomic_load_n(stop_flag, __ATOMIC_ACQUIRE) != 0;
 }
 
 static void load_ibv_once(void) {
@@ -205,10 +221,10 @@ static int post_ctrl_recv(MsvRdmaQp *qp, uint32_t slot, char *err_buf, size_t er
     return 0;
 }
 
-static int post_data_recv(MsvRdmaQp *qp, uint32_t slot, uint32_t max_len, char *err_buf, size_t err_cap) {
+static int post_data_recv(MsvRdmaQp *qp, uint32_t slot, uint32_t exact_len, char *err_buf, size_t err_cap) {
     struct ibv_sge sge;
     sge.addr = (uint64_t)(uintptr_t)qp_data_slot(qp, slot);
-    sge.length = max_len;
+    sge.length = exact_len;
     sge.lkey = qp->ring_mr->lkey;
 
     struct ibv_recv_wr wr;
@@ -220,7 +236,7 @@ static int post_data_recv(MsvRdmaQp *qp, uint32_t slot, uint32_t max_len, char *
     struct ibv_recv_wr *bad = NULL;
     int rc = ibv_post_recv(qp->qp, &wr, &bad);
     if (rc != 0) {
-        set_err(err_buf, err_cap, "ibv_post_recv(data slot=%u len=%u) failed (rc=%d)", slot, max_len, rc);
+        set_err(err_buf, err_cap, "ibv_post_recv(data slot=%u len=%u) failed (rc=%d)", slot, exact_len, rc);
         return -1;
     }
     return 0;
@@ -579,7 +595,7 @@ int msv_rdma_serve_offer(
     uint64_t len,
     const uint8_t tid_16[16],
     volatile int *stop_flag,
-    uint64_t deadline_mono_ms,
+    uint64_t timeout_ms,
     char *err_buf,
     size_t err_cap
 ) {
@@ -593,6 +609,8 @@ int msv_rdma_serve_offer(
         return -2;
     }
 
+    const uint64_t deadline_ms = compute_deadline_ms(timeout_ms);
+
     /* Phase 1: wait for matching REQ(tid_16) doorbell from dst. */
     uint32_t chunk_bytes = (uint32_t)MSV_CHUNK_BYTES;
     uint64_t credits = 0;
@@ -600,7 +618,7 @@ int msv_rdma_serve_offer(
     uint32_t idle_spins = 0;
 
     while (!got_req) {
-        if (stop_flag && __atomic_load_n(stop_flag, __ATOMIC_ACQUIRE) != 0) {
+        if (stop_requested(stop_flag)) {
             return 1;
         }
         struct ibv_wc wcs[16];
@@ -612,7 +630,7 @@ int msv_rdma_serve_offer(
         if (n == 0) {
             idle_spins++;
             if ((idle_spins & 0x3fU) == 0) {
-                if (deadline_mono_ms > 0 && mono_ms() >= deadline_mono_ms) {
+                if (deadline_exceeded(deadline_ms)) {
                     return 1;
                 }
                 usleep(50);
@@ -630,11 +648,14 @@ int msv_rdma_serve_offer(
             uint32_t slot = (uint32_t)(wcs[i].wr_id & WR_IDX_MASK);
             if (tag == WR_TAG_CTRL_RECV) {
                 MsvCtrlMsg msg;
-                memcpy(&msg, qp_ctrl_recv_slot(qp, slot), sizeof(msg));
+                int full_ctrl = (wcs[i].byte_len == sizeof(MsvCtrlMsg));
+                if (full_ctrl) {
+                    memcpy(&msg, qp_ctrl_recv_slot(qp, slot), sizeof(msg));
+                }
                 if (post_ctrl_recv(qp, slot, err_buf, err_cap) != 0) {
                     return -2;
                 }
-                if (msg.magic == MSV_CTRL_MAGIC && memcmp(msg.tid, tid_16, 16) == 0) {
+                if (full_ctrl && msg.magic == MSV_CTRL_MAGIC && memcmp(msg.tid, tid_16, 16) == 0) {
                     if (msg.kind == MSV_CTRL_REQ && !got_req) {
                         if (msg.chunk_bytes > 0 && msg.chunk_bytes <= MSV_CHUNK_BYTES) {
                             chunk_bytes = msg.chunk_bytes;
@@ -656,15 +677,25 @@ int msv_rdma_serve_offer(
 
     /* Phase 2: stream all chunks over credit-paced IBV_WR_SEND using the staging ring. */
     const uint8_t *src = (const uint8_t *)src_buf;
-    uint64_t total_chunks = (len + chunk_bytes - 1) / chunk_bytes;
+    const uint64_t total_chunks = 1ULL + (len - 1ULL) / (uint64_t)chunk_bytes;
     uint64_t sent_chunks = 0;
     uint32_t send_inflight = 0;
     uint8_t slot_busy[MSV_DATA_SLOTS];
     memset(slot_busy, 0, sizeof(slot_busy));
     uint32_t next_slot = 0;
+    uint32_t loop_iters = 0;
     idle_spins = 0;
 
     while (sent_chunks < total_chunks || send_inflight > 0) {
+        if (stop_requested(stop_flag)) {
+            set_err(err_buf, err_cap, "sender cancelled mid-transfer");
+            return -1;
+        }
+        if ((++loop_iters & 0x3fU) == 0 && deadline_exceeded(deadline_ms)) {
+            set_err(err_buf, err_cap, "sender timed out mid-transfer");
+            return -1;
+        }
+
         while (sent_chunks < total_chunks && credits > 0 && send_inflight < MSV_DATA_SLOTS) {
             uint32_t slot = next_slot % MSV_DATA_SLOTS;
             if (slot_busy[slot]) break;
@@ -693,11 +724,11 @@ int msv_rdma_serve_offer(
         if (n == 0) {
             idle_spins++;
             if ((idle_spins & 0x3ffU) == 0) {
-                if (stop_flag && __atomic_load_n(stop_flag, __ATOMIC_ACQUIRE) != 0) {
+                if (stop_requested(stop_flag)) {
                     set_err(err_buf, err_cap, "sender cancelled mid-transfer");
                     return -1;
                 }
-                if (deadline_mono_ms > 0 && mono_ms() >= deadline_mono_ms) {
+                if (deadline_exceeded(deadline_ms)) {
                     set_err(err_buf, err_cap, "sender timed out waiting for credits");
                     return -1;
                 }
@@ -719,11 +750,14 @@ int msv_rdma_serve_offer(
                 if (send_inflight > 0) send_inflight--;
             } else if (tag == WR_TAG_CTRL_RECV) {
                 MsvCtrlMsg msg;
-                memcpy(&msg, qp_ctrl_recv_slot(qp, slot), sizeof(msg));
+                int full_ctrl = (wcs[i].byte_len == sizeof(MsvCtrlMsg));
+                if (full_ctrl) {
+                    memcpy(&msg, qp_ctrl_recv_slot(qp, slot), sizeof(msg));
+                }
                 if (post_ctrl_recv(qp, slot, err_buf, err_cap) != 0) {
                     return -2;
                 }
-                if (msg.magic == MSV_CTRL_MAGIC && msg.kind == MSV_CTRL_CRED
+                if (full_ctrl && msg.magic == MSV_CTRL_MAGIC && msg.kind == MSV_CTRL_CRED
                     && memcmp(msg.tid, tid_16, 16) == 0) {
                     credits += msg.credits;
                 }
@@ -739,7 +773,8 @@ int msv_rdma_pull_offer(
     void *dst_buf,
     uint64_t len,
     const uint8_t tid_16[16],
-    uint64_t deadline_mono_ms,
+    volatile int *stop_flag,
+    uint64_t timeout_ms,
     char *err_buf,
     size_t err_cap
 ) {
@@ -752,10 +787,15 @@ int msv_rdma_pull_offer(
         set_err(err_buf, err_cap, "pull_offer requires receiver QP");
         return -2;
     }
+    if (stop_requested(stop_flag)) {
+        set_err(err_buf, err_cap, "rdma pull cancelled");
+        return -1;
+    }
 
+    const uint64_t deadline_ms = compute_deadline_ms(timeout_ms);
     uint8_t *dst = (uint8_t *)dst_buf;
     const uint32_t chunk_bytes = (uint32_t)MSV_CHUNK_BYTES;
-    const uint64_t total_chunks = (len + chunk_bytes - 1) / chunk_bytes;
+    const uint64_t total_chunks = 1ULL + (len - 1ULL) / (uint64_t)chunk_bytes;
     const uint32_t init_win = total_chunks < MSV_WINDOW ? (uint32_t)total_chunks : MSV_WINDOW;
 
     /* 1. Post initial credit-bounded data RECVs (<= 2 MiB) BEFORE sending REQ.
@@ -798,12 +838,24 @@ int msv_rdma_pull_offer(
     uint64_t granted_credits = init_win;
     uint32_t pending_credit = 0;
     uint32_t idle_spins = 0;
+    uint32_t loop_iters = 0;
     uint64_t last_req_ms = mono_ms();
     int req_retries = 0;
 
     /* 3. Receive all chunks, copy into dst_buf, repost RECVs, send CREDIT doorbells,
      *    and drain all ctrl send completions before returning so QP stays clean. */
     while (recvd_chunks < total_chunks || ctrl_inflight > 0) {
+        if (stop_requested(stop_flag)) {
+            set_err(err_buf, err_cap, "rdma pull cancelled (%llu/%llu chunks)",
+                    (unsigned long long)recvd_chunks, (unsigned long long)total_chunks);
+            return -1;
+        }
+        if ((++loop_iters & 0x3fU) == 0 && deadline_exceeded(deadline_ms)) {
+            set_err(err_buf, err_cap, "rdma pull timed out (%llu/%llu chunks)",
+                    (unsigned long long)recvd_chunks, (unsigned long long)total_chunks);
+            return -1;
+        }
+
         struct ibv_wc wcs[32];
         int n = ibv_poll_cq(qp->cq, 32, wcs);
         if (n < 0) {
@@ -813,15 +865,20 @@ int msv_rdma_pull_offer(
         if (n == 0) {
             idle_spins++;
             if ((idle_spins & 0x3ffU) == 0) {
-                uint64_t now = mono_ms();
-                if (deadline_mono_ms > 0 && now >= deadline_mono_ms) {
+                if (stop_requested(stop_flag)) {
+                    set_err(err_buf, err_cap, "rdma pull cancelled (%llu/%llu chunks)",
+                            (unsigned long long)recvd_chunks, (unsigned long long)total_chunks);
+                    return -1;
+                }
+                if (deadline_exceeded(deadline_ms)) {
                     set_err(err_buf, err_cap, "rdma pull timed out (%llu/%llu chunks)",
                             (unsigned long long)recvd_chunks, (unsigned long long)total_chunks);
                     return -1;
                 }
+                uint64_t now = mono_ms();
                 /* If initial REQ was lost before any data chunk arrived, retry REQ up to 2 times. */
-                if (recvd_chunks == 0 && req_retries < 2 && now - last_req_ms >= 200
-                    && !ctrl_busy[ctrl_next]) {
+                if (recvd_chunks == 0 && req_retries < 2 && now > 0 && now >= last_req_ms
+                    && (now - last_req_ms) >= 200 && !ctrl_busy[ctrl_next]) {
                     MsvCtrlMsg *r2 = qp_ctrl_send_slot(qp, ctrl_next);
                     memset(r2, 0, sizeof(*r2));
                     r2->magic = MSV_CTRL_MAGIC;
@@ -948,23 +1005,24 @@ int msv_rdma_qp_connect(MsvRdmaQp *qp, const uint8_t peer_gid[16], uint32_t peer
     return -1;
 }
 void msv_rdma_qp_destroy(MsvRdmaQp *qp) { (void)qp; }
-int msv_rdma_serve_offer(MsvRdmaQp *qp, const void *src_buf, uint64_t len, const uint8_t tid_16[16], volatile int *stop_flag, uint64_t deadline_mono_ms, char *err_buf, size_t err_cap) {
+int msv_rdma_serve_offer(MsvRdmaQp *qp, const void *src_buf, uint64_t len, const uint8_t tid_16[16], volatile int *stop_flag, uint64_t timeout_ms, char *err_buf, size_t err_cap) {
     (void)qp;
     (void)src_buf;
     (void)len;
     (void)tid_16;
     (void)stop_flag;
-    (void)deadline_mono_ms;
+    (void)timeout_ms;
     (void)err_buf;
     (void)err_cap;
     return -2;
 }
-int msv_rdma_pull_offer(MsvRdmaQp *qp, void *dst_buf, uint64_t len, const uint8_t tid_16[16], uint64_t deadline_mono_ms, char *err_buf, size_t err_cap) {
+int msv_rdma_pull_offer(MsvRdmaQp *qp, void *dst_buf, uint64_t len, const uint8_t tid_16[16], volatile int *stop_flag, uint64_t timeout_ms, char *err_buf, size_t err_cap) {
     (void)qp;
     (void)dst_buf;
     (void)len;
     (void)tid_16;
-    (void)deadline_mono_ms;
+    (void)stop_flag;
+    (void)timeout_ms;
     (void)err_buf;
     (void)err_cap;
     return -2;

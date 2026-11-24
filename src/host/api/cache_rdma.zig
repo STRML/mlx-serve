@@ -43,6 +43,7 @@ const MIN_EXPIRES_MS: u64 = 1_000;
 const MAX_EXPIRES_MS: u64 = 300_000;
 const MAX_PULL_DEADLINE_MS: u64 = 300_000;
 const MAX_OFFERS: usize = 32;
+const MAX_QPS: usize = 32;
 const CONSUMED_RING_LEN: usize = 256;
 const QUIESCE_WAIT_MS: i64 = 500;
 const DEFAULT_PSN: u32 = 7;
@@ -69,8 +70,8 @@ extern fn msv_rdma_dev_close(dev: *CDev) callconv(.c) void;
 extern fn msv_rdma_qp_create(dev: *CDev, psn: u32, is_sender: c_int, local_out: *CEndpoint, err_buf: ?[*]u8, err_cap: usize) callconv(.c) ?*CQp;
 extern fn msv_rdma_qp_connect(qp: *CQp, peer_gid: *const [16]u8, peer_qpn: u32, peer_psn: u32, peer_lid: u16, err_buf: ?[*]u8, err_cap: usize) callconv(.c) c_int;
 extern fn msv_rdma_qp_destroy(qp: *CQp) callconv(.c) void;
-extern fn msv_rdma_serve_offer(qp: *CQp, src_buf: *const anyopaque, len: u64, tid_16: *const [16]u8, stop_flag: *volatile c_int, deadline_mono_ms: u64, err_buf: ?[*]u8, err_cap: usize) callconv(.c) c_int;
-extern fn msv_rdma_pull_offer(qp: *CQp, dst_buf: *anyopaque, len: u64, tid_16: *const [16]u8, deadline_mono_ms: u64, err_buf: ?[*]u8, err_cap: usize) callconv(.c) c_int;
+extern fn msv_rdma_serve_offer(qp: *CQp, src_buf: *const anyopaque, len: u64, tid_16: *const [16]u8, stop_flag: *volatile c_int, timeout_ms: u64, err_buf: ?[*]u8, err_cap: usize) callconv(.c) c_int;
+extern fn msv_rdma_pull_offer(qp: *CQp, dst_buf: *anyopaque, len: u64, tid_16: *const [16]u8, stop_flag: *volatile c_int, timeout_ms: u64, err_buf: ?[*]u8, err_cap: usize) callconv(.c) c_int;
 
 // ── Pluggable Transport VTable (Real IBVerbs + Loopback test transport) ──────
 
@@ -85,8 +86,8 @@ pub const Transport = struct {
     qp_create: *const fn (ctx: *anyopaque, dev: *anyopaque, psn: u32, is_sender: bool, local_out: *CEndpoint, err_buf: []u8) ?*anyopaque,
     qp_connect: *const fn (ctx: *anyopaque, qp: *anyopaque, peer_gid: [16]u8, peer_qpn: u32, peer_psn: u32, peer_lid: u16, err_buf: []u8) bool,
     qp_destroy: *const fn (ctx: *anyopaque, qp: *anyopaque) void,
-    serve_offer: *const fn (ctx: *anyopaque, qp: *anyopaque, src_buf: []const u8, tid_16: [16]u8, stop_flag: *std.atomic.Value(c_int), deadline_mono_ms: u64, err_buf: []u8) ServeStatus,
-    pull_offer: *const fn (ctx: *anyopaque, qp: *anyopaque, dst_buf: []u8, tid_16: [16]u8, deadline_mono_ms: u64, err_buf: []u8) ReadStatus,
+    serve_offer: *const fn (ctx: *anyopaque, qp: *anyopaque, src_buf: []const u8, tid_16: [16]u8, stop_flag: *std.atomic.Value(c_int), timeout_ms: u64, err_buf: []u8) ServeStatus,
+    pull_offer: *const fn (ctx: *anyopaque, qp: *anyopaque, dst_buf: []u8, tid_16: [16]u8, stop_flag: *std.atomic.Value(c_int), timeout_ms: u64, err_buf: []u8) ReadStatus,
 };
 
 var real_transport_dummy: u8 = 0;
@@ -159,7 +160,7 @@ fn realServeOffer(
     src_buf: []const u8,
     tid_16: [16]u8,
     stop_flag: *std.atomic.Value(c_int),
-    deadline_mono_ms: u64,
+    timeout_ms: u64,
     err_buf: []u8,
 ) ServeStatus {
     if (comptime !has_real_rdma) return .io_error;
@@ -169,7 +170,7 @@ fn realServeOffer(
         src_buf.len,
         &tid_16,
         @ptrCast(&stop_flag.raw),
-        deadline_mono_ms,
+        timeout_ms,
         err_buf.ptr,
         err_buf.len,
     );
@@ -186,7 +187,8 @@ fn realPullOffer(
     qp: *anyopaque,
     dst_buf: []u8,
     tid_16: [16]u8,
-    deadline_mono_ms: u64,
+    stop_flag: *std.atomic.Value(c_int),
+    timeout_ms: u64,
     err_buf: []u8,
 ) ReadStatus {
     if (comptime !has_real_rdma) return .io_error;
@@ -195,7 +197,8 @@ fn realPullOffer(
         dst_buf.ptr,
         dst_buf.len,
         &tid_16,
-        deadline_mono_ms,
+        @ptrCast(&stop_flag.raw),
+        timeout_ms,
         err_buf.ptr,
         err_buf.len,
     );
@@ -256,12 +259,14 @@ fn defaultImportBody(io: std.Io, allocator: std.mem.Allocator, body: []const u8,
     return scheduler.importCache(&req);
 }
 
-// ── State Manager (host-unit owned) ──────────────────────────────────────────
+// ── State Manager (host-unit owned; refcounted Dev/QP/Offer lifetimes) ───────
 
 const DevEntry = struct {
     name_buf: [64]u8 = @splat(0),
     name_len: usize = 0,
     handle: *anyopaque,
+    /// Protected by `Manager.mu`: 1 for membership in `mgr.devs` + 1 per live `QpEntry`.
+    refcount: u32 = 1,
 
     fn name(self: *const DevEntry) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -277,6 +282,7 @@ const QpEntry = struct {
     dev_name_buf: [64]u8 = @splat(0),
     dev_name_len: usize = 0,
     role: QpRole,
+    dev: *DevEntry,
     handle: *anyopaque,
     local: CEndpoint,
     state: QpState = .init,
@@ -284,6 +290,9 @@ const QpEntry = struct {
     peer_qpn: u32 = 0,
     peer_psn: u32 = 0,
     in_use: bool = false,
+    /// Set when removed from `mgr.qps` while `in_use == true`; destroyed by the owning op on exit.
+    retired: bool = false,
+    stop_flag: std.atomic.Value(c_int) = .init(0),
 
     fn peerBox(self: *const QpEntry) []const u8 {
         return self.peer_box_buf[0..self.peer_box_len];
@@ -308,11 +317,13 @@ const OfferEntry = struct {
     buf_allocator: std.mem.Allocator,
     reserved_export_bytes: u64,
     expires_at_ms: i64,
-    deadline_mono_ms: u64,
+    timeout_ms: u64,
     state: OfferState = .pinned,
     stop_flag: std.atomic.Value(c_int) = .init(0),
     thread: ?std.Thread = null,
-    qp_handle: ?*anyopaque = null,
+    /// Protected by `Manager.mu`: 1 for membership in `mgr.offers` + 1 per active responder/joiner.
+    /// Memory is freed only when `refcount` transitions `1 -> 0`.
+    refcount: u32 = 1,
 
     fn idSlice(self: *const OfferEntry) []const u8 {
         return &self.transfer_id;
@@ -340,19 +351,20 @@ const ResponderCtx = struct {
     mgr: *Manager,
     io: std.Io,
     offer: *OfferEntry,
-    qp_handle: *anyopaque,
+    qp: *QpEntry,
 };
 
 fn responderMain(ctx: ResponderCtx) void {
     var err_buf: [256]u8 = @splat(0);
     const offer = ctx.offer;
+    const qp = ctx.qp;
     const status = ctx.mgr.transport.serve_offer(
         ctx.mgr.transport.ctx,
-        ctx.qp_handle,
+        qp.handle,
         offer.buf_ptr[0..offer.buf_len],
         offer.tid_16,
         &offer.stop_flag,
-        offer.deadline_mono_ms,
+        offer.timeout_ms,
         &err_buf,
     );
     const qp_broken = (status == .timeout or status == .io_error);
@@ -365,18 +377,43 @@ fn responderMain(ctx: ResponderCtx) void {
         });
     }
 
-    ctx.mgr.mu.lockUncancelable(ctx.io);
-    defer ctx.mgr.mu.unlock(ctx.io);
-    if (status == .ok and offer.state == .serving) {
-        offer.state = .served;
-    }
-    if (ctx.mgr.findQpIndexLocked(offer.dstBox(), offer.devName(), .send)) |q_idx| {
-        if (ctx.mgr.qps.items[q_idx].handle == ctx.qp_handle) {
-            ctx.mgr.qps.items[q_idx].in_use = false;
-            if (qp_broken) ctx.mgr.removeQpAtLocked(q_idx);
+    var free_offer = false;
+    var destroy_qp: ?*QpEntry = null;
+    var close_dev: ?*DevEntry = null;
+    {
+        ctx.mgr.mu.lockUncancelable(ctx.io);
+        defer ctx.mgr.mu.unlock(ctx.io);
+        if (status == .ok and offer.state == .serving) {
+            offer.state = .served;
         }
+        qp.in_use = false;
+        if (qp.retired) {
+            destroy_qp = qp;
+        } else if (qp_broken) {
+            if (ctx.mgr.findQpEntryIndexLocked(qp)) |q_idx| {
+                _ = ctx.mgr.qps.swapRemove(q_idx);
+                qp.retired = true;
+                destroy_qp = qp;
+            }
+        }
+        if (destroy_qp) |dq| {
+            close_dev = ctx.mgr.decDevRefLocked(dq.dev);
+        }
+        free_offer = ctx.mgr.decOfferRefLocked(offer);
+        ctx.mgr.active_ops -|= 1;
     }
-    ctx.mgr.active_ops -|= 1;
+
+    if (destroy_qp) |dq| {
+        ctx.mgr.transport.qp_destroy(ctx.mgr.transport.ctx, dq.handle);
+        ctx.mgr.alloc().destroy(dq);
+    }
+    if (close_dev) |cd| {
+        ctx.mgr.transport.dev_close(ctx.mgr.transport.ctx, cd.handle);
+        ctx.mgr.alloc().destroy(cd);
+    }
+    if (free_offer) {
+        offer.freeResources(ctx.mgr.alloc());
+    }
 }
 
 const ConsumedId = struct {
@@ -388,19 +425,24 @@ const ConsumedId = struct {
     }
 };
 
+const JoinItem = struct {
+    offer: *OfferEntry,
+    thread: ?std.Thread,
+};
+
 pub const Manager = struct {
     mu: std.Io.Mutex = .init,
     transport: Transport = real_transport,
     cache_hooks: ?CacheHooks = null,
     clock_fn: *const fn (std.Io) i64 = io_util.nowMsMonotonic,
     test_available_override: ?bool = null,
-    devs: std.ArrayList(DevEntry) = .empty,
-    qps: std.ArrayList(QpEntry) = .empty,
+    devs: std.ArrayList(*DevEntry) = .empty,
+    qps: std.ArrayList(*QpEntry) = .empty,
     offers: std.ArrayList(*OfferEntry) = .empty,
     consumed: [CONSUMED_RING_LEN]ConsumedId = @splat(.{}),
     consumed_next: usize = 0,
     active_ops: u32 = 0,
-    quiescing: bool = false,
+    quiescing_count: u32 = 0,
 
     fn alloc(self: *const Manager) std.mem.Allocator {
         _ = self;
@@ -416,8 +458,22 @@ pub const Manager = struct {
         return self.transport.available(self.transport.ctx);
     }
 
+    fn decDevRefLocked(self: *Manager, dev: *DevEntry) ?*DevEntry {
+        _ = self;
+        std.debug.assert(dev.refcount > 0);
+        dev.refcount -= 1;
+        return if (dev.refcount == 0) dev else null;
+    }
+
+    fn decOfferRefLocked(self: *Manager, offer: *OfferEntry) bool {
+        _ = self;
+        std.debug.assert(offer.refcount > 0);
+        offer.refcount -= 1;
+        return offer.refcount == 0;
+    }
+
     fn findDevLocked(self: *Manager, dev_name: []const u8) ?*DevEntry {
-        for (self.devs.items) |*d| {
+        for (self.devs.items) |d| {
             if (std.mem.eql(u8, d.name(), dev_name)) return d;
         }
         return null;
@@ -430,44 +486,129 @@ pub const Manager = struct {
             return null;
         }
         const h = self.transport.dev_open(self.transport.ctx, dev_name, err_buf) orelse return null;
-        var entry: DevEntry = .{ .handle = h, .name_len = dev_name.len };
-        @memcpy(entry.name_buf[0..dev_name.len], dev_name);
-        self.devs.append(self.alloc(), entry) catch {
+        const entry = self.alloc().create(DevEntry) catch {
             self.transport.dev_close(self.transport.ctx, h);
             _ = std.fmt.bufPrint(err_buf, "out of memory storing rdma dev\x00", .{}) catch {};
             return null;
         };
-        return &self.devs.items[self.devs.items.len - 1];
+        entry.* = .{ .handle = h, .name_len = dev_name.len, .refcount = 1 };
+        @memcpy(entry.name_buf[0..dev_name.len], dev_name);
+        self.devs.append(self.alloc(), entry) catch {
+            self.transport.dev_close(self.transport.ctx, h);
+            self.alloc().destroy(entry);
+            _ = std.fmt.bufPrint(err_buf, "out of memory storing rdma dev\x00", .{}) catch {};
+            return null;
+        };
+        return entry;
     }
 
     fn findQpIndexLocked(self: *Manager, peer_box: []const u8, dev_name: []const u8, role: QpRole) ?usize {
-        for (self.qps.items, 0..) |*q, idx| {
+        for (self.qps.items, 0..) |q, idx| {
             if (q.role == role and std.mem.eql(u8, q.peerBox(), peer_box) and std.mem.eql(u8, q.devName(), dev_name)) return idx;
         }
         return null;
     }
 
-    fn removeQpAtLocked(self: *Manager, idx: usize) void {
+    fn findQpEntryIndexLocked(self: *Manager, target: *const QpEntry) ?usize {
+        for (self.qps.items, 0..) |q, idx| {
+            if (q == target) return idx;
+        }
+        return null;
+    }
+
+    fn createQpLocked(
+        self: *Manager,
+        io: std.Io,
+        dev: *DevEntry,
+        peer_box: []const u8,
+        rdma_dev: []const u8,
+        role: QpRole,
+        local_out: *CEndpoint,
+        err_buf: []u8,
+    ) ?*QpEntry {
+        if (self.qps.items.len >= MAX_QPS) {
+            _ = std.fmt.bufPrint(err_buf, "too many active RDMA QPs\x00", .{}) catch {};
+            return null;
+        }
+        const psn = randomPsn(io);
+        const q_handle = self.transport.qp_create(self.transport.ctx, dev.handle, psn, role == .send, local_out, err_buf) orelse return null;
+        const qe = self.alloc().create(QpEntry) catch {
+            self.transport.qp_destroy(self.transport.ctx, q_handle);
+            _ = std.fmt.bufPrint(err_buf, "out of memory allocating qp entry\x00", .{}) catch {};
+            return null;
+        };
+        qe.* = .{
+            .role = role,
+            .dev = dev,
+            .handle = q_handle,
+            .local = local_out.*,
+            .state = .init,
+            .peer_box_len = peer_box.len,
+            .dev_name_len = rdma_dev.len,
+        };
+        @memcpy(qe.peer_box_buf[0..peer_box.len], peer_box);
+        @memcpy(qe.dev_name_buf[0..rdma_dev.len], rdma_dev);
+        self.qps.append(self.alloc(), qe) catch {
+            self.transport.qp_destroy(self.transport.ctx, q_handle);
+            self.alloc().destroy(qe);
+            _ = std.fmt.bufPrint(err_buf, "out of memory storing qp entry\x00", .{}) catch {};
+            return null;
+        };
+        dev.refcount += 1;
+        return qe;
+    }
+
+    /// Remove QP at `idx` from `self.qps` and either destroy immediately (if `!in_use`) or mark
+    /// `retired = true` so the active op destroys it safely on exit (never UAF!).
+    fn retireQpAtLocked(self: *Manager, idx: usize) struct { qp: ?*QpEntry, dev: ?*DevEntry } {
         const q = self.qps.swapRemove(idx);
-        self.transport.qp_destroy(self.transport.ctx, q.handle);
+        q.stop_flag.store(1, .release);
+        q.retired = true;
+        if (q.in_use) {
+            return .{ .qp = null, .dev = null };
+        }
+        const close_dev = self.decDevRefLocked(q.dev);
+        return .{ .qp = q, .dev = close_dev };
+    }
+
+    fn destroyRetiredQp(self: *Manager, qp: ?*QpEntry, dev: ?*DevEntry) void {
+        if (qp) |q| {
+            self.transport.qp_destroy(self.transport.ctx, q.handle);
+            self.alloc().destroy(q);
+        }
+        if (dev) |d| {
+            self.transport.dev_close(self.transport.ctx, d.handle);
+            self.alloc().destroy(d);
+        }
+    }
+
+    fn hasActiveOfferForLinkLocked(self: *Manager, dst_box: []const u8, rdma_dev: []const u8) bool {
+        for (self.offers.items) |o| {
+            if ((o.state == .pinned or o.state == .serving) and
+                std.mem.eql(u8, o.dstBox(), dst_box) and std.mem.eql(u8, o.devName(), rdma_dev))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn spawnResponderLocked(self: *Manager, io: std.Io, offer: *OfferEntry, q: *QpEntry) bool {
-        if (q.in_use or q.state != .rts) return false;
+        if (q.in_use or q.state != .rts or q.retired) return false;
         offer.stop_flag.store(0, .release);
-        offer.qp_handle = q.handle;
         offer.state = .serving;
+        offer.refcount += 1; // owned by responderMain
         q.in_use = true;
         self.active_ops += 1;
         const th = std.Thread.spawn(.{}, responderMain, .{ResponderCtx{
             .mgr = self,
             .io = io,
             .offer = offer,
-            .qp_handle = q.handle,
+            .qp = q,
         }}) catch {
             q.in_use = false;
             self.active_ops -|= 1;
-            offer.qp_handle = null;
+            offer.refcount -= 1;
             offer.state = .pinned;
             return false;
         };
@@ -475,31 +616,15 @@ pub const Manager = struct {
         return true;
     }
 
-    /// Detach any expired offers under lock, returning them so the caller can join their
-    /// responder threads WITHOUT holding `self.mu` and then free their resources.
-    fn collectExpiredLocked(self: *Manager, now_ms: i64, out: []*OfferEntry) usize {
-        var count: usize = 0;
-        var i: usize = 0;
-        while (i < self.offers.items.len and count < out.len) {
-            if (now_ms >= self.offers.items[i].expires_at_ms) {
-                const removed = self.offers.swapRemove(i);
-                removed.stop_flag.store(1, .release);
-                out[count] = removed;
-                count += 1;
-            } else {
-                i += 1;
-            }
-        }
-        return count;
-    }
-
-    fn finishDetachedOffers(self: *Manager, detached: []*OfferEntry) void {
-        for (detached) |o| {
-            if (o.thread) |t| {
-                o.thread = null;
-                t.join();
-            }
-            o.freeResources(self.alloc());
+    fn joinAndReleaseOffers(self: *Manager, io: std.Io, items: []JoinItem) void {
+        for (items) |it| {
+            if (it.thread) |t| t.join();
+            const should_free = blk: {
+                self.mu.lockUncancelable(io);
+                defer self.mu.unlock(io);
+                break :blk self.decOfferRefLocked(it.offer);
+            };
+            if (should_free) it.offer.freeResources(self.alloc());
         }
     }
 
@@ -515,34 +640,109 @@ pub const Manager = struct {
         return true;
     }
 
+    /// Blocking sweep that removes all expired offers, joins any running responders outside the
+    /// mutex, and releases their memory in batches until none remain expired.
     pub fn sweepExpired(self: *Manager, io: std.Io) usize {
-        var detached_buf: [MAX_OFFERS]*OfferEntry = undefined;
-        const count = blk: {
+        var total: usize = 0;
+        while (true) {
+            var batch: [MAX_OFFERS]JoinItem = undefined;
+            var n: usize = 0;
+            {
+                self.mu.lockUncancelable(io);
+                defer self.mu.unlock(io);
+                const now_ms = self.nowMs(io);
+                var i: usize = 0;
+                while (i < self.offers.items.len and n < batch.len) {
+                    const o = self.offers.items[i];
+                    if (now_ms >= o.expires_at_ms) {
+                        _ = self.offers.swapRemove(i);
+                        o.stop_flag.store(1, .release);
+                        const th = o.thread;
+                        o.thread = null;
+                        // Transfer the `mgr.offers` reference to `batch[n]`.
+                        batch[n] = .{ .offer = o, .thread = th };
+                        n += 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            if (n == 0) break;
+            self.joinAndReleaseOffers(io, batch[0..n]);
+            total += n;
+        }
+        return total;
+    }
+
+    /// Non-blocking sweep safe for latency-sensitive endpoints like `GET /v1/internal/mode`:
+    /// immediately frees expired offers that have no unjoined thread, and signals `stop_flag` on
+    /// any still-running expired responders without blocking on `thread.join()`.
+    pub fn sweepExpiredNonBlocking(self: *Manager, io: std.Io) usize {
+        var to_free: [MAX_OFFERS]*OfferEntry = undefined;
+        var n: usize = 0;
+        {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
-            break :blk self.collectExpiredLocked(self.nowMs(io), &detached_buf);
-        };
-        if (count > 0) self.finishDetachedOffers(detached_buf[0..count]);
-        return count;
+            const now_ms = self.nowMs(io);
+            var i: usize = 0;
+            while (i < self.offers.items.len and n < to_free.len) {
+                const o = self.offers.items[i];
+                if (now_ms >= o.expires_at_ms) {
+                    o.stop_flag.store(1, .release);
+                    if (o.thread == null) {
+                        _ = self.offers.swapRemove(i);
+                        if (self.decOfferRefLocked(o)) {
+                            to_free[n] = o;
+                            n += 1;
+                        }
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+        for (to_free[0..n]) |o| o.freeResources(self.alloc());
+        return n;
     }
 
     pub fn quiesce(self: *Manager, io: std.Io) struct { qps_closed: usize, offers_cleared: usize } {
-        var detached_buf: [MAX_OFFERS]*OfferEntry = undefined;
-        var detached_n: usize = 0;
+        var offers_cleared: usize = 0;
 
         self.mu.lockUncancelable(io);
-        self.quiescing = true;
-        while (self.offers.items.len > 0 and detached_n < detached_buf.len) {
-            const o = self.offers.pop().?;
-            o.stop_flag.store(1, .release);
-            detached_buf[detached_n] = o;
-            detached_n += 1;
-        }
+        self.quiescing_count += 1;
+        // Signal every active pull/send QP and every offer to stop immediately.
+        for (self.qps.items) |q| q.stop_flag.store(1, .release);
+        for (self.offers.items) |o| o.stop_flag.store(1, .release);
         self.mu.unlock(io);
 
-        // Join all offer responder threads outside the mutex so they can exit cleanly.
-        self.finishDetachedOffers(detached_buf[0..detached_n]);
+        defer {
+            self.mu.lockUncancelable(io);
+            self.quiescing_count -|= 1;
+            self.mu.unlock(io);
+        }
 
+        // Drain all offers in batches and join their responder threads outside the mutex.
+        while (true) {
+            var batch: [MAX_OFFERS]JoinItem = undefined;
+            var n: usize = 0;
+            {
+                self.mu.lockUncancelable(io);
+                defer self.mu.unlock(io);
+                while (self.offers.items.len > 0 and n < batch.len) {
+                    const o = self.offers.pop().?;
+                    o.stop_flag.store(1, .release);
+                    const th = o.thread;
+                    o.thread = null;
+                    batch[n] = .{ .offer = o, .thread = th };
+                    n += 1;
+                }
+            }
+            if (n == 0) break;
+            self.joinAndReleaseOffers(io, batch[0..n]);
+            offers_cleared += n;
+        }
+
+        // Wait briefly for any active pulls / handlers to unwind after stop_flag.
         self.mu.lockUncancelable(io);
         const wait_deadline = io_util.nowMsMonotonic(io) + QUIESCE_WAIT_MS;
         while (self.active_ops > 0 and io_util.nowMsMonotonic(io) < wait_deadline) {
@@ -550,23 +750,55 @@ pub const Manager = struct {
             std.Io.sleep(io, .fromMilliseconds(5), .real) catch {};
             self.mu.lockUncancelable(io);
         }
-        defer {
-            self.quiescing = false;
-            self.mu.unlock(io);
-        }
 
-        const qps_closed = self.qps.items.len;
-        for (self.qps.items) |q| {
+        // Retire all QPs and remove all devices from the active tables. Any QP still `in_use`
+        // (or device still referenced by an in-use QP) stays alive via refcount and is destroyed
+        // safely by the unwinding op's exit path — zero UAF even if `active_ops > 0`.
+        var qps_to_destroy: [MAX_QPS]*QpEntry = undefined;
+        var qps_destroy_n: usize = 0;
+        var devs_to_close: [MAX_QPS]*DevEntry = undefined;
+        var devs_close_n: usize = 0;
+        var qps_closed: usize = 0;
+
+        while (self.qps.items.len > 0) {
+            const q = self.qps.pop().?;
+            q.stop_flag.store(1, .release);
+            q.retired = true;
+            qps_closed += 1;
+            if (!q.in_use) {
+                if (qps_destroy_n < qps_to_destroy.len) {
+                    qps_to_destroy[qps_destroy_n] = q;
+                    qps_destroy_n += 1;
+                }
+                if (self.decDevRefLocked(q.dev)) |d| {
+                    if (devs_close_n < devs_to_close.len) {
+                        devs_to_close[devs_close_n] = d;
+                        devs_close_n += 1;
+                    }
+                }
+            }
+        }
+        while (self.devs.items.len > 0) {
+            const d = self.devs.pop().?;
+            if (self.decDevRefLocked(d)) |dead| {
+                if (devs_close_n < devs_to_close.len) {
+                    devs_to_close[devs_close_n] = dead;
+                    devs_close_n += 1;
+                }
+            }
+        }
+        self.mu.unlock(io);
+
+        for (qps_to_destroy[0..qps_destroy_n]) |q| {
             self.transport.qp_destroy(self.transport.ctx, q.handle);
+            self.alloc().destroy(q);
         }
-        self.qps.clearRetainingCapacity();
-
-        for (self.devs.items) |d| {
+        for (devs_to_close[0..devs_close_n]) |d| {
             self.transport.dev_close(self.transport.ctx, d.handle);
+            self.alloc().destroy(d);
         }
-        self.devs.clearRetainingCapacity();
 
-        return .{ .qps_closed = qps_closed, .offers_cleared = detached_n };
+        return .{ .qps_closed = qps_closed, .offers_cleared = offers_cleared };
     }
 
     pub fn deinitAll(self: *Manager, io: std.Io) void {
@@ -607,11 +839,27 @@ pub fn sweepExpired(io: std.Io) void {
     _ = g_manager.sweepExpired(io);
 }
 
+pub fn sweepExpiredNonBlocking(io: std.Io) void {
+    _ = g_manager.sweepExpiredNonBlocking(io);
+}
+
 pub fn quiesceGlobal(io: std.Io) void {
     _ = g_manager.quiesce(io);
 }
 
-// ── Hex / GID / Transfer-ID Helpers ──────────────────────────────────────────
+// ── Hex / GID / Transfer-ID / Identifier Helpers ─────────────────────────────
+
+fn isSafeIdent(s: []const u8) bool {
+    if (s.len == 0 or s.len >= 64) return false;
+    for (s) |c| {
+        const ok = (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or
+            c == '_' or c == '-' or c == '.' or c == ':';
+        if (!ok) return false;
+    }
+    return true;
+}
 
 fn formatGidHex(gid: [16]u8) [32]u8 {
     return std.fmt.bytesToHex(gid, .lower);
@@ -640,6 +888,12 @@ fn randomTransferId(io: std.Io) struct { hex: [32]u8, raw: [16]u8 } {
     var rnd: [16]u8 = undefined;
     io.random(&rnd);
     return .{ .hex = std.fmt.bytesToHex(rnd, .lower), .raw = rnd };
+}
+
+fn randomPsn(io: std.Io) u32 {
+    var rnd: [4]u8 = undefined;
+    io.random(&rnd);
+    return std.mem.readInt(u32, &rnd, .little) & 0x00ffffff;
 }
 
 fn transferIdTo16(transfer_id: []const u8) [16]u8 {
@@ -740,8 +994,9 @@ pub fn handleRequestOn(
             try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Method not allowed", 405);
             return;
         }
-        if (inst.sw.snapshot().mode != .tp1) {
-            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA cache transfer unavailable outside TP1", 503, "rdma_tp4_active");
+        const snap = inst.sw.snapshot();
+        if (snap.mode != .tp1 or !snap.admitting) {
+            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA cache transfer unavailable outside admitting TP1", 503, "rdma_tp4_active");
             return;
         }
         return handleOffer(mgr, allocator, stream, body);
@@ -752,8 +1007,9 @@ pub fn handleRequestOn(
             try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Method not allowed", 405);
             return;
         }
-        if (inst.sw.snapshot().mode != .tp1) {
-            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA cache transfer unavailable outside TP1", 503, "rdma_tp4_active");
+        const snap = inst.sw.snapshot();
+        if (snap.mode != .tp1 or !snap.admitting) {
+            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA cache transfer unavailable outside admitting TP1", 503, "rdma_tp4_active");
             return;
         }
         return handleAccept(mgr, allocator, stream, body);
@@ -764,8 +1020,9 @@ pub fn handleRequestOn(
             try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Method not allowed", 405);
             return;
         }
-        if (inst.sw.snapshot().mode != .tp1) {
-            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA cache transfer unavailable outside TP1", 503, "rdma_tp4_active");
+        const snap = inst.sw.snapshot();
+        if (snap.mode != .tp1 or !snap.admitting) {
+            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA cache transfer unavailable outside admitting TP1", 503, "rdma_tp4_active");
             return;
         }
         return handlePull(mgr, allocator, stream, body);
@@ -811,13 +1068,12 @@ fn handleOffer(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body:
         try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing rdma_dev", 400, "bad_request");
         return;
     };
-    const raw_expires = getPositiveU64(obj, "expires_ms") orelse 35_000;
-    const expires_ms = std.math.clamp(raw_expires, MIN_EXPIRES_MS, MAX_EXPIRES_MS);
-
-    if (dst_box.len >= 64 or rdma_dev.len >= 64) {
-        try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "dst_box or rdma_dev too long", 400, "bad_request");
+    if (!isSafeIdent(dst_box) or !isSafeIdent(rdma_dev)) {
+        try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid dst_box or rdma_dev identifier", 400, "bad_request");
         return;
     }
+    const raw_expires = getPositiveU64(obj, "expires_ms") orelse 35_000;
+    const expires_ms = std.math.clamp(raw_expires, MIN_EXPIRES_MS, MAX_EXPIRES_MS);
 
     _ = mgr.sweepExpired(stream.io);
 
@@ -826,12 +1082,16 @@ fn handleOffer(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body:
     {
         mgr.mu.lockUncancelable(stream.io);
         defer mgr.mu.unlock(stream.io);
-        if (mgr.quiescing) {
+        if (mgr.quiescing_count > 0) {
             try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA transport quiescing", 503, "rdma_unavailable");
             return;
         }
         if (mgr.offers.items.len >= MAX_OFFERS) {
             try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "Too many pinned RDMA offers", 503, "rdma_busy");
+            return;
+        }
+        if (mgr.hasActiveOfferForLinkLocked(dst_box, rdma_dev)) {
+            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA link already has an active offer", 503, "rdma_busy");
             return;
         }
         if (mgr.findQpIndexLocked(dst_box, rdma_dev, .send)) |q_idx| {
@@ -915,8 +1175,17 @@ fn handleOffer(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body:
     {
         mgr.mu.lockUncancelable(stream.io);
         defer mgr.mu.unlock(stream.io);
-        if (mgr.quiescing) {
+        if (mgr.quiescing_count > 0) {
             try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA transport quiescing", 503, "rdma_unavailable");
+            return;
+        }
+        // Re-check capacity and per-link exclusion under lock #2 to eliminate TOCTOU races.
+        if (mgr.offers.items.len >= MAX_OFFERS) {
+            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "Too many pinned RDMA offers", 503, "rdma_busy");
+            return;
+        }
+        if (mgr.hasActiveOfferForLinkLocked(dst_box, rdma_dev)) {
+            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA link already has an active offer", 503, "rdma_busy");
             return;
         }
         const dev = mgr.findDevLocked(rdma_dev) orelse {
@@ -924,42 +1193,26 @@ fn handleOffer(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body:
             return;
         };
 
-        var q_idx: usize = undefined;
+        var qp_entry: *QpEntry = undefined;
         if (mgr.findQpIndexLocked(dst_box, rdma_dev, .send)) |existing| {
-            if (mgr.qps.items[existing].in_use) {
+            qp_entry = mgr.qps.items[existing];
+            if (qp_entry.in_use) {
                 try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA sender QP busy", 503, "rdma_busy");
                 return;
             }
-            q_idx = existing;
-            local_ep = mgr.qps.items[existing].local;
-            qp_mode = if (mgr.qps.items[existing].state == .rts) "persistent" else "accept";
+            local_ep = qp_entry.local;
+            qp_mode = if (qp_entry.state == .rts) "persistent" else "accept";
         } else {
-            const q_handle = mgr.transport.qp_create(mgr.transport.ctx, dev.handle, DEFAULT_PSN, true, &local_ep, &err_buf) orelse {
+            qp_entry = mgr.createQpLocked(stream.io, dev, dst_box, rdma_dev, .send, &local_ep, &err_buf) orelse {
                 const detail = cErrSlice(&err_buf);
-                try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "ibv_create_qp failed", 503, "rdma_unavailable");
+                const reason: []const u8 = if (std.mem.indexOf(u8, detail, "too many") != null) "rdma_busy" else "rdma_unavailable";
+                try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "ibv_create_qp failed", 503, reason);
                 return;
             };
-            var qe: QpEntry = .{
-                .role = .send,
-                .handle = q_handle,
-                .local = local_ep,
-                .state = .init,
-                .peer_box_len = dst_box.len,
-                .dev_name_len = rdma_dev.len,
-            };
-            @memcpy(qe.peer_box_buf[0..dst_box.len], dst_box);
-            @memcpy(qe.dev_name_buf[0..rdma_dev.len], rdma_dev);
-            mgr.qps.append(mgr.alloc(), qe) catch {
-                mgr.transport.qp_destroy(mgr.transport.ctx, q_handle);
-                try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Out of memory", 503);
-                return;
-            };
-            q_idx = mgr.qps.items.len - 1;
             qp_mode = "accept";
         }
 
         const now_ms = mgr.nowMs(stream.io);
-        const now_mono: u64 = @intCast(@max(io_util.nowMsMonotonic(stream.io), 0));
         const oe = mgr.alloc().create(OfferEntry) catch {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Out of memory storing offer", 503);
             return;
@@ -974,8 +1227,9 @@ fn handleOffer(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body:
             .buf_allocator = export_alloc,
             .reserved_export_bytes = reserved_bytes,
             .expires_at_ms = now_ms +| @as(i64, @intCast(expires_ms)),
-            .deadline_mono_ms = now_mono +| expires_ms,
+            .timeout_ms = expires_ms,
             .state = .pinned,
+            .refcount = 1,
         };
         @memcpy(oe.dst_box_buf[0..dst_box.len], dst_box);
         @memcpy(oe.dev_name_buf[0..rdma_dev.len], rdma_dev);
@@ -989,8 +1243,8 @@ fn handleOffer(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body:
 
         // If the persistent sender QP is already RTS, arm the UC responder BEFORE returning 200
         // so dst:/pull can immediately send its REQ doorbell without racing.
-        if (mgr.qps.items[q_idx].state == .rts) {
-            if (!mgr.spawnResponderLocked(stream.io, oe, &mgr.qps.items[q_idx])) {
+        if (qp_entry.state == .rts) {
+            if (!mgr.spawnResponderLocked(stream.io, oe, qp_entry)) {
                 _ = mgr.offers.pop();
                 oe.freeResources(mgr.alloc());
                 try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "Failed to arm RDMA responder", 503, "rdma_unavailable");
@@ -1050,15 +1304,25 @@ fn handleAccept(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body
         try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing rdma_dev", 400, "bad_request");
         return;
     };
-    if (peer_box.len >= 64 or rdma_dev.len >= 64) {
-        try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "peer_box or rdma_dev too long", 400, "bad_request");
+    if (!isSafeIdent(peer_box) or !isSafeIdent(rdma_dev)) {
+        try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid peer_box or rdma_dev identifier", 400, "bad_request");
         return;
     }
     const reset = getOptionalBool(obj, "reset") orelse false;
+    const transfer_id_opt = getOptionalString(obj, "transfer_id");
     const peer_gid_str = getOptionalString(obj, "peer_gid");
     const peer_qpn_opt = getOptionalU32(obj, "peer_qpn");
-    const peer_psn = getOptionalU32(obj, "peer_psn") orelse DEFAULT_PSN;
-    const peer_lid: u16 = @intCast(getOptionalU32(obj, "peer_lid") orelse 0);
+    const peer_psn = (getOptionalU32(obj, "peer_psn") orelse DEFAULT_PSN) & 0x00ffffff;
+    const peer_lid: u16 = blk: {
+        if (obj.get("peer_lid")) |v| {
+            if (v != .integer or v.integer < 0 or v.integer > std.math.maxInt(u16)) {
+                try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid peer_lid (must be 0..65535)", 400, "bad_request");
+                return;
+            }
+            break :blk @intCast(v.integer);
+        }
+        break :blk 0;
+    };
 
     _ = mgr.sweepExpired(stream.io);
 
@@ -1066,72 +1330,68 @@ fn handleAccept(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body
     var local_ep: CEndpoint = .{};
     var status_str: []const u8 = "init";
 
-    // Reset-only call (src self-healing after dst restart): stop any responder waiting on the
-    // old sender QP, recreate a fresh INIT sender QP, and return its new endpoint.
+    // Reset-only call (src self-healing after dst restart): stop & join any responder waiting on
+    // the old sender QP (holding an OfferEntry ref while joining so concurrent sweep/delete cannot
+    // UAF!), recreate a fresh INIT sender QP with a fresh random PSN, and return its endpoint.
     if (reset and peer_gid_str == null and peer_qpn_opt == null) {
-        // First stop and join any responder currently bound to (peer_box, rdma_dev, .send)
-        // WITHOUT holding mgr.mu during thread.join().
-        var stopped_threads: [MAX_OFFERS]std.Thread = undefined;
-        var stopped_n: usize = 0;
+        while (true) {
+            var join_batch: [MAX_OFFERS]JoinItem = undefined;
+            var join_n: usize = 0;
+            {
+                mgr.mu.lockUncancelable(stream.io);
+                defer mgr.mu.unlock(stream.io);
+                for (mgr.offers.items) |o| {
+                    if (std.mem.eql(u8, o.dstBox(), peer_box) and std.mem.eql(u8, o.devName(), rdma_dev)) {
+                        o.stop_flag.store(1, .release);
+                        if (o.thread) |t| {
+                            if (join_n < join_batch.len) {
+                                o.thread = null;
+                                o.refcount += 1; // pin OfferEntry while joining outside mutex
+                                join_batch[join_n] = .{ .offer = o, .thread = t };
+                                join_n += 1;
+                            }
+                        }
+                        if (o.state == .serving) o.state = .pinned;
+                    }
+                }
+            }
+            if (join_n == 0) break;
+            mgr.joinAndReleaseOffers(stream.io, join_batch[0..join_n]);
+        }
+
+        var retired_qp: ?*QpEntry = null;
+        var retired_dev: ?*DevEntry = null;
         {
             mgr.mu.lockUncancelable(stream.io);
             defer mgr.mu.unlock(stream.io);
-            for (mgr.offers.items) |o| {
-                if (std.mem.eql(u8, o.dstBox(), peer_box) and std.mem.eql(u8, o.devName(), rdma_dev)) {
-                    o.stop_flag.store(1, .release);
-                    if (o.thread) |t| {
-                        o.thread = null;
-                        if (stopped_n < stopped_threads.len) {
-                            stopped_threads[stopped_n] = t;
-                            stopped_n += 1;
-                        }
-                    }
-                    if (o.state == .serving) o.state = .pinned;
-                    o.qp_handle = null;
-                }
-            }
-        }
-        for (stopped_threads[0..stopped_n]) |t| t.join();
-
-        mgr.mu.lockUncancelable(stream.io);
-        defer mgr.mu.unlock(stream.io);
-        if (mgr.quiescing) {
-            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA transport quiescing", 503, "rdma_unavailable");
-            return;
-        }
-        const dev = mgr.getOrOpenDevLocked(rdma_dev, &err_buf) orelse {
-            const detail = cErrSlice(&err_buf);
-            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "RDMA device unavailable", 503, "rdma_unavailable");
-            return;
-        };
-        if (mgr.findQpIndexLocked(peer_box, rdma_dev, .send)) |idx| {
-            if (mgr.qps.items[idx].in_use) {
-                try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "QP currently busy", 503, "rdma_busy");
+            if (mgr.quiescing_count > 0) {
+                try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA transport quiescing", 503, "rdma_unavailable");
                 return;
             }
-            mgr.removeQpAtLocked(idx);
+            const dev = mgr.getOrOpenDevLocked(rdma_dev, &err_buf) orelse {
+                const detail = cErrSlice(&err_buf);
+                try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "RDMA device unavailable", 503, "rdma_unavailable");
+                return;
+            };
+            if (mgr.findQpIndexLocked(peer_box, rdma_dev, .send)) |idx| {
+                if (mgr.qps.items[idx].in_use) {
+                    try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "QP currently busy", 503, "rdma_busy");
+                    return;
+                }
+                const ret = mgr.retireQpAtLocked(idx);
+                retired_qp = ret.qp;
+                retired_dev = ret.dev;
+            }
+            if (mgr.createQpLocked(stream.io, dev, peer_box, rdma_dev, .send, &local_ep, &err_buf) == null) {
+                const detail = cErrSlice(&err_buf);
+                const reason: []const u8 = if (std.mem.indexOf(u8, detail, "too many") != null) "rdma_busy" else "rdma_unavailable";
+                mgr.destroyRetiredQp(retired_qp, retired_dev);
+                try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "ibv_create_qp failed", 503, reason);
+                return;
+            }
+            status_str = "init";
         }
-        const q_handle = mgr.transport.qp_create(mgr.transport.ctx, dev.handle, DEFAULT_PSN, true, &local_ep, &err_buf) orelse {
-            const detail = cErrSlice(&err_buf);
-            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "ibv_create_qp failed", 503, "rdma_unavailable");
-            return;
-        };
-        var qe: QpEntry = .{
-            .role = .send,
-            .handle = q_handle,
-            .local = local_ep,
-            .state = .init,
-            .peer_box_len = peer_box.len,
-            .dev_name_len = rdma_dev.len,
-        };
-        @memcpy(qe.peer_box_buf[0..peer_box.len], peer_box);
-        @memcpy(qe.dev_name_buf[0..rdma_dev.len], rdma_dev);
-        mgr.qps.append(mgr.alloc(), qe) catch {
-            mgr.transport.qp_destroy(mgr.transport.ctx, q_handle);
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Out of memory", 503);
-            return;
-        };
-        status_str = "init";
+        mgr.destroyRetiredQp(retired_qp, retired_dev);
     } else {
         const pg_str = peer_gid_str orelse {
             try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing peer_gid", 400, "bad_request");
@@ -1146,124 +1406,119 @@ fn handleAccept(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body
             return;
         };
 
-        mgr.mu.lockUncancelable(stream.io);
-        defer mgr.mu.unlock(stream.io);
-        if (mgr.quiescing) {
-            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA transport quiescing", 503, "rdma_unavailable");
-            return;
-        }
-        const dev = mgr.getOrOpenDevLocked(rdma_dev, &err_buf) orelse {
-            const detail = cErrSlice(&err_buf);
-            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "RDMA device unavailable", 503, "rdma_unavailable");
-            return;
-        };
-
-        // If this node has an INIT sender QP for (peer_box, rdma_dev) and !reset, this is src
-        // completing the handshake for its offered QPN. Otherwise this is dst connecting a recv QP.
-        const is_src_handshake = blk: {
-            if (reset) break :blk false;
-            if (mgr.findQpIndexLocked(peer_box, rdma_dev, .send)) |s_idx| {
-                break :blk mgr.qps.items[s_idx].state == .init;
+        var retired_qp: ?*QpEntry = null;
+        var retired_dev: ?*DevEntry = null;
+        {
+            mgr.mu.lockUncancelable(stream.io);
+            defer mgr.mu.unlock(stream.io);
+            if (mgr.quiescing_count > 0) {
+                try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA transport quiescing", 503, "rdma_unavailable");
+                return;
             }
-            break :blk false;
-        };
+            const dev = mgr.getOrOpenDevLocked(rdma_dev, &err_buf) orelse {
+                const detail = cErrSlice(&err_buf);
+                try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "RDMA device unavailable", 503, "rdma_unavailable");
+                return;
+            };
 
-        const role: QpRole = if (is_src_handshake) .send else .recv;
-        var idx: usize = undefined;
-        if (mgr.findQpIndexLocked(peer_box, rdma_dev, role)) |existing| {
-            const q = &mgr.qps.items[existing];
-            if (!reset and q.state == .rts and q.peer_qpn == peer_qpn and std.mem.eql(u8, &q.peer_gid, &peer_gid)) {
-                local_ep = q.local;
-                status_str = "ready";
-                idx = existing;
-            } else if (!reset and q.state == .init) {
-                idx = existing;
-            } else {
-                if (q.in_use) {
-                    try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "QP currently busy", 503, "rdma_busy");
+            // Explicit role disambiguation:
+            //   - `transfer_id` present (and `!reset`): `src:/accept` completing its `.send` QP
+            //     handshake and arming that exact offer. Never silently creates a bogus `.recv` QP!
+            //   - `transfer_id` absent (or `reset == true`): `dst:/accept` connecting its `.recv` QP.
+            const role: QpRole = if (!reset and transfer_id_opt != null) .send else .recv;
+
+            var qp_entry: *QpEntry = undefined;
+            if (role == .send) {
+                const s_idx = mgr.findQpIndexLocked(peer_box, rdma_dev, .send) orelse {
+                    try sendErrorResponseWithReason(allocator, stream, "409 Conflict", "conflict", "No pending INIT sender QP for peer", 409, "qp_reset");
+                    return;
+                };
+                qp_entry = mgr.qps.items[s_idx];
+                if (qp_entry.state != .init) {
+                    try sendErrorResponseWithReason(allocator, stream, "409 Conflict", "conflict", "Sender QP not in INIT state", 409, "qp_reset");
                     return;
                 }
-                mgr.removeQpAtLocked(existing);
-                const q_handle = mgr.transport.qp_create(mgr.transport.ctx, dev.handle, DEFAULT_PSN, role == .send, &local_ep, &err_buf) orelse {
-                    const detail = cErrSlice(&err_buf);
-                    try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "ibv_create_qp failed", 503, "rdma_unavailable");
-                    return;
-                };
-                var qe: QpEntry = .{
-                    .role = role,
-                    .handle = q_handle,
-                    .local = local_ep,
-                    .state = .init,
-                    .peer_box_len = peer_box.len,
-                    .dev_name_len = rdma_dev.len,
-                };
-                @memcpy(qe.peer_box_buf[0..peer_box.len], peer_box);
-                @memcpy(qe.dev_name_buf[0..rdma_dev.len], rdma_dev);
-                mgr.qps.append(mgr.alloc(), qe) catch {
-                    mgr.transport.qp_destroy(mgr.transport.ctx, q_handle);
-                    try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Out of memory", 503);
-                    return;
-                };
-                idx = mgr.qps.items.len - 1;
-            }
-        } else {
-            const q_handle = mgr.transport.qp_create(mgr.transport.ctx, dev.handle, DEFAULT_PSN, role == .send, &local_ep, &err_buf) orelse {
-                const detail = cErrSlice(&err_buf);
-                try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "ibv_create_qp failed", 503, "rdma_unavailable");
-                return;
-            };
-            var qe: QpEntry = .{
-                .role = role,
-                .handle = q_handle,
-                .local = local_ep,
-                .state = .init,
-                .peer_box_len = peer_box.len,
-                .dev_name_len = rdma_dev.len,
-            };
-            @memcpy(qe.peer_box_buf[0..peer_box.len], peer_box);
-            @memcpy(qe.dev_name_buf[0..rdma_dev.len], rdma_dev);
-            mgr.qps.append(mgr.alloc(), qe) catch {
-                mgr.transport.qp_destroy(mgr.transport.ctx, q_handle);
-                try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Out of memory", 503);
-                return;
-            };
-            idx = mgr.qps.items.len - 1;
-        }
-
-        if (!std.mem.eql(u8, status_str, "ready")) {
-            const q = &mgr.qps.items[idx];
-            if (!mgr.transport.qp_connect(mgr.transport.ctx, q.handle, peer_gid, peer_qpn, peer_psn, peer_lid, &err_buf)) {
-                mgr.removeQpAtLocked(idx);
-                const detail = cErrSlice(&err_buf);
-                try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "ibv_modify_qp failed", 503, "rdma_unavailable");
-                return;
-            }
-            q.state = .rts;
-            q.peer_gid = peer_gid;
-            q.peer_qpn = peer_qpn;
-            q.peer_psn = peer_psn;
-            local_ep = q.local;
-            status_str = "ready";
-
-            // On src handshake completion, immediately arm the responder for the newest pinned
-            // offer targeting (peer_box, rdma_dev) BEFORE returning HTTP 200.
-            if (role == .send) {
-                var j: usize = mgr.offers.items.len;
-                while (j > 0) {
-                    j -= 1;
-                    const o = mgr.offers.items[j];
-                    if (o.state == .pinned and o.thread == null and
-                        std.mem.eql(u8, o.dstBox(), peer_box) and std.mem.eql(u8, o.devName(), rdma_dev))
-                    {
-                        if (!mgr.spawnResponderLocked(stream.io, o, q)) {
-                            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "Failed to arm RDMA responder", 503, "rdma_unavailable");
+            } else {
+                if (mgr.findQpIndexLocked(peer_box, rdma_dev, .recv)) |existing| {
+                    const q = mgr.qps.items[existing];
+                    if (!reset and q.state == .rts and q.peer_qpn == peer_qpn and q.peer_psn == peer_psn and std.mem.eql(u8, &q.peer_gid, &peer_gid)) {
+                        qp_entry = q;
+                        local_ep = q.local;
+                        status_str = "ready";
+                    } else {
+                        if (q.in_use) {
+                            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "QP currently busy", 503, "rdma_busy");
                             return;
                         }
-                        break;
+                        const ret = mgr.retireQpAtLocked(existing);
+                        retired_qp = ret.qp;
+                        retired_dev = ret.dev;
+                        qp_entry = mgr.createQpLocked(stream.io, dev, peer_box, rdma_dev, .recv, &local_ep, &err_buf) orelse {
+                            const detail = cErrSlice(&err_buf);
+                            const reason: []const u8 = if (std.mem.indexOf(u8, detail, "too many") != null) "rdma_busy" else "rdma_unavailable";
+                            mgr.destroyRetiredQp(retired_qp, retired_dev);
+                            try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "ibv_create_qp failed", 503, reason);
+                            return;
+                        };
+                    }
+                } else {
+                    qp_entry = mgr.createQpLocked(stream.io, dev, peer_box, rdma_dev, .recv, &local_ep, &err_buf) orelse {
+                        const detail = cErrSlice(&err_buf);
+                        const reason: []const u8 = if (std.mem.indexOf(u8, detail, "too many") != null) "rdma_busy" else "rdma_unavailable";
+                        try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "ibv_create_qp failed", 503, reason);
+                        return;
+                    };
+                }
+            }
+
+            if (!std.mem.eql(u8, status_str, "ready")) {
+                // On src, verify the target offer is still pinned BEFORE transitioning the QP so a
+                // missing/expired offer does not burn the INIT QP.
+                var target_offer: ?*OfferEntry = null;
+                if (role == .send) {
+                    const want_tid = transfer_id_opt.?;
+                    for (mgr.offers.items) |o| {
+                        if (std.mem.eql(u8, o.idSlice(), want_tid) and o.state == .pinned and o.thread == null and
+                            std.mem.eql(u8, o.dstBox(), peer_box) and std.mem.eql(u8, o.devName(), rdma_dev))
+                        {
+                            target_offer = o;
+                            break;
+                        }
+                    }
+                    if (target_offer == null) {
+                        try sendErrorResponseWithReason(allocator, stream, "404 Not Found", "not_found", "Pinned offer not found for transfer_id", 404, "cache_miss");
+                        return;
+                    }
+                }
+
+                if (!mgr.transport.qp_connect(mgr.transport.ctx, qp_entry.handle, peer_gid, peer_qpn, peer_psn, peer_lid, &err_buf)) {
+                    if (mgr.findQpEntryIndexLocked(qp_entry)) |q_idx| {
+                        const ret = mgr.retireQpAtLocked(q_idx);
+                        mgr.destroyRetiredQp(ret.qp, ret.dev);
+                    }
+                    mgr.destroyRetiredQp(retired_qp, retired_dev);
+                    const detail = cErrSlice(&err_buf);
+                    try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", if (detail.len > 0) detail else "ibv_modify_qp failed", 503, "rdma_unavailable");
+                    return;
+                }
+                qp_entry.state = .rts;
+                qp_entry.peer_gid = peer_gid;
+                qp_entry.peer_qpn = peer_qpn;
+                qp_entry.peer_psn = peer_psn;
+                local_ep = qp_entry.local;
+                status_str = "ready";
+
+                if (role == .send) {
+                    const o = target_offer.?;
+                    if (!mgr.spawnResponderLocked(stream.io, o, qp_entry)) {
+                        mgr.destroyRetiredQp(retired_qp, retired_dev);
+                        try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "Failed to arm RDMA responder", 503, "rdma_unavailable");
+                        return;
                     }
                 }
             }
         }
+        mgr.destroyRetiredQp(retired_qp, retired_dev);
     }
 
     const gid_hex = formatGidHex(local_ep.gid);
@@ -1298,6 +1553,10 @@ fn handlePull(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body: 
         try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing transfer_id", 400, "bad_request");
         return;
     };
+    if (transfer_id.len > 128) {
+        try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "transfer_id too long", 400, "bad_request");
+        return;
+    }
     const src_box = getNonEmptyString(obj, "src_box") orelse {
         try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing src_box", 400, "bad_request");
         return;
@@ -1306,6 +1565,10 @@ fn handlePull(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body: 
         try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing rdma_dev", 400, "bad_request");
         return;
     };
+    if (!isSafeIdent(src_box) or !isSafeIdent(rdma_dev)) {
+        try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid src_box or rdma_dev identifier", 400, "bad_request");
+        return;
+    }
     const deadline_ms = std.math.clamp(getPositiveU64(obj, "deadline_ms") orelse 30_000, 1, MAX_PULL_DEADLINE_MS);
     const offer_val = obj.get("offer") orelse {
         try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing offer object", 400, "bad_request");
@@ -1335,7 +1598,7 @@ fn handlePull(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body: 
         return;
     }
 
-    // 2. Validate byte_len and regions.
+    // 2. Validate byte_len, regions, and optional offer.gid/qpn/psn.
     const byte_len = getPositiveU64(offer, "byte_len") orelse {
         try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid offer.byte_len", 400, "bad_offer");
         return;
@@ -1384,7 +1647,22 @@ fn handlePull(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body: 
     }
 
     const offer_qpn = getOptionalU32(offer, "qpn");
-    const offer_gid: ?[16]u8 = if (getOptionalString(offer, "gid")) |gs| parseGidHex(gs) else null;
+    const offer_psn: ?u32 = if (getOptionalU32(offer, "psn")) |p| p & 0x00ffffff else null;
+    const offer_gid: ?[16]u8 = blk: {
+        if (offer.get("gid")) |gv| {
+            if (gv == .null) break :blk null;
+            if (gv != .string or gv.string.len == 0) {
+                try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid offer.gid", 400, "bad_offer");
+                return;
+            }
+            const parsed_gid = parseGidHex(gv.string) orelse {
+                try sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", "Malformed offer.gid hex", 400, "bad_offer");
+                return;
+            };
+            break :blk parsed_gid;
+        }
+        break :blk null;
+    };
 
     // 3. Pre-DMA headroom + budget check (<1 ms, 0 bytes transferred on refusal -> 400 import_no_room).
     if (!http_server.reserveCacheImportBytes(byte_len)) {
@@ -1401,11 +1679,11 @@ fn handlePull(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body: 
     _ = mgr.sweepExpired(stream.io);
 
     // 4. Acquire connected RTS receiver QP + verify single-use transfer_id under lock (before RDMA).
-    var qp_handle: *anyopaque = undefined;
+    var qp_entry: *QpEntry = undefined;
     {
         mgr.mu.lockUncancelable(stream.io);
         defer mgr.mu.unlock(stream.io);
-        if (mgr.quiescing) {
+        if (mgr.quiescing_count > 0) {
             try sendErrorResponseWithReason(allocator, stream, "503 Service Unavailable", "server_error", "RDMA transport quiescing", 503, "rdma_unavailable");
             return;
         }
@@ -1417,7 +1695,7 @@ fn handlePull(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body: 
             try sendErrorResponseWithReason(allocator, stream, "409 Conflict", "conflict", "RDMA QP not connected for source peer", 409, "qp_reset");
             return;
         };
-        const q = &mgr.qps.items[q_idx];
+        const q = mgr.qps.items[q_idx];
         if (q.state != .rts) {
             try sendErrorResponseWithReason(allocator, stream, "409 Conflict", "conflict", "RDMA QP not in RTS state", 409, "qp_reset");
             return;
@@ -1425,6 +1703,12 @@ fn handlePull(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body: 
         if (offer_qpn) |oqpn| {
             if (q.peer_qpn != oqpn) {
                 try sendErrorResponseWithReason(allocator, stream, "409 Conflict", "conflict", "RDMA QP peer QPN mismatch (peer restarted)", 409, "qp_reset");
+                return;
+            }
+        }
+        if (offer_psn) |opsn| {
+            if (q.peer_psn != opsn) {
+                try sendErrorResponseWithReason(allocator, stream, "409 Conflict", "conflict", "RDMA QP peer PSN mismatch (peer restarted)", 409, "qp_reset");
                 return;
             }
         }
@@ -1442,22 +1726,35 @@ fn handlePull(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body: 
             try sendErrorResponseWithReason(allocator, stream, "409 Conflict", "conflict", "transfer_id already consumed", 409, "duplicate");
             return;
         }
+        q.stop_flag.store(0, .release);
         q.in_use = true;
         mgr.active_ops += 1;
-        qp_handle = q.handle;
+        qp_entry = q;
     }
 
     var qp_broken = false;
     defer {
-        mgr.mu.lockUncancelable(stream.io);
-        if (mgr.findQpIndexLocked(src_box, rdma_dev, .recv)) |q_idx| {
-            if (mgr.qps.items[q_idx].handle == qp_handle) {
-                mgr.qps.items[q_idx].in_use = false;
-                if (qp_broken) mgr.removeQpAtLocked(q_idx);
+        var destroy_qp: ?*QpEntry = null;
+        var close_dev: ?*DevEntry = null;
+        {
+            mgr.mu.lockUncancelable(stream.io);
+            defer mgr.mu.unlock(stream.io);
+            qp_entry.in_use = false;
+            if (qp_entry.retired) {
+                destroy_qp = qp_entry;
+            } else if (qp_broken) {
+                if (mgr.findQpEntryIndexLocked(qp_entry)) |q_idx| {
+                    _ = mgr.qps.swapRemove(q_idx);
+                    qp_entry.retired = true;
+                    destroy_qp = qp_entry;
+                }
             }
+            if (destroy_qp) |dq| {
+                close_dev = mgr.decDevRefLocked(dq.dev);
+            }
+            mgr.active_ops -|= 1;
         }
-        mgr.active_ops -|= 1;
-        mgr.mu.unlock(stream.io);
+        mgr.destroyRetiredQp(destroy_qp, close_dev);
     }
 
     // 5. Allocate receive buffer (0 ms MR registration — QP uses its pre-registered 4 MiB ring).
@@ -1475,10 +1772,11 @@ fn handlePull(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn, body: 
     const deadline_mono = now_mono +| deadline_ms;
     const read_status = mgr.transport.pull_offer(
         mgr.transport.ctx,
-        qp_handle,
+        qp_entry.handle,
         dst_buf,
         tid_16,
-        deadline_mono,
+        &qp_entry.stop_flag,
+        deadline_ms,
         &err_buf,
     );
     const t_rdma_end = io_util.nowUsMonotonic(stream.io);
@@ -1553,8 +1851,7 @@ fn handleDeleteOffer(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn,
 
     _ = mgr.sweepExpired(stream.io);
 
-    var detached_release: ?*OfferEntry = null;
-    var join_only: ?std.Thread = null;
+    var join_item: ?JoinItem = null;
     var resp_buf: [256]u8 = undefined;
     const resp: []const u8 = blk: {
         mgr.mu.lockUncancelable(stream.io);
@@ -1563,13 +1860,21 @@ fn handleDeleteOffer(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn,
         for (mgr.offers.items, 0..) |o, idx| {
             if (std.mem.eql(u8, o.idSlice(), tid)) {
                 o.stop_flag.store(1, .release);
+                const th = o.thread;
+                o.thread = null;
                 if (clean) {
-                    detached_release = mgr.offers.swapRemove(idx);
+                    _ = mgr.offers.swapRemove(idx);
+                    // Transfer `mgr.offers`'s reference to `join_item`.
+                    join_item = .{ .offer = o, .thread = th };
                     break :blk "{\"status\":\"released\"}";
                 } else {
                     o.state = .quarantined;
-                    join_only = o.thread;
-                    o.thread = null;
+                    if (th != null) {
+                        // Hold an extra reference while joining outside mutex so a concurrent
+                        // sweep/quiesce/clean=1 cannot UAF `o` before `join()` completes!
+                        o.refcount += 1;
+                        join_item = .{ .offer = o, .thread = th };
+                    }
                     const rem = @max(o.expires_at_ms - now_ms, 0);
                     break :blk try std.fmt.bufPrint(&resp_buf, "{{\"status\":\"quarantined\",\"remaining_ms\":{d}}}", .{rem});
                 }
@@ -1578,13 +1883,9 @@ fn handleDeleteOffer(mgr: *Manager, allocator: std.mem.Allocator, stream: *Conn,
         break :blk "{\"status\":\"already_released\"}";
     };
 
-    if (join_only) |t| t.join();
-    if (detached_release) |o| {
-        if (o.thread) |t| {
-            o.thread = null;
-            t.join();
-        }
-        o.freeResources(mgr.alloc());
+    if (join_item) |item| {
+        var single = [1]JoinItem{item};
+        mgr.joinAndReleaseOffers(stream.io, &single);
     }
     try sendResponse(stream, "200 OK", "application/json", resp);
 }
@@ -1646,10 +1947,12 @@ pub const LoopbackFabric = struct {
 
     const FakeQp = struct {
         qpn: u32,
+        psn: u32,
         gid: [16]u8,
         is_sender: bool,
         connected: bool = false,
         peer_qpn: u32 = 0,
+        peer_psn: u32 = 0,
         peer_gid: [16]u8 = @splat(0),
         alive: bool = true,
         // Rendezvous state for two-sided serve_offer <-> pull_offer in loopback tests.
@@ -1729,21 +2032,22 @@ pub const LoopbackFabric = struct {
         const q = self.allocator.create(FakeQp) catch return null;
         const qpn = self.next_qpn;
         self.next_qpn += 1;
-        q.* = .{ .qpn = qpn, .gid = d.gid, .is_sender = is_sender };
+        q.* = .{ .qpn = qpn, .psn = psn & 0x00ffffff, .gid = d.gid, .is_sender = is_sender };
         self.qps.append(self.allocator, q) catch {
             self.allocator.destroy(q);
             return null;
         };
-        local_out.* = .{ .gid = d.gid, .qpn = qpn, .psn = psn, .lid = 1, .gid_index = 2, .active_mtu = 5 };
+        local_out.* = .{ .gid = d.gid, .qpn = qpn, .psn = q.psn, .lid = 1, .gid_index = 2, .active_mtu = 5 };
         return q;
     }
 
-    fn qpConnect(_: *anyopaque, qp: *anyopaque, peer_gid: [16]u8, peer_qpn: u32, _: u32, _: u16, _: []u8) bool {
+    fn qpConnect(_: *anyopaque, qp: *anyopaque, peer_gid: [16]u8, peer_qpn: u32, peer_psn: u32, _: u16, _: []u8) bool {
         const q: *FakeQp = @ptrCast(@alignCast(qp));
         if (!q.alive) return false;
         q.connected = true;
         q.peer_gid = peer_gid;
         q.peer_qpn = peer_qpn;
+        q.peer_psn = peer_psn & 0x00ffffff;
         return true;
     }
 
@@ -1786,7 +2090,6 @@ pub const LoopbackFabric = struct {
                     q.armed_len = 0;
                     return .cancelled;
                 }
-                // Copy is in progress; spin briefly until SLOT_DONE.
             }
             std.Thread.yield() catch {};
         }
@@ -1797,6 +2100,7 @@ pub const LoopbackFabric = struct {
         qp: *anyopaque,
         dst_buf: []u8,
         tid_16: [16]u8,
+        stop_flag: *std.atomic.Value(c_int),
         _: u64,
         err_buf: []u8,
     ) ReadStatus {
@@ -1810,19 +2114,22 @@ pub const LoopbackFabric = struct {
 
         var peer: ?*FakeQp = null;
         for (self.qps.items) |cand| {
-            if (cand.alive and cand.connected and cand.is_sender and cand.qpn == q.peer_qpn and cand.peer_qpn == q.qpn) {
+            if (cand.alive and cand.connected and cand.is_sender and
+                cand.qpn == q.peer_qpn and cand.peer_qpn == q.qpn and
+                cand.psn == q.peer_psn and cand.peer_psn == q.psn)
+            {
                 peer = cand;
                 break;
             }
         }
         const src_qp = peer orelse {
-            _ = std.fmt.bufPrint(err_buf, "peer sender qp not in RTS\x00", .{}) catch {};
+            _ = std.fmt.bufPrint(err_buf, "peer sender qp not in RTS or PSN mismatch\x00", .{}) catch {};
             return .io_error;
         };
 
-        // Wait up to 2 s for sender responder thread to publish SLOT_ARMED.
         var waited: usize = 0;
         while (waited < 40_000) : (waited += 1) {
+            if (stop_flag.load(.acquire) != 0) return .timeout;
             if (src_qp.slot_state.cmpxchgStrong(SLOT_ARMED, SLOT_COPYING, .acq_rel, .acquire) == null) {
                 if (!std.mem.eql(u8, &src_qp.armed_tid, &tid_16) or src_qp.armed_len != dst_buf.len or src_qp.armed_ptr == null) {
                     src_qp.slot_state.store(SLOT_ARMED, .release);
@@ -1998,6 +2305,12 @@ test "cache_rdma: full offer -> accept -> pull -> delete(clean=1) -> persistent 
     try testing.expectEqual(@as(u16, 200), offer1.status);
     try testing.expectEqual(@as(usize, 1), src_mgr.activeOfferCount(testing.io));
 
+    // Overlapping offer on the same (dst_box, rdma_dev) while offer1 is pinned -> 503 rdma_busy!
+    const overlap = try invokeHttp(&src_mgr, a, "POST", "/v1/cache/rdma/offer", auth_hdr, "{\"session_key\":\"sess-alpha\",\"dst_box\":\"studio2\",\"rdma_dev\":\"rdma_en2\",\"expires_ms\":35000}");
+    defer overlap.deinit(a);
+    try testing.expectEqual(@as(u16, 503), overlap.status);
+    try testing.expect(std.mem.indexOf(u8, overlap.body, "\"reason\":\"rdma_busy\"") != null);
+
     const offer1_json = try std.json.parseFromSlice(std.json.Value, a, offer1.body, .{});
     defer offer1_json.deinit();
     const o1 = offer1_json.value.object;
@@ -2007,8 +2320,8 @@ test "cache_rdma: full offer -> accept -> pull -> delete(clean=1) -> persistent 
     const src_qpn = o1.get("qpn").?.integer;
     const src_psn = o1.get("psn").?.integer;
 
-    // 3. Router-mediated QP accept: dst then src (zero outbound HTTP from mlx-serve!)
-    const dst_acc_body = try std.fmt.allocPrint(a, "{{\"peer_box\":\"studio1\",\"rdma_dev\":\"rdma_en3\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d}}}", .{ src_gid, src_qpn, src_psn });
+    // 3. Router-mediated QP accept: dst (with reset=true) then src (with transfer_id)
+    const dst_acc_body = try std.fmt.allocPrint(a, "{{\"peer_box\":\"studio1\",\"rdma_dev\":\"rdma_en3\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d},\"reset\":true}}", .{ src_gid, src_qpn, src_psn });
     defer a.free(dst_acc_body);
     const dst_acc = try invokeHttp(&dst_mgr, a, "POST", "/v1/cache/rdma/accept", auth_hdr, dst_acc_body);
     defer dst_acc.deinit(a);
@@ -2019,7 +2332,7 @@ test "cache_rdma: full offer -> accept -> pull -> delete(clean=1) -> persistent 
     const dst_qpn = dst_acc_json.value.object.get("qpn").?.integer;
     const dst_psn = dst_acc_json.value.object.get("psn").?.integer;
 
-    const src_acc_body = try std.fmt.allocPrint(a, "{{\"peer_box\":\"studio2\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d}}}", .{ dst_gid, dst_qpn, dst_psn });
+    const src_acc_body = try std.fmt.allocPrint(a, "{{\"transfer_id\":\"{s}\",\"peer_box\":\"studio2\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d}}}", .{ tid1, dst_gid, dst_qpn, dst_psn });
     defer a.free(src_acc_body);
     const src_acc = try invokeHttp(&src_mgr, a, "POST", "/v1/cache/rdma/accept", auth_hdr, src_acc_body);
     defer src_acc.deinit(a);
@@ -2080,10 +2393,10 @@ test "cache_rdma: full offer -> accept -> pull -> delete(clean=1) -> persistent 
 
     // Still pinned before expires_ms; swept once clock advances past expires_ms.
     test_clock_ms += 4_999;
-    try testing.expectEqual(@as(usize, 0), src_mgr.sweepExpired(testing.io));
+    try testing.expectEqual(@as(usize, 0), src_mgr.sweepExpiredNonBlocking(testing.io));
     try testing.expectEqual(@as(usize, 1), src_mgr.activeOfferCount(testing.io));
     test_clock_ms += 2;
-    try testing.expectEqual(@as(usize, 1), src_mgr.sweepExpired(testing.io));
+    try testing.expectEqual(@as(usize, 1), src_mgr.sweepExpiredNonBlocking(testing.io));
     try testing.expectEqual(@as(usize, 0), src_mgr.activeOfferCount(testing.io));
 
     // 9. Quiesce tears down all persistent QPs cleanly.
@@ -2118,13 +2431,13 @@ test "cache_rdma: qp_reset self-heal re-arms pinned offer after dst restart" {
     var dst_mgr: Manager = .{ .transport = fabric.transport(), .cache_hooks = dst_cache.hooks(), .clock_fn = fakeClock };
     defer dst_mgr.deinitAll(testing.io);
 
-    // Cold offer + accept + pull to establish persistent QP pair.
+    // Cold offer + accept + delete to establish persistent QP pair.
     const o1 = try invokeHttp(&src_mgr, a, "POST", "/v1/cache/rdma/offer", auth_hdr, "{\"session_key\":\"sess-heal\",\"dst_box\":\"studio2\",\"rdma_dev\":\"rdma_en2\",\"expires_ms\":35000}");
     defer o1.deinit(a);
     const o1_j = try std.json.parseFromSlice(std.json.Value, a, o1.body, .{});
     defer o1_j.deinit();
     const tid1 = o1_j.value.object.get("transfer_id").?.string;
-    const da1_body = try std.fmt.allocPrint(a, "{{\"peer_box\":\"studio1\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d}}}", .{
+    const da1_body = try std.fmt.allocPrint(a, "{{\"peer_box\":\"studio1\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d},\"reset\":true}}", .{
         o1_j.value.object.get("gid").?.string, o1_j.value.object.get("qpn").?.integer, o1_j.value.object.get("psn").?.integer,
     });
     defer a.free(da1_body);
@@ -2132,8 +2445,8 @@ test "cache_rdma: qp_reset self-heal re-arms pinned offer after dst restart" {
     defer da1.deinit(a);
     const da1_j = try std.json.parseFromSlice(std.json.Value, a, da1.body, .{});
     defer da1_j.deinit();
-    const sa1_body = try std.fmt.allocPrint(a, "{{\"peer_box\":\"studio2\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d}}}", .{
-        da1_j.value.object.get("gid").?.string, da1_j.value.object.get("qpn").?.integer, da1_j.value.object.get("psn").?.integer,
+    const sa1_body = try std.fmt.allocPrint(a, "{{\"transfer_id\":\"{s}\",\"peer_box\":\"studio2\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d}}}", .{
+        tid1, da1_j.value.object.get("gid").?.string, da1_j.value.object.get("qpn").?.integer, da1_j.value.object.get("psn").?.integer,
     });
     defer a.free(sa1_body);
     const sa1 = try invokeHttp(&src_mgr, a, "POST", "/v1/cache/rdma/accept", auth_hdr, sa1_body);
@@ -2163,7 +2476,7 @@ test "cache_rdma: qp_reset self-heal re-arms pinned offer after dst restart" {
     try testing.expectEqual(@as(u16, 409), p2_fail.status);
     try testing.expect(std.mem.indexOf(u8, p2_fail.body, "\"reason\":\"qp_reset\"") != null);
 
-    // Router self-heal: src:/accept(reset=true) -> dst:/accept(reset=true) -> src:/accept -> retry pull!
+    // Router self-heal: src:/accept(reset=true) -> dst:/accept(reset=true) -> src:/accept(transfer_id) -> retry pull!
     const sr = try invokeHttp(&src_mgr, a, "POST", "/v1/cache/rdma/accept", auth_hdr, "{\"peer_box\":\"studio2\",\"rdma_dev\":\"rdma_en2\",\"reset\":true}");
     defer sr.deinit(a);
     try testing.expectEqual(@as(u16, 200), sr.status);
@@ -2181,15 +2494,15 @@ test "cache_rdma: qp_reset self-heal re-arms pinned offer after dst restart" {
     const da2_j = try std.json.parseFromSlice(std.json.Value, a, da2.body, .{});
     defer da2_j.deinit();
 
-    const sa2_body = try std.fmt.allocPrint(a, "{{\"peer_box\":\"studio2\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d}}}", .{
-        da2_j.value.object.get("gid").?.string, da2_j.value.object.get("qpn").?.integer, da2_j.value.object.get("psn").?.integer,
+    const sa2_body = try std.fmt.allocPrint(a, "{{\"transfer_id\":\"{s}\",\"peer_box\":\"studio2\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d}}}", .{
+        tid2, da2_j.value.object.get("gid").?.string, da2_j.value.object.get("qpn").?.integer, da2_j.value.object.get("psn").?.integer,
     });
     defer a.free(sa2_body);
     const sa2 = try invokeHttp(&src_mgr, a, "POST", "/v1/cache/rdma/accept", auth_hdr, sa2_body);
     defer sa2.deinit(a);
     try testing.expectEqual(@as(u16, 200), sa2.status);
 
-    // Retry pull with updated offer QPN -> succeeds on the SAME still-pinned offer!
+    // Retry pull with updated offer QPN + PSN -> succeeds on the SAME still-pinned offer!
     const p2_retry_body = try std.fmt.allocPrint(
         a,
         "{{\"transfer_id\":\"{s}\",\"session_key\":\"sess-heal\",\"src_box\":\"studio1\",\"rdma_dev\":\"rdma_en2\",\"deadline_ms\":10000,\"offer\":{{\"transfer_id\":\"{s}\",\"build_id\":\"{s}\",\"byte_len\":{d},\"import_peak\":{d},\"rdma_dev\":\"rdma_en2\",\"gid\":\"{s}\",\"qpn\":{d},\"psn\":{d},\"regions\":[{{\"addr\":4096,\"rkey\":0,\"len\":{d}}}],\"expires_ms\":35000}}}}",
@@ -2208,7 +2521,7 @@ test "cache_rdma: qp_reset self-heal re-arms pinned offer after dst restart" {
     try testing.expectEqual(@as(u16, 200), del2.status);
 }
 
-test "cache_rdma: pull refuses mixed_build (409) and import_no_room (400) before any RDMA pull" {
+test "cache_rdma: pull refuses mixed_build (409), import_no_room (400), malformed gid (400), and accept validates peer_lid & non-admitting TP1" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
 
@@ -2230,6 +2543,24 @@ test "cache_rdma: pull refuses mixed_build (409) and import_no_room (400) before
     try testing.expect(std.mem.indexOf(u8, r_mixed.body, "\"reason\":\"mixed_build\"") != null);
     try testing.expectEqual(@as(usize, 0), fabric.reads_completed);
 
+    // Malformed offer.gid -> 400 bad_offer (never silently ignored)
+    const bad_gid_body = try std.fmt.allocPrint(a, "{{\"transfer_id\":\"tid-badgid\",\"session_key\":\"s\",\"src_box\":\"studio1\",\"rdma_dev\":\"rdma_en2\",\"deadline_ms\":5000,\"offer\":{{\"transfer_id\":\"tid-badgid\",\"build_id\":\"{s}\",\"byte_len\":1024,\"import_peak\":2048,\"rdma_dev\":\"rdma_en2\",\"gid\":\"not-hex\",\"regions\":[{{\"addr\":4096,\"rkey\":0,\"len\":1024}}],\"expires_ms\":5000}}}}", .{build_options.build_id});
+    defer a.free(bad_gid_body);
+    const r_badgid = try invokeHttp(&dst_mgr, a, "POST", "/v1/cache/rdma/pull", auth_hdr, bad_gid_body);
+    defer r_badgid.deinit(a);
+    try testing.expectEqual(@as(u16, 400), r_badgid.status);
+    try testing.expect(std.mem.indexOf(u8, r_badgid.body, "\"reason\":\"bad_offer\"") != null);
+
+    // peer_lid > 65535 -> 400 bad_request (no @intCast panic)
+    const bad_lid = try invokeHttp(&dst_mgr, a, "POST", "/v1/cache/rdma/accept", auth_hdr, "{\"peer_box\":\"studio1\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"00000000000000000000ffff0afe0c01\",\"peer_qpn\":100,\"peer_lid\":65536}");
+    defer bad_lid.deinit(a);
+    try testing.expectEqual(@as(u16, 400), bad_lid.status);
+
+    // Unescaped characters in rdma_dev -> 400 bad_request
+    const bad_dev = try invokeHttp(&dst_mgr, a, "POST", "/v1/cache/rdma/accept", auth_hdr, "{\"peer_box\":\"studio1\",\"rdma_dev\":\"rdma\\\"bad\",\"peer_gid\":\"00000000000000000000ffff0afe0c01\",\"peer_qpn\":100}");
+    defer bad_dev.deinit(a);
+    try testing.expectEqual(@as(u16, 400), bad_dev.status);
+
     // Pre-flight import_no_room -> 400 import_no_room with 0 RDMA bytes transferred
     const old_override = http_request.import_headroom_override;
     defer http_request.import_headroom_override = old_override;
@@ -2242,4 +2573,11 @@ test "cache_rdma: pull refuses mixed_build (409) and import_no_room (400) before
     try testing.expectEqual(@as(u16, 400), r_noroom.status);
     try testing.expect(std.mem.indexOf(u8, r_noroom.body, "\"reason\":\"import_no_room\"") != null);
     try testing.expectEqual(@as(usize, 0), fabric.reads_completed);
+
+    // Draining (TP1 but !admitting) -> 503 rdma_tp4_active!
+    _ = sw.command(.drain, 1, 0);
+    const r_drain = try invokeHttp(&dst_mgr, a, "POST", "/v1/cache/rdma/offer", auth_hdr, "{\"session_key\":\"s\",\"dst_box\":\"studio2\",\"rdma_dev\":\"rdma_en2\"}");
+    defer r_drain.deinit(a);
+    try testing.expectEqual(@as(u16, 503), r_drain.status);
+    try testing.expect(std.mem.indexOf(u8, r_drain.body, "\"reason\":\"rdma_tp4_active\"") != null);
 }

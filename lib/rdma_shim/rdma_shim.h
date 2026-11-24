@@ -28,7 +28,7 @@ void msv_rdma_dev_close(MsvRdmaDev *dev);
 
 /* Allocate IBV_QPT_UC QP + CQ + pre-registered 4 MiB staging ring MR, and
  * transition RESET -> INIT.
- * role: 0 = recv (dst/puller), 1 = send (src/offerer). */
+ * is_sender: 0 = recv (dst/puller), 1 = send (src/offerer). */
 MsvRdmaQp *msv_rdma_qp_create(
     MsvRdmaDev *dev,
     uint32_t psn,
@@ -58,10 +58,11 @@ void msv_rdma_qp_destroy(MsvRdmaQp *qp);
  * Waits on the sender QP for a matching REQ(tid_16) doorbell from dst, then streams
  * `len` bytes from `src_buf` over credit-paced IBV_QPT_UC IBV_WR_SEND using the QP's
  * pre-registered staging ring (zero per-transfer ibv_reg_mr).
- * Polls `*stop_flag` while waiting/streaming so DELETE/quiesce can cancel cleanly.
+ * Polls `*stop_flag` while waiting and streaming so DELETE/quiesce can cancel cleanly.
+ * `timeout_ms` is a relative timeout measured on CLOCK_MONOTONIC inside this call (0 = none).
  * Returns:
  *   0  on complete transfer,
- *   1  if cancelled via *stop_flag before transfer started,
+ *   1  if cancelled/expired via *stop_flag or timeout before transfer started,
  *  -1  if cancelled/timed out mid-transfer (caller should reset QP),
  *  -2  on verbs/WC error (caller should reset QP). */
 int msv_rdma_serve_offer(
@@ -70,7 +71,7 @@ int msv_rdma_serve_offer(
     uint64_t len,
     const uint8_t tid_16[16],
     volatile int *stop_flag,
-    uint64_t deadline_mono_ms,
+    uint64_t timeout_ms,
     char *err_buf,
     size_t err_cap
 );
@@ -79,16 +80,19 @@ int msv_rdma_serve_offer(
  * Posts credit-bounded IBV_WR_RECV chunks (<= 2 MiB inflight, staying below macOS TB5's
  * 4 MiB posted-recv limit), sends REQ(tid_16) over the UC QP, refills RECVs + sends
  * CREDIT doorbells, and copies all `len` bytes into `dst_buf`.
+ * Polls `*stop_flag` (optional) so quiesce/shutdown can abort cleanly without UAF.
+ * `timeout_ms` is a relative timeout measured on CLOCK_MONOTONIC inside this call (0 = none).
  * Returns:
  *   0  on complete transfer,
- *  -1  on deadline timeout (caller should reset QP),
+ *  -1  on timeout or cancellation (caller should reset QP),
  *  -2  on verbs/WC/protocol error (caller should reset QP). */
 int msv_rdma_pull_offer(
     MsvRdmaQp *qp,
     void *dst_buf,
     uint64_t len,
     const uint8_t tid_16[16],
-    uint64_t deadline_mono_ms,
+    volatile int *stop_flag,
+    uint64_t timeout_ms,
     char *err_buf,
     size_t err_cap
 );

@@ -158,7 +158,7 @@ pub fn handle(sw: *sw_mod.Switch, internal_key: ?[32]u8, req: Request, wall_now_
     const is_get = std.mem.eql(u8, req.method, "GET");
     if (std.mem.eql(u8, route, "mode")) {
         if (!is_get) return plain(buf, 405, "method not allowed");
-        cache_rdma.sweepExpired(sw.io);
+        cache_rdma.sweepExpiredNonBlocking(sw.io);
         const extra = if (cache_rdma.isAvailable())
             ",\"build_id\":\"" ++ build_options.build_id ++ "\",\"cache_rdma\":true"
         else

@@ -2762,8 +2762,8 @@ test "dsv41 peer fetch: RDMA offer -> accept -> pull -> delete transfers live KV
     defer a_turn2.deinit(testing.allocator);
     try expectStatus("rdma_node_a_turn2_200", 200, a_turn2);
 
-    // Step 1.5: Router-mediated QP accept (dst then src).
-    const dst_acc_body = try std.fmt.allocPrint(testing.allocator, "{{\"peer_box\":\"studio1\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d}}}", .{
+    // Step 1.5: Router-mediated QP accept (dst with reset=true, then src with transfer_id).
+    const dst_acc_body = try std.fmt.allocPrint(testing.allocator, "{{\"peer_box\":\"studio1\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d},\"reset\":true}}", .{
         o.get("gid").?.string, o.get("qpn").?.integer, o.get("psn").?.integer,
     });
     defer testing.allocator.free(dst_acc_body);
